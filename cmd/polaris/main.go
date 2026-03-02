@@ -894,6 +894,7 @@ type RiskDetail struct {
 type MappedControl struct {
 	ControlCode string `json:"control_code"`
 	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 	Category    string `json:"category"`
 	Type        string `json:"type"`
 	Objective   string `json:"objective,omitempty"`
@@ -1081,6 +1082,9 @@ func cmdRiskShow(args []string) {
 		for _, ctrl := range riskDetail.MappedControls {
 			typeBadge := formatControlType(ctrl.Type)
 			fmt.Printf("  %s %s %s\n", ctrl.ControlCode, typeBadge, ctrl.Name)
+			if ctrl.Description != "" {
+				fmt.Printf("    %s\n", wrapText(ctrl.Description, 74, "    "))
+			}
 		}
 
 		fmt.Println()
@@ -1414,16 +1418,21 @@ func formatPriority(score int) string {
 
 // Control represents a control from the API
 type Control struct {
-	ID             string   `json:"id"`
-	ControlCode    string   `json:"control_code"`
-	Name           string   `json:"name"`
-	Category       string   `json:"category"`
-	Type           string   `json:"type"`
-	Objective      string   `json:"objective"`
-	Description    string   `json:"description"`
-	Weight         int      `json:"weight"`
-	Implementation string   `json:"implementation,omitempty"`
-	RiskCodes      []string `json:"risk_codes,omitempty"`
+	ID                    string   `json:"id"`
+	ControlCode           string   `json:"control_code"`
+	Name                  string   `json:"name"`
+	Category              string   `json:"category"`
+	Type                  string   `json:"type"`
+	Objective             string   `json:"objective"`
+	Description           string   `json:"description"`
+	RiskStatement         string   `json:"risk_statement,omitempty"`
+	TestDescription       string   `json:"test_description,omitempty"`
+	Remediation           string   `json:"remediation,omitempty"`
+	ExpectedEvidenceTypes []string `json:"expected_evidence_types"`
+	Treatment             string   `json:"treatment,omitempty"`
+	Weight                int      `json:"weight"`
+	Implementation        string   `json:"implementation,omitempty"`
+	RiskCodes             []string `json:"risk_codes,omitempty"`
 }
 
 // ListControlsResponse matches the API response
@@ -1517,7 +1526,7 @@ func cmdControlList(args []string) {
 	fmt.Printf("Found %d controls:\n\n", listResp.Total)
 	for _, c := range listResp.Controls {
 		typeBadge := formatControlType(c.Type)
-		fmt.Printf("%-8s %s [%s] %s\n", c.ControlCode, typeBadge, c.Category, c.Name)
+		fmt.Printf("%-8s %-14s %d/10 %-12s [%s] %s\n", c.ControlCode, typeBadge, c.Weight, formatWeightTier(c.Weight), formatCategory(c.Category), c.Name)
 	}
 }
 
@@ -1556,14 +1565,35 @@ func cmdControlShow(args []string) {
 
 	// Output in a format suitable for further processing or display
 	fmt.Printf("Control: %s - %s\n", control.ControlCode, control.Name)
-	fmt.Printf("Category: %s\n", control.Category)
+	fmt.Printf("Category: %s\n", formatCategory(control.Category))
 	fmt.Printf("Type: %s\n", control.Type)
-	fmt.Printf("Weight: %d/10\n", control.Weight)
-	fmt.Println()
-	fmt.Printf("Objective:\n  %s\n", control.Objective)
+	fmt.Printf("Weight: %d/10 (%s)\n", control.Weight, formatWeightTier(control.Weight))
+	if control.Treatment != "" {
+		fmt.Printf("Treatment: %s\n", control.Treatment)
+	}
 	if control.Description != "" {
 		fmt.Println()
 		fmt.Printf("Description:\n  %s\n", wrapText(control.Description, 78, "  "))
+	}
+	if control.Objective != "" {
+		fmt.Println()
+		fmt.Printf("Objective:\n  %s\n", wrapText(control.Objective, 78, "  "))
+	}
+	if control.RiskStatement != "" {
+		fmt.Println()
+		fmt.Printf("Risk Statement:\n  %s\n", wrapText(control.RiskStatement, 78, "  "))
+	}
+	if control.TestDescription != "" {
+		fmt.Println()
+		fmt.Printf("Test Description:\n  %s\n", wrapText(control.TestDescription, 78, "  "))
+	}
+	if control.Remediation != "" {
+		fmt.Println()
+		fmt.Printf("Remediation:\n  %s\n", wrapText(control.Remediation, 78, "  "))
+	}
+	if len(control.ExpectedEvidenceTypes) > 0 {
+		fmt.Println()
+		fmt.Printf("Expected Evidence: %s\n", strings.Join(control.ExpectedEvidenceTypes, ", "))
 	}
 	if control.Implementation != "" {
 		fmt.Println()
@@ -1587,6 +1617,31 @@ func formatControlType(controlType string) string {
 	default:
 		return "[" + strings.ToUpper(controlType) + "]"
 	}
+}
+
+// formatWeightTier returns a human-readable tier label for a control weight (1-10)
+func formatWeightTier(weight int) string {
+	if weight >= 9 {
+		return "Critical"
+	} else if weight >= 7 {
+		return "Required"
+	} else if weight >= 5 {
+		return "Important"
+	} else if weight >= 3 {
+		return "Recommended"
+	}
+	return "Advisory"
+}
+
+// formatCategory formats a snake_case category into Title Case
+func formatCategory(category string) string {
+	words := strings.Split(category, "_")
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // ============================================================================
@@ -2794,16 +2849,42 @@ func cmdEvidenceSubmit(args []string) {
 
 	cfg := loadAndResolveConfig()
 
-	// First, resolve control code to UUID
-	controlID, err := findControlIDByCode(cfg, controlCode)
+	// Fetch the full control to get ID and expected evidence types
+	controlURL := cfg.APIURL + "/api/v1/controls/by-code/" + controlCode
+	controlResp, err := makeAPIRequest(cfg, "GET", controlURL, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: control %s not found: %v\n", controlCode, err)
 		os.Exit(1)
+	}
+
+	var control Control
+	if err := json.Unmarshal(controlResp, &control); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing control response: %v\n", err)
+		os.Exit(1)
+	}
+	if control.ID == "" {
+		fmt.Fprintf(os.Stderr, "Error: control %s not found\n", controlCode)
+		os.Exit(1)
+	}
+
+	// Warn if evidence type doesn't match expected types
+	if len(control.ExpectedEvidenceTypes) > 0 {
+		matched := false
+		for _, et := range control.ExpectedEvidenceTypes {
+			if et == evidenceType {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			fmt.Fprintf(os.Stderr, "Note: %s expects evidence types: %s (submitting \"%s\" anyway)\n",
+				controlCode, strings.Join(control.ExpectedEvidenceTypes, ", "), evidenceType)
+		}
 	}
 
 	// Submit evidence
 	body := map[string]string{
-		"control_id":        controlID,
+		"control_id":        control.ID,
 		"type":              evidenceType,
 		"name":              name,
 		"url_or_identifier": url,
@@ -2829,7 +2910,7 @@ func cmdEvidenceSubmit(args []string) {
 
 	fmt.Printf("Evidence submitted successfully.\n")
 	fmt.Printf("  ID:      %s\n", evidence.ID)
-	fmt.Printf("  Control: %s\n", controlCode)
+	fmt.Printf("  Control: %s (%s)\n", controlCode, control.Name)
 	fmt.Printf("  Type:    %s\n", evidence.Type)
 	fmt.Printf("  Name:    %s\n", evidence.Name)
 	fmt.Printf("  Status:  %s\n", evidence.Status)

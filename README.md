@@ -68,7 +68,7 @@ After `polaris init` (or `polaris plugin install claude`), the following slash c
 | `polaris plugin` | Manage editor plugins (install, update, list, remove) |
 | `polaris scan` | Submit risk scan findings |
 | `polaris risk` | Manage risks (list, show, close, resolve) |
-| `polaris control` | Query the 58-control reliability catalog |
+| `polaris control` | Query the 56-control reliability catalog |
 | `polaris knowledge` | Search organizational knowledge base |
 | `polaris evidence` | Submit and manage control evidence |
 | `polaris config` | Manage configuration |
