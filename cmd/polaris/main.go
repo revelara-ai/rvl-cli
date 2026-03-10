@@ -403,7 +403,8 @@ func cmdStatus() {
 	plugins, err := getInstalledPlugins()
 	if err != nil || len(plugins) == 0 {
 		fmt.Println("  No plugins installed")
-		fmt.Println("  Run 'polaris plugin install claude' to install")
+		fmt.Println("  Run 'polaris plugin install <editor>' to install")
+		fmt.Println("  Available: claude, codex, gemini, cursor, windsurf")
 	} else {
 		for _, p := range plugins {
 			if serverVersion != "" && p.Version != serverVersion {
@@ -458,15 +459,16 @@ func cmdPlugin(args []string) {
 		fmt.Fprintln(os.Stderr, `Usage: polaris plugin <command>
 
 Commands:
-  install <editor>   Install plugin for editor (claude, gemini, windsurf, cursor)
-  update [editor]    Update plugin(s) to latest version
-  list               List installed plugins
-  remove <editor>    Remove installed plugin
+  install <editor>   Install skills for editor (claude, codex, gemini, cursor, windsurf)
+  update [editor]    Update skills to latest version
+  list               List installed skills
+  remove <editor>    Remove installed skills
 
 Examples:
   polaris plugin install claude    Install Claude Code plugin
+  polaris plugin install codex     Install Codex CLI skills
+  polaris plugin install gemini    Install Gemini CLI skills + agents
   polaris plugin update            Update all installed plugins
-  polaris plugin update claude     Update specific plugin
   polaris plugin list              Show installed plugins`)
 		os.Exit(1)
 	}
@@ -476,7 +478,7 @@ Examples:
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
 			fmt.Fprintln(os.Stderr, "Usage: polaris plugin install <editor>")
-			fmt.Fprintln(os.Stderr, "Available: claude, gemini, windsurf, cursor")
+			fmt.Fprintln(os.Stderr, "Available: claude, codex, gemini, cursor, windsurf")
 			os.Exit(1)
 		}
 		editor := args[1]
@@ -3376,10 +3378,27 @@ Examples:
   polaris init --force                 Overwrite existing config`)
 }
 
+// editorBinaries maps editor names to their CLI binary names for PATH detection
+var editorBinaries = []struct {
+	name   string
+	binary string
+}{
+	{"claude", "claude"},
+	{"codex", "codex"},
+	{"gemini", "gemini"},
+	{"cursor", "cursor"},
+	{"windsurf", "windsurf"},
+}
+
+// isEditorAvailable checks if the given CLI binary is on the PATH.
+func isEditorAvailable(binary string) bool {
+	_, err := exec.LookPath(binary)
+	return err == nil
+}
+
 // isClaudeCodeAvailable checks if the claude CLI is on the PATH.
 func isClaudeCodeAvailable() bool {
-	_, err := exec.LookPath("claude")
-	return err == nil
+	return isEditorAvailable("claude")
 }
 
 // cmdInit initializes Polaris for a repository
@@ -3470,85 +3489,99 @@ func cmdInit(args []string) {
 	}
 	fmt.Println()
 
-	// Step 3: Install plugin
+	// Step 3: Install skills for detected editors
 	pluginInstalled := false
 	pluginVersion := ""
 	if !skipPlugin {
 		plugins, _ := getInstalledPlugins()
-		var existing *pluginInfo
+		installedMap := make(map[string]*pluginInfo)
 		for i := range plugins {
-			if plugins[i].Editor == "claude" {
-				existing = &plugins[i]
-				break
+			installedMap[plugins[i].Editor] = &plugins[i]
+		}
+
+		// Fetch server version once for update checks
+		loginCfgForPlugin, _ := loadConfig()
+		serverVersion := fetchServerPluginVersion(loginCfgForPlugin)
+
+		// Detect available editors
+		var detectedEditors []string
+		for _, e := range editorBinaries {
+			if isEditorAvailable(e.binary) {
+				detectedEditors = append(detectedEditors, e.name)
 			}
 		}
 
-		if existing != nil {
-			// Plugin already installed — check for updates
-			loginCfgForPlugin, _ := loadConfig()
-			serverVersion := fetchServerPluginVersion(loginCfgForPlugin)
-			if serverVersion != "" && serverVersion != existing.Version {
-				doUpdate := force || yesAll
-				if !doUpdate {
-					err := huh.NewConfirm().
-						Title(fmt.Sprintf("Update Polaris plugin? (v%s → v%s)", existing.Version, serverVersion)).
-						Affirmative("Yes").
-						Negative("No").
-						Value(&doUpdate).
-						Run()
-					if err != nil {
-						doUpdate = false
+		if len(detectedEditors) == 0 {
+			fmt.Println("Skills: No supported editors detected on PATH")
+			fmt.Println("  Supported: claude, codex, gemini, cursor, windsurf")
+			fmt.Println("  Install an editor, then run: polaris plugin install <editor>")
+		}
+
+		for _, editorName := range detectedEditors {
+			existing := installedMap[editorName]
+
+			if existing != nil {
+				// Already installed — check for updates
+				if serverVersion != "" && serverVersion != existing.Version {
+					doUpdate := force || yesAll
+					if !doUpdate {
+						err := huh.NewConfirm().
+							Title(fmt.Sprintf("Update Polaris skills for %s? (v%s → v%s)", editorName, existing.Version, serverVersion)).
+							Affirmative("Yes").
+							Negative("No").
+							Value(&doUpdate).
+							Run()
+						if err != nil {
+							doUpdate = false
+						}
 					}
-				}
-				if doUpdate {
-					if err := installPlugin("claude"); err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: could not update plugin: %v\n", err)
+					if doUpdate {
+						if err := installPlugin(editorName); err != nil {
+							fmt.Fprintf(os.Stderr, "Warning: could not update %s skills: %v\n", editorName, err)
+						} else {
+							pluginInstalled = true
+							pluginVersion = serverVersion
+						}
 					} else {
 						pluginInstalled = true
-						pluginVersion = serverVersion
+						pluginVersion = existing.Version
+						fmt.Printf("Skills (%s): Keeping v%s\n", editorName, existing.Version)
 					}
 				} else {
 					pluginInstalled = true
 					pluginVersion = existing.Version
-					fmt.Printf("Plugin: Keeping v%s\n", existing.Version)
+					fmt.Printf("Skills (%s): Up to date (v%s)\n", editorName, existing.Version)
 				}
 			} else {
-				pluginInstalled = true
-				pluginVersion = existing.Version
-				fmt.Printf("Plugin: Up to date (v%s)\n", existing.Version)
-			}
-		} else if isClaudeCodeAvailable() {
-			// Claude Code available but plugin not installed
-			doInstall := yesAll
-			if !yesAll {
-				err := huh.NewConfirm().
-					Title("Install Polaris plugin for Claude Code?").
-					Affirmative("Yes").
-					Negative("No").
-					Value(&doInstall).
-					Run()
-				if err != nil {
-					doInstall = false
+				// Editor available but skills not installed
+				doInstall := yesAll
+				if !yesAll {
+					err := huh.NewConfirm().
+						Title(fmt.Sprintf("Install Polaris skills for %s?", editorName)).
+						Affirmative("Yes").
+						Negative("No").
+						Value(&doInstall).
+						Run()
+					if err != nil {
+						doInstall = false
+					}
 				}
-			}
-			if doInstall {
-				if err := installPlugin("claude"); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not install plugin: %v\n", err)
-				} else {
-					pluginInstalled = true
-					// Read back the version from metadata
-					updatedPlugins, _ := getInstalledPlugins()
-					for _, p := range updatedPlugins {
-						if p.Editor == "claude" {
-							pluginVersion = p.Version
-							break
+				if doInstall {
+					if err := installPlugin(editorName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: could not install %s skills: %v\n", editorName, err)
+					} else {
+						pluginInstalled = true
+						// Read back the version from metadata
+						updatedPlugins, _ := getInstalledPlugins()
+						for _, p := range updatedPlugins {
+							if p.Editor == editorName {
+								pluginVersion = p.Version
+								break
+							}
 						}
 					}
 				}
 			}
-		} else {
-			fmt.Println("Plugin: Skipped (Claude Code not detected)")
-			fmt.Println("  Install Claude Code, then run: polaris plugin install claude")
 		}
 		fmt.Println()
 	}
@@ -4197,8 +4230,9 @@ type pluginInfo struct {
 	Location  string `json:"location"`
 }
 
-// getPluginDir returns the installation directory for a given editor's plugin
-// Returns path in format: ~/.claude/plugins/cache/polaris-api/polaris/<version>/
+// getPluginDir returns the installation directory for a given editor's plugin.
+// For Claude, returns the marketplace cache path. For other editors, returns
+// the canonical skill/agent directory where the tarball is extracted directly.
 func getPluginDir(editor, version string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -4209,17 +4243,20 @@ func getPluginDir(editor, version string) (string, error) {
 	case "claude":
 		// Claude Code plugin cache format: ~/.claude/plugins/cache/<source>/<plugin>/<version>/
 		return filepath.Join(home, ".claude", "plugins", "cache", "polaris-api", "polaris", version), nil
+	case "codex":
+		// Codex skills: ~/.agents/skills/ (tarball has {name}/SKILL.md layout)
+		return filepath.Join(home, ".agents", "skills"), nil
 	case "gemini":
-		// Future: Gemini Code plugin location
-		return filepath.Join(home, ".gemini", "plugins", "cache", "polaris-api", "polaris", version), nil
-	case "windsurf":
-		// Future: Windsurf plugin location
-		return filepath.Join(home, ".windsurf", "plugins", "cache", "polaris-api", "polaris", version), nil
+		// Gemini: ~/.gemini/ (tarball has skills/{name}/SKILL.md + agents/polaris-*.md)
+		return filepath.Join(home, ".gemini"), nil
 	case "cursor":
-		// Future: Cursor plugin location
-		return filepath.Join(home, ".cursor", "plugins", "cache", "polaris-api", "polaris", version), nil
+		// Cursor: ~/.cursor/ (tarball has skills/{name}/SKILL.md + agents/polaris-*.md)
+		return filepath.Join(home, ".cursor"), nil
+	case "windsurf":
+		// Windsurf skills: ~/.codeium/windsurf/skills/ (tarball has {name}/SKILL.md layout)
+		return filepath.Join(home, ".codeium", "windsurf", "skills"), nil
 	default:
-		return "", fmt.Errorf("unsupported editor: %s (available: claude, gemini, windsurf, cursor)", editor)
+		return "", fmt.Errorf("unsupported editor: %s (available: claude, codex, gemini, cursor, windsurf)", editor)
 	}
 }
 
@@ -4415,7 +4452,7 @@ func installPlugin(editor string) error {
 
 	// Download plugin tarball
 	client := &http.Client{Timeout: 60 * time.Second}
-	downloadURL := cfg.APIURL + "/api/v1/plugin/download"
+	downloadURL := cfg.APIURL + "/api/v1/plugin/download?editor=" + editor
 
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
@@ -4477,6 +4514,13 @@ func installPlugin(editor string) error {
 		return err
 	}
 
+	// Editor-specific post-extraction setup
+	if editor == "gemini" {
+		if err := enableGeminiSubagents(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not enable Gemini subagents: %v\n", err)
+		}
+	}
+
 	// Save plugin metadata
 	if err := savePluginInfo(editor, version, targetDir); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save plugin metadata: %v\n", err)
@@ -4527,7 +4571,8 @@ func listInstalledPlugins() {
 	if len(plugins) == 0 {
 		fmt.Println("No Polaris plugins installed.")
 		fmt.Println("\nTo install:")
-		fmt.Println("  polaris plugin install claude")
+		fmt.Println("  polaris plugin install <editor>")
+		fmt.Println("  Available: claude, codex, gemini, cursor, windsurf")
 		return
 	}
 
@@ -4558,6 +4603,13 @@ func listInstalledPlugins() {
 	}
 }
 
+// polarisSkillNames lists all Polaris skill directory names for cleanup
+var polarisSkillNames = []string{
+	"detect-risks", "analyze-risks", "remediate-risks", "risk-check",
+	"risk-guidance", "control-guidance", "submit-evidence", "reliability-review",
+	"incident-patterns", "sre-context", "list-open",
+}
+
 // removePlugin removes an installed plugin (all versions)
 func removePlugin(editor string) error {
 	home, err := os.UserHomeDir()
@@ -4576,13 +4628,13 @@ func removePlugin(editor string) error {
 		return nil
 	}
 
-	// For Claude Code, use official CLI to uninstall
-	if editor == "claude" {
+	switch editor {
+	case "claude":
+		// Use official CLI to uninstall
 		fmt.Println("Uninstalling plugin via Claude Code CLI...")
 		cmd := exec.Command("claude", "plugin", "uninstall", "polaris@polaris-local")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			// Plugin might not be installed via marketplace, try manual cleanup
 			fmt.Fprintf(os.Stderr, "Warning: claude plugin uninstall failed: %v\n", err)
 			fmt.Println("Attempting manual cleanup...")
 		} else {
@@ -4601,30 +4653,29 @@ func removePlugin(editor string) error {
 		fmt.Println("Removing marketplace registration...")
 		cmd = exec.Command("claude", "plugin", "marketplace", "remove", "polaris-local")
 		cmd.Run() // Ignore error - marketplace might not exist
-	} else {
-		// For other editors, use direct removal
-		var pluginParentDir string
-		switch editor {
-		case "gemini":
-			pluginParentDir = filepath.Join(home, ".gemini", "plugins", "cache", "polaris-api", "polaris")
-		case "windsurf":
-			pluginParentDir = filepath.Join(home, ".windsurf", "plugins", "cache", "polaris-api", "polaris")
-		case "cursor":
-			pluginParentDir = filepath.Join(home, ".cursor", "plugins", "cache", "polaris-api", "polaris")
-		default:
-			return fmt.Errorf("unsupported editor: %s", editor)
-		}
 
-		// Check if installed
-		if _, err := os.Stat(pluginParentDir); os.IsNotExist(err) {
-			fmt.Printf("Plugin for %s is not installed.\n", editor)
-			return nil
-		}
+	case "codex":
+		// Remove known Polaris skill subdirectories from ~/.agents/skills/
+		skillsDir := filepath.Join(home, ".agents", "skills")
+		removeSkillDirs(skillsDir)
 
-		// Remove directory
-		if err := os.RemoveAll(pluginParentDir); err != nil {
-			return fmt.Errorf("remove plugin directory: %w", err)
-		}
+	case "gemini":
+		// Remove skill subdirectories + polaris-*.md agent files
+		removeSkillDirs(filepath.Join(home, ".gemini", "skills"))
+		removeAgentFiles(filepath.Join(home, ".gemini", "agents"))
+
+	case "cursor":
+		// Remove skill subdirectories + polaris-*.md agent files
+		removeSkillDirs(filepath.Join(home, ".cursor", "skills"))
+		removeAgentFiles(filepath.Join(home, ".cursor", "agents"))
+
+	case "windsurf":
+		// Remove known Polaris skill subdirectories from ~/.codeium/windsurf/skills/
+		skillsDir := filepath.Join(home, ".codeium", "windsurf", "skills")
+		removeSkillDirs(skillsDir)
+
+	default:
+		return fmt.Errorf("unsupported editor: %s", editor)
 	}
 
 	// Remove metadata
@@ -4633,6 +4684,81 @@ func removePlugin(editor string) error {
 
 	fmt.Printf("✓ Removed %s plugin\n", editor)
 	return nil
+}
+
+// removeSkillDirs removes known Polaris skill subdirectories from a base directory
+func removeSkillDirs(baseDir string) {
+	for _, name := range polarisSkillNames {
+		dir := filepath.Join(baseDir, name)
+		if _, err := os.Stat(dir); err == nil {
+			if err := os.RemoveAll(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", dir, err)
+			}
+		}
+	}
+}
+
+// enableGeminiSubagents ensures experimental.enableAgents is true in ~/.gemini/settings.json.
+// Gemini CLI requires this flag to discover subagent files in ~/.gemini/agents/.
+func enableGeminiSubagents() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	settingsPath := filepath.Join(home, ".gemini", "settings.json")
+
+	var settings map[string]any
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		_ = json.Unmarshal(data, &settings)
+	}
+	if settings == nil {
+		settings = make(map[string]any)
+	}
+
+	// Get or create experimental section
+	experimental, ok := settings["experimental"].(map[string]any)
+	if !ok {
+		experimental = make(map[string]any)
+		settings["experimental"] = experimental
+	}
+
+	// Check if already enabled
+	if enabled, ok := experimental["enableAgents"].(bool); ok && enabled {
+		return nil
+	}
+
+	experimental["enableAgents"] = true
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0755); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+		return err
+	}
+
+	fmt.Println("✓ Enabled experimental subagents in ~/.gemini/settings.json")
+	return nil
+}
+
+// removeAgentFiles removes polaris-*.md agent files from a directory
+func removeAgentFiles(agentsDir string) {
+	matches, err := filepath.Glob(filepath.Join(agentsDir, "polaris-*.md"))
+	if err != nil {
+		return
+	}
+	for _, f := range matches {
+		if err := os.Remove(f); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", f, err)
+		}
+	}
 }
 
 // Helper functions
@@ -4931,7 +5057,7 @@ func removePluginFromMetadata(editor, metadataFile string) error {
 }
 
 func printPostInstallInstructions(editor, location string) {
-	fmt.Printf("\n✓ Polaris plugin installed for %s\n\n", editor)
+	fmt.Printf("\n✓ Polaris skills installed for %s\n\n", editor)
 
 	switch editor {
 	case "claude":
@@ -4944,9 +5070,24 @@ func printPostInstallInstructions(editor, location string) {
 		fmt.Println("  /polaris:detect-risks     - Scan for reliability risks")
 		fmt.Println("  /polaris:analyze-risks    - Analyze detected risks")
 		fmt.Println("  /polaris:remediate-risks  - Generate remediation plans")
-	case "gemini", "windsurf", "cursor":
-		fmt.Printf("Plugin installed to: %s\n", location)
-		fmt.Println("Refer to your editor's documentation for enabling plugins.")
+	case "codex":
+		fmt.Printf("Skills installed to: %s\n\n", location)
+		fmt.Println("Skills are auto-discovered by Codex CLI.")
+		fmt.Println("Try: \"scan this codebase for reliability risks\"")
+	case "gemini":
+		fmt.Printf("Skills and agents installed to: %s\n\n", location)
+		fmt.Println("Skills are auto-discovered by Gemini CLI.")
+		fmt.Println("Subagents enabled via experimental.enableAgents in ~/.gemini/settings.json")
+		fmt.Println("\nNote: Subagents are experimental and run in YOLO mode (no per-tool confirmation).")
+		fmt.Println("Try: \"scan this codebase for reliability risks\"")
+	case "cursor":
+		fmt.Printf("Skills and agents installed to: %s\n\n", location)
+		fmt.Println("Skills and agents are auto-discovered by Cursor.")
+		fmt.Println("Use /detect-risks or ask naturally.")
+	case "windsurf":
+		fmt.Printf("Skills installed to: %s\n\n", location)
+		fmt.Println("Skills are auto-discovered by Windsurf.")
+		fmt.Println("Use @detect-risks or ask Cascade naturally.")
 	}
 }
 
@@ -4996,7 +5137,7 @@ func printInitSummary(cfg *ProjectConfig, pluginInstalled bool, pluginVersion st
 		fmt.Println("  polaris login               Set up API credentials")
 	}
 	if !pluginInstalled {
-		fmt.Println("  polaris plugin install claude  Install the Claude Code plugin")
+		fmt.Println("  polaris plugin install <editor>  Install skills (claude, codex, gemini, cursor, windsurf)")
 	}
 	fmt.Println("  polaris status              Check API connection")
 	fmt.Println("  /polaris:detect-risks       Run first risk scan")
