@@ -296,7 +296,7 @@ func cmdLogin() {
 	// Prompt for API URL
 	defaultURL := cfg.APIURL
 	if defaultURL == "" {
-		defaultURL = "https://api.relynce.ai"
+		defaultURL = "https://api-dev.relynce.ai"
 	}
 	fmt.Printf("Polaris API URL [%s]: ", defaultURL)
 	apiURL, _ := reader.ReadString('\n')
