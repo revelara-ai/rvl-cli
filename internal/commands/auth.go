@@ -5,13 +5,109 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/relynce/rely-cli/internal/api"
 	"github.com/relynce/rely-cli/internal/config"
 	"github.com/relynce/rely-cli/internal/plugin"
 	"golang.org/x/term"
 )
+
+// readAPIKeyWithEcho reads an API key with brief visual echo before masking.
+// Characters are displayed as typed/pasted, then replaced with * after a short delay.
+// Falls back to term.ReadPassword if raw mode is unavailable (e.g., piped input).
+func readAPIKeyWithEcho(fd int) (string, error) {
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		// Fall back to standard hidden password input
+		b, err := term.ReadPassword(fd)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	defer term.Restore(fd, oldState)
+
+	var (
+		key          []byte
+		maskedCount  int // asterisks currently on screen
+		visibleCount int // cleartext chars currently on screen
+		mu           sync.Mutex
+		maskTimer    *time.Timer
+	)
+
+	maskVisible := func() {
+		if visibleCount > 0 {
+			os.Stdout.WriteString(strings.Repeat("\b", visibleCount) + strings.Repeat("*", visibleCount))
+			maskedCount += visibleCount
+			visibleCount = 0
+		}
+	}
+
+	scheduleMask := func() {
+		if maskTimer != nil {
+			maskTimer.Stop()
+		}
+		maskTimer = time.AfterFunc(500*time.Millisecond, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			maskVisible()
+		})
+	}
+
+	buf := make([]byte, 1)
+	for {
+		if _, err := os.Stdin.Read(buf); err != nil {
+			return "", err
+		}
+
+		mu.Lock()
+		b := buf[0]
+
+		switch {
+		case b == '\r' || b == '\n':
+			if maskTimer != nil {
+				maskTimer.Stop()
+			}
+			maskVisible()
+			mu.Unlock()
+			os.Stdout.WriteString("\r\n")
+			return string(key), nil
+
+		case b == 127 || b == 8: // Backspace / Delete
+			if len(key) > 0 {
+				key = key[:len(key)-1]
+				os.Stdout.WriteString("\b \b")
+				if visibleCount > 0 {
+					visibleCount--
+				} else if maskedCount > 0 {
+					maskedCount--
+				}
+			}
+			mu.Unlock()
+
+		case b == 3: // Ctrl+C
+			if maskTimer != nil {
+				maskTimer.Stop()
+			}
+			mu.Unlock()
+			os.Stdout.WriteString("\r\n")
+			return "", fmt.Errorf("interrupted")
+
+		case b >= 32 && b < 127: // Printable ASCII
+			key = append(key, b)
+			visibleCount++
+			os.Stdout.Write([]byte{b})
+			scheduleMask()
+			mu.Unlock()
+
+		default:
+			mu.Unlock()
+		}
+	}
+}
 
 // CmdLogin handles the login command
 func CmdLogin() {
@@ -38,16 +134,14 @@ func CmdLogin() {
 	} else {
 		fmt.Print("API Key: ")
 	}
-	apiKeyBytes, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
+	apiKey, err := readAPIKeyWithEcho(int(syscall.Stdin))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading API key: %v\n", err)
 		os.Exit(1)
 	}
-	apiKey := strings.TrimSpace(string(apiKeyBytes))
+	apiKey = strings.TrimSpace(apiKey)
 	if apiKey != "" {
 		cfg.APIKey = apiKey
-		fmt.Println("  API key received.")
 	} else if cfg.APIKey != "" {
 		fmt.Println("  Keeping existing API key.")
 	}
