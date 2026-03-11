@@ -85,6 +85,10 @@ func main() {
 		commands.CmdEvidence(os.Args[2:])
 	case "config":
 		commands.CmdConfig(os.Args[2:])
+	case "commands":
+		commands.CmdCommands(os.Args[2:])
+	case "completion":
+		commands.CmdCompletion(os.Args[2:])
 	case "plugin":
 		plugin.CmdPlugin(os.Args[2:])
 	case "version":
@@ -114,7 +118,9 @@ Commands:
   control            Query reliability controls catalog
   knowledge          Query organizational knowledge base (facts, procedures, patterns)
   evidence           Manage control evidence (submit, list, verify)
+  commands           List available skills and agents from the API
   plugin             Manage editor plugins (install, update, list, remove)
+  completion         Generate shell completion scripts (bash, zsh, fish)
   config show        Show current configuration (API key masked)
   config set <k> <v> Set a configuration value
   version            Show version information
