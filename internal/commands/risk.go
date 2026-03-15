@@ -228,7 +228,7 @@ func CmdRiskList(args []string) {
 		}
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks", cfg.ResolvedOrgID)
+	endpoint := cfg.APIURL + "/api/v1/risks"
 	queryParams := []string{}
 	if statusFilter != "" {
 		queryParams = append(queryParams, fmt.Sprintf("status=%s", statusFilter))
@@ -293,7 +293,7 @@ func CmdRiskShow(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s", cfg.ResolvedOrgID, riskID)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID
 	body, err := api.MakeAPIRequest(cfg, "GET", endpoint, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching risk: %v\n", err)
@@ -371,7 +371,7 @@ func CmdRiskContext(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s/context", cfg.ResolvedOrgID, riskID)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/context"
 	body, err := api.MakeAPIRequest(cfg, "GET", endpoint, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching risk context: %v\n", err)
@@ -553,7 +553,7 @@ func printRiskContext(ctx RiskContextResponse) {
 func CmdRiskStale(args []string) {
 	cfg := api.LoadAndResolveConfig()
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks?status=stale", cfg.ResolvedOrgID)
+	endpoint := cfg.APIURL + "/api/v1/risks/stale"
 	body, err := api.MakeAPIRequest(cfg, "GET", endpoint, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching stale risks: %v\n", err)
@@ -604,7 +604,7 @@ func CmdRiskClose(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s/close", cfg.ResolvedOrgID, riskID)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/close"
 	_, err = api.MakeAPIRequest(cfg, "POST", endpoint, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error closing risk: %v\n", err)
@@ -630,7 +630,7 @@ func CmdRiskResolve(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s/resolve", cfg.ResolvedOrgID, riskID)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/resolve"
 	_, err = api.MakeAPIRequest(cfg, "POST", endpoint, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving risk: %v\n", err)
@@ -656,8 +656,9 @@ func CmdRiskAcknowledge(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s/acknowledge", cfg.ResolvedOrgID, riskID)
-	_, err = api.MakeAPIRequest(cfg, "POST", endpoint, nil)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/status"
+	statusBody, _ := json.Marshal(map[string]string{"status": "acknowledged"})
+	_, err = api.MakeAPIRequest(cfg, "PATCH", endpoint, statusBody)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error acknowledging risk: %v\n", err)
 		os.Exit(1)
@@ -682,8 +683,9 @@ func CmdRiskAccept(args []string) {
 		os.Exit(1)
 	}
 
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks/%s/accept", cfg.ResolvedOrgID, riskID)
-	_, err = api.MakeAPIRequest(cfg, "POST", endpoint, nil)
+	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/status"
+	statusBody, _ := json.Marshal(map[string]string{"status": "accepted"})
+	_, err = api.MakeAPIRequest(cfg, "PATCH", endpoint, statusBody)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accepting risk: %v\n", err)
 		os.Exit(1)
@@ -694,7 +696,7 @@ func CmdRiskAccept(args []string) {
 
 // FindRiskIDByCode finds a risk ID by its risk code
 func FindRiskIDByCode(cfg *config.Config, riskCode string) (string, error) {
-	endpoint := fmt.Sprintf("/v1/orgs/%s/risks", cfg.ResolvedOrgID)
+	endpoint := cfg.APIURL + "/api/v1/risks"
 	body, err := api.MakeAPIRequest(cfg, "GET", endpoint, nil)
 	if err != nil {
 		return "", err
