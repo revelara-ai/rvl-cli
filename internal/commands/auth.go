@@ -129,8 +129,12 @@ func CmdLogin() {
 	cfg.APIURL = apiURL
 
 	if cfg.APIKey != "" {
-		masked := cfg.APIKey[:8] + "..." + cfg.APIKey[len(cfg.APIKey)-4:]
-		fmt.Printf("API Key [%s] (Enter to keep): ", masked)
+		if len(cfg.APIKey) > 12 {
+			masked := cfg.APIKey[:8] + "..." + cfg.APIKey[len(cfg.APIKey)-4:]
+			fmt.Printf("API Key [%s] (Enter to keep): ", masked)
+		} else {
+			fmt.Print("API Key [set] (Enter to keep): ")
+		}
 	} else {
 		fmt.Print("API Key: ")
 	}
