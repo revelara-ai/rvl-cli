@@ -54,7 +54,10 @@ func ResolveOrganizationID(cfg *config.Config) error {
 		return fmt.Errorf("fetch organizations failed (status %d)", resp.StatusCode)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
 
 	var orgsResp struct {
 		Organizations []struct {
@@ -138,7 +141,10 @@ func MakeAPIRequest(cfg *config.Config, method, url string, body []byte) ([]byte
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		return nil, fmt.Errorf("authentication failed - run 'rely login' to reconfigure")

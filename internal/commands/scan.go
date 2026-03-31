@@ -300,7 +300,10 @@ func submitScan(cfg *config.Config, scanReq *ScanRequest) (*ScanResponse, error)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		return nil, fmt.Errorf("authentication failed - run 'rely login' to reconfigure")
 	}
