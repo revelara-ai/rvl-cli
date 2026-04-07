@@ -768,13 +768,21 @@ func CmdRiskResolve(args []string) {
 // CmdRiskAccept accepts a risk (intentional decision to retain)
 func CmdRiskAccept(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely risk accept <risk-code>")
+		fmt.Fprintln(os.Stderr, "Usage: rely risk accept <risk-code> [--reason \"...\"]")
 		os.Exit(1)
 	}
 
 	cfg := api.LoadAndResolveConfig()
 
 	riskCode := args[0]
+	reason := ""
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--reason" && i+1 < len(args) {
+			reason = args[i+1]
+			i++
+		}
+	}
+
 	riskID, err := FindRiskIDByCode(cfg, riskCode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error finding risk: %v\n", err)
@@ -782,7 +790,7 @@ func CmdRiskAccept(args []string) {
 	}
 
 	endpoint := cfg.APIURL + "/api/v1/risks/" + riskID + "/status"
-	statusBody, _ := json.Marshal(map[string]string{"status": "accepted"})
+	statusBody, _ := json.Marshal(map[string]string{"status": "accepted", "reason": reason})
 	_, err = api.MakeAPIRequest(cfg, "PATCH", endpoint, statusBody)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accepting risk: %v\n", err)
