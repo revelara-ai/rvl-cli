@@ -745,6 +745,8 @@ func CmdRiskResolve(args []string) {
 		if args[i] == "--reason" && i+1 < len(args) {
 			reason = args[i+1]
 			i++
+		} else if strings.HasPrefix(args[i], "--reason=") {
+			reason = strings.TrimPrefix(args[i], "--reason=")
 		}
 	}
 
@@ -780,6 +782,8 @@ func CmdRiskAccept(args []string) {
 		if args[i] == "--reason" && i+1 < len(args) {
 			reason = args[i+1]
 			i++
+		} else if strings.HasPrefix(args[i], "--reason=") {
+			reason = strings.TrimPrefix(args[i], "--reason=")
 		}
 	}
 
