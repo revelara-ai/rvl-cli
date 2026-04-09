@@ -12,8 +12,26 @@ import (
 
 // ProjectConfig represents the .relynce.yaml project configuration file
 type ProjectConfig struct {
-	Project    string             `yaml:"project"`
-	Components []ProjectComponent `yaml:"components"`
+	Project     string             `yaml:"project"`
+	Criticality string             `yaml:"criticality,omitempty"`
+	Components  []ProjectComponent `yaml:"components"`
+}
+
+// CriticalityScore maps the human-friendly criticality label to a float64 (0.0-1.0)
+// for use in risk scoring. Unknown or empty values default to 0.0 (no boost).
+func (c *ProjectConfig) CriticalityScore() float64 {
+	switch c.Criticality {
+	case "hobby":
+		return 0.0
+	case "internal":
+		return 0.25
+	case "customer-facing":
+		return 0.6
+	case "critical":
+		return 1.0
+	default:
+		return 0.0
+	}
 }
 
 // ProjectComponent represents a component within a project

@@ -27,7 +27,8 @@ type ScanRequest struct {
 	Stack        *ScanStackInfo   `json:"stack,omitempty"`
 	Components   []ScanComponent  `json:"components,omitempty"`
 	Dependencies []ScanDependency `json:"dependencies,omitempty"`
-	CatalogMeta  *ScanCatalogMeta `json:"catalog_meta,omitempty"`
+	CatalogMeta         *ScanCatalogMeta `json:"catalog_meta,omitempty"`
+	BusinessCriticality *float64         `json:"business_criticality,omitempty"`
 }
 
 // ScanMetadata contains metadata about the scan
@@ -217,8 +218,13 @@ func CmdScan(args []string, version string) {
 	}
 	scanReq.Metadata.ScannerID = "rely-cli-" + version
 
-	if projectCfg := project.LoadProjectConfigFrom(targetDir); projectCfg != nil && len(projectCfg.Components) > 0 {
-		project.MapFindingsToComponents(scanReq.Findings, projectCfg)
+	if projectCfg := project.LoadProjectConfigFrom(targetDir); projectCfg != nil {
+		if len(projectCfg.Components) > 0 {
+			project.MapFindingsToComponents(scanReq.Findings, projectCfg)
+		}
+		if crit := projectCfg.CriticalityScore(); crit > 0 {
+			scanReq.BusinessCriticality = &crit
+		}
 	}
 
 	if dryRun {
