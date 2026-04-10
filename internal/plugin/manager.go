@@ -409,12 +409,43 @@ func PrintPostInstallInstructions(editor, location string) {
 	}
 }
 
+// installAll detects installed editors and installs the plugin to each one.
+// Failed installs for individual editors print a warning and continue.
+func installAll() {
+	editors := DetectInstalled()
+	if len(editors) == 0 {
+		fmt.Println("No supported editors detected.")
+		fmt.Printf("Supported: %s\n", EditorNames())
+		fmt.Println("\nInstall an editor CLI, then run: rely plugin install --all")
+		return
+	}
+
+	fmt.Printf("Detected %d editor(s): %s\n\n", len(editors), strings.Join(editors, ", "))
+
+	var succeeded, failed int
+	for _, editor := range editors {
+		if err := InstallPlugin(editor); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to install for %s: %v\n\n", editor, err)
+			failed++
+		} else {
+			succeeded++
+			fmt.Println()
+		}
+	}
+
+	fmt.Printf("Done: %d succeeded", succeeded)
+	if failed > 0 {
+		fmt.Printf(", %d failed", failed)
+	}
+	fmt.Println()
+}
+
 // CmdPlugin handles plugin management (install, update, list, remove).
 func CmdPlugin(args []string) {
 	editorList := EditorNames()
 
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>   Install skills for editor (%s)\n  update [editor]    Update skills to latest version\n  list               List installed skills\n  remove <editor>    Remove installed skills\n\nExamples:\n  rely plugin install claude    Install Claude Code plugin\n  rely plugin install codex     Install Codex CLI skills\n  rely plugin install gemini    Install Gemini CLI skills + agents\n  rely plugin update            Update all installed plugins\n  rely plugin list              Show installed plugins\n", editorList)
+		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>   Install skills for editor (%s)\n  install --all      Auto-detect and install to all editors\n  update [editor]    Update skills to latest version\n  update --all       Update all installed plugins\n  list               List installed skills\n  remove <editor>    Remove installed skills\n\nExamples:\n  rely plugin install claude    Install Claude Code plugin\n  rely plugin install --all     Install to all detected editors\n  rely plugin update            Update all installed plugins\n  rely plugin list              Show installed plugins\n", editorList)
 		os.Exit(1)
 	}
 
@@ -423,17 +454,22 @@ func CmdPlugin(args []string) {
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
 			fmt.Fprintln(os.Stderr, "Usage: rely plugin install <editor>")
+			fmt.Fprintln(os.Stderr, "       rely plugin install --all")
 			fmt.Fprintf(os.Stderr, "Available: %s\n", editorList)
 			os.Exit(1)
 		}
-		editor := args[1]
-		if err := InstallPlugin(editor); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		if args[1] == "--all" {
+			installAll()
+		} else {
+			editor := args[1]
+			if err := InstallPlugin(editor); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	case "update":
 		editor := ""
-		if len(args) >= 2 {
+		if len(args) >= 2 && args[1] != "--all" {
 			editor = args[1]
 		}
 		if err := UpdatePlugin(editor); err != nil {

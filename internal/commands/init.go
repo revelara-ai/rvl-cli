@@ -160,7 +160,7 @@ func CmdInit(args []string) {
 		serverVersion := api.FetchServerPluginVersion(loginCfgForPlugin)
 
 		// Detect available editors
-		detectedEditors := plugin.DetectEditors()
+		detectedEditors := plugin.DetectInstalled()
 
 		if len(detectedEditors) == 0 {
 			fmt.Println("Skills: No supported editors detected on PATH")

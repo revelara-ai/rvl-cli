@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -28,6 +30,11 @@ type EditorDef struct {
 	// AgentGlob is the glob pattern for matching agent files during removal.
 	// Defaults to "rely-*.md" if empty.
 	AgentGlob string
+
+	// ConfigDir is the path relative to $HOME used for detection.
+	// If the directory exists, the editor is considered installed.
+	// Empty means detection relies on binary check only.
+	ConfigDir string
 
 	// PostInstall is called after standard tarball extraction (e.g., EnableGeminiSubagents).
 	PostInstall func() error
@@ -67,6 +74,7 @@ var Registry = map[string]EditorDef{
 		DisplayName:   "Claude Code",
 		Binary:        "claude",
 		Tier:          1,
+		ConfigDir:     ".claude",
 		CustomInstall: InstallClaudePlugin,
 		CustomRemove:  removeClaudePlugin,
 		Instructions: []string{
@@ -91,6 +99,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "gemini",
 		Tier:        2,
 		InstallDir:  ".gemini",
+		ConfigDir:   ".gemini",
 		SkillsDir:   ".gemini/skills",
 		AgentsDir:   ".gemini/agents",
 		PostInstall: EnableGeminiSubagents,
@@ -108,6 +117,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "cursor",
 		Tier:        2,
 		InstallDir:  ".cursor",
+		ConfigDir:   ".cursor",
 		SkillsDir:   ".cursor/skills",
 		AgentsDir:   ".cursor/agents",
 		Instructions: []string{
@@ -121,6 +131,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "windsurf",
 		Tier:        2,
 		InstallDir:  ".codeium/windsurf/skills",
+		ConfigDir:   ".codeium/windsurf",
 		Instructions: []string{
 			"Skills are auto-discovered by Windsurf.",
 			"Use @scan or ask Cascade naturally.",
@@ -132,6 +143,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "copilot",
 		Tier:        2,
 		InstallDir:  ".copilot",
+		ConfigDir:   ".copilot",
 		SkillsDir:   ".copilot/skills",
 		AgentsDir:   ".copilot/agents",
 		AgentGlob:   "rely-*.agent.md",
@@ -146,6 +158,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "auggie",
 		Tier:        2,
 		InstallDir:  ".augment",
+		ConfigDir:   ".augment",
 		SkillsDir:   ".augment/skills",
 		AgentsDir:   ".augment/agents",
 		Instructions: []string{
@@ -171,11 +184,41 @@ func EditorNames() string {
 	return strings.Join(names, ", ")
 }
 
+// isEditorDetected returns true if the editor is present on this machine.
+// Detection passes if the CLI binary is on PATH or the config directory exists.
+func isEditorDetected(def EditorDef) bool {
+	if IsEditorAvailable(def.Binary) {
+		return true
+	}
+	if def.ConfigDir != "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if _, err := os.Stat(filepath.Join(home, def.ConfigDir)); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // DetectEditors returns the names of editors whose CLI binary is on the PATH.
 func DetectEditors() []string {
 	var found []string
 	for name, def := range Registry {
 		if IsEditorAvailable(def.Binary) {
+			found = append(found, name)
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
+// DetectInstalled returns the names of editors detected on this machine.
+// An editor is detected if its CLI binary is on PATH or its config directory exists.
+func DetectInstalled() []string {
+	var found []string
+	for name, def := range Registry {
+		if isEditorDetected(def) {
 			found = append(found, name)
 		}
 	}

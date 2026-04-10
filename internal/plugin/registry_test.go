@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -193,6 +195,79 @@ func TestRegistryAgentsDir(t *testing.T) {
 		def := Registry[editor]
 		if def.AgentsDir != "" {
 			t.Errorf("Registry[%q].AgentsDir = %q, want empty", editor, def.AgentsDir)
+		}
+	}
+}
+
+func TestRegistryConfigDir(t *testing.T) {
+	// Most editors should have ConfigDir for detection
+	withConfigDir := []string{"claude", "gemini", "cursor", "windsurf", "copilot", "augment"}
+	for _, editor := range withConfigDir {
+		def := Registry[editor]
+		if def.ConfigDir == "" {
+			t.Errorf("Registry[%q].ConfigDir is empty", editor)
+		}
+	}
+}
+
+func TestIsEditorDetected_BinaryOnPath(t *testing.T) {
+	// "go" is always on PATH in test environments
+	def := EditorDef{Binary: "go"}
+	if !isEditorDetected(def) {
+		t.Error("isEditorDetected should return true when binary is on PATH")
+	}
+}
+
+func TestIsEditorDetected_NoBinaryNoConfig(t *testing.T) {
+	def := EditorDef{Binary: "nonexistent-binary-xyz-12345"}
+	if isEditorDetected(def) {
+		t.Error("isEditorDetected should return false when binary not on PATH and no ConfigDir")
+	}
+}
+
+func TestIsEditorDetected_ConfigDirExists(t *testing.T) {
+	// Create a temp dir to simulate a config directory
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".test-editor")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Override HOME for the test
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", origHome)
+
+	def := EditorDef{
+		Binary:    "nonexistent-binary-xyz-12345",
+		ConfigDir: ".test-editor",
+	}
+	if !isEditorDetected(def) {
+		t.Error("isEditorDetected should return true when config dir exists")
+	}
+}
+
+func TestIsEditorDetected_ConfigDirNotExists(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", origHome)
+
+	def := EditorDef{
+		Binary:    "nonexistent-binary-xyz-12345",
+		ConfigDir: ".nonexistent-config-dir",
+	}
+	if isEditorDetected(def) {
+		t.Error("isEditorDetected should return false when neither binary nor config dir exist")
+	}
+}
+
+func TestDetectInstalled_ReturnsSorted(t *testing.T) {
+	editors := DetectInstalled()
+	for i := 1; i < len(editors); i++ {
+		if editors[i] < editors[i-1] {
+			t.Errorf("DetectInstalled() not sorted: %q comes after %q", editors[i], editors[i-1])
 		}
 	}
 }
