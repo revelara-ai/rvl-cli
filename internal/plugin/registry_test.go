@@ -8,7 +8,14 @@ import (
 )
 
 func TestRegistryHasAllEditors(t *testing.T) {
-	expected := []string{"claude", "codex", "gemini", "cursor", "windsurf", "copilot", "augment"}
+	expected := []string{
+		// Tier 1-2
+		"claude", "codex", "gemini", "cursor", "windsurf", "copilot", "augment",
+		// Tier 3
+		"cline", "roo", "openhands", "goose", "warp", "continue", "amp",
+		"kilo", "opencode", "trae", "junie", "qwen-code", "antigravity",
+		"firebender", "kiro",
+	}
 	for _, editor := range expected {
 		if _, ok := Registry[editor]; !ok {
 			t.Errorf("editor %q missing from Registry", editor)
@@ -285,6 +292,38 @@ func TestRegistryLocalDirPaths(t *testing.T) {
 		def := Registry[editor]
 		if def.LocalDir != wantDir {
 			t.Errorf("Registry[%q].LocalDir = %q, want %q", editor, def.LocalDir, wantDir)
+		}
+	}
+}
+
+func TestRegistryTier3Editors(t *testing.T) {
+	tier3 := []string{
+		"cline", "roo", "openhands", "goose", "warp", "continue", "amp",
+		"kilo", "opencode", "trae", "junie", "qwen-code", "antigravity",
+		"firebender", "kiro",
+	}
+	for _, editor := range tier3 {
+		def := Registry[editor]
+		if def.Tier != 3 {
+			t.Errorf("Registry[%q].Tier = %d, want 3", editor, def.Tier)
+		}
+		if def.InstallDir == "" {
+			t.Errorf("Registry[%q].InstallDir is empty", editor)
+		}
+		if def.ConfigDir == "" {
+			t.Errorf("Registry[%q].ConfigDir is empty", editor)
+		}
+		if def.LocalDir == "" {
+			t.Errorf("Registry[%q].LocalDir is empty", editor)
+		}
+		if def.CustomInstall != nil {
+			t.Errorf("Registry[%q] should not have CustomInstall (Tier 3)", editor)
+		}
+		if def.CustomRemove != nil {
+			t.Errorf("Registry[%q] should not have CustomRemove (Tier 3)", editor)
+		}
+		if len(def.Instructions) == 0 {
+			t.Errorf("Registry[%q].Instructions is empty", editor)
 		}
 	}
 }

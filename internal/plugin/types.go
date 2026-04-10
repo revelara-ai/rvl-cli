@@ -16,10 +16,18 @@ type PluginInfo struct {
 }
 
 // PolarisSkillNames lists all Relynce skill directory names for cleanup.
-// Includes both old (pre-0.7.0) and current names to clean up any version.
+// Includes current skills, agent-as-skill entries, and legacy names.
 var PolarisSkillNames = []string{
 	// Current skills (v0.7.0+)
 	"ask", "evidence", "fix", "review", "risks", "scan", "status",
+	// Agent-as-skill entries (v0.14.0+, Tier 3 editors)
+	"rely-ai-reliability-pro", "rely-capacity-planning-pro", "rely-cicd-pro",
+	"rely-cost-governance-pro", "rely-deployment-excellence-pro",
+	"rely-development-testing-pro", "rely-disaster-recovery-pro",
+	"rely-golang-pro", "rely-incident-response-pro", "rely-javascript-pro",
+	"rely-observability-pro", "rely-post-incident-pro", "rely-python-pro",
+	"rely-reliability-culture-pro", "rely-resilience-pro",
+	"rely-security-supply-chain-pro", "rely-slo-monitoring-pro",
 	// Legacy skills (pre-0.7.0) — kept for cleanup of old installations
 	"detect-risks", "analyze-risks", "remediate-risks", "risk-check",
 	"risk-guidance", "control-guidance", "submit-evidence", "reliability-review",
