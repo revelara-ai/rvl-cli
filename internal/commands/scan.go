@@ -169,8 +169,11 @@ func CmdScan(args []string, version string) {
 		targetDir = absTarget
 	}
 
-	if service == "" && targetDir != "" {
+	if targetDir != "" {
 		if projectCfg := project.LoadProjectConfigFrom(targetDir); projectCfg != nil && projectCfg.Project != "" {
+			if service != "" && service != projectCfg.Project {
+				fmt.Fprintf(os.Stderr, "Warning: --service %q overridden by target's .relynce.yaml project: %q\n", service, projectCfg.Project)
+			}
 			service = projectCfg.Project
 		}
 	}
