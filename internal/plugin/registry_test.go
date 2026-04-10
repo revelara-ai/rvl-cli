@@ -271,3 +271,106 @@ func TestDetectInstalled_ReturnsSorted(t *testing.T) {
 		}
 	}
 }
+
+func TestRegistryLocalDirPaths(t *testing.T) {
+	tests := map[string]string{
+		"codex":    ".agents/skills",
+		"gemini":   ".gemini",
+		"cursor":   ".cursor",
+		"windsurf": ".windsurf/skills",
+		"copilot":  ".copilot",
+		"augment":  ".augment",
+	}
+	for editor, wantDir := range tests {
+		def := Registry[editor]
+		if def.LocalDir != wantDir {
+			t.Errorf("Registry[%q].LocalDir = %q, want %q", editor, def.LocalDir, wantDir)
+		}
+	}
+}
+
+func TestRegistryClaudeNoLocalDir(t *testing.T) {
+	def := Registry["claude"]
+	if def.LocalDir != "" {
+		t.Errorf("Registry[claude].LocalDir = %q, want empty (uses CustomInstall)", def.LocalDir)
+	}
+}
+
+func TestExtractFlag(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		flag     string
+		wantArgs []string
+		wantFlag bool
+	}{
+		{
+			name:     "flag present",
+			args:     []string{"gemini", "--project"},
+			flag:     "--project",
+			wantArgs: []string{"gemini"},
+			wantFlag: true,
+		},
+		{
+			name:     "flag absent",
+			args:     []string{"gemini"},
+			flag:     "--project",
+			wantArgs: []string{"gemini"},
+			wantFlag: false,
+		},
+		{
+			name:     "flag before editor",
+			args:     []string{"--project", "gemini"},
+			flag:     "--project",
+			wantArgs: []string{"gemini"},
+			wantFlag: true,
+		},
+		{
+			name:     "all with flag",
+			args:     []string{"--all", "--project"},
+			flag:     "--project",
+			wantArgs: []string{"--all"},
+			wantFlag: true,
+		},
+		{
+			name:     "empty args",
+			args:     []string{},
+			flag:     "--project",
+			wantArgs: nil,
+			wantFlag: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotArgs, gotFlag := extractFlag(tt.args, tt.flag)
+			if gotFlag != tt.wantFlag {
+				t.Errorf("extractFlag() flag = %v, want %v", gotFlag, tt.wantFlag)
+			}
+			if len(gotArgs) != len(tt.wantArgs) {
+				t.Errorf("extractFlag() args = %v, want %v", gotArgs, tt.wantArgs)
+				return
+			}
+			for i := range gotArgs {
+				if gotArgs[i] != tt.wantArgs[i] {
+					t.Errorf("extractFlag() args[%d] = %q, want %q", i, gotArgs[i], tt.wantArgs[i])
+				}
+			}
+		})
+	}
+}
+
+func TestDetectProjectRoot(t *testing.T) {
+	// detectProjectRoot should return something (either git root or cwd)
+	root, err := detectProjectRoot()
+	if err != nil {
+		t.Fatalf("detectProjectRoot() error: %v", err)
+	}
+	if root == "" {
+		t.Error("detectProjectRoot() returned empty string")
+	}
+	// Should be an absolute path
+	if !filepath.IsAbs(root) {
+		t.Errorf("detectProjectRoot() = %q, want absolute path", root)
+	}
+}

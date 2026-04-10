@@ -187,7 +187,7 @@ func CmdInit(args []string) {
 						}
 					}
 					if doUpdate {
-						if err := plugin.InstallPlugin(editorName); err != nil {
+						if err := plugin.InstallPlugin(editorName, ""); err != nil {
 							fmt.Fprintf(os.Stderr, "Warning: could not update %s skills: %v\n", editorName, err)
 						} else {
 							pluginInstalled = true
@@ -218,7 +218,7 @@ func CmdInit(args []string) {
 					}
 				}
 				if doInstall {
-					if err := plugin.InstallPlugin(editorName); err != nil {
+					if err := plugin.InstallPlugin(editorName, ""); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: could not install %s skills: %v\n", editorName, err)
 					} else {
 						pluginInstalled = true

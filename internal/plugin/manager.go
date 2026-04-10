@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/relynce/rely-cli/internal/api"
 	"github.com/relynce/rely-cli/internal/config"
+	"github.com/relynce/rely-cli/internal/project"
 )
 
 // GetPluginDir returns the installation directory for a given editor's plugin.
@@ -99,16 +101,53 @@ func ExtractTarball(tarballData []byte, targetDir string) error {
 	return nil
 }
 
-// InstallPlugin downloads and installs the Relynce plugin for the specified editor
-func InstallPlugin(editor string) error {
+// detectProjectRoot returns the project root directory.
+// Uses git root if available, otherwise the current working directory.
+func detectProjectRoot() (string, error) {
+	root := project.DetectGitRoot()
+	if root != "" {
+		return root, nil
+	}
+	return os.Getwd()
+}
+
+// extractFlag removes a flag from an argument list and returns whether it was present.
+func extractFlag(args []string, flag string) ([]string, bool) {
+	var filtered []string
+	found := false
+	for _, a := range args {
+		if a == flag {
+			found = true
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered, found
+}
+
+// InstallPlugin downloads and installs the Relynce plugin for the specified editor.
+// If projectRoot is non-empty, installs to projectRoot/LocalDir (project-local).
+func InstallPlugin(editor, projectRoot string) error {
 	def, ok := Registry[editor]
 	if !ok {
 		return fmt.Errorf("unsupported editor: %s (available: %s)", editor, EditorNames())
 	}
 
-	fmt.Printf("Installing Relynce plugin for %s...\n", editor)
+	isProject := projectRoot != ""
 
-	if editor == "claude" {
+	if isProject {
+		if def.LocalDir == "" {
+			return fmt.Errorf("--project not supported for %s", editor)
+		}
+		if def.CustomInstall != nil {
+			return fmt.Errorf("--project not supported for %s (uses custom install flow)", editor)
+		}
+		fmt.Printf("Installing Relynce plugin for %s (project-local)...\n", editor)
+	} else {
+		fmt.Printf("Installing Relynce plugin for %s...\n", editor)
+	}
+
+	if !isProject && editor == "claude" {
 		if err := CleanupOldClaudeInstallations(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not clean up old installations: %v\n", err)
 		}
@@ -170,14 +209,19 @@ func InstallPlugin(editor string) error {
 		fmt.Println("✓ Checksum verified")
 	}
 
-	// Editors with CustomInstall handle the entire flow themselves
-	if def.CustomInstall != nil {
+	// Editors with CustomInstall handle the entire flow themselves (global only)
+	if !isProject && def.CustomInstall != nil {
 		return def.CustomInstall(version, tarballData)
 	}
 
-	targetDir, err := GetPluginDir(editor, version)
-	if err != nil {
-		return err
+	var targetDir string
+	if isProject {
+		targetDir = filepath.Join(projectRoot, def.LocalDir)
+	} else {
+		targetDir, err = GetPluginDir(editor, version)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -189,15 +233,18 @@ func InstallPlugin(editor string) error {
 		return err
 	}
 
-	// Run post-install hook if defined (e.g., EnableGeminiSubagents)
-	if def.PostInstall != nil {
+	// Run post-install hook if defined (e.g., EnableGeminiSubagents) — global only
+	if !isProject && def.PostInstall != nil {
 		if err := def.PostInstall(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: post-install hook failed: %v\n", err)
 		}
 	}
 
-	if err := SavePluginInfo(editor, version, targetDir); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not save plugin metadata: %v\n", err)
+	// Track global installs in metadata; project-local installs live in the repo
+	if !isProject {
+		if err := SavePluginInfo(editor, version, targetDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not save plugin metadata: %v\n", err)
+		}
 	}
 
 	PrintPostInstallInstructions(editor, targetDir)
@@ -221,14 +268,14 @@ func UpdatePlugin(editor string) error {
 		fmt.Printf("Updating %d plugin(s)...\n", len(plugins))
 		for _, p := range plugins {
 			fmt.Printf("\nUpdating %s plugin...\n", p.Editor)
-			if err := InstallPlugin(p.Editor); err != nil {
+			if err := InstallPlugin(p.Editor, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to update %s: %v\n", p.Editor, err)
 			}
 		}
 		return nil
 	}
 
-	return InstallPlugin(editor)
+	return InstallPlugin(editor, "")
 }
 
 // ListInstalledPlugins lists all installed Relynce plugins
@@ -271,21 +318,55 @@ func ListInstalledPlugins() {
 			}
 		}
 	}
+
+	// Show project-local installations if we're in a project
+	root := project.DetectGitRoot()
+	if root != "" {
+		var localEditors []string
+		for name, def := range Registry {
+			if def.LocalDir == "" {
+				continue
+			}
+			localDir := filepath.Join(root, def.LocalDir)
+			// Check if any current skill dirs exist
+			for _, skill := range PolarisSkillNames[:7] {
+				if _, err := os.Stat(filepath.Join(localDir, skill)); err == nil {
+					localEditors = append(localEditors, name)
+					break
+				}
+			}
+		}
+		if len(localEditors) > 0 {
+			sort.Strings(localEditors)
+			fmt.Printf("\nProject-local installations (%s):\n", root)
+			for _, e := range localEditors {
+				def := Registry[e]
+				fmt.Printf("  %s → %s\n", e, filepath.Join(root, def.LocalDir))
+			}
+		}
+	}
 }
 
-// RemovePlugin removes an installed plugin (all versions)
-func RemovePlugin(editor string) error {
+// RemovePlugin removes an installed plugin (all versions).
+// If projectRoot is non-empty, removes from projectRoot/LocalDir (project-local).
+func RemovePlugin(editor, projectRoot string) error {
 	def, ok := Registry[editor]
 	if !ok {
 		return fmt.Errorf("unsupported editor: %s (available: %s)", editor, EditorNames())
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("cannot determine home directory: %w", err)
+	isProject := projectRoot != ""
+
+	if isProject && def.LocalDir == "" {
+		return fmt.Errorf("--project not supported for %s", editor)
 	}
 
-	fmt.Printf("Remove Relynce plugin for %s? [y/N] ", editor)
+	scope := "global"
+	if isProject {
+		scope = "project-local"
+	}
+
+	fmt.Printf("Remove %s Relynce plugin for %s? [y/N] ", scope, editor)
 	reader := bufio.NewReader(os.Stdin)
 	response, _ := reader.ReadString('\n')
 	response = strings.ToLower(strings.TrimSpace(response))
@@ -295,25 +376,42 @@ func RemovePlugin(editor string) error {
 		return nil
 	}
 
-	if def.CustomRemove != nil {
-		if err := def.CustomRemove(home); err != nil {
-			return err
-		}
-	} else {
-		// Standard removal: clean up skill dirs and agent files
-		skillsDir := filepath.Join(home, def.effectiveSkillsDir())
-		RemoveSkillDirs(skillsDir)
+	if isProject {
+		// Project-local removal: clean up from project root
+		baseDir := filepath.Join(projectRoot, def.LocalDir)
+		RemoveSkillDirs(baseDir)
 
 		if def.AgentsDir != "" {
-			agentsDir := filepath.Join(home, def.AgentsDir)
+			// Derive project-local agents dir from LocalDir
+			agentsDir := filepath.Join(projectRoot, def.LocalDir, "agents")
 			removeAgentFilesByGlob(agentsDir, def.effectiveAgentGlob())
 		}
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot determine home directory: %w", err)
+		}
+
+		if def.CustomRemove != nil {
+			if err := def.CustomRemove(home); err != nil {
+				return err
+			}
+		} else {
+			// Standard removal: clean up skill dirs and agent files
+			skillsDir := filepath.Join(home, def.effectiveSkillsDir())
+			RemoveSkillDirs(skillsDir)
+
+			if def.AgentsDir != "" {
+				agentsDir := filepath.Join(home, def.AgentsDir)
+				removeAgentFilesByGlob(agentsDir, def.effectiveAgentGlob())
+			}
+		}
+
+		metadataFile := filepath.Join(home, ".relynce", "plugins.json")
+		_ = RemovePluginFromMetadata(editor, metadataFile)
 	}
 
-	metadataFile := filepath.Join(home, ".relynce", "plugins.json")
-	_ = RemovePluginFromMetadata(editor, metadataFile)
-
-	fmt.Printf("✓ Removed %s plugin\n", editor)
+	fmt.Printf("✓ Removed %s plugin (%s)\n", editor, scope)
 	return nil
 }
 
@@ -410,8 +508,9 @@ func PrintPostInstallInstructions(editor, location string) {
 }
 
 // installAll detects installed editors and installs the plugin to each one.
-// Failed installs for individual editors print a warning and continue.
-func installAll() {
+// If projectRoot is non-empty, installs project-locally. Editors without
+// LocalDir are skipped for project-local installs.
+func installAll(projectRoot string) {
 	editors := DetectInstalled()
 	if len(editors) == 0 {
 		fmt.Println("No supported editors detected.")
@@ -422,9 +521,18 @@ func installAll() {
 
 	fmt.Printf("Detected %d editor(s): %s\n\n", len(editors), strings.Join(editors, ", "))
 
-	var succeeded, failed int
+	var succeeded, failed, skipped int
 	for _, editor := range editors {
-		if err := InstallPlugin(editor); err != nil {
+		// Skip editors that don't support project-local installs
+		if projectRoot != "" {
+			def := Registry[editor]
+			if def.LocalDir == "" || def.CustomInstall != nil {
+				fmt.Printf("Skipping %s (--project not supported)\n\n", editor)
+				skipped++
+				continue
+			}
+		}
+		if err := InstallPlugin(editor, projectRoot); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to install for %s: %v\n\n", editor, err)
 			failed++
 		} else {
@@ -437,6 +545,9 @@ func installAll() {
 	if failed > 0 {
 		fmt.Printf(", %d failed", failed)
 	}
+	if skipped > 0 {
+		fmt.Printf(", %d skipped", skipped)
+	}
 	fmt.Println()
 }
 
@@ -445,32 +556,46 @@ func CmdPlugin(args []string) {
 	editorList := EditorNames()
 
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>   Install skills for editor (%s)\n  install --all      Auto-detect and install to all editors\n  update [editor]    Update skills to latest version\n  update --all       Update all installed plugins\n  list               List installed skills\n  remove <editor>    Remove installed skills\n\nExamples:\n  rely plugin install claude    Install Claude Code plugin\n  rely plugin install --all     Install to all detected editors\n  rely plugin update            Update all installed plugins\n  rely plugin list              Show installed plugins\n", editorList)
+		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>            Install skills for editor (%s)\n  install <editor> --project  Install to current project directory\n  install --all               Auto-detect and install to all editors\n  install --all --project     Auto-detect and install project-locally\n  update [editor]             Update skills to latest version\n  update --all                Update all installed plugins\n  list                        List installed skills\n  remove <editor>             Remove installed skills\n  remove <editor> --project   Remove project-local skills\n\nExamples:\n  rely plugin install claude         Install Claude Code plugin\n  rely plugin install gemini --project  Install to project directory\n  rely plugin install --all          Install to all detected editors\n  rely plugin update                 Update all installed plugins\n  rely plugin list                   Show installed plugins\n", editorList)
 		os.Exit(1)
+	}
+
+	// Extract --project flag from subcommand args
+	subArgs := args[1:]
+	subArgs, isProject := extractFlag(subArgs, "--project")
+
+	var projectRoot string
+	if isProject {
+		var err error
+		projectRoot, err = detectProjectRoot()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: could not detect project root: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	switch args[0] {
 	case "install":
-		if len(args) < 2 {
+		if len(subArgs) < 1 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
-			fmt.Fprintln(os.Stderr, "Usage: rely plugin install <editor>")
-			fmt.Fprintln(os.Stderr, "       rely plugin install --all")
+			fmt.Fprintln(os.Stderr, "Usage: rely plugin install <editor> [--project]")
+			fmt.Fprintln(os.Stderr, "       rely plugin install --all [--project]")
 			fmt.Fprintf(os.Stderr, "Available: %s\n", editorList)
 			os.Exit(1)
 		}
-		if args[1] == "--all" {
-			installAll()
+		if subArgs[0] == "--all" {
+			installAll(projectRoot)
 		} else {
-			editor := args[1]
-			if err := InstallPlugin(editor); err != nil {
+			editor := subArgs[0]
+			if err := InstallPlugin(editor, projectRoot); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 		}
 	case "update":
 		editor := ""
-		if len(args) >= 2 && args[1] != "--all" {
-			editor = args[1]
+		if len(subArgs) >= 1 && subArgs[0] != "--all" {
+			editor = subArgs[0]
 		}
 		if err := UpdatePlugin(editor); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -479,13 +604,13 @@ func CmdPlugin(args []string) {
 	case "list":
 		ListInstalledPlugins()
 	case "remove", "uninstall":
-		if len(args) < 2 {
+		if len(subArgs) < 1 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
-			fmt.Fprintln(os.Stderr, "Usage: rely plugin remove <editor>")
+			fmt.Fprintln(os.Stderr, "Usage: rely plugin remove <editor> [--project]")
 			os.Exit(1)
 		}
-		editor := args[1]
-		if err := RemovePlugin(editor); err != nil {
+		editor := subArgs[0]
+		if err := RemovePlugin(editor, projectRoot); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

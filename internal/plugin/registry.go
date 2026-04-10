@@ -36,6 +36,10 @@ type EditorDef struct {
 	// Empty means detection relies on binary check only.
 	ConfigDir string
 
+	// LocalDir is the path relative to the project root for --project installs.
+	// Empty means --project is not supported for this editor.
+	LocalDir string
+
 	// PostInstall is called after standard tarball extraction (e.g., EnableGeminiSubagents).
 	PostInstall func() error
 
@@ -88,6 +92,7 @@ var Registry = map[string]EditorDef{
 		Binary:      "codex",
 		Tier:        2,
 		InstallDir:  ".agents/skills",
+		LocalDir:    ".agents/skills",
 		Instructions: []string{
 			"Skills are auto-discovered by Codex CLI.",
 			"Try: \"scan this codebase for reliability risks\"",
@@ -100,6 +105,7 @@ var Registry = map[string]EditorDef{
 		Tier:        2,
 		InstallDir:  ".gemini",
 		ConfigDir:   ".gemini",
+		LocalDir:    ".gemini",
 		SkillsDir:   ".gemini/skills",
 		AgentsDir:   ".gemini/agents",
 		PostInstall: EnableGeminiSubagents,
@@ -118,6 +124,7 @@ var Registry = map[string]EditorDef{
 		Tier:        2,
 		InstallDir:  ".cursor",
 		ConfigDir:   ".cursor",
+		LocalDir:    ".cursor",
 		SkillsDir:   ".cursor/skills",
 		AgentsDir:   ".cursor/agents",
 		Instructions: []string{
@@ -132,6 +139,7 @@ var Registry = map[string]EditorDef{
 		Tier:        2,
 		InstallDir:  ".codeium/windsurf/skills",
 		ConfigDir:   ".codeium/windsurf",
+		LocalDir:    ".windsurf/skills",
 		Instructions: []string{
 			"Skills are auto-discovered by Windsurf.",
 			"Use @scan or ask Cascade naturally.",
@@ -144,6 +152,7 @@ var Registry = map[string]EditorDef{
 		Tier:        2,
 		InstallDir:  ".copilot",
 		ConfigDir:   ".copilot",
+		LocalDir:    ".copilot",
 		SkillsDir:   ".copilot/skills",
 		AgentsDir:   ".copilot/agents",
 		AgentGlob:   "rely-*.agent.md",
@@ -159,6 +168,7 @@ var Registry = map[string]EditorDef{
 		Tier:        2,
 		InstallDir:  ".augment",
 		ConfigDir:   ".augment",
+		LocalDir:    ".augment",
 		SkillsDir:   ".augment/skills",
 		AgentsDir:   ".augment/agents",
 		Instructions: []string{
