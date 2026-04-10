@@ -1,0 +1,198 @@
+package plugin
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestRegistryHasAllEditors(t *testing.T) {
+	expected := []string{"claude", "codex", "gemini", "cursor", "windsurf", "copilot", "augment"}
+	for _, editor := range expected {
+		if _, ok := Registry[editor]; !ok {
+			t.Errorf("editor %q missing from Registry", editor)
+		}
+	}
+}
+
+func TestRegistryRequiredFields(t *testing.T) {
+	for name, def := range Registry {
+		if def.Name == "" {
+			t.Errorf("Registry[%q].Name is empty", name)
+		}
+		if def.Name != name {
+			t.Errorf("Registry[%q].Name = %q, want %q", name, def.Name, name)
+		}
+		if def.DisplayName == "" {
+			t.Errorf("Registry[%q].DisplayName is empty", name)
+		}
+		if def.Binary == "" {
+			t.Errorf("Registry[%q].Binary is empty", name)
+		}
+		if def.Tier < 1 || def.Tier > 3 {
+			t.Errorf("Registry[%q].Tier = %d, want 1-3", name, def.Tier)
+		}
+		if def.CustomInstall == nil && def.InstallDir == "" {
+			t.Errorf("Registry[%q] has neither InstallDir nor CustomInstall", name)
+		}
+		if len(def.Instructions) == 0 {
+			t.Errorf("Registry[%q].Instructions is empty", name)
+		}
+	}
+}
+
+func TestRegistryClaudeHasCustomFlows(t *testing.T) {
+	def := Registry["claude"]
+	if def.CustomInstall == nil {
+		t.Error("claude should have CustomInstall")
+	}
+	if def.CustomRemove == nil {
+		t.Error("claude should have CustomRemove")
+	}
+	if def.InstallDir != "" {
+		t.Error("claude should not have InstallDir (uses CustomInstall)")
+	}
+}
+
+func TestRegistryGeminiHasPostInstall(t *testing.T) {
+	def := Registry["gemini"]
+	if def.PostInstall == nil {
+		t.Error("gemini should have PostInstall hook")
+	}
+}
+
+func TestRegistryCopilotAgentGlob(t *testing.T) {
+	def := Registry["copilot"]
+	if def.AgentGlob != "rely-*.agent.md" {
+		t.Errorf("copilot AgentGlob = %q, want %q", def.AgentGlob, "rely-*.agent.md")
+	}
+}
+
+func TestEffectiveSkillsDir_DefaultsToInstallDir(t *testing.T) {
+	// Codex has no SkillsDir, should default to InstallDir
+	def := Registry["codex"]
+	if def.SkillsDir != "" {
+		t.Skip("codex has explicit SkillsDir")
+	}
+	got := def.effectiveSkillsDir()
+	if got != def.InstallDir {
+		t.Errorf("effectiveSkillsDir() = %q, want %q (InstallDir)", got, def.InstallDir)
+	}
+}
+
+func TestEffectiveSkillsDir_ExplicitOverride(t *testing.T) {
+	def := Registry["gemini"]
+	got := def.effectiveSkillsDir()
+	if got != ".gemini/skills" {
+		t.Errorf("effectiveSkillsDir() = %q, want %q", got, ".gemini/skills")
+	}
+}
+
+func TestEffectiveAgentGlob_Default(t *testing.T) {
+	def := Registry["gemini"]
+	got := def.effectiveAgentGlob()
+	if got != "rely-*.md" {
+		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rely-*.md")
+	}
+}
+
+func TestEffectiveAgentGlob_Override(t *testing.T) {
+	def := Registry["copilot"]
+	got := def.effectiveAgentGlob()
+	if got != "rely-*.agent.md" {
+		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rely-*.agent.md")
+	}
+}
+
+func TestIsValidEditor(t *testing.T) {
+	for name := range Registry {
+		if !IsValidEditor(name) {
+			t.Errorf("IsValidEditor(%q) = false, want true", name)
+		}
+	}
+
+	if IsValidEditor("vim") {
+		t.Error("IsValidEditor(vim) = true, want false")
+	}
+	if IsValidEditor("") {
+		t.Error("IsValidEditor('') = true, want false")
+	}
+}
+
+func TestEditorNames(t *testing.T) {
+	names := EditorNames()
+
+	// Should contain all editors
+	for name := range Registry {
+		if !strings.Contains(names, name) {
+			t.Errorf("EditorNames() missing %q", name)
+		}
+	}
+
+	// Should be sorted (verify by checking a few known orderings)
+	parts := strings.Split(names, ", ")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] < parts[i-1] {
+			t.Errorf("EditorNames() not sorted: %q comes after %q", parts[i], parts[i-1])
+		}
+	}
+}
+
+func TestRegistryInstallDirPaths(t *testing.T) {
+	tests := map[string]string{
+		"codex":    ".agents/skills",
+		"gemini":   ".gemini",
+		"cursor":   ".cursor",
+		"windsurf": ".codeium/windsurf/skills",
+		"copilot":  ".copilot",
+		"augment":  ".augment",
+	}
+	for editor, wantDir := range tests {
+		def := Registry[editor]
+		if def.InstallDir != wantDir {
+			t.Errorf("Registry[%q].InstallDir = %q, want %q", editor, def.InstallDir, wantDir)
+		}
+	}
+}
+
+func TestRegistryBinaryNames(t *testing.T) {
+	tests := map[string]string{
+		"claude":   "claude",
+		"codex":    "codex",
+		"gemini":   "gemini",
+		"cursor":   "cursor",
+		"windsurf": "windsurf",
+		"copilot":  "copilot",
+		"augment":  "auggie",
+	}
+	for editor, wantBinary := range tests {
+		def := Registry[editor]
+		if def.Binary != wantBinary {
+			t.Errorf("Registry[%q].Binary = %q, want %q", editor, def.Binary, wantBinary)
+		}
+	}
+}
+
+func TestRegistryAgentsDir(t *testing.T) {
+	// Editors with agents should have AgentsDir
+	withAgents := map[string]string{
+		"gemini":  ".gemini/agents",
+		"cursor":  ".cursor/agents",
+		"copilot": ".copilot/agents",
+		"augment": ".augment/agents",
+	}
+	for editor, wantDir := range withAgents {
+		def := Registry[editor]
+		if def.AgentsDir != wantDir {
+			t.Errorf("Registry[%q].AgentsDir = %q, want %q", editor, def.AgentsDir, wantDir)
+		}
+	}
+
+	// Editors without agents should have empty AgentsDir
+	withoutAgents := []string{"codex", "windsurf"}
+	for _, editor := range withoutAgents {
+		def := Registry[editor]
+		if def.AgentsDir != "" {
+			t.Errorf("Registry[%q].AgentsDir = %q, want empty", editor, def.AgentsDir)
+		}
+	}
+}

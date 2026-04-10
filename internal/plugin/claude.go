@@ -277,6 +277,33 @@ func DisablePluginInSettings(pluginKey string) error {
 	return os.WriteFile(settingsFile, data, 0644)
 }
 
+// removeClaudePlugin handles the entire removal flow for Claude Code.
+// It runs the claude CLI uninstall, removes the marketplace, and deregisters.
+func removeClaudePlugin(home string) error {
+	fmt.Println("Uninstalling plugin via Claude Code CLI...")
+	cmd := exec.Command("claude", "plugin", "uninstall", "rely@relynce-local")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: claude plugin uninstall failed: %v\n", err)
+		fmt.Println("Attempting manual cleanup...")
+	} else {
+		fmt.Println(string(output))
+	}
+
+	marketplaceDir := filepath.Join(home, ".relynce", "marketplace")
+	if err := os.RemoveAll(marketplaceDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove marketplace: %v\n", err)
+	} else {
+		fmt.Println("✓ Removed local marketplace")
+	}
+
+	fmt.Println("Removing marketplace registration...")
+	cmd = exec.Command("claude", "plugin", "marketplace", "remove", "relynce-local")
+	cmd.Run()
+
+	return nil
+}
+
 // UnregisterFromClaudeCode removes polaris from ~/.claude/plugins/installed_plugins.json
 func UnregisterFromClaudeCode() error {
 	home, err := os.UserHomeDir()

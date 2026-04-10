@@ -33,20 +33,6 @@ var PolarisSkillNames = []string{
 	"slo-monitoring-guidance",
 }
 
-// EditorBinaries maps editor names to their CLI binary names for PATH detection
-var EditorBinaries = []struct {
-	Name   string
-	Binary string
-}{
-	{"claude", "claude"},
-	{"codex", "codex"},
-	{"gemini", "gemini"},
-	{"cursor", "cursor"},
-	{"windsurf", "windsurf"},
-	{"copilot", "copilot"},
-	{"augment", "auggie"},
-}
-
 // SavePluginInfo persists plugin metadata to ~/.relynce/plugins.json
 func SavePluginInfo(editor, version, location string) error {
 	home, err := os.UserHomeDir()

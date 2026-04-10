@@ -160,16 +160,11 @@ func CmdInit(args []string) {
 		serverVersion := api.FetchServerPluginVersion(loginCfgForPlugin)
 
 		// Detect available editors
-		var detectedEditors []string
-		for _, e := range plugin.EditorBinaries {
-			if plugin.IsEditorAvailable(e.Binary) {
-				detectedEditors = append(detectedEditors, e.Name)
-			}
-		}
+		detectedEditors := plugin.DetectEditors()
 
 		if len(detectedEditors) == 0 {
 			fmt.Println("Skills: No supported editors detected on PATH")
-			fmt.Println("  Supported: claude, codex, gemini, cursor, windsurf, copilot, augment")
+			fmt.Printf("  Supported: %s\n", plugin.EditorNames())
 			fmt.Println("  Install an editor, then run: rely plugin install <editor>")
 		}
 

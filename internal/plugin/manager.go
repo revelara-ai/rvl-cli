@@ -23,29 +23,22 @@ import (
 
 // GetPluginDir returns the installation directory for a given editor's plugin.
 func GetPluginDir(editor, version string) (string, error) {
+	def, ok := Registry[editor]
+	if !ok {
+		return "", fmt.Errorf("unsupported editor: %s (available: %s)", editor, EditorNames())
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}
 
-	switch editor {
-	case "claude":
+	if def.InstallDir == "" {
+		// Claude uses a version-dependent path (legacy compat)
 		return filepath.Join(home, ".claude", "plugins", "cache", "relynce-api", "relynce", version), nil
-	case "codex":
-		return filepath.Join(home, ".agents", "skills"), nil
-	case "gemini":
-		return filepath.Join(home, ".gemini"), nil
-	case "cursor":
-		return filepath.Join(home, ".cursor"), nil
-	case "windsurf":
-		return filepath.Join(home, ".codeium", "windsurf", "skills"), nil
-	case "copilot":
-		return filepath.Join(home, ".copilot"), nil
-	case "augment":
-		return filepath.Join(home, ".augment"), nil
-	default:
-		return "", fmt.Errorf("unsupported editor: %s (available: claude, codex, gemini, cursor, windsurf, copilot, augment)", editor)
 	}
+
+	return filepath.Join(home, def.InstallDir), nil
 }
 
 // ExtractTarball extracts a tar.gz tarball to the target directory
@@ -108,6 +101,11 @@ func ExtractTarball(tarballData []byte, targetDir string) error {
 
 // InstallPlugin downloads and installs the Relynce plugin for the specified editor
 func InstallPlugin(editor string) error {
+	def, ok := Registry[editor]
+	if !ok {
+		return fmt.Errorf("unsupported editor: %s (available: %s)", editor, EditorNames())
+	}
+
 	fmt.Printf("Installing Relynce plugin for %s...\n", editor)
 
 	if editor == "claude" {
@@ -172,8 +170,9 @@ func InstallPlugin(editor string) error {
 		fmt.Println("✓ Checksum verified")
 	}
 
-	if editor == "claude" {
-		return InstallClaudePlugin(version, tarballData)
+	// Editors with CustomInstall handle the entire flow themselves
+	if def.CustomInstall != nil {
+		return def.CustomInstall(version, tarballData)
 	}
 
 	targetDir, err := GetPluginDir(editor, version)
@@ -190,9 +189,10 @@ func InstallPlugin(editor string) error {
 		return err
 	}
 
-	if editor == "gemini" {
-		if err := EnableGeminiSubagents(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not enable Gemini subagents: %v\n", err)
+	// Run post-install hook if defined (e.g., EnableGeminiSubagents)
+	if def.PostInstall != nil {
+		if err := def.PostInstall(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: post-install hook failed: %v\n", err)
 		}
 	}
 
@@ -243,7 +243,7 @@ func ListInstalledPlugins() {
 		fmt.Println("No Relynce plugins installed.")
 		fmt.Println("\nTo install:")
 		fmt.Println("  rely plugin install <editor>")
-		fmt.Println("  Available: claude, codex, gemini, cursor, windsurf, copilot, augment")
+		fmt.Printf("  Available: %s\n", EditorNames())
 		return
 	}
 
@@ -275,6 +275,11 @@ func ListInstalledPlugins() {
 
 // RemovePlugin removes an installed plugin (all versions)
 func RemovePlugin(editor string) error {
+	def, ok := Registry[editor]
+	if !ok {
+		return fmt.Errorf("unsupported editor: %s (available: %s)", editor, EditorNames())
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("cannot determine home directory: %w", err)
@@ -290,55 +295,19 @@ func RemovePlugin(editor string) error {
 		return nil
 	}
 
-	switch editor {
-	case "claude":
-		fmt.Println("Uninstalling plugin via Claude Code CLI...")
-		cmd := exec.Command("claude", "plugin", "uninstall", "rely@relynce-local")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: claude plugin uninstall failed: %v\n", err)
-			fmt.Println("Attempting manual cleanup...")
-		} else {
-			fmt.Println(string(output))
+	if def.CustomRemove != nil {
+		if err := def.CustomRemove(home); err != nil {
+			return err
 		}
-
-		marketplaceDir := filepath.Join(home, ".relynce", "marketplace")
-		if err := os.RemoveAll(marketplaceDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove marketplace: %v\n", err)
-		} else {
-			fmt.Println("✓ Removed local marketplace")
-		}
-
-		fmt.Println("Removing marketplace registration...")
-		cmd = exec.Command("claude", "plugin", "marketplace", "remove", "relynce-local")
-		cmd.Run()
-
-	case "codex":
-		skillsDir := filepath.Join(home, ".agents", "skills")
+	} else {
+		// Standard removal: clean up skill dirs and agent files
+		skillsDir := filepath.Join(home, def.effectiveSkillsDir())
 		RemoveSkillDirs(skillsDir)
 
-	case "gemini":
-		RemoveSkillDirs(filepath.Join(home, ".gemini", "skills"))
-		RemoveAgentFiles(filepath.Join(home, ".gemini", "agents"))
-
-	case "cursor":
-		RemoveSkillDirs(filepath.Join(home, ".cursor", "skills"))
-		RemoveAgentFiles(filepath.Join(home, ".cursor", "agents"))
-
-	case "windsurf":
-		skillsDir := filepath.Join(home, ".codeium", "windsurf", "skills")
-		RemoveSkillDirs(skillsDir)
-
-	case "copilot":
-		RemoveSkillDirs(filepath.Join(home, ".copilot", "skills"))
-		RemoveCopilotAgentFiles(filepath.Join(home, ".copilot", "agents"))
-
-	case "augment":
-		RemoveSkillDirs(filepath.Join(home, ".augment", "skills"))
-		RemoveAgentFiles(filepath.Join(home, ".augment", "agents"))
-
-	default:
-		return fmt.Errorf("unsupported editor: %s", editor)
+		if def.AgentsDir != "" {
+			agentsDir := filepath.Join(home, def.AgentsDir)
+			removeAgentFilesByGlob(agentsDir, def.effectiveAgentGlob())
+		}
 	}
 
 	metadataFile := filepath.Join(home, ".relynce", "plugins.json")
@@ -346,6 +315,19 @@ func RemovePlugin(editor string) error {
 
 	fmt.Printf("✓ Removed %s plugin\n", editor)
 	return nil
+}
+
+// removeAgentFilesByGlob removes agent files matching the given glob pattern.
+func removeAgentFilesByGlob(agentsDir, pattern string) {
+	matches, err := filepath.Glob(filepath.Join(agentsDir, pattern))
+	if err != nil {
+		return
+	}
+	for _, f := range matches {
+		if err := os.Remove(f); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", f, err)
+		}
+	}
 }
 
 // RemoveSkillDirs removes known Relynce skill subdirectories from a base directory
@@ -406,93 +388,33 @@ func EnableGeminiSubagents() error {
 	return nil
 }
 
-// RemoveAgentFiles removes rely-*.md agent files from a directory
-func RemoveAgentFiles(agentsDir string) {
-	matches, err := filepath.Glob(filepath.Join(agentsDir, "rely-*.md"))
-	if err != nil {
-		return
-	}
-	for _, f := range matches {
-		if err := os.Remove(f); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", f, err)
-		}
-	}
-}
-
-// RemoveCopilotAgentFiles removes rely-*.agent.md agent files from a directory.
-func RemoveCopilotAgentFiles(agentsDir string) {
-	matches, err := filepath.Glob(filepath.Join(agentsDir, "rely-*.agent.md"))
-	if err != nil {
-		return
-	}
-	for _, f := range matches {
-		if err := os.Remove(f); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", f, err)
-		}
-	}
-}
 
 // PrintPostInstallInstructions prints editor-specific next steps
 func PrintPostInstallInstructions(editor, location string) {
+	def, ok := Registry[editor]
+	if !ok {
+		return
+	}
+
 	fmt.Printf("\n✓ Relynce skills installed for %s\n\n", editor)
 
-	switch editor {
-	case "claude":
-		fmt.Println("To use the plugin:")
-		fmt.Println("  1. Add to your settings.json:")
-		fmt.Printf("     \"enabledPlugins\": [\"rely@%s\"]\n\n", location)
-		fmt.Println("  2. Or start Claude Code with:")
-		fmt.Printf("     claude --plugin-dir %s\n\n", location)
-		fmt.Println("Available commands:")
-		fmt.Println("  /rely:scan             - Scan for reliability risks")
-		fmt.Println("  /rely:fix R-XXX        - Fix a specific risk")
-		fmt.Println("  /rely:ask \"question\"   - Ask a reliability expert")
-	case "codex":
+	if def.AgentsDir != "" {
+		fmt.Printf("Skills and agents installed to: %s\n\n", location)
+	} else {
 		fmt.Printf("Skills installed to: %s\n\n", location)
-		fmt.Println("Skills are auto-discovered by Codex CLI.")
-		fmt.Println("Try: \"scan this codebase for reliability risks\"")
-	case "gemini":
-		fmt.Printf("Skills and agents installed to: %s\n\n", location)
-		fmt.Println("Skills are auto-discovered by Gemini CLI.")
-		fmt.Println("Subagents enabled via experimental.enableAgents in ~/.gemini/settings.json")
-		fmt.Println("\nNote: Subagents are experimental and run in YOLO mode (no per-tool confirmation).")
-		fmt.Println("Try: \"scan this codebase for reliability risks\"")
-	case "cursor":
-		fmt.Printf("Skills and agents installed to: %s\n\n", location)
-		fmt.Println("Skills and agents are auto-discovered by Cursor.")
-		fmt.Println("Use /scan or ask naturally.")
-	case "windsurf":
-		fmt.Printf("Skills installed to: %s\n\n", location)
-		fmt.Println("Skills are auto-discovered by Windsurf.")
-		fmt.Println("Use @scan or ask Cascade naturally.")
-	case "copilot":
-		fmt.Printf("Skills and agents installed to: %s\n\n", location)
-		fmt.Println("Skills and agents are auto-discovered by Copilot CLI.")
-		fmt.Println("Try: \"scan this codebase for reliability risks\"")
-	case "augment":
-		fmt.Printf("Skills and agents installed to: %s\n\n", location)
-		fmt.Println("Skills and agents are auto-discovered by Augment CLI.")
-		fmt.Println("Try: \"scan this codebase for reliability risks\"")
+	}
+
+	for _, line := range def.Instructions {
+		fmt.Println(line)
 	}
 }
 
 // CmdPlugin handles plugin management (install, update, list, remove).
 func CmdPlugin(args []string) {
+	editorList := EditorNames()
+
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, `Usage: rely plugin <command>
-
-Commands:
-  install <editor>   Install skills for editor (claude, codex, gemini, cursor, windsurf, copilot, augment)
-  update [editor]    Update skills to latest version
-  list               List installed skills
-  remove <editor>    Remove installed skills
-
-Examples:
-  rely plugin install claude    Install Claude Code plugin
-  rely plugin install codex     Install Codex CLI skills
-  rely plugin install gemini    Install Gemini CLI skills + agents
-  rely plugin update            Update all installed plugins
-  rely plugin list              Show installed plugins`)
+		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>   Install skills for editor (%s)\n  update [editor]    Update skills to latest version\n  list               List installed skills\n  remove <editor>    Remove installed skills\n\nExamples:\n  rely plugin install claude    Install Claude Code plugin\n  rely plugin install codex     Install Codex CLI skills\n  rely plugin install gemini    Install Gemini CLI skills + agents\n  rely plugin update            Update all installed plugins\n  rely plugin list              Show installed plugins\n", editorList)
 		os.Exit(1)
 	}
 
@@ -501,7 +423,7 @@ Examples:
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
 			fmt.Fprintln(os.Stderr, "Usage: rely plugin install <editor>")
-			fmt.Fprintln(os.Stderr, "Available: claude, codex, gemini, cursor, windsurf, copilot, augment")
+			fmt.Fprintf(os.Stderr, "Available: %s\n", editorList)
 			os.Exit(1)
 		}
 		editor := args[1]
