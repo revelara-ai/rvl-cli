@@ -225,9 +225,10 @@ Examples:
   rely evidence verify <evidence-id>
 
 Plugin Command:
-  rely plugin install <editor>      Install plugin for editor (claude, codex, gemini, cursor, windsurf, copilot, augment)
+  rely plugin install <editor>      Install plugin for editor
   rely plugin update [editor]       Update plugin(s) to latest version
   rely plugin list                  List installed plugins
+  rely plugin editors               List all supported editors
   rely plugin remove <editor>       Remove installed plugin
 
 Init Command:

@@ -391,6 +391,28 @@ func EditorNames() string {
 	return strings.Join(names, ", ")
 }
 
+// EditorInfo holds a name and display name pair for listing.
+type EditorInfo struct {
+	Name        string
+	DisplayName string
+}
+
+// EditorsByTier returns editors grouped as custom (tier 1-2) and universal (tier 3).
+// Each list is sorted alphabetically by name.
+func EditorsByTier() (custom, universal []EditorInfo) {
+	for name, def := range Registry {
+		info := EditorInfo{Name: name, DisplayName: def.DisplayName}
+		if def.Tier <= 2 {
+			custom = append(custom, info)
+		} else {
+			universal = append(universal, info)
+		}
+	}
+	sort.Slice(custom, func(i, j int) bool { return custom[i].Name < custom[j].Name })
+	sort.Slice(universal, func(i, j int) bool { return universal[i].Name < universal[j].Name })
+	return custom, universal
+}
+
 // isEditorDetected returns true if the editor is present on this machine.
 // Detection passes if the CLI binary is on PATH or the config directory exists.
 func isEditorDetected(def EditorDef) bool {

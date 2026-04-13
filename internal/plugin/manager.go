@@ -278,6 +278,24 @@ func UpdatePlugin(editor string) error {
 	return InstallPlugin(editor, "")
 }
 
+// listEditors prints all supported editors grouped by integration type.
+func listEditors() {
+	custom, universal := EditorsByTier()
+
+	fmt.Println("Custom integrations (editor-specific install):")
+	for _, e := range custom {
+		fmt.Fprintf(os.Stdout, "  %-14s %s\n", e.Name, e.DisplayName)
+	}
+
+	fmt.Println("\nUniversal integrations (generic skills directory):")
+	for _, e := range universal {
+		fmt.Fprintf(os.Stdout, "  %-14s %s\n", e.Name, e.DisplayName)
+	}
+
+	fmt.Println("\nInstall:  rely plugin install <name>")
+	fmt.Println("Auto:     rely plugin install --all")
+}
+
 // ListInstalledPlugins lists all installed Relynce plugins
 func ListInstalledPlugins() {
 	plugins, err := GetInstalledPlugins()
@@ -556,7 +574,7 @@ func CmdPlugin(args []string) {
 	editorList := EditorNames()
 
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>            Install skills for editor (%s)\n  install <editor> --project  Install to current project directory\n  install --all               Auto-detect and install to all editors\n  install --all --project     Auto-detect and install project-locally\n  update [editor]             Update skills to latest version\n  update --all                Update all installed plugins\n  list                        List installed skills\n  remove <editor>             Remove installed skills\n  remove <editor> --project   Remove project-local skills\n\nExamples:\n  rely plugin install claude         Install Claude Code plugin\n  rely plugin install gemini --project  Install to project directory\n  rely plugin install --all          Install to all detected editors\n  rely plugin update                 Update all installed plugins\n  rely plugin list                   Show installed plugins\n", editorList)
+		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>            Install skills for editor (%s)\n  install <editor> --project  Install to current project directory\n  install --all               Auto-detect and install to all editors\n  install --all --project     Auto-detect and install project-locally\n  update [editor]             Update skills to latest version\n  update --all                Update all installed plugins\n  list                        List installed skills\n  editors                     List all supported editors\n  remove <editor>             Remove installed skills\n  remove <editor> --project   Remove project-local skills\n\nExamples:\n  rely plugin install claude         Install Claude Code plugin\n  rely plugin install gemini --project  Install to project directory\n  rely plugin install --all          Install to all detected editors\n  rely plugin update                 Update all installed plugins\n  rely plugin editors                Show all supported editors\n  rely plugin list                   Show installed plugins\n", editorList)
 		os.Exit(1)
 	}
 
@@ -603,6 +621,8 @@ func CmdPlugin(args []string) {
 		}
 	case "list":
 		ListInstalledPlugins()
+	case "editors":
+		listEditors()
 	case "remove", "uninstall":
 		if len(subArgs) < 1 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
@@ -616,7 +636,7 @@ func CmdPlugin(args []string) {
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown plugin command: %s\n", args[0])
-		fmt.Fprintln(os.Stderr, "Usage: rely plugin <install|update|list|remove>")
+		fmt.Fprintln(os.Stderr, "Usage: rely plugin <install|update|list|editors|remove>")
 		os.Exit(1)
 	}
 }
