@@ -39,7 +39,7 @@ func CmdConfig(args []string) {
 		key, value := args[1], args[2]
 		cfg, _ := config.LoadConfig()
 		if cfg == nil {
-			cfg = &config.Config{}
+			cfg = &config.Config{APIURL: config.DefaultAPIURL}
 		}
 		switch key {
 		case "api_url":

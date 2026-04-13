@@ -118,7 +118,7 @@ func CmdLogin() {
 	}
 	defaultURL := cfg.APIURL
 	if defaultURL == "" {
-		defaultURL = "https://api-dev.relynce.ai"
+		defaultURL = config.DefaultAPIURL
 	}
 	fmt.Printf("Relynce API URL [%s]: ", defaultURL)
 	apiURL, _ := reader.ReadString('\n')

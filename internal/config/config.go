@@ -11,6 +11,9 @@ import (
 const (
 	configDir  = ".relynce"
 	configFile = "config.yaml"
+
+	// DefaultAPIURL is the production Relynce API endpoint.
+	DefaultAPIURL = "https://api.relynce.ai"
 )
 
 // Config holds the CLI configuration
@@ -47,6 +50,9 @@ func LoadConfig() (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.APIURL == "" {
+		cfg.APIURL = DefaultAPIURL
 	}
 	return &cfg, nil
 }
