@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 type ScanRequest struct {
 	Service      string        `json:"service"`
 	ScanType     string        `json:"scan_type"`
+	ScanMode     string        `json:"scan_mode,omitempty"`
 	Findings     []interface{} `json:"findings"`
 	Metadata     ScanMetadata  `json:"metadata,omitempty"`
 
@@ -134,6 +136,9 @@ func CmdScan(args []string, version string) {
 	var useStdin bool
 	var dryRun bool
 	var targetDir string
+	var reviewMode bool
+	var autoInfer bool
+	var ciMode bool
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -162,6 +167,12 @@ func CmdScan(args []string, version string) {
 			inputFile = args[i]
 		case "--dry-run":
 			dryRun = true
+		case "--review":
+			reviewMode = true
+		case "--auto-infer":
+			autoInfer = true
+		case "--ci":
+			ciMode = true
 		default:
 			if strings.HasPrefix(args[i], "--target=") {
 				targetDir = strings.TrimPrefix(args[i], "--target=")
@@ -250,9 +261,31 @@ func CmdScan(args []string, version string) {
 		}
 	}
 
+	// Resolve scan mode: --ci > --auto-infer > --review > default (review if TTY)
+	scanMode := "review" // default
+	if ciMode {
+		scanMode = "ci"
+	} else if autoInfer {
+		scanMode = "auto"
+	} else if reviewMode {
+		scanMode = "review"
+	} else if !isTTY() {
+		// No TTY and no explicit flag: fall back to auto (non-interactive)
+		scanMode = "auto"
+	}
+
+	// Review mode requires a TTY for interactive confirmation
+	if scanMode == "review" && useStdin {
+		fmt.Fprintln(os.Stderr, "Warning: --review requires a TTY for confirmation. Falling back to --auto-infer because stdin is used for input.")
+		scanMode = "auto"
+	}
+
+	scanReq.ScanMode = scanMode
+
 	if dryRun {
 		fmt.Printf("Dry run - would submit to %s:\n", cfg.APIURL)
 		fmt.Printf("  Service: %s\n", scanReq.Service)
+		fmt.Printf("  Mode: %s\n", scanMode)
 		if targetDir != "" {
 			fmt.Printf("  Target: %s\n", targetDir)
 		}
@@ -263,10 +296,33 @@ func CmdScan(args []string, version string) {
 
 	response, err := submitScan(cfg, &scanReq)
 	if err != nil {
+		if scanMode == "ci" {
+			ciError := map[string]any{"error": err.Error(), "service": service}
+			jsonOut, _ := json.Marshal(ciError)
+			fmt.Println(string(jsonOut))
+			os.Exit(2)
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
+	// CI mode: output JSON and exit with code based on severity
+	if scanMode == "ci" {
+		printCIOutput(response)
+		return
+	}
+
+	// Review mode: show control structure and ask for confirmation
+	if scanMode == "review" && response.ControlStructure != nil {
+		printControlStructureReview(response.ControlStructure)
+		if !promptConfirmation("Accept this control structure and proceed with results?") {
+			fmt.Println("Scan results discarded. Use --auto-infer to skip review.")
+			return
+		}
+		fmt.Println()
+	}
+
+	// Standard output (review-confirmed or auto mode)
 	fmt.Printf("Scan submitted successfully\n")
 	fmt.Printf("  Scan ID: %s\n", response.ScanID)
 	fmt.Printf("  Service: %s\n", response.Service)
@@ -319,6 +375,57 @@ func CmdScan(args []string, version string) {
 	}
 
 	fmt.Printf("View results: %s/risks\n", cfg.APIURL)
+}
+
+// isTTY returns true if stdout is a terminal (not piped or redirected).
+func isTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// printControlStructureReview displays the control structure for interactive review.
+func printControlStructureReview(cs *ScanControlStructureResult) {
+	fmt.Println("\nControl Structure (Review Mode)")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("  Nodes: %d | Edges: %d\n", cs.NodeCount, cs.EdgeCount)
+	fmt.Printf("  Files scanned: %d | Lines scanned: %d\n", cs.ScannedFiles, cs.ScannedLines)
+	if uca := cs.UCACoverage; uca != nil {
+		fmt.Printf("  Control actions: %d discovered, %d analyzed (cap: %d)\n",
+			uca.Discovered, uca.Analyzed, uca.Cap)
+		fmt.Printf("  UCAs identified: %d (%d stored)\n", uca.UCAsGenerated, uca.UCAsStored)
+	}
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println()
+}
+
+// promptConfirmation asks a yes/no question and returns the answer.
+func promptConfirmation(question string) bool {
+	fmt.Printf("%s [Y/n] ", question)
+	reader := bufio.NewReader(os.Stdin)
+	answer, err := reader.ReadString('\n')
+	if err != nil {
+		return true // default to yes on read error
+	}
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "" || answer == "y" || answer == "yes"
+}
+
+// printCIOutput outputs scan results as JSON for CI/CD pipelines.
+// Exit codes: 0 = success (no critical/high), 1 = findings with critical/high severity.
+func printCIOutput(response *ScanResponse) {
+	out, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error marshaling CI output: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Println(string(out))
+
+	if response.Summary.Critical > 0 || response.Summary.High > 0 {
+		os.Exit(1)
+	}
 }
 
 // submitScan sends the scan request to the API and returns the response
