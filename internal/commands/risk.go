@@ -473,10 +473,39 @@ func CmdRiskShow(args []string) {
 	}
 
 	if risk.Narrative != "" {
-		fmt.Println("\nNarrative:")
-		fmt.Println(strings.Repeat("-", 80))
-		wrapped := display.WrapText(risk.Narrative, 80, "")
-		fmt.Println(wrapped)
+		stpa := display.ParseSTPAContext(risk.Narrative)
+		if stpa != nil {
+			fmt.Println("\nSTPA Causal Analysis:")
+			fmt.Println(strings.Repeat("-", 80))
+			if stpa.UCAType != "" {
+				fmt.Printf("  Unsafe Control Action: %s", display.FormatUCAType(stpa.UCAType))
+				if cat := display.FormatUCACategory(stpa.UCAType); cat != "" {
+					fmt.Printf("  (%s)", cat)
+				}
+				fmt.Println()
+			}
+			if stpa.LossScenario != "" {
+				fmt.Printf("  Loss Scenario: %s\n", stpa.LossScenario)
+			}
+			if len(stpa.CausalFactors) > 0 {
+				fmt.Println("  Causal Factors:")
+				for _, f := range stpa.CausalFactors {
+					wrapped := display.WrapText(f, 74, "      ")
+					fmt.Printf("    > %s\n", wrapped)
+				}
+			}
+			if stpa.CleanNarrative != "" {
+				fmt.Println("\nNarrative:")
+				fmt.Println(strings.Repeat("-", 80))
+				wrapped := display.WrapText(stpa.CleanNarrative, 80, "")
+				fmt.Println(wrapped)
+			}
+		} else {
+			fmt.Println("\nNarrative:")
+			fmt.Println(strings.Repeat("-", 80))
+			wrapped := display.WrapText(risk.Narrative, 80, "")
+			fmt.Println(wrapped)
+		}
 	}
 
 	if len(risk.MappedControls) > 0 {
@@ -536,6 +565,28 @@ func printRiskContext(ctx RiskContextResponse) {
 	fmt.Printf("Status:   %s\n", display.FormatStatus(ctx.Risk.Status))
 	fmt.Printf("Category: %s\n", ctx.Risk.Category)
 	fmt.Printf("Score:    %d\n", ctx.Risk.Score)
+
+	if stpa := display.ParseSTPAContext(ctx.Risk.Narrative); stpa != nil {
+		fmt.Println("\nSTPA Causal Analysis:")
+		fmt.Println(strings.Repeat("-", 80))
+		if stpa.UCAType != "" {
+			fmt.Printf("  Unsafe Control Action: %s", display.FormatUCAType(stpa.UCAType))
+			if cat := display.FormatUCACategory(stpa.UCAType); cat != "" {
+				fmt.Printf("  (%s)", cat)
+			}
+			fmt.Println()
+		}
+		if stpa.LossScenario != "" {
+			fmt.Printf("  Loss Scenario: %s\n", stpa.LossScenario)
+		}
+		if len(stpa.CausalFactors) > 0 {
+			fmt.Println("  Causal Factors:")
+			for _, f := range stpa.CausalFactors {
+				wrapped := display.WrapText(f, 74, "      ")
+				fmt.Printf("    > %s\n", wrapped)
+			}
+		}
+	}
 
 	if len(ctx.ScoreBreakdown) > 0 {
 		fmt.Println("\nScore Breakdown:")

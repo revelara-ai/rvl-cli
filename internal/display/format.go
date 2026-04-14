@@ -1,6 +1,9 @@
 package display
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // FormatStatus formats risk status for display
 func FormatStatus(status string) string {
@@ -109,6 +112,86 @@ func TruncateText(text string, maxLen int) string {
 		return text[:maxLen]
 	}
 	return text[:maxLen-3] + "..."
+}
+
+// STPAContext holds parsed STPA causal analysis from an enriched narrative.
+type STPAContext struct {
+	UCAType        string
+	LossScenario   string
+	CausalFactors  []string
+	CleanNarrative string
+}
+
+var (
+	ucaRe     = regexp.MustCompile(`\*\*Unsafe Control Action:\*\*\s*(.+)`)
+	lossRe    = regexp.MustCompile(`\*\*Loss Scenario:\*\*\s*(.+)`)
+	factorsRe = regexp.MustCompile(`\*\*Causal Factors:\*\*`)
+)
+
+// ParseSTPAContext extracts STPA markers from an enriched narrative.
+// Returns nil if no STPA markers are found.
+func ParseSTPAContext(narrative string) *STPAContext {
+	if narrative == "" {
+		return nil
+	}
+
+	var ctx STPAContext
+	clean := narrative
+
+	if m := ucaRe.FindStringSubmatch(narrative); len(m) > 1 {
+		ctx.UCAType = strings.TrimSpace(m[1])
+		clean = strings.Replace(clean, m[0], "", 1)
+	}
+
+	if m := lossRe.FindStringSubmatch(narrative); len(m) > 1 {
+		ctx.LossScenario = strings.TrimSpace(m[1])
+		clean = strings.Replace(clean, m[0], "", 1)
+	}
+
+	if loc := factorsRe.FindStringIndex(narrative); loc != nil {
+		factorsBlock := narrative[loc[1]:]
+		clean = strings.Replace(clean, narrative[loc[0]:], "", 1)
+		for _, line := range strings.Split(factorsBlock, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "- ") {
+				ctx.CausalFactors = append(ctx.CausalFactors, strings.TrimPrefix(line, "- "))
+			}
+		}
+	}
+
+	if ctx.UCAType == "" && ctx.LossScenario == "" && len(ctx.CausalFactors) == 0 {
+		return nil
+	}
+
+	ctx.CleanNarrative = strings.TrimSpace(clean)
+	return &ctx
+}
+
+// FormatUCACategory maps a UCA type to the STPA causal question it answers.
+func FormatUCACategory(ucaType string) string {
+	switch strings.ToLower(strings.ReplaceAll(ucaType, " ", "_")) {
+	case "not_provided":
+		return "What control is missing?"
+	case "providing_incorrectly":
+		return "What assumption is wrong?"
+	case "wrong_timing":
+		return "What feedback is delayed?"
+	case "wrong_duration":
+		return "What enforcement is bypassed?"
+	default:
+		return ""
+	}
+}
+
+// FormatUCAType formats a UCA type for human display (underscores to spaces, title case).
+func FormatUCAType(ucaType string) string {
+	words := strings.Split(strings.ReplaceAll(ucaType, "_", " "), " ")
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // WrapText wraps text to a specified width with optional indent
