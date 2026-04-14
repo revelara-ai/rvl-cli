@@ -76,12 +76,32 @@ type ScanCatalogMeta struct {
 
 // ScanResponse represents the response from the scan endpoint
 type ScanResponse struct {
-	ScanID    string       `json:"scan_id"`
-	Service   string       `json:"service"`
-	Summary   ScanSummary  `json:"summary"`
-	Findings  []ScanResult `json:"findings"`
-	Warnings  []string     `json:"warnings,omitempty"`
-	Timestamp string       `json:"timestamp"`
+	ScanID           string                      `json:"scan_id"`
+	Service          string                      `json:"service"`
+	Summary          ScanSummary                 `json:"summary"`
+	Findings         []ScanResult                `json:"findings"`
+	ControlStructure *ScanControlStructureResult  `json:"control_structure,omitempty"`
+	Warnings         []string                    `json:"warnings,omitempty"`
+	Timestamp        string                      `json:"timestamp"`
+}
+
+// ScanControlStructureResult is the control structure portion of a scan response.
+type ScanControlStructureResult struct {
+	SnapshotID   string           `json:"snapshot_id"`
+	NodeCount    int              `json:"node_count"`
+	EdgeCount    int              `json:"edge_count"`
+	ScannedFiles int              `json:"scanned_files"`
+	ScannedLines int64            `json:"scanned_lines"`
+	UCACoverage  *ScanUCACoverage `json:"uca_coverage,omitempty"`
+}
+
+// ScanUCACoverage reports UCA identification results during a scan.
+type ScanUCACoverage struct {
+	Discovered    int `json:"discovered"`
+	Analyzed      int `json:"analyzed"`
+	Cap           int `json:"cap"`
+	UCAsGenerated int `json:"ucas_generated"`
+	UCAsStored    int `json:"ucas_stored"`
 }
 
 // ScanSummary provides aggregate statistics about the scan results
@@ -257,6 +277,19 @@ func CmdScan(args []string, version string) {
 		fmt.Printf("  Priority: Critical=%d, High=%d, Medium=%d, Low=%d\n",
 			response.Summary.Critical, response.Summary.High,
 			response.Summary.Medium, response.Summary.Low)
+	}
+
+	if cs := response.ControlStructure; cs != nil {
+		fmt.Printf("  Control Structure: %d nodes, %d edges (%d files scanned)\n",
+			cs.NodeCount, cs.EdgeCount, cs.ScannedFiles)
+		if uca := cs.UCACoverage; uca != nil {
+			fmt.Printf("  STPA Coverage: %d/%d control actions analyzed",
+				uca.Analyzed, uca.Discovered)
+			if uca.Cap > 0 && uca.Discovered > uca.Cap {
+				fmt.Printf(" (capped at %d)", uca.Cap)
+			}
+			fmt.Printf(" | %d UCAs identified\n", uca.UCAsGenerated)
+		}
 	}
 	fmt.Println()
 
