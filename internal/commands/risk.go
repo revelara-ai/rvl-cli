@@ -22,9 +22,12 @@ type Risk struct {
 	Status       string   `json:"status"`
 	Services     []string `json:"linked_services"`
 	ControlCodes []string `json:"control_codes,omitempty"`
-	StaleSince   string   `json:"stale_since,omitempty"`
-	LastSeenAt   string   `json:"last_seen_at,omitempty"`
-	ResolvedAt   string   `json:"resolved_at,omitempty"`
+	StaleSince    string   `json:"stale_since,omitempty"`
+	LastSeenAt    string   `json:"last_seen_at,omitempty"`
+	ResolvedAt    string   `json:"resolved_at,omitempty"`
+	UCAType       string   `json:"uca_type,omitempty"`
+	CausalFactors []string `json:"causal_factors,omitempty"`
+	LossScenario  string   `json:"loss_scenario,omitempty"`
 }
 
 // RiskDetail represents detailed risk information
@@ -472,40 +475,42 @@ func CmdRiskShow(args []string) {
 		fmt.Printf("Resolved At: %s\n", risk.ResolvedAt)
 	}
 
-	if risk.Narrative != "" {
-		stpa := display.ParseSTPAContext(risk.Narrative)
-		if stpa != nil {
-			fmt.Println("\nSTPA Causal Analysis:")
-			fmt.Println(strings.Repeat("-", 80))
-			if stpa.UCAType != "" {
-				fmt.Printf("  Unsafe Control Action: %s", display.FormatUCAType(stpa.UCAType))
-				if cat := display.FormatUCACategory(stpa.UCAType); cat != "" {
-					fmt.Printf("  (%s)", cat)
-				}
-				fmt.Println()
+	// Prefer structured STPA fields from API JSON; fall back to narrative parsing
+	hasStructuredSTPA := risk.UCAType != "" || len(risk.CausalFactors) > 0 || risk.LossScenario != ""
+	if hasStructuredSTPA {
+		fmt.Println("\nSTPA Causal Analysis:")
+		fmt.Println(strings.Repeat("-", 80))
+		if risk.UCAType != "" {
+			fmt.Printf("  Unsafe Control Action: %s", display.FormatUCAType(risk.UCAType))
+			if cat := display.FormatUCACategory(risk.UCAType); cat != "" {
+				fmt.Printf("  (%s)", cat)
 			}
-			if stpa.LossScenario != "" {
-				fmt.Printf("  Loss Scenario: %s\n", stpa.LossScenario)
-			}
-			if len(stpa.CausalFactors) > 0 {
-				fmt.Println("  Causal Factors:")
-				for _, f := range stpa.CausalFactors {
-					wrapped := display.WrapText(f, 74, "      ")
-					fmt.Printf("    > %s\n", wrapped)
-				}
-			}
-			if stpa.CleanNarrative != "" {
-				fmt.Println("\nNarrative:")
-				fmt.Println(strings.Repeat("-", 80))
-				wrapped := display.WrapText(stpa.CleanNarrative, 80, "")
-				fmt.Println(wrapped)
-			}
-		} else {
-			fmt.Println("\nNarrative:")
-			fmt.Println(strings.Repeat("-", 80))
-			wrapped := display.WrapText(risk.Narrative, 80, "")
-			fmt.Println(wrapped)
+			fmt.Println()
 		}
+		if risk.LossScenario != "" {
+			fmt.Printf("  Loss Scenario: %s\n", risk.LossScenario)
+		}
+		if len(risk.CausalFactors) > 0 {
+			fmt.Println("  Causal Factors:")
+			for _, f := range risk.CausalFactors {
+				wrapped := display.WrapText(f, 74, "      ")
+				fmt.Printf("    > %s\n", wrapped)
+			}
+		}
+	}
+
+	if risk.Narrative != "" {
+		// Strip STPA markers from narrative if we already showed structured fields
+		narrativeText := risk.Narrative
+		if hasStructuredSTPA {
+			if stpa := display.ParseSTPAContext(risk.Narrative); stpa != nil && stpa.CleanNarrative != "" {
+				narrativeText = stpa.CleanNarrative
+			}
+		}
+		fmt.Println("\nNarrative:")
+		fmt.Println(strings.Repeat("-", 80))
+		wrapped := display.WrapText(narrativeText, 80, "")
+		fmt.Println(wrapped)
 	}
 
 	if len(risk.MappedControls) > 0 {
@@ -566,7 +571,29 @@ func printRiskContext(ctx RiskContextResponse) {
 	fmt.Printf("Category: %s\n", ctx.Risk.Category)
 	fmt.Printf("Score:    %d\n", ctx.Risk.Score)
 
-	if stpa := display.ParseSTPAContext(ctx.Risk.Narrative); stpa != nil {
+	// Prefer structured STPA fields from API JSON; fall back to narrative parsing
+	hasStructuredSTPA := ctx.Risk.UCAType != "" || len(ctx.Risk.CausalFactors) > 0 || ctx.Risk.LossScenario != ""
+	if hasStructuredSTPA {
+		fmt.Println("\nSTPA Causal Analysis:")
+		fmt.Println(strings.Repeat("-", 80))
+		if ctx.Risk.UCAType != "" {
+			fmt.Printf("  Unsafe Control Action: %s", display.FormatUCAType(ctx.Risk.UCAType))
+			if cat := display.FormatUCACategory(ctx.Risk.UCAType); cat != "" {
+				fmt.Printf("  (%s)", cat)
+			}
+			fmt.Println()
+		}
+		if ctx.Risk.LossScenario != "" {
+			fmt.Printf("  Loss Scenario: %s\n", ctx.Risk.LossScenario)
+		}
+		if len(ctx.Risk.CausalFactors) > 0 {
+			fmt.Println("  Causal Factors:")
+			for _, f := range ctx.Risk.CausalFactors {
+				wrapped := display.WrapText(f, 74, "      ")
+				fmt.Printf("    > %s\n", wrapped)
+			}
+		}
+	} else if stpa := display.ParseSTPAContext(ctx.Risk.Narrative); stpa != nil {
 		fmt.Println("\nSTPA Causal Analysis:")
 		fmt.Println(strings.Repeat("-", 80))
 		if stpa.UCAType != "" {
