@@ -200,7 +200,7 @@ func CmdLogout() {
 // Takes version and gitHash as params since they're defined in main
 func CmdStatus(version, gitHash string) {
 	cfg := api.LoadAndResolveConfig()
-	fmt.Printf("Relynce CLI v%s (%s)\n", version, gitHash)
+	fmt.Printf("Relynce CLI %s (%s)\n", version, gitHash)
 	fmt.Printf("API URL: %s\n", cfg.APIURL)
 	if len(cfg.APIKey) > 8 {
 		fmt.Printf("API Key: %s...%s\n", cfg.APIKey[:4], cfg.APIKey[len(cfg.APIKey)-4:])
