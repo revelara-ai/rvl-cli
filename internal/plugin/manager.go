@@ -37,7 +37,7 @@ func GetPluginDir(editor, version string) (string, error) {
 
 	if def.InstallDir == "" {
 		// Claude uses a version-dependent path (legacy compat)
-		return filepath.Join(home, ".claude", "plugins", "cache", "relynce-api", "relynce", version), nil
+		return filepath.Join(home, ".claude", "plugins", "cache", "revelara-api", "revelara", version), nil
 	}
 
 	return filepath.Join(home, def.InstallDir), nil
@@ -125,7 +125,7 @@ func extractFlag(args []string, flag string) ([]string, bool) {
 	return filtered, found
 }
 
-// InstallPlugin downloads and installs the Relynce plugin for the specified editor.
+// InstallPlugin downloads and installs the Revelara plugin for the specified editor.
 // If projectRoot is non-empty, installs to projectRoot/LocalDir (project-local).
 func InstallPlugin(editor, projectRoot string) error {
 	def, ok := Registry[editor]
@@ -142,9 +142,9 @@ func InstallPlugin(editor, projectRoot string) error {
 		if def.CustomInstall != nil {
 			return fmt.Errorf("--project not supported for %s (uses custom install flow)", editor)
 		}
-		fmt.Printf("Installing Relynce plugin for %s (project-local)...\n", editor)
+		fmt.Printf("Installing Revelara plugin for %s (project-local)...\n", editor)
 	} else {
-		fmt.Printf("Installing Relynce plugin for %s...\n", editor)
+		fmt.Printf("Installing Revelara plugin for %s...\n", editor)
 	}
 
 	if !isProject && editor == "claude" {
@@ -155,7 +155,7 @@ func InstallPlugin(editor, projectRoot string) error {
 
 	cfg, err := config.LoadConfig()
 	if err != nil || cfg == nil || cfg.APIKey == "" || cfg.APIURL == "" {
-		return fmt.Errorf("no API credentials configured — run 'rely login' first")
+		return fmt.Errorf("no API credentials configured — run 'rvl login' first")
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -187,7 +187,7 @@ func InstallPlugin(editor, projectRoot string) error {
 	if version == "" {
 		// Legacy fallback: parse from Content-Disposition filename
 		cd := resp.Header.Get("Content-Disposition")
-		version = strings.TrimPrefix(cd, "attachment; filename=relynce-plugin-")
+		version = strings.TrimPrefix(cd, "attachment; filename=revelara-plugin-")
 		version = strings.TrimPrefix(version, "attachment; filename=polaris-plugin-")
 		version = strings.TrimSuffix(version, ".tar.gz")
 		version = strings.TrimPrefix(version, editor+"-")
@@ -292,11 +292,11 @@ func listEditors() {
 		fmt.Fprintf(os.Stdout, "  %-14s %s\n", e.Name, e.DisplayName)
 	}
 
-	fmt.Println("\nInstall:  rely plugin install <name>")
-	fmt.Println("Auto:     rely plugin install --all")
+	fmt.Println("\nInstall:  rvl plugin install <name>")
+	fmt.Println("Auto:     rvl plugin install --all")
 }
 
-// ListInstalledPlugins lists all installed Relynce plugins
+// ListInstalledPlugins lists all installed Revelara plugins
 func ListInstalledPlugins() {
 	plugins, err := GetInstalledPlugins()
 	if err != nil {
@@ -305,9 +305,9 @@ func ListInstalledPlugins() {
 	}
 
 	if len(plugins) == 0 {
-		fmt.Println("No Relynce plugins installed.")
+		fmt.Println("No Revelara plugins installed.")
 		fmt.Println("\nTo install:")
-		fmt.Println("  rely plugin install <editor>")
+		fmt.Println("  rvl plugin install <editor>")
 		fmt.Printf("  Available: %s\n", EditorNames())
 		return
 	}
@@ -315,7 +315,7 @@ func ListInstalledPlugins() {
 	cfg, _ := config.LoadConfig()
 	serverVersion := api.FetchServerPluginVersion(cfg)
 
-	fmt.Println("Installed Relynce plugins:")
+	fmt.Println("Installed Revelara plugins:")
 	for _, p := range plugins {
 		fmt.Printf("\n  %s\n", p.Editor)
 		fmt.Printf("    Version:   %s\n", p.Version)
@@ -331,7 +331,7 @@ func ListInstalledPlugins() {
 	if serverVersion != "" {
 		for _, p := range plugins {
 			if SemVerNewer(p.Version, serverVersion) {
-				fmt.Printf("\nRun 'rely plugin update' to upgrade.\n")
+				fmt.Printf("\nRun 'rvl plugin update' to upgrade.\n")
 				break
 			}
 		}
@@ -384,7 +384,7 @@ func RemovePlugin(editor, projectRoot string) error {
 		scope = "project-local"
 	}
 
-	fmt.Printf("Remove %s Relynce plugin for %s? [y/N] ", scope, editor)
+	fmt.Printf("Remove %s Revelara plugin for %s? [y/N] ", scope, editor)
 	reader := bufio.NewReader(os.Stdin)
 	response, _ := reader.ReadString('\n')
 	response = strings.ToLower(strings.TrimSpace(response))
@@ -425,7 +425,7 @@ func RemovePlugin(editor, projectRoot string) error {
 			}
 		}
 
-		metadataFile := filepath.Join(home, ".relynce", "plugins.json")
+		metadataFile := filepath.Join(home, ".revelara", "plugins.json")
 		_ = RemovePluginFromMetadata(editor, metadataFile)
 	}
 
@@ -446,7 +446,7 @@ func removeAgentFilesByGlob(agentsDir, pattern string) {
 	}
 }
 
-// RemoveSkillDirs removes known Relynce skill subdirectories from a base directory
+// RemoveSkillDirs removes known Revelara skill subdirectories from a base directory
 func RemoveSkillDirs(baseDir string) {
 	for _, name := range PolarisSkillNames {
 		dir := filepath.Join(baseDir, name)
@@ -512,7 +512,7 @@ func PrintPostInstallInstructions(editor, location string) {
 		return
 	}
 
-	fmt.Printf("\n✓ Relynce skills installed for %s\n\n", editor)
+	fmt.Printf("\n✓ Revelara skills installed for %s\n\n", editor)
 
 	if def.AgentsDir != "" {
 		fmt.Printf("Skills and agents installed to: %s\n\n", location)
@@ -533,7 +533,7 @@ func installAll(projectRoot string) {
 	if len(editors) == 0 {
 		fmt.Println("No supported editors detected.")
 		fmt.Printf("Supported: %s\n", EditorNames())
-		fmt.Println("\nInstall an editor CLI, then run: rely plugin install --all")
+		fmt.Println("\nInstall an editor CLI, then run: rvl plugin install --all")
 		return
 	}
 
@@ -574,7 +574,7 @@ func CmdPlugin(args []string) {
 	editorList := EditorNames()
 
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: rely plugin <command>\n\nCommands:\n  install <editor>            Install skills for editor (%s)\n  install <editor> --project  Install to current project directory\n  install --all               Auto-detect and install to all editors\n  install --all --project     Auto-detect and install project-locally\n  update [editor]             Update skills to latest version\n  update --all                Update all installed plugins\n  list                        List installed skills\n  editors                     List all supported editors\n  remove <editor>             Remove installed skills\n  remove <editor> --project   Remove project-local skills\n\nExamples:\n  rely plugin install claude         Install Claude Code plugin\n  rely plugin install gemini --project  Install to project directory\n  rely plugin install --all          Install to all detected editors\n  rely plugin update                 Update all installed plugins\n  rely plugin editors                Show all supported editors\n  rely plugin list                   Show installed plugins\n", editorList)
+		fmt.Fprintf(os.Stderr, "Usage: rvl plugin <command>\n\nCommands:\n  install <editor>            Install skills for editor (%s)\n  install <editor> --project  Install to current project directory\n  install --all               Auto-detect and install to all editors\n  install --all --project     Auto-detect and install project-locally\n  update [editor]             Update skills to latest version\n  update --all                Update all installed plugins\n  list                        List installed skills\n  editors                     List all supported editors\n  remove <editor>             Remove installed skills\n  remove <editor> --project   Remove project-local skills\n\nExamples:\n  rvl plugin install claude         Install Claude Code plugin\n  rvl plugin install gemini --project  Install to project directory\n  rvl plugin install --all          Install to all detected editors\n  rvl plugin update                 Update all installed plugins\n  rvl plugin editors                Show all supported editors\n  rvl plugin list                   Show installed plugins\n", editorList)
 		os.Exit(1)
 	}
 
@@ -596,8 +596,8 @@ func CmdPlugin(args []string) {
 	case "install":
 		if len(subArgs) < 1 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
-			fmt.Fprintln(os.Stderr, "Usage: rely plugin install <editor> [--project]")
-			fmt.Fprintln(os.Stderr, "       rely plugin install --all [--project]")
+			fmt.Fprintln(os.Stderr, "Usage: rvl plugin install <editor> [--project]")
+			fmt.Fprintln(os.Stderr, "       rvl plugin install --all [--project]")
 			fmt.Fprintf(os.Stderr, "Available: %s\n", editorList)
 			os.Exit(1)
 		}
@@ -626,7 +626,7 @@ func CmdPlugin(args []string) {
 	case "remove", "uninstall":
 		if len(subArgs) < 1 {
 			fmt.Fprintln(os.Stderr, "Error: editor name required")
-			fmt.Fprintln(os.Stderr, "Usage: rely plugin remove <editor> [--project]")
+			fmt.Fprintln(os.Stderr, "Usage: rvl plugin remove <editor> [--project]")
 			os.Exit(1)
 		}
 		editor := subArgs[0]
@@ -636,7 +636,7 @@ func CmdPlugin(args []string) {
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown plugin command: %s\n", args[0])
-		fmt.Fprintln(os.Stderr, "Usage: rely plugin <install|update|list|editors|remove>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl plugin <install|update|list|editors|remove>")
 		os.Exit(1)
 	}
 }

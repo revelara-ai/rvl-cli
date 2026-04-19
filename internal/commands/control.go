@@ -58,10 +58,10 @@ func CmdControl(args []string) {
 }
 
 func printControlUsage() {
-	fmt.Println(`rely control - Query reliability controls catalog
+	fmt.Println(`rvl control - Query reliability controls catalog
 
 Usage:
-  rely control <subcommand> [options]
+  rvl control <subcommand> [options]
 
 Subcommands:
   list              List controls in the catalog
@@ -72,10 +72,10 @@ List Options:
   --limit=<n>       Maximum results (default 50)
 
 Examples:
-  rely control list
-  rely control list --category=fault_tolerance
-  rely control show RC-018
-  rely control show RC-019`)
+  rvl control list
+  rvl control list --category=fault_tolerance
+  rvl control show RC-018
+  rvl control show RC-019`)
 }
 
 func cmdControlList(args []string) {
@@ -118,13 +118,13 @@ func cmdControlList(args []string) {
 func cmdControlShow(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: control code required")
-		fmt.Fprintln(os.Stderr, "Usage: rely control show <control-code>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl control show <control-code>")
 		os.Exit(1)
 	}
 	controlCode := args[0]
 	if strings.HasPrefix(controlCode, "R-") && !strings.HasPrefix(controlCode, "RC-") {
 		fmt.Fprintf(os.Stderr, "Note: \"%s\" is a risk code, not a control code (RC-XXX).\n", controlCode)
-		fmt.Fprintf(os.Stderr, "Use \"rely risk show %s\" to see its mapped controls.\n", controlCode)
+		fmt.Fprintf(os.Stderr, "Use \"rvl risk show %s\" to see its mapped controls.\n", controlCode)
 		os.Exit(1)
 	}
 	cfg := api.LoadAndResolveConfig()

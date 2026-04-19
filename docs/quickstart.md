@@ -1,12 +1,12 @@
-# Relynce Quickstart Guide
+# Revelara Quickstart Guide
 
-## Welcome to Relynce
+## Welcome to Revelara
 
-Relynce is a reliability risk analysis platform that works in your browser and your IDE. Whether you're a developer, SRE, or engineering leader, Relynce gives you the insights you need to build more resilient systems.
+Revelara is a reliability risk analysis platform that works in your browser and your IDE. Whether you're a developer, SRE, or engineering leader, Revelara gives you the insights you need to build more resilient systems.
 
 ## Accepting Your Invite and First Login
 
-Relynce is currently invite-only. You'll receive an email invitation with a link to get started.
+Revelara is currently invite-only. You'll receive an email invitation with a link to get started.
 
 1. **Click the link** in your invitation email
 2. **Create your account** — sign up with Google, GitHub, Microsoft, or email and password
@@ -15,7 +15,7 @@ Relynce is currently invite-only. You'll receive an email invitation with a link
 
 ## Your First Look Around
 
-Relynce has five main sections accessible from the top navigation:
+Revelara has five main sections accessible from the top navigation:
 
 **Analysis** — Chat-based incident exploration. Ask questions about your organization's historical incidents and get AI-powered answers with sources cited.
 
@@ -31,18 +31,18 @@ If you belong to multiple organizations, use the organization switcher in the he
 
 ## Setting Up Claude Code Integration
 
-The Claude Code integration is how you scan your codebase for reliability risks. These scan results feed into the risk register, map to compliance controls, and populate the dashboards you see in the web UI. To get the most out of Relynce, you'll want to set this up.
+The Claude Code integration is how you scan your codebase for reliability risks. These scan results feed into the risk register, map to compliance controls, and populate the dashboards you see in the web UI. To get the most out of Revelara, you'll want to set this up.
 
 ### Prerequisites
 
 - Claude Code installed and working on your machine
-- A Relynce API key (create one below before installing the CLI)
+- A Revelara API key (create one below before installing the CLI)
 
 ### Step 1: Create an API Key
 
-You'll need an API key to connect the CLI to your Relynce account.
+You'll need an API key to connect the CLI to your Revelara account.
 
-1. Log in to Relynce at [dev.relynce.ai](https://dev.relynce.ai)
+1. Log in to Revelara at [dev.revelara.ai](https://dev.revelara.ai)
 2. Click your profile picture in the top-right corner
 3. Go to **API Keys**
 4. Click **Create New Key**
@@ -52,10 +52,10 @@ You'll need an API key to connect the CLI to your Relynce account.
 
 ### Step 2: Install the CLI
 
-Install the Relynce command-line tool:
+Install the Revelara command-line tool:
 
 ```bash
-go install github.com/relynce/rely-cli/cmd/rely@latest
+go install github.com/relynce/rely-cli/cmd/rvl@latest
 ```
 
 Or download a pre-built binary from the [releases page](https://github.com/relynce/rely-cli/releases).
@@ -65,7 +65,7 @@ Or download a pre-built binary from the [releases page](https://github.com/relyn
 Run the interactive setup — you'll need the API key you copied in Step 1:
 
 ```bash
-rely login
+rvl login
 ```
 
 You'll be prompted for your API URL, API Key, and Organization name.
@@ -73,7 +73,7 @@ You'll be prompted for your API URL, API Key, and Organization name.
 ### Step 4: Verify Your Setup
 
 ```bash
-rely status
+rvl status
 ```
 
 You should see a message confirming your connection.
@@ -83,20 +83,20 @@ You should see a message confirming your connection.
 From within your project's git repository, run:
 
 ```bash
-rely init
+rvl init
 ```
 
-This creates a `.relynce.yaml` project configuration file and installs the Relynce skills for Claude Code.
+This creates a `.revelara.yaml` project configuration file and installs the Revelara skills for Claude Code.
 
 You can also run non-interactively:
 
 ```bash
-rely init --project my-service -y
+rvl init --project my-service -y
 ```
 
-#### Understanding `.relynce.yaml`
+#### Understanding `.revelara.yaml`
 
-The `.relynce.yaml` file identifies your project:
+The `.revelara.yaml` file identifies your project:
 
 ```yaml
 project: my-service
@@ -117,21 +117,21 @@ components:
 Scan your codebase to identify potential reliability issues:
 
 ```
-/rely:detect-risks
+/rvl:detect-risks
 ```
 
-This runs a full scan and saves findings to the risk register. The service name is auto-detected from your `.relynce.yaml`.
+This runs a full scan and saves findings to the risk register. The service name is auto-detected from your `.revelara.yaml`.
 
 You can also scan a different project from your current session:
 
 ```
-/rely:detect-risks /path/to/other-project
+/rvl:detect-risks /path/to/other-project
 ```
 
 For a quick read-only assessment without saving results:
 
 ```
-/rely:risk-check my-service
+/rvl:risk-check my-service
 ```
 
 ### Understand: Learn What the Risk Means
@@ -139,19 +139,19 @@ For a quick read-only assessment without saving results:
 Get context on detected risks and learn how to fix them:
 
 ```
-/rely:control-guidance RC-015
+/rvl:control-guidance RC-015
 ```
 
 Search historical incidents for patterns related to your risk:
 
 ```
-/rely:incident-patterns "database failover"
+/rvl:incident-patterns "database failover"
 ```
 
 Load reliability context for your entire session:
 
 ```
-/rely:sre-context
+/rvl:sre-context
 ```
 
 Or visit the **Risks** tab in the web UI to browse the full risk register and see recommended actions.
@@ -161,35 +161,35 @@ Or visit the **Risks** tab in the web UI to browse the full risk register and se
 1. Implement the fix recommended in the control guidance
 2. Submit evidence that you've addressed the control:
    ```
-   /rely:submit-evidence RC-015
+   /rvl:submit-evidence RC-015
    ```
 3. Review your changes for remaining reliability issues:
    ```
-   /rely:reliability-review
+   /rvl:reliability-review
    ```
 
 ## Quick Reference: All Skills
 
 | Skill | Description |
 |-------|-------------|
-| `/rely:detect-risks [service or path]` | Full codebase scan, saves risks to the register |
-| `/rely:risk-check <service>` | Quick assessment without saving results |
-| `/rely:control-guidance RC-XXX` | Implementation guidance for a specific control |
-| `/rely:reliability-review` | Analyze your git diff for reliability issues |
-| `/rely:incident-patterns <query>` | Search historical incidents for patterns |
-| `/rely:sre-context` | Load full reliability context for your session |
-| `/rely:submit-evidence RC-XXX` | Record that you've implemented a control |
-| `/rely:list-open` | List open risks assigned to you |
+| `/rvl:detect-risks [service or path]` | Full codebase scan, saves risks to the register |
+| `/rvl:risk-check <service>` | Quick assessment without saving results |
+| `/rvl:control-guidance RC-XXX` | Implementation guidance for a specific control |
+| `/rvl:reliability-review` | Analyze your git diff for reliability issues |
+| `/rvl:incident-patterns <query>` | Search historical incidents for patterns |
+| `/rvl:sre-context` | Load full reliability context for your session |
+| `/rvl:submit-evidence RC-XXX` | Record that you've implemented a control |
+| `/rvl:list-open` | List open risks assigned to you |
 
 ## Troubleshooting
 
 **"Not configured" error**
 
-Run `rely login` to set up your CLI credentials.
+Run `rvl login` to set up your CLI credentials.
 
 **"Connection failed" error**
 
-Check that the Relynce server is reachable. Verify your API URL is correct with `rely status`.
+Check that the Revelara server is reachable. Verify your API URL is correct with `rvl status`.
 
 **"Invalid or expired API key" error**
 
@@ -201,11 +201,11 @@ Your API key may not have the required permissions. Delete the old key and creat
 
 **Skills don't show up in Claude Code**
 
-Run `rely init` to install skills. If you've already run init, try `rely init --force` to reinstall. Restart Claude Code if needed.
+Run `rvl init` to install skills. If you've already run init, try `rvl init --force` to reinstall. Restart Claude Code if needed.
 
 ## Next Steps
 
-1. **Run Your First Scan** — Run `/rely:detect-risks` on one of your team's services. This populates the risk register and compliance dashboards.
+1. **Run Your First Scan** — Run `/rvl:detect-risks` on one of your team's services. This populates the risk register and compliance dashboards.
 
 2. **Upload Your Postmortems** — Go to Documents and upload your team's incident reports and RCAs.
 
@@ -215,4 +215,4 @@ Run `rely init` to install skills. If you've already run init, try `rely init --
 
 ## Questions?
 
-If you get stuck, check the [Troubleshooting](#troubleshooting) section above or reach out to your Relynce administrator.
+If you get stuck, check the [Troubleshooting](#troubleshooting) section above or reach out to your Revelara administrator.

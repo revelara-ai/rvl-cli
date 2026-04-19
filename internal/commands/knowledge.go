@@ -245,10 +245,10 @@ func CmdKnowledge(args []string) {
 }
 
 func printKnowledgeUsage() {
-	fmt.Println(`rely knowledge - Query organizational knowledge base
+	fmt.Println(`rvl knowledge - Query organizational knowledge base
 
 Usage:
-  rely knowledge <subcommand> [options]
+  rvl knowledge <subcommand> [options]
 
 Subcommands:
   enrich              Fetch patterns, procedures, and health in one call
@@ -270,10 +270,10 @@ Enrich Options:
   --limit=<n>         Maximum results per section (default 10)
 
 Search Options:
-  rely knowledge search <query> [--limit=N]
+  rvl knowledge search <query> [--limit=N]
 
 Graph-Search Options:
-  rely knowledge graph-search <query> [--limit=N] [--depth=N] [--types=causes,mitigates]
+  rvl knowledge graph-search <query> [--limit=N] [--depth=N] [--types=causes,mitigates]
 
 Facts Options:
   --vertical=<v>      Filter by SRE vertical (e.g., fault-tolerance, monitoring-alerting)
@@ -295,36 +295,36 @@ Patterns Options:
   --limit=<n>         Maximum results (default 20)
 
 Relationships Options:
-  rely knowledge relationships <entity_type> <entity_id>
+  rvl knowledge relationships <entity_type> <entity_id>
   Entity types: fact, procedure, pattern, service, technology, control
 
 Graph Options:
-  rely knowledge graph <entity_type> <entity_id> [--depth=N] [--min-strength=0.3] [--type=causes,mitigates]
+  rvl knowledge graph <entity_type> <entity_id> [--depth=N] [--min-strength=0.3] [--type=causes,mitigates]
 
 Foresight Options:
-  rely knowledge foresight --entity-type=<type> --entity-id=<id> [--depth=N] [--min-strength=0.3]
+  rvl knowledge foresight --entity-type=<type> --entity-id=<id> [--depth=N] [--min-strength=0.3]
                            [--include-mitigations] [--relation-types=causes,depends_on] [--format=table|json]
 
 Examples:
-  rely knowledge enrich --vertical=fault-tolerance
-  rely knowledge enrich --control=RC-018 --query="timeout failure"
-  rely knowledge search "circuit breaker timeout patterns"
-  rely knowledge graph-search "timeout failures" --depth=2
-  rely knowledge facts --vertical=fault-tolerance --technology=go
-  rely knowledge procedures --control=RC-018
-  rely knowledge patterns --type=failure_mode --min-occurrences=3
-  rely knowledge relationships fact fact_abc12
-  rely knowledge graph fact fact_abc12 --depth=2 --type=causes,mitigates
-  rely knowledge foresight --entity-type=service --entity-id=checkout-api --include-mitigations
-  rely knowledge foresight --entity-type=pattern --entity-id=pattern_abc12 --depth=5 --format=json
-  rely knowledge health`)
+  rvl knowledge enrich --vertical=fault-tolerance
+  rvl knowledge enrich --control=RC-018 --query="timeout failure"
+  rvl knowledge search "circuit breaker timeout patterns"
+  rvl knowledge graph-search "timeout failures" --depth=2
+  rvl knowledge facts --vertical=fault-tolerance --technology=go
+  rvl knowledge procedures --control=RC-018
+  rvl knowledge patterns --type=failure_mode --min-occurrences=3
+  rvl knowledge relationships fact fact_abc12
+  rvl knowledge graph fact fact_abc12 --depth=2 --type=causes,mitigates
+  rvl knowledge foresight --entity-type=service --entity-id=checkout-api --include-mitigations
+  rvl knowledge foresight --entity-type=pattern --entity-id=pattern_abc12 --depth=5 --format=json
+  rvl knowledge health`)
 }
 
 // cmdKnowledgeSearch performs a semantic search across all knowledge types
 func cmdKnowledgeSearch(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: search query required")
-		fmt.Fprintln(os.Stderr, "Usage: rely knowledge search <query> [--limit=N]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl knowledge search <query> [--limit=N]")
 		os.Exit(1)
 	}
 
@@ -650,7 +650,7 @@ func cmdKnowledgeHealth() {
 func cmdKnowledgeRelationships(args []string) {
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "Error: entity type and entity ID required")
-		fmt.Fprintln(os.Stderr, "Usage: rely knowledge relationships <type> <id>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl knowledge relationships <type> <id>")
 		fmt.Fprintln(os.Stderr, "Types: fact, procedure, pattern, service, technology, control")
 		os.Exit(1)
 	}
@@ -701,7 +701,7 @@ func cmdKnowledgeRelationships(args []string) {
 func cmdKnowledgeGraph(args []string) {
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "Error: entity type and entity ID required")
-		fmt.Fprintln(os.Stderr, "Usage: rely knowledge graph <type> <id> [--depth=N] [--min-strength=0.3] [--type=causes,mitigates]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl knowledge graph <type> <id> [--depth=N] [--min-strength=0.3] [--type=causes,mitigates]")
 		os.Exit(1)
 	}
 
@@ -798,7 +798,7 @@ func cmdKnowledgeForesight(args []string) {
 
 	if entityType == "" || entityID == "" {
 		fmt.Fprintln(os.Stderr, "Error: --entity-type and --entity-id are required")
-		fmt.Fprintln(os.Stderr, "Usage: rely knowledge foresight --entity-type=<type> --entity-id=<id> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl knowledge foresight --entity-type=<type> --entity-id=<id> [options]")
 		fmt.Fprintln(os.Stderr, "Entity types: service, fact, procedure, pattern, technology, control, incident, risk")
 		os.Exit(1)
 	}
@@ -897,7 +897,7 @@ func formatForesightDelay(seconds int) string {
 func cmdKnowledgeGraphSearch(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: search query required")
-		fmt.Fprintln(os.Stderr, "Usage: rely knowledge graph-search <query> [--limit=N] [--depth=N] [--types=causes,mitigates]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl knowledge graph-search <query> [--limit=N] [--depth=N] [--types=causes,mitigates]")
 		os.Exit(1)
 	}
 

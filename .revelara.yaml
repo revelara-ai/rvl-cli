@@ -1,4 +1,4 @@
-# Relynce project configuration
+# Revelara project configuration
 # Used by detect-risks and reliability-review skills for consistent service naming
 project: rely-cli
 components:

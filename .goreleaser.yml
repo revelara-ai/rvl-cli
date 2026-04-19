@@ -1,8 +1,8 @@
 version: 2
 
 builds:
-  - main: ./cmd/rely
-    binary: rely
+  - main: ./cmd/rvl
+    binary: rvl
     env:
       - CGO_ENABLED=0
     ldflags:
@@ -19,7 +19,7 @@ builds:
 
 archives:
   - format: tar.gz
-    name_template: "rely_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "rvl_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         format: zip

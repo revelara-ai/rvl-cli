@@ -178,7 +178,7 @@ func CmdRisk(args []string) {
 }
 
 func printRiskUsage() {
-	fmt.Println(`Usage: rely risk <command> [options]
+	fmt.Println(`Usage: rvl risk <command> [options]
 
 Commands:
   list                    List all risks in the register
@@ -198,13 +198,13 @@ Options:
   --limit <n>            Number of results (for ready command, default: 10)
 
 Examples:
-  rely risk list
-  rely risk list --status detected --service polaris
-  rely risk ready
-  rely risk ready --limit 20 --category change_management
-  rely risk show R-001
-  rely risk context R-001
-  rely risk resolve R-001`)
+  rvl risk list
+  rvl risk list --status detected --service polaris
+  rvl risk ready
+  rvl risk ready --limit 20 --category change_management
+  rvl risk show R-001
+  rvl risk context R-001
+  rvl risk resolve R-001`)
 }
 
 // CmdRiskList lists all risks in the register
@@ -428,7 +428,7 @@ func parseInt(s string) int {
 // CmdRiskShow shows detailed information about a specific risk
 func CmdRiskShow(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely risk show <risk-code>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl risk show <risk-code>")
 		os.Exit(1)
 	}
 
@@ -534,7 +534,7 @@ func CmdRiskShow(args []string) {
 // CmdRiskContext shows full context for a risk
 func CmdRiskContext(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely risk context <risk-code>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl risk context <risk-code>")
 		os.Exit(1)
 	}
 
@@ -811,7 +811,7 @@ func CmdRiskStale(args []string) {
 // CmdRiskResolve marks a risk as resolved
 func CmdRiskResolve(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely risk resolve <risk-code> [--reason \"...\"]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl risk resolve <risk-code> [--reason \"...\"]")
 		os.Exit(1)
 	}
 
@@ -848,7 +848,7 @@ func CmdRiskResolve(args []string) {
 // CmdRiskAccept accepts a risk (intentional decision to retain)
 func CmdRiskAccept(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely risk accept <risk-code> [--reason \"...\"]")
+		fmt.Fprintln(os.Stderr, "Usage: rvl risk accept <risk-code> [--reason \"...\"]")
 		os.Exit(1)
 	}
 

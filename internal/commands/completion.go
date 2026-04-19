@@ -29,10 +29,10 @@ func CmdCompletion(args []string) {
 }
 
 func printCompletionUsage() {
-	fmt.Println(`rely completion - Generate shell completion scripts
+	fmt.Println(`rvl completion - Generate shell completion scripts
 
 Usage:
-  rely completion <shell>
+  rvl completion <shell>
 
 Shells:
   bash    Generate bash completion script
@@ -41,19 +41,19 @@ Shells:
 
 Setup:
   # Bash (add to ~/.bashrc)
-  eval "$(rely completion bash)"
+  eval "$(rvl completion bash)"
 
   # Zsh (add to ~/.zshrc)
-  eval "$(rely completion zsh)"
+  eval "$(rvl completion zsh)"
 
   # Fish
-  rely completion fish | source
+  rvl completion fish | source
   # Or persist:
-  rely completion fish > ~/.config/fish/completions/rely.fish`)
+  rvl completion fish > ~/.config/fish/completions/rvl.fish`)
 }
 
-const bashCompletion = `# rely bash completion
-_rely() {
+const bashCompletion = `# rvl bash completion
+_rvl() {
     local cur prev commands
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -62,7 +62,7 @@ _rely() {
     commands="init login logout status scan risk control knowledge evidence commands plugin completion config version help"
 
     case "${prev}" in
-        rely)
+        rvl)
             COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
             return 0
             ;;
@@ -106,19 +106,19 @@ _rely() {
             ;;
     esac
 }
-complete -F _rely rely
+complete -F _rvl rvl
 `
 
-const zshCompletion = `#compdef rely
+const zshCompletion = `#compdef rvl
 
-_rely() {
+_rvl() {
     local -a commands
     commands=(
-        'init:Initialize Relynce for this repository'
+        'init:Initialize Revelara for this repository'
         'login:Configure credentials interactively'
         'logout:Remove stored credentials'
         'status:Check connection and authentication status'
-        'scan:Submit risk findings to Relynce'
+        'scan:Submit risk findings to Revelara'
         'risk:Manage risk lifecycle'
         'control:Query reliability controls catalog'
         'knowledge:Query organizational knowledge base'
@@ -167,70 +167,70 @@ _rely() {
     fi
 }
 
-_rely "$@"
+_rvl "$@"
 `
 
-const fishCompletion = `# rely fish completion
+const fishCompletion = `# rvl fish completion
 
 # Disable file completions by default
-complete -c rely -f
+complete -c rvl -f
 
 # Top-level commands
-complete -c rely -n "__fish_use_subcommand" -a "init" -d "Initialize Relynce for this repository"
-complete -c rely -n "__fish_use_subcommand" -a "login" -d "Configure credentials interactively"
-complete -c rely -n "__fish_use_subcommand" -a "logout" -d "Remove stored credentials"
-complete -c rely -n "__fish_use_subcommand" -a "status" -d "Check connection and authentication status"
-complete -c rely -n "__fish_use_subcommand" -a "scan" -d "Submit risk findings to Relynce"
-complete -c rely -n "__fish_use_subcommand" -a "risk" -d "Manage risk lifecycle"
-complete -c rely -n "__fish_use_subcommand" -a "control" -d "Query reliability controls catalog"
-complete -c rely -n "__fish_use_subcommand" -a "knowledge" -d "Query organizational knowledge base"
-complete -c rely -n "__fish_use_subcommand" -a "evidence" -d "Manage control evidence"
-complete -c rely -n "__fish_use_subcommand" -a "commands" -d "List available skills and agents"
-complete -c rely -n "__fish_use_subcommand" -a "plugin" -d "Manage editor plugins"
-complete -c rely -n "__fish_use_subcommand" -a "completion" -d "Generate shell completion scripts"
-complete -c rely -n "__fish_use_subcommand" -a "config" -d "Manage configuration"
-complete -c rely -n "__fish_use_subcommand" -a "version" -d "Show version information"
-complete -c rely -n "__fish_use_subcommand" -a "help" -d "Show help message"
+complete -c rvl -n "__fish_use_subcommand" -a "init" -d "Initialize Revelara for this repository"
+complete -c rvl -n "__fish_use_subcommand" -a "login" -d "Configure credentials interactively"
+complete -c rvl -n "__fish_use_subcommand" -a "logout" -d "Remove stored credentials"
+complete -c rvl -n "__fish_use_subcommand" -a "status" -d "Check connection and authentication status"
+complete -c rvl -n "__fish_use_subcommand" -a "scan" -d "Submit risk findings to Revelara"
+complete -c rvl -n "__fish_use_subcommand" -a "risk" -d "Manage risk lifecycle"
+complete -c rvl -n "__fish_use_subcommand" -a "control" -d "Query reliability controls catalog"
+complete -c rvl -n "__fish_use_subcommand" -a "knowledge" -d "Query organizational knowledge base"
+complete -c rvl -n "__fish_use_subcommand" -a "evidence" -d "Manage control evidence"
+complete -c rvl -n "__fish_use_subcommand" -a "commands" -d "List available skills and agents"
+complete -c rvl -n "__fish_use_subcommand" -a "plugin" -d "Manage editor plugins"
+complete -c rvl -n "__fish_use_subcommand" -a "completion" -d "Generate shell completion scripts"
+complete -c rvl -n "__fish_use_subcommand" -a "config" -d "Manage configuration"
+complete -c rvl -n "__fish_use_subcommand" -a "version" -d "Show version information"
+complete -c rvl -n "__fish_use_subcommand" -a "help" -d "Show help message"
 
 # risk subcommands
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "list" -d "List risks"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "show" -d "Show risk details"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "stale" -d "List stale risks"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "close" -d "Close a risk"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "resolve" -d "Mark risk as resolved"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "acknowledge" -d "Acknowledge risks"
-complete -c rely -n "__fish_seen_subcommand_from risk" -a "accept" -d "Accept risk"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "list" -d "List risks"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "show" -d "Show risk details"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "stale" -d "List stale risks"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "close" -d "Close a risk"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "resolve" -d "Mark risk as resolved"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "acknowledge" -d "Acknowledge risks"
+complete -c rvl -n "__fish_seen_subcommand_from risk" -a "accept" -d "Accept risk"
 
 # control subcommands
-complete -c rely -n "__fish_seen_subcommand_from control" -a "list" -d "List controls"
-complete -c rely -n "__fish_seen_subcommand_from control" -a "show" -d "Show control details"
+complete -c rvl -n "__fish_seen_subcommand_from control" -a "list" -d "List controls"
+complete -c rvl -n "__fish_seen_subcommand_from control" -a "show" -d "Show control details"
 
 # knowledge subcommands
-complete -c rely -n "__fish_seen_subcommand_from knowledge" -a "search" -d "Search knowledge base"
-complete -c rely -n "__fish_seen_subcommand_from knowledge" -a "procedures" -d "List procedures"
-complete -c rely -n "__fish_seen_subcommand_from knowledge" -a "patterns" -d "List patterns"
+complete -c rvl -n "__fish_seen_subcommand_from knowledge" -a "search" -d "Search knowledge base"
+complete -c rvl -n "__fish_seen_subcommand_from knowledge" -a "procedures" -d "List procedures"
+complete -c rvl -n "__fish_seen_subcommand_from knowledge" -a "patterns" -d "List patterns"
 
 # evidence subcommands
-complete -c rely -n "__fish_seen_subcommand_from evidence" -a "submit" -d "Submit evidence"
-complete -c rely -n "__fish_seen_subcommand_from evidence" -a "list" -d "List evidence"
-complete -c rely -n "__fish_seen_subcommand_from evidence" -a "verify" -d "Verify evidence"
+complete -c rvl -n "__fish_seen_subcommand_from evidence" -a "submit" -d "Submit evidence"
+complete -c rvl -n "__fish_seen_subcommand_from evidence" -a "list" -d "List evidence"
+complete -c rvl -n "__fish_seen_subcommand_from evidence" -a "verify" -d "Verify evidence"
 
 # commands options
-complete -c rely -n "__fish_seen_subcommand_from commands" -l "skills" -d "Show only skills"
-complete -c rely -n "__fish_seen_subcommand_from commands" -l "agents" -d "Show only agents"
+complete -c rvl -n "__fish_seen_subcommand_from commands" -l "skills" -d "Show only skills"
+complete -c rvl -n "__fish_seen_subcommand_from commands" -l "agents" -d "Show only agents"
 
 # plugin subcommands
-complete -c rely -n "__fish_seen_subcommand_from plugin" -a "install" -d "Install plugin for editor"
-complete -c rely -n "__fish_seen_subcommand_from plugin" -a "update" -d "Update plugin(s)"
-complete -c rely -n "__fish_seen_subcommand_from plugin" -a "list" -d "List installed plugins"
-complete -c rely -n "__fish_seen_subcommand_from plugin" -a "remove" -d "Remove installed plugin"
+complete -c rvl -n "__fish_seen_subcommand_from plugin" -a "install" -d "Install plugin for editor"
+complete -c rvl -n "__fish_seen_subcommand_from plugin" -a "update" -d "Update plugin(s)"
+complete -c rvl -n "__fish_seen_subcommand_from plugin" -a "list" -d "List installed plugins"
+complete -c rvl -n "__fish_seen_subcommand_from plugin" -a "remove" -d "Remove installed plugin"
 
 # config subcommands
-complete -c rely -n "__fish_seen_subcommand_from config" -a "show" -d "Show configuration"
-complete -c rely -n "__fish_seen_subcommand_from config" -a "set" -d "Set a configuration value"
+complete -c rvl -n "__fish_seen_subcommand_from config" -a "show" -d "Show configuration"
+complete -c rvl -n "__fish_seen_subcommand_from config" -a "set" -d "Set a configuration value"
 
 # completion subcommands
-complete -c rely -n "__fish_seen_subcommand_from completion" -a "bash" -d "Generate bash completions"
-complete -c rely -n "__fish_seen_subcommand_from completion" -a "zsh" -d "Generate zsh completions"
-complete -c rely -n "__fish_seen_subcommand_from completion" -a "fish" -d "Generate fish completions"
+complete -c rvl -n "__fish_seen_subcommand_from completion" -a "bash" -d "Generate bash completions"
+complete -c rvl -n "__fish_seen_subcommand_from completion" -a "zsh" -d "Generate zsh completions"
+complete -c rvl -n "__fish_seen_subcommand_from completion" -a "fish" -d "Generate fish completions"
 `

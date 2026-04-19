@@ -3,7 +3,7 @@ package project
 import "strings"
 
 // MapFindingsToComponents sets linked_services on each finding based on
-// evidence paths matched against .relynce.yaml components. Uses longest-prefix
+// evidence paths matched against .revelara.yaml components. Uses longest-prefix
 // matching so nested paths (e.g. services/x/frontend/) beat parent paths.
 func MapFindingsToComponents(findings []interface{}, projectCfg *ProjectConfig) {
 	if projectCfg == nil || len(projectCfg.Components) == 0 {

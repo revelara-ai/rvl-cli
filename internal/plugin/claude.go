@@ -11,7 +11,7 @@ import (
 	"github.com/relynce/rely-cli/internal/project"
 )
 
-// CleanupOldClaudeInstallations removes old Relynce installations from Claude Code directories
+// CleanupOldClaudeInstallations removes old Revelara installations from Claude Code directories
 func CleanupOldClaudeInstallations() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -21,7 +21,7 @@ func CleanupOldClaudeInstallations() error {
 	// Remove old commands from ~/.claude/commands/polaris/
 	oldCommandsDir := filepath.Join(home, ".claude", "commands", "polaris")
 	if _, err := os.Stat(oldCommandsDir); err == nil {
-		fmt.Printf("Removing old Relynce commands from %s...\n", oldCommandsDir)
+		fmt.Printf("Removing old Revelara commands from %s...\n", oldCommandsDir)
 		if err := os.RemoveAll(oldCommandsDir); err != nil {
 			return fmt.Errorf("remove old commands: %w", err)
 		}
@@ -38,9 +38,9 @@ func InstallClaudePlugin(version string, tarballData []byte) error {
 		return fmt.Errorf("get home directory: %w", err)
 	}
 
-	// Create local marketplace structure at ~/.relynce/marketplace
-	marketplaceDir := filepath.Join(home, ".relynce", "marketplace")
-	pluginDir := filepath.Join(marketplaceDir, "plugins", "relynce")
+	// Create local marketplace structure at ~/.revelara/marketplace
+	marketplaceDir := filepath.Join(home, ".revelara", "marketplace")
+	pluginDir := filepath.Join(marketplaceDir, "plugins", "revelara")
 
 	// Clean up existing installation
 	if err := os.RemoveAll(marketplaceDir); err != nil && !os.IsNotExist(err) {
@@ -61,24 +61,24 @@ func InstallClaudePlugin(version string, tarballData []byte) error {
 	// Create marketplace.json
 	marketplaceJSON := fmt.Sprintf(`{
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "relynce-local",
-  "description": "Relynce plugin for reliability risk analysis",
+  "name": "revelara-local",
+  "description": "Revelara plugin for reliability risk analysis",
   "owner": {
-    "name": "Relynce",
-    "email": "team@relynce.ai"
+    "name": "Revelara",
+    "email": "team@revelara.ai"
   },
   "plugins": [
     {
-      "name": "relynce",
+      "name": "revelara",
       "version": "%s",
       "description": "Reliability risk analysis and incident prevention for engineering teams",
       "author": {
-        "name": "Relynce",
-        "email": "team@relynce.ai"
+        "name": "Revelara",
+        "email": "team@revelara.ai"
       },
-      "source": "./plugins/relynce",
+      "source": "./plugins/revelara",
       "category": "development",
-      "homepage": "https://docs.relynce.ai"
+      "homepage": "https://docs.revelara.ai"
     }
   ]
 }`, version)
@@ -96,8 +96,8 @@ func InstallClaudePlugin(version string, tarballData []byte) error {
 	fmt.Println("✓ Created local marketplace")
 
 	// Remove old marketplace if it exists
-	fmt.Println("Removing old Relynce marketplace (if exists)...")
-	cmd := exec.Command("claude", "plugin", "marketplace", "remove", "relynce-local")
+	fmt.Println("Removing old Revelara marketplace (if exists)...")
+	cmd := exec.Command("claude", "plugin", "marketplace", "remove", "revelara-local")
 	cmd.Run() // Ignore error - marketplace might not exist
 
 	// Add marketplace using claude CLI
@@ -111,7 +111,7 @@ func InstallClaudePlugin(version string, tarballData []byte) error {
 
 	// Install plugin using claude CLI
 	fmt.Println("Installing plugin...")
-	cmd = exec.Command("claude", "plugin", "install", "relynce@relynce-local")
+	cmd = exec.Command("claude", "plugin", "install", "revelara@revelara-local")
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("install plugin: %w\nOutput: %s", err, string(output))
@@ -136,8 +136,8 @@ func InstallClaudePlugin(version string, tarballData []byte) error {
 		}
 	}
 
-	fmt.Printf("\n✅ Relynce plugin successfully installed!\n")
-	fmt.Printf("Commands are now available: /rely:scan, /rely:fix, /rely:ask, etc.\n")
+	fmt.Printf("\n✅ Revelara plugin successfully installed!\n")
+	fmt.Printf("Commands are now available: /rvl:scan, /rvl:fix, /rvl:ask, etc.\n")
 	fmt.Printf("\nRestart Claude Code to ensure all commands are loaded.\n")
 
 	return nil
@@ -193,7 +193,7 @@ func RegisterWithClaudeCode(version, installPath string) error {
 	}
 
 	// Use key format: plugin@source
-	key := "rely@relynce-api"
+	key := "rvl@revelara-api"
 	reg.Plugins[key] = []pluginEntry{entry}
 
 	// Save registry
@@ -281,7 +281,7 @@ func DisablePluginInSettings(pluginKey string) error {
 // It runs the claude CLI uninstall, removes the marketplace, and deregisters.
 func removeClaudePlugin(home string) error {
 	fmt.Println("Uninstalling plugin via Claude Code CLI...")
-	cmd := exec.Command("claude", "plugin", "uninstall", "rely@relynce-local")
+	cmd := exec.Command("claude", "plugin", "uninstall", "rvl@revelara-local")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: claude plugin uninstall failed: %v\n", err)
@@ -290,7 +290,7 @@ func removeClaudePlugin(home string) error {
 		fmt.Println(string(output))
 	}
 
-	marketplaceDir := filepath.Join(home, ".relynce", "marketplace")
+	marketplaceDir := filepath.Join(home, ".revelara", "marketplace")
 	if err := os.RemoveAll(marketplaceDir); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not remove marketplace: %v\n", err)
 	} else {
@@ -298,7 +298,7 @@ func removeClaudePlugin(home string) error {
 	}
 
 	fmt.Println("Removing marketplace registration...")
-	cmd = exec.Command("claude", "plugin", "marketplace", "remove", "relynce-local")
+	cmd = exec.Command("claude", "plugin", "marketplace", "remove", "revelara-local")
 	cmd.Run()
 
 	return nil
@@ -336,7 +336,7 @@ func UnregisterFromClaudeCode() error {
 		return nil
 	}
 
-	key := "rely@relynce-api"
+	key := "rvl@revelara-api"
 	delete(reg.Plugins, key)
 
 	data, err := json.MarshalIndent(reg, "", "  ")

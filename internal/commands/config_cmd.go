@@ -10,7 +10,7 @@ import (
 // CmdConfig handles config subcommands (show, set)
 func CmdConfig(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: rely config <show|set>")
+		fmt.Fprintln(os.Stderr, "Usage: rvl config <show|set>")
 		os.Exit(1)
 	}
 	switch args[0] {
@@ -21,7 +21,7 @@ func CmdConfig(args []string) {
 			os.Exit(1)
 		}
 		if cfg == nil {
-			fmt.Println("No configuration found. Run 'rely login' first.")
+			fmt.Println("No configuration found. Run 'rvl login' first.")
 			return
 		}
 		fmt.Printf("api_url: %s\n", cfg.APIURL)
@@ -33,7 +33,7 @@ func CmdConfig(args []string) {
 		fmt.Printf("org_name: %s\n", cfg.OrgName)
 	case "set":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: rely config set <key> <value>")
+			fmt.Fprintln(os.Stderr, "Usage: rvl config set <key> <value>")
 			os.Exit(1)
 		}
 		key, value := args[1], args[2]
