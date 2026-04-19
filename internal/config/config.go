@@ -9,11 +9,11 @@ import (
 )
 
 const (
-	configDir  = ".relynce"
+	configDir  = ".revelara"
 	configFile = "config.yaml"
 
-	// DefaultAPIURL is the production Relynce API endpoint.
-	DefaultAPIURL = "https://api.relynce.ai"
+	// DefaultAPIURL is the production Revelara API endpoint.
+	DefaultAPIURL = "https://api.revelara.ai"
 )
 
 // Config holds the CLI configuration

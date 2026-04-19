@@ -49,7 +49,7 @@ type ScanStackInfo struct {
 	CloudProvider  string   `json:"cloud_provider,omitempty"`
 }
 
-// ScanComponent represents a service component from .relynce.yaml or auto-detection.
+// ScanComponent represents a service component from .revelara.yaml or auto-detection.
 type ScanComponent struct {
 	Name         string   `json:"name"`
 	Path         string   `json:"path,omitempty"`
@@ -67,7 +67,7 @@ type ScanDependency struct {
 	Source      string `json:"source,omitempty"`
 }
 
-// ScanCatalogMeta holds optional manual overrides from .relynce.yaml.
+// ScanCatalogMeta holds optional manual overrides from .revelara.yaml.
 type ScanCatalogMeta struct {
 	DisplayName string `json:"display_name,omitempty"`
 	Description string `json:"description,omitempty"`
@@ -203,15 +203,15 @@ func CmdScan(args []string, version string) {
 	if targetDir != "" {
 		if projectCfg := project.LoadProjectConfigFrom(targetDir); projectCfg != nil && projectCfg.Project != "" {
 			if service != "" && service != projectCfg.Project {
-				fmt.Fprintf(os.Stderr, "Warning: --service %q overridden by target's .relynce.yaml project: %q\n", service, projectCfg.Project)
+				fmt.Fprintf(os.Stderr, "Warning: --service %q overridden by target's .revelara.yaml project: %q\n", service, projectCfg.Project)
 			}
 			service = projectCfg.Project
 		}
 	}
 
 	if service == "" {
-		fmt.Fprintln(os.Stderr, "Error: --service is required (or use --target with a project that has .relynce.yaml)")
-		fmt.Fprintln(os.Stderr, "Usage: rely scan --service <name> [--stdin|--file <path>] [--target <path>] [--dry-run]")
+		fmt.Fprintln(os.Stderr, "Error: --service is required (or use --target with a project that has .revelara.yaml)")
+		fmt.Fprintln(os.Stderr, "Usage: rvl scan --service <name> [--stdin|--file <path>] [--target <path>] [--dry-run]")
 		os.Exit(1)
 	}
 
@@ -454,7 +454,7 @@ func submitScan(cfg *config.Config, scanReq *ScanRequest) (*ScanResponse, error)
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("authentication failed - run 'rely login' to reconfigure")
+		return nil, fmt.Errorf("authentication failed - run 'rvl login' to reconfigure")
 	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(respBody))

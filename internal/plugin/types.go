@@ -15,12 +15,20 @@ type PluginInfo struct {
 	Location  string `json:"location"`
 }
 
-// PolarisSkillNames lists all Relynce skill directory names for cleanup.
+// PolarisSkillNames lists all Revelara skill directory names for cleanup.
 // Includes current skills, agent-as-skill entries, and legacy names.
 var PolarisSkillNames = []string{
 	// Current skills (v0.7.0+)
 	"ask", "evidence", "fix", "review", "risks", "scan", "status",
-	// Agent-as-skill entries (v0.14.0+, Tier 3 editors)
+	// Agent-as-skill entries (v0.19.0+, Tier 3 editors, rvl- prefix)
+	"rvl-ai-reliability-pro", "rvl-capacity-planning-pro", "rvl-cicd-pro",
+	"rvl-cost-governance-pro", "rvl-deployment-excellence-pro",
+	"rvl-development-testing-pro", "rvl-disaster-recovery-pro",
+	"rvl-golang-pro", "rvl-incident-response-pro", "rvl-javascript-pro",
+	"rvl-observability-pro", "rvl-post-incident-pro", "rvl-python-pro",
+	"rvl-reliability-culture-pro", "rvl-resilience-pro",
+	"rvl-security-supply-chain-pro", "rvl-slo-monitoring-pro",
+	// Legacy agent-as-skill entries (pre-0.19.0, rely- prefix)
 	"rely-ai-reliability-pro", "rely-capacity-planning-pro", "rely-cicd-pro",
 	"rely-cost-governance-pro", "rely-deployment-excellence-pro",
 	"rely-development-testing-pro", "rely-disaster-recovery-pro",
@@ -41,14 +49,14 @@ var PolarisSkillNames = []string{
 	"slo-monitoring-guidance",
 }
 
-// SavePluginInfo persists plugin metadata to ~/.relynce/plugins.json
+// SavePluginInfo persists plugin metadata to ~/.revelara/plugins.json
 func SavePluginInfo(editor, version, location string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
 
-	metadataDir := filepath.Join(home, ".relynce")
+	metadataDir := filepath.Join(home, ".revelara")
 	if err := os.MkdirAll(metadataDir, 0755); err != nil {
 		return err
 	}
@@ -98,13 +106,18 @@ func GetInstalledPlugins() ([]PluginInfo, error) {
 		return nil, err
 	}
 
-	metadataFile := filepath.Join(home, ".relynce", "plugins.json")
+	metadataFile := filepath.Join(home, ".revelara", "plugins.json")
 	data, err := os.ReadFile(metadataFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []PluginInfo{}, nil
+		// Try legacy location
+		legacyFile := filepath.Join(home, ".relynce", "plugins.json")
+		data, err = os.ReadFile(legacyFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return []PluginInfo{}, nil
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 
 	var plugins []PluginInfo

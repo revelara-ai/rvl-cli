@@ -1,6 +1,6 @@
-/rely
+/rvl
 *.exe
 .env
-.relynce/
+.revelara/
 bin/
 CLAUDE.md

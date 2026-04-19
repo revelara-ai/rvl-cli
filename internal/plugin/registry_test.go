@@ -71,8 +71,8 @@ func TestRegistryGeminiHasPostInstall(t *testing.T) {
 
 func TestRegistryCopilotAgentGlob(t *testing.T) {
 	def := Registry["copilot"]
-	if def.AgentGlob != "rely-*.agent.md" {
-		t.Errorf("copilot AgentGlob = %q, want %q", def.AgentGlob, "rely-*.agent.md")
+	if def.AgentGlob != "rvl-*.agent.md" {
+		t.Errorf("copilot AgentGlob = %q, want %q", def.AgentGlob, "rvl-*.agent.md")
 	}
 }
 
@@ -99,16 +99,16 @@ func TestEffectiveSkillsDir_ExplicitOverride(t *testing.T) {
 func TestEffectiveAgentGlob_Default(t *testing.T) {
 	def := Registry["gemini"]
 	got := def.effectiveAgentGlob()
-	if got != "rely-*.md" {
-		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rely-*.md")
+	if got != "rvl-*.md" {
+		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rvl-*.md")
 	}
 }
 
 func TestEffectiveAgentGlob_Override(t *testing.T) {
 	def := Registry["copilot"]
 	got := def.effectiveAgentGlob()
-	if got != "rely-*.agent.md" {
-		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rely-*.agent.md")
+	if got != "rvl-*.agent.md" {
+		t.Errorf("effectiveAgentGlob() = %q, want %q", got, "rvl-*.agent.md")
 	}
 }
 

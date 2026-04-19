@@ -1,4 +1,4 @@
-// Package main provides the rely CLI for secure interaction with Relynce API.
+// Package main provides the rvl CLI for secure interaction with Revelara API.
 // This CLI acts as a trusted intermediary - credentials are stored locally and
 // never exposed to LLM contexts.
 package main
@@ -38,28 +38,42 @@ func init() {
 	}
 }
 
-// migrateConfigDir copies ~/.polaris/ to ~/.relynce/ if the old dir exists but the new one doesn't.
+// migrateConfigDir performs a 3-way migration of the config directory:
+//  1. If ~/.revelara/ exists, done.
+//  2. If ~/.relynce/ exists, rename to ~/.revelara/.
+//  3. If ~/.polaris/ exists, copy files to ~/.revelara/.
 func migrateConfigDir() {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
-	oldDir := filepath.Join(home, ".polaris")
-	newDir := filepath.Join(home, ".relynce")
 
-	// Only migrate if old exists and new doesn't
-	if _, err := os.Stat(oldDir); os.IsNotExist(err) {
+	newDir := filepath.Join(home, ".revelara")
+
+	// If target already exists, nothing to do
+	if _, err := os.Stat(newDir); err == nil {
 		return
 	}
-	if _, err := os.Stat(newDir); err == nil {
-		return // new dir already exists
+
+	// Try renaming ~/.relynce/ -> ~/.revelara/
+	relynceDir := filepath.Join(home, ".relynce")
+	if _, err := os.Stat(relynceDir); err == nil {
+		if err := os.Rename(relynceDir, newDir); err == nil {
+			fmt.Fprintf(os.Stderr, "Migrated configuration from ~/.relynce/ to ~/.revelara/\n")
+			return
+		}
 	}
 
-	// Copy old to new
+	// Try copying ~/.polaris/ -> ~/.revelara/
+	polarisDir := filepath.Join(home, ".polaris")
+	if _, err := os.Stat(polarisDir); os.IsNotExist(err) {
+		return
+	}
+
 	if err := os.MkdirAll(newDir, 0700); err != nil {
 		return
 	}
-	entries, err := os.ReadDir(oldDir)
+	entries, err := os.ReadDir(polarisDir)
 	if err != nil {
 		return
 	}
@@ -68,7 +82,7 @@ func migrateConfigDir() {
 		if entry.IsDir() {
 			continue // skip subdirectories for now
 		}
-		data, err := os.ReadFile(filepath.Join(oldDir, entry.Name()))
+		data, err := os.ReadFile(filepath.Join(polarisDir, entry.Name()))
 		if err != nil {
 			continue
 		}
@@ -78,12 +92,12 @@ func migrateConfigDir() {
 		migrated++
 	}
 	if migrated > 0 {
-		fmt.Fprintf(os.Stderr, "Migrated configuration from ~/.polaris/ to ~/.relynce/\n")
+		fmt.Fprintf(os.Stderr, "Migrated configuration from ~/.polaris/ to ~/.revelara/\n")
 	}
 }
 
 func main() {
-	// Auto-migrate config directory from ~/.polaris/ to ~/.relynce/
+	// Auto-migrate config directory to ~/.revelara/
 	migrateConfigDir()
 
 	if len(os.Args) < 2 {
@@ -121,8 +135,10 @@ func main() {
 		plugin.CmdPlugin(os.Args[2:])
 	case "review":
 		commands.CmdReview(os.Args[2:])
+	case "migrate":
+		commands.CmdMigrate(os.Args[2:])
 	case "version":
-		fmt.Printf("rely version %s (%s)\n", version, gitHash)
+		fmt.Printf("rvl version %s (%s)\n", version, gitHash)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -133,17 +149,17 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`rely - Secure CLI for Relynce reliability analysis
+	fmt.Println(`rvl - Secure CLI for Revelara reliability analysis
 
 Usage:
-  rely <command> [options]
+  rvl <command> [options]
 
 Commands:
-  init               Initialize Relynce for this repository
+  init               Initialize Revelara for this repository
   login              Configure credentials interactively
   logout             Remove stored credentials
   status             Check connection and authentication status
-  scan               Submit risk findings to Relynce
+  scan               Submit risk findings to Revelara
   review             Review a commit or PR for reliability risks (CI/CD gate)
   risk               Manage risk lifecycle (list, close, resolve, etc.)
   control            Query reliability controls catalog
@@ -154,17 +170,18 @@ Commands:
   completion         Generate shell completion scripts (bash, zsh, fish)
   config show        Show current configuration (API key masked)
   config set <k> <v> Set a configuration value
+  migrate            Migrate project config files to new naming convention
   version            Show version information
   help               Show this help message
 
 Scan Command:
-  rely scan --service <name> --stdin       Read findings JSON from stdin
-  rely scan --service <name> --file <path> Read findings from file
-  rely scan --service <name> --dry-run     Validate without submitting
-  rely scan --target <path> --file <path>  Scan another project (service auto-resolved from .relynce.yaml)
+  rvl scan --service <name> --stdin       Read findings JSON from stdin
+  rvl scan --service <name> --file <path> Read findings from file
+  rvl scan --service <name> --dry-run     Validate without submitting
+  rvl scan --target <path> --file <path>  Scan another project (service auto-resolved from .revelara.yaml)
 
 Review Command:
-  rely review [--commit <sha>] [--base <ref>] [--env <env>] [--format <text|json>] [--enforce] [--fail-closed] [--verbose]
+  rvl review [--commit <sha>] [--base <ref>] [--env <env>] [--format <text|json>] [--enforce] [--fail-closed] [--verbose]
     Review a commit or PR for reliability risks
     Flags:
       --commit <sha>     Commit to review (default: HEAD)
@@ -176,69 +193,69 @@ Review Command:
       --verbose          Show full risk details
 
 Risk Command:
-  rely risk list [--status=detected] [--service=name]  List risks
-  rely risk show <risk-code>                           Show risk details with mapped controls
-  rely risk stale [--service=name]                     List stale risks
-  rely risk close <risk-code> [--reason="..."]         Close a risk
-  rely risk resolve <risk-code> --reason="..."         Mark risk as resolved
-  rely risk acknowledge <risk-code> [<risk-code>...]   Acknowledge risks
-  rely risk accept <risk-code> --reason="..."          Accept risk (won't mitigate)
+  rvl risk list [--status=detected] [--service=name]  List risks
+  rvl risk show <risk-code>                           Show risk details with mapped controls
+  rvl risk stale [--service=name]                     List stale risks
+  rvl risk close <risk-code> [--reason="..."]         Close a risk
+  rvl risk resolve <risk-code> --reason="..."         Mark risk as resolved
+  rvl risk acknowledge <risk-code> [<risk-code>...]   Acknowledge risks
+  rvl risk accept <risk-code> --reason="..."          Accept risk (won't mitigate)
 
 Control Command:
-  rely control list [--category=<cat>]     List controls in catalog
-  rely control show <control-code>         Show control details (e.g., RC-018)
+  rvl control list [--category=<cat>]     List controls in catalog
+  rvl control show <control-code>         Show control details (e.g., RC-018)
 
 Examples:
   # Initial setup
-  rely login
+  rvl login
 
   # Submit findings from Claude Code skill
-  echo '{"findings":[...]}' | rely scan --service checkout-api --stdin
+  echo '{"findings":[...]}' | rvl scan --service checkout-api --stdin
 
-  # Scan a different project (service name auto-resolved from target's .relynce.yaml)
-  rely scan --target /path/to/other-project --file findings.json
+  # Scan a different project (service name auto-resolved from target's .revelara.yaml)
+  rvl scan --target /path/to/other-project --file findings.json
 
   # Check status
-  rely status
+  rvl status
 
   # Review code for reliability risks (use in CI/CD)
-  rely review --enforce
-  rely review --commit abc123 --env production --format json
+  rvl review --enforce
+  rvl review --commit abc123 --env production --format json
 
   # Manage risks
-  rely risk list --status=detected
-  rely risk close R-001 --reason "Fixed by implementing timeout"
-  rely risk stale --service checkout-api
+  rvl risk list --status=detected
+  rvl risk close R-001 --reason "Fixed by implementing timeout"
+  rvl risk stale --service checkout-api
 
   # Query controls catalog
-  rely control list --category=fault_tolerance
-  rely control show RC-018
+  rvl control list --category=fault_tolerance
+  rvl control show RC-018
 
   # Query knowledge base
-  rely knowledge search "circuit breaker timeout"
-  rely knowledge procedures --control=RC-018
-  rely knowledge patterns --type=failure_mode
+  rvl knowledge search "circuit breaker timeout"
+  rvl knowledge procedures --control=RC-018
+  rvl knowledge patterns --type=failure_mode
 
   # Submit evidence for controls
-  rely evidence submit --control=RC-018 --type=code --name="Circuit breaker impl" --url="https://github.com/..."
-  rely evidence list --status=configured
-  rely evidence verify <evidence-id>
+  rvl evidence submit --control=RC-018 --type=code --name="Circuit breaker impl" --url="https://github.com/..."
+  rvl evidence list --status=configured
+  rvl evidence verify <evidence-id>
 
 Plugin Command:
-  rely plugin install <editor>      Install plugin for editor
-  rely plugin update [editor]       Update plugin(s) to latest version
-  rely plugin list                  List installed plugins
-  rely plugin editors               List all supported editors
-  rely plugin remove <editor>       Remove installed plugin
+  rvl plugin install <editor>      Install plugin for editor
+  rvl plugin update [editor]       Update plugin(s) to latest version
+  rvl plugin list                  List installed plugins
+  rvl plugin editors               List all supported editors
+  rvl plugin remove <editor>       Remove installed plugin
 
 Init Command:
-  rely init                         Interactive initialization
-  rely init --project <name>        Set project name non-interactively
-  rely init --skip-plugin           Skip plugin installation
-  rely init --force                 Overwrite existing config without prompting
-  rely init -y                      Accept all defaults
+  rvl init                         Interactive initialization
+  rvl init --project <name>        Set project name non-interactively
+  rvl init --skip-plugin           Skip plugin installation
+  rvl init --force                 Overwrite existing config without prompting
+  rvl init -y                      Accept all defaults
 
 Configuration:
-  Credentials are stored in ~/.relynce/config.yaml
+  Credentials are stored in ~/.revelara/config.yaml
   Never share this file or expose credentials to LLM contexts.`)
 }

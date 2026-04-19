@@ -10,7 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ProjectConfig represents the .relynce.yaml project configuration file
+// ProjectConfig represents the .revelara.yaml project configuration file
 type ProjectConfig struct {
 	Project     string             `yaml:"project"`
 	Criticality string             `yaml:"criticality,omitempty"`
@@ -40,8 +40,9 @@ type ProjectComponent struct {
 	Path string `yaml:"path"`
 }
 
-// LoadProjectConfigFrom reads .relynce.yaml from the specified directory's git root.
+// LoadProjectConfigFrom reads .revelara.yaml from the specified directory's git root.
 // If targetDir is empty, uses the current working directory (existing behavior).
+// Falls back to .relynce.yaml then .polaris.yaml, auto-renaming to .revelara.yaml.
 func LoadProjectConfigFrom(targetDir string) *ProjectConfig {
 	var gitRoot string
 	if targetDir != "" {
@@ -66,18 +67,28 @@ func LoadProjectConfigFrom(targetDir string) *ProjectConfig {
 		gitRoot = strings.TrimSpace(string(out))
 	}
 
+	revelaraPath := filepath.Join(gitRoot, ".revelara.yaml")
 	relyncePath := filepath.Join(gitRoot, ".relynce.yaml")
 	polarisPath := filepath.Join(gitRoot, ".polaris.yaml")
-	data, err := os.ReadFile(relyncePath)
+
+	// 1. Try .revelara.yaml first
+	data, err := os.ReadFile(revelaraPath)
 	if err != nil {
-		// Fallback: try .polaris.yaml and auto-rename
-		data, err = os.ReadFile(polarisPath)
+		// 2. Fallback: try .relynce.yaml and auto-rename
+		data, err = os.ReadFile(relyncePath)
 		if err != nil {
-			return nil
-		}
-		// Auto-rename .polaris.yaml → .relynce.yaml
-		if renameErr := os.Rename(polarisPath, relyncePath); renameErr == nil {
-			fmt.Fprintf(os.Stderr, "Renamed .polaris.yaml → .relynce.yaml\n")
+			// 3. Fallback: try .polaris.yaml and auto-rename
+			data, err = os.ReadFile(polarisPath)
+			if err != nil {
+				return nil
+			}
+			if renameErr := os.Rename(polarisPath, revelaraPath); renameErr == nil {
+				fmt.Fprintf(os.Stderr, "Renamed .polaris.yaml to .revelara.yaml\n")
+			}
+		} else {
+			if renameErr := os.Rename(relyncePath, revelaraPath); renameErr == nil {
+				fmt.Fprintf(os.Stderr, "Renamed .relynce.yaml to .revelara.yaml\n")
+			}
 		}
 	}
 
@@ -88,18 +99,18 @@ func LoadProjectConfigFrom(targetDir string) *ProjectConfig {
 	return &cfg
 }
 
-// LoadProjectConfig reads .relynce.yaml from the current directory's git root.
+// LoadProjectConfig reads .revelara.yaml from the current directory's git root.
 func LoadProjectConfig() *ProjectConfig {
 	return LoadProjectConfigFrom("")
 }
 
-// WriteProjectConfig writes a ProjectConfig to disk as .relynce.yaml
+// WriteProjectConfig writes a ProjectConfig to disk as .revelara.yaml
 func WriteProjectConfig(path string, cfg *ProjectConfig) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 
-	header := "# Relynce project configuration\n# Used by detect-risks and reliability-review skills for consistent service naming\n"
+	header := "# Revelara project configuration\n# Used by detect-risks and reliability-review skills for consistent service naming\n"
 	return os.WriteFile(path, []byte(header+string(data)), 0644)
 }

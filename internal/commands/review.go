@@ -176,7 +176,7 @@ func CmdReview(args []string) {
 		}
 	}
 	if projectName == "" {
-		fmt.Fprintln(os.Stderr, "Error: could not determine project name. Use --project or create .relynce.yaml")
+		fmt.Fprintln(os.Stderr, "Error: could not determine project name. Use --project or create .revelara.yaml")
 		os.Exit(1)
 	}
 
@@ -258,7 +258,7 @@ func CmdReview(args []string) {
 }
 
 func printReviewUsage() {
-	fmt.Println(`Usage: rely review [options]
+	fmt.Println(`Usage: rvl review [options]
 
 Flags:
   --commit <sha>         Commit to review (default: HEAD)
@@ -268,12 +268,12 @@ Flags:
   --enforce              Exit 1 on hold (default: advisory mode, always exit 0)
   --fail-closed          Exit 1 if API unreachable (default: fail open)
   --verbose              Show full details
-  --project <name>       Project name (auto-resolved from .relynce.yaml or git)
+  --project <name>       Project name (auto-resolved from .revelara.yaml or git)
 
 Examples:
-  rely review
-  rely review --commit abc123 --env production --enforce
-  rely review --format json`)
+  rvl review
+  rvl review --commit abc123 --env production --enforce
+  rvl review --format json`)
 }
 
 // detectBaseRef attempts to detect the base ref from CI environment variables

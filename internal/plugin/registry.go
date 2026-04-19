@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// EditorDef describes how to install, remove, and configure the Relynce plugin
+// EditorDef describes how to install, remove, and configure the Revelara plugin
 // for a given AI coding editor. Adding a new editor = adding one entry to Registry.
 type EditorDef struct {
 	Name        string
@@ -28,7 +28,7 @@ type EditorDef struct {
 	AgentsDir string
 
 	// AgentGlob is the glob pattern for matching agent files during removal.
-	// Defaults to "rely-*.md" if empty.
+	// Defaults to "rvl-*.md" if empty.
 	AgentGlob string
 
 	// ConfigDir is the path relative to $HOME used for detection.
@@ -63,12 +63,12 @@ func (d EditorDef) effectiveSkillsDir() string {
 	return d.InstallDir
 }
 
-// effectiveAgentGlob returns AgentGlob if set, otherwise "rely-*.md".
+// effectiveAgentGlob returns AgentGlob if set, otherwise "rvl-*.md".
 func (d EditorDef) effectiveAgentGlob() string {
 	if d.AgentGlob != "" {
 		return d.AgentGlob
 	}
-	return "rely-*.md"
+	return "rvl-*.md"
 }
 
 // Registry maps editor names to their definitions.
@@ -82,7 +82,7 @@ var Registry = map[string]EditorDef{
 		CustomInstall: InstallClaudePlugin,
 		CustomRemove:  removeClaudePlugin,
 		Instructions: []string{
-			"Commands are now available: /rely:scan, /rely:fix, /rely:ask, etc.",
+			"Commands are now available: /rvl:scan, /rvl:fix, /rvl:ask, etc.",
 			"Restart Claude Code to ensure all commands are loaded.",
 		},
 	},
@@ -155,7 +155,7 @@ var Registry = map[string]EditorDef{
 		LocalDir:    ".copilot",
 		SkillsDir:   ".copilot/skills",
 		AgentsDir:   ".copilot/agents",
-		AgentGlob:   "rely-*.agent.md",
+		AgentGlob:   "rvl-*.agent.md",
 		Instructions: []string{
 			"Skills and agents are auto-discovered by Copilot CLI.",
 			"Try: \"scan this codebase for reliability risks\"",

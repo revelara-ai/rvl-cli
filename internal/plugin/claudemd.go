@@ -8,11 +8,13 @@ import (
 )
 
 const (
-	claudeMdBlockStart = "<!-- BEGIN RELYNCE MANAGED BLOCK - DO NOT EDIT -->"
-	claudeMdBlockEnd   = "<!-- END RELYNCE MANAGED BLOCK -->"
+	claudeMdBlockStart    = "<!-- BEGIN REVELARA MANAGED BLOCK - DO NOT EDIT -->"
+	claudeMdBlockEnd      = "<!-- END REVELARA MANAGED BLOCK -->"
+	claudeMdBlockStartOld = "<!-- BEGIN RELYNCE MANAGED BLOCK - DO NOT EDIT -->"
+	claudeMdBlockEndOld   = "<!-- END RELYNCE MANAGED BLOCK -->"
 )
 
-// EnsureClaudeMd creates or updates the project CLAUDE.md with a managed Relynce block.
+// EnsureClaudeMd creates or updates the project CLAUDE.md with a managed Revelara block.
 // templatePath is the path to the CLAUDE.md template from the installed plugin.
 // If yesAll is true, all prompts are auto-accepted.
 //
@@ -41,8 +43,21 @@ func EnsureClaudeMd(gitRoot, templatePath string, yesAll bool) (string, error) {
 	}
 
 	contentStr := string(content)
+
+	// Detect start marker: try new name first, then old name
 	hasStartMarker := strings.Contains(contentStr, claudeMdBlockStart)
 	hasEndMarker := strings.Contains(contentStr, claudeMdBlockEnd)
+	hasOldStartMarker := strings.Contains(contentStr, claudeMdBlockStartOld)
+	hasOldEndMarker := strings.Contains(contentStr, claudeMdBlockEndOld)
+
+	// If old markers are present but new ones aren't, migrate them
+	if !hasStartMarker && hasOldStartMarker {
+		hasStartMarker = true
+		hasEndMarker = hasOldEndMarker
+		// Replace old markers with new ones in content before processing
+		contentStr = strings.Replace(contentStr, claudeMdBlockStartOld, claudeMdBlockStart, 1)
+		contentStr = strings.Replace(contentStr, claudeMdBlockEndOld, claudeMdBlockEnd, 1)
+	}
 
 	if !hasStartMarker {
 		// CLAUDE.md exists but no managed block — append

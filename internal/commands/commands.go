@@ -89,7 +89,7 @@ func printSkills(cfg *config.Config) {
 
 	for _, s := range skillsResp.Skills {
 		desc := extractSkillDescription(s.Content)
-		fmt.Printf("  /rely:%-22s %s\n", s.Name, desc)
+		fmt.Printf("  /rvl:%-22s %s\n", s.Name, desc)
 	}
 }
 
@@ -115,7 +115,7 @@ func printAgents(cfg *config.Config) {
 
 	for _, a := range agentsResp.Agents {
 		desc := extractAgentDescription(a.Content)
-		fmt.Printf("  rely:%-23s %s\n", a.Name, desc)
+		fmt.Printf("  rvl:%-23s %s\n", a.Name, desc)
 	}
 }
 
@@ -156,16 +156,16 @@ func extractAgentDescription(content string) string {
 }
 
 func printCommandsUsage() {
-	fmt.Println(`rely commands - List available skills and agents
+	fmt.Println(`rvl commands - List available skills and agents
 
 Usage:
-  rely commands [options]
+  rvl commands [options]
 
 Options:
   --skills    Show only skills
   --agents    Show only agents
 
 Examples:
-  rely commands
-  rely commands --skills`)
+  rvl commands
+  rvl commands --skills`)
 }
