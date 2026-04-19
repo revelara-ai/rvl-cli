@@ -135,6 +135,8 @@ func main() {
 		plugin.CmdPlugin(os.Args[2:])
 	case "review":
 		commands.CmdReview(os.Args[2:])
+	case "stpa":
+		commands.CmdSTPA(os.Args[2:])
 	case "migrate":
 		commands.CmdMigrate(os.Args[2:])
 	case "version":
@@ -165,6 +167,7 @@ Commands:
   control            Query reliability controls catalog
   knowledge          Query organizational knowledge base (facts, procedures, patterns)
   evidence           Manage control evidence (submit, list, verify)
+  stpa               STPA safety analysis tools (list-ucas)
   commands           List available skills and agents from the API
   plugin             Manage editor plugins (install, update, list, remove)
   completion         Generate shell completion scripts (bash, zsh, fish)
