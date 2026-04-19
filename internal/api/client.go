@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/relynce/rely-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/config"
 )
 
 // LoadAndResolveConfig loads config and resolves org name to UUID.

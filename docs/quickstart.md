@@ -55,10 +55,10 @@ You'll need an API key to connect the CLI to your Revelara account.
 Install the Revelara command-line tool:
 
 ```bash
-go install github.com/relynce/rely-cli/cmd/rvl@latest
+go install github.com/revelara-ai/rvl-cli/cmd/rvl@latest
 ```
 
-Or download a pre-built binary from the [releases page](https://github.com/relynce/rely-cli/releases).
+Or download a pre-built binary from the [releases page](https://github.com/revelara-ai/rvl-cli/releases).
 
 ### Step 3: Configure the CLI
 

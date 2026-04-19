@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/config"
-	"github.com/relynce/rely-cli/internal/plugin"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/plugin"
 	"golang.org/x/term"
 )
 

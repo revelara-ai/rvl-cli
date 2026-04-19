@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"runtime/debug"
 
-	"github.com/relynce/rely-cli/internal/commands"
-	"github.com/relynce/rely-cli/internal/plugin"
+	"github.com/revelara-ai/rvl-cli/internal/commands"
+	"github.com/revelara-ai/rvl-cli/internal/plugin"
 )
 
 // version and gitHash are set at build time via -ldflags "-X main.version=... -X main.gitHash=..."

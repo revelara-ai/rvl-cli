@@ -9,9 +9,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/display"
-	"github.com/relynce/rely-cli/internal/project"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/display"
+	"github.com/revelara-ai/rvl-cli/internal/project"
 )
 
 // ReviewRequest represents the payload sent to the review endpoint

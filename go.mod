@@ -1,4 +1,4 @@
-module github.com/relynce/rely-cli
+module github.com/revelara-ai/rvl-cli
 
 go 1.25
 

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/relynce/rely-cli/internal/project"
+	"github.com/revelara-ai/rvl-cli/internal/project"
 )
 
 // CleanupOldClaudeInstallations removes old Revelara installations from Claude Code directories
