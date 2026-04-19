@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/config"
-	"github.com/relynce/rely-cli/internal/display"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/display"
 )
 
 // Control represents a reliability control from the catalog

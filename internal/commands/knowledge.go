@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/display"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/display"
 )
 
 // KnowledgeSearchResult represents a search result from the knowledge API

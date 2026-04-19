@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/relynce/rely-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/config"
 )
 
 // CmdConfig handles config subcommands (show, set)

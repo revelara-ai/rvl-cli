@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/config"
-	"github.com/relynce/rely-cli/internal/project"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/project"
 )
 
 // ScanRequest represents the payload sent to the scan endpoint

@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/relynce/rely-cli/internal/api"
-	"github.com/relynce/rely-cli/internal/config"
+	"github.com/revelara-ai/rvl-cli/internal/api"
+	"github.com/revelara-ai/rvl-cli/internal/config"
 )
 
 // SkillsResponse matches the API response for GET /api/v1/skills

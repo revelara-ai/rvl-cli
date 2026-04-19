@@ -7,12 +7,12 @@ Connect your codebase to the [Revelara](https://dev.revelara.ai) reliability ris
 **From source (requires Go 1.25+):**
 
 ```bash
-go install github.com/relynce/rely-cli/cmd/rvl@latest
+go install github.com/revelara-ai/rvl-cli/cmd/rvl@latest
 ```
 
 **From release binary:**
 
-Download from [Releases](https://github.com/relynce/rely-cli/releases) for your platform.
+Download from [Releases](https://github.com/revelara-ai/rvl-cli/releases) for your platform.
 
 ## Quick Start
 
