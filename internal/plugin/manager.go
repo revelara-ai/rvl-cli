@@ -209,6 +209,16 @@ func InstallPlugin(editor, projectRoot string) error {
 		fmt.Println("✓ Checksum verified")
 	}
 
+	// Verify integrity manifest signature and per-file hashes
+	signingKey := api.FetchSigningKey(cfg)
+	if signingKey != nil {
+		manifest, verifyErr := VerifyTarball(tarballData, signingKey)
+		if verifyErr != nil {
+			return fmt.Errorf("integrity verification failed: %w", verifyErr)
+		}
+		fmt.Printf("✓ Integrity verified (signed by %s at %s)\n", manifest.KeyID, manifest.SignedAt)
+	}
+
 	// Editors with CustomInstall handle the entire flow themselves (global only)
 	if !isProject && def.CustomInstall != nil {
 		return def.CustomInstall(version, tarballData)

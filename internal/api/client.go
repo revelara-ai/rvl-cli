@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -198,4 +200,51 @@ func FetchServerPluginVersion(cfg *config.Config) string {
 		return result.Version[:idx]
 	}
 	return result.Version
+}
+
+// FetchSigningKey fetches the Ed25519 public key used to sign plugin tarballs.
+// Returns nil if the server doesn't support signing or is unreachable.
+func FetchSigningKey(cfg *config.Config) ed25519.PublicKey {
+	if cfg == nil || cfg.APIURL == "" {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", cfg.APIURL+"/api/v1/plugin/signing-key", nil)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil
+	}
+
+	var result struct {
+		Algorithm string `json:"algorithm"`
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil
+	}
+
+	if result.Algorithm != "EdDSA" || result.PublicKey == "" {
+		return nil
+	}
+
+	keyBytes, err := hex.DecodeString(result.PublicKey)
+	if err != nil {
+		return nil
+	}
+
+	if len(keyBytes) != ed25519.PublicKeySize {
+		return nil
+	}
+
+	return ed25519.PublicKey(keyBytes)
 }
