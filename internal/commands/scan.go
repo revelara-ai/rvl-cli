@@ -35,9 +35,12 @@ type ScanRequest struct {
 
 // ScanMetadata contains metadata about the scan
 type ScanMetadata struct {
-	GitCommit string `json:"git_commit,omitempty"`
-	GitBranch string `json:"git_branch,omitempty"`
-	ScannerID string `json:"scanner_id,omitempty"`
+	GitCommit     string `json:"git_commit,omitempty"`
+	GitBranch     string `json:"git_branch,omitempty"`
+	ScannerID     string `json:"scanner_id,omitempty"`
+	SkillName     string `json:"skill_name,omitempty"`
+	SkillVersion  string `json:"skill_version,omitempty"`
+	SkillChecksum string `json:"skill_checksum,omitempty"`
 }
 
 // ScanStackInfo holds detected technology stack information.
