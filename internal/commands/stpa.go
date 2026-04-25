@@ -66,9 +66,10 @@ Examples:
 
 // stpaFindings is the input JSON format produced by the STPA design review skill.
 type stpaFindings struct {
-	Losses        []stpaLoss         `json:"losses"`
-	Findings      []stpaFinding      `json:"findings"`
-	LossScenarios []stpaLossScenario `json:"loss_scenarios"`
+	Losses           []stpaLoss              `json:"losses"`
+	Findings         []stpaFinding           `json:"findings"`
+	LossScenarios    []stpaLossScenario      `json:"loss_scenarios"`
+	ControlStructure *stpaControlStructure   `json:"control_structure,omitempty"`
 }
 
 type stpaLoss struct {
@@ -105,6 +106,29 @@ type stpaControlLink struct {
 	Relationship string `json:"relationship"`
 }
 
+type stpaControlStructure struct {
+	Nodes []stpaCSNode `json:"nodes"`
+	Edges []stpaCSEdge `json:"edges"`
+}
+
+type stpaCSNode struct {
+	NodeKey        string `json:"node_key"`
+	Name           string `json:"name"`
+	HierarchyLevel string `json:"hierarchy_level"`
+	Source         string `json:"source"`
+	Confidence     int    `json:"confidence"`
+	Description    string `json:"description,omitempty"`
+}
+
+type stpaCSEdge struct {
+	FromKey    string `json:"from_key"`
+	ToKey      string `json:"to_key"`
+	Label      string `json:"label"`
+	EdgeType   string `json:"edge_type"`
+	Source     string `json:"source"`
+	Confidence int    `json:"confidence"`
+}
+
 func cmdSTPASubmit(args []string) {
 	var filePath, service string
 	for _, arg := range args {
@@ -120,7 +144,7 @@ func cmdSTPASubmit(args []string) {
 		fmt.Fprintln(os.Stderr, "Usage: rvl stpa submit --file=<path>")
 		os.Exit(1)
 	}
-	_ = service // reserved for future repo scoping
+	repoURL := service // --service flag provides the repo URL for control structure scoping
 
 	// Read and parse input
 	data, err := os.ReadFile(filePath)
@@ -155,12 +179,25 @@ func cmdSTPASubmit(args []string) {
 		submitLossScenarios(cfg, findings.LossScenarios, ucaIDs, &stats)
 	}
 
+	// 4. Control structure (nodes + edges)
+	if findings.ControlStructure != nil && (len(findings.ControlStructure.Nodes) > 0 || len(findings.ControlStructure.Edges) > 0) {
+		if repoURL == "" {
+			fmt.Fprintln(os.Stderr, "  [skip] control_structure present but --service not set; skipping")
+		} else {
+			submitControlStructure(cfg, repoURL, findings.ControlStructure, &stats)
+		}
+	}
+
 	// Summary
 	fmt.Println()
 	fmt.Printf("Submitted: %d loss definitions (%d new), %d UCAs (%d new), %d loss scenarios\n",
 		stats.lossDefsTotal, stats.lossDefsNew,
 		stats.ucasTotal, stats.ucasNew,
 		stats.scenariosCreated)
+	if stats.csNodes > 0 || stats.csEdges > 0 {
+		fmt.Printf("Control structure: %d nodes, %d edges upserted\n",
+			stats.csNodes, stats.csEdges)
+	}
 	if stats.ucaLinks > 0 || stats.controlLinks > 0 {
 		fmt.Printf("Linked: %d UCA associations, %d control associations\n",
 			stats.ucaLinks, stats.controlLinks)
@@ -178,6 +215,8 @@ type submitStats struct {
 	scenariosCreated int
 	ucaLinks         int
 	controlLinks     int
+	csNodes          int
+	csEdges          int
 	errors           int
 }
 
@@ -371,6 +410,78 @@ func submitLossScenarios(cfg *config.Config, scenarios []stpaLossScenario, ucaID
 			stats.controlLinks++
 		}
 	}
+}
+
+func submitControlStructure(cfg *config.Config, repoURL string, cs *stpaControlStructure, stats *submitStats) {
+	fmt.Println("Submitting control structure...")
+
+	type csNodeReq struct {
+		NodeKey        string `json:"node_key"`
+		Name           string `json:"name"`
+		Description    string `json:"description,omitempty"`
+		HierarchyLevel string `json:"hierarchy_level"`
+		Source         string `json:"source"`
+		Confidence     int    `json:"confidence"`
+	}
+	type csEdgeReq struct {
+		FromKey    string `json:"from_key"`
+		ToKey      string `json:"to_key"`
+		Label      string `json:"label"`
+		EdgeType   string `json:"edge_type"`
+		Source     string `json:"source"`
+		Confidence int    `json:"confidence"`
+	}
+
+	nodes := make([]csNodeReq, len(cs.Nodes))
+	for i, n := range cs.Nodes {
+		nodes[i] = csNodeReq{
+			NodeKey:        n.NodeKey,
+			Name:           n.Name,
+			Description:    n.Description,
+			HierarchyLevel: n.HierarchyLevel,
+			Source:         n.Source,
+			Confidence:     n.Confidence,
+		}
+	}
+
+	edges := make([]csEdgeReq, len(cs.Edges))
+	for i, e := range cs.Edges {
+		edges[i] = csEdgeReq{
+			FromKey:    e.FromKey,
+			ToKey:      e.ToKey,
+			Label:      e.Label,
+			EdgeType:   e.EdgeType,
+			Source:     e.Source,
+			Confidence: e.Confidence,
+		}
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"repo_url": repoURL,
+		"nodes":    nodes,
+		"edges":    edges,
+	})
+
+	resp, err := api.MakeAPIRequest(cfg, "POST", cfg.APIURL+"/api/v1/control-structure/model", body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  [error] %v\n", err)
+		stats.errors++
+		return
+	}
+
+	var result struct {
+		NodesUpserted int `json:"nodes_upserted"`
+		EdgesUpserted int `json:"edges_upserted"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		fmt.Fprintf(os.Stderr, "  [error] parse response: %v\n", err)
+		stats.errors++
+		return
+	}
+
+	stats.csNodes = result.NodesUpserted
+	stats.csEdges = result.EdgesUpserted
+	fmt.Printf("  [upserted] %d nodes, %d edges for %s\n", result.NodesUpserted, result.EdgesUpserted, repoURL)
 }
 
 // -- List UCAs --
