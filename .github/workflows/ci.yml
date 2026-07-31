@@ -32,6 +32,36 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  helpers:
+    name: go helper (vet + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+
+      - name: Verify pinned dependencies
+        working-directory: helpers/goindex
+        run: go mod verify
+
+      - name: Vet
+        working-directory: helpers/goindex
+        run: go vet ./...
+
+      - name: Test
+        working-directory: helpers/goindex
+        run: go test ./...
+
+      - name: Packet schema is declared
+        working-directory: helpers/goindex
+        run: |
+          # A consumer negotiates on this number before paying for a load;
+          # it must always be printable without loading anything.
+          test -n "$(go run . -packet-schema)"
+
       - name: No internal codenames
         run: |
           # concatenated so this pattern never matches its own source
