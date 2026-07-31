@@ -78,6 +78,18 @@ pub struct CompareReport {
     /// one over the full gold set.
     pub gold_matched: usize,
     pub gold_total: usize,
+    /// site_ids that appear more than once in an arm. The join pairs every A
+    /// row against ONE B row per id, so a repeated id can pair rows that
+    /// describe different sites and manufacture phantom regressions. Reported
+    /// rather than silently tolerated.
+    pub ambiguous_join_keys: usize,
+}
+
+fn a_distinct(a: &[Finding]) -> usize {
+    a.iter()
+        .map(|f| f.site_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 /// Compare baseline `a` vs treatment `b` on their shared sites.
@@ -94,16 +106,22 @@ pub fn compare_conditions(
 ) -> anyhow::Result<CompareReport> {
     let by_id_b: BTreeMap<&str, &Finding> = b.iter().map(|f| (f.site_id.as_str(), f)).collect();
     let mut shared: Vec<(&Finding, &Finding)> = Vec::new();
+    let mut matched_b: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut only_a = 0usize;
     for fa in a {
         match by_id_b.get(fa.site_id.as_str()) {
-            Some(fb) => shared.push((fa, *fb)),
+            Some(fb) => {
+                matched_b.insert(fa.site_id.as_str());
+                shared.push((fa, *fb));
+            }
             None => only_a += 1,
         }
     }
-    // by_id_b collapses duplicate ids, so its size minus the joined count is
-    // exactly the number of B-only sites.
-    let only_b = by_id_b.len() - shared.len();
+    // Count DISTINCT matched B entries, not shared pairs: real corpora repeat
+    // a site_id (same file:line retrieved twice), so several shared pairs can
+    // point at one B row and `by_id_b.len() - shared.len()` underflows.
+    let only_b = by_id_b.len() - matched_b.len();
+    let ambiguous_join_keys = (a.len() - a_distinct(a)) + (b.len() - by_id_b.len());
     if shared.is_empty() {
         anyhow::bail!(
             "no shared sites between the two conditions ({only_a} only in A, {only_b} only in B); \
@@ -200,5 +218,6 @@ pub fn compare_conditions(
         accuracy_delta,
         gold_matched,
         gold_total: gold.map(|g| g.len()).unwrap_or(0),
+        ambiguous_join_keys,
     })
 }

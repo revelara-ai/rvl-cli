@@ -12,6 +12,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Scan retrieved packets against the signed spec cache: spec matching,
+    /// propagation, triage. Deterministic, no model calls.
+    Scan {
+        /// Retriever packet stream (JSONL) from a language helper.
+        #[arg(long)]
+        retrieved: PathBuf,
+        /// DEV ONLY: bypass the signed cache and load specs from a file.
+        /// Loudly announced; never silent.
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        /// Class judgments (JSON array) for triage; unjudged classes still
+        /// surface, they are never dropped.
+        #[arg(long)]
+        judgments: Option<PathBuf>,
+        /// Write findings JSON here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVLSCAN_OFFLINE=1 disables all fetches).
     Sync,
@@ -109,6 +127,127 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
     }
 }
 
+/// One finding row. Mirrors the rvl-eval `run` emitter so the eval harness
+/// can score a scan output without a conversion step.
+#[derive(serde::Serialize)]
+struct FindingOut {
+    site_id: String,
+    snapshot_id: String,
+    verdict: String,
+    reason: String,
+    class: String,
+}
+
+/// The scan: packets + verified specs -> propagation -> triage. Deterministic,
+/// no model calls. Undecided outcomes stay undecided and are reported in the
+/// coverage section; they are never promoted to a violation.
+fn run_scan(
+    store: &CacheStore,
+    keyset: &Keyset,
+    retrieved: &std::path::Path,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    let specs_text = match specs_file {
+        Some(p) => {
+            // Dev override. Announced on stderr every time: an unverified
+            // spec cache must never load quietly.
+            eprintln!(
+                "WARNING: loading UNVERIFIED specs from {} (--specs-file is a dev override; \
+                 production scans use the signed cache)",
+                p.display()
+            );
+            std::fs::read_to_string(p)?
+        }
+        None => {
+            let loaded = store.load(keyset, &rvl_cache::today_utc())?;
+            if let Some(hint) = &loaded.upgrade_hint {
+                eprintln!("{hint}");
+            }
+            if let Some(note) = &loaded.staleness_note {
+                eprintln!("{note}");
+            }
+            println!(
+                "spec cache {} (schema {}, {:?})",
+                loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+            );
+            serde_json::to_string(&loaded.envelope.specs)?
+        }
+    };
+
+    let stream = std::fs::read_to_string(retrieved)?;
+    let (sites, repo_cfg, skipped) = rvl_core::parse_stream(&stream);
+    anyhow::ensure!(
+        !sites.is_empty(),
+        "no parseable sites in {}",
+        retrieved.display()
+    );
+    let cache = rvl_spec::SpecCache::load(&specs_text)?;
+    let served = cache.served_bound(&repo_cfg);
+    let findings = rvl_propagate::propagate_all(&sites, &cache, &served);
+
+    println!(
+        "sites {} | specs {} | unparseable lines {skipped}",
+        sites.len(),
+        cache.len()
+    );
+
+    // Coverage: every outcome class reported, undecided included.
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in &findings {
+        *counts.entry(f.verdict.as_str()).or_insert(0) += 1;
+    }
+    let n = sites.len().max(1);
+    println!("\n{:<16} {:>6} {:>8}", "verdict", "n", "share");
+    for (k, v) in &counts {
+        println!("{k:<16} {v:>6} {:>7.1}%", 100.0 * *v as f64 / n as f64);
+    }
+    let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
+    println!(
+        "\ndecided {decided}/{} ({:.1}%) — undecided sites are reported, never counted as violations",
+        sites.len(),
+        100.0 * decided as f64 / n as f64
+    );
+
+    // Triage: collapse violations into reader-facing classes.
+    let judgments: Vec<rvl_triage::ClassJudgment> = match judgments {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+        None => Vec::new(),
+    };
+    let verdict_rows: Vec<(String, rvl_core::Verdict, String)> = findings
+        .iter()
+        .map(|f| (f.site_id.clone(), f.verdict, f.reason.clone()))
+        .collect();
+    let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    if !items.is_empty() {
+        println!("\ntriaged items ({}):", items.len());
+        for it in items.iter().take(20) {
+            println!(
+                "  [{:<9}] {} {} — {} site(s)",
+                it.disposition, it.class.client_type, it.class.method, it.site_count
+            );
+        }
+    }
+
+    if let Some(p) = out {
+        let rows: Vec<FindingOut> = findings
+            .iter()
+            .zip(sites.iter())
+            .map(|(f, s)| FindingOut {
+                site_id: f.site_id.clone(),
+                snapshot_id: s.snapshot_id.clone(),
+                verdict: f.verdict.as_str().to_string(),
+                reason: f.reason.clone(),
+                class: rvl_triage::class_key_string(s),
+            })
+            .collect();
+        std::fs::write(p, serde_json::to_string_pretty(&rows)?)?;
+        println!("\nwrote {}", p.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -121,6 +260,19 @@ fn run() -> anyhow::Result<ExitCode> {
     let store = CacheStore::open(&cfg.cache_dir)?;
     let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
     match cmd {
+        Cmd::Scan {
+            retrieved,
+            specs_file,
+            judgments,
+            out,
+        } => run_scan(
+            &store,
+            &keyset,
+            &retrieved,
+            specs_file.as_deref(),
+            judgments.as_deref(),
+            out.as_deref(),
+        ),
         Cmd::Sync => {
             if !cfg.offline && cfg.org_key.is_empty() {
                 anyhow::bail!("RVLSCAN_ORG_KEY is not set (or set RVLSCAN_OFFLINE=1)");
