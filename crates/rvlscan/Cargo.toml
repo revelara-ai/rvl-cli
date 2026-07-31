@@ -1,0 +1,10 @@
+[package]
+name = "rvlscan"
+description = "Revelara reliability scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
