@@ -28,10 +28,10 @@ fn arm_a() -> Vec<Finding> {
 /// Treatment: same sites; one lost decision, one flip, one new decision.
 fn arm_b() -> Vec<Finding> {
     vec![
-        f("r1/a.go:1", "r1", "db.Query", "abstain"),   // lost_decision (regression)
-        f("r1/b.go:2", "r1", "db.Query", "violates"),  // flipped_decided (regression)
-        f("r1/c.go:3", "r1", "http.Do", "violates"),   // unchanged
-        f("r2/d.go:4", "r2", "http.Do", "violates"),   // improvement (not a regression)
+        f("r1/a.go:1", "r1", "db.Query", "abstain"), // lost_decision (regression)
+        f("r1/b.go:2", "r1", "db.Query", "violates"), // flipped_decided (regression)
+        f("r1/c.go:3", "r1", "http.Do", "violates"), // unchanged
+        f("r2/d.go:4", "r2", "http.Do", "violates"), // improvement (not a regression)
     ]
 }
 
@@ -63,8 +63,14 @@ fn regressions_are_explicit_and_typed() {
         .iter()
         .map(|x| (x.site_id.clone(), x.kind.clone()))
         .collect();
-    assert_eq!(kinds.get("r1/a.go:1").map(String::as_str), Some("lost_decision"));
-    assert_eq!(kinds.get("r1/b.go:2").map(String::as_str), Some("flipped_decided"));
+    assert_eq!(
+        kinds.get("r1/a.go:1").map(String::as_str),
+        Some("lost_decision")
+    );
+    assert_eq!(
+        kinds.get("r1/b.go:2").map(String::as_str),
+        Some("flipped_decided")
+    );
     // the improvement on r2/d.go:4 must NOT appear as a regression
     assert!(!kinds.contains_key("r2/d.go:4"));
 }
@@ -75,8 +81,16 @@ fn disagreements_are_sampled_deterministically() {
     let r2 = compare_conditions(&arm_a(), &arm_b(), None, 200, 2, 42).unwrap();
     // 3 sites disagree; sample capped at 2, same seed -> same sample
     assert_eq!(r1.disagreement_sample.len(), 2);
-    let ids1: Vec<_> = r1.disagreement_sample.iter().map(|d| d.site_id.clone()).collect();
-    let ids2: Vec<_> = r2.disagreement_sample.iter().map(|d| d.site_id.clone()).collect();
+    let ids1: Vec<_> = r1
+        .disagreement_sample
+        .iter()
+        .map(|d| d.site_id.clone())
+        .collect();
+    let ids2: Vec<_> = r2
+        .disagreement_sample
+        .iter()
+        .map(|d| d.site_id.clone())
+        .collect();
     assert_eq!(ids1, ids2);
     // each carries both reasons for human review
     assert!(r1.disagreement_sample[0].a_reason.starts_with("because"));
@@ -89,14 +103,17 @@ fn decided_delta_has_a_ci_not_a_lone_scalar() {
     // A decided 3/4, B decided 3/4 -> mean delta 0 with a CI around it
     assert!(d.mean.abs() < 0.2);
     assert!(d.lo <= d.mean && d.mean <= d.hi);
-    assert!(r.accuracy_delta.is_none(), "no gold supplied, no accuracy claim");
+    assert!(
+        r.accuracy_delta.is_none(),
+        "no gold supplied, no accuracy claim"
+    );
 }
 
 #[test]
 fn gold_adds_accuracy_regressions_and_delta() {
     let mut gold = BTreeMap::new();
     gold.insert("r1/b.go:2".to_string(), "satisfies".to_string()); // A right, B wrong
-    gold.insert("r1/c.go:3".to_string(), "violates".to_string());  // both right
+    gold.insert("r1/c.go:3".to_string(), "violates".to_string()); // both right
     let r = compare_conditions(&arm_a(), &arm_b(), Some(&gold), 200, 5, 42).unwrap();
     assert!(r.accuracy_delta.is_some());
     assert!(r

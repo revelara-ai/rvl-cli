@@ -88,15 +88,28 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::SeedSet(s) => write!(f, "refused: {s} is a seed set (permanently gate-ineligible)"),
+            Refusal::SeedSet(s) => write!(
+                f,
+                "refused: {s} is a seed set (permanently gate-ineligible)"
+            ),
             Refusal::Consumed(s) => write!(f, "refused: {s} is consumed (single-use per version)"),
             Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < 50"),
-            Refusal::RegistryUnavailable(e) => write!(f, "refused (fail-closed): quarantine registry unavailable: {e}"),
-            Refusal::EvidenceUnreadable(e) => write!(f, "refused (fail-closed): gate evidence unreadable: {e}"),
+            Refusal::RegistryUnavailable(e) => write!(
+                f,
+                "refused (fail-closed): quarantine registry unavailable: {e}"
+            ),
+            Refusal::EvidenceUnreadable(e) => {
+                write!(f, "refused (fail-closed): gate evidence unreadable: {e}")
+            }
             Refusal::RepoNotQuarantined(r) => write!(f, "refused: {r} not in quarantine registry"),
-            Refusal::GroundingOverlap(r) => write!(f, "refused: gate-set repo {r} present in grounding corpus"),
+            Refusal::GroundingOverlap(r) => {
+                write!(f, "refused: gate-set repo {r} present in grounding corpus")
+            }
             Refusal::GoldTooSmall { decided, required } => {
-                write!(f, "refused: only {decided} decided adjudications < sample_size {required}")
+                write!(
+                    f,
+                    "refused: only {decided} decided adjudications < sample_size {required}"
+                )
             }
         }
     }
@@ -200,7 +213,13 @@ pub fn load_gate_inputs(
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()
         .map_err(|e| Refusal::EvidenceUnreadable(format!("{}: {e}", verdicts_path.display())))?;
-    Ok(GateInputs { manifest, seed_set_names, registry, grounding_repos, rows })
+    Ok(GateInputs {
+        manifest,
+        seed_set_names,
+        registry,
+        grounding_repos,
+        rows,
+    })
 }
 
 /// Validate a gate set's provenance before any scoring. Returns the registry
@@ -247,12 +266,21 @@ pub struct GateScore {
 /// Score adjudicated gold rows: precision = confirmed violates / decided,
 /// with the pass verdict taken on the Wilson 95% lower bound vs `target`.
 pub fn score_gate(rows: &[GoldRow], sample_size: usize, target: f64) -> Result<GateScore, Refusal> {
-    let n_unsure = rows.iter().filter(|r| r.adjudicated == AdjudicatedVerdict::Unsure).count();
+    let n_unsure = rows
+        .iter()
+        .filter(|r| r.adjudicated == AdjudicatedVerdict::Unsure)
+        .count();
     let n_decided = rows.len() - n_unsure;
     if n_decided < sample_size {
-        return Err(Refusal::GoldTooSmall { decided: n_decided, required: sample_size });
+        return Err(Refusal::GoldTooSmall {
+            decided: n_decided,
+            required: sample_size,
+        });
     }
-    let confirmed = rows.iter().filter(|r| r.adjudicated == AdjudicatedVerdict::Violates).count();
+    let confirmed = rows
+        .iter()
+        .filter(|r| r.adjudicated == AdjudicatedVerdict::Violates)
+        .count();
     let precision = confirmed as f64 / n_decided as f64;
     let wilson_lb = wilson_lower_bound(confirmed as u64, n_decided as u64);
     Ok(GateScore {

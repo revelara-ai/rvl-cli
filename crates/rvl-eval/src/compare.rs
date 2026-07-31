@@ -118,7 +118,9 @@ pub fn compare_conditions(
             .as_deref()
             .or(fb.class.as_deref())
             .unwrap_or("unclassified");
-        let cell = table.entry((fa.snapshot_id.clone(), class.to_string())).or_default();
+        let cell = table
+            .entry((fa.snapshot_id.clone(), class.to_string()))
+            .or_default();
         cell.n += 1;
         cell.a_decided += decided(&fa.verdict) as usize;
         cell.b_decided += decided(&fb.verdict) as usize;
@@ -141,7 +143,11 @@ pub fn compare_conditions(
     let mut cb: Vec<bool> = Vec::new();
     for (fa, fb) in &shared {
         if fa.verdict != fb.verdict && decided(&fa.verdict) {
-            let kind = if decided(&fb.verdict) { "flipped_decided" } else { "lost_decision" };
+            let kind = if decided(&fb.verdict) {
+                "flipped_decided"
+            } else {
+                "lost_decision"
+            };
             regressions.push(mk(fa, fb, kind));
         }
         if let Some(expect) = gold.and_then(|g| g.get(&fa.site_id)) {

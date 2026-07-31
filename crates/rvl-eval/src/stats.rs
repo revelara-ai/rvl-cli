@@ -21,7 +21,10 @@ pub fn wilson_interval(successes: u64, n: u64) -> (f64, f64) {
     let denom = 1.0 + z2 / n;
     let center = p + z2 / (2.0 * n);
     let margin = Z95 * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
-    (((center - margin) / denom).max(0.0), ((center + margin) / denom).min(1.0))
+    (
+        ((center - margin) / denom).max(0.0),
+        ((center + margin) / denom).min(1.0),
+    )
 }
 
 /// The gate metric: Wilson 95% lower bound.
@@ -74,7 +77,12 @@ pub fn paired_bootstrap(a: &[bool], b: &[bool], reps: usize, seed: u64) -> BootD
     let lo = deltas[(0.025 * deltas.len() as f64) as usize];
     let hi = deltas[((0.975 * deltas.len() as f64) as usize).min(deltas.len() - 1)];
     let p_better = deltas.iter().filter(|d| **d > 0.0).count() as f64 / deltas.len() as f64;
-    BootDelta { mean, lo, hi, p_better }
+    BootDelta {
+        mean,
+        lo,
+        hi,
+        p_better,
+    }
 }
 
 #[cfg(test)]
@@ -86,7 +94,10 @@ mod tests {
         let a = vec![true, false, true, true, false, true, false, true];
         let r = paired_bootstrap(&a, &a, 500, 1);
         assert!(r.mean.abs() < 1e-9);
-        assert!(r.lo <= 0.0 && r.hi >= 0.0, "identical arms must not appear separated");
+        assert!(
+            r.lo <= 0.0 && r.hi >= 0.0,
+            "identical arms must not appear separated"
+        );
     }
 
     #[test]

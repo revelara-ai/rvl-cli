@@ -24,8 +24,6 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
-
-
 /// A verdict about one call site.
 ///
 /// `NotApplicable` is not a flavour of `Satisfies`. A site that performs no
@@ -227,7 +225,11 @@ impl Site {
         format!("{}:{}", self.file_path, self.line_number)
     }
     pub fn api_key(&self) -> (String, String) {
-        let t = if self.client_type.is_empty() { "?".to_string() } else { self.client_type.clone() };
+        let t = if self.client_type.is_empty() {
+            "?".to_string()
+        } else {
+            self.client_type.clone()
+        };
         (t, self.method.clone())
     }
     /// All source in scope of this site: the enclosing function plus every
@@ -277,11 +279,16 @@ pub fn scope_of(path: &str) -> ScopeClass {
         ScopeClass::Migration
     } else if p.contains("backfill") {
         ScopeClass::Backfill
-    } else if p.contains("/test") || p.starts_with("tests/") || p.ends_with("_test.go")
-        || p.contains("test_") || p.ends_with("conftest.py")
+    } else if p.contains("/test")
+        || p.starts_with("tests/")
+        || p.ends_with("_test.go")
+        || p.contains("test_")
+        || p.ends_with("conftest.py")
     {
         ScopeClass::TestSupport
-    } else if p.starts_with("scripts/") || p.contains("/scripts/") || p.starts_with("cmd/")
+    } else if p.starts_with("scripts/")
+        || p.contains("/scripts/")
+        || p.starts_with("cmd/")
         || p.contains("/devtools/")
     {
         ScopeClass::DevOnly
@@ -356,7 +363,10 @@ mod tests {
         assert!(Verdict::Violates.is_decided());
         assert!(Verdict::Satisfies.is_decided());
         assert!(!Verdict::Abstain.is_decided());
-        assert!(!Verdict::NotApplicable.is_decided(), "a rejected candidate is not a label");
+        assert!(
+            !Verdict::NotApplicable.is_decided(),
+            "a rejected candidate is not a label"
+        );
     }
 
     #[test]
@@ -364,14 +374,19 @@ mod tests {
         let mut p = Provenance::default();
         assert!(p.complete());
         p.hit_caller_budget = true;
-        assert!(!p.complete(), "a truncated search must not license reasoning from absence");
+        assert!(
+            !p.complete(),
+            "a truncated search must not license reasoning from absence"
+        );
     }
 
     #[test]
     fn repo_config_record_does_not_become_a_site() {
         let stream = concat!(
-            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#, "\n",
-            r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#, "\n"
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#,
+            "\n"
         );
         let (sites, cfg, skipped) = parse_stream(stream);
         assert_eq!(sites.len(), 1);
@@ -382,26 +397,43 @@ mod tests {
 
     #[test]
     fn malformed_lines_degrade_coverage_rather_than_aborting() {
-        let (sites, _, skipped) = parse_stream("{not json}\n{\"file_path\":\"b.go\",\"line_number\":1}\n");
+        let (sites, _, skipped) =
+            parse_stream("{not json}\n{\"file_path\":\"b.go\",\"line_number\":1}\n");
         assert_eq!(sites.len(), 1);
         assert_eq!(skipped, 1);
     }
 
     #[test]
     fn ctx_evidence_distinguishes_all_none_and_mixed() {
-        let p = |t, d| Provenance { direct_callers: t, direct_callers_passing_bounded_ctx: d, ..Default::default() };
+        let p = |t, d| Provenance {
+            direct_callers: t,
+            direct_callers_passing_bounded_ctx: d,
+            ..Default::default()
+        };
         assert_eq!(p(0, 0).ctx_evidence(), CtxEvidence::Unknown);
         assert_eq!(p(7, 0).ctx_evidence(), CtxEvidence::NoneBounded);
         assert_eq!(p(7, 7).ctx_evidence(), CtxEvidence::AllBounded);
-        assert_eq!(p(7, 3).ctx_evidence(), CtxEvidence::Mixed { bounded: 3, total: 7 });
+        assert_eq!(
+            p(7, 3).ctx_evidence(),
+            CtxEvidence::Mixed {
+                bounded: 3,
+                total: 7
+            }
+        );
     }
 
     #[test]
     fn scope_source_spans_callers_and_callees() {
         let s = Site {
             enclosing_function_body: "body".into(),
-            callers: vec![Snippet { source: "up".into(), ..Default::default() }],
-            callees: vec![Snippet { source: "down".into(), ..Default::default() }],
+            callers: vec![Snippet {
+                source: "up".into(),
+                ..Default::default()
+            }],
+            callees: vec![Snippet {
+                source: "down".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let src = s.scope_source();

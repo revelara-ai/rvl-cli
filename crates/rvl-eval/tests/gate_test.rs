@@ -108,7 +108,10 @@ fn manifest_missing_field_is_error() {
 #[test]
 fn seed_set_names_parse() {
     let names = parse_seed_set_names(SEED_SETS_YAML).unwrap();
-    assert_eq!(names, vec!["ppi-labels".to_string(), "eval-go-v0".to_string()]);
+    assert_eq!(
+        names,
+        vec!["ppi-labels".to_string(), "eval-go-v0".to_string()]
+    );
 }
 
 // --- Provenance validation (fail-closed) ---
@@ -260,6 +263,9 @@ fn too_few_decided_is_refused() {
     let err = score_gate(&gold(40, 8, 2), 50, 0.90).unwrap_err();
     assert_eq!(
         err,
-        Refusal::GoldTooSmall { decided: 48, required: 50 }
+        Refusal::GoldTooSmall {
+            decided: 48,
+            required: 50
+        }
     );
 }

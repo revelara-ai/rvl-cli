@@ -37,14 +37,19 @@ struct Cli {
 enum Cmd {
     /// Propagate specs over a retrieved site stream and emit findings.
     Run {
-        #[arg(long)] retrieved: PathBuf,
-        #[arg(long)] specs: PathBuf,
-        #[arg(long)] out: Option<PathBuf>,
+        #[arg(long)]
+        retrieved: PathBuf,
+        #[arg(long)]
+        specs: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Score findings against adjudicated ground truth.
     Score {
-        #[arg(long)] findings: PathBuf,
-        #[arg(long)] gold: PathBuf,
+        #[arg(long)]
+        findings: PathBuf,
+        #[arg(long)]
+        gold: PathBuf,
     },
     /// Sweep a retrieval-policy axis and report what each setting buys.
     ///
@@ -55,65 +60,93 @@ enum Cmd {
     /// rather than guessed.
     Sweep {
         /// Command template; {flag} is replaced with the axis setting.
-        #[arg(long)] retriever: String,
-        #[arg(long)] axis: String,
-        #[arg(long)] values: String,
-        #[arg(long)] specs: PathBuf,
+        #[arg(long)]
+        retriever: String,
+        #[arg(long)]
+        axis: String,
+        #[arg(long)]
+        values: String,
+        #[arg(long)]
+        specs: PathBuf,
     },
     /// Prediction-Powered Inference: a debiased estimate with valid CIs from
     /// many machine labels plus a few human ones.
     Ppi {
-        #[arg(long)] findings: PathBuf,
-        #[arg(long)] adjudicated: PathBuf,
+        #[arg(long)]
+        findings: PathBuf,
+        #[arg(long)]
+        adjudicated: PathBuf,
         /// Which verdict the rate is being estimated for.
-        #[arg(long, default_value = "violates")] target: String,
+        #[arg(long, default_value = "violates")]
+        target: String,
     },
     /// Score against mined bounded/unbounded twins (paired protocol).
     Twins {
-        #[arg(long)] paired: PathBuf,
-        #[arg(long)] specs: PathBuf,
+        #[arg(long)]
+        paired: PathBuf,
+        #[arg(long)]
+        specs: PathBuf,
     },
     /// Compare two runs on the sites they share, with a paired bootstrap CI.
     Compare {
-        #[arg(long)] a: PathBuf,
-        #[arg(long)] b: PathBuf,
-        #[arg(long)] gold: PathBuf,
-        #[arg(long, default_value_t = 2000)] boot: usize,
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long)]
+        b: PathBuf,
+        #[arg(long)]
+        gold: PathBuf,
+        #[arg(long, default_value_t = 2000)]
+        boot: usize,
     },
     /// GATE MODE: score a minted gate set (per-language precision as Wilson
     /// 95% lower bound) with fail-closed provenance enforcement.
     Gate {
         /// Gate-set directory containing manifest.yaml + verdicts.jsonl.
-        #[arg(long)] set: PathBuf,
+        #[arg(long)]
+        set: PathBuf,
         /// registry/seed_sets.yaml from rvlscan-eval (seed-set refusal).
-        #[arg(long)] seed_sets: PathBuf,
+        #[arg(long)]
+        seed_sets: PathBuf,
         /// registry/quarantine.yaml from rvlscan-eval (fail-closed if absent).
-        #[arg(long)] registry: PathBuf,
+        #[arg(long)]
+        registry: PathBuf,
         /// Engine grounding-corpus manifest: one repo (owner/name) per line.
-        #[arg(long)] grounding_manifest: PathBuf,
+        #[arg(long)]
+        grounding_manifest: PathBuf,
         /// Wilson-LB precision target.
-        #[arg(long, default_value_t = 0.90)] target: f64,
+        #[arg(long, default_value_t = 0.90)]
+        target: f64,
     },
     /// Latency replay: warm staged-diff p95 and hook triage-count targets.
     Latency {
         /// JSONL of {diff_id, warm_ms, findings} rows.
-        #[arg(long)] replay: PathBuf,
-        #[arg(long, default_value_t = 2000.0)] p95_target_ms: f64,
-        #[arg(long, default_value_t = 0.0)] triage_median: f64,
-        #[arg(long, default_value_t = 3.0)] triage_p95: f64,
+        #[arg(long)]
+        replay: PathBuf,
+        #[arg(long, default_value_t = 2000.0)]
+        p95_target_ms: f64,
+        #[arg(long, default_value_t = 0.0)]
+        triage_median: f64,
+        #[arg(long, default_value_t = 3.0)]
+        triage_p95: f64,
     },
     /// Two-condition retriever comparison (baseline vs treatment, downstream
     /// frozen): per-repo x per-class table, regression list, disagreement
     /// sample, paired bootstrap CIs. Never a lone scalar.
     Compare2 {
-        #[arg(long)] a: PathBuf,
-        #[arg(long)] b: PathBuf,
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long)]
+        b: PathBuf,
         /// Optional gold file ({"cases":[{path|site_id, expect|verdict}]}).
-        #[arg(long)] gold: Option<PathBuf>,
-        #[arg(long, default_value_t = 2000)] boot: usize,
+        #[arg(long)]
+        gold: Option<PathBuf>,
+        #[arg(long, default_value_t = 2000)]
+        boot: usize,
         /// Disagreement sites to print for human review.
-        #[arg(long, default_value_t = 10)] sample: usize,
-        #[arg(long, default_value_t = 42)] seed: u64,
+        #[arg(long, default_value_t = 10)]
+        sample: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
 }
 
@@ -163,7 +196,10 @@ fn score(findings: &[Finding], gold: &[GoldCase]) -> (usize, usize, Vec<String>)
         if f.verdict == g.expect {
             correct += 1;
         } else {
-            misses.push(format!("{}: want {} got {} ({})", g.id, g.expect, f.verdict, f.reason));
+            misses.push(format!(
+                "{}: want {} got {} ({})",
+                g.id, g.expect, f.verdict, f.reason
+            ));
         }
     }
     (correct, pairs.len(), misses)
@@ -188,7 +224,11 @@ struct Adjudication {
 /// under i.i.d. sampling of the labelled subset, so the sample must be RANDOM;
 /// adjudicating the conflicts (which is the right way to choose what to fix)
 /// produces a biased subset and must not be fed here.
-fn ppi_proportion(machine_all: &[bool], machine_lab: &[bool], human_lab: &[bool]) -> (f64, f64, f64, f64, f64) {
+fn ppi_proportion(
+    machine_all: &[bool],
+    machine_lab: &[bool],
+    human_lab: &[bool],
+) -> (f64, f64, f64, f64, f64) {
     let big_n = machine_all.len() as f64;
     let n = human_lab.len() as f64;
     let f_bar = machine_all.iter().filter(|b| **b).count() as f64 / big_n;
@@ -229,13 +269,21 @@ fn wilson_half_width(p: f64, n: f64) -> f64 {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Run { retrieved, specs, out } => {
+        Cmd::Run {
+            retrieved,
+            specs,
+            out,
+        } => {
             let text = std::fs::read_to_string(&retrieved)?;
             let (sites, cfg, skipped) = parse_stream(&text);
             let cache = SpecCache::load(&std::fs::read_to_string(&specs)?)?;
             let served = cache.served_bound(&cfg);
 
-            println!("sites {} | specs {} | unparseable lines {skipped}", sites.len(), cache.len());
+            println!(
+                "sites {} | specs {} | unparseable lines {skipped}",
+                sites.len(),
+                cache.len()
+            );
             println!("repo-level bound on served requests: {served:?}");
 
             let findings = propagate_all(&sites, &cache, &served);
@@ -261,8 +309,11 @@ fn main() -> Result<()> {
                 println!("{k:<16} {v:>6} {:>7.1}%", 100.0 * *v as f64 / n as f64);
             }
             let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
-            println!("\ndecided {decided}/{} ({:.1}%), zero model calls",
-                     out_rows.len(), 100.0 * decided as f64 / n as f64);
+            println!(
+                "\ndecided {decided}/{} ({:.1}%), zero model calls",
+                out_rows.len(),
+                100.0 * decided as f64 / n as f64
+            );
 
             if let Some(p) = out {
                 std::fs::write(&p, serde_json::to_string_pretty(&out_rows)?)?;
@@ -273,24 +324,40 @@ fn main() -> Result<()> {
             let f = load_findings(&findings)?;
             let g: GoldFile = serde_json::from_str(&std::fs::read_to_string(&gold)?)?;
             let (correct, total, misses) = score(&f, &g.cases);
-            println!("gold cases {} | joined {total} | UNJOINED {}",
-                     g.cases.len(), g.cases.len() - total);
+            println!(
+                "gold cases {} | joined {total} | UNJOINED {}",
+                g.cases.len(),
+                g.cases.len() - total
+            );
             if total == 0 {
                 anyhow::bail!("nothing to score: the join is empty, which is a bug, not a result");
             }
-            println!("accuracy {correct}/{total} = {:.1}%", 100.0 * correct as f64 / total as f64);
+            println!(
+                "accuracy {correct}/{total} = {:.1}%",
+                100.0 * correct as f64 / total as f64
+            );
             for m in &misses {
                 println!("  MISS {m}");
             }
         }
-        Cmd::Sweep { retriever, axis, values, specs } => {
+        Cmd::Sweep {
+            retriever,
+            axis,
+            values,
+            specs,
+        } => {
             let cache = SpecCache::load(&std::fs::read_to_string(&specs)?)?;
-            println!("{:<10} {:>7} {:>9} {:>9} {:>9} {:>10}",
-                     axis, "sites", "decided", "violates", "abstain", "bytes");
+            println!(
+                "{:<10} {:>7} {:>9} {:>9} {:>9} {:>10}",
+                axis, "sites", "decided", "violates", "abstain", "bytes"
+            );
             println!("{}", "-".repeat(58));
             for v in values.split(',') {
                 let cmd = retriever.replace("{flag}", v.trim());
-                let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output()
+                let out = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
                     .with_context(|| format!("running {cmd}"))?;
                 let text = String::from_utf8_lossy(&out.stdout);
                 let (sites, cfg, skipped) = parse_stream(&text);
@@ -300,17 +367,32 @@ fn main() -> Result<()> {
                 let served = cache.served_bound(&cfg);
                 let f = propagate_all(&sites, &cache, &served);
                 let decided = f.iter().filter(|x| x.verdict.is_decided()).count();
-                let viol = f.iter().filter(|x| x.verdict == rvl_core::Verdict::Violates).count();
-                let abst = f.iter().filter(|x| x.verdict == rvl_core::Verdict::Abstain).count();
-                println!("{:<10} {:>7} {:>8.1}% {:>9} {:>9} {:>10}",
-                         v.trim(), sites.len(),
-                         100.0 * decided as f64 / sites.len().max(1) as f64,
-                         viol, abst, text.len());
+                let viol = f
+                    .iter()
+                    .filter(|x| x.verdict == rvl_core::Verdict::Violates)
+                    .count();
+                let abst = f
+                    .iter()
+                    .filter(|x| x.verdict == rvl_core::Verdict::Abstain)
+                    .count();
+                println!(
+                    "{:<10} {:>7} {:>8.1}% {:>9} {:>9} {:>10}",
+                    v.trim(),
+                    sites.len(),
+                    100.0 * decided as f64 / sites.len().max(1) as f64,
+                    viol,
+                    abst,
+                    text.len()
+                );
             }
             println!("\nA setting that raises `decided` without raising accuracy is buying");
             println!("confidence, not correctness; score each against gold before adopting one.");
         }
-        Cmd::Ppi { findings, adjudicated, target } => {
+        Cmd::Ppi {
+            findings,
+            adjudicated,
+            target,
+        } => {
             let f = load_findings(&findings)?;
             let adj: Vec<Adjudication> =
                 serde_json::from_str(&std::fs::read_to_string(&adjudicated)?)?;
@@ -336,9 +418,12 @@ fn main() -> Result<()> {
             }
             let machine_all: Vec<bool> = f.iter().map(|x| x.verdict == target).collect();
 
-            println!("target '{target}' | machine-labelled {} | adjudicated {} \
+            println!(
+                "target '{target}' | machine-labelled {} | adjudicated {} \
 (unsure {unsure} excluded, {unmatched} unmatched)",
-                     machine_all.len(), human_lab.len());
+                machine_all.len(),
+                human_lab.len()
+            );
             if human_lab.len() < 2 {
                 println!("too few adjudications for an interval; adjudicate a random sample first");
                 return Ok(());
@@ -346,20 +431,37 @@ fn main() -> Result<()> {
             let (theta, half, classical, half_c, f_bar) =
                 ppi_proportion(&machine_all, &machine_lab, &human_lab);
             println!("\n  scanner rate (all sites)     {:.1}%", 100.0 * f_bar);
-            println!("  classical (labelled only)    {:.1}%  +/- {:.1}  (Wilson, n={})",
-                     100.0 * classical, 100.0 * half_c, human_lab.len());
-            println!("  PPI (debiased, all evidence) {:.1}%  +/- {:.1}", 100.0 * theta, 100.0 * half);
+            println!(
+                "  classical (labelled only)    {:.1}%  +/- {:.1}  (Wilson, n={})",
+                100.0 * classical,
+                100.0 * half_c,
+                human_lab.len()
+            );
+            println!(
+                "  PPI (debiased, all evidence) {:.1}%  +/- {:.1}",
+                100.0 * theta,
+                100.0 * half
+            );
             if half < half_c {
-                println!("\n  PPI interval is {:.1}x tighter than labelled-only.", half_c / half.max(1e-9));
+                println!(
+                    "\n  PPI interval is {:.1}x tighter than labelled-only.",
+                    half_c / half.max(1e-9)
+                );
             } else {
-                println!("\n  PPI is NOT tighter here: the machine labels disagree with the humans");
+                println!(
+                    "\n  PPI is NOT tighter here: the machine labels disagree with the humans"
+                );
                 println!("  enough that they carry little information. That is a finding.");
             }
             println!("  Valid only if the adjudicated subset was sampled at RANDOM.");
         }
         Cmd::Twins { paired, specs } => {
             #[derive(Deserialize)]
-            struct TwinMeta { pair_id: String, side: String, label: String }
+            struct TwinMeta {
+                pair_id: String,
+                side: String,
+                label: String,
+            }
 
             let text = std::fs::read_to_string(&paired)?;
             let (sites, _, skipped) = parse_stream(&text);
@@ -407,25 +509,43 @@ fn main() -> Result<()> {
                 let f = rvl_propagate::propagate(&s, &cache, &served);
                 let entry = pairs.entry(meta.pair_id.clone()).or_insert((None, None));
                 let slot = (f.verdict.as_str().to_string(), meta.label.clone());
-                if meta.side == "before" { entry.0 = Some(slot) } else { entry.1 = Some(slot) }
+                if meta.side == "before" {
+                    entry.0 = Some(slot)
+                } else {
+                    entry.1 = Some(slot)
+                }
             }
 
-            println!("twins {} rows / {} pairs | unparseable {skipped} | \
-specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
+            println!(
+                "twins {} rows / {} pairs | unparseable {skipped} | \
+specs borrowed by method for {borrowed} rows",
+                sites.len(),
+                pairs.len()
+            );
 
             let (mut both_right, mut discriminated, mut uninformative, mut wrong) = (0, 0, 0, 0);
             let mut detail: Vec<String> = Vec::new();
             for (pid, (b, a)) in &pairs {
-                let (Some((bv, bl)), Some((av, al))) = (b, a) else { continue };
+                let (Some((bv, bl)), Some((av, al))) = (b, a) else {
+                    continue;
+                };
                 let exact = bv == bl && av == al;
                 let disc = bv != av;
                 let uninf = bv == "abstain" && av == "abstain";
-                if exact { both_right += 1 }
-                if disc { discriminated += 1 }
-                if uninf { uninformative += 1 }
+                if exact {
+                    both_right += 1
+                }
+                if disc {
+                    discriminated += 1
+                }
+                if uninf {
+                    uninformative += 1
+                }
                 if !exact && !uninf {
                     wrong += 1;
-                    detail.push(format!("  {pid}: before {bv} (want {bl}), after {av} (want {al})"));
+                    detail.push(format!(
+                        "  {pid}: before {bv} (want {bl}), after {av} (want {al})"
+                    ));
                 }
             }
             let n = pairs.len().max(1);
@@ -433,7 +553,9 @@ specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
             println!("  discriminated (verdict CHANGED across the twin)      {discriminated}/{n}");
             println!("  uninformative (abstained on both sides)              {uninformative}/{n}");
             println!("  wrong                                                {wrong}/{n}");
-            for d in detail.iter().take(8) { println!("{d}") }
+            for d in detail.iter().take(8) {
+                println!("{d}")
+            }
             println!("\nDiscrimination is the weaker but more robust signal: it asks only");
             println!("whether the engine SEES the change a developer made, independent of");
             println!("whether it names both sides correctly.");
@@ -442,27 +564,51 @@ specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
             let (fa, fb) = (load_findings(&a)?, load_findings(&b)?);
             let g: GoldFile = serde_json::from_str(&std::fs::read_to_string(&gold)?)?;
             let (pa, pb) = (join(&fa, &g.cases), join(&fb, &g.cases));
-            let shared: Vec<_> = pa.iter()
-                .filter_map(|(gc, f)| pb.iter().find(|(g2, _)| g2.id == gc.id).map(|(_, f2)| (gc, *f, *f2)))
+            let shared: Vec<_> = pa
+                .iter()
+                .filter_map(|(gc, f)| {
+                    pb.iter()
+                        .find(|(g2, _)| g2.id == gc.id)
+                        .map(|(_, f2)| (gc, *f, *f2))
+                })
                 .collect();
             if shared.is_empty() {
                 anyhow::bail!("no shared scored sites; an empty join is a bug, not a result");
             }
-            let ha: Vec<bool> = shared.iter().map(|(g, f, _)| f.verdict == g.expect).collect();
-            let hb: Vec<bool> = shared.iter().map(|(g, _, f)| f.verdict == g.expect).collect();
+            let ha: Vec<bool> = shared
+                .iter()
+                .map(|(g, f, _)| f.verdict == g.expect)
+                .collect();
+            let hb: Vec<bool> = shared
+                .iter()
+                .map(|(g, _, f)| f.verdict == g.expect)
+                .collect();
             let acc = |v: &[bool]| v.iter().filter(|x| **x).count() as f64 / v.len() as f64;
             let d = paired_bootstrap(&ha, &hb, boot, 42);
             let (mean, lo, hi, p) = (d.mean, d.lo, d.hi, d.p_better);
             println!("shared scored sites: {}", shared.len());
-            println!("  A accuracy {:.1}%\n  B accuracy {:.1}%", 100.0 * acc(&ha), 100.0 * acc(&hb));
-            println!("  paired delta (B-A) {mean:+.3}  95% CI [{lo:+.3}, {hi:+.3}]  P(B>A) {:.1}%", 100.0 * p);
+            println!(
+                "  A accuracy {:.1}%\n  B accuracy {:.1}%",
+                100.0 * acc(&ha),
+                100.0 * acc(&hb)
+            );
+            println!(
+                "  paired delta (B-A) {mean:+.3}  95% CI [{lo:+.3}, {hi:+.3}]  P(B>A) {:.1}%",
+                100.0 * p
+            );
             if lo > 0.0 {
                 println!("  separated: the gap survives resampling");
             } else {
                 println!("  NOT separated: the CI crosses zero, do not claim a difference");
             }
         }
-        Cmd::Gate { set, seed_sets, registry, grounding_manifest, target } => {
+        Cmd::Gate {
+            set,
+            seed_sets,
+            registry,
+            grounding_manifest,
+            target,
+        } => {
             // Exit contract: 0 pass, 1 metric fail, 2 refusal. EVERY input
             // problem is a refusal (fail-closed) so a CI wrapper can tell
             // "engine not good enough" from "evidence invalid".
@@ -470,11 +616,18 @@ specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
                 eprintln!("{r}");
                 std::process::exit(2);
             };
-            let inputs = match gate::load_gate_inputs(&set, &seed_sets, &registry, &grounding_manifest) {
-                Ok(i) => i,
-                Err(r) => refuse(&r),
-            };
-            let gate::GateInputs { manifest, seed_set_names, registry: reg, grounding_repos, rows } = inputs;
+            let inputs =
+                match gate::load_gate_inputs(&set, &seed_sets, &registry, &grounding_manifest) {
+                    Ok(i) => i,
+                    Err(r) => refuse(&r),
+                };
+            let gate::GateInputs {
+                manifest,
+                seed_set_names,
+                registry: reg,
+                grounding_repos,
+                rows,
+            } = inputs;
             let registry_version =
                 match gate::validate_gate_set(&manifest, &seed_set_names, &reg, &grounding_repos) {
                     Ok(v) => v,
@@ -482,44 +635,73 @@ specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
                 };
 
             // The population, printed WITH the number, always.
-            println!("GATE RUN  set {} | language {} | minted {} | registry v{registry_version}",
-                     manifest.set_id, manifest.language, manifest.minted);
+            println!(
+                "GATE RUN  set {} | language {} | minted {} | registry v{registry_version}",
+                manifest.set_id, manifest.language, manifest.minted
+            );
             for pin in &manifest.repos {
                 println!("  repo {} @ {}", pin.repo, pin.frozen_sha);
             }
             println!("  sampling frame: {}", manifest.sampling_frame.trim());
-            println!("  adjudication: {} by {} ({})",
-                     manifest.adjudication.protocol,
-                     manifest.adjudication.adjudicator,
-                     manifest.adjudication.date);
+            println!(
+                "  adjudication: {} by {} ({})",
+                manifest.adjudication.protocol,
+                manifest.adjudication.adjudicator,
+                manifest.adjudication.date
+            );
 
             let s = match gate::score_gate(&rows, manifest.sample_size, target) {
                 Ok(s) => s,
                 Err(r) => refuse(&r),
             };
-            println!("\n  decided {} (unsure {} excluded) | confirmed violates {}",
-                     s.n_decided, s.n_unsure, s.confirmed_violates);
-            println!("  precision {:.3} | Wilson 95% LB {:.3} | target {target:.2}",
-                     s.precision, s.wilson_lb);
-            println!("\n  {}", if s.pass { "PASS: the lower bound clears the target" }
-                                else { "FAIL: the LOWER BOUND is the gate, not the point estimate" });
+            println!(
+                "\n  decided {} (unsure {} excluded) | confirmed violates {}",
+                s.n_decided, s.n_unsure, s.confirmed_violates
+            );
+            println!(
+                "  precision {:.3} | Wilson 95% LB {:.3} | target {target:.2}",
+                s.precision, s.wilson_lb
+            );
+            println!(
+                "\n  {}",
+                if s.pass {
+                    "PASS: the lower bound clears the target"
+                } else {
+                    "FAIL: the LOWER BOUND is the gate, not the point estimate"
+                }
+            );
             if !s.pass {
                 std::process::exit(1);
             }
         }
-        Cmd::Latency { replay, p95_target_ms, triage_median, triage_p95 } => {
+        Cmd::Latency {
+            replay,
+            p95_target_ms,
+            triage_median,
+            triage_p95,
+        } => {
             let rows: Vec<latency::ReplayRow> = load_jsonl(&replay)?;
             let r = latency::score_replay(&rows, p95_target_ms, triage_median, triage_p95)?;
             println!("replayed diffs {}", r.n);
-            println!("  warm p95 {:.0}ms (target < {p95_target_ms:.0}ms)  {}",
-                     r.warm_p95_ms, if r.latency_pass { "PASS" } else { "FAIL" });
+            println!(
+                "  warm p95 {:.0}ms (target < {p95_target_ms:.0}ms)  {}",
+                r.warm_p95_ms,
+                if r.latency_pass { "PASS" } else { "FAIL" }
+            );
             println!("  triage counts median {:.0} (target <= {triage_median:.0}), p95 {:.0} (target <= {triage_p95:.0})  {}",
                      r.triage_median, r.triage_p95, if r.triage_pass { "PASS" } else { "FAIL" });
             if !(r.latency_pass && r.triage_pass) {
                 std::process::exit(1);
             }
         }
-        Cmd::Compare2 { a, b, gold, boot, sample, seed } => {
+        Cmd::Compare2 {
+            a,
+            b,
+            gold,
+            boot,
+            sample,
+            seed,
+        } => {
             let (fa, fb) = (load_findings(&a)?, load_findings(&b)?);
             let gold_map: Option<BTreeMap<String, String>> = match &gold {
                 Some(p) => {
@@ -530,35 +712,64 @@ specs borrowed by method for {borrowed} rows", sites.len(), pairs.len());
             };
             let r = compare::compare_conditions(&fa, &fb, gold_map.as_ref(), boot, sample, seed)?;
 
-            println!("shared sites {} | only in A {} | only in B {}", r.shared, r.only_a, r.only_b);
-            println!("\n{:<24} {:<40} {:>4} {:>6} {:>6} {:>6} {:>6}",
-                     "repo", "class", "n", "A dec", "B dec", "A vio", "B vio");
+            println!(
+                "shared sites {} | only in A {} | only in B {}",
+                r.shared, r.only_a, r.only_b
+            );
+            println!(
+                "\n{:<24} {:<40} {:>4} {:>6} {:>6} {:>6} {:>6}",
+                "repo", "class", "n", "A dec", "B dec", "A vio", "B vio"
+            );
             println!("{}", "-".repeat(98));
             for ((repo, class), c) in &r.table {
-                println!("{:<24} {:<40} {:>4} {:>6} {:>6} {:>6} {:>6}",
-                         repo, class, c.n, c.a_decided, c.b_decided, c.a_violates, c.b_violates);
+                println!(
+                    "{:<24} {:<40} {:>4} {:>6} {:>6} {:>6} {:>6}",
+                    repo, class, c.n, c.a_decided, c.b_decided, c.a_violates, c.b_violates
+                );
             }
 
             println!("\nregressions ({}):", r.regressions.len());
             for x in &r.regressions {
-                println!("  [{:<15}] {} | A {} -> B {}", x.kind, x.site_id, x.a_verdict, x.b_verdict);
+                println!(
+                    "  [{:<15}] {} | A {} -> B {}",
+                    x.kind, x.site_id, x.a_verdict, x.b_verdict
+                );
             }
-            println!("\ndisagreement sample ({} of the disagreeing sites, seed {seed}):",
-                     r.disagreement_sample.len());
+            println!(
+                "\ndisagreement sample ({} of the disagreeing sites, seed {seed}):",
+                r.disagreement_sample.len()
+            );
             for d in &r.disagreement_sample {
-                println!("  {} | A {} ({}) | B {} ({})",
-                         d.site_id, d.a_verdict, d.a_reason, d.b_verdict, d.b_reason);
+                println!(
+                    "  {} | A {} ({}) | B {} ({})",
+                    d.site_id, d.a_verdict, d.a_reason, d.b_verdict, d.b_reason
+                );
             }
 
             let d = r.decided_delta;
-            println!("\ndecided-rate delta (B-A) {:+.3}  95% CI [{:+.3}, {:+.3}]  P(B>A) {:.1}%",
-                     d.mean, d.lo, d.hi, 100.0 * d.p_better);
+            println!(
+                "\ndecided-rate delta (B-A) {:+.3}  95% CI [{:+.3}, {:+.3}]  P(B>A) {:.1}%",
+                d.mean,
+                d.lo,
+                d.hi,
+                100.0 * d.p_better
+            );
             if let Some(d) = r.accuracy_delta {
-                println!("accuracy delta (B-A)     {:+.3}  95% CI [{:+.3}, {:+.3}]  P(B>A) {:.1}%  \
+                println!(
+                    "accuracy delta (B-A)     {:+.3}  95% CI [{:+.3}, {:+.3}]  P(B>A) {:.1}%  \
 (gold joined {}/{}; the CI covers only the joined subpopulation)",
-                         d.mean, d.lo, d.hi, 100.0 * d.p_better, r.gold_matched, r.gold_total);
+                    d.mean,
+                    d.lo,
+                    d.hi,
+                    100.0 * d.p_better,
+                    r.gold_matched,
+                    r.gold_total
+                );
             } else if r.gold_total > 0 {
-                println!("gold supplied ({} cases) but joined 0 shared sites; no accuracy claim", r.gold_total);
+                println!(
+                    "gold supplied ({} cases) but joined 0 shared sites; no accuracy claim",
+                    r.gold_total
+                );
             }
             println!("\nRead the table and the regression list; a favourable delta with a");
             println!("non-empty regression list is a trade-off, not a win.");
@@ -572,10 +783,19 @@ mod tests {
     use super::*;
 
     fn f(id: &str, v: &str) -> Finding {
-        Finding { site_id: id.into(), snapshot_id: "r".into(), verdict: v.into(), reason: String::new(), class: None }
+        Finding {
+            site_id: id.into(),
+            snapshot_id: "r".into(),
+            verdict: v.into(),
+            reason: String::new(),
+            class: None,
+        }
     }
     fn g(id: &str, v: &str) -> GoldCase {
-        GoldCase { id: id.into(), expect: v.into() }
+        GoldCase {
+            id: id.into(),
+            expect: v.into(),
+        }
     }
 
     #[test]
@@ -588,8 +808,14 @@ mod tests {
 
     #[test]
     fn unjoined_gold_is_reported_not_silently_dropped() {
-        let (_, total, _) = score(&[f("a.py:1", "violates")], &[g("a.py", "violates"), g("missing.py", "satisfies")]);
-        assert_eq!(total, 1, "the caller must be able to see the join was partial");
+        let (_, total, _) = score(
+            &[f("a.py:1", "violates")],
+            &[g("a.py", "violates"), g("missing.py", "satisfies")],
+        );
+        assert_eq!(
+            total, 1,
+            "the caller must be able to see the join was partial"
+        );
     }
 
     #[test]
@@ -608,7 +834,10 @@ mod tests {
         let lab_m = vec![true, false, true, false];
         let lab_y = lab_m.clone();
         let (theta, _, _, _, f_bar) = ppi_proportion(&all, &lab_m, &lab_y);
-        assert!((theta - f_bar).abs() < 1e-9, "no disagreement means no correction");
+        assert!(
+            (theta - f_bar).abs() < 1e-9,
+            "no disagreement means no correction"
+        );
     }
 
     #[test]
@@ -620,7 +849,9 @@ mod tests {
         lab_y.extend(vec![false; 5]);
         let (theta, _, _, _, f_bar) = ppi_proportion(&all, &lab_m, &lab_y);
         assert!((f_bar - 1.0).abs() < 1e-9);
-        assert!((theta - 0.5).abs() < 1e-9, "PPI must pull the estimate down to the human rate");
+        assert!(
+            (theta - 0.5).abs() < 1e-9,
+            "PPI must pull the estimate down to the human rate"
+        );
     }
-
 }

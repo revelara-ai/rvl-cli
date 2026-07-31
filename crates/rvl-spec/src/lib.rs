@@ -220,7 +220,9 @@ impl SpecCache {
     pub fn served_bound(&self, cfg: &RepoConfig) -> ServedBound {
         let mut seen: Vec<(String, Bounds)> = Vec::new();
         for c in &cfg.constructions {
-            let Some(spec) = self.config(&c.type_name) else { continue };
+            let Some(spec) = self.config(&c.type_name) else {
+                continue;
+            };
             if spec.scope != Scope::ServedRequests || spec.confidence < MIN_CONFIDENCE {
                 continue;
             }
@@ -237,9 +239,7 @@ impl SpecCache {
                 if seen.iter().all(|(_, b)| *b == first) {
                     ServedBound::Agreed(first)
                 } else {
-                    ServedBound::Conflict(
-                        seen.iter().map(|(t, b)| format!("{t}={b:?}")).collect(),
-                    )
+                    ServedBound::Conflict(seen.iter().map(|(t, b)| format!("{t}={b:?}")).collect())
                 }
             }
         }
@@ -281,9 +281,13 @@ mod tests {
 
     fn api(blocking: Blocking, confidence: f64) -> ApiSpec {
         ApiSpec {
-            type_name: "t".into(), method: "Do".into(), blocking,
-            bounded_by: vec![Mechanism::Context], confidence,
-            rationale: String::new(), site_count: 1,
+            type_name: "t".into(),
+            method: "Do".into(),
+            blocking,
+            bounded_by: vec![Mechanism::Context],
+            confidence,
+            rationale: String::new(),
+            site_count: 1,
         }
     }
 
@@ -297,7 +301,11 @@ mod tests {
     #[test]
     fn low_confidence_blocking_spec_abstains() {
         let (v, _) = spec_gate(Some(&api(Blocking::Yes, 0.55))).unwrap();
-        assert_eq!(v, Verdict::Abstain, "a shaky spec applies to every site at once");
+        assert_eq!(
+            v,
+            Verdict::Abstain,
+            "a shaky spec applies to every site at once"
+        );
         assert!(spec_gate(Some(&api(Blocking::Yes, 0.9))).is_none());
     }
 
@@ -313,22 +321,33 @@ mod tests {
     }
 
     fn cache(specs: Vec<(&str, Bounds, Scope, f64)>) -> SpecCache {
-        SpecCache::from_file(SpecFile { scopes: vec![],
+        SpecCache::from_file(SpecFile {
+            scopes: vec![],
             apis: vec![],
-            configs: specs.into_iter().map(|(t, b, s, c)| ConfigSpec {
-                type_name: t.into(), bounds: b, scope: s, confidence: c,
-                rationale: String::new(),
-            }).collect(),
+            configs: specs
+                .into_iter()
+                .map(|(t, b, s, c)| ConfigSpec {
+                    type_name: t.into(),
+                    bounds: b,
+                    scope: s,
+                    confidence: c,
+                    rationale: String::new(),
+                })
+                .collect(),
         })
     }
 
     fn repo(types: &[&str]) -> RepoConfig {
         RepoConfig {
             snapshot_id: "r".into(),
-            constructions: types.iter().map(|t| ConfigFact {
-                type_name: (*t).into(), fields: vec!["Timeout".into()],
-                ..Default::default()
-            }).collect(),
+            constructions: types
+                .iter()
+                .map(|t| ConfigFact {
+                    type_name: (*t).into(),
+                    fields: vec!["Timeout".into()],
+                    ..Default::default()
+                })
+                .collect(),
         }
     }
 
@@ -339,8 +358,18 @@ mod tests {
         // enforces them and was specced phase_only. Taking the max silently
         // turned "not really bounded" into a false pass.
         let c = cache(vec![
-            ("cfg.ServerConfig", Bounds::WholeCall, Scope::ServedRequests, 0.9),
-            ("net/http.Server", Bounds::PhaseOnly, Scope::ServedRequests, 0.9),
+            (
+                "cfg.ServerConfig",
+                Bounds::WholeCall,
+                Scope::ServedRequests,
+                0.9,
+            ),
+            (
+                "net/http.Server",
+                Bounds::PhaseOnly,
+                Scope::ServedRequests,
+                0.9,
+            ),
         ]);
         match c.served_bound(&repo(&["cfg.ServerConfig", "net/http.Server"])) {
             ServedBound::Conflict(v) => assert_eq!(v.len(), 2),
@@ -350,22 +379,46 @@ mod tests {
 
     #[test]
     fn agreeing_server_specs_are_used() {
-        let c = cache(vec![("net/http.Server", Bounds::PhaseOnly, Scope::ServedRequests, 0.9)]);
-        assert_eq!(c.served_bound(&repo(&["net/http.Server"])), ServedBound::Agreed(Bounds::PhaseOnly));
+        let c = cache(vec![(
+            "net/http.Server",
+            Bounds::PhaseOnly,
+            Scope::ServedRequests,
+            0.9,
+        )]);
+        assert_eq!(
+            c.served_bound(&repo(&["net/http.Server"])),
+            ServedBound::Agreed(Bounds::PhaseOnly)
+        );
     }
 
     #[test]
     fn low_confidence_config_specs_are_ignored_entirely() {
-        let c = cache(vec![("net/http.Server", Bounds::WholeCall, Scope::ServedRequests, 0.3)]);
-        assert_eq!(c.served_bound(&repo(&["net/http.Server"])), ServedBound::None);
+        let c = cache(vec![(
+            "net/http.Server",
+            Bounds::WholeCall,
+            Scope::ServedRequests,
+            0.3,
+        )]);
+        assert_eq!(
+            c.served_bound(&repo(&["net/http.Server"])),
+            ServedBound::None
+        );
     }
 
     #[test]
     fn merge_prefers_higher_confidence() {
-        let mut base = SpecCache::from_file(SpecFile { scopes: vec![], apis: vec![api(Blocking::Yes, 0.7)], configs: vec![] });
+        let mut base = SpecCache::from_file(SpecFile {
+            scopes: vec![],
+            apis: vec![api(Blocking::Yes, 0.7)],
+            configs: vec![],
+        });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
-        base.merge(SpecCache::from_file(SpecFile { scopes: vec![], apis: vec![better], configs: vec![] }));
+        base.merge(SpecCache::from_file(SpecFile {
+            scopes: vec![],
+            apis: vec![better],
+            configs: vec![],
+        }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");

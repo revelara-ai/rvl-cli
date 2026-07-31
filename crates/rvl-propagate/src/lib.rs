@@ -11,7 +11,7 @@
 //! to a human adjudication, not to intuition.
 
 use rvl_core::{scope_of, CtxEvidence, Site, Verdict};
-use rvl_spec::{Bounds, Mechanism, ServedBound, SpecCache, spec_gate};
+use rvl_spec::{spec_gate, Bounds, Mechanism, ServedBound, SpecCache};
 
 /// Evidence of a bound, and how much of the call it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,9 +39,13 @@ fn has_deadline_call(src: &str) -> bool {
 /// and reported a violation on a correctly-bounded migration.
 fn has_session_bound(src: &str) -> bool {
     let lower = src.to_ascii_lowercase();
-    ["lock_timeout", "statement_timeout", "idle_in_transaction_session_timeout"]
-        .iter()
-        .any(|k| lower.contains(k))
+    [
+        "lock_timeout",
+        "statement_timeout",
+        "idle_in_transaction_session_timeout",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
         && lower.contains("set")
 }
 
@@ -85,7 +89,11 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
     let spec = specs.api(&key);
 
     if let Some((verdict, reason)) = spec_gate(spec) {
-        return Finding { site_id: id, verdict, reason };
+        return Finding {
+            site_id: id,
+            verdict,
+            reason,
+        };
     }
 
     // Scope is checked AFTER the API gate so a non-I/O call in an exempt scope
@@ -96,7 +104,11 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
         return Finding {
             site_id: id,
             verdict: Verdict::Satisfies,
-            reason: format!("scope {} is not governed by this control: {}", scope.as_str(), sp.rationale),
+            reason: format!(
+                "scope {} is not governed by this control: {}",
+                scope.as_str(),
+                sp.rationale
+            ),
         };
     }
     let spec = spec.expect("spec_gate returns None only when a spec exists");
@@ -190,7 +202,9 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
             Mechanism::ClientConfig => {
                 for c in &site.client_construction {
                     match specs.config(&c.symbol).map(|s| s.bounds) {
-                        Some(Bounds::WholeCall) => whole.push(format!("client config {}", c.symbol)),
+                        Some(Bounds::WholeCall) => {
+                            whole.push(format!("client config {}", c.symbol))
+                        }
                         Some(Bounds::PhaseOnly) => {
                             phase.push(format!("client config {} bounds only a phase", c.symbol))
                         }
@@ -203,7 +217,11 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
     }
 
     if !whole.is_empty() {
-        return Finding { site_id: id, verdict: Verdict::Satisfies, reason: whole.join("; ") };
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Satisfies,
+            reason: whole.join("; "),
+        };
     }
     if served_unresolved {
         return Finding {
@@ -249,9 +267,13 @@ mod tests {
     fn cache(bounded_by: Vec<Mechanism>, configs: Vec<ConfigSpec>) -> SpecCache {
         SpecCache::from_file(SpecFile {
             apis: vec![ApiSpec {
-                type_name: "db.Pool".into(), method: "Query".into(),
-                blocking: Blocking::Yes, bounded_by, confidence: 0.9,
-                rationale: String::new(), site_count: 1,
+                type_name: "db.Pool".into(),
+                method: "Query".into(),
+                blocking: Blocking::Yes,
+                bounded_by,
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
             }],
             configs,
             scopes: vec![],
@@ -260,14 +282,21 @@ mod tests {
 
     fn site() -> Site {
         Site {
-            file_path: "a.go".into(), line_number: 1, method: "Query".into(),
-            client_type: "db.Pool".into(), ..Default::default()
+            file_path: "a.go".into(),
+            line_number: 1,
+            method: "Query".into(),
+            client_type: "db.Pool".into(),
+            ..Default::default()
         }
     }
 
     #[test]
     fn complete_search_with_no_bound_is_a_violation() {
-        let f = propagate(&site(), &cache(vec![Mechanism::Context], vec![]), &ServedBound::None);
+        let f = propagate(
+            &site(),
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+        );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("complete"));
     }
@@ -275,9 +304,20 @@ mod tests {
     #[test]
     fn truncated_search_abstains_instead_of_asserting() {
         let mut s = site();
-        s.provenance = Provenance { hit_caller_budget: true, ..Default::default() };
-        let f = propagate(&s, &cache(vec![Mechanism::Context], vec![]), &ServedBound::None);
-        assert_eq!(f.verdict, Verdict::Abstain, "absence is only evidence when the search was complete");
+        s.provenance = Provenance {
+            hit_caller_budget: true,
+            ..Default::default()
+        };
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::Abstain,
+            "absence is only evidence when the search was complete"
+        );
     }
 
     #[test]
@@ -285,28 +325,57 @@ mod tests {
         // The regression this guards: both callers CONTAIN a WithTimeout and
         // neither passes it here. Only the dataflow counts may move a verdict.
         let mut s = site();
-        s.provenance = Provenance { ancestors_traced: 2, ancestors_with_deadline: 2,
-                                    direct_callers: 2, direct_callers_passing_bounded_ctx: 0,
-                                    enclosing_takes_context: true, ..Default::default() };
-        assert_eq!(propagate(&s, &cache(vec![Mechanism::Context], vec![]), &ServedBound::None).verdict,
-                   Verdict::Violates);
+        s.provenance = Provenance {
+            ancestors_traced: 2,
+            ancestors_with_deadline: 2,
+            direct_callers: 2,
+            direct_callers_passing_bounded_ctx: 0,
+            enclosing_takes_context: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            propagate(
+                &s,
+                &cache(vec![Mechanism::Context], vec![]),
+                &ServedBound::None
+            )
+            .verdict,
+            Verdict::Violates
+        );
     }
 
     #[test]
     fn dataflow_confirmed_bounded_ctx_satisfies() {
         let mut s = site();
-        s.provenance = Provenance { direct_callers: 3, direct_callers_passing_bounded_ctx: 3,
-                                    ..Default::default() };
-        assert_eq!(propagate(&s, &cache(vec![Mechanism::Context], vec![]), &ServedBound::None).verdict,
-                   Verdict::Satisfies);
+        s.provenance = Provenance {
+            direct_callers: 3,
+            direct_callers_passing_bounded_ctx: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            propagate(
+                &s,
+                &cache(vec![Mechanism::Context], vec![]),
+                &ServedBound::None
+            )
+            .verdict,
+            Verdict::Satisfies
+        );
     }
 
     #[test]
     fn one_unbounded_path_among_several_is_not_a_pass() {
         let mut s = site();
-        s.provenance = Provenance { direct_callers: 4, direct_callers_passing_bounded_ctx: 3,
-                                    ..Default::default() };
-        let f = propagate(&s, &cache(vec![Mechanism::Context], vec![]), &ServedBound::None);
+        s.provenance = Provenance {
+            direct_callers: 4,
+            direct_callers_passing_bounded_ctx: 3,
+            ..Default::default()
+        };
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+        );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("1 of 4"));
     }
@@ -314,8 +383,15 @@ mod tests {
     #[test]
     fn deadline_in_a_callee_counts_the_same_as_one_in_a_caller() {
         let mut s = site();
-        s.callees = vec![Snippet { source: "ctx, cancel := context.WithTimeout(ctx, d)".into(), ..Default::default() }];
-        let f = propagate(&s, &cache(vec![Mechanism::Context], vec![]), &ServedBound::None);
+        s.callees = vec![Snippet {
+            source: "ctx, cancel := context.WithTimeout(ctx, d)".into(),
+            ..Default::default()
+        }];
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+        );
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
 
@@ -327,7 +403,11 @@ mod tests {
         // propagation inventing bounds.
         let mut s = site();
         s.snippet = "pool.Query(sql, timeout=5)".into();
-        let f = propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &ServedBound::None);
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
+        );
         assert_eq!(f.verdict, Verdict::Violates);
     }
 
@@ -337,19 +417,33 @@ mod tests {
         // not the DB API's spec mentions decorators: the bound belongs to the
         // site's context, not to the callee.
         let mut s = site();
-        s.enclosing_function_body = "@shared_task(time_limit=120)\ndef build():\n    pool.Query(q)".into();
-        let f = propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &ServedBound::None);
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef build():\n    pool.Query(q)".into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
+        );
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
 
     #[test]
     fn phase_only_client_config_is_a_violation_not_a_pass() {
         let mut s = site();
-        s.client_construction = vec![Snippet { symbol: "redis.Options".into(), ..Default::default() }];
-        let specs = cache(vec![Mechanism::ClientConfig], vec![ConfigSpec {
-            type_name: "redis.Options".into(), bounds: Bounds::PhaseOnly,
-            scope: Scope::ThisClient, confidence: 0.9, rationale: String::new(),
-        }]);
+        s.client_construction = vec![Snippet {
+            symbol: "redis.Options".into(),
+            ..Default::default()
+        }];
+        let specs = cache(
+            vec![Mechanism::ClientConfig],
+            vec![ConfigSpec {
+                type_name: "redis.Options".into(),
+                bounds: Bounds::PhaseOnly,
+                scope: Scope::ThisClient,
+                confidence: 0.9,
+                rationale: String::new(),
+            }],
+        );
         let f = propagate(&s, &specs, &ServedBound::None);
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("phase"));
@@ -360,9 +454,13 @@ mod tests {
         // @shared_task(time_limit=120) bounds every call in the task. The
         // fixture gold set scored app/reports.py wrong until Decorator existed.
         let mut s = site();
-        s.enclosing_function_body = "@shared_task(time_limit=120)\ndef build_report():\n    db.query()".into();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef build_report():\n    db.query()".into();
         let specs = cache(vec![Mechanism::Decorator], vec![]);
-        assert_eq!(propagate(&s, &specs, &ServedBound::None).verdict, Verdict::Satisfies);
+        assert_eq!(
+            propagate(&s, &specs, &ServedBound::None).verdict,
+            Verdict::Satisfies
+        );
     }
 
     #[test]
@@ -376,7 +474,12 @@ mod tests {
         s.enclosing_function_body =
             "def run_migrations():\n    conn.execute(\"SET lock_timeout = '2s'\")".into();
         assert_eq!(
-            propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &ServedBound::None).verdict,
+            propagate(
+                &s,
+                &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None
+            )
+            .verdict,
             Verdict::Satisfies
         );
     }
@@ -387,7 +490,12 @@ mod tests {
         s.snippet = "tx.Exec(ctx, \"SET statement_timeout = '30s'\")".into();
         s.enclosing_function_body = s.snippet.clone();
         assert_eq!(
-            propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &ServedBound::None).verdict,
+            propagate(
+                &s,
+                &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None
+            )
+            .verdict,
             Verdict::Violates,
             "crediting the bound-setter with its own bound is circular"
         );
@@ -418,7 +526,12 @@ mod tests {
         let mut s = site();
         s.enclosing_function_body = "# TODO: add a statement_timeout here\npool.Query(q)".into();
         assert_eq!(
-            propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &ServedBound::None).verdict,
+            propagate(
+                &s,
+                &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None
+            )
+            .verdict,
             Verdict::Violates
         );
     }
@@ -429,24 +542,36 @@ mod tests {
         s.file_path = "scripts/seed_dev_data.py".into();
         let mut f = SpecFile {
             apis: vec![ApiSpec {
-                type_name: "db.Pool".into(), method: "Query".into(), blocking: Blocking::Yes,
-                bounded_by: vec![Mechanism::Context], confidence: 0.9,
-                rationale: String::new(), site_count: 1,
+                type_name: "db.Pool".into(),
+                method: "Query".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::Context],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
             }],
             configs: vec![],
             scopes: vec![ScopeSpec {
-                scope: "dev_only".into(), applies: false, confidence: 0.9,
+                scope: "dev_only".into(),
+                applies: false,
+                confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
         };
         let specs = SpecCache::from_file(f.clone());
-        assert_eq!(propagate(&s, &specs, &ServedBound::None).verdict, Verdict::Satisfies);
+        assert_eq!(
+            propagate(&s, &specs, &ServedBound::None).verdict,
+            Verdict::Satisfies
+        );
 
         // A low-confidence exemption must NOT fire: silently exempting a scope
         // is how a real violation disappears.
         f.scopes[0].confidence = 0.3;
         let weak = SpecCache::from_file(f);
-        assert_eq!(propagate(&s, &weak, &ServedBound::None).verdict, Verdict::Violates);
+        assert_eq!(
+            propagate(&s, &weak, &ServedBound::None).verdict,
+            Verdict::Violates
+        );
     }
 
     #[test]
@@ -461,8 +586,14 @@ mod tests {
         };
         let specs = cache(vec![Mechanism::ServerConfig], vec![]);
         let conflict = ServedBound::Conflict(vec!["a=WholeCall".into(), "b=PhaseOnly".into()]);
-        assert_eq!(propagate(&served_site, &specs, &conflict).verdict, Verdict::Abstain);
+        assert_eq!(
+            propagate(&served_site, &specs, &conflict).verdict,
+            Verdict::Abstain
+        );
         // A site not reached through a handler is unaffected by the conflict.
-        assert_eq!(propagate(&site(), &specs, &conflict).verdict, Verdict::Violates);
+        assert_eq!(
+            propagate(&site(), &specs, &conflict).verdict,
+            Verdict::Violates
+        );
     }
 }
