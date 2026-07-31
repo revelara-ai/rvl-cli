@@ -8,3 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rvl-cache = { path = "../rvl-cache" }
+
+[dev-dependencies]
+tempfile = "3"

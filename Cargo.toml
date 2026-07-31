@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rvlscan",
+    "crates/rvl-cache",
     "crates/rvl-core",
     "crates/rvl-spec",
     "crates/rvl-propagate",
@@ -22,6 +23,11 @@ serde_yaml = "0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ureq = "2"
 
 # The profile that 'dist' will build with
 [profile.dist]
