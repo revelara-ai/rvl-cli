@@ -38,6 +38,28 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Incremental-scan packet index (content-hash keyed).
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCmd {
+    /// Build the index from a retriever packet stream. Explicit and off the
+    /// hook path: a cold full load is never paid during a commit.
+    Init {
+        #[arg(long)]
+        retrieved: PathBuf,
+    },
+    /// Re-index from a packet stream. What a post-commit hook invokes.
+    Reindex {
+        #[arg(long)]
+        retrieved: PathBuf,
+    },
+    /// Show how many files are indexed.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -62,6 +84,7 @@ enum CacheCmd {
 /// keyset would be the verification bypass the distribution contract forbids.
 struct Config {
     cache_dir: PathBuf,
+    index_dir: PathBuf,
     offline: bool,
     base_url: String,
     org_key: String,
@@ -77,8 +100,17 @@ impl Config {
                     .unwrap_or_default();
                 home.join(".revelara").join("cache").join("specs")
             });
+        let index_dir = std::env::var_os("RVLSCAN_INDEX_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                home.join(".revelara").join("cache").join("index")
+            });
         Self {
             cache_dir,
+            index_dir,
             offline: offline_from_env(std::env::var("RVLSCAN_OFFLINE").ok().as_deref()),
             base_url: std::env::var("RVLSCAN_API_BASE")
                 .unwrap_or_else(|_| "https://api.revelara.ai".into()),
@@ -287,6 +319,47 @@ fn run() -> anyhow::Result<ExitCode> {
                 &keyset,
                 cfg.offline,
             )))
+        }
+        Cmd::Index { cmd } => {
+            let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
+            match cmd {
+                IndexCmd::Init { retrieved } | IndexCmd::Reindex { retrieved } => {
+                    let stream = std::fs::read_to_string(&retrieved)?;
+                    let (sites, _, skipped) = rvl_core::parse_stream(&stream);
+                    // Group by originating file so each entry is keyed by that
+                    // file's current content hash.
+                    let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
+                        std::collections::BTreeMap::new();
+                    for s in sites {
+                        by_file.entry(s.file_path.clone()).or_default().push(s);
+                    }
+                    let (mut indexed, mut missing) = (0usize, 0usize);
+                    for (file, packets) in by_file {
+                        let path = PathBuf::from(&file);
+                        match rvl_index::hash_file(&path) {
+                            Ok(h) => {
+                                idx.put(&path, &h, &packets)?;
+                                indexed += 1;
+                            }
+                            // The stream can name files this checkout does not
+                            // have (foreign corpus); count them, never fail.
+                            Err(_) => missing += 1,
+                        }
+                    }
+                    println!(
+                        "indexed {indexed} file(s) | unreadable {missing} | unparseable lines {skipped}"
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                IndexCmd::Status => {
+                    println!(
+                        "{} file(s) indexed at {}",
+                        idx.len()?,
+                        cfg.index_dir.display()
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
         }
         Cmd::Cache { cmd } => match cmd {
             CacheCmd::Import { artifact, sig } => {
