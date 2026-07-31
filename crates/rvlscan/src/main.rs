@@ -397,7 +397,24 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Rust sets SIGPIPE to SIG_IGN before main, so writing to a closed pipe
+/// returns EPIPE and `println!` panics. A scanner is piped into `head`,
+/// `less`, and `grep -q` constantly; restore the default disposition so the
+/// process dies quietly the way every other unix tool does.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the OS default before any
+    // output happens; no handler state to race with.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() -> ExitCode {
+    restore_default_sigpipe();
     match run() {
         Ok(code) => code,
         Err(e) => {
