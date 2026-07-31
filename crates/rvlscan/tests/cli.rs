@@ -72,10 +72,19 @@ fn cache_import_refuses_missing_signature() {
 // --- scan engine surface (po-3t3oj.15) ---
 
 fn write_scan_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // Packets name real files: the index hashes file CONTENT, so a fixture
+    // whose paths do not exist can be parsed but never indexed.
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    let unknown_go = src.join("unknown.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    std::fs::write(&unknown_go, "package svc\n\nfunc m() { u.Mystery() }\n").unwrap();
     let packets = dir.join("retrieved.jsonl");
-    std::fs::write(&packets, concat!(
-        r#"{"snapshot_id":"fixture","file_path":"svc/db.go","line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}"#, "\n",
-        r#"{"snapshot_id":"fixture","file_path":"svc/unknown.go","line_number":20,"func":"Mystery","client_type":"x.Unknown","snippet":"u.Mystery()","lang":"go"}"#, "\n",
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n         {{\"snapshot_id\":\"fixture\",\"file_path\":{unk:?},\"line_number\":20,\"func\":\"Mystery\",\"client_type\":\"x.Unknown\",\"snippet\":\"u.Mystery()\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+        unk = unknown_go.to_str().unwrap(),
     )).unwrap();
     let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"configs":[]}"#).unwrap();
@@ -142,5 +151,57 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
     assert!(
         stderr.contains("rvlscan sync") || stderr.contains("cache import"),
         "error must point at sync/import: {stderr}"
+    );
+}
+
+// --- incremental index surface (po-3t3oj.14) ---
+
+#[test]
+fn index_status_reports_empty_then_populated() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["index", "status"])
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .output()
+        .expect("run rvlscan");
+    assert!(
+        out.status.success(),
+        "index status must work on an empty index"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("0 file"), "want empty count: {stdout}");
+}
+
+#[test]
+fn index_init_indexes_packets_from_a_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["index", "init", "--retrieved"])
+        .arg(&packets)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .output()
+        .expect("run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "index init failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("indexed"),
+        "want an indexed summary: {stdout}"
+    );
+
+    // status now reflects the indexed files
+    let out = bin()
+        .args(["index", "status"])
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .output()
+        .expect("run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("0 file"),
+        "index should be non-empty: {stdout}"
     );
 }
