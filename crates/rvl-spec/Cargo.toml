@@ -1,0 +1,10 @@
+[package]
+name = "rvl-spec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rvl-core = { path = "../rvl-core" }
