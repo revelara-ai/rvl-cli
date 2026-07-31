@@ -205,3 +205,38 @@ fn index_init_indexes_packets_from_a_stream() {
         "index should be non-empty: {stdout}"
     );
 }
+
+// --- SIGPIPE (po-3t3oj.23) ---
+
+#[test]
+#[cfg(unix)]
+fn output_piped_to_a_truncating_reader_does_not_panic() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let mut child = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rvlscan");
+
+    // Read one byte, then drop the pipe: this is what `| head -1` does.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut one = [0u8; 1];
+    let _ = stdout.read(&mut one);
+    drop(stdout);
+
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "closing the pipe must not panic the scanner: {stderr}"
+    );
+}

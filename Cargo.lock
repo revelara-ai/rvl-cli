@@ -850,6 +850,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rvl-cache",
  "rvl-core",
  "rvl-index",
