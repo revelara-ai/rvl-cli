@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/rvlscan"]
+members = [
+    "crates/rvlscan",
+    "crates/rvl-core",
+    "crates/rvl-spec",
+    "crates/rvl-propagate",
+    "crates/rvl-eval",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +14,14 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/revelara-ai/rvlscan"
 homepage = "https://revelara.ai"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 
 # The profile that 'dist' will build with
 [profile.dist]
