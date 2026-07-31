@@ -295,10 +295,7 @@ fn main() -> Result<()> {
                     snapshot_id: s.snapshot_id.clone(),
                     verdict: f.verdict.as_str().to_string(),
                     reason: f.reason.clone(),
-                    class: {
-                        let (t, m) = s.api_key();
-                        Some(format!("{t}.{m}"))
-                    },
+                    class: Some(rvl_triage::class_key_string(s)),
                 })
                 .collect();
 

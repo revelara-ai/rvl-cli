@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rvlscan",
     "crates/rvl-cache",
+    "crates/rvl-triage",
     "crates/rvl-core",
     "crates/rvl-spec",
     "crates/rvl-propagate",

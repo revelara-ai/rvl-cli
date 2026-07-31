@@ -13,3 +13,4 @@ rand = { workspace = true }
 rvl-core = { path = "../rvl-core" }
 rvl-spec = { path = "../rvl-spec" }
 rvl-propagate = { path = "../rvl-propagate" }
+rvl-triage = { path = "../rvl-triage" }

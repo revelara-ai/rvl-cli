@@ -744,6 +744,7 @@ dependencies = [
  "rvl-core",
  "rvl-propagate",
  "rvl-spec",
+ "rvl-triage",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -771,12 +772,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvl-triage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rvl-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rvlscan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "rvl-cache",
+ "rvl-core",
+ "rvl-propagate",
+ "rvl-spec",
+ "rvl-triage",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

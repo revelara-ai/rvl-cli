@@ -130,3 +130,37 @@ fn disjoint_arms_are_an_error_not_a_result() {
     let b = vec![f("y:2", "r", "c", "violates")];
     assert!(compare_conditions(&a, &b, None, 100, 5, 42).is_err());
 }
+
+#[test]
+fn duplicate_site_ids_do_not_underflow_only_b() {
+    // Real corpora repeat a site_id (the same file:line retrieved twice).
+    // Counting shared PAIRS against distinct B rows underflows; this is the
+    // regression guard for that panic.
+    let a = vec![
+        f("r1/a.go:1", "r1", "db.Query", "violates"),
+        f("r1/a.go:1", "r1", "db.Query", "violates"),
+        f("r1/b.go:2", "r1", "db.Query", "satisfies"),
+    ];
+    let b = vec![
+        f("r1/a.go:1", "r1", "db.Query", "violates"),
+        f("r1/b.go:2", "r1", "db.Query", "satisfies"),
+    ];
+    let r = compare_conditions(&a, &b, None, 100, 5, 42).unwrap();
+    assert_eq!(r.shared, 3, "every A row that joins is a shared pair");
+    assert_eq!(r.only_a, 0);
+    assert_eq!(r.only_b, 0, "both B rows matched, so none are B-only");
+}
+
+#[test]
+fn repeated_site_ids_are_reported_not_silently_joined() {
+    let a = vec![
+        f("dup.go:1", "r1", "c.M", "violates"),
+        f("dup.go:1", "r1", "other.M", "not_applicable"),
+    ];
+    let b = a.clone();
+    let r = compare_conditions(&a, &b, None, 100, 5, 42).unwrap();
+    assert!(
+        r.ambiguous_join_keys > 0,
+        "a repeated join key must be surfaced"
+    );
+}

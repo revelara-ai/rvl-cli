@@ -11,6 +11,13 @@ homepage.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 rvl-cache = { path = "../rvl-cache" }
+rvl-core = { path = "../rvl-core" }
+rvl-spec = { path = "../rvl-spec" }
+rvl-propagate = { path = "../rvl-propagate" }
+rvl-triage = { path = "../rvl-triage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = { workspace = true }
