@@ -2,7 +2,7 @@
 //!
 //! This is the half of the pipeline that runs locally with zero model calls,
 //! and it is why the scanner can ship as a Rust binary plus a JSON cache rather
-//! than as a model. On polaris, 76 spec answers decided 1525 sites and agreed
+//! than as a model. On the reference Go repo, 76 spec answers decided 1525 sites and agreed
 //! with the far more expensive per-site LLM panel on 94.0% of the sites where
 //! both committed, while abstaining on none that the panel decided.
 //!
@@ -187,7 +187,7 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
             // semantics: http.Server's WriteTimeout deadlines the connection
             // write and never cancels the request context, so it does not bound
             // a pgx query running in that handler. Treating it as ambient sent
-            // 867 polaris sites to abstain on a server-spec conflict that was
+            // 867 reference-repo sites to abstain on a server-spec conflict that was
             // irrelevant to almost all of them.
             Mechanism::ServerConfig if is_served_request_root(site) => match served {
                 ServedBound::Conflict(_) => served_unresolved = true,

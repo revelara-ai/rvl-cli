@@ -6,7 +6,7 @@
 //! forever. Per-site labels are worth nothing to the next repo.
 //!
 //! This inverts the cost model that made the per-site scanner unaffordable. On
-//! polaris, 1525 call sites reduced to 76 spec questions (23x), and the spec
+//! the reference Go repo, 1525 call sites reduced to 76 spec questions (23x), and the spec
 //! answers reproduced a per-site finding at roughly 1/40th the cost: seven APIs
 //! judged non-blocking removed 285 sites, 18.7% of the corpus, which matched
 //! the 14-19% not-applicable rate the per-site panel measured over two runs.

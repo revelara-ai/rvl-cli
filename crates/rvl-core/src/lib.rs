@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
-/// this, 821 of 1525 real polaris records failed to parse and the scanner
+/// this, 821 of 1525 real production records failed to parse and the scanner
 /// silently examined 46% of the repository. The same nil-slice trap cost a
 /// wrong headline number once already in the Python prototype; here the
 /// unparseable-line count in the harness caught it immediately.
