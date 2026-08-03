@@ -244,6 +244,48 @@ impl SpecCache {
             }
         }
     }
+
+    /// What the repo's construction sites impose on calls made THROUGH their
+    /// own clients (`this_client` scope) — the analog of `served_bound` for
+    /// client config. A DB pool constructed with a whole-call `query_timeout`
+    /// bounds every query issued on it, but for a DI-injected pool that
+    /// construction is nowhere near the call site, so per-site retrieval can
+    /// never see it. This is the repo-level fact that closes the gap.
+    ///
+    /// Deliberately conservative (soundness pin, po-3t3oj.30): `Agreed` only
+    /// when every `this_client` whole/phase config in the repo agrees. If they
+    /// conflict, this returns `Conflict` and the caller abstains rather than
+    /// guessing which config governs a call — a false pass on a reliability
+    /// property is the one error we refuse. `Agreed` is what licenses the
+    /// guarded broadening to related DB-family calls; exact-type matches do not
+    /// need it.
+    pub fn client_bound(&self, cfg: &RepoConfig) -> ServedBound {
+        let mut seen: Vec<(String, Bounds)> = Vec::new();
+        for c in &cfg.constructions {
+            let Some(spec) = self.config(&c.type_name) else {
+                continue;
+            };
+            if spec.scope != Scope::ThisClient || spec.confidence < MIN_CONFIDENCE {
+                continue;
+            }
+            if matches!(spec.bounds, Bounds::WholeCall | Bounds::PhaseOnly)
+                && !seen.iter().any(|(t, _)| t == &c.type_name)
+            {
+                seen.push((c.type_name.clone(), spec.bounds));
+            }
+        }
+        match seen.len() {
+            0 => ServedBound::None,
+            _ => {
+                let first = seen[0].1;
+                if seen.iter().all(|(_, b)| *b == first) {
+                    ServedBound::Agreed(first)
+                } else {
+                    ServedBound::Conflict(seen.iter().map(|(t, b)| format!("{t}={b:?}")).collect())
+                }
+            }
+        }
+    }
 }
 
 /// The verdict a spec forces on its own, before any evidence is searched.

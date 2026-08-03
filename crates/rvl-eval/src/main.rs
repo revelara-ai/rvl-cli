@@ -278,6 +278,7 @@ fn main() -> Result<()> {
             let (sites, cfg, skipped) = parse_stream(&text);
             let cache = SpecCache::load(&std::fs::read_to_string(&specs)?)?;
             let served = cache.served_bound(&cfg);
+            let client = cache.client_bound(&cfg);
 
             println!(
                 "sites {} | specs {} | unparseable lines {skipped}",
@@ -286,7 +287,7 @@ fn main() -> Result<()> {
             );
             println!("repo-level bound on served requests: {served:?}");
 
-            let findings = propagate_all(&sites, &cache, &served);
+            let findings = propagate_all(&sites, &cache, &served, &client);
             let out_rows: Vec<Finding> = findings
                 .iter()
                 .zip(sites.iter())
@@ -362,7 +363,8 @@ fn main() -> Result<()> {
                     println!("  warning: {skipped} unparseable lines at {axis}={v}");
                 }
                 let served = cache.served_bound(&cfg);
-                let f = propagate_all(&sites, &cache, &served);
+                let client = cache.client_bound(&cfg);
+                let f = propagate_all(&sites, &cache, &served, &client);
                 let decided = f.iter().filter(|x| x.verdict.is_decided()).count();
                 let viol = f
                     .iter()
@@ -491,6 +493,7 @@ fn main() -> Result<()> {
             }
 
             let served = rvl_spec::ServedBound::None;
+            let client = rvl_spec::ServedBound::None;
             // (verdict, wanted-label) per side of a twin.
             type TwinSide = Option<(String, String)>;
             let mut pairs: BTreeMap<String, (TwinSide, TwinSide)> = BTreeMap::new();
@@ -503,7 +506,7 @@ fn main() -> Result<()> {
                         borrowed += 1;
                     }
                 }
-                let f = rvl_propagate::propagate(&s, &cache, &served);
+                let f = rvl_propagate::propagate(&s, &cache, &served, &client);
                 let entry = pairs.entry(meta.pair_id.clone()).or_insert((None, None));
                 let slot = (f.verdict.as_str().to_string(), meta.label.clone());
                 if meta.side == "before" {
