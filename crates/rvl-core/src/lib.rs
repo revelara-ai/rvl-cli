@@ -46,6 +46,17 @@ impl Verdict {
     pub fn is_decided(self) -> bool {
         matches!(self, Verdict::Violates | Verdict::Satisfies)
     }
+    /// Whether the scanner reached a conclusion for this site: a bounded or
+    /// unbounded blocking call, OR a non-blocking one (`NotApplicable`). This is
+    /// the human-facing "resolved" notion, broader than `is_decided` (which is
+    /// blocking-only for the eval/precision report). A non-blocking call the
+    /// spec resolved is handled, not an abstention, so it belongs here.
+    pub fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            Verdict::Violates | Verdict::Satisfies | Verdict::NotApplicable
+        )
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Violates => "violates",
@@ -367,6 +378,20 @@ mod tests {
             !Verdict::NotApplicable.is_decided(),
             "a rejected candidate is not a label"
         );
+    }
+
+    #[test]
+    fn resolved_includes_not_applicable_but_not_abstain() {
+        // "Resolved" is the human coverage notion: the scanner reached a
+        // conclusion, including "this call does not block". Only Abstain is
+        // unresolved.
+        assert!(Verdict::Violates.is_resolved());
+        assert!(Verdict::Satisfies.is_resolved());
+        assert!(
+            Verdict::NotApplicable.is_resolved(),
+            "a non-blocking call is resolved, not an abstention"
+        );
+        assert!(!Verdict::Abstain.is_resolved());
     }
 
     #[test]

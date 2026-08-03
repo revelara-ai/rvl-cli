@@ -76,13 +76,33 @@ pub struct Finding {
     pub suppressed: bool,
 }
 
-/// Coverage summary for the footer/coverage section.
+/// Coverage summary for the coverage section.
+///
+/// `resolved` counts every site the scanner reached a conclusion on: a bounded
+/// blocking call, an unbounded one, OR a non-blocking call (`NotApplicable`).
+/// The older "decided" number counted only blocking conclusions and so buried
+/// the large set of calls the specs correctly resolve as non-blocking, making
+/// coverage read far worse than it is. The remaining sites `abstain`, broken
+/// out by lever so the reader sees WHY each is unresolved.
 #[derive(Debug, Clone, Copy)]
 pub struct Coverage {
-    pub decided: usize,
+    pub resolved: usize,
     pub total: usize,
-    /// Unknown API surfaces (no spec) queued for the factory.
-    pub unknown: usize,
+    /// No spec for the API — the mint/coverage lever.
+    pub abstain_no_spec: usize,
+    /// Spec present but boundedness couldn't be established (search truncated)
+    /// — the retrieval-depth / out-of-code-bound lever.
+    pub abstain_bounds: usize,
+    /// Spec says blocking "depends" per call site — the per-site-judge lever.
+    pub abstain_judge: usize,
+    /// Any other undecided outcome.
+    pub abstain_other: usize,
+}
+
+impl Coverage {
+    pub fn abstain_total(&self) -> usize {
+        self.abstain_no_spec + self.abstain_bounds + self.abstain_judge + self.abstain_other
+    }
 }
 
 /// A short, stable id for a finding class, for explain/suppress references.
@@ -171,15 +191,32 @@ pub fn render_ladder(findings: &[Finding], cov: Coverage, elapsed: &str, color: 
     }
 
     let _ = writeln!(o, "{}", paint("\u{25a0} COVERAGE", "32", color));
-    let mut cline = format!("  {}/{} API surfaces decided", cov.decided, cov.total);
-    if cov.unknown > 0 {
-        let _ = write!(
-            cline,
-            " \u{00b7} {} unknown queued for the spec factory",
-            cov.unknown
-        );
-    }
+    let total = cov.total.max(1);
+    let pct = 100 * cov.resolved / total;
+    let cline = format!(
+        "  {}/{} API surfaces resolved ({}%)",
+        cov.resolved, cov.total, pct
+    );
     let _ = writeln!(o, "{}", paint(&cline, "2", color));
+    // Abstain breakdown, each bucket tied to the lever that closes it.
+    let ab = cov.abstain_total();
+    if ab > 0 {
+        let mut parts: Vec<String> = Vec::new();
+        if cov.abstain_no_spec > 0 {
+            parts.push(format!("{} no spec", cov.abstain_no_spec));
+        }
+        if cov.abstain_bounds > 0 {
+            parts.push(format!("{} unresolved bounds", cov.abstain_bounds));
+        }
+        if cov.abstain_judge > 0 {
+            parts.push(format!("{} need per-site judge", cov.abstain_judge));
+        }
+        if cov.abstain_other > 0 {
+            parts.push(format!("{} other", cov.abstain_other));
+        }
+        let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
+        let _ = writeln!(o, "{}", paint(&aline, "2", color));
+    }
     o.push('\n');
 
     let suppressed = findings

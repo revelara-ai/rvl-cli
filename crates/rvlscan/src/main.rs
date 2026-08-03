@@ -858,16 +858,30 @@ fn render_scan_output(
     color: Option<&str>,
     start: std::time::Instant,
 ) -> anyhow::Result<ExitCode> {
-    let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
-    let unknown = findings
-        .iter()
-        .filter(|f| f.reason.starts_with("no spec"))
-        .count();
-    let coverage = render::Coverage {
-        decided,
+    // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
+    // or non-blocking). The rest abstain; bucket them by the lever that closes
+    // each: no spec -> mint, truncated search -> retrieval depth, "depends" ->
+    // per-site judge. Reason strings are the propagation layer's output contract.
+    let resolved = findings.iter().filter(|f| f.verdict.is_resolved()).count();
+    let mut coverage = render::Coverage {
+        resolved,
         total: sites.len(),
-        unknown,
+        abstain_no_spec: 0,
+        abstain_bounds: 0,
+        abstain_judge: 0,
+        abstain_other: 0,
     };
+    for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
+        if f.reason.starts_with("no spec") {
+            coverage.abstain_no_spec += 1;
+        } else if f.reason.contains("truncated") {
+            coverage.abstain_bounds += 1;
+        } else if f.reason.contains("depends") || f.reason.contains("per-site") {
+            coverage.abstain_judge += 1;
+        } else {
+            coverage.abstain_other += 1;
+        }
+    }
     let mut ladder_findings = triage_to_findings(items);
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever

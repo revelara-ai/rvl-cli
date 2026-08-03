@@ -122,7 +122,7 @@ fn scan_with_specs_file_emits_findings_and_coverage() {
         "ladder must render a coverage section: {stdout}"
     );
     assert!(
-        stdout.contains("surfaces decided"),
+        stdout.contains("surfaces resolved"),
         "coverage must report the decided count: {stdout}"
     );
     assert!(
