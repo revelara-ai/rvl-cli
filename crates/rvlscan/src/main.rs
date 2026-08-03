@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 mod render;
+mod shared_config;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -110,11 +111,12 @@ enum CacheCmd {
     Status,
 }
 
-/// All runtime configuration, resolved once. Env-only today; when the
-/// config-file surface lands, the three-way merge (default / file / env)
-/// happens in this constructor and nowhere else. The signing keyset is
-/// deliberately NOT here: pinned keys are compiled in, and a configurable
-/// keyset would be the verification bypass the distribution contract forbids.
+/// All runtime configuration, resolved once. `base_url` and `org_key` layer
+/// three sources (rvlscan-specific env / shared rvl-cli env / shared config
+/// file) over a default; that merge happens in this constructor and nowhere
+/// else. The signing keyset is deliberately NOT here: pinned keys are compiled
+/// in, and a configurable keyset would be the verification bypass the
+/// distribution contract forbids. `shared_config` reads ONLY api_url/api_key.
 struct Config {
     cache_dir: PathBuf,
     index_dir: PathBuf,
@@ -122,6 +124,9 @@ struct Config {
     base_url: String,
     org_key: String,
 }
+
+/// The production default API endpoint, matching rvl-cli's `DefaultAPIURL`.
+const DEFAULT_API_URL: &str = "https://api.revelara.ai";
 
 impl Config {
     fn from_env() -> Self {
@@ -141,13 +146,36 @@ impl Config {
                     .unwrap_or_default();
                 home.join(".revelara").join("cache").join("index")
             });
+
+        // Read the shared rvl-cli config file once (missing/malformed → empty).
+        let shared = shared_config::load_shared_config();
+
+        // Precedence (highest first), for BOTH values:
+        //   base_url: RVLSCAN_API_BASE  > RVL_API_URL > file api_url > default
+        //   org_key:  RVLSCAN_ORG_KEY   > RVL_API_KEY > file api_key > (empty)
+        // Empty strings are skipped so an exported-but-empty env var never
+        // shadows a real value from a lower-precedence source.
+        let base_url = shared_config::first_nonempty(&[
+            std::env::var("RVLSCAN_API_BASE").ok(),
+            std::env::var("RVL_API_URL").ok(),
+            shared.api_url.clone(),
+            Some(DEFAULT_API_URL.to_string()),
+        ])
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+
+        let org_key = shared_config::first_nonempty(&[
+            std::env::var("RVLSCAN_ORG_KEY").ok(),
+            std::env::var("RVL_API_KEY").ok(),
+            shared.api_key.clone(),
+        ])
+        .unwrap_or_default();
+
         Self {
             cache_dir,
             index_dir,
             offline: offline_from_env(std::env::var("RVLSCAN_OFFLINE").ok().as_deref()),
-            base_url: std::env::var("RVLSCAN_API_BASE")
-                .unwrap_or_else(|_| "https://api.revelara.ai".into()),
-            org_key: std::env::var("RVLSCAN_ORG_KEY").unwrap_or_default(),
+            base_url,
+            org_key,
         }
     }
 }
@@ -725,7 +753,10 @@ fn run() -> anyhow::Result<ExitCode> {
         ),
         Cmd::Sync => {
             if !cfg.offline && cfg.org_key.is_empty() {
-                anyhow::bail!("RVLSCAN_ORG_KEY is not set (or set RVLSCAN_OFFLINE=1)");
+                anyhow::bail!(
+                    "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
+                     `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1)"
+                );
             }
             let fetcher = HttpFetcher {
                 base_url: cfg.base_url,
