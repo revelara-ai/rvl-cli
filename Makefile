@@ -12,6 +12,10 @@
 PROFILE ?= debug
 CARGO   ?= cargo
 GO      ?= go
+# Where `install` puts the binary + its helpers. Override with
+# `make install BINDIR=/usr/local/bin` (may need sudo).
+PREFIX  ?= $(HOME)/.local
+BINDIR  ?= $(PREFIX)/bin
 
 ifeq ($(PROFILE),release)
 CARGO_FLAGS := --release
@@ -21,11 +25,34 @@ endif
 
 BIN_DIR := target/$(PROFILE)
 
-.PHONY: build helpers dev test lint fmt fmt-check clippy clean help
+.PHONY: build rebuild install uninstall helpers dev test lint fmt fmt-check clippy clean help
 
 ## build: compile the rvlscan workspace binaries
 build:
 	$(CARGO) build $(CARGO_FLAGS)
+
+## rebuild: force a clean recompile of the rvlscan binary
+rebuild:
+	$(CARGO) build $(CARGO_FLAGS) -p rvlscan
+
+## install: release-build rvlscan + goindex/pyindex and put them on PATH (BINDIR)
+install:
+	$(CARGO) build --release -p rvlscan
+	$(GO) build -C helpers/goindex -o $(abspath target/release)/goindex .
+	install -d "$(BINDIR)"
+	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
+	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
+	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
+	@echo "installed rvlscan + goindex + pyindex.py to $(BINDIR)"
+	@echo "  Go + Python scanning work out of the box (helpers are adjacent to the binary)."
+	@echo "  TypeScript needs its node deps, so until TS packaging (po-3t3oj.26):"
+	@echo "    RVLSCAN_TSINDEX=$(abspath helpers/tsindex/tsindex.js)  (run 'npm --prefix helpers/tsindex install' once)"
+	@case ":$$PATH:" in *":$(BINDIR):"*) : ;; *) echo "  NOTE: $(BINDIR) is not on your PATH — add it, then: rvlscan scan <path>";; esac
+
+## uninstall: remove the installed binary + helpers from BINDIR
+uninstall:
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py"
+	@echo "removed rvlscan + goindex + pyindex.py from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex next to the rvlscan binary
 helpers: build
