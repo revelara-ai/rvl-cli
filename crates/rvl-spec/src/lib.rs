@@ -90,6 +90,83 @@ pub enum Scope {
     None,
 }
 
+/// A coarse client-I/O family. It scopes a repo-level client-config bound to
+/// the calls it can plausibly govern: a DB pool's `query_timeout` bounds DB
+/// queries, never an image tool's `taskTimeoutMillis` (measured on immich).
+///
+/// Classified mechanically from the type name (like `scope_of`), and
+/// deliberately CONSERVATIVE: only strong, well-known markers classify; an
+/// unrecognised type returns `None` and never borrows another family's bound —
+/// a finding is left for a human rather than risk a cross-family false pass.
+/// (The more general design is an authorer-assigned family tag on the spec;
+/// this keyword classifier is the sound interim — see po-3t3oj.34.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    Database,
+    Http,
+    Cache,
+    Rpc,
+    MessageQueue,
+}
+
+/// Classify a client type into an I/O family, or `None` if unrecognised.
+pub fn client_family(type_name: &str) -> Option<Family> {
+    let t = type_name.to_ascii_lowercase();
+    let has = |ks: &[&str]| ks.iter().any(|k| t.contains(k));
+    // Database: ORMs, query builders, drivers, pools. Strong markers only —
+    // bare "pool"/"pg" are excluded because a non-DB connection pool must not
+    // borrow a DB timeout (false-negative risk the soundness pin forbids).
+    if has(&[
+        "typeorm",
+        "kysely",
+        "sequelize",
+        "prisma",
+        "mongoose",
+        "mongodb",
+        "datasource",
+        "queryrunner",
+        "pgxpool",
+        "pgpool",
+        "database/sql",
+        "sqlplugin",
+        "gocql",
+        "xorm",
+        "postgres",
+        "mysql",
+        "sqlite",
+        "mssql",
+        "cassandra",
+        "clickhouse",
+        "dynamodb",
+    ]) {
+        return Some(Family::Database);
+    }
+    if has(&["redis", "memcache", "ioredis", "valkey"]) {
+        return Some(Family::Cache);
+    }
+    if has(&["grpc", "twirp", "thrift"]) {
+        return Some(Family::Rpc);
+    }
+    if has(&[
+        "amqp", "kafka", "rabbitmq", "sqs", "bullmq", "pubsub", "nats",
+    ]) {
+        return Some(Family::MessageQueue);
+    }
+    if has(&[
+        "http",
+        "axios",
+        "gaxios",
+        "got",
+        "undici",
+        "node-fetch",
+        "httpclient",
+        "restclient",
+    ]) {
+        return Some(Family::Http);
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSpec {
     #[serde(rename = "type")]
@@ -259,8 +336,16 @@ impl SpecCache {
     /// property is the one error we refuse. `Agreed` is what licenses the
     /// guarded broadening to related DB-family calls; exact-type matches do not
     /// need it.
-    pub fn client_bound(&self, cfg: &RepoConfig) -> ServedBound {
-        let mut seen: Vec<(String, Bounds)> = Vec::new();
+    /// Group the repo's `this_client` config constructions BY I/O family and
+    /// resolve each family's bound independently. A DB pool's whole-call
+    /// timeout governs the Database family; an image tool's timeout governs no
+    /// recognised family and is dropped. A call is later broadened only by its
+    /// OWN family's bound, so one client's timeout can never mask another's
+    /// unbounded calls. Within a family: `Agreed` iff every construction agrees,
+    /// else `Conflict` (abstain). Constructions whose type has no family are
+    /// skipped — never a basis for broadening.
+    pub fn client_bound_by_family(&self, cfg: &RepoConfig) -> HashMap<Family, ServedBound> {
+        let mut by_family: HashMap<Family, Vec<(String, Bounds)>> = HashMap::new();
         for c in &cfg.constructions {
             let Some(spec) = self.config(&c.type_name) else {
                 continue;
@@ -268,23 +353,29 @@ impl SpecCache {
             if spec.scope != Scope::ThisClient || spec.confidence < MIN_CONFIDENCE {
                 continue;
             }
-            if matches!(spec.bounds, Bounds::WholeCall | Bounds::PhaseOnly)
-                && !seen.iter().any(|(t, _)| t == &c.type_name)
-            {
+            if !matches!(spec.bounds, Bounds::WholeCall | Bounds::PhaseOnly) {
+                continue;
+            }
+            let Some(fam) = client_family(&c.type_name) else {
+                continue;
+            };
+            let seen = by_family.entry(fam).or_default();
+            if !seen.iter().any(|(t, _)| t == &c.type_name) {
                 seen.push((c.type_name.clone(), spec.bounds));
             }
         }
-        match seen.len() {
-            0 => ServedBound::None,
-            _ => {
+        by_family
+            .into_iter()
+            .map(|(fam, seen)| {
                 let first = seen[0].1;
-                if seen.iter().all(|(_, b)| *b == first) {
+                let bound = if seen.iter().all(|(_, b)| *b == first) {
                     ServedBound::Agreed(first)
                 } else {
                     ServedBound::Conflict(seen.iter().map(|(t, b)| format!("{t}={b:?}")).collect())
-                }
-            }
-        }
+                };
+                (fam, bound)
+            })
+            .collect()
     }
 }
 
@@ -464,5 +555,34 @@ mod tests {
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");
+    }
+    #[test]
+    fn client_family_classifies_the_real_corpus_types() {
+        use super::{client_family, Family};
+        // DB configs + calls (twenty/immich): must classify Database.
+        for t in [
+            "typeorm.QueryRunner",
+            "typeorm.Repository",
+            "typeorm.DataSource",
+            "GlobalWorkspaceDataSource",
+            "kysely.RawBuilder",
+            "kysely.SelectQueryBuilder",
+            "github.com/jackc/pgx/v5/pgxpool.Pool",
+            "database/sql.Tx",
+        ] {
+            assert_eq!(client_family(t), Some(Family::Database), "{t}");
+        }
+        // Non-DB clients that carry timeouts (immich/twenty) must NOT be Database.
+        for t in [
+            "ExifTool",
+            "PendingEvents",
+            "imapflow.ImapFlow",
+            "E2BDriver",
+            "sharp.Sharp",
+        ] {
+            assert_ne!(client_family(t), Some(Family::Database), "{t}");
+        }
+        assert_eq!(client_family("axios.AxiosInstance"), Some(Family::Http));
+        assert_eq!(client_family("ioredis.Redis"), Some(Family::Cache));
     }
 }
