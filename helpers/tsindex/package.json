@@ -1,0 +1,20 @@
+{
+  "name": "tsindex",
+  "version": "0.1.0",
+  "description": "TypeScript retriever helper for rvlscan: emits the versioned packet stream rvlscan consumes. Retrieval only, no verdicts.",
+  "license": "MIT",
+  "private": true,
+  "bin": {
+    "tsindex": "tsindex.js"
+  },
+  "main": "tsindex.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "typescript": "^5.9.3"
+  }
+}
