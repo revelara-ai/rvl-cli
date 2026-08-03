@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+# pyindex -- Python retriever helper for rvlscan.
+#
+# Retrieval mode: emit the SOURCE that bears on a call site, never a verdict.
+# This is the Python sibling of helpers/goindex. It emits the SAME versioned
+# packet stream rvlscan consumes, for Python source instead of Go.
+#
+# The split this enforces
+#
+#   Per-language work is RETRIEVAL: mechanical, semantically neutral, no
+#   reliability opinion. "Here is the call site." "Here is the client this
+#   receiver was constructed from." That is compiler-frontend work and it is
+#   genuinely cheap to add per language.
+#
+#   JUDGEMENT stays semantic -- the LLM panel now, a distilled student later.
+#   Nothing here decides whether a call is bounded, retried, or safe. It only
+#   reports what exists and where, and how confident the resolution was.
+#
+# Why stdlib `ast` and not pyright / LibCST
+#
+#   Python has no compile-time type system to lean on the way Go does, so full
+#   type resolution would mean shelling out to a heavyweight external checker
+#   (pyright) or a third-party CST library. That trades pinnability and a clean
+#   dependency story for resolution we cannot fully trust anyway: Python is
+#   dynamically typed, so even a "resolved" receiver is a best-effort inference.
+#   We keep the engine in the standard library (`ast`) and make the confidence
+#   explicit per site via `provenance.client_type_resolved`. Sites we cannot
+#   resolve are still emitted with `client_type: ""` and resolved=False -- a low
+#   tier for the panel, not a dropped site.
+#
+# callers/callees are empty in v1: this helper walks a single file's imports
+# and local assignments, it does not build a cross-module call graph. The keys
+# are emitted (as empty arrays) so the packet shape is stable and a later
+# version can fill them without a schema bump.
+
+import argparse
+import ast
+import json
+import os
+import sys
+
+# PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
+# helper churn behind this number: a consumer that does not know a version
+# refuses the stream rather than guessing at its shape. It MUST agree with
+# goindex's PacketSchema and rvl_index's schema.
+PACKET_SCHEMA = 1
+
+# Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes. A pathologically
+# long function body should not blow up a packet line.
+MAX_SNIPPET_BYTES = 2400
+
+# Construction snippets to include per site (mirrors goindex maxCtorsEmitted).
+MAX_CTORS_EMITTED = 2
+
+# ---------------------------------------------------------------------------
+# Client-detection heuristic.
+#
+# Python is dynamically typed, so we cannot ask a type checker "is this an HTTP
+# client?". Instead we key off the METHOD NAME being called, split into two
+# tiers by how likely the name is to also be an ordinary builtin-container or
+# string method:
+#
+#   STRONG_IO_METHODS -- verbs that are almost never methods on a list/dict/str
+#     (execute, request, fetchall, ...). We emit these whether or not the
+#     receiver type resolved: a `cur.execute(sql)` on an unresolved cursor is
+#     still a real DB call site, it just lands as a low-confidence tier.
+#
+#   WEAK_IO_METHODS -- verbs that collide with builtins (`dict.get`, `str.split`
+#     is not here but `get`/`send`/`read` are ambiguous). We emit these ONLY
+#     when the receiver resolves to an imported/constructed client, so
+#     `requests.get(...)` and `session.get(...)` survive but `somedict.get(k)`
+#     is dropped as noise.
+#
+# Everything else -- `items.append(x)`, `os.path.join(...)`, `s.strip()` -- has
+# a method name in neither set and is never emitted. This is a deliberately
+# small, conservative allowlist; it favours a resolvable, meaningful set over
+# indexing every attribute call in the file.
+# ---------------------------------------------------------------------------
+
+STRONG_IO_METHODS = frozenset({
+    # HTTP verbs (requests/httpx/urllib3/aiohttp style)
+    "request", "post", "put", "patch", "delete", "head", "options",
+    # DB drivers / cursors (psycopg2, sqlite3, pymysql, SQLAlchemy)
+    "execute", "executemany", "fetchone", "fetchall", "fetchmany",
+    # generic RPC / messaging / do-style clients
+    "do", "publish", "subscribe",
+    # sockets
+    "sendall", "recv", "recvfrom",
+    # urllib / subprocess
+    "urlopen", "check_output", "check_call",
+})
+
+WEAK_IO_METHODS = frozenset({
+    # ambiguous with builtin containers -- require a resolved receiver
+    "get", "send", "connect", "call", "run", "query", "invoke", "read", "write",
+})
+
+
+def _is_io_method(method, resolved):
+    """A call qualifies as a site if its method is a strong I/O verb, or a weak
+    one whose receiver resolved to a concrete client type."""
+    if method in STRONG_IO_METHODS:
+        return True
+    if method in WEAK_IO_METHODS and resolved:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Expression rendering
+# ---------------------------------------------------------------------------
+
+def expr_to_str(node):
+    """Render a receiver expression to its dotted source-ish text.
+
+    Mirrors goindex's exprString: `Name` -> "session", `Attribute` -> "self.client".
+    Anything more complex (a call result, a subscript) falls back to the exact
+    source segment when available, else "".
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = expr_to_str(node.value)
+        if base:
+            return base + "." + node.attr
+        return node.attr
+    # ast.unparse is stdlib (3.9+) and gives a faithful rendering for the rest.
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ""
+
+
+def _root_name(node):
+    """Leftmost Name identifier of an attribute chain, or None."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _cap(text):
+    if text is None:
+        return ""
+    if len(text) > MAX_SNIPPET_BYTES:
+        return text[:MAX_SNIPPET_BYTES] + "\n# ... truncated"
+    return text
+
+
+def _segment(source, node):
+    """Exact source text of an AST node (stdlib, 3.8+), byte-capped."""
+    try:
+        seg = ast.get_source_segment(source, node)
+    except Exception:
+        seg = None
+    return _cap(seg or "")
+
+
+# ---------------------------------------------------------------------------
+# Per-file retrieval
+# ---------------------------------------------------------------------------
+
+class FileIndex:
+    """Import + assignment tracking for a single Python module.
+
+    Everything is best-effort and module-scoped (no real name scoping): a later
+    assignment shadows an earlier one, last write wins. That is unsound in the
+    same way goindex's assignedFromDeadline is -- rare in practice, cheaper than
+    a full control-flow graph, and recorded here rather than hidden. The panel
+    sees the confidence via client_type_resolved and discounts accordingly.
+    """
+
+    def __init__(self, source):
+        self.source = source
+        # name/alias -> dotted client path.  `import requests` -> requests:requests;
+        # `from redis import Redis` -> Redis:redis.Redis.
+        self.imports = {}
+        # local variable name -> resolved client type (`session` -> requests.Session)
+        self.var_types = {}
+        # "self.<attr>" -> resolved client type (best-effort, keyed across the module)
+        self.self_attr_types = {}
+        # construction snippets, so a construction-time timeout= is retrievable
+        self.ctor_by_var = {}       # var name -> [Snippet]
+        self.ctor_by_selfattr = {}  # "self.x" -> [Snippet]
+        self.ctor_by_type = {}      # client type -> [Snippet]
+
+    # -- import resolution ---------------------------------------------------
+
+    def collect_imports(self, tree):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        # `import a.b as c` -> c resolves to a.b
+                        self.imports[alias.asname] = alias.name
+                    else:
+                        # `import a.b.c` binds the top name `a`
+                        top = alias.name.split(".")[0]
+                        self.imports[top] = top
+            elif isinstance(node, ast.ImportFrom):
+                if node.module is None:
+                    # relative `from . import x` -- no reliable dotted path
+                    continue
+                for alias in node.names:
+                    bound = alias.asname or alias.name
+                    self.imports[bound] = node.module + "." + alias.name
+
+    def resolve_ctor(self, func):
+        """Resolve a constructor expression to its dotted client type via imports.
+
+        `Redis(...)`           -> redis.Redis   (name imported)
+        `requests.Session()`   -> requests.Session (module imported, attr appended)
+        `conn.cursor()`        -> None          (conn is not an imported name)
+        """
+        if isinstance(func, ast.Name):
+            return self.imports.get(func.id)
+        if isinstance(func, ast.Attribute):
+            root = _root_name(func)
+            if root is not None and root in self.imports:
+                dotted = expr_to_str(func)
+                # replace the imported alias root with its resolved module path
+                return self.imports[root] + dotted[len(root):]
+        return None
+
+    # -- assignment resolution ----------------------------------------------
+
+    def collect_assignments(self, tree):
+        for node in ast.walk(tree):
+            targets = None
+            value = None
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            if targets is None or not isinstance(value, ast.Call):
+                continue
+            ctype = self.resolve_ctor(value.func)
+            if not ctype:
+                continue
+            # Whole assignment statement, so an options/kwargs literal carrying a
+            # timeout comes along with it.
+            snip = {
+                "file": None,  # filled by caller (needs the emit-relative path)
+                "line": node.lineno,
+                "symbol": ctype,
+                "source": _segment(self.source, node),
+            }
+            for tgt in targets:
+                if isinstance(tgt, ast.Name):
+                    self.var_types[tgt.id] = ctype
+                    self.ctor_by_var.setdefault(tgt.id, []).append(snip)
+                elif (isinstance(tgt, ast.Attribute)
+                      and isinstance(tgt.value, ast.Name)
+                      and tgt.value.id == "self"):
+                    key = "self." + tgt.attr
+                    self.self_attr_types[key] = ctype
+                    self.ctor_by_selfattr.setdefault(key, []).append(snip)
+            self.ctor_by_type.setdefault(ctype, []).append(snip)
+
+    # -- receiver resolution at a call site ---------------------------------
+
+    def resolve_receiver(self, recv):
+        """(client_type, resolved) for a receiver expression, best-effort."""
+        if isinstance(recv, ast.Name):
+            if recv.id in self.var_types:
+                return self.var_types[recv.id], True
+            if recv.id in self.imports:
+                return self.imports[recv.id], True
+            return "", False
+        if isinstance(recv, ast.Attribute):
+            dotted = expr_to_str(recv)
+            if dotted in self.self_attr_types:
+                return self.self_attr_types[dotted], True
+            root = _root_name(recv)
+            if root is not None and root in self.imports:
+                return self.imports[root] + dotted[len(root):], True
+            return "", False
+        return "", False
+
+    def constructions_for(self, recv, recv_str, client_type):
+        """Construction snippets bearing on this receiver, capped."""
+        out = []
+        if isinstance(recv, ast.Name) and recv.id in self.ctor_by_var:
+            out = self.ctor_by_var[recv.id]
+        elif recv_str in self.ctor_by_selfattr:
+            out = self.ctor_by_selfattr[recv_str]
+        elif client_type and client_type in self.ctor_by_type:
+            out = self.ctor_by_type[client_type]
+        return out[:MAX_CTORS_EMITTED]
+
+
+def _enclosing_functions(tree):
+    """Map every AST node to the innermost enclosing FunctionDef/AsyncFunctionDef.
+
+    Returns {id(node): (func_name, func_node)}. Nodes at module scope are absent.
+    """
+    mapping = {}
+
+    def visit(node, func_name, func_node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                mapping[id(child)] = (child.name, child)
+                # descend with this def as the new enclosing function
+                visit(child, child.name, child)
+            else:
+                if func_node is not None:
+                    mapping[id(child)] = (func_name, func_node)
+                visit(child, func_name, func_node)
+
+    visit(tree, "", None)
+    return mapping
+
+
+def retrieve_file(abs_path, file_path, snapshot):
+    """Parse one Python file and return a list of site records (dicts)."""
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except (OSError, UnicodeDecodeError) as err:
+        print("skip {}: {}".format(file_path, err), file=sys.stderr)
+        return []
+    try:
+        tree = ast.parse(source, filename=abs_path)
+    except SyntaxError as err:
+        print("parse failed {}: {}".format(file_path, err), file=sys.stderr)
+        return []
+
+    idx = FileIndex(source)
+    idx.collect_imports(tree)
+    idx.collect_assignments(tree)
+    # stamp the emit-relative path onto every construction snippet
+    for bucket in (idx.ctor_by_var, idx.ctor_by_selfattr, idx.ctor_by_type):
+        for snips in bucket.values():
+            for s in snips:
+                s["file"] = file_path
+
+    enclosing = _enclosing_functions(tree)
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            # only receiver.method(...) shapes are call sites
+            continue
+        method = func.attr
+        recv = func.value
+        client_type, resolved = idx.resolve_receiver(recv)
+        if not _is_io_method(method, resolved):
+            continue
+
+        recv_str = expr_to_str(recv)
+        func_name, func_node = enclosing.get(id(node), ("", None))
+        line = node.lineno
+        snippet = _segment(source, node)
+        body = _segment(source, func_node) if func_node is not None else ""
+        constructions = idx.constructions_for(recv, recv_str, client_type)
+
+        record = {
+            "packet_schema": PACKET_SCHEMA,
+            # site_key stamped below in emit(); kept identical to goindex's siteKey
+            "site_key": "",
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": line,
+            "symbol": func_name,
+            "func": method,
+            "receiver": recv_str,
+            "client_type": client_type,
+            "snippet": snippet,
+            "enclosing_function_body": body,
+            "callers": [],   # empty in v1 (no cross-module call graph)
+            "callees": [],   # empty in v1
+            "client_construction": constructions,
+            "provenance": {
+                "client_type_resolved": resolved,
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+            },
+            "lang": "python",
+        }
+        out.append(record)
+    return out
+
+
+def site_key(record):
+    """Mirror rvl_index::site_key and goindex's siteKey exactly:
+    file:line:client_type:method. A file:line is NOT unique -- several client
+    calls can share a line -- so downstream joins key on this."""
+    return "{}:{}:{}:{}".format(
+        record["file_path"], record["line_number"],
+        record["client_type"], record["func"])
+
+
+def emit(records, out=sys.stdout):
+    """Stamp schema + site_key on every record and write one JSON object per
+    line. One choke point: a record that reaches a consumer unstamped is a
+    record no index can key."""
+    for rec in records:
+        rec["packet_schema"] = PACKET_SCHEMA
+        rec["site_key"] = site_key(rec)
+        out.write(json.dumps(rec))
+        out.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+
+_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
+    "site-packages", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist",
+})
+
+
+def _rel(root, abs_path):
+    """Emit-relative path, forward-slashed, matching goindex's filepath.Rel+ToSlash."""
+    return os.path.relpath(abs_path, root).replace(os.sep, "/")
+
+
+def discover(root, files_arg):
+    """Yield (abs_path, emit_relative_path) for the files to index.
+
+    With --files, only the listed (repo-relative) files are processed -- the
+    incremental reload path. Matching is exact-path (via normpath), never a
+    prefix, so a shallow reload of db.py does not pull in db_extra.py.
+    """
+    if files_arg:
+        for raw in files_arg.split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            abs_path = name if os.path.isabs(name) else os.path.join(root, name)
+            abs_path = os.path.normpath(abs_path)
+            if os.path.isfile(abs_path) and abs_path.endswith(".py"):
+                yield abs_path, _rel(root, abs_path)
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        # prune noise directories in place
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fn in sorted(filenames):
+            if fn.endswith(".py"):
+                abs_path = os.path.join(dirpath, fn)
+                yield abs_path, _rel(root, abs_path)
+
+
+def run_retrieve(root, snapshot, files_arg):
+    records = []
+    for abs_path, file_path in discover(root, files_arg):
+        records.extend(retrieve_file(abs_path, file_path, snapshot))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="pyindex",
+        description="Python retriever helper: emit rvlscan's versioned packet "
+                    "stream for Python source. Retrieval only, no verdicts.")
+    p.add_argument("--packet-schema", action="store_true",
+                   help="print the emitted packet schema version and exit")
+    p.add_argument("--retrieve", action="store_true",
+                   help="emit retrieved SOURCE packets (JSONL) to stdout")
+    p.add_argument("--root", default=".",
+                   help="repository root to index (default: .)")
+    p.add_argument("--name", default=None,
+                   help="snapshot id (defaults to the base name of --root)")
+    p.add_argument("--files", default="",
+                   help="comma-separated repo-relative .py files; emit packets "
+                        "only for these (incremental reload path)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    # Lets a consumer negotiate the contract before paying for a load.
+    if args.packet_schema:
+        print(PACKET_SCHEMA)
+        return 0
+
+    if args.retrieve:
+        root = os.path.abspath(args.root)
+        snapshot = args.name or os.path.basename(root.rstrip(os.sep)) or root
+        records = run_retrieve(root, snapshot, args.files)
+        emit(records)
+        print("{}: {} retrieved sites".format(snapshot, len(records)),
+              file=sys.stderr)
+        return 0
+
+    build_parser().print_usage(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
