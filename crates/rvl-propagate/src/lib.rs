@@ -11,7 +11,10 @@
 //! to a human adjudication, not to intuition.
 
 use rvl_core::{scope_of, CtxEvidence, Site, Verdict};
-use rvl_spec::{spec_gate, Bounds, Mechanism, Scope, ServedBound, SpecCache};
+use rvl_spec::{
+    client_family, spec_gate, Bounds, Family, Mechanism, Scope, ServedBound, SpecCache,
+};
+use std::collections::HashMap;
 
 /// Evidence of a bound, and how much of the call it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,11 +90,10 @@ pub fn propagate(
     site: &Site,
     specs: &SpecCache,
     served: &ServedBound,
-    // Repo-level client bound: computed and threaded, but NOT yet applied.
-    // Sound broadening requires family-scoping (po-3t3oj.30); until then only
-    // exact-type client-config matches satisfy. Kept in the signature so the
-    // family-scoped increment is a body change, not an API churn.
-    _client: &ServedBound,
+    // Repo-level client bounds, resolved per I/O family. A call is broadened
+    // only by its OWN family's bound (po-3t3oj.34), so one client's timeout can
+    // never mask another family's unbounded calls.
+    client: &HashMap<Family, ServedBound>,
 ) -> Finding {
     let id = site.id();
     let key = site.api_key();
@@ -125,6 +127,7 @@ pub fn propagate(
     let mut whole: Vec<String> = Vec::new();
     let mut phase: Vec<String> = Vec::new();
     let mut served_unresolved = false;
+    let mut client_unresolved = false;
 
     // AMBIENT mechanisms are checked for every blocking API, regardless of what
     // the spec lists. The distinction the first version missed: bounded_by
@@ -209,6 +212,7 @@ pub fn propagate(
                 _ => {}
             },
             Mechanism::ClientConfig => {
+                let before = whole.len() + phase.len();
                 // EXACT (a): the client is constructed at this site with a
                 // config the specs recognise.
                 for c in &site.client_construction {
@@ -238,18 +242,30 @@ pub fn propagate(
                         }
                     }
                 }
-                // GUARDED BROADENING is DELIBERATELY DISABLED pending a
-                // family-scoped design. The repo-level `client_bound` is
-                // computed and threaded (`_client`), but applying a single
-                // whole-call config across ALL client_config calls is UNSOUND:
-                // a repo can construct several unrelated clients with timeouts
-                // (measured on immich: an ExifTool `taskTimeoutMillis` and a
-                // Kysely DB pool with NO timeout), and broadening the ExifTool
-                // bound to the DB queries is exactly the false negative the
-                // soundness pin forbids. Sound broadening must match the config
-                // to the call's client FAMILY; until that lands, only EXACT-type
-                // matches (above) satisfy, and everything else stays a finding
-                // for a human. See po-3t3oj.30 (family-scoped config lane).
+                // FAMILY-SCOPED GUARDED BROADENING (po-3t3oj.34): only when no
+                // exact bound was found, and only from the call's OWN I/O
+                // family's repo-level config. A DB query is broadened by a DB
+                // pool's whole-call timeout, never by an image tool's timeout
+                // (immich: ExifTool vs an unbounded Kysely pool). A call whose
+                // type has no recognised family, or whose family has no config,
+                // stays a finding. Conflicting configs within the family abstain
+                // to a human — never a guess.
+                if whole.len() + phase.len() == before {
+                    if let Some(bound) =
+                        client_family(&site.client_type).and_then(|f| client.get(&f))
+                    {
+                        match bound {
+                            ServedBound::Agreed(Bounds::WholeCall) => whole.push(
+                                "repo constructs this client's family with a single, unconflicted whole-call timeout".into(),
+                            ),
+                            ServedBound::Agreed(Bounds::PhaseOnly) => {
+                                phase.push("repo client config bounds only a phase".into())
+                            }
+                            ServedBound::Conflict(_) => client_unresolved = true,
+                            _ => {}
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -267,6 +283,13 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting server-config specs".into(),
+        };
+    }
+    if client_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason: "conflicting client-config specs in this family".into(),
         };
     }
     // A phase-only bound is worse than no bound found, not better: it means the
@@ -297,7 +320,7 @@ pub fn propagate_all(
     sites: &[Site],
     specs: &SpecCache,
     served: &ServedBound,
-    client: &ServedBound,
+    client: &HashMap<Family, ServedBound>,
 ) -> Vec<Finding> {
     sites
         .iter()
@@ -310,6 +333,7 @@ mod tests {
     use super::*;
     use rvl_core::{Provenance, RootFact, Snippet};
     use rvl_spec::{ApiSpec, Blocking, ConfigSpec, Scope, ScopeSpec, SpecFile};
+    use std::collections::HashMap;
 
     fn cache(bounded_by: Vec<Mechanism>, configs: Vec<ConfigSpec>) -> SpecCache {
         SpecCache::from_file(SpecFile {
@@ -343,7 +367,7 @@ mod tests {
             &site(),
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("complete"));
@@ -370,25 +394,65 @@ mod tests {
                 vec![client_cfg(Bounds::WholeCall)],
             ),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
 
+    // A ClientConfig-bounded call on a recognised DB client type, no exact config.
+    fn db_call() -> (Site, SpecCache) {
+        let cache = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "typeorm.QueryRunner".into(),
+                method: "query".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::ClientConfig],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+            }],
+            configs: vec![],
+            scopes: vec![],
+        });
+        let site = Site {
+            file_path: "a.ts".into(),
+            line_number: 1,
+            method: "query".into(),
+            client_type: "typeorm.QueryRunner".into(),
+            ..Default::default()
+        };
+        (site, cache)
+    }
+
     #[test]
-    fn repo_level_broadening_is_disabled_until_family_scoped() {
-        // SOUNDNESS: a repo-level whole-call client config must NOT satisfy a
-        // call whose exact type has no config. Global broadening would let one
-        // client's timeout (e.g. immich's ExifTool) mask another client's
-        // genuinely-unbounded calls (immich's DB) -- the false negative the
-        // pin forbids. Until family-scoping lands, this stays a Violation.
-        let f = propagate(
-            &site(),
-            &cache(vec![Mechanism::ClientConfig], vec![]),
-            &ServedBound::None,
-            &ServedBound::Agreed(Bounds::WholeCall),
-        );
+    fn family_broadening_satisfies_within_the_same_family() {
+        // A DB call is broadened by the Database family's single whole-call bound.
+        let (s, cache) = db_call();
+        let client = HashMap::from([(Family::Database, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(&s, &cache, &ServedBound::None, &client);
+        assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn family_broadening_never_crosses_families_the_immich_guard() {
+        // THE cross-family false-negative guard: a DB call must NOT be satisfied
+        // by an HTTP client's whole-call timeout. (immich: an ExifTool/HTTP
+        // timeout must never mask the unbounded Kysely DB queries.)
+        let (s, cache) = db_call();
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(&s, &cache, &ServedBound::None, &client);
         assert_eq!(f.verdict, Verdict::Violates);
+    }
+
+    #[test]
+    fn family_conflict_abstains_never_guesses() {
+        let (s, cache) = db_call();
+        let client = HashMap::from([(
+            Family::Database,
+            ServedBound::Conflict(vec!["a".into(), "b".into()]),
+        )]);
+        let f = propagate(&s, &cache, &ServedBound::None, &client);
+        assert_eq!(f.verdict, Verdict::Abstain);
     }
 
     #[test]
@@ -399,7 +463,7 @@ mod tests {
             &site(),
             &cache(vec![Mechanism::ClientConfig], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Violates);
     }
@@ -415,7 +479,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(
             f.verdict,
@@ -442,7 +506,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::Context], vec![]),
                 &ServedBound::None,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Violates
@@ -462,7 +526,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::Context], vec![]),
                 &ServedBound::None,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Satisfies
@@ -481,7 +545,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("1 of 4"));
@@ -498,7 +562,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
@@ -515,7 +579,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::ClientConfig], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Violates);
     }
@@ -532,7 +596,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::ClientConfig], vec![]),
             &ServedBound::None,
-            &ServedBound::None,
+            &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
@@ -554,7 +618,7 @@ mod tests {
                 rationale: String::new(),
             }],
         );
-        let f = propagate(&s, &specs, &ServedBound::None, &ServedBound::None);
+        let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("phase"));
     }
@@ -568,7 +632,7 @@ mod tests {
             "@shared_task(time_limit=120)\ndef build_report():\n    db.query()".into();
         let specs = cache(vec![Mechanism::Decorator], vec![]);
         assert_eq!(
-            propagate(&s, &specs, &ServedBound::None, &ServedBound::None).verdict,
+            propagate(&s, &specs, &ServedBound::None, &HashMap::new()).verdict,
             Verdict::Satisfies
         );
     }
@@ -588,7 +652,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
                 &ServedBound::None,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Satisfies
@@ -605,7 +669,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
                 &ServedBound::None,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Violates,
@@ -631,7 +695,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
                 &conflict,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Violates
@@ -648,7 +712,7 @@ mod tests {
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
                 &ServedBound::None,
-                &ServedBound::None
+                &HashMap::new()
             )
             .verdict,
             Verdict::Violates
@@ -679,7 +743,7 @@ mod tests {
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
-            propagate(&s, &specs, &ServedBound::None, &ServedBound::None).verdict,
+            propagate(&s, &specs, &ServedBound::None, &HashMap::new()).verdict,
             Verdict::Satisfies
         );
 
@@ -688,7 +752,7 @@ mod tests {
         f.scopes[0].confidence = 0.3;
         let weak = SpecCache::from_file(f);
         assert_eq!(
-            propagate(&s, &weak, &ServedBound::None, &ServedBound::None).verdict,
+            propagate(&s, &weak, &ServedBound::None, &HashMap::new()).verdict,
             Verdict::Violates
         );
     }
@@ -706,12 +770,12 @@ mod tests {
         let specs = cache(vec![Mechanism::ServerConfig], vec![]);
         let conflict = ServedBound::Conflict(vec!["a=WholeCall".into(), "b=PhaseOnly".into()]);
         assert_eq!(
-            propagate(&served_site, &specs, &conflict, &ServedBound::None).verdict,
+            propagate(&served_site, &specs, &conflict, &HashMap::new()).verdict,
             Verdict::Abstain
         );
         // A site not reached through a handler is unaffected by the conflict.
         assert_eq!(
-            propagate(&site(), &specs, &conflict, &ServedBound::None).verdict,
+            propagate(&site(), &specs, &conflict, &HashMap::new()).verdict,
             Verdict::Violates
         );
     }
