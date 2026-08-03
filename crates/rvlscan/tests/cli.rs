@@ -114,14 +114,20 @@ fn scan_with_specs_file_emits_findings_and_coverage() {
         stderr.to_uppercase().contains("UNVERIFIED"),
         "no unverified banner: {stderr}"
     );
-    // coverage section: undecided outcomes are first-class, never violates
+    // The severity ladder renders a COVERAGE section reporting the decided
+    // rate; undecided outcomes are folded into coverage, never counted as
+    // violations. The footer states the blocking/advisory verdict.
     assert!(
-        stdout.contains("abstain"),
-        "coverage must report abstain: {stdout}"
+        stdout.contains("COVERAGE"),
+        "ladder must render a coverage section: {stdout}"
     );
     assert!(
-        stdout.contains("decided"),
-        "coverage must report decided rate: {stdout}"
+        stdout.contains("surfaces decided"),
+        "coverage must report the decided count: {stdout}"
+    );
+    assert!(
+        stdout.contains("commit clean") || stdout.contains("blocked"),
+        "ladder must render a verdict footer: {stdout}"
     );
     // findings written and well-formed
     let rows: serde_json::Value =
