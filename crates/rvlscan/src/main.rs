@@ -44,6 +44,15 @@ enum Cmd {
         /// Color output: auto (default), always, or never. NO_COLOR is honored.
         #[arg(long)]
         color: Option<String>,
+        /// Warm re-scan: reuse the persistent packet index and re-retrieve only
+        /// files whose content hash changed. Ignored when `--retrieved` is given.
+        #[arg(long)]
+        incremental: bool,
+        /// Fail CLOSED when the incremental wall budget is exhausted or a
+        /// retriever errors (CI). Default is fail-open: degrade to the reused
+        /// portion so a scan never blocks.
+        #[arg(long)]
+        strict: bool,
     },
     /// Explain one finding as an evidence block: the sites it covers, the
     /// control, and the fix. Takes the same inputs as `scan` plus the finding
@@ -307,8 +316,11 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
 // intentionally out of scope: discovery falls back to env override, a helper
 // adjacent to the rvlscan binary, then PATH.
 
-/// A source language rvlscan knows how to retrieve packets for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
+/// order Go < Python) makes it a stable `BTreeMap` key, so a multi-language
+/// incremental retrieval runs helpers in the same deterministic order the
+/// single-command path documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
@@ -486,18 +498,24 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
 }
 
 /// Build the full argv (program first) for invoking a resolved helper against
-/// `root`, tagging the snapshot `name`. Pure, so command construction is
-/// unit-testable without spawning a process.
-fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str) -> Vec<String> {
+/// `root`, tagging the snapshot `name`. When `files` is non-empty, append
+/// `--files a,b,c` (repo-relative paths) so the helper emits packets ONLY for
+/// those files, the incremental reload path both goindex and pyindex support.
+/// Pure, so command construction is unit-testable without spawning a process.
+fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String]) -> Vec<String> {
     let root = root.display().to_string();
     let helper_path = helper.path.display().to_string();
-    let tail = [
+    let mut tail = vec![
         "--retrieve".to_string(),
         "--root".to_string(),
         root,
         "--name".to_string(),
         name.to_string(),
     ];
+    if !files.is_empty() {
+        tail.push("--files".to_string());
+        tail.push(files.join(","));
+    }
     match helper.kind {
         HelperKind::Executable => std::iter::once(helper_path).chain(tail).collect(),
         HelperKind::PyScript => std::iter::once("python3".to_string())
@@ -508,9 +526,15 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str) -> Vec<String> 
 }
 
 /// Run a resolved helper over `root` and return its stdout (the JSONL packet
-/// stream). A non-zero exit surfaces the helper's stderr in the error.
-fn run_helper(helper: &ResolvedHelper, root: &Path, name: &str) -> anyhow::Result<String> {
-    let argv = helper_argv(helper, root, name);
+/// stream). When `files` is non-empty the helper emits only those files'
+/// packets. A non-zero exit surfaces the helper's stderr in the error.
+fn run_helper(
+    helper: &ResolvedHelper,
+    root: &Path,
+    name: &str,
+    files: &[String],
+) -> anyhow::Result<String> {
+    let argv = helper_argv(helper, root, name, files);
     let (program, args) = argv.split_first().expect("argv always has a program");
     let output = std::process::Command::new(program)
         .args(args)
@@ -524,6 +548,69 @@ fn run_helper(helper: &ResolvedHelper, root: &Path, name: &str) -> anyhow::Resul
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Derive the snapshot tag for a scan target: the canonical base name of
+/// `path`, falling back to "repo" when that is unavailable (e.g. `.` at `/`).
+fn snapshot_name(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .ok()
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// Collect the candidate source files (`*.go` / `*.py`) under `root` for the
+/// incremental hash-gate, using the same bounded, vendored-dir-skipping walk
+/// `detect_languages` relies on. Paths are `root`-prefixed so they hash
+/// directly and strip cleanly back to the repo-relative form the helpers emit.
+fn walk_source_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(entry.path());
+                }
+            } else if ft.is_file() {
+                match entry.path().extension().and_then(|e| e.to_str()) {
+                    Some("go") | Some("py") => out.push(entry.path()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The repo-relative, forward-slashed spelling of `file` under `root`. Matches
+/// the `file_path` the helpers emit (`filepath.Rel` + `ToSlash` on the Go side,
+/// `os.path.relpath` + `/` on the Python side), so a candidate path lines up
+/// with the sites retrieved from it.
+fn repo_relative(root: &Path, file: &Path) -> String {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The language whose helper retrieves a given source file, by extension.
+fn lang_of_path(path: &Path) -> Option<Lang> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("go") => Some(Lang::Go),
+        Some("py") => Some(Lang::Python),
+        _ => None,
+    }
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -541,17 +628,11 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
         "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
         path.display()
     );
-    let name = std::fs::canonicalize(path)
-        .ok()
-        .as_deref()
-        .and_then(Path::file_name)
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "repo".to_string());
+    let name = snapshot_name(path);
     let mut combined = String::new();
     for lang in langs {
         let helper = resolve_helper(lang)?;
-        let out = run_helper(&helper, path, &name)?;
+        let out = run_helper(&helper, path, &name, &[])?;
         if !combined.is_empty() && !combined.ends_with('\n') {
             combined.push('\n');
         }
@@ -572,6 +653,31 @@ fn resolve_findings(
     store: &CacheStore,
     keyset: &Keyset,
     stream: &str,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<(
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+)> {
+    let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
+    findings_from_sites(
+        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, verbose,
+    )
+}
+
+/// The pipeline shared by the packet-stream path and the incremental path:
+/// verified specs + already-assembled sites -> propagation -> triage. The
+/// incremental caller hands its merged (reused + freshly retrieved) sites here
+/// directly, skipping `parse_stream`.
+#[allow(clippy::too_many_arguments)]
+fn findings_from_sites(
+    store: &CacheStore,
+    keyset: &Keyset,
+    sites: Vec<rvl_core::Site>,
+    repo_cfg: &rvl_core::RepoConfig,
+    skipped: usize,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
     verbose: bool,
@@ -607,13 +713,12 @@ fn resolve_findings(
         }
     };
 
-    let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     anyhow::ensure!(
         !sites.is_empty(),
         "no parseable sites in the retrieved packet stream"
     );
     let cache = rvl_spec::SpecCache::load(&specs_text)?;
-    let served = cache.served_bound(&repo_cfg);
+    let served = cache.served_bound(repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served);
 
     if verbose {
@@ -667,7 +772,20 @@ fn run_scan(
     let stream = resolve_packet_stream(retrieved, path)?;
     let (findings, items, sites) =
         resolve_findings(store, keyset, &stream, specs_file, judgments, true)?;
+    render_scan_output(path, &findings, &items, &sites, out, color, start)
+}
 
+/// Render the ladder + optional `--out` JSON for a completed scan. Shared by
+/// the packet-stream path and the incremental path so both report identically.
+fn render_scan_output(
+    path: &std::path::Path,
+    findings: &[rvl_propagate::Finding],
+    items: &[rvl_triage::TriagedItem],
+    sites: &[rvl_core::Site],
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+    start: std::time::Instant,
+) -> anyhow::Result<ExitCode> {
     let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
     let unknown = findings
         .iter()
@@ -678,7 +796,7 @@ fn run_scan(
         total: sites.len(),
         unknown,
     };
-    let mut ladder_findings = triage_to_findings(&items);
+    let mut ladder_findings = triage_to_findings(items);
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -715,6 +833,315 @@ fn run_scan(
         println!("\nwrote {}", p.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// --- incremental scan: warm re-scan via the persistent packet index (po-3t3oj.14) ---
+//
+// A warm re-scan hashes the candidate source files, reuses indexed packets for
+// the ones whose content is unchanged, and re-retrieves ONLY the changed files
+// through the language helpers (`--files a,b,c`). Reused + freshly retrieved
+// sites are merged and fed into the same pipeline a full scan uses; the changed
+// files are re-indexed so the next run treats them as unchanged.
+//
+// Two invariants, inherited from rvl-index:
+//   * Reuse and merge key on the full `site_key` (path:line:client_type:method),
+//     never file:line: one location can resolve to several sites with different
+//     verdicts, and a file:line key silently drops one of a colliding pair.
+//   * The retrieval wall budget fails OPEN: when it is exhausted the scan
+//     degrades to the reused portion rather than blocking. `--strict` inverts
+//     that for CI, where a partial answer is worse than a failed job.
+
+/// Default wall-clock cap on the CHANGED-file retrieval, mirroring
+/// `rvl_index::Budget::hook()`. A warm scan sits on a pre-commit hook; it must
+/// never hang a commit, so it degrades to what it has once this elapses.
+const INCREMENTAL_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A real `rvl_index::Retriever`: shells out to the language helpers for a
+/// specific CHANGED-file list. Files are grouped by extension -> language and
+/// each language's helper runs once over just that language's changed files.
+struct HelperRetriever {
+    root: PathBuf,
+    name: String,
+}
+
+impl HelperRetriever {
+    /// Retrieve packets for `changed` (absolute paths), returning the sites and
+    /// the repo-scoped construction facts (carried by whichever helper ran).
+    /// Sites keep the repo-relative `file_path` the helpers emit.
+    fn retrieve_full(
+        &self,
+        changed: &[PathBuf],
+    ) -> anyhow::Result<(Vec<rvl_core::Site>, rvl_core::RepoConfig)> {
+        // Group changed files by language, as repo-relative paths for `--files`.
+        let mut by_lang: std::collections::BTreeMap<Lang, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for p in changed {
+            if let Some(lang) = lang_of_path(p) {
+                by_lang
+                    .entry(lang)
+                    .or_default()
+                    .push(repo_relative(&self.root, p));
+            }
+        }
+        let mut sites = Vec::new();
+        let mut repo_cfg = rvl_core::RepoConfig::default();
+        for (lang, files) in by_lang {
+            let helper = resolve_helper(lang)?;
+            let stream = run_helper(&helper, &self.root, &self.name, &files)?;
+            let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
+            sites.append(&mut got);
+            // The last non-empty construction record wins; helpers emit
+            // whole-repo constructions regardless of `--files`.
+            if !cfg.constructions.is_empty() {
+                repo_cfg = cfg;
+            }
+        }
+        Ok((sites, repo_cfg))
+    }
+}
+
+impl rvl_index::Retriever for HelperRetriever {
+    fn retrieve(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<rvl_core::Site>> {
+        Ok(self.retrieve_full(paths)?.0)
+    }
+}
+
+/// What a budgeted retrieval produced: the fresh sites, the repo config, and a
+/// degradation note when the wall budget was hit or the retriever errored under
+/// fail-open. `degraded` gates re-indexing: files we did not actually retrieve
+/// must NOT be recorded as scanned, or the next run skips them.
+#[derive(Debug)]
+struct RetrieveResult {
+    sites: Vec<rvl_core::Site>,
+    repo_cfg: rvl_core::RepoConfig,
+    degraded_note: Option<String>,
+}
+
+/// The outcome of running a closure under a wall-clock cap.
+enum Budgeted<T> {
+    Done(T),
+    TimedOut,
+    Failed(anyhow::Error),
+}
+
+/// Run `f` on a worker thread and wait at most `cap`. On timeout the worker is
+/// left to finish and exit on its own (the process is short-lived); we never
+/// block past the cap. Sync by design: no async runtime, like the rest of the
+/// binary.
+fn run_with_budget<T, F>(cap: std::time::Duration, f: F) -> Budgeted<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(cap) {
+        Ok(Ok(v)) => Budgeted::Done(v),
+        Ok(Err(e)) => Budgeted::Failed(e),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Budgeted::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Budgeted::Failed(anyhow::anyhow!("retrieval worker exited without a result"))
+        }
+    }
+}
+
+/// Turn a budget outcome into a `RetrieveResult`, applying the fail-open /
+/// `--strict` policy. Pure and thread-free so the policy is unit-testable.
+fn resolve_budgeted(
+    outcome: Budgeted<(Vec<rvl_core::Site>, rvl_core::RepoConfig)>,
+    strict: bool,
+    changed_len: usize,
+    cap: std::time::Duration,
+) -> anyhow::Result<RetrieveResult> {
+    match outcome {
+        Budgeted::Done((sites, repo_cfg)) => Ok(RetrieveResult {
+            sites,
+            repo_cfg,
+            degraded_note: None,
+        }),
+        Budgeted::TimedOut => {
+            if strict {
+                anyhow::bail!(
+                    "wall budget of {:?} exhausted retrieving {changed_len} changed file(s); \
+                     --strict refuses a partial answer",
+                    cap
+                );
+            }
+            Ok(RetrieveResult {
+                sites: Vec::new(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: Some(format!(
+                    "retrieval capped at {cap:?}: {changed_len} changed file(s) not re-scanned; \
+                     results cover the reused portion only"
+                )),
+            })
+        }
+        Budgeted::Failed(e) => {
+            if strict {
+                return Err(e);
+            }
+            Ok(RetrieveResult {
+                sites: Vec::new(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: Some(format!(
+                    "retrieval failed ({e}); results cover the reused portion only"
+                )),
+            })
+        }
+    }
+}
+
+/// Merge reused and freshly-retrieved sites, de-duplicating on the full
+/// `site_key`. Reused and fresh come from disjoint file sets, so this normally
+/// drops nothing; keying on `site_key` (never file:line) guarantees a location
+/// that resolves to two sites with different client types keeps both.
+fn merge_on_site_key(
+    reused: Vec<rvl_core::Site>,
+    fresh: Vec<rvl_core::Site>,
+) -> Vec<rvl_core::Site> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(reused.len() + fresh.len());
+    for s in reused.into_iter().chain(fresh) {
+        if seen.insert(rvl_index::site_key(&s)) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The assembled result of a warm pass.
+struct IncrementalScan {
+    sites: Vec<rvl_core::Site>,
+    repo_cfg: rvl_core::RepoConfig,
+    reused_files: usize,
+    retrieved_files: usize,
+    degraded_note: Option<String>,
+}
+
+/// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
+/// hash-gate `candidates`, reuse indexed packets for the unchanged, retrieve the
+/// changed via `retrieve`, re-index what came back (unless degraded), and merge.
+fn incremental_sites<F>(
+    index: &rvl_index::PacketIndex,
+    root: &Path,
+    candidates: &[PathBuf],
+    retrieve: F,
+) -> anyhow::Result<IncrementalScan>
+where
+    F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
+{
+    let plan = index.plan_reload(candidates);
+
+    // Reuse indexed packets for the unchanged files.
+    let mut reused = Vec::new();
+    for f in &plan.unchanged {
+        let h = rvl_index::hash_file(f)?;
+        if let Some(cached) = index.get(f, &h)? {
+            reused.extend(cached);
+        }
+    }
+    let reused_files = plan.unchanged.len();
+
+    // Retrieve the changed files (skip the helper entirely when nothing changed).
+    let rr = if plan.changed.is_empty() {
+        RetrieveResult {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            degraded_note: None,
+        }
+    } else {
+        retrieve(&plan.changed)?
+    };
+
+    // Re-index the freshly retrieved files so the next pass reuses them. Only
+    // when NOT degraded: recording a file we did not actually retrieve would
+    // make the next run skip it.
+    let degraded = rr.degraded_note.is_some();
+    if !degraded {
+        for f in &plan.changed {
+            let rel = repo_relative(root, f);
+            let for_file: Vec<rvl_core::Site> = rr
+                .sites
+                .iter()
+                .filter(|s| s.file_path == rel)
+                .cloned()
+                .collect();
+            let h = rvl_index::hash_file(f)?;
+            index.put(f, &h, &for_file)?;
+        }
+    }
+    let retrieved_files = if degraded { 0 } else { plan.changed.len() };
+
+    let sites = merge_on_site_key(reused, rr.sites);
+    Ok(IncrementalScan {
+        sites,
+        repo_cfg: rr.repo_cfg,
+        reused_files,
+        retrieved_files,
+        degraded_note: rr.degraded_note,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan_incremental(
+    store: &CacheStore,
+    keyset: &Keyset,
+    index_dir: &std::path::Path,
+    path: &std::path::Path,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+    strict: bool,
+) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
+    let candidates = walk_source_files(path);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
+        path.display()
+    );
+
+    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
+    let name = snapshot_name(path);
+    let root = path.to_path_buf();
+
+    let scan = incremental_sites(&index, path, &candidates, |changed| {
+        // Budget only the potentially-slow helper retrieval.
+        let retriever = HelperRetriever {
+            root: root.clone(),
+            name: name.clone(),
+        };
+        let changed_owned = changed.to_vec();
+        let changed_len = changed_owned.len();
+        let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
+            retriever.retrieve_full(&changed_owned)
+        });
+        resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
+    })?;
+
+    // One-line reuse summary to stderr; the ladder itself goes to stdout.
+    eprintln!(
+        "incremental: reused {} files from index, retrieved {} changed",
+        scan.reused_files, scan.retrieved_files
+    );
+    if let Some(note) = &scan.degraded_note {
+        eprintln!("incremental: degraded (fail-open): {note}");
+    }
+
+    let (findings, items, sites) = findings_from_sites(
+        store,
+        keyset,
+        scan.sites,
+        &scan.repo_cfg,
+        0,
+        specs_file,
+        judgments,
+        true,
+    )?;
+    render_scan_output(path, &findings, &items, &sites, out, color, start)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -810,16 +1237,37 @@ fn run() -> anyhow::Result<ExitCode> {
             judgments,
             out,
             color,
-        } => run_scan(
-            &store,
-            &keyset,
-            &path.unwrap_or_else(|| PathBuf::from(".")),
-            retrieved.as_deref(),
-            specs_file.as_deref(),
-            judgments.as_deref(),
-            out.as_deref(),
-            color.as_deref(),
-        ),
+            incremental,
+            strict,
+        } => {
+            let path = path.unwrap_or_else(|| PathBuf::from("."));
+            // `--incremental` only applies when we own retrieval; `--retrieved`
+            // is a prebuilt stream with no per-file hash gate to reuse.
+            if incremental && retrieved.is_none() {
+                run_scan_incremental(
+                    &store,
+                    &keyset,
+                    &cfg.index_dir,
+                    &path,
+                    specs_file.as_deref(),
+                    judgments.as_deref(),
+                    out.as_deref(),
+                    color.as_deref(),
+                    strict,
+                )
+            } else {
+                run_scan(
+                    &store,
+                    &keyset,
+                    &path,
+                    retrieved.as_deref(),
+                    specs_file.as_deref(),
+                    judgments.as_deref(),
+                    out.as_deref(),
+                    color.as_deref(),
+                )
+            }
+        }
         Cmd::Explain {
             id,
             path,
@@ -1043,7 +1491,7 @@ mod tests {
             path: PathBuf::from("/opt/goindex"),
             kind: HelperKind::Executable,
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo");
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
             argv,
             vec![
@@ -1063,7 +1511,7 @@ mod tests {
             path: PathBuf::from("/opt/pyindex.py"),
             kind: HelperKind::PyScript,
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo");
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
             argv,
             vec![
@@ -1076,6 +1524,197 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    #[test]
+    fn helper_argv_appends_files_for_changed_only() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/goindex"),
+            kind: HelperKind::Executable,
+        };
+        let changed = vec!["svc/db.go".to_string(), "svc/http.go".to_string()];
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &changed);
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/goindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo",
+                "--files",
+                "svc/db.go,svc/http.go",
+            ],
+            "the incremental path passes only the changed files via --files"
+        );
+        // The full path (no --files) is unchanged.
+        assert!(
+            !helper_argv(&helper, Path::new("/repo"), "repo", &[]).contains(&"--files".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_relative_is_forward_slashed_under_root() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            repo_relative(root, Path::new("/repo/svc/db.go")),
+            "svc/db.go"
+        );
+        assert_eq!(repo_relative(root, Path::new("/repo/main.go")), "main.go");
+    }
+
+    fn site_at(path: &str, line: u32, client: &str, method: &str) -> rvl_core::Site {
+        rvl_core::Site {
+            file_path: path.into(),
+            line_number: line,
+            client_type: client.into(),
+            method: method.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_keeps_two_sites_sharing_a_location() {
+        // po-3t3oj.15: one file:line resolves to two sites with different client
+        // types. A file:line-keyed merge would drop one; site_key keeps both.
+        let a = site_at("svc/x.go", 306, "drive.Service", "Do");
+        let b = site_at("svc/x.go", 306, "http.Client", "Do");
+        let merged = merge_on_site_key(vec![a.clone()], vec![b.clone()]);
+        assert_eq!(merged.len(), 2, "colliding location must not drop a site");
+        // A genuine duplicate (same site_key) IS collapsed.
+        let dup = merge_on_site_key(vec![a.clone()], vec![a]);
+        assert_eq!(dup.len(), 1);
+    }
+
+    #[test]
+    fn site_key_collision_round_trips_through_index_and_reload() {
+        // Two sites at the SAME file:line, different client_type, must survive
+        // put -> get -> plan_reload without collision.
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let f = dir.path().join("x.go");
+        std::fs::write(&f, "package x\n").unwrap();
+        let h = rvl_index::hash_file(&f).unwrap();
+        let both = vec![
+            site_at("x.go", 306, "drive.Service", "Do"),
+            site_at("x.go", 306, "http.Client", "Do"),
+        ];
+        idx.put(&f, &h, &both).unwrap();
+
+        let got = idx.get(&f, &h).unwrap().expect("hash matches");
+        assert_eq!(got.len(), 2, "both colliding sites stored and returned");
+        let keys: std::collections::HashSet<_> = got.iter().map(rvl_index::site_key).collect();
+        assert_eq!(keys.len(), 2, "the two sites keep distinct site_keys");
+
+        // The unchanged file reloads from the index (reuse), not re-retrieval.
+        let plan = idx.plan_reload(std::slice::from_ref(&f));
+        assert_eq!(plan.unchanged, vec![f]);
+        assert!(plan.changed.is_empty());
+    }
+
+    #[test]
+    fn incremental_reuses_unchanged_and_retrieves_only_changed() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let warm = dir.path().join("warm.go");
+        let cold = dir.path().join("cold.go");
+        std::fs::write(&warm, "package warm\n").unwrap();
+        std::fs::write(&cold, "package cold\n").unwrap();
+        // Pre-index warm.go so it is reused.
+        idx.put(
+            &warm,
+            &rvl_index::hash_file(&warm).unwrap(),
+            &[site_at("warm.go", 9, "p.C", "Warm")],
+        )
+        .unwrap();
+
+        let calls = Cell::new(0usize);
+        // Fake retriever: echoes one site per changed file, repo-relative pathed.
+        let fake = |changed: &[PathBuf]| {
+            calls.set(calls.get() + 1);
+            let sites = changed
+                .iter()
+                .map(|c| site_at(&repo_relative(dir.path(), c), 1, "p.C", "Do"))
+                .collect();
+            Ok(RetrieveResult {
+                sites,
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: None,
+            })
+        };
+        let candidates = walk_source_files(dir.path());
+        let scan = incremental_sites(&idx, dir.path(), &candidates, fake).unwrap();
+        assert_eq!(scan.reused_files, 1);
+        assert_eq!(scan.retrieved_files, 1);
+        assert_eq!(scan.sites.len(), 2, "1 reused + 1 retrieved");
+        assert_eq!(
+            calls.get(),
+            1,
+            "retriever invoked once, for the changed file"
+        );
+
+        // Second pass: nothing changed, the retriever is not invoked at all.
+        let calls2 = Cell::new(0usize);
+        let fake2 = |changed: &[PathBuf]| {
+            calls2.set(calls2.get() + 1);
+            Ok(RetrieveResult {
+                sites: changed
+                    .iter()
+                    .map(|c| site_at(&repo_relative(dir.path(), c), 1, "p.C", "Do"))
+                    .collect(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: None,
+            })
+        };
+        let scan2 = incremental_sites(&idx, dir.path(), &candidates, fake2).unwrap();
+        assert_eq!(scan2.reused_files, 2, "both files now reused");
+        assert_eq!(scan2.retrieved_files, 0);
+        assert_eq!(calls2.get(), 0, "no helper run when nothing changed");
+    }
+
+    #[test]
+    fn budget_timeout_fails_open_but_strict_fails_closed() {
+        let cap = std::time::Duration::from_millis(10);
+        // Fail-open: a timeout degrades to the reused portion with a note.
+        let open = resolve_budgeted(Budgeted::TimedOut, false, 3, cap).unwrap();
+        assert!(open.sites.is_empty());
+        assert!(
+            open.degraded_note.is_some(),
+            "degradation must be explained"
+        );
+        // --strict: a timeout is an error naming the budget.
+        let err = resolve_budgeted(Budgeted::TimedOut, true, 3, cap).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("budget"));
+    }
+
+    #[test]
+    fn budget_retriever_error_fails_open_but_strict_propagates() {
+        let cap = std::time::Duration::from_secs(10);
+        let mk = || Budgeted::Failed(anyhow::anyhow!("helper missing"));
+        // Fail-open: an error degrades, keeping the scan alive.
+        let open = resolve_budgeted(mk(), false, 1, cap).unwrap();
+        assert!(open.sites.is_empty());
+        assert!(open.degraded_note.unwrap().contains("helper missing"));
+        // --strict: the error propagates.
+        let err = resolve_budgeted(mk(), true, 1, cap).unwrap_err();
+        assert!(err.to_string().contains("helper missing"));
+    }
+
+    #[test]
+    fn run_with_budget_returns_done_and_times_out() {
+        // Fast closure completes.
+        match run_with_budget(std::time::Duration::from_secs(5), || Ok(7u32)) {
+            Budgeted::Done(v) => assert_eq!(v, 7),
+            _ => panic!("a fast closure must complete within the cap"),
+        }
+        // Slow closure trips the (tiny, injected) cap.
+        let slow = run_with_budget(std::time::Duration::from_millis(10), || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(0u32)
+        });
+        assert!(matches!(slow, Budgeted::TimedOut), "the wall cap must fire");
     }
 
     #[test]
