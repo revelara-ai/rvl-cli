@@ -160,6 +160,98 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
     );
 }
 
+// --- single-command scan: helper orchestration (po-3t3oj.25) ---
+
+/// End-to-end: `rvlscan scan <dir>` with NO `--retrieved` must detect the Go
+/// source, run goindex itself, and feed the packets into the pipeline. Requires
+/// a `go` toolchain to build the helper; if `go` is absent the test is skipped
+/// with a log line rather than failing (the feature is exercised, the CI env is
+/// just missing the compiler).
+#[test]
+fn scan_without_retrieved_runs_the_go_helper() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let goindex_src = workspace.join("helpers").join("goindex");
+    let fixture = goindex_src.join("testdata").join("fixture");
+    assert!(fixture.join("go.mod").is_file(), "fixture module missing");
+
+    // Build goindex from source so the test exercises a real helper run.
+    let dir = tempfile::tempdir().unwrap();
+    let goindex_bin = dir.path().join("goindex");
+    let build = Command::new("go")
+        .args(["build", "-o"])
+        .arg(&goindex_bin)
+        .arg(".")
+        .current_dir(&goindex_src)
+        .output();
+    match build {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            eprintln!(
+                "SKIP scan_without_retrieved_runs_the_go_helper: `go build` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("SKIP scan_without_retrieved_runs_the_go_helper: `go` not available: {e}");
+            return;
+        }
+    }
+
+    // A minimal (empty) spec set: the assertion is that packets were produced
+    // and parsed (sites N, N>0), not that anything is decided.
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    // The helper produced packets that parsed into at least one site.
+    assert!(
+        stdout.contains("sites "),
+        "verbose summary must report parsed sites: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sites 0 "),
+        "the fixture must yield at least one site: {stdout}"
+    );
+    assert!(
+        stdout.contains("COVERAGE"),
+        "ladder must render a coverage section: {stdout}"
+    );
+}
+
+/// With no `--retrieved` and no source under the target, the scan fails closed
+/// with guidance toward the escape hatch.
+#[test]
+fn scan_without_retrieved_on_empty_dir_fails_with_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("empty");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&target)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(!out.status.success(), "no sources must fail the scan");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no supported source files") && stderr.contains("--retrieved"),
+        "error must name the escape hatch: {stderr}"
+    );
+}
+
 // --- incremental index surface (po-3t3oj.14) ---
 
 #[test]
