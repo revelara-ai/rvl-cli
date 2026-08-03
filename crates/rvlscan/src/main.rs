@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 mod render;
+mod report;
 mod shared_config;
 mod waiver;
 
@@ -53,6 +54,34 @@ enum Cmd {
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+    },
+    /// Show EXACTLY what a scan would report to the Revelara spec factory about
+    /// unknown API surfaces: shape only — `client_type.method` and a site count,
+    /// NEVER source, file paths, or line numbers. This visibility IS the privacy
+    /// feature; you can audit precisely what would ever leave this machine.
+    /// Reporting is LOCAL-ONLY today: this command shows/writes the payload, it
+    /// does not transmit it. Mirrors `scan`'s inputs.
+    Report {
+        /// Repo/dir to scan (default: current directory). Ignored when
+        /// `--retrieved` is given.
+        path: Option<PathBuf>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL).
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        /// DEV ONLY: bypass the signed cache and load specs from a file.
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        /// Warm re-scan: reuse the persistent packet index. Ignored when
+        /// `--retrieved` is given.
+        #[arg(long)]
+        incremental: bool,
+        /// Print the exact `Report` JSON payload (what the wire would carry)
+        /// instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Write the exact `Report` JSON payload to this file.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Explain one finding as an evidence block: the sites it covers, the
     /// control, and the fix. Takes the same inputs as `scan` plus the finding
@@ -743,10 +772,15 @@ fn findings_from_sites(
             if let Some(note) = &loaded.staleness_note {
                 eprintln!("{note}");
             }
-            println!(
-                "spec cache {} (schema {}, {:?})",
-                loaded.envelope.content_version, loaded.envelope.schema, loaded.source
-            );
+            // Gated by `verbose` (like the sites|specs line below) so quiet
+            // callers such as `explain` and `report --json` keep stdout clean
+            // for their own payload. Staleness/upgrade hints stay on stderr.
+            if verbose {
+                println!(
+                    "spec cache {} (schema {}, {:?})",
+                    loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                );
+            }
             serde_json::to_string(&loaded.envelope.specs)?
         }
     };
@@ -1122,6 +1156,40 @@ where
     })
 }
 
+/// Run one warm incremental pass: hash-gate the candidate sources, reuse indexed
+/// packets, and budget-retrieve the changed files. Shared by `scan --incremental`
+/// and `report --incremental` so both assemble sites the same way.
+fn incremental_scan_pass(
+    index_dir: &std::path::Path,
+    path: &std::path::Path,
+    strict: bool,
+) -> anyhow::Result<IncrementalScan> {
+    let candidates = walk_source_files(path);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
+        path.display()
+    );
+
+    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
+    let name = snapshot_name(path);
+    let root = path.to_path_buf();
+
+    incremental_sites(&index, path, &candidates, |changed| {
+        // Budget only the potentially-slow helper retrieval.
+        let retriever = HelperRetriever {
+            root: root.clone(),
+            name: name.clone(),
+        };
+        let changed_owned = changed.to_vec();
+        let changed_len = changed_owned.len();
+        let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
+            retriever.retrieve_full(&changed_owned)
+        });
+        resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan_incremental(
     store: &CacheStore,
@@ -1135,30 +1203,7 @@ fn run_scan_incremental(
     strict: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
-    let candidates = walk_source_files(path);
-    anyhow::ensure!(
-        !candidates.is_empty(),
-        "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
-        path.display()
-    );
-
-    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
-    let name = snapshot_name(path);
-    let root = path.to_path_buf();
-
-    let scan = incremental_sites(&index, path, &candidates, |changed| {
-        // Budget only the potentially-slow helper retrieval.
-        let retriever = HelperRetriever {
-            root: root.clone(),
-            name: name.clone(),
-        };
-        let changed_owned = changed.to_vec();
-        let changed_len = changed_owned.len();
-        let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
-            retriever.retrieve_full(&changed_owned)
-        });
-        resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
-    })?;
+    let scan = incremental_scan_pass(index_dir, path, strict)?;
 
     // One-line reuse summary to stderr; the ladder itself goes to stdout.
     eprintln!(
@@ -1256,6 +1301,123 @@ fn run_suppress(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The shape-only privacy report. Runs the SAME resolve->scan pipeline `scan`
+/// uses to get findings + sites, then reduces to shape-only surfaces. Prints the
+/// human-readable audit view by default, the exact JSON payload with `--json`,
+/// and writes the JSON with `--out`. NEVER transmits: this shows/writes exactly
+/// what a future upload would carry, nothing more.
+#[allow(clippy::too_many_arguments)]
+fn run_report(
+    store: &CacheStore,
+    keyset: &Keyset,
+    index_dir: &std::path::Path,
+    path: &std::path::Path,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    incremental: bool,
+    json: bool,
+    out: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    // Reporting is local-only today: this command shows/writes the payload; it
+    // does not transmit it.
+    eprintln!(
+        "note: reporting is local-only; this shows exactly what a scan WOULD send \
+         to the spec factory (shape + counts only), it does not transmit anything"
+    );
+
+    // Same resolve->scan pipeline scan uses, via the shared building blocks.
+    let (findings, sites) = if incremental && retrieved.is_none() {
+        // report is read-only and never blocks a workflow: fail-open (strict=false).
+        let scan = incremental_scan_pass(index_dir, path, false)?;
+        eprintln!(
+            "incremental: reused {} files from index, retrieved {} changed",
+            scan.reused_files, scan.retrieved_files
+        );
+        if let Some(note) = &scan.degraded_note {
+            eprintln!("incremental: degraded (fail-open): {note}");
+        }
+        let (findings, _items, sites) = findings_from_sites(
+            store,
+            keyset,
+            scan.sites,
+            &scan.repo_cfg,
+            0,
+            specs_file,
+            None,
+            false,
+        )?;
+        (findings, sites)
+    } else {
+        let stream = resolve_packet_stream(retrieved, path)?;
+        let (findings, _items, sites) =
+            resolve_findings(store, keyset, &stream, specs_file, None, false)?;
+        (findings, sites)
+    };
+
+    let report = report::build_report(&sites, &findings, env!("CARGO_PKG_VERSION"));
+    let payload = serde_json::to_string_pretty(&report)?;
+
+    if let Some(p) = out {
+        std::fs::write(p, &payload)
+            .with_context(|| format!("writing report JSON to {}", p.display()))?;
+        eprintln!("wrote report payload to {}", p.display());
+    }
+
+    if json {
+        // The exact payload the wire would carry: shape + counts, nothing else.
+        println!("{payload}");
+    } else {
+        print!("{}", render_report_human(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The human-readable report: an explicit header stating precisely what would
+/// leave and that it carries no source/paths, the `site_count  client_type.method`
+/// table, and a total-surface footer. This visibility IS the privacy feature.
+fn render_report_human(report: &report::Report) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str(
+        "This is EXACTLY what a scan would send to the Revelara spec factory.\n\
+         It contains ONLY API shape (client_type.method) and a per-surface count.\n\
+         No source code, no file paths, no line numbers, nothing repo-identifying \
+         ever leaves this machine.\n\n",
+    );
+
+    if report.surfaces.is_empty() {
+        s.push_str("No unknown API surfaces: nothing would be reported.\n");
+        return s;
+    }
+
+    // Width the count column to the widest count for a clean right-aligned table.
+    let w = report
+        .surfaces
+        .iter()
+        .map(|r| r.site_count.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max("sites".len());
+    let _ = writeln!(s, "  {:>w$}  surface", "sites", w = w);
+    let _ = writeln!(s, "  {:>w$}  -------", "-".repeat(w), w = w);
+    for r in &report.surfaces {
+        let _ = writeln!(
+            s,
+            "  {:>w$}  {}.{}",
+            r.site_count,
+            r.client_type,
+            r.method,
+            w = w
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n{} unknown API surface(s) would be reported.",
+        report.surfaces.len()
+    );
+    s
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -1306,6 +1468,24 @@ fn run() -> anyhow::Result<ExitCode> {
                 )
             }
         }
+        Cmd::Report {
+            path,
+            retrieved,
+            specs_file,
+            incremental,
+            json,
+            out,
+        } => run_report(
+            &store,
+            &keyset,
+            &cfg.index_dir,
+            &path.unwrap_or_else(|| PathBuf::from(".")),
+            retrieved.as_deref(),
+            specs_file.as_deref(),
+            incremental,
+            json,
+            out.as_deref(),
+        ),
         Cmd::Explain {
             id,
             path,
