@@ -21,6 +21,8 @@ fn f(id_seed: &str, sev: &str, disp: &str, crit: u32) -> Finding {
         fix: "set a Timeout or thread a ctx deadline".into(),
         site_count: 3,
         example_sites: vec!["a.go:1".into(), "b.go:2".into()],
+        class_rule: "pkg.T.M".into(),
+        suppressed: false,
     }
 }
 
@@ -45,6 +47,13 @@ fn color_auto_honors_no_color_and_tty() {
 }
 
 // --- finding id ---
+
+#[test]
+fn finding_carries_class_rule_waiver_key() {
+    // The class_rule field is the waiver key threaded through to the suppress
+    // path; the ladder itself just carries it.
+    assert_eq!(f("x", "high", "surface", 0).class_rule, "pkg.T.M");
+}
 
 #[test]
 fn finding_id_is_stable_and_short() {
@@ -117,6 +126,66 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         out.contains("12 corpus incidents") && out.contains("2 critical"),
         "incident counts shown"
     );
+}
+
+#[test]
+fn suppressed_finding_is_hidden_and_counted_in_footer() {
+    // A waiver-suppressed finding classifies as Suppressed regardless of its
+    // base severity/disposition, stays out of the ladder body, and shows up in
+    // the clean footer's suppressed count.
+    let mut waived = f("waived1", "high", "surface", 2);
+    waived.suppressed = true;
+    assert_eq!(
+        classify(&waived),
+        Section::Suppressed,
+        "suppressed by waiver"
+    );
+
+    let findings = vec![f("adv1", "medium", "surface", 0), waived];
+    let out = render_ladder(
+        &findings,
+        Coverage {
+            decided: 5,
+            total: 5,
+            unknown: 0,
+        },
+        "0.1s",
+        false,
+    );
+    // The suppressed finding does not render in BLOCKING/ADVISORY.
+    assert!(
+        !out.contains(&finding_id("waived1")),
+        "suppressed finding must not render in the ladder body"
+    );
+    assert!(!out.contains("BLOCKING"), "no blocking section");
+    // Footer reports it, and still says commit clean (suppressed never blocks).
+    assert!(
+        out.contains("1 suppressed"),
+        "footer shows suppressed count"
+    );
+    assert!(
+        out.contains("commit clean"),
+        "suppressed does not block commit"
+    );
+}
+
+#[test]
+fn zero_suppressed_omits_the_suppressed_footer_clause() {
+    let out = render_ladder(
+        &[f("adv1", "medium", "surface", 0)],
+        Coverage {
+            decided: 1,
+            total: 1,
+            unknown: 0,
+        },
+        "0.1s",
+        false,
+    );
+    assert!(
+        !out.contains("suppressed"),
+        "no suppressed clause when count is 0"
+    );
+    assert!(out.contains("commit clean"));
 }
 
 #[test]

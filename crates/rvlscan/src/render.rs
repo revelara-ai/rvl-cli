@@ -67,6 +67,13 @@ pub struct Finding {
     pub site_count: usize,
     /// Extra example sites for the explain view.
     pub example_sites: Vec<String>,
+    /// The waiver key for this finding: the class key `client_type.method`
+    /// (e.g. `db.RLSPool.QueryRow`). Matched case-insensitively against
+    /// `.revelara.yaml` waivers; also the value written by `rvlscan suppress`.
+    pub class_rule: String,
+    /// Set when a `.revelara.yaml` waiver suppresses this finding. Folded into
+    /// the Suppressed section like `low_value`, kept out of BLOCKING/ADVISORY.
+    pub suppressed: bool,
 }
 
 /// Coverage summary for the footer/coverage section.
@@ -102,7 +109,7 @@ pub fn finding_id(class_key: &str) -> String {
 /// `low_value` is suppressed; anything unjudged is advisory (surfaced, not
 /// blocking — an un-triaged finding must not block a commit).
 pub fn classify(f: &Finding) -> Section {
-    if f.disposition == "low_value" {
+    if f.suppressed || f.disposition == "low_value" {
         return Section::Suppressed;
     }
     let base_blocking = f.severity == "high";
@@ -175,13 +182,21 @@ pub fn render_ladder(findings: &[Finding], cov: Coverage, elapsed: &str, color: 
     let _ = writeln!(o, "{}", paint(&cline, "2", color));
     o.push('\n');
 
+    let suppressed = findings
+        .iter()
+        .filter(|f| classify(f) == Section::Suppressed)
+        .count();
+
     if blocking.is_empty() {
-        let _ = writeln!(
-            o,
-            "{} {} advisory \u{00b7} commit clean",
+        let mut foot = format!(
+            "{} {} advisory",
             paint("\u{2713}", "32", color),
             advisory.len()
         );
+        if suppressed > 0 {
+            let _ = write!(foot, " \u{00b7} {suppressed} suppressed");
+        }
+        let _ = writeln!(o, "{foot} \u{00b7} commit clean");
     } else {
         let _ = writeln!(
             o,
@@ -264,7 +279,7 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
         "  {}",
         paint(
             &format!(
-                "suppress: rvlscan suppress {} --reason=\"...\"  (durable, org-visible)",
+                "suppress: rvlscan suppress {} --reason=\"...\"  (writes .revelara.yaml, shared via git)",
                 f.id
             ),
             "2",
