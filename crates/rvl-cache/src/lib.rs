@@ -52,10 +52,13 @@ pub struct Keyset {
     keys: Vec<ed25519_dalek::VerifyingKey>,
 }
 
-/// The dev keyset. The factory (spec-factory pipeline) must mint the
-/// production keypair and replace this before any customer release.
+/// The dev keyset: the public half of the ed25519 keypair the spec factory
+/// signs dev caches with (minted 2026-08-02; private half held out of band in
+/// the minikube secret spec-signing-dev). The factory must mint a separate
+/// PRODUCTION keypair and add its public key here (additive rotation) before
+/// any customer release; this dev key stays for local/dev caches.
 pub const DEV_KEYSET_HEX: &[&str] =
-    &["b2af57436cd073ece109c08a17f9ebacd60cedddfa641153b4dc3204877c1498"];
+    &["aebac9ca1b7bf75b4848320858eceb1ce421ff152870f01fcdcb8e6be8514e9a"];
 
 impl Keyset {
     pub fn from_hex(keys_hex: &[&str]) -> anyhow::Result<Self> {
