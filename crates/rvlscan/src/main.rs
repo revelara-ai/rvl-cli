@@ -791,7 +791,8 @@ fn findings_from_sites(
     );
     let cache = rvl_spec::SpecCache::load(&specs_text)?;
     let served = cache.served_bound(repo_cfg);
-    let findings = rvl_propagate::propagate_all(&sites, &cache, &served);
+    let client = cache.client_bound(repo_cfg);
+    let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
 
     if verbose {
         println!(

@@ -11,7 +11,7 @@
 //! to a human adjudication, not to intuition.
 
 use rvl_core::{scope_of, CtxEvidence, Site, Verdict};
-use rvl_spec::{spec_gate, Bounds, Mechanism, ServedBound, SpecCache};
+use rvl_spec::{spec_gate, Bounds, Mechanism, Scope, ServedBound, SpecCache};
 
 /// Evidence of a bound, and how much of the call it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +83,12 @@ fn is_served_request_root(site: &Site) -> bool {
 }
 
 /// Apply the specs to one site.
-pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Finding {
+pub fn propagate(
+    site: &Site,
+    specs: &SpecCache,
+    served: &ServedBound,
+    client: &ServedBound,
+) -> Finding {
     let id = site.id();
     let key = site.api_key();
     let spec = specs.api(&key);
@@ -116,6 +121,7 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
     let mut whole: Vec<String> = Vec::new();
     let mut phase: Vec<String> = Vec::new();
     let mut served_unresolved = false;
+    let mut client_unresolved = false;
 
     // AMBIENT mechanisms are checked for every blocking API, regardless of what
     // the spec lists. The distinction the first version missed: bounded_by
@@ -200,6 +206,9 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
                 _ => {}
             },
             Mechanism::ClientConfig => {
+                let before = whole.len() + phase.len();
+                // EXACT (a): the client is constructed at this site with a
+                // config the specs recognise.
                 for c in &site.client_construction {
                     match specs.config(&c.symbol).map(|s| s.bounds) {
                         Some(Bounds::WholeCall) => {
@@ -208,6 +217,39 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
                         Some(Bounds::PhaseOnly) => {
                             phase.push(format!("client config {} bounds only a phase", c.symbol))
                         }
+                        _ => {}
+                    }
+                }
+                // EXACT (b): the call's own client_type carries a this_client
+                // config, even when the construction is not at this site.
+                if let Some(s) = specs.config(&site.client_type) {
+                    if s.scope == Scope::ThisClient && s.confidence >= rvl_spec::MIN_CONFIDENCE {
+                        match s.bounds {
+                            Bounds::WholeCall => {
+                                whole.push(format!("client config {}", site.client_type))
+                            }
+                            Bounds::PhaseOnly => phase.push(format!(
+                                "client config {} bounds only a phase",
+                                site.client_type
+                            )),
+                            _ => {}
+                        }
+                    }
+                }
+                // GUARDED BROADENING (soundness pin, po-3t3oj.30): only when no
+                // exact bound was found for this call, and only when the repo
+                // has a SINGLE, unconflicted whole/phase this_client config for
+                // the DB family (client_bound == Agreed). Conflicting configs
+                // abstain to a human rather than guess which one governs.
+                if whole.len() + phase.len() == before {
+                    match client {
+                        ServedBound::Agreed(Bounds::WholeCall) => whole.push(
+                            "repo constructs its client with a single, unconflicted whole-call timeout".into(),
+                        ),
+                        ServedBound::Agreed(Bounds::PhaseOnly) => phase.push(
+                            "repo client config bounds only a phase".into(),
+                        ),
+                        ServedBound::Conflict(_) => client_unresolved = true,
                         _ => {}
                     }
                 }
@@ -228,6 +270,13 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting server-config specs".into(),
+        };
+    }
+    if client_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason: "conflicting client-config specs".into(),
         };
     }
     // A phase-only bound is worse than no bound found, not better: it means the
@@ -254,8 +303,16 @@ pub fn propagate(site: &Site, specs: &SpecCache, served: &ServedBound) -> Findin
     }
 }
 
-pub fn propagate_all(sites: &[Site], specs: &SpecCache, served: &ServedBound) -> Vec<Finding> {
-    sites.iter().map(|s| propagate(s, specs, served)).collect()
+pub fn propagate_all(
+    sites: &[Site],
+    specs: &SpecCache,
+    served: &ServedBound,
+    client: &ServedBound,
+) -> Vec<Finding> {
+    sites
+        .iter()
+        .map(|s| propagate(s, specs, served, client))
+        .collect()
 }
 
 #[cfg(test)]
@@ -296,9 +353,76 @@ mod tests {
             &site(),
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
+            &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("complete"));
+    }
+
+    fn client_cfg(bounds: Bounds) -> ConfigSpec {
+        ConfigSpec {
+            type_name: "db.Pool".into(),
+            bounds,
+            scope: Scope::ThisClient,
+            confidence: 0.9,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn client_config_exact_type_satisfies() {
+        // The call's own client_type carries a whole-call this_client config,
+        // even without a per-site construction. Exact match needs no broadening.
+        let f = propagate(
+            &site(),
+            &cache(
+                vec![Mechanism::ClientConfig],
+                vec![client_cfg(Bounds::WholeCall)],
+            ),
+            &ServedBound::None,
+            &ServedBound::None,
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn client_config_guarded_broadening_satisfies_on_agreed() {
+        // No exact config for THIS type, but the repo has a single, unconflicted
+        // whole-call this_client config (client == Agreed) -> broaden and satisfy.
+        let f = propagate(
+            &site(),
+            &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
+            &ServedBound::Agreed(Bounds::WholeCall),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies);
+        assert!(f.reason.contains("unconflicted"));
+    }
+
+    #[test]
+    fn client_config_with_no_bound_still_violates_the_soundness_guard() {
+        // THE false-negative guard: a client_config-bounded call with no exact
+        // config AND no repo-level client bound must NOT be silently satisfied.
+        let f = propagate(
+            &site(),
+            &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
+            &ServedBound::None,
+        );
+        assert_eq!(f.verdict, Verdict::Violates);
+    }
+
+    #[test]
+    fn client_config_conflict_abstains_never_guesses() {
+        // Conflicting this_client configs -> abstain to a human, never a pass.
+        let f = propagate(
+            &site(),
+            &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
+            &ServedBound::Conflict(vec!["a".into(), "b".into()]),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert!(f.reason.contains("client-config"));
     }
 
     #[test]
@@ -311,6 +435,7 @@ mod tests {
         let f = propagate(
             &s,
             &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
             &ServedBound::None,
         );
         assert_eq!(
@@ -337,6 +462,7 @@ mod tests {
             propagate(
                 &s,
                 &cache(vec![Mechanism::Context], vec![]),
+                &ServedBound::None,
                 &ServedBound::None
             )
             .verdict,
@@ -356,6 +482,7 @@ mod tests {
             propagate(
                 &s,
                 &cache(vec![Mechanism::Context], vec![]),
+                &ServedBound::None,
                 &ServedBound::None
             )
             .verdict,
@@ -375,6 +502,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::Context], vec![]),
             &ServedBound::None,
+            &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("1 of 4"));
@@ -390,6 +518,7 @@ mod tests {
         let f = propagate(
             &s,
             &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
             &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -407,6 +536,7 @@ mod tests {
             &s,
             &cache(vec![Mechanism::ClientConfig], vec![]),
             &ServedBound::None,
+            &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Violates);
     }
@@ -422,6 +552,7 @@ mod tests {
         let f = propagate(
             &s,
             &cache(vec![Mechanism::ClientConfig], vec![]),
+            &ServedBound::None,
             &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -444,7 +575,7 @@ mod tests {
                 rationale: String::new(),
             }],
         );
-        let f = propagate(&s, &specs, &ServedBound::None);
+        let f = propagate(&s, &specs, &ServedBound::None, &ServedBound::None);
         assert_eq!(f.verdict, Verdict::Violates);
         assert!(f.reason.contains("phase"));
     }
@@ -458,7 +589,7 @@ mod tests {
             "@shared_task(time_limit=120)\ndef build_report():\n    db.query()".into();
         let specs = cache(vec![Mechanism::Decorator], vec![]);
         assert_eq!(
-            propagate(&s, &specs, &ServedBound::None).verdict,
+            propagate(&s, &specs, &ServedBound::None, &ServedBound::None).verdict,
             Verdict::Satisfies
         );
     }
@@ -477,6 +608,7 @@ mod tests {
             propagate(
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None,
                 &ServedBound::None
             )
             .verdict,
@@ -493,6 +625,7 @@ mod tests {
             propagate(
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None,
                 &ServedBound::None
             )
             .verdict,
@@ -515,7 +648,13 @@ mod tests {
         };
         let conflict = ServedBound::Conflict(vec!["a=WholeCall".into(), "b=PhaseOnly".into()]);
         assert_eq!(
-            propagate(&s, &cache(vec![Mechanism::ClientConfig], vec![]), &conflict).verdict,
+            propagate(
+                &s,
+                &cache(vec![Mechanism::ClientConfig], vec![]),
+                &conflict,
+                &ServedBound::None
+            )
+            .verdict,
             Verdict::Violates
         );
     }
@@ -529,6 +668,7 @@ mod tests {
             propagate(
                 &s,
                 &cache(vec![Mechanism::ClientConfig], vec![]),
+                &ServedBound::None,
                 &ServedBound::None
             )
             .verdict,
@@ -560,7 +700,7 @@ mod tests {
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
-            propagate(&s, &specs, &ServedBound::None).verdict,
+            propagate(&s, &specs, &ServedBound::None, &ServedBound::None).verdict,
             Verdict::Satisfies
         );
 
@@ -569,7 +709,7 @@ mod tests {
         f.scopes[0].confidence = 0.3;
         let weak = SpecCache::from_file(f);
         assert_eq!(
-            propagate(&s, &weak, &ServedBound::None).verdict,
+            propagate(&s, &weak, &ServedBound::None, &ServedBound::None).verdict,
             Verdict::Violates
         );
     }
@@ -587,12 +727,12 @@ mod tests {
         let specs = cache(vec![Mechanism::ServerConfig], vec![]);
         let conflict = ServedBound::Conflict(vec!["a=WholeCall".into(), "b=PhaseOnly".into()]);
         assert_eq!(
-            propagate(&served_site, &specs, &conflict).verdict,
+            propagate(&served_site, &specs, &conflict, &ServedBound::None).verdict,
             Verdict::Abstain
         );
         // A site not reached through a handler is unaffected by the conflict.
         assert_eq!(
-            propagate(&site(), &specs, &conflict).verdict,
+            propagate(&site(), &specs, &conflict, &ServedBound::None).verdict,
             Verdict::Violates
         );
     }
