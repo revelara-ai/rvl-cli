@@ -57,6 +57,31 @@ rvlscan explain <id> --retrieved packets.jsonl
 The signed spec cache is used by default (run `rvlscan sync` to populate it).
 `--specs-file` is a loudly-announced dev override.
 
+## Privacy
+
+**Customer code never leaves the machine.** `rvlscan` is open source so this is
+true and auditable by construction, not aspiration. When a scan reports the
+unknown API surfaces it could not decide (no spec exists yet), the payload
+carries ONLY the API SHAPE — `client_type`, `method`, and a `site_count` — and
+nothing else: no source snippets, no enclosing function bodies, no file paths
+(paths leak repo structure), no line numbers, nothing repo-identifying beyond
+the public API identity and a count.
+
+The shape-only report type (`ReportSurface`) is structurally incapable of
+carrying source; audit tests build a report from source-bearing sites and assert
+the source never appears in the serialized payload.
+
+Use `rvlscan report` to see EXACTLY what would ever be transmitted:
+
+```sh
+rvlscan report [PATH]                 # human-readable table of shape + counts
+rvlscan report [PATH] --json          # the exact JSON payload the wire would carry
+rvlscan report [PATH] --out shape.json  # write that JSON payload to a file
+```
+
+Reporting is local-only today: `rvlscan report` shows or writes the payload, it
+does not transmit it.
+
 ## Development
 
 This is a Cargo workspace. The `rvlscan` binary lives in `crates/rvlscan`.
