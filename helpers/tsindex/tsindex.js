@@ -109,6 +109,110 @@ const NOISE_METHODS = new Set([
   'map', 'filter', 'forEach', 'reduce', 'push', 'pop', 'slice', 'concat',
 ]);
 
+// ---------------------------------------------------------------------------
+// Repo-level config retrieval (the `repo_config` packet).
+//
+// A DI-injected pool/DataSource carries its `query_timeout` in a central module,
+// nowhere near the call sites that use it, so per-site retrieval can never reach
+// it. Mirroring goindex's RepoConfig, we emit ONE repo-scoped record per run
+// listing DB/HTTP client CONSTRUCTIONS that set a timeout-ish config field. This
+// is RETRIEVAL ONLY: we report the observed fact (which type set which timeout
+// fields), never whether that field actually bounds anything -- that judgement
+// is the spec author's, downstream.
+//
+// TIMEOUT_FIELD_SUBSTRINGS is matched case-insensitively as a SUBSTRING against
+// each construction-literal property name. `timeout`/`deadline` subsume most of
+// the list; the explicit long names (`maxQueryExecutionTime`, ...) cover the few
+// that carry no `timeout`/`deadline` substring. The ORIGINAL property name is
+// what we record, not the matched substring.
+// ---------------------------------------------------------------------------
+
+const TIMEOUT_FIELD_SUBSTRINGS = [
+  'query_timeout', 'statement_timeout', 'statementtimeout',
+  'maxqueryexecutiontime', 'connectiontimeoutmillis', 'connecttimeout',
+  'commandtimeout', 'requesttimeout', 'idletimeoutmillis', 'sockettimeout',
+  'timeout', 'deadline',
+];
+
+// Factory calls whose first object-literal argument configures a constructed
+// client, so `axios.create({timeout})`, `got.extend({timeout})`,
+// `createPool({...})`, `mysql.createPool({...})` are covered alongside
+// `new Pool({...})`. Matched on the last name of the callee.
+const FACTORY_CALL_NAMES = new Set([
+  'create', 'extend', 'createPool', 'createConnection', 'createClient',
+]);
+
+function isTimeoutish(name) {
+  if (!name) return false;
+  const lc = name.toLowerCase();
+  return TIMEOUT_FIELD_SUBSTRINGS.some((s) => lc.includes(s));
+}
+
+// propertyName returns the source name of an object-literal member, for both
+// `{ query_timeout: X }` (PropertyAssignment) and `{ timeout }` (shorthand).
+function propertyName(p) {
+  if (!p.name) return '';
+  if (ts.isStringLiteral(p.name)) return p.name.text;
+  if (typeof p.name.getText === 'function') return p.name.getText();
+  return '';
+}
+
+// collectTimeoutFields scans an object literal for timeout-ish property names,
+// descending ONE level into nested object literals (TypeORM's `extra`, a
+// dialect's `pool`, ...). `depth` guards that single level. Found names are
+// added to `out` (a Set, so duplicates across a literal collapse).
+function collectTimeoutFields(objLiteral, depth, out) {
+  if (!objLiteral || !ts.isObjectLiteralExpression(objLiteral)) return;
+  for (const p of objLiteral.properties) {
+    const name = propertyName(p);
+    if (name && isTimeoutish(name)) out.add(name);
+    if (
+      depth < 1 &&
+      ts.isPropertyAssignment(p) &&
+      p.initializer &&
+      ts.isObjectLiteralExpression(p.initializer)
+    ) {
+      collectTimeoutFields(p.initializer, depth + 1, out);
+    }
+  }
+}
+
+// firstObjectArg returns the first argument of a new/call expression when it is
+// an object literal (the config literal), else null.
+function firstObjectArg(node) {
+  const args = node.arguments;
+  if (!args || args.length === 0) return null;
+  return ts.isObjectLiteralExpression(args[0]) ? args[0] : null;
+}
+
+// isFactoryCall reports whether a CallExpression is a known client factory
+// (`axios.create`, `got.extend`, `createPool`, ...), keyed on the callee's last
+// name so both `createPool(...)` and `mysql.createPool(...)` qualify.
+function isFactoryCall(node) {
+  const callee = node.expression;
+  let name = '';
+  if (ts.isIdentifier(callee)) name = callee.text;
+  else if (ts.isPropertyAccessExpression(callee)) name = callee.name.text;
+  return FACTORY_CALL_NAMES.has(name);
+}
+
+// constructedType resolves the type a construction produces to `<pkg>.<Type>`,
+// reusing the same package-identity resolver the site packets use (so pnpm's
+// `.pnpm/` path layer is already collapsed by packageFromDeclPath's lastIndexOf
+// on `/node_modules/`). Falls back to the constructor/factory identifier text
+// (`DataSource`, `Pool`, `axios.create`) when the type cannot be attributed to
+// an external package.
+function constructedType(node, checker, program) {
+  const { clientType, resolved } = resolveClientType(node, checker, program);
+  // Guard against a degenerate pnpm path with no inner node_modules leaking a
+  // `.pnpm` pseudo-package into the type; normal pnpm layouts resolve cleanly.
+  if (resolved && clientType && !clientType.startsWith('.pnpm')) {
+    return clientType;
+  }
+  const callee = node.expression;
+  return callee && typeof callee.getText === 'function' ? callee.getText() : '';
+}
+
 function cap(text) {
   if (text == null) return '';
   if (text.length > MAX_SNIPPET_BYTES) {
@@ -469,7 +573,53 @@ function runRetrieve(root, snapshot, filesArg) {
     };
     visit(sf);
   }
-  return records;
+
+  const repoConfig = collectRepoConfig(program, checker, snapshot, isScanned);
+  return { records, repoConfig };
+}
+
+// collectRepoConfig walks EVERY scanned source file (repo-scoped, so never
+// restricted by the incremental --files filter) for client CONSTRUCTIONS whose
+// config literal sets a timeout-ish field, deduped to one `{type, fields}` entry
+// per distinct constructed type (fields unioned across constructions of that
+// type). Returns the repo_config packet the config lane consumes. A construction
+// with no timeout-ish field is dropped; a run with none yields an empty array.
+function collectRepoConfig(program, checker, snapshot, isScanned) {
+  const byType = new Map(); // type -> Set(field names)
+  for (const sf of program.getSourceFiles()) {
+    if (!isScanned(sf)) continue;
+    const visit = (node) => {
+      let objArg = null;
+      if (ts.isNewExpression(node)) {
+        objArg = firstObjectArg(node);
+      } else if (ts.isCallExpression(node) && isFactoryCall(node)) {
+        objArg = firstObjectArg(node);
+      }
+      if (objArg) {
+        const fields = new Set();
+        collectTimeoutFields(objArg, 0, fields);
+        if (fields.size > 0) {
+          const type = constructedType(node, checker, program);
+          if (type) {
+            const set = byType.get(type) || new Set();
+            for (const f of fields) set.add(f);
+            byType.set(type, set);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  const constructions = [...byType.entries()]
+    .map(([type, fields]) => ({ type, fields: [...fields] }))
+    .sort((a, b) => a.type.localeCompare(b.type));
+  return {
+    packet_schema: PACKET_SCHEMA,
+    kind: 'repo_config',
+    snapshot_id: snapshot,
+    constructions,
+  };
 }
 
 function realOr(p) {
@@ -605,10 +755,14 @@ function main(argv) {
   if (args.retrieve) {
     const root = path.resolve(args.root);
     const snapshot = args.name || path.basename(root) || root;
-    const records = runRetrieve(root, snapshot, args.files);
+    const { records, repoConfig } = runRetrieve(root, snapshot, args.files);
     emit(records);
+    // One repo-scoped record per run, after the site packets. rvl_core's
+    // parse_stream keys on kind:"repo_config" to route it away from sites.
+    process.stdout.write(JSON.stringify(repoConfig) + '\n');
     process.stderr.write(
-      `${snapshot}: ${records.length} retrieved sites\n`,
+      `${snapshot}: ${records.length} retrieved sites, ` +
+        `${repoConfig.constructions.length} config constructions\n`,
     );
     return 0;
   }
@@ -629,6 +783,8 @@ module.exports = {
   STRONG_IO_METHODS,
   WEAK_IO_METHODS,
   NOISE_METHODS,
+  isTimeoutish,
+  collectTimeoutFields,
 };
 
 if (require.main === module) {
