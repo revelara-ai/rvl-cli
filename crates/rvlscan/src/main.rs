@@ -1,3 +1,6 @@
+use std::io::IsTerminal;
+mod render;
+
 use clap::{Parser, Subcommand};
 use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, SyncOutcome};
 use std::path::PathBuf;
@@ -29,6 +32,25 @@ enum Cmd {
         /// Write findings JSON here.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Color output: auto (default), always, or never. NO_COLOR is honored.
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Explain one finding as an evidence block: the sites it covers, the
+    /// control, and the fix. Takes the same inputs as `scan` plus the finding
+    /// id shown in the ladder (e.g. `rvlscan explain 2ben --retrieved ...`).
+    Explain {
+        /// The finding id from the ladder's `explain:` hint.
+        id: String,
+        #[arg(long)]
+        retrieved: PathBuf,
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        #[arg(long)]
+        judgments: Option<PathBuf>,
+        /// Color output: auto (default), always, or never. NO_COLOR is honored.
+        #[arg(long)]
+        color: Option<String>,
     },
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVLSCAN_OFFLINE=1 disables all fetches).
@@ -170,17 +192,63 @@ struct FindingOut {
     class: String,
 }
 
-/// The scan: packets + verified specs -> propagation -> triage. Deterministic,
-/// no model calls. Undecided outcomes stay undecided and are reported in the
-/// coverage section; they are never promoted to a violation.
-fn run_scan(
+/// Map triaged items to renderable findings. Incident-linkage fields
+/// (counts, control) are not yet populated — they arrive from the corpus/
+/// judgment layer — so they default to empty and the ladder degrades to
+/// severity + coverage until that data flows.
+fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding> {
+    items
+        .iter()
+        .map(|it| {
+            let ck = &it.class;
+            // The id must be unique per rendered class. ClassKey distinguishes
+            // by reason too (e.g. "no bound anywhere" vs "only phase bounds"),
+            // so the reason belongs in the id key or distinct classes collide.
+            let key = format!(
+                "{}.{}:{}:{}",
+                ck.client_type, ck.method, ck.scope, ck.reason
+            );
+            let short = ck.client_type.rsplit('/').next().unwrap_or(&ck.client_type);
+            render::Finding {
+                id: render::finding_id(&key),
+                site: it
+                    .example_sites
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("{} sites", it.site_count)),
+                description: format!("{}.{} \u{2014} {}", short, ck.method, ck.reason),
+                disposition: it.disposition.clone(),
+                severity: it.severity.clone(),
+                incident_count: 0,
+                critical_count: 0,
+                control: String::new(),
+                fix: it.fix.clone(),
+                site_count: it.site_count,
+                example_sites: it.example_sites.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The scan: packets + verified specs -> propagation -> triage.
+/// Deterministic, no model calls. Undecided outcomes are reported in the
+/// coverage section, never promoted to a violation.
+/// The deterministic core shared by `scan` and `explain`: load verified specs,
+/// parse packets, propagate, triage. Returns the raw findings (for --out and
+/// coverage) alongside the triaged items and a `verbose` cache-status line.
+/// `verbose` gates the one-line "sites | specs" summary so `explain` stays quiet.
+fn resolve_findings(
     store: &CacheStore,
     keyset: &Keyset,
     retrieved: &std::path::Path,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
-    out: Option<&std::path::Path>,
-) -> anyhow::Result<ExitCode> {
+    verbose: bool,
+) -> anyhow::Result<(
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+)> {
     let specs_text = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
@@ -219,30 +287,16 @@ fn run_scan(
     let served = cache.served_bound(&repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served);
 
-    println!(
-        "sites {} | specs {} | unparseable lines {skipped}",
-        sites.len(),
-        cache.len()
-    );
-
-    // Coverage: every outcome class reported, undecided included.
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for f in &findings {
-        *counts.entry(f.verdict.as_str()).or_insert(0) += 1;
+    if verbose {
+        println!(
+            "sites {} | specs {} | unparseable lines {skipped}",
+            sites.len(),
+            cache.len()
+        );
     }
-    let n = sites.len().max(1);
-    println!("\n{:<16} {:>6} {:>8}", "verdict", "n", "share");
-    for (k, v) in &counts {
-        println!("{k:<16} {v:>6} {:>7.1}%", 100.0 * *v as f64 / n as f64);
-    }
-    let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
-    println!(
-        "\ndecided {decided}/{} ({:.1}%) — undecided sites are reported, never counted as violations",
-        sites.len(),
-        100.0 * decided as f64 / n as f64
-    );
 
-    // Triage: collapse violations into reader-facing classes.
+    // Triage: collapse violations into reader-facing classes. Unjudged classes
+    // still surface; they are never dropped.
     let judgments: Vec<rvl_triage::ClassJudgment> = match judgments {
         Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
         None => Vec::new(),
@@ -252,15 +306,52 @@ fn run_scan(
         .map(|f| (f.site_id.clone(), f.verdict, f.reason.clone()))
         .collect();
     let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
-    if !items.is_empty() {
-        println!("\ntriaged items ({}):", items.len());
-        for it in items.iter().take(20) {
-            println!(
-                "  [{:<9}] {} {} — {} site(s)",
-                it.disposition, it.class.client_type, it.class.method, it.site_count
-            );
-        }
-    }
+    Ok((findings, items, sites))
+}
+
+/// Resolve the color decision, honoring `--color` then NO_COLOR and a non-tty
+/// stdout. An unrecognized `--color` value falls back to auto.
+fn stdout_color(mode: Option<&str>) -> bool {
+    let mode = match mode {
+        Some("always") => render::ColorMode::Always,
+        Some("never") => render::ColorMode::Never,
+        _ => render::ColorMode::Auto,
+    };
+    mode.resolve(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+fn run_scan(
+    store: &CacheStore,
+    keyset: &Keyset,
+    retrieved: &std::path::Path,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
+    let (findings, items, sites) =
+        resolve_findings(store, keyset, retrieved, specs_file, judgments, true)?;
+
+    let decided = findings.iter().filter(|f| f.verdict.is_decided()).count();
+    let unknown = findings
+        .iter()
+        .filter(|f| f.reason.starts_with("no spec"))
+        .count();
+    let coverage = render::Coverage {
+        decided,
+        total: sites.len(),
+        unknown,
+    };
+    let ladder_findings = triage_to_findings(&items);
+    let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
+    print!(
+        "{}",
+        render::render_ladder(&ladder_findings, coverage, &elapsed, stdout_color(color))
+    );
 
     if let Some(p) = out {
         let rows: Vec<FindingOut> = findings
@@ -277,6 +368,34 @@ fn run_scan(
         std::fs::write(p, serde_json::to_string_pretty(&rows)?)?;
         println!("\nwrote {}", p.display());
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_explain(
+    store: &CacheStore,
+    keyset: &Keyset,
+    id: &str,
+    retrieved: &std::path::Path,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    color: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let (_findings, items, _sites) =
+        resolve_findings(store, keyset, retrieved, specs_file, judgments, false)?;
+    let ladder_findings = triage_to_findings(&items);
+    let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
+        eprintln!(
+            "no finding with id '{id}' in this scan (ids are shown in the ladder's 'explain:' hint)"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+    // Named incident citations arrive from the corpus/judgment layer, which is
+    // not yet wired; until then explain shows the structural evidence it has.
+    let incidents: Vec<(String, bool, String)> = Vec::new();
+    print!(
+        "{}",
+        render::render_explain(f, &incidents, stdout_color(color))
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -297,6 +416,7 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file,
             judgments,
             out,
+            color,
         } => run_scan(
             &store,
             &keyset,
@@ -304,6 +424,22 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
             out.as_deref(),
+            color.as_deref(),
+        ),
+        Cmd::Explain {
+            id,
+            retrieved,
+            specs_file,
+            judgments,
+            color,
+        } => run_explain(
+            &store,
+            &keyset,
+            &id,
+            &retrieved,
+            specs_file.as_deref(),
+            judgments.as_deref(),
+            color.as_deref(),
         ),
         Cmd::Sync => {
             if !cfg.offline && cfg.org_key.is_empty() {
