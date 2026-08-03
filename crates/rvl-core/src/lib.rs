@@ -235,6 +235,17 @@ impl Site {
     pub fn id(&self) -> String {
         format!("{}:{}", self.file_path, self.line_number)
     }
+    /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
+    /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
+    /// put several distinct sites on one line -- so anything that rematches a
+    /// verdict back to its site (triage) must key on this, or it grabs the
+    /// wrong call and mislabels the finding. Mirrors `rvl_index::site_key`.
+    pub fn site_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.file_path, self.line_number, self.client_type, self.method
+        )
+    }
     pub fn api_key(&self) -> (String, String) {
         let t = if self.client_type.is_empty() {
             "?".to_string()
