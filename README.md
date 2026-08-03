@@ -62,18 +62,43 @@ The signed spec cache is used by default (run `rvlscan sync` to populate it).
 This is a Cargo workspace. The `rvlscan` binary lives in `crates/rvlscan`.
 
 ```sh
-cargo build
-cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+make build          # cargo build
+make test lint      # cargo test; clippy -D warnings
+make dev            # build + install helpers next to the binary
 ```
+
+`make dev` (or `make helpers`) builds `goindex` and copies `pyindex.py` into
+`target/<profile>/` next to the `rvlscan` binary, so a locally built
+`rvlscan scan <path>` resolves its retriever via the adjacent-to-binary
+discovery path with **no env var** — the same layout a release archive ships.
+On a gvm box with a mismatched `GOROOT`, override the Go invocation:
+`make helpers GO='env -u GOROOT go'`. Raw `cargo` still works for anything the
+Makefile does not wrap.
 
 ## Releases
 
 Releases are cut by pushing a v-prefixed semver tag (e.g. `v0.1.0`).
 [cargo-dist](https://github.com/axodotdev/cargo-dist) builds the release
 archives and publishes the Homebrew formula to `revelara-ai/homebrew-tap`.
-Helper binaries ship as pinned, checksummed release assets.
+
+### Shipping the retriever helpers
+
+For a released `rvlscan` to scan with zero configuration, each release archive
+must place the retriever helpers **next to the `rvlscan` binary** (the
+adjacent-to-binary discovery slot). Two helpers, two shapes:
+
+- **`pyindex.py`** is platform-independent (stdlib Python). It is added to
+  every archive verbatim; scanning Python requires `python3` on the user's
+  `PATH` at runtime.
+- **`goindex`** is a compiled Go binary and must be cross-compiled **per
+  target triple** (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, …) and
+  injected into the matching archive. cargo-dist does not build non-Rust
+  artifacts itself, so this is a release-CI build step (`GOOS`/`GOARCH` matrix
+  matching `dist-workspace.toml` `targets`) that emits `goindex` into each
+  archive's binary directory. **This CI wiring is not yet in place** — until
+  it is, released users fall back to `RVLSCAN_GOINDEX` / a `goindex` on `PATH`.
+  It must be validated against a real release (do not merge speculative release
+  changes; CI credits are limited).
 
 The spec-cache version is independent of the binary version and is not coupled
 to this repo's release CI.
