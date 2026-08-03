@@ -19,13 +19,24 @@ function run(...args) {
   return execFileSync('node', [TSINDEX, ...args], { encoding: 'utf8' });
 }
 
-function retrieveRecords(...extra) {
+function retrieveAll(...extra) {
   const out = run('--retrieve', '--root', FIXTURE_ROOT, ...extra);
   return out
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
     .map((l) => JSON.parse(l)); // throws if a line is not valid JSON
+}
+
+// Site packets only (the repo_config record is filtered out).
+function retrieveRecords(...extra) {
+  return retrieveAll(...extra).filter((r) => r.kind !== 'repo_config');
+}
+
+function repoConfig(...extra) {
+  const cfgs = retrieveAll(...extra).filter((r) => r.kind === 'repo_config');
+  assert.strictEqual(cfgs.length, 1, 'exactly one repo_config record per run');
+  return cfgs[0];
 }
 
 test('--packet-schema prints 1', () => {
@@ -144,7 +155,45 @@ test('--files restricts output to the listed file (exact path)', () => {
   for (const r of records) {
     assert.strictEqual(r.file_path, 'src/service.ts');
   }
-  // a non-existent file yields nothing (not an error, not everything).
-  const out = run('--retrieve', '--root', FIXTURE_ROOT, '--files', 'does_not_exist.ts');
-  assert.strictEqual(out.trim(), '');
+  // a non-existent file yields no SITES (not an error, not everything). The
+  // repo-scoped repo_config line is always emitted, so filter to site packets.
+  const sites = retrieveRecords('--files', 'does_not_exist.ts');
+  assert.strictEqual(sites.length, 0);
+});
+
+test('repo_config packet is emitted, well-formed, and repo-scoped', () => {
+  const cfg = repoConfig();
+  assert.strictEqual(cfg.kind, 'repo_config', 'kind must be the literal repo_config');
+  assert.strictEqual(cfg.packet_schema, 1);
+  assert.ok(cfg.snapshot_id, 'snapshot_id must be set');
+  assert.ok(Array.isArray(cfg.constructions), 'constructions must be an array');
+});
+
+test('repo_config records timeout-ish constructions and skips no-timeout ones', () => {
+  const cfg = repoConfig();
+  const byType = new Map(cfg.constructions.map((c) => [c.type, c.fields]));
+
+  // TypeORM DataSource with a NESTED extra.query_timeout, resolved to <pkg>.<Type>.
+  const ds = byType.get('typeorm.DataSource');
+  assert.ok(ds, `expected a typeorm.DataSource construction: ${JSON.stringify([...byType.keys()])}`);
+  assert.ok(ds.includes('query_timeout'), 'DataSource fields must include query_timeout');
+
+  // node-postgres Pool with a top-level connection timeout.
+  const pool = byType.get('pg.Pool');
+  assert.ok(pool, `expected a pg.Pool construction: ${JSON.stringify([...byType.keys()])}`);
+  assert.ok(
+    pool.includes('connectionTimeoutMillis'),
+    'pg.Pool fields must include connectionTimeoutMillis',
+  );
+
+  // The no-timeout `new Pool({})` must NOT add a bare field-less pg.Pool entry:
+  // pg.Pool is present only because a DIFFERENT construction set a timeout, and
+  // its fields never include an empty/no-timeout marker.
+  assert.ok(pool.length >= 1, 'a recorded construction always carries >=1 field');
+
+  // Each construction is exactly {type, fields}.
+  for (const c of cfg.constructions) {
+    assert.strictEqual(typeof c.type, 'string');
+    assert.ok(Array.isArray(c.fields) && c.fields.length >= 1);
+  }
 });

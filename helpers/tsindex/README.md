@@ -53,6 +53,56 @@ is a `receiver.method(...)` call. Every record carries:
 - `callers`, `callees` — **empty arrays in v1** (see below).
 - `lang` — `"typescript"`.
 
+## The `repo_config` record (one per run)
+
+In addition to the per-site packets, tsindex emits **exactly one** repo-scoped
+line, mirroring goindex's `RepoConfig`:
+
+    {"packet_schema":1,"kind":"repo_config","snapshot_id":"<name>",
+     "constructions":[{"type":"typeorm.DataSource","fields":["query_timeout"]}]}
+
+Its `kind` is the literal `"repo_config"`; `rvl_core::parse_stream` keys on that
+to route it away from the site stream. `constructions` is a **deduped** list of
+`{type, fields}`, one entry per distinct constructed client type that sets at
+least one timeout-ish field (fields are unioned across every construction of
+that type). The line is emitted **even when `constructions` is empty**.
+
+Why repo-scoped: a DI-injected pool/`DataSource` carries its `query_timeout` in
+a central module, nowhere near the call sites it governs, so per-site (even
+upward) retrieval can never reach it. This record carries the fact forward.
+
+**What it scans.** Object/config literals passed to a client CONSTRUCTION:
+`new X({...})` (TypeORM `DataSource`, node-postgres `Pool`, `ioredis` `Redis`,
+`MongoClient`, ...) and a small set of client FACTORIES (`axios.create`,
+`got.extend`, `createPool`, `createConnection`, `createClient`). The literal is
+scanned for timeout-ish property names, descending **one level** into a nested
+literal (TypeORM's `extra`, a dialect's `pool`). Timeout-ish is a
+case-insensitive substring match: `query_timeout`, `statement_timeout`,
+`maxQueryExecutionTime`, `connectionTimeoutMillis`, `connectTimeout`,
+`commandTimeout`, `requestTimeout`, `idleTimeoutMillis`, `socketTimeout`,
+`timeout`, `deadline`.
+
+**`type` resolution** reuses the site packets' package-identity resolver: the
+constructed type resolves to `<pkg>.<TypeName>` (`typeorm.DataSource`, `pg.Pool`,
+`axios.AxiosInstance`); when it cannot be attributed to an external package
+(a local subclass, an unresolved factory) it falls back to the
+constructor/factory identifier text (`GlobalWorkspaceDataSource`,
+`axios.create`).
+
+This is **retrieval only**: the record reports *which* type set *which* timeout
+fields — never whether that field actually bounds anything, and never the
+field's value. Detection is on field-name PRESENCE, so a dynamic
+`query_timeout: config.get('...')` is still recorded (the name is present even
+though the value is computed).
+
+**Detection limit.** Only an **inline** object-literal argument is scanned. A
+construction handed a pre-built options *variable* — `new DataSource(opts)`,
+where `opts` (and its `extra.query_timeout`) is a separate `const` — is not
+traced back to that variable, so its fields are missed. (In twenty, the
+`core.datasource.ts` `new DataSource(typeORMCoreModuleOptions as ...)` is missed
+for this reason, but the same `query_timeout` fact is still retrieved from the
+inline-literal `new GlobalWorkspaceDataSource({... extra: { query_timeout }})`.)
+
 ## Resolution engine: the TypeScript compiler API + TypeChecker
 
 Unlike Python, TypeScript ships a real type system, so tsindex uses the
