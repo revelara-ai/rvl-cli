@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod render;
 mod shared_config;
+mod waiver;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -63,6 +64,30 @@ enum Cmd {
         /// Color output: auto (default), always, or never. NO_COLOR is honored.
         #[arg(long)]
         color: Option<String>,
+    },
+    /// Waive a finding: append a rule waiver to `./.revelara.yaml` (under
+    /// `scanner.waivers`, the same list rvl-cli reads) so it no longer surfaces
+    /// as blocking/advisory. Takes the same inputs as `explain` plus the finding
+    /// id; the waived rule is the finding's class key `client_type.method`.
+    Suppress {
+        /// The finding id from the ladder's `explain:`/`suppress:` hint.
+        id: String,
+        /// Repo/dir to scan and where `.revelara.yaml` is written (default: cwd).
+        path: Option<PathBuf>,
+        /// Optional audit reason recorded on the waiver.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional `YYYY-MM-DD` expiry; after it the waiver is inert. Empty is
+        /// open-ended.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL).
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        #[arg(long)]
+        judgments: Option<PathBuf>,
     },
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVLSCAN_OFFLINE=1 disables all fetches).
@@ -264,6 +289,10 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                 fix: it.fix.clone(),
                 site_count: it.site_count,
                 example_sites: it.example_sites.clone(),
+                // The waiver key: the readable class key `client_type.method`.
+                // Matched against `.revelara.yaml` waivers; written by suppress.
+                class_rule: format!("{}.{}", ck.client_type, ck.method),
+                suppressed: false,
             }
         })
         .collect()
@@ -649,7 +678,21 @@ fn run_scan(
         total: sites.len(),
         unknown,
     };
-    let ladder_findings = triage_to_findings(&items);
+    let mut ladder_findings = triage_to_findings(&items);
+
+    // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
+    // used). A waived finding is folded into the Suppressed section: reported in
+    // the footer count, kept out of BLOCKING/ADVISORY. Missing config = no-op.
+    let waivers = waiver::load_waivers(&path.join(".revelara.yaml"));
+    if !waivers.is_empty() {
+        let today = rvl_cache::today_utc();
+        for f in &mut ladder_findings {
+            if waiver::is_waived(&f.class_rule, &f.site, &waivers, &today) {
+                f.suppressed = true;
+            }
+        }
+    }
+
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
         "{}",
@@ -705,6 +748,49 @@ fn run_explain(
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_suppress(
+    store: &CacheStore,
+    keyset: &Keyset,
+    id: &str,
+    path: &std::path::Path,
+    reason: Option<&str>,
+    expires: Option<&str>,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    // Re-run the same resolve -> triage pipeline explain uses so the id resolves
+    // to exactly the finding the user saw in the ladder.
+    let stream = resolve_packet_stream(retrieved, path)?;
+    let (_findings, items, _sites) =
+        resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
+    let ladder_findings = triage_to_findings(&items);
+    let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
+        eprintln!(
+            "no finding with id '{id}' in this scan (ids are shown in the ladder's 'explain:' hint)"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let w = waiver::Waiver {
+        rule: f.class_rule.clone(),
+        paths: vec![],
+        expires: expires.unwrap_or("").trim().to_string(),
+        reason: reason.unwrap_or("").trim().to_string(),
+    };
+    let file = path.join(".revelara.yaml");
+    waiver::append_waiver(&file, &w)?;
+
+    println!("waived rule `{}` (finding {})", f.class_rule, f.id);
+    if !w.expires.is_empty() {
+        println!("expires {}", w.expires);
+    }
+    println!("wrote {}", file.display());
+    println!("this waiver is a local file; commit .revelara.yaml so your team shares it via git");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -750,6 +836,25 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
             color.as_deref(),
+        ),
+        Cmd::Suppress {
+            id,
+            path,
+            reason,
+            expires,
+            retrieved,
+            specs_file,
+            judgments,
+        } => run_suppress(
+            &store,
+            &keyset,
+            &id,
+            &path.unwrap_or_else(|| PathBuf::from(".")),
+            reason.as_deref(),
+            expires.as_deref(),
+            retrieved.as_deref(),
+            specs_file.as_deref(),
+            judgments.as_deref(),
         ),
         Cmd::Sync => {
             if !cfg.offline && cfg.org_key.is_empty() {
