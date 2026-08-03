@@ -246,13 +246,22 @@ pub fn render_ladder(findings: &[Finding], cov: Coverage, elapsed: &str, color: 
     o
 }
 
+/// Provisional ranking for an unjudged finding: blast radius (how many sites
+/// the class hits) is the one severity signal available without a class judge.
+/// It is EXPOSURE, not criticality -- reported as such so the reader is never
+/// told a severity we didn't actually judge.
+fn exposure_tier(site_count: usize) -> &'static str {
+    if site_count >= 100 {
+        "high"
+    } else if site_count >= 10 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
 fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
     let _ = writeln!(o, "  {} \u{2014} {}", f.site, f.description);
-    let sev = if f.severity.is_empty() {
-        "unjudged".to_string()
-    } else {
-        f.severity.clone()
-    };
     let mut ev = String::new();
     if f.incident_count > 0 {
         ev = format!(
@@ -264,10 +273,23 @@ fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
             let _ = write!(ev, ", {} critical", f.critical_count);
         }
     }
-    let mut meta = format!("severity: {sev}{ev}");
-    if f.site_count > 1 {
-        let _ = write!(meta, "  \u{00b7} {} sites", f.site_count);
-    }
+    // A judged finding shows its severity; an unjudged one ranks by exposure
+    // (blast radius) and says plainly the severity is unrated -- honest about
+    // what the scanner knows vs. what a human review still owes it.
+    let meta = if f.severity.is_empty() {
+        let plural = if f.site_count == 1 { "" } else { "s" };
+        format!(
+            "exposure: {} \u{00b7} {} site{plural} \u{00b7} severity unrated{ev}",
+            exposure_tier(f.site_count),
+            f.site_count
+        )
+    } else {
+        let mut m = format!("severity: {}{ev}", f.severity);
+        if f.site_count > 1 {
+            let _ = write!(m, "  \u{00b7} {} sites", f.site_count);
+        }
+        m
+    };
     let _ = writeln!(o, "    {}", paint(&meta, "2", color));
     let mut tail = String::new();
     if !f.control.is_empty() {
