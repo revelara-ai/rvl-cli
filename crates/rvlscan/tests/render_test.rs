@@ -101,9 +101,12 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         f("hidden", "low", "low_value", 0),
     ];
     let cov = Coverage {
-        decided: 58,
+        resolved: 58,
         total: 59,
-        unknown: 1,
+        abstain_no_spec: 1,
+        abstain_bounds: 0,
+        abstain_judge: 0,
+        abstain_other: 0,
     };
     let out = render_ladder(&findings, cov, "0.4s (warm)", false);
 
@@ -111,10 +114,13 @@ fn ladder_groups_by_severity_with_blocked_footer() {
     assert!(out.contains("ADVISORY"), "advisory section present");
     assert!(out.contains("COVERAGE"), "coverage section present");
     assert!(
-        out.contains("58/59 API surfaces decided"),
-        "coverage counts shown"
+        out.contains("58/59 API surfaces resolved (98%)"),
+        "resolved counts + percent shown"
     );
-    assert!(out.contains("1 unknown queued"), "unknown surface reported");
+    assert!(
+        out.contains("1 abstain") && out.contains("1 no spec"),
+        "abstain breakdown reported"
+    );
     assert!(out.contains("blocked"), "footer says blocked");
     // low_value must not appear anywhere.
     assert!(
@@ -145,9 +151,12 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
     let out = render_ladder(
         &findings,
         Coverage {
-            decided: 5,
+            resolved: 5,
             total: 5,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         false,
@@ -174,9 +183,12 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
     let out = render_ladder(
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
-            decided: 1,
+            resolved: 1,
             total: 1,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         false,
@@ -194,9 +206,12 @@ fn ladder_with_no_blocking_says_commit_clean() {
     let out = render_ladder(
         &findings,
         Coverage {
-            decided: 10,
+            resolved: 10,
             total: 10,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         false,
@@ -210,9 +225,12 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let out = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
-            decided: 1,
+            resolved: 1,
             total: 1,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         false,
@@ -225,9 +243,12 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let colored = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
-            decided: 1,
+            resolved: 1,
             total: 1,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         true,
@@ -245,9 +266,12 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     let out = render_ladder(
         &[f("b", "high", "surface", 2)],
         Coverage {
-            decided: 1,
+            resolved: 1,
             total: 1,
-            unknown: 0,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
         },
         "0.1s",
         false,
