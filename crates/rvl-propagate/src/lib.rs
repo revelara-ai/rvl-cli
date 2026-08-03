@@ -87,7 +87,11 @@ pub fn propagate(
     site: &Site,
     specs: &SpecCache,
     served: &ServedBound,
-    client: &ServedBound,
+    // Repo-level client bound: computed and threaded, but NOT yet applied.
+    // Sound broadening requires family-scoping (po-3t3oj.30); until then only
+    // exact-type client-config matches satisfy. Kept in the signature so the
+    // family-scoped increment is a body change, not an API churn.
+    _client: &ServedBound,
 ) -> Finding {
     let id = site.id();
     let key = site.api_key();
@@ -121,7 +125,6 @@ pub fn propagate(
     let mut whole: Vec<String> = Vec::new();
     let mut phase: Vec<String> = Vec::new();
     let mut served_unresolved = false;
-    let mut client_unresolved = false;
 
     // AMBIENT mechanisms are checked for every blocking API, regardless of what
     // the spec lists. The distinction the first version missed: bounded_by
@@ -206,7 +209,6 @@ pub fn propagate(
                 _ => {}
             },
             Mechanism::ClientConfig => {
-                let before = whole.len() + phase.len();
                 // EXACT (a): the client is constructed at this site with a
                 // config the specs recognise.
                 for c in &site.client_construction {
@@ -236,23 +238,18 @@ pub fn propagate(
                         }
                     }
                 }
-                // GUARDED BROADENING (soundness pin, po-3t3oj.30): only when no
-                // exact bound was found for this call, and only when the repo
-                // has a SINGLE, unconflicted whole/phase this_client config for
-                // the DB family (client_bound == Agreed). Conflicting configs
-                // abstain to a human rather than guess which one governs.
-                if whole.len() + phase.len() == before {
-                    match client {
-                        ServedBound::Agreed(Bounds::WholeCall) => whole.push(
-                            "repo constructs its client with a single, unconflicted whole-call timeout".into(),
-                        ),
-                        ServedBound::Agreed(Bounds::PhaseOnly) => phase.push(
-                            "repo client config bounds only a phase".into(),
-                        ),
-                        ServedBound::Conflict(_) => client_unresolved = true,
-                        _ => {}
-                    }
-                }
+                // GUARDED BROADENING is DELIBERATELY DISABLED pending a
+                // family-scoped design. The repo-level `client_bound` is
+                // computed and threaded (`_client`), but applying a single
+                // whole-call config across ALL client_config calls is UNSOUND:
+                // a repo can construct several unrelated clients with timeouts
+                // (measured on immich: an ExifTool `taskTimeoutMillis` and a
+                // Kysely DB pool with NO timeout), and broadening the ExifTool
+                // bound to the DB queries is exactly the false negative the
+                // soundness pin forbids. Sound broadening must match the config
+                // to the call's client FAMILY; until that lands, only EXACT-type
+                // matches (above) satisfy, and everything else stays a finding
+                // for a human. See po-3t3oj.30 (family-scoped config lane).
             }
             _ => {}
         }
@@ -270,13 +267,6 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting server-config specs".into(),
-        };
-    }
-    if client_unresolved {
-        return Finding {
-            site_id: id,
-            verdict: Verdict::Abstain,
-            reason: "conflicting client-config specs".into(),
         };
     }
     // A phase-only bound is worse than no bound found, not better: it means the
@@ -386,23 +376,25 @@ mod tests {
     }
 
     #[test]
-    fn client_config_guarded_broadening_satisfies_on_agreed() {
-        // No exact config for THIS type, but the repo has a single, unconflicted
-        // whole-call this_client config (client == Agreed) -> broaden and satisfy.
+    fn repo_level_broadening_is_disabled_until_family_scoped() {
+        // SOUNDNESS: a repo-level whole-call client config must NOT satisfy a
+        // call whose exact type has no config. Global broadening would let one
+        // client's timeout (e.g. immich's ExifTool) mask another client's
+        // genuinely-unbounded calls (immich's DB) -- the false negative the
+        // pin forbids. Until family-scoping lands, this stays a Violation.
         let f = propagate(
             &site(),
             &cache(vec![Mechanism::ClientConfig], vec![]),
             &ServedBound::None,
             &ServedBound::Agreed(Bounds::WholeCall),
         );
-        assert_eq!(f.verdict, Verdict::Satisfies);
-        assert!(f.reason.contains("unconflicted"));
+        assert_eq!(f.verdict, Verdict::Violates);
     }
 
     #[test]
     fn client_config_with_no_bound_still_violates_the_soundness_guard() {
         // THE false-negative guard: a client_config-bounded call with no exact
-        // config AND no repo-level client bound must NOT be silently satisfied.
+        // config must NOT be silently satisfied.
         let f = propagate(
             &site(),
             &cache(vec![Mechanism::ClientConfig], vec![]),
@@ -410,19 +402,6 @@ mod tests {
             &ServedBound::None,
         );
         assert_eq!(f.verdict, Verdict::Violates);
-    }
-
-    #[test]
-    fn client_config_conflict_abstains_never_guesses() {
-        // Conflicting this_client configs -> abstain to a human, never a pass.
-        let f = propagate(
-            &site(),
-            &cache(vec![Mechanism::ClientConfig], vec![]),
-            &ServedBound::None,
-            &ServedBound::Conflict(vec!["a".into(), "b".into()]),
-        );
-        assert_eq!(f.verdict, Verdict::Abstain);
-        assert!(f.reason.contains("client-config"));
     }
 
     #[test]
