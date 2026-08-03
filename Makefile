@@ -43,16 +43,28 @@ install:
 	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
 	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
 	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
-	@echo "installed rvlscan + goindex + pyindex.py to $(BINDIR)"
-	@echo "  Go + Python scanning work out of the box (helpers are adjacent to the binary)."
-	@echo "  TypeScript needs its node deps, so until TS packaging (po-3t3oj.26):"
-	@echo "    RVLSCAN_TSINDEX=$(abspath helpers/tsindex/tsindex.js)  (run 'npm --prefix helpers/tsindex install' once)"
+	@# TypeScript: tsindex is a Node script needing `typescript`. Install
+	@# tsindex.js adjacent to the binary and put its `typescript` dep in
+	@# $(PREFIX)/node_modules, which Node resolves by walking up from BINDIR.
+	@# Zero-env once installed; skipped (Go/Python still work) if Node is absent.
+	@if command -v node >/dev/null 2>&1; then \
+	  npm --prefix helpers/tsindex install --no-audit --no-fund --silent >/dev/null 2>&1 || true; \
+	  install -m 0644 helpers/tsindex/tsindex.js "$(BINDIR)/tsindex.js"; \
+	  mkdir -p "$(PREFIX)/node_modules"; \
+	  cp -R helpers/tsindex/node_modules/typescript "$(PREFIX)/node_modules/"; \
+	  echo "installed rvlscan + goindex + pyindex.py + tsindex.js to $(BINDIR)"; \
+	  echo "  Go, Python, and TypeScript scanning all work with zero env."; \
+	else \
+	  echo "installed rvlscan + goindex + pyindex.py to $(BINDIR)"; \
+	  echo "  Go + Python work out of the box; TypeScript needs Node (install it, then re-run 'make install')."; \
+	fi
 	@case ":$$PATH:" in *":$(BINDIR):"*) : ;; *) echo "  NOTE: $(BINDIR) is not on your PATH — add it, then: rvlscan scan <path>";; esac
 
 ## uninstall: remove the installed binary + helpers from BINDIR
 uninstall:
-	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py"
-	@echo "removed rvlscan + goindex + pyindex.py from $(BINDIR)"
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
+	rm -rf "$(PREFIX)/node_modules/typescript"
+	@echo "removed rvlscan + goindex + pyindex.py + tsindex.js from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex next to the rvlscan binary
 helpers: build
