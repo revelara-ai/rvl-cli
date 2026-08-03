@@ -808,9 +808,14 @@ fn findings_from_sites(
         Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
         None => Vec::new(),
     };
+    // Key each verdict on the site's UNIQUE site_key (not the finding's
+    // file:line site_id, which collides on chained calls), so triage rematches
+    // it to the right call and labels the finding correctly (po-3t3oj.35).
+    // findings are index-aligned with sites (propagate_all maps 1:1).
     let verdict_rows: Vec<(String, rvl_core::Verdict, String)> = findings
         .iter()
-        .map(|f| (f.site_id.clone(), f.verdict, f.reason.clone()))
+        .zip(sites.iter())
+        .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
     let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
     Ok((findings, items, sites))

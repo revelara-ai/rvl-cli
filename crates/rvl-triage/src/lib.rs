@@ -90,20 +90,23 @@ pub fn triage(
     verdicts: &[(String, Verdict, String)], // (site_id, verdict, reason)
     judgments: &[ClassJudgment],
 ) -> Vec<TriagedItem> {
-    let by_id: BTreeMap<&str, &Site> = sites
+    // Keyed on site_key (file:line:client_type:method), NOT id() (file:line):
+    // chained calls share a line, so id() collides and a violate on `.execute`
+    // would be rematched to the `.select` site and mislabeled (po-3t3oj.35).
+    // The `verdicts` ids MUST therefore be site_keys, supplied by the caller.
+    let by_key: BTreeMap<&str, &Site> = sites
         .iter()
-        .map(|s| (Box::leak(s.id().into_boxed_str()) as &str, s))
+        .map(|s| (Box::leak(s.site_key().into_boxed_str()) as &str, s))
         .collect();
     let mut classes: BTreeMap<ClassKey, Vec<String>> = BTreeMap::new();
-    for (id, v, reason) in verdicts {
+    for (key, v, reason) in verdicts {
         if *v != Verdict::Violates {
             continue;
         }
-        if let Some(s) = by_id.get(id.as_str()) {
-            classes
-                .entry(class_of(s, reason))
-                .or_default()
-                .push(id.clone());
+        if let Some(s) = by_key.get(key.as_str()) {
+            // Store the readable `file:line` for example_sites; grouping is by
+            // the class derived from the correctly-matched site.
+            classes.entry(class_of(s, reason)).or_default().push(s.id());
         }
     }
 
@@ -160,7 +163,13 @@ mod tests {
             .collect();
         let verdicts: Vec<_> = sites
             .iter()
-            .map(|s| (s.id(), Verdict::Violates, "no bound anywhere".to_string()))
+            .map(|s| {
+                (
+                    s.site_key(),
+                    Verdict::Violates,
+                    "no bound anywhere".to_string(),
+                )
+            })
             .collect();
         let items = triage(&sites, &verdicts, &[]);
         assert_eq!(items.len(), 1, "50 instances of one shape are one item");
@@ -168,9 +177,40 @@ mod tests {
     }
 
     #[test]
+    fn chained_line_labels_the_violating_call_not_a_sibling() {
+        // Regression (po-3t3oj.35): `db.selectFrom(...).select(...).execute()`
+        // puts a not_applicable `.select` and a violating `.execute` on ONE
+        // line. Keyed on file:line the violate would be mislabeled `.select`;
+        // keyed on site_key it is correctly the `.execute`.
+        let sel = site("a/repo.ts", 10, "kysely.SelectQueryBuilder", "select");
+        let exec = site("a/repo.ts", 10, "kysely.SelectQueryBuilder", "execute");
+        let sites = vec![sel.clone(), exec.clone()];
+        // Only the .execute is a violate; the .select is not_applicable.
+        let verdicts = vec![
+            (
+                sel.site_key(),
+                Verdict::NotApplicable,
+                "does not block".into(),
+            ),
+            (
+                exec.site_key(),
+                Verdict::Violates,
+                "no bound anywhere".into(),
+            ),
+        ];
+        let items = triage(&sites, &verdicts, &[]);
+        assert_eq!(items.len(), 1, "one violate -> one item");
+        assert_eq!(
+            items[0].class.method, "execute",
+            "labels the violating call"
+        );
+        assert_eq!(items[0].class.client_type, "kysely.SelectQueryBuilder");
+    }
+
+    #[test]
     fn unjudged_classes_surface_rather_than_vanish() {
         let s = vec![site("a/f.go", 1, "db.Pool", "Query")];
-        let v = vec![(s[0].id(), Verdict::Violates, "no bound".to_string())];
+        let v = vec![(s[0].site_key(), Verdict::Violates, "no bound".to_string())];
         let items = triage(&s, &v, &[]);
         assert_eq!(
             items[0].disposition, "unjudged",
@@ -200,7 +240,7 @@ mod tests {
         ];
         let v: Vec<_> = s
             .iter()
-            .map(|x| (x.id(), Verdict::Violates, "no bound".to_string()))
+            .map(|x| (x.site_key(), Verdict::Violates, "no bound".to_string()))
             .collect();
         assert_eq!(triage(&s, &v, &[]).len(), 2);
     }
