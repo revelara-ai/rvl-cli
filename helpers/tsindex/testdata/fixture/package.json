@@ -1,0 +1,11 @@
+{
+  "name": "tsindex-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A small well-typed TS project exercising pg, axios, and ioredis client calls plus non-client noise, for tsindex tests.",
+  "devDependencies": {
+    "pg": "8.11.3",
+    "axios": "1.6.2",
+    "ioredis": "5.3.2"
+  }
+}

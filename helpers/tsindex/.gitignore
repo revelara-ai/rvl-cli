@@ -1,0 +1,3 @@
+# The helper's own typescript install (restored by `npm install`). The fixture
+# under testdata/fixture/node_modules is hand-written stubs and IS tracked.
+/node_modules

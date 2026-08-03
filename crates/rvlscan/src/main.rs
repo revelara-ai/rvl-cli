@@ -317,13 +317,14 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python) makes it a stable `BTreeMap` key, so a multi-language
-/// incremental retrieval runs helpers in the same deterministic order the
-/// single-command path documents.
+/// order Go < Python < TypeScript) makes it a stable `BTreeMap` key, so a
+/// multi-language incremental retrieval runs helpers in the same deterministic
+/// order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
+    TypeScript,
 }
 
 impl Lang {
@@ -332,6 +333,7 @@ impl Lang {
         match self {
             Lang::Go => "goindex",
             Lang::Python => "pyindex",
+            Lang::TypeScript => "tsindex",
         }
     }
     /// The env var that overrides helper discovery for this language.
@@ -339,6 +341,7 @@ impl Lang {
         match self {
             Lang::Go => "RVLSCAN_GOINDEX",
             Lang::Python => "RVLSCAN_PYINDEX",
+            Lang::TypeScript => "RVLSCAN_TSINDEX",
         }
     }
 }
@@ -348,16 +351,19 @@ impl std::fmt::Display for Lang {
         f.write_str(match self {
             Lang::Go => "Go",
             Lang::Python => "Python",
+            Lang::TypeScript => "TypeScript",
         })
     }
 }
 
-/// How a resolved helper is invoked. A Go helper (or a pyindex executable on
-/// PATH) runs directly; a pyindex `.py` script runs under `python3`.
+/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex
+/// executable on PATH) runs directly; a pyindex `.py` script runs under
+/// `python3`, and a tsindex `.js` script runs under `node`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
     Executable,
     PyScript,
+    NodeScript,
 }
 
 /// A helper located on disk, ready to be turned into a command.
@@ -370,16 +376,26 @@ struct ResolvedHelper {
 /// Directory names never worth descending into during language detection.
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "vendor", "__pycache__"];
 
+/// A TypeScript declaration file (`*.d.ts`) is types-only, not scannable source.
+/// Its extension is still `ts`, so it must be filtered by name, not extension.
+fn is_declaration_ts(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".d.ts"))
+}
+
 /// Detect which supported languages have source under `root`. Pure and
-/// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`) short-circuit,
-/// otherwise a walk that skips vendored/build dirs looks for `*.go` / `*.py`.
-/// Order is stable (Go before Python) so a multi-language repo runs its helpers
-/// in a deterministic order.
+/// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
+/// `tsconfig.json`) short-circuit, otherwise a walk that skips vendored/build
+/// dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`). Order is
+/// stable (Go, Python, TypeScript) so a multi-language repo runs its helpers in
+/// a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
-    if !(go && py) {
-        walk_for_sources(root, &mut go, &mut py);
+    let mut ts = root.join("tsconfig.json").is_file();
+    if !(go && py && ts) {
+        walk_for_sources(root, &mut go, &mut py, &mut ts);
     }
     let mut out = Vec::new();
     if go {
@@ -388,17 +404,20 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if py {
         out.push(Lang::Python);
     }
+    if ts {
+        out.push(Lang::TypeScript);
+    }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py` when a `.go`/`.py` file is seen, and
-/// stops early once both are found. Skips `.git`, `node_modules`, `target`,
-/// `vendor`, `__pycache__` so a big checkout does not turn detection into a
-/// full-tree crawl.
-fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool) {
+/// Bounded directory walk: sets `go`/`py`/`ts` when a `.go`/`.py`/`.ts`|`.tsx`
+/// (non-`.d.ts`) file is seen, and stops early once all three are found. Skips
+/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout
+/// does not turn detection into a full-tree crawl.
+fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py {
+        if *go && *py && *ts {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -412,9 +431,11 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool) {
                     stack.push(entry.path());
                 }
             } else if ft.is_file() {
-                match entry.path().extension().and_then(|e| e.to_str()) {
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
                     Some("go") => *go = true,
                     Some("py") => *py = true,
+                    Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
                     _ => {}
                 }
             }
@@ -424,14 +445,16 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool) {
 
 /// Classify a resolved helper path into how it must be invoked. Go helpers are
 /// always executables; a Python helper is a `python3` script when it ends in
-/// `.py`, otherwise an executable on PATH.
+/// `.py`, a TypeScript helper is a `node` script when it ends in `.js`,
+/// otherwise an executable on PATH.
 fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
+    let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
         Lang::Go => HelperKind::Executable,
-        Lang::Python if path.extension().and_then(|e| e.to_str()) == Some("py") => {
-            HelperKind::PyScript
-        }
+        Lang::Python if ext == Some("py") => HelperKind::PyScript,
         Lang::Python => HelperKind::Executable,
+        Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
+        Lang::TypeScript => HelperKind::Executable,
     };
     ResolvedHelper {
         path: path.to_path_buf(),
@@ -466,6 +489,13 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         return Ok(classify_helper(lang, &p));
     }
     let base = lang.helper_base();
+    // The scripted-helper filename to also look for, for a language whose helper
+    // ships as a script rather than a native binary (pyindex.py, tsindex.js).
+    let script_name = match lang {
+        Lang::Python => Some(format!("{base}.py")),
+        Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::Go => None,
+    };
     // (2) adjacent to the rvlscan binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -473,10 +503,10 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             if cand.is_file() {
                 return Ok(classify_helper(lang, &cand));
             }
-            if lang == Lang::Python {
-                let cand_py = dir.join(format!("{base}.py"));
-                if cand_py.is_file() {
-                    return Ok(classify_helper(lang, &cand_py));
+            if let Some(script) = &script_name {
+                let cand_script = dir.join(script);
+                if cand_script.is_file() {
+                    return Ok(classify_helper(lang, &cand_script));
                 }
             }
         }
@@ -485,8 +515,8 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     if let Some(found) = find_on_path(base) {
         return Ok(classify_helper(lang, &found));
     }
-    if lang == Lang::Python {
-        if let Some(found) = find_on_path("pyindex.py") {
+    if let Some(script) = &script_name {
+        if let Some(found) = find_on_path(script) {
             return Ok(classify_helper(lang, &found));
         }
     }
@@ -519,6 +549,10 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
     match helper.kind {
         HelperKind::Executable => std::iter::once(helper_path).chain(tail).collect(),
         HelperKind::PyScript => std::iter::once("python3".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::NodeScript => std::iter::once("node".to_string())
             .chain(std::iter::once(helper_path))
             .chain(tail)
             .collect(),
@@ -581,8 +615,10 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
                     stack.push(entry.path());
                 }
             } else if ft.is_file() {
-                match entry.path().extension().and_then(|e| e.to_str()) {
-                    Some("go") | Some("py") => out.push(entry.path()),
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("go" | "py") => out.push(path),
+                    Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
             }
@@ -604,11 +640,13 @@ fn repo_relative(root: &Path, file: &Path) -> String {
         .join("/")
 }
 
-/// The language whose helper retrieves a given source file, by extension.
+/// The language whose helper retrieves a given source file, by extension. A
+/// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
 fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
+        Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
         _ => None,
     }
 }
@@ -1461,6 +1499,32 @@ mod tests {
     }
 
     #[test]
+    fn detect_typescript_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    #[test]
+    fn detect_typescript_via_tsconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("tsconfig.json"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    #[test]
+    fn detect_tsx_counts_but_dts_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("component.tsx"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+
+        // A directory whose only TS file is a `.d.ts` is types-only: no helper.
+        let dts_only = tempfile::tempdir().unwrap();
+        touch(&dts_only.path().join("types.d.ts"));
+        assert!(detect_languages(dts_only.path()).is_empty());
+    }
+
+    #[test]
     fn detect_neither_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("README.md"));
@@ -1524,6 +1588,52 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    #[test]
+    fn ts_node_script_argv_runs_under_node() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/tsindex.js"),
+            kind: HelperKind::NodeScript,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "node",
+                "/opt/tsindex.js",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_typescript_js_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex.js")).kind,
+            HelperKind::NodeScript
+        );
+        assert_eq!(
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_ts_but_not_dts() {
+        assert_eq!(
+            lang_of_path(Path::new("svc/app.ts")),
+            Some(Lang::TypeScript)
+        );
+        assert_eq!(
+            lang_of_path(Path::new("svc/view.tsx")),
+            Some(Lang::TypeScript)
+        );
+        assert_eq!(lang_of_path(Path::new("svc/types.d.ts")), None);
     }
 
     #[test]
