@@ -320,6 +320,142 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
+// --- G2 server-entry lane (po-av01j.3) ---
+
+/// The hand-authored SEED server-spec corpus (RC-020/RC-069/RC-018); the
+/// production corpus rides the LLM factory.
+const SERVER_SPECS_SEED: &str = include_str!("testdata/server_specs_seed.json");
+
+/// One JSONL server-entry registration record for a fixture stream.
+fn server_entry_line(file: &str, line: u32, method: &str, snippet: &str) -> String {
+    serde_json::json!({
+        "snapshot_id": "fixture",
+        "file_path": file,
+        "line_number": line,
+        "func": method,
+        "client_type": "net/http.ServeMux",
+        "snippet": snippet,
+        "lang": "go",
+        "site_kind": "server_entry",
+    })
+    .to_string()
+}
+
+/// End-to-end: a `--retrieved` stream carrying server-entry registrations is
+/// judged by the G2 lane against the seed specs. A route surface with no
+/// health endpoint and no rate limiter surfaces RC-020 and RC-069 as ADVISORY
+/// findings; the server-entry records stay out of the G1 site count and out
+/// of the `--out` eval rows.
+#[test]
+fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        "HandleFunc",
+        r#"mux.HandleFunc("/users", usersHandler)"#,
+    ));
+    stream.push('\n');
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        11,
+        "HandleFunc",
+        r#"mux.HandleFunc("/orders", ordersHandler)"#,
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("RC-020"),
+        "missing health-endpoint violation must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-069"),
+        "missing rate-limiter violation must surface: {stdout}"
+    );
+    assert!(
+        !stdout.contains("RC-018"),
+        "RC-018 is a judgement control; absence must abstain, never surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("ADVISORY") && !stdout.contains("BLOCKING"),
+        "server-entry findings are advisory, never blocking: {stdout}"
+    );
+    // The G1 site count excludes server-entry records (2 fixture G1 sites),
+    // and the verbose line reports the server-entry inventory separately.
+    assert!(
+        stdout.contains("sites 2") && stdout.contains("server-entry 2"),
+        "server-entry records must not inflate the G1 site count: {stdout}"
+    );
+    // The --out eval rows are the G1 lane only.
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        2,
+        "server-entry records must not become eval rows: {rows}"
+    );
+}
+
+/// The healthy shape: a health route plus rate-limiting middleware satisfies
+/// RC-020/RC-069 and nothing from the server lane surfaces in the ladder.
+#[test]
+fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        "HandleFunc",
+        r#"mux.HandleFunc("/healthz", healthHandler)"#,
+    ));
+    stream.push('\n');
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        12,
+        "Use",
+        "r.Use(middleware.Throttle(100))",
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}");
+    assert!(
+        !stdout.contains("RC-020") && !stdout.contains("RC-069"),
+        "a satisfied server-entry control must not surface: {stdout}"
+    );
+}
+
 // --- incremental index surface (po-3t3oj.14) ---
 
 #[test]

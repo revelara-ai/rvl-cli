@@ -438,6 +438,49 @@ fn resolve_structure_findings(
         .unwrap_or_default()
 }
 
+// --- G2 server-entry lane (po-av01j.3) ---
+
+/// Map server-entry control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the lane's record); every one
+/// renders ADVISORY — a missing health endpoint or rate limiter is real
+/// exposure but not a commit-blocker, and limiting may live at a gateway the
+/// scanner cannot see. The waiver key is `server_entry.RC-XXX`, so
+/// `rvlscan suppress` and `.revelara.yaml` waivers work on these like any
+/// other finding.
+fn server_to_findings(
+    findings: &[rvl_propagate::server_entry::ServerEntryFinding],
+) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("server_entry.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f
+                    .evidence
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "server".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium severity + zero incident counts is the
+                // Advisory cell of render::classify, same as the structure
+                // lane: judged by the evaluator, so never "unjudged".
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
 // --- single-command scan: language detection + helper orchestration (po-3t3oj.25) ---
 //
 // Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
@@ -810,6 +853,16 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
     Ok(combined)
 }
 
+/// What the resolve -> propagate -> triage pipeline hands back: the G1
+/// findings and triaged items, the G1 sites they are index-aligned with, and
+/// the G2 server-entry lane's control findings (po-av01j.3).
+type PipelineOutput = (
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+    Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+);
+
 /// The scan: packets + verified specs -> propagation -> triage.
 /// Deterministic, no model calls. Undecided outcomes are reported in the
 /// coverage section, never promoted to a violation.
@@ -827,11 +880,7 @@ fn resolve_findings(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<PipelineOutput> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
         store,
@@ -861,11 +910,7 @@ fn findings_from_sites(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<PipelineOutput> {
     let specs_text = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
@@ -902,6 +947,14 @@ fn findings_from_sites(
         !sites.is_empty(),
         "no parseable sites in the retrieved packet stream"
     );
+    // G2 (po-av01j.3): server-entry records ride the same stream but are
+    // judged by their own lane. Partition them out BEFORE propagation so the
+    // G1 coverage numbers, the `--out` eval rows, and the shape-only report
+    // all stay client-call-only (server-entry surfaces are control-level spec
+    // questions, not API-spec mint candidates).
+    let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
+        .into_iter()
+        .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
@@ -919,6 +972,7 @@ fn findings_from_sites(
             let overlay = rvl_spec::SpecFile {
                 apis: vec![],
                 scopes: vec![],
+                server: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -937,10 +991,16 @@ fn findings_from_sites(
     let served = cache.served_bound(repo_cfg);
     let client = cache.client_bound_by_family(repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
+    let server_findings = rvl_propagate::server_entry::evaluate(&server_sites, &cache);
 
     if verbose {
+        let server_note = if server_sites.is_empty() {
+            String::new()
+        } else {
+            format!(" | server-entry {}", server_sites.len())
+        };
         println!(
-            "sites {} | specs {} | unparseable lines {skipped}",
+            "sites {}{server_note} | specs {} | unparseable lines {skipped}",
             sites.len(),
             cache.len()
         );
@@ -962,7 +1022,7 @@ fn findings_from_sites(
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
     let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
-    Ok((findings, items, sites))
+    Ok((findings, items, sites, server_findings))
 }
 
 // --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---
@@ -1106,7 +1166,7 @@ fn run_scan(
         );
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (findings, mut items, sites) = resolve_findings(
+    let (findings, mut items, sites, server) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1116,7 +1176,10 @@ fn run_scan(
         true,
     )?;
     items.extend(citems);
-    let structure = resolve_structure_findings(retrieved, &stream, path);
+    // Structure + server-entry lanes join the ladder at the same seam: both
+    // are control-mapped advisory findings outside the per-class triage.
+    let mut structure = resolve_structure_findings(retrieved, &stream, path);
+    structure.extend(server_to_findings(&server));
     render_scan_output(
         state_path, path, &findings, &items, &sites, &structure, out, color, start,
     )
@@ -1713,7 +1776,7 @@ fn run_scan_incremental(
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
-    let (findings, mut items, sites) = findings_from_sites(
+    let (findings, mut items, sites, server) = findings_from_sites(
         store,
         keyset,
         scan.sites,
@@ -1729,8 +1792,10 @@ fn run_scan_incremental(
     // scan rather than riding the packet index.
     items.extend(content_items(path));
     // Incremental scans own the live tree, so the structure lane inventories
-    // it directly (one bounded walk; there is no packet stream to ride).
-    let structure = resolve_structure_findings(None, "", path);
+    // it directly (one bounded walk; there is no packet stream to ride). The
+    // server-entry lane rode the packet index like every other site.
+    let mut structure = resolve_structure_findings(None, "", path);
+    structure.extend(server_to_findings(&server));
     render_scan_output(
         state_path, path, &findings, &items, &sites, &structure, out, color, start,
     )
@@ -1777,7 +1842,7 @@ fn run_explain(
         return Ok(ExitCode::SUCCESS);
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, mut items, _sites) = resolve_findings(
+    let (_findings, mut items, _sites, server) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1793,6 +1858,7 @@ fn run_explain(
     }
     let mut ladder_findings = triage_to_findings(&items);
     ladder_findings.extend(resolve_structure_findings(retrieved, &stream, path));
+    ladder_findings.extend(server_to_findings(&server));
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1838,7 +1904,7 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path)?;
-                let (_findings, mut items, _sites) = resolve_findings(
+                let (_findings, mut items, _sites, server) = resolve_findings(
                     store,
                     keyset,
                     &stream,
@@ -1853,6 +1919,7 @@ fn run_suppress(
                 }
                 let mut ladder_findings = triage_to_findings(&items);
                 ladder_findings.extend(resolve_structure_findings(retrieved, &stream, scan_path));
+                ladder_findings.extend(server_to_findings(&server));
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1919,7 +1986,10 @@ fn run_report(
         if let Some(note) = &scan.degraded_note {
             eprintln!("incremental: degraded (fail-open): {note}");
         }
-        let (findings, _items, sites) = findings_from_sites(
+        // Server-entry sites were partitioned out of `sites` inside the
+        // pipeline: they are control-level spec questions, never candidates
+        // for the shape-only API-surface report.
+        let (findings, _items, sites, _server) = findings_from_sites(
             store,
             keyset,
             scan.sites,
@@ -1933,7 +2003,7 @@ fn run_report(
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path)?;
-        let (findings, _items, sites) =
+        let (findings, _items, sites, _server) =
             resolve_findings(store, keyset, &stream, specs_file, None, Some(path), false)?;
         (findings, sites)
     };

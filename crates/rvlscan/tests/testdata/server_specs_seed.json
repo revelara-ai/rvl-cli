@@ -1,0 +1,57 @@
+{
+  "_comment": "SEED/test-grade server-entry spec corpus for the G2 lane (po-av01j.3). Hand-authored, sufficient for e2e tests only. The PRODUCTION corpus is authored through the LLM spec factory with human review; these seeds are deliberately small and conservative.",
+  "apis": [],
+  "configs": [],
+  "server": [
+    {
+      "control": "RC-020",
+      "kind": "health_path",
+      "patterns": [
+        "/health",
+        "/healthz",
+        "/health/live",
+        "/health/ready",
+        "/livez",
+        "/readyz",
+        "/ping",
+        "/heartbeat"
+      ],
+      "confidence": 0.9,
+      "rationale": "seed: route paths conventionally serving liveness/readiness probes"
+    },
+    {
+      "control": "RC-069",
+      "kind": "rate_limit_middleware",
+      "patterns": [
+        "ratelimit",
+        "rate-limit",
+        "rate_limit",
+        "limiter",
+        "throttle",
+        "tollbooth",
+        "slowapi",
+        "x/time/rate"
+      ],
+      "confidence": 0.9,
+      "rationale": "seed: middleware/handler identities of the mainstream rate-limiting libraries (express-rate-limit, chi Throttle, tollbooth, slowapi, flask-limiter)"
+    },
+    {
+      "control": "RC-018",
+      "kind": "degraded_response",
+      "patterns": [
+        "circuitbreaker",
+        "circuit_breaker",
+        "circuit-breaker",
+        "gobreaker",
+        "hystrix",
+        "fallback",
+        "loadshed",
+        "load_shed",
+        "toobusy",
+        "opossum"
+      ],
+      "confidence": 0.9,
+      "rationale": "seed: middleware/handler identities that provide a degraded-response path under overload or dependency failure"
+    }
+  ]
+}

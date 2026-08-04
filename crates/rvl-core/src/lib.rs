@@ -284,7 +284,21 @@ pub struct Site {
     /// for C/C++ (expansion locations); other languages emit false/absent.
     #[serde(default)]
     pub macro_expansion: bool,
+    /// Which KIND of site this record inventories. Empty (the default) is the
+    /// classic G1 client-call site every existing emitter produces, so v1/v2
+    /// G1 streams parse unchanged — an additive default-carrying field within
+    /// the v2 train, deliberately NOT a schema bump. G2+ emitters stamp their
+    /// own kind ([`SITE_KIND_SERVER_ENTRY`] for HTTP handler/route/middleware
+    /// registrations); each kind is judged by its own lane, and spec
+    /// applicability filters on this field so G1 specs never fire on a
+    /// server-entry site or vice versa.
+    #[serde(default)]
+    pub site_kind: String,
 }
+
+/// The `site_kind` a G2 server-entry record carries: an HTTP handler, route,
+/// or middleware-chain registration inventoried by a typed retriever.
+pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
 impl Site {
     pub fn id(&self) -> String {
@@ -600,6 +614,43 @@ mod tests {
             "a repo-scoped record must not become an empty Site"
         );
         assert_eq!(skipped, 0, "another record kind is not a parse failure");
+    }
+
+    #[test]
+    fn site_kind_survives_a_parse_serialize_round_trip() {
+        // G2 (po-av01j.3): server-entry sites ride the SAME Site stream,
+        // distinguished by the additive `site_kind` field. Losing it in
+        // transit (parse -> index -> reload) would silently demote a
+        // server-entry record back to a G1 call site.
+        let line = concat!(
+            r#"{"file_path":"routes.go","line_number":12,"func":"HandleFunc","#,
+            r#""client_type":"net/http.ServeMux","site_kind":"server_entry"}"#
+        );
+        let (sites, _, skipped) = parse_stream(line);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 1);
+        let back = serde_json::to_value(&sites[0]).unwrap();
+        assert_eq!(
+            back.get("site_kind").and_then(|v| v.as_str()),
+            Some("server_entry"),
+            "site_kind must survive the Site round trip"
+        );
+    }
+
+    #[test]
+    fn site_kind_defaults_to_the_g1_call_site() {
+        // Every v1/v2 record predating the field parses as a classic G1 call
+        // site: the empty default IS the G1 marker, so no schema bump is
+        // needed (additive default-carrying field within the v2 train).
+        let (sites, _, skipped) =
+            parse_stream(r#"{"file_path":"a.go","line_number":7,"func":"Query"}"#);
+        assert_eq!(skipped, 0);
+        let back = serde_json::to_value(&sites[0]).unwrap();
+        assert_eq!(
+            back.get("site_kind").and_then(|v| v.as_str()),
+            Some(""),
+            "a record predating the field must parse as a G1 call site"
+        );
     }
 
     #[test]

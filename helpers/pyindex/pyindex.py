@@ -111,6 +111,100 @@ def _is_io_method(method, resolved):
 
 
 # ---------------------------------------------------------------------------
+# G2 server-entry detection (po-av01j.3).
+#
+# Server-entry sites (HTTP handler registrations, route definitions,
+# middleware attachments) ride the SAME packet stream, distinguished by the
+# additive `site_kind` field. Detection is deliberately conservative: a
+# registration is emitted only when the receiver RESOLVES (via imports /
+# assignments) to a known framework type, or the called name resolves to a
+# django.urls function -- an unresolved `app.get(...)` could as easily be an
+# HTTP client, so it abstains from this lane rather than guessing.
+# ---------------------------------------------------------------------------
+
+# Mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+SITE_KIND_SERVER_ENTRY = "server_entry"
+
+# Framework types whose route/middleware methods register server entries.
+_SERVER_TYPES = frozenset({
+    "flask.Flask", "flask.Blueprint", "fastapi.FastAPI", "fastapi.APIRouter",
+})
+
+# Route-registration verbs on those types (flask app.route / add_url_rule,
+# FastAPI's per-verb decorators and router mounting surface).
+_SERVER_ROUTE_METHODS = frozenset({
+    "route", "get", "post", "put", "delete", "patch", "options", "head",
+    "api_route", "add_api_route", "add_url_rule", "websocket",
+})
+
+# Middleware-chain attachment verbs on those types.
+_SERVER_MIDDLEWARE_METHODS = frozenset({
+    "add_middleware", "middleware", "before_request", "after_request",
+    "include_router",
+})
+
+# django URL-configuration functions, matched by their import-resolved dotted
+# names (a local helper named `path` never matches).
+_DJANGO_URL_FUNCS = frozenset({
+    "django.urls.path", "django.urls.re_path", "django.conf.urls.url",
+})
+
+
+def _server_entry_target(target, idx):
+    """(client_type, method) when `target` -- the callable expression of a call
+    or decorator -- is a server-entry registration surface, else None."""
+    if isinstance(target, ast.Attribute):
+        method = target.attr
+        if (method not in _SERVER_ROUTE_METHODS
+                and method not in _SERVER_MIDDLEWARE_METHODS):
+            return None
+        client_type, resolved = idx.resolve_receiver(target.value)
+        if resolved and client_type in _SERVER_TYPES:
+            return client_type, method
+        return None
+    if isinstance(target, ast.Name):
+        dotted = idx.imports.get(target.id)
+        if dotted in _DJANGO_URL_FUNCS:
+            mod, name = dotted.rsplit(".", 1)
+            return mod, name
+    return None
+
+
+def _server_entry_record(snapshot, file_path, line, symbol, method, client_type,
+                         receiver, snippet, body, const_args):
+    """One server-entry packet. Same shape as a G1 record plus the site_kind
+    stamp; the route path (a literal in the mainstream frameworks) rides the
+    existing const_args machinery."""
+    return {
+        "packet_schema": PACKET_SCHEMA,
+        "site_key": "",  # stamped in emit()
+        "snapshot_id": snapshot,
+        "file_path": file_path,
+        "line_number": line,
+        "symbol": symbol,
+        "func": method,
+        "receiver": receiver,
+        "client_type": client_type,
+        "snippet": snippet,
+        "enclosing_function_body": body,
+        "callers": [],
+        "callees": [],
+        "client_construction": [],
+        "const_args": const_args,
+        "macro_expansion": False,
+        "site_kind": SITE_KIND_SERVER_ENTRY,
+        "provenance": {
+            "client_type_resolved": True,
+            "callers_total": 0,
+            "callers_included": 0,
+            "callees_total": 0,
+            "callees_included": 0,
+        },
+        "lang": "python",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Expression rendering
 # ---------------------------------------------------------------------------
 
@@ -390,10 +484,52 @@ def retrieve_file(abs_path, file_path, snapshot):
     enclosing = _enclosing_functions(tree)
 
     out = []
+    # G2 pre-pass: decorator registrations. @app.route("/x") / @api.get("/y")
+    # attach the route to the DECORATED handler, so the record's symbol is the
+    # handler and its enclosing body is the handler's source. Registered
+    # decorator Call nodes are skipped by the main walk below, or @api.get
+    # would ALSO emit as a G1 client call (get is a weak I/O verb on a
+    # resolved receiver).
+    decorator_nodes = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            call = dec if isinstance(dec, ast.Call) else None
+            target = call.func if call is not None else dec
+            se = _server_entry_target(target, idx)
+            if se is None:
+                continue
+            decorator_nodes.add(id(dec))
+            client_type, method = se
+            recv = target.value if isinstance(target, ast.Attribute) else None
+            out.append(_server_entry_record(
+                snapshot, file_path, dec.lineno, node.name, method, client_type,
+                expr_to_str(recv) if recv is not None else "",
+                _segment(source, dec), _segment(source, node),
+                _const_args(call, idx) if call is not None else []))
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        if id(node) in decorator_nodes:
+            continue  # already emitted as a decorator registration
         func = node.func
+        # G2 call-form registrations: app.add_middleware(...), app.add_url_rule,
+        # api.include_router(...), django's path()/re_path()/url(). Checked
+        # BEFORE the G1 gate so a registration never emits as a client call.
+        se = _server_entry_target(func, idx)
+        if se is not None:
+            client_type, method = se
+            func_name, func_node = enclosing.get(id(node), ("", None))
+            recv = func.value if isinstance(func, ast.Attribute) else None
+            out.append(_server_entry_record(
+                snapshot, file_path, node.lineno, func_name, method, client_type,
+                expr_to_str(recv) if recv is not None else "",
+                _segment(source, node),
+                _segment(source, func_node) if func_node is not None else "",
+                _const_args(node, idx)))
+            continue
         if not isinstance(func, ast.Attribute):
             # only receiver.method(...) shapes are call sites
             continue

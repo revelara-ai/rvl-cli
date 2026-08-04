@@ -16,6 +16,8 @@ use rvl_spec::{
 };
 use std::collections::HashMap;
 
+pub mod server_entry;
+
 /// Evidence of a bound, and how much of the call it covers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finding {
@@ -107,6 +109,21 @@ pub fn propagate(
     client: &HashMap<Family, ServedBound>,
 ) -> Finding {
     let id = site.id();
+    // Spec applicability filters on site_kind (po-av01j.3): this lane judges
+    // CLIENT-CALL sites only. A server-entry (or any future G2+ kind) record
+    // rides the same stream but is judged by its own lane; letting a G1
+    // blocking spec fire on it would score a route registration as an
+    // unbounded call, and vice versa.
+    if !site.site_kind.is_empty() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "site_kind {} is judged by its own lane, not the client-call lane",
+                site.site_kind
+            ),
+        };
+    }
     let key = site.api_key();
     let spec = specs.api(&key);
 
@@ -377,6 +394,7 @@ mod tests {
             }],
             configs,
             scopes: vec![],
+            server: vec![],
         })
     }
 
@@ -388,6 +406,28 @@ mod tests {
             client_type: "db.Pool".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_server_entry_site_is_never_judged_by_the_client_call_lane() {
+        // G2 (po-av01j.3): even with a G1 spec keyed to the same (type,
+        // method), a server-entry registration is not a blocking-call
+        // question. It reports NotApplicable here and is judged by the
+        // server-entry lane instead.
+        let mut s = site();
+        s.site_kind = rvl_core::SITE_KIND_SERVER_ENTRY.into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable);
+        assert!(
+            f.reason.contains("server_entry"),
+            "the reason must name the kind that was routed away: {}",
+            f.reason
+        );
     }
 
     #[test]
@@ -443,6 +483,7 @@ mod tests {
             }],
             configs: vec![],
             scopes: vec![],
+            server: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -821,6 +862,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
+            server: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(

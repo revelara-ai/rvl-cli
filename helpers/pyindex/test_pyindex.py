@@ -152,6 +152,64 @@ class TestRetrievedPackets(unittest.TestCase):
         cached = next(r for r in records if r["symbol"] == "cached_lookup")
         self.assertEqual(cached["const_args"], [])
 
+    def test_server_entry_registrations_are_inventoried(self):
+        """G2 (po-av01j.3): flask/fastapi/django registrations emit as sites
+        stamped site_kind server_entry, with the framework identity as
+        client_type and the route path riding const_args. They never ALSO
+        emit as G1 client calls."""
+        records = _retrieve_records()
+        entries = [r for r in records if r.get("site_kind") == "server_entry"]
+        g1 = [r for r in records if not r.get("site_kind")]
+        self.assertTrue(g1, "G1 sites must still be emitted alongside entries")
+
+        by_ct = {}
+        for e in entries:
+            by_ct.setdefault(e["client_type"], []).append(e)
+        # flask app + blueprint routes, decorator form.
+        flask_routes = by_ct.get("flask.Flask", [])
+        self.assertTrue(any(e["func"] == "route" and e["symbol"] == "healthz"
+                            for e in flask_routes),
+                        "expected @app.route('/healthz'): {}".format(entries))
+        self.assertTrue(any(e["func"] == "route" for e in
+                            by_ct.get("flask.Blueprint", [])),
+                        "expected @bp.route('/users')")
+        # The path literal rides const_args.
+        healthz = next(e for e in flask_routes
+                       if e["func"] == "route" and e["symbol"] == "healthz")
+        self.assertTrue(any(a["value"] == "'/healthz'"
+                            for a in healthz["const_args"]),
+                        healthz["const_args"])
+        # fastapi verb decorator + middleware forms.
+        fastapi_entries = by_ct.get("fastapi.FastAPI", [])
+        self.assertTrue(any(e["func"] == "get" and e["symbol"] == "orders"
+                            for e in fastapi_entries),
+                        "expected @api.get('/orders')")
+        for mw in ("middleware", "add_middleware", "include_router"):
+            self.assertTrue(any(e["func"] == mw for e in fastapi_entries),
+                            "expected a fastapi {} registration".format(mw))
+        # flask bare-attribute middleware decorator + call-form url rule.
+        self.assertTrue(any(e["func"] == "before_request"
+                            for e in flask_routes),
+                        "expected @app.before_request")
+        self.assertTrue(any(e["func"] == "add_url_rule"
+                            for e in flask_routes),
+                        "expected app.add_url_rule('/legacy')")
+        # django path()/re_path() by import-resolved name.
+        django = by_ct.get("django.urls", [])
+        self.assertTrue(any(e["func"] == "path" for e in django),
+                        "expected a django path() registration")
+        self.assertTrue(any(e["func"] == "re_path" for e in django),
+                        "expected a django re_path() registration")
+
+        # The registrations never leak into the G1 lane: no G1 record calls a
+        # route/middleware verb on a server framework type.
+        for r in g1:
+            self.assertNotIn(r["client_type"],
+                             {"flask.Flask", "flask.Blueprint",
+                              "fastapi.FastAPI", "fastapi.APIRouter",
+                              "django.urls"},
+                             "server registration leaked into G1: {}".format(r))
+
     def test_files_filter_is_exact_path(self):
         # the incremental path emits only the listed file
         records = _retrieve_records("--files", "svc.py")

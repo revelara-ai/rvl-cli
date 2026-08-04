@@ -188,6 +188,57 @@ test('non-client noise is not emitted', () => {
   }
 });
 
+test('server-entry registrations are inventoried and never leak into G1', () => {
+  // G2 (po-av01j.3): express route/middleware registrations and NestJS route
+  // decorators emit as site_kind "server_entry" with the framework identity
+  // as client_type and the route path riding const_args.
+  const records = retrieveRecords();
+  const entries = records.filter((r) => r.site_kind === 'server_entry');
+  const g1 = records.filter((r) => !r.site_kind);
+  assert.ok(g1.length >= 1, 'G1 sites must still be emitted alongside entries');
+
+  // express app.get('/healthz', ...) on a resolved express.Express receiver.
+  const health = entries.find(
+    (r) => r.client_type === 'express.Express' && r.func === 'get',
+  );
+  assert.ok(health, `expected the app.get healthz entry: ${JSON.stringify(entries)}`);
+  assert.ok(
+    health.const_args.some((a) => a.value.includes('/healthz')),
+    `route path must ride const_args: ${JSON.stringify(health.const_args)}`,
+  );
+  assert.strictEqual(health.packet_schema, 2);
+  assert.ok(health.site_key, 'site_key must be stamped on server entries');
+
+  // express middleware attachment + a Router-typed registration.
+  assert.ok(
+    entries.some((r) => r.client_type === 'express.Express' && r.func === 'use'),
+    'expected the app.use middleware attachment',
+  );
+  assert.ok(
+    entries.some((r) => r.client_type === 'express.Router' && r.func === 'post'),
+    'expected the router.post registration',
+  );
+
+  // NestJS route decorator, attributed to @nestjs/common with the decorated
+  // method as the symbol.
+  const nest = entries.find((r) => r.client_type === '@nestjs/common.Get');
+  assert.ok(nest, 'expected the @Get route decorator entry');
+  assert.strictEqual(nest.symbol, 'list');
+  assert.ok(nest.const_args.some((a) => a.value.includes('/orders')));
+
+  // The registrations never ALSO emit as G1 client calls.
+  for (const r of g1) {
+    const isServerType =
+      r.client_type.startsWith('express.') ||
+      r.client_type.startsWith('@nestjs/common.');
+    const verb = r.func.toLowerCase();
+    assert.ok(
+      !(isServerType && (verb === 'get' || verb === 'post' || verb === 'use')),
+      `server registration leaked into G1: ${JSON.stringify(r)}`,
+    );
+  }
+});
+
 test('--files restricts output to the listed file (exact path)', () => {
   const records = retrieveRecords('--files', 'src/service.ts');
   assert.ok(records.length >= 1);
