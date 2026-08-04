@@ -695,14 +695,44 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
   return rec;
 }
 
+// Write a string to fd 1 (stdout) SYNCHRONOUSLY and completely. process.exit()
+// discards whatever process.stdout.write() has buffered, and on a PIPE (how
+// rvlscan captures the helper via std::process .output()) large writes buffer
+// heavily -- so an async write + process.exit truncates the tail
+// nondeterministically (po-3t3oj.37: identical scans returned 14k/5k/2k/463
+// sites). A blocking fd write with an EAGAIN retry loop cannot be truncated:
+// it does not return until the pipe has taken every byte.
+function writeStdoutSync(str) {
+  const buf = Buffer.from(str, 'utf8');
+  let off = 0;
+  while (off < buf.length) {
+    try {
+      off += fs.writeSync(1, buf, off, buf.length - off);
+    } catch (e) {
+      if (e.code === 'EAGAIN') continue; // pipe momentarily full; retry
+      throw e;
+    }
+  }
+}
+
 function emit(records, out) {
-  const w = out || process.stdout;
+  if (out) {
+    // File-stream sink (in-process test harness): its own drain is awaited.
+    for (const rec of records) {
+      rec.packet_schema = PACKET_SCHEMA;
+      rec.site_key = siteKey(rec);
+      out.write(JSON.stringify(rec));
+      out.write('\n');
+    }
+    return;
+  }
+  const lines = [];
   for (const rec of records) {
     rec.packet_schema = PACKET_SCHEMA;
     rec.site_key = siteKey(rec);
-    w.write(JSON.stringify(rec));
-    w.write('\n');
+    lines.push(JSON.stringify(rec));
   }
+  if (lines.length) writeStdoutSync(lines.join('\n') + '\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -748,7 +778,7 @@ function main(argv) {
 
   // Let a consumer negotiate the contract before paying for a load.
   if (args.packetSchema) {
-    process.stdout.write(String(PACKET_SCHEMA) + '\n');
+    writeStdoutSync(String(PACKET_SCHEMA) + '\n');
     return 0;
   }
 
@@ -759,7 +789,7 @@ function main(argv) {
     emit(records);
     // One repo-scoped record per run, after the site packets. rvl_core's
     // parse_stream keys on kind:"repo_config" to route it away from sites.
-    process.stdout.write(JSON.stringify(repoConfig) + '\n');
+    writeStdoutSync(JSON.stringify(repoConfig) + '\n');
     process.stderr.write(
       `${snapshot}: ${records.length} retrieved sites, ` +
         `${repoConfig.constructions.length} config constructions\n`,
