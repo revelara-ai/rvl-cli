@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rvlscan",
     "crates/rvl-cache",
+    "crates/rvl-content",
     "crates/rvl-triage",
     "crates/rvl-index",
     "crates/rvl-core",
@@ -24,6 +25,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"

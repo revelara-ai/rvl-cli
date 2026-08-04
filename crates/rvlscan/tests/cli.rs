@@ -252,6 +252,74 @@ fn scan_without_retrieved_on_empty_dir_fails_with_guidance() {
     );
 }
 
+// --- G5 content lane: secrets, RC-043 (po-av01j.6) ---
+
+/// End-to-end: a repo with NO Go/Py/TS source but a planted (fake) token gets
+/// a content-lane scan: the ladder names the `secret.<rule>` class, maps it to
+/// RC-043, never prints the raw token, and blocks. A `.revelara.yaml` waiver
+/// with the class matcher (the po-3t3oj.27 engine, unchanged) suppresses it.
+#[test]
+fn scan_detects_planted_secret_and_waiver_suppresses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "content-only scan must succeed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "ladder must name the secret class: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-043"),
+        "finding must be born control-mapped: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&token),
+        "the raw secret must never render: {stdout}"
+    );
+    assert!(
+        stdout.contains("BLOCKING"),
+        "a live token in runtime scope must block: {stdout}"
+    );
+
+    // Waive the class and re-scan: suppressed, not blocking.
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n",
+    )
+    .unwrap();
+    let out2 = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout2 = String::from_utf8(out2.stdout).unwrap();
+    assert!(out2.status.success(), "waived scan must succeed: {stdout2}");
+    assert!(
+        !stdout2.contains("BLOCKING"),
+        "a waived finding must not block: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("suppressed"),
+        "footer must report the suppression: {stdout2}"
+    );
+}
+
 // --- incremental index surface (po-3t3oj.14) ---
 
 #[test]

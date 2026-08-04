@@ -337,7 +337,7 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                 severity: it.severity.clone(),
                 incident_count: 0,
                 critical_count: 0,
-                control: String::new(),
+                control: it.control.clone(),
                 fix: it.fix.clone(),
                 site_count: it.site_count,
                 example_sites: it.example_sites.clone(),
@@ -877,6 +877,90 @@ fn findings_from_sites(
     Ok((findings, items, sites))
 }
 
+// --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---
+//
+// A pure-Rust in-process lane (crates/rvl-content), not an external helper:
+// content-pattern scanning needs no language toolchain, so the helper model's
+// per-target packaging cost buys nothing here. Content findings ride the same
+// packet schema (`client_type` "secret", `method` = rule id, snippet = masked
+// preview ONLY) and the same triage/waiver/render machinery, but they are kept
+// OUT of the spec-lane plumbing on purpose: never in coverage totals (they are
+// not API surfaces), never in `--out` eval rows (the eval harness scores spec
+// verdicts), and never in the shape-only report (their sites carry file paths,
+// which the report contract forbids).
+
+/// The control every content-lane secret finding maps to: RC-043, centralized
+/// secret management. The judgment layer owns control mapping; the content
+/// lane's judgments are built in, so its findings are born mapped.
+const SECRETS_CONTROL: &str = "RC-043";
+
+/// Fix guidance, from RC-043's remediation: an exposed secret is compromised
+/// the moment it is committed, so rotation is part of the fix, not an option.
+const SECRETS_FIX: &str = "remove the secret from source, rotate it immediately, and load it \
+     from a centralized secret manager (RC-043)";
+
+/// Built-in class judgments for content findings, one per rule x scope class.
+/// Token shapes are high severity (blocking) everywhere except test support,
+/// where a planted fixture credential is the common case; the generic entropy
+/// rule stays medium (advisory) everywhere because shape alone is weak
+/// evidence. `verdict` is always `surface`: a matched secret is never spam.
+fn content_judgments(findings: &[rvl_content::ContentFinding]) -> Vec<rvl_triage::ClassJudgment> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for f in findings {
+        if !seen.insert((f.rule_id.clone(), f.severity.clone())) {
+            continue;
+        }
+        for scope in [
+            "runtime",
+            "migration",
+            "test_support",
+            "dev_only",
+            "backfill",
+        ] {
+            let severity = if scope == "test_support" || f.severity != "high" {
+                "medium"
+            } else {
+                "high"
+            };
+            out.push(rvl_triage::ClassJudgment {
+                api: format!("secret.{}", f.rule_id),
+                scope: scope.to_string(),
+                verdict: "surface".to_string(),
+                severity: severity.to_string(),
+                fix: SECRETS_FIX.to_string(),
+                control: SECRETS_CONTROL.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Run the content lane over `path` and triage its findings into ladder items.
+/// Verdicts are pre-decided (`Violates`): a content-pattern match IS the
+/// evidence, there is no spec question to propagate. The waiver key downstream
+/// is the class rule `secret.<rule_id>`, so `rvlscan suppress` and hand-written
+/// `.revelara.yaml` waivers work unchanged (po-3t3oj.27).
+fn content_items(path: &Path) -> Vec<rvl_triage::TriagedItem> {
+    let findings = rvl_content::scan_root(path);
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let sites = rvl_content::to_sites(&findings, &snapshot_name(path));
+    let rows: Vec<(String, rvl_core::Verdict, String)> = sites
+        .iter()
+        .zip(findings.iter())
+        .map(|(s, f)| {
+            (
+                s.site_key(),
+                rvl_core::Verdict::Violates,
+                f.description.clone(),
+            )
+        })
+        .collect();
+    rvl_triage::triage(&sites, &rows, &content_judgments(&findings))
+}
+
 /// Resolve the color decision, honoring `--color` then NO_COLOR and a non-tty
 /// stdout. An unrecognized `--color` value falls back to auto.
 fn stdout_color(mode: Option<&str>) -> bool {
@@ -904,8 +988,24 @@ fn run_scan(
     color: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+    // Content lane first: it is language-agnostic, so it must not depend on
+    // the language pipeline having anything to do. With `--retrieved` the scan
+    // is an escape-hatch replay of a prebuilt stream, possibly from another
+    // tree entirely, so scanning PATH's content would mix two repos: skip.
+    let citems = if retrieved.is_none() {
+        content_items(path)
+    } else {
+        Vec::new()
+    };
+    // A repo with no supported languages but WITH content findings (an
+    // .env/terraform tree) still gets a scan: the ladder is the content lane
+    // alone and coverage reports zero API surfaces. Without content findings
+    // the original fail-closed guidance stands.
+    if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
+        return render_scan_output(state_path, path, &[], &citems, &[], out, color, start);
+    }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (findings, items, sites) = resolve_findings(
+    let (findings, mut items, sites) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -914,6 +1014,7 @@ fn run_scan(
         Some(path),
         true,
     )?;
+    items.extend(citems);
     render_scan_output(
         state_path, path, &findings, &items, &sites, out, color, start,
     )
@@ -1506,7 +1607,7 @@ fn run_scan_incremental(
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
-    let (findings, items, sites) = findings_from_sites(
+    let (findings, mut items, sites) = findings_from_sites(
         store,
         keyset,
         scan.sites,
@@ -1517,6 +1618,10 @@ fn run_scan_incremental(
         Some(path),
         true,
     )?;
+    // The content lane is cheap (one regex pass over the tree) and its rules
+    // change with the binary, not the sources, so it runs FULL on every warm
+    // scan rather than riding the packet index.
+    items.extend(content_items(path));
     render_scan_output(
         state_path, path, &findings, &items, &sites, out, color, start,
     )
@@ -1563,7 +1668,7 @@ fn run_explain(
         return Ok(ExitCode::SUCCESS);
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, items, _sites) = resolve_findings(
+    let (_findings, mut items, _sites) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1572,6 +1677,11 @@ fn run_explain(
         Some(path),
         false,
     )?;
+    // Mirror the scan's content lane so a `secret.*` finding id resolves in
+    // the live fallback too (skipped for --retrieved, same as scan).
+    if retrieved.is_none() {
+        items.extend(content_items(path));
+    }
     let ladder_findings = triage_to_findings(&items);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
@@ -1618,7 +1728,7 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path)?;
-                let (_findings, items, _sites) = resolve_findings(
+                let (_findings, mut items, _sites) = resolve_findings(
                     store,
                     keyset,
                     &stream,
@@ -1627,6 +1737,10 @@ fn run_suppress(
                     Some(scan_path),
                     false,
                 )?;
+                // Same content-lane mirror as explain's live fallback.
+                if retrieved.is_none() {
+                    items.extend(content_items(scan_path));
+                }
                 let ladder_findings = triage_to_findings(&items);
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(

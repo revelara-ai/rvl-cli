@@ -1,0 +1,17 @@
+[package]
+name = "rvl-content"
+description = "G5 content-pattern retriever: language-agnostic secret detection (RC-043)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+regex = { workspace = true }
+rvl-core = { path = "../rvl-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
