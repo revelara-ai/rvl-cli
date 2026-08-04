@@ -182,8 +182,9 @@ type RetrievedSite struct {
 	// no macros, so always false here; C/C++ retrievers set it mechanically
 	// from expansion locations.
 	MacroExpansion bool `json:"macro_expansion"`
-	// SiteKind marks what KIND of surface this is: empty for the classic G1
-	// client call site, "background_job" for a G3 scheduler/queue
+	// SiteKind distinguishes what this record inventories. Empty = classic G1
+	// client-call site; "server_entry" = an HTTP handler/route/middleware
+	// registration (G2, po-av01j.3); "background_job" = a G3 scheduler/queue
 	// registration or worker-loop entry (po-av01j.4). Additive
 	// default-carrying field within the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
@@ -228,6 +229,107 @@ func jobFrameworkType(callee *types.Func) string {
 		}
 	}
 	return ""
+}
+
+// siteKindServerEntry mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+const siteKindServerEntry = "server_entry"
+
+// serverEntryFrameworks maps a framework router TYPE (version-normalized, see
+// normalizeVersionedType) to the registration methods that inventory a
+// server-entry point on it. RETRIEVAL, not judgement: the table names the
+// mainstream framework surfaces the type information can identify
+// mechanically; an unknown router type abstains (no emission) rather than
+// guessing. Middleware attachment verbs (Use, Mount, Route) ride the same
+// table — the evaluator downstream distinguishes them by method name.
+var serverEntryFrameworks = map[string]map[string]bool{
+	"net/http.ServeMux": {"Handle": true, "HandleFunc": true},
+	"github.com/gorilla/mux.Router": {
+		"Handle": true, "HandleFunc": true, "Use": true,
+	},
+	"github.com/gin-gonic/gin.Engine": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Handle": true, "Use": true,
+	},
+	"github.com/gin-gonic/gin.RouterGroup": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Handle": true, "Use": true,
+	},
+	"github.com/labstack/echo.Echo": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Add": true, "Use": true,
+	},
+	"github.com/labstack/echo.Group": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Add": true, "Use": true,
+	},
+	"github.com/go-chi/chi.Mux": {
+		"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+		"Head": true, "Options": true, "Handle": true, "HandleFunc": true,
+		"Method": true, "MethodFunc": true, "Use": true, "Route": true, "Mount": true,
+	},
+	"github.com/go-chi/chi.Router": {
+		"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+		"Head": true, "Options": true, "Handle": true, "HandleFunc": true,
+		"Method": true, "MethodFunc": true, "Use": true, "Route": true, "Mount": true,
+	},
+}
+
+// Package-level registration functions (no receiver type to resolve), keyed
+// by the type checker's FullName.
+var serverEntryPkgFuncs = map[string]string{
+	"net/http.Handle":     "net/http",
+	"net/http.HandleFunc": "net/http",
+}
+
+// normalizeVersionedType strips a Go-modules major-version segment from a
+// type string's package path ("github.com/go-chi/chi/v5.Mux" ->
+// "github.com/go-chi/chi.Mux") so one table row covers every major version.
+func normalizeVersionedType(t string) string {
+	dot := strings.LastIndex(t, ".")
+	if dot < 0 {
+		return t
+	}
+	pkg, name := t[:dot], t[dot+1:]
+	if slash := strings.LastIndex(pkg, "/"); slash >= 0 {
+		last := pkg[slash+1:]
+		if len(last) >= 2 && last[0] == 'v' && isAllDigits(last[1:]) {
+			pkg = pkg[:slash]
+		}
+	}
+	return pkg + "." + name
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// serverEntryClientType reports whether a selector call is a server-entry
+// registration the table recognizes, and the framework identity to stamp as
+// client_type. Resolution is fully typed: a receiver whose type does not
+// resolve to a known router type abstains, never guesses.
+func serverEntryClientType(info *types.Info, sel *ast.SelectorExpr, callee *types.Func) (string, bool) {
+	if callee == nil {
+		return "", false
+	}
+	if ct, ok := serverEntryPkgFuncs[callee.FullName()]; ok {
+		return ct, true
+	}
+	t := info.TypeOf(sel.X)
+	if t == nil {
+		return "", false
+	}
+	typeStr := strings.TrimPrefix(t.String(), "*")
+	methods, known := serverEntryFrameworks[normalizeVersionedType(typeStr)]
+	if !known || !methods[callee.Name()] {
+		return "", false
+	}
+	return typeStr, true
+
 }
 
 type srcIndex struct {
@@ -653,6 +755,26 @@ func runRetrieve(root, name string) []RetrievedSite {
 						return true
 					}
 					callee, _ := info.Uses[sel.Sel].(*types.Func)
+					// G2 server-entry registrations are checked FIRST: chi's
+					// r.Get would otherwise collide with the G1 ioMethods
+					// gate and emit a route registration as a client call. A
+					// matched registration emits one server_entry record and
+					// never a G1 site.
+					if ct, isServer := serverEntryClientType(info, sel, callee); isServer {
+						file, line := rel(p, c)
+						out = append(out, RetrievedSite{
+							Snapshot: name, File: file, Line: line,
+							Symbol: fd.Name.Name, Method: callee.Name(),
+							Receiver:   exprString(sel.X),
+							ClientType: ct,
+							CallSite:   src.text(p, c, c),
+							Enclosing:  src.text(p, fd, fd),
+							ConstArgs:  constArgs(info, c),
+							SiteKind:   siteKindServerEntry,
+							Prov:       Provenance{ClientTypeKnown: true},
+						})
+						return true
+					}
 					if callee == nil {
 						return true
 					}

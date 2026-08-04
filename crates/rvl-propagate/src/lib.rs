@@ -16,6 +16,8 @@ use rvl_spec::{
 };
 use std::collections::HashMap;
 
+pub mod server_entry;
+
 /// Evidence of a bound, and how much of the call it covers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finding {
@@ -107,8 +109,38 @@ pub fn propagate(
     client: &HashMap<Family, ServedBound>,
 ) -> Finding {
     let id = site.id();
+    // Site kinds with their OWN lane are never a client-call question: a
+    // server-entry registration (po-av01j.3) is judged by the server-entry
+    // lane even when a G1 spec is keyed to the same (type, method) — scoring
+    // a route registration as an unbounded call would be a category error.
+    // Kinds that RIDE this lane's judgment machinery (background_job,
+    // po-av01j.4) fall through to the applicability gate below instead.
+    if site.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "site_kind {} is judged by its own lane, not the client-call lane",
+                site.site_kind
+            ),
+        };
+    }
     let key = site.api_key();
     let spec = specs.api(&key);
+
+    // Any other kinded site WITHOUT a client-call spec is likewise not this
+    // lane's question; with a spec it reaches the applicability gate, so a
+    // spec declaring job-altitude coverage flows through ordinary judgment.
+    if !site.site_kind.is_empty() && spec.is_none() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "site_kind {} is judged by its own lane, not the client-call lane",
+                site.site_kind
+            ),
+        };
+    }
 
     // Applicability by site kind (G3, po-av01j.4). A spec governs only the
     // site kinds it declares (empty = the classic G1 call site), so a
@@ -400,6 +432,7 @@ mod tests {
             configs,
             scopes: vec![],
             config_keys: vec![],
+            server: vec![],
         })
     }
 
@@ -432,6 +465,7 @@ mod tests {
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
+            server: vec![],
         })
     }
 
@@ -544,9 +578,32 @@ mod tests {
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
+            server: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn a_server_entry_site_is_never_judged_by_the_client_call_lane() {
+        // G2 (po-av01j.3): even with a G1 spec keyed to the same (type,
+        // method), a server-entry registration is not a blocking-call
+        // question. It reports NotApplicable here and is judged by the
+        // server-entry lane instead.
+        let mut s = site();
+        s.site_kind = rvl_core::SITE_KIND_SERVER_ENTRY.into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable);
+        assert!(
+            f.reason.contains("server_entry"),
+            "the reason must name the kind that was routed away: {}",
+            f.reason
+        );
     }
 
     #[test]
@@ -604,6 +661,7 @@ mod tests {
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
+            server: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -984,6 +1042,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
+            server: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(

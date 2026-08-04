@@ -149,6 +149,48 @@ function isJobCtor(clientType) {
   return JOB_CTOR_TYPES.some((e) => clientType === e.pkg + '.' + e.type);
 }
 
+// G2 server-entry detection (po-av01j.3).
+//
+// Server-entry sites (HTTP handler registrations, route definitions,
+// middleware attachments) ride the SAME packet stream, distinguished by the
+// additive `site_kind` field. Detection is deliberately conservative and
+// TYPED: a registration is emitted only when the receiver RESOLVES to a type
+// from a known server framework package (express, fastify), or a route
+// decorator's identifier resolves to @nestjs/common. An unresolved
+// `app.get(...)` could as easily be an HTTP client, so it abstains from this
+// lane (and falls through to the ordinary G1 rules).
+// ---------------------------------------------------------------------------
+
+// Mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+const SITE_KIND_SERVER_ENTRY = 'server_entry';
+
+// npm packages whose resolved types are server frameworks.
+const SERVER_PACKAGES = new Set(['express', 'fastify']);
+
+// Route-registration verbs on a server framework receiver (lowercased).
+const SERVER_ROUTE_METHODS = new Set([
+  'get', 'post', 'put', 'delete', 'patch', 'options', 'head', 'all', 'route',
+]);
+
+// Middleware-chain attachment verbs on a server framework receiver
+// (lowercased; `register`/`addhook` are fastify's plugin/hook surface).
+const SERVER_MIDDLEWARE_METHODS = new Set(['use', 'register', 'addhook']);
+
+// NestJS route decorators, matched by name AND by the identifier resolving to
+// @nestjs/common (a local helper named Get never matches).
+const NEST_ROUTE_DECORATORS = new Set([
+  'Get', 'Post', 'Put', 'Delete', 'Patch', 'Options', 'Head', 'All',
+]);
+
+// isServerFrameworkType reports whether a resolved `<pkg>.<Type>` client type
+// belongs to a known server framework package.
+function isServerFrameworkType(clientType) {
+  const i = clientType.lastIndexOf('.');
+  if (i < 0) return false;
+  return SERVER_PACKAGES.has(clientType.slice(0, i));
+
+}
+
 const NOISE_METHODS = new Set([
   // chainable / promise
   'then', 'catch', 'finally',
@@ -623,6 +665,10 @@ function runRetrieve(root, snapshot, filesArg) {
         // G3: some constructions ARE handler registrations (bullmq Worker).
         const rec = jobSiteFromNew(node, sf, relPath, snapshot, checker, program);
         if (rec) records.push(rec);
+      } else if (ts.isMethodDeclaration(node)) {
+        // G2: NestJS route decorators register the decorated class method.
+        records.push(...nestRouteRecords(node, sf, relPath, snapshot, checker));
+
       }
       ts.forEachChild(node, visit);
     };
@@ -779,6 +825,48 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     program,
   );
 
+  // G2 server-entry registrations are checked FIRST: `app.get('/x', h)` on a
+  // resolved express receiver would otherwise emit as a G1 client call. A
+  // matched registration emits one server_entry record and never a G1 site.
+  if (resolved && isServerFrameworkType(clientType)) {
+    const lower = method.toLowerCase();
+    if (SERVER_ROUTE_METHODS.has(lower) || SERVER_MIDDLEWARE_METHODS.has(lower)) {
+      const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+      const enc = enclosingFunction(node);
+      return {
+        packet_schema: PACKET_SCHEMA,
+        site_key: '', // stamped in emit()
+        snapshot_id: snapshot,
+        file_path: relPath,
+        line_number: line + 1,
+        symbol: enc.name,
+        func: method,
+        receiver: receiver.getText(),
+        client_type: clientType,
+        client_version: version,
+        snippet: cap(node.getText()),
+        enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
+        callers: [],
+        callees: [],
+        // The route path (a literal in the mainstream frameworks) rides the
+        // existing const_args machinery.
+        const_args: constArgsOf(node, checker),
+        macro_expansion: false,
+        client_construction: [],
+        site_kind: SITE_KIND_SERVER_ENTRY,
+        provenance: {
+          client_type_resolved: true,
+          confidence_tier: 'high',
+          callers_total: 0,
+          callers_included: 0,
+          callees_total: 0,
+          callees_included: 0,
+        },
+        lang: 'typescript',
+      };
+    }
+  }
+
   // Emission decision (documented in the header):
   //   * a resolved external client emits regardless of method name, unless the
   //     method is obvious non-I/O noise (.then/.map/.on/...);
@@ -886,6 +974,71 @@ function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
     },
     lang: 'typescript',
   };
+}
+
+// nestRouteRecords emits one server-entry record per NestJS route decorator
+// (`@Get('/x')`) on a class method. Conservative and typed: the decorator's
+// identifier must RESOLVE to @nestjs/common through its import binding; a
+// same-named local decorator abstains. The record's symbol is the decorated
+// handler method; the route path rides const_args like every other literal.
+function nestRouteRecords(node, sf, relPath, snapshot, checker) {
+  const out = [];
+  const decorators =
+    typeof ts.canHaveDecorators === 'function' && ts.canHaveDecorators(node)
+      ? ts.getDecorators(node)
+      : node.decorators;
+  if (!decorators) return out;
+  for (const dec of decorators) {
+    const expr = dec.expression;
+    if (!ts.isCallExpression(expr) || !ts.isIdentifier(expr.expression)) {
+      continue;
+    }
+    const name = expr.expression.text;
+    if (!NEST_ROUTE_DECORATORS.has(name)) continue;
+    let sym;
+    try {
+      sym = checker.getSymbolAtLocation(expr.expression);
+    } catch (_e) {
+      sym = undefined;
+    }
+    const imp = packageFromImport(sym);
+    if (!imp || imp.pkg !== '@nestjs/common') continue;
+    const { line } = sf.getLineAndCharacterOfPosition(dec.getStart());
+    out.push({
+      packet_schema: PACKET_SCHEMA,
+      site_key: '', // stamped in emit()
+      snapshot_id: snapshot,
+      file_path: relPath,
+      line_number: line + 1,
+      symbol:
+        node.name && typeof node.name.getText === 'function'
+          ? node.name.getText()
+          : '',
+      func: name,
+      receiver: '',
+      client_type: '@nestjs/common.' + name,
+      client_version: '',
+      snippet: cap(dec.getText()),
+      enclosing_function_body: cap(node.getText()),
+      callers: [],
+      callees: [],
+      const_args: constArgsOf(expr, checker),
+      macro_expansion: false,
+      client_construction: [],
+      site_kind: SITE_KIND_SERVER_ENTRY,
+      provenance: {
+        client_type_resolved: true,
+        confidence_tier: 'high',
+        callers_total: 0,
+        callers_included: 0,
+        callees_total: 0,
+        callees_included: 0,
+      },
+      lang: 'typescript',
+    });
+  }
+  return out;
+
 }
 
 // Write a string to fd 1 (stdout) SYNCHRONOUSLY and completely. process.exit()

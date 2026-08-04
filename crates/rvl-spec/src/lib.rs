@@ -280,6 +280,44 @@ pub struct ConfigKeySpec {
     pub fix: String,
 }
 
+/// The `kind` of a [`ServerSpec`]: route paths that count as a health-check
+/// endpoint (RC-020).
+pub const SERVER_KIND_HEALTH_PATH: &str = "health_path";
+/// The `kind` of a [`ServerSpec`]: middleware/handler identities that
+/// rate-limit (RC-069).
+pub const SERVER_KIND_RATE_LIMIT: &str = "rate_limit_middleware";
+/// The `kind` of a [`ServerSpec`]: middleware/handler identities that provide
+/// a degraded-response path (RC-018, the G2 half).
+pub const SERVER_KIND_DEGRADED_RESPONSE: &str = "degraded_response";
+
+/// A spec for a control that rides the G2 server-entry lane (po-av01j.3).
+///
+/// Unlike an [`ApiSpec`] (a question about one API), a server spec carries the
+/// JUDGEMENT patterns the server-entry evaluator matches against the
+/// inventoried registrations: which route paths count as a health endpoint,
+/// which middleware identities rate-limit, which provide degraded responses.
+/// The retrievers stay neutral — they inventory registrations; what a path or
+/// identity MEANS lives here, factory-authored like every other spec.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerSpec {
+    /// Control code this spec serves ("RC-020" | "RC-069" | "RC-018").
+    pub control: String,
+    /// What the patterns match (`SERVER_KIND_*`). A string, not an enum, so a
+    /// future factory adding a kind degrades to an ignored spec rather than a
+    /// cache-wide parse failure.
+    #[serde(default)]
+    pub kind: String,
+    /// Case-insensitive match targets: route paths for `health_path`,
+    /// identity substrings for the middleware kinds.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpecFile {
     #[serde(default)]
@@ -293,6 +331,10 @@ pub struct SpecFile {
     /// fields), so the envelope schema version does not move.
     #[serde(default)]
     pub config_keys: Vec<ConfigKeySpec>,
+    /// G2 server-entry control specs. Defaults empty: every cache predating
+    /// the lane still loads, and the evaluator abstains without specs.
+    #[serde(default)]
+    pub server: Vec<ServerSpec>,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -313,6 +355,7 @@ pub struct SpecCache {
     configs: HashMap<String, ConfigSpec>,
     scopes: HashMap<String, ScopeSpec>,
     config_keys: HashMap<(String, String), ConfigKeySpec>,
+    server: Vec<ServerSpec>,
 }
 
 impl SpecCache {
@@ -335,7 +378,18 @@ impl SpecCache {
         for s in f.config_keys {
             c.config_keys.insert((s.format.clone(), s.key.clone()), s);
         }
+        c.server = f.server;
         c
+    }
+
+    /// The usable G2 server-entry specs: everything at or above the
+    /// confidence floor. A shaky server spec is ignored entirely — it applies
+    /// to every registration in the repo at once, the same multiplier that
+    /// set [`MIN_CONFIDENCE`].
+    pub fn server_specs(&self) -> impl Iterator<Item = &ServerSpec> {
+        self.server
+            .iter()
+            .filter(|s| s.confidence >= MIN_CONFIDENCE)
     }
 
     /// True when the control does not govern this scope. Absent or
@@ -359,7 +413,11 @@ impl SpecCache {
         self.config_keys.get(&(format.to_string(), key.to_string()))
     }
     pub fn len(&self) -> usize {
-        self.apis.len() + self.configs.len() + self.scopes.len() + self.config_keys.len()
+        self.apis.len()
+            + self.configs.len()
+            + self.scopes.len()
+            + self.config_keys.len()
+            + self.server.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -391,6 +449,17 @@ impl SpecCache {
                 _ => {
                     self.config_keys.insert(k, v);
                 }
+            }
+        }
+        for v in other.server {
+            match self
+                .server
+                .iter_mut()
+                .find(|s| s.control == v.control && s.kind == v.kind)
+            {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.server.push(v),
             }
         }
     }
@@ -561,6 +630,7 @@ mod tests {
             scopes: vec![],
             apis: vec![],
             config_keys: vec![],
+            server: vec![],
             configs: specs
                 .into_iter()
                 .map(|(t, b, s, c)| ConfigSpec {
@@ -650,6 +720,7 @@ mod tests {
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
             config_keys: vec![],
+            server: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -658,6 +729,7 @@ mod tests {
             apis: vec![better],
             configs: vec![],
             config_keys: vec![],
+            server: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -791,6 +863,38 @@ mod tests {
             !both.applies_to("server_entry"),
             "undeclared kinds stay out"
         );
+    }
+
+    #[test]
+    fn server_specs_ride_the_spec_file_and_low_confidence_ones_are_ignored() {
+        // G2 (po-av01j.3): the controls that ride the server-entry lane
+        // (RC-020 health checks, RC-069 rate limiting, RC-018 degraded
+        // response) are spec-driven like everything else. A spec below the
+        // confidence floor decides nothing — spec error is multiplied.
+        let text = r#"{
+            "apis": [], "configs": [],
+            "server": [
+                {"control":"RC-020","kind":"health_path",
+                 "patterns":["/healthz","/health"],
+                 "confidence":0.9,"rationale":"seed"},
+                {"control":"RC-069","kind":"rate_limit_middleware",
+                 "patterns":["ratelimit"],
+                 "confidence":0.3,"rationale":"too shaky to apply"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).unwrap();
+        let usable: Vec<_> = cache.server_specs().collect();
+        assert_eq!(usable.len(), 1, "the 0.3-confidence spec must be ignored");
+        assert_eq!(usable[0].control, "RC-020");
+        assert_eq!(usable[0].kind, SERVER_KIND_HEALTH_PATH);
+        assert_eq!(usable[0].patterns, vec!["/healthz", "/health"]);
+    }
+
+    #[test]
+    fn a_spec_file_without_a_server_section_still_loads() {
+        // Every production cache today predates the section; it must default.
+        let cache = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert_eq!(cache.server_specs().count(), 0);
     }
 
     #[test]
