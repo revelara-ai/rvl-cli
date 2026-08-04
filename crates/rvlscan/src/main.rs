@@ -140,6 +140,39 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    /// Install the Revelara workflow skills and lenses (the /rvl:scan lens
+    /// set, CAST/STPA interrogatory workflows, assessment skills) into your
+    /// coding-agent harness. Download-only: content is fetched from the
+    /// Revelara API, verified, and cached; nothing leaves this machine.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// Install skills into a harness. With no name, installs into every
+    /// detected harness (Claude Code first).
+    Install {
+        /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
+        harness: Option<String>,
+        /// Stage files but do not run the harness's plugin registration
+        /// commands (Claude Code); they are printed for manual use instead.
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Update installed skills to the served version. With no name, updates
+    /// every harness recorded by a previous install.
+    Update {
+        /// Harness name; defaults to everything previously installed.
+        harness: Option<String>,
+        /// Stage files but do not run registration commands (Claude Code).
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Show installed, cached, and served skill versions (drift report).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1891,6 +1924,251 @@ fn render_report_human(report: &report::Report) -> String {
     s
 }
 
+// --- skills distribution: install workflow skills/lenses into harnesses (po-av01j.14) ---
+
+/// Is `binary` a file on PATH? Used only to decide between running the
+/// Claude Code registration commands and printing them for manual use.
+fn binary_on_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|d| d.join(binary).is_file())
+}
+
+/// Print a registration's commands in copy-pasteable form.
+fn print_registration_commands(reg: &rvl_skills::harness::Registration) {
+    for argv in &reg.commands {
+        println!("  {} {}", reg.binary, argv.join(" "));
+    }
+}
+
+/// Run the harness registration commands (e.g. `claude plugin marketplace
+/// add`). The first command is cleanup and may fail harmlessly; any later
+/// failure falls back to printing the remaining commands for manual use.
+fn run_registration(reg: &rvl_skills::harness::Registration) {
+    for (i, argv) in reg.commands.iter().enumerate() {
+        let result = std::process::Command::new(reg.binary).args(argv).output();
+        let ok = match &result {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+        if ok || i == 0 {
+            continue; // cleanup (i == 0) is best-effort: nothing to remove is fine
+        }
+        let detail = match result {
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        eprintln!(
+            "registration step '{} {}' failed: {detail}",
+            reg.binary,
+            argv.join(" ")
+        );
+        eprintln!("finish registration manually:");
+        for argv in &reg.commands[i..] {
+            eprintln!("  {} {}", reg.binary, argv.join(" "));
+        }
+        return;
+    }
+    println!("registered with {}", reg.binary);
+}
+
+/// Print one install's outcome and handle its registration step.
+fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: bool) {
+    let source = if report.from_cache {
+        " (from cache)"
+    } else {
+        ""
+    };
+    println!(
+        "installed {} skills {}{source}: {} file(s) at {}",
+        report.harness,
+        report.version,
+        report.receipt.files_written,
+        report.receipt.location.display()
+    );
+    for w in &report.warnings {
+        eprintln!("  warning: {w}");
+    }
+    if let Some(reg) = &report.receipt.register {
+        if no_register {
+            println!("skipping registration (--no-register); to register manually:");
+            print_registration_commands(reg);
+        } else if binary_on_path(reg.binary) {
+            run_registration(reg);
+        } else {
+            println!(
+                "'{}' not found on PATH; to register once it is:",
+                reg.binary
+            );
+            print_registration_commands(reg);
+        }
+    }
+    println!("  {}", report.receipt.note);
+}
+
+/// Install or update the named harness, or every relevant one when omitted
+/// (install: detected harnesses; update: previously installed harnesses,
+/// falling back to detection). Mirrors `rvl plugin install/update`.
+fn run_skills_install(
+    env: &rvl_skills::flow::Env,
+    harness: Option<String>,
+    no_register: bool,
+    update: bool,
+) -> anyhow::Result<ExitCode> {
+    let supported = || rvl_skills::harness::supported_names().join(", ");
+    let targets: Vec<String> = match harness {
+        Some(name) => {
+            anyhow::ensure!(
+                rvl_skills::harness::by_name(&name).is_some(),
+                "unsupported harness: {name} (supported: {})",
+                supported()
+            );
+            vec![name]
+        }
+        None => {
+            let mut names: Vec<String> = if update {
+                env.store.read_installed().keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            if names.is_empty() {
+                names = rvl_skills::harness::detect_installed(env.home);
+            }
+            if names.is_empty() {
+                println!(
+                    "No supported coding-agent harness detected (supported: {}).",
+                    supported()
+                );
+                println!("Install one, or name it explicitly: rvlscan skills install <harness>");
+                return Ok(ExitCode::SUCCESS);
+            }
+            names
+        }
+    };
+
+    let mut failed = 0usize;
+    for name in &targets {
+        // by_name is total over `targets` by construction; skip defensively.
+        let Some(h) = rvl_skills::harness::by_name(name) else {
+            continue;
+        };
+        match rvl_skills::flow::install_one(env, h.as_ref()) {
+            Ok(report) => render_install_report(&report, no_register),
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Render the drift report, mirroring `rvl plugin list`'s UX.
+fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
+    match (&report.served_version, &report.server_note) {
+        (Some(v), _) => println!("Served plugin version: {v}"),
+        (None, Some(note)) => println!("Served plugin version: unknown ({note})"),
+        (None, None) => println!("Served plugin version: unknown"),
+    }
+
+    if report.harnesses.is_empty() {
+        println!("\nNo skills installed. Run 'rvlscan skills install'.");
+    } else {
+        println!("\nInstalled:");
+        let mut drift = false;
+        for h in &report.harnesses {
+            let state = match &h.update_available {
+                Some(v) => {
+                    drift = true;
+                    format!("update available: {v}")
+                }
+                None if report.served_version.is_some() => "up to date".to_string(),
+                None => "server version unknown".to_string(),
+            };
+            println!(
+                "  {:<10} {:<10} ({state})  {}",
+                h.harness, h.installed_version, h.location
+            );
+        }
+        if drift {
+            println!("\nRun 'rvlscan skills update' to upgrade.");
+        }
+    }
+
+    if !report.cached.is_empty() {
+        println!("\nCached:");
+        for c in &report.cached {
+            println!(
+                "  {:<10} {:<10} (fetched {})",
+                c.editor, c.version, c.fetched_at
+            );
+        }
+    }
+}
+
+/// `rvlscan skills`: resolve env/config once, then dispatch. Uses the same
+/// base URL/org key resolution as `sync` (rvlscan env > rvl-cli env >
+/// shared config file) and the spec cache's offline kill switch.
+fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
+    let skills_cache_dir = std::env::var_os("RVLSCAN_SKILLS_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
+    let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
+    let fetcher = rvl_skills::fetch::HttpFetcher {
+        base_url: cfg.base_url.clone(),
+        org_key: cfg.org_key.clone(),
+    };
+    let env = rvl_skills::flow::Env {
+        store: &store,
+        fetcher: &fetcher,
+        home: &home,
+        offline: cfg.offline,
+        allow_unsigned: std::env::var("RVLSCAN_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
+        allow_missing_checksum: std::env::var("RVLSCAN_ALLOW_MISSING_CHECKSUM")
+            .ok()
+            .as_deref()
+            == Some("1"),
+    };
+    let require_key = || {
+        anyhow::ensure!(
+            cfg.offline || !cfg.org_key.is_empty(),
+            "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
+             `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1 \
+             to install from the local cache)"
+        );
+        Ok(())
+    };
+    match cmd {
+        SkillsCmd::Install {
+            harness,
+            no_register,
+        } => {
+            require_key()?;
+            run_skills_install(&env, harness, no_register, false)
+        }
+        SkillsCmd::Update {
+            harness,
+            no_register,
+        } => {
+            require_key()?;
+            run_skills_install(&env, harness, no_register, true)
+        }
+        SkillsCmd::Status => {
+            render_skills_status(&rvl_skills::flow::status(&env));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -2082,6 +2360,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Cmd::Skills { cmd } => run_skills(&cfg, cmd),
     }
 }
 

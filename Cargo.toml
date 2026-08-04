@@ -7,6 +7,7 @@ members = [
     "crates/rvl-triage",
     "crates/rvl-index",
     "crates/rvl-core",
+    "crates/rvl-skills",
     "crates/rvl-spec",
     "crates/rvl-propagate",
     "crates/rvl-eval",
@@ -32,6 +33,8 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 ureq = "2"
+tar = "0.4"
+flate2 = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]

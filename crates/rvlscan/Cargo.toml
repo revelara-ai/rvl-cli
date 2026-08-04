@@ -13,6 +13,7 @@ clap = { workspace = true }
 rvl-cache = { path = "../rvl-cache" }
 rvl-content = { path = "../rvl-content" }
 rvl-core = { path = "../rvl-core" }
+rvl-skills = { path = "../rvl-skills" }
 rvl-spec = { path = "../rvl-spec" }
 rvl-propagate = { path = "../rvl-propagate" }
 rvl-triage = { path = "../rvl-triage" }
