@@ -34,6 +34,7 @@ pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
+pub mod prometheus;
 
 /// How the effective value of a config key was produced, ordered by
 /// decreasing evidentiary strength. This is the packet's confidence marker
@@ -140,6 +141,16 @@ pub trait ConfigRetriever {
     fn format_id(&self) -> &'static str;
     /// Whether a repo-relative (forward-slashed) path belongs to this format.
     fn matches(&self, rel_path: &str) -> bool;
+    /// Content-aware claim for formats with NO canonical path (Prometheus
+    /// rule files, Kubernetes manifests): consulted with a bounded head of
+    /// each bare YAML file no path-based [`Self::matches`] claimed, before
+    /// sighting. Detection must be conservative — a declined file degrades
+    /// to an identity-only sighting, never a wrong parse. Default: never
+    /// claims, so path-anchored formats are unaffected.
+    fn matches_head(&self, rel_path: &str, head: &str) -> bool {
+        let _ = (rel_path, head);
+        false
+    }
     /// Parse one matching file into packets.
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved;
 }
@@ -150,6 +161,7 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(github_actions::GithubActions),
         Box::new(gitlab_ci::GitlabCi),
         Box::new(dep_manifests::DepManifests),
+        Box::new(prometheus::PrometheusRules),
     ]
 }
 
@@ -189,6 +201,9 @@ pub struct LaneRetrieval {
 fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let is_yaml = rel.ends_with(".yml") || rel.ends_with(".yaml");
+    if name == "alertmanager.yml" || name == "alertmanager.yaml" {
+        return Some("alertmanager");
+    }
     if rel == ".circleci/config.yml" || rel == ".circleci/config.yaml" {
         return Some("circleci");
     }
@@ -233,7 +248,18 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
             return Some("kubernetes");
         }
         if col0("groups:") && head.contains("expr:") {
+            // The literal-YAML variants are claimed by the retriever before
+            // sighting; what reaches here is a variant it declined. Helm/Go
+            // templating is the known one (no rendering on the scan path —
+            // wayfinder po-ae75b.1), sighted under its own identity so
+            // prevalence can rank a future render lane.
+            if prometheus::helm_templated(head) {
+                return Some("prometheus-rules-templated");
+            }
             return Some("prometheus-rules");
+        }
+        if col0("route:") && col0("receivers:") {
+            return Some("alertmanager");
         }
     }
     None
@@ -276,14 +302,30 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
                 out.unparseable_files += got.unparseable;
                 continue;
             }
-            // Unsupported-format sighting. Path shapes need no read; bare
-            // YAML gets a bounded head sniff (content read locally, dropped).
+            // Path shapes need no read; bare YAML gets a bounded head read
+            // for content-identified formats and sighting (content is read
+            // locally and dropped either way).
             let needs_head = rel.ends_with(".yml") || rel.ends_with(".yaml");
             let head = if needs_head {
                 read_head(&path, 4096)
             } else {
                 String::new()
             };
+            // Content-identified formats (no canonical path) get a bounded
+            // head consult before the file degrades to a sighting.
+            if needs_head {
+                if let Some(r) = retrievers.iter().find(|r| r.matches_head(&rel, &head)) {
+                    let Ok(contents) = std::fs::read_to_string(&path) else {
+                        out.unparseable_files += 1;
+                        continue;
+                    };
+                    let got = r.retrieve(&rel, &contents, snapshot_id);
+                    out.packets.extend(got.packets);
+                    out.unparseable_files += got.unparseable;
+                    continue;
+                }
+            }
+            // Unsupported-format sighting.
             if let Some(fmt) = sight_format(&rel, &head) {
                 *sightings.entry(fmt).or_insert(0) += 1;
             }
@@ -399,6 +441,27 @@ mod tests {
             ),
             Some("prometheus-rules")
         );
+        assert_eq!(
+            sight_format("monitoring/alertmanager.yml", ""),
+            Some("alertmanager"),
+            "the canonical file name identifies alertmanager"
+        );
+        assert_eq!(
+            sight_format(
+                "config/am.yaml",
+                "route:\n  receiver: default\nreceivers:\n- name: default\n"
+            ),
+            Some("alertmanager"),
+            "route+receivers shape identifies alertmanager"
+        );
+        assert_eq!(
+            sight_format(
+                "chart/templates/rules.yml",
+                "groups:\n- name: x\n  rules:\n  - alert: A\n    expr: up == 0\n    for: {{ .Values.d }}\n"
+            ),
+            Some("prometheus-rules-templated"),
+            "a templated rules variant sights under its own identity"
+        );
         assert_eq!(sight_format("docs/notes.yaml", "a: b\n"), None);
         assert_eq!(sight_format("src/main.go", ""), None);
         // Dependency-manifest variants the dep-manifests retriever does not
@@ -478,26 +541,63 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_repo_routes_workflow_files_to_the_gha_retriever() {
+    fn retrieve_repo_routes_rule_files_to_the_prometheus_retriever() {
+        // Rule files have no canonical path: the walk identifies them by a
+        // bounded head consult (matches_head), anywhere in the tree.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join("deploy/alerts")).unwrap();
         std::fs::write(
-            root.join(".github/workflows/ci.yml"),
-            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps: []\n",
+            root.join("deploy/alerts/api.yml"),
+            "groups:\n- name: api\n  rules:\n  - alert: Down\n    expr: up == 0\n",
         )
         .unwrap();
         let got = retrieve_repo(root, "snap");
         assert!(
             got.packets
                 .iter()
-                .any(|p| p.format == "github-actions" && p.key == "job.timeout-minutes"),
-            "workflow files route to the GitHub Actions retriever: {:?}",
+                .any(|p| p.format == "prometheus-rules" && p.key == "rule.for"),
+            "rule files route to the Prometheus retriever: {:?}",
             got.packets
         );
         assert!(
             got.sightings.is_empty(),
             "a supported format is not sighted"
+        );
+    }
+
+    #[test]
+    fn retrieve_repo_sights_templated_rules_and_alertmanager() {
+        // A Helm-templated rule file is declined by the retriever (no
+        // rendering on the scan path) and degrades to an identity-only
+        // sighting; alertmanager config is identified but not inventoried.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("chart/templates")).unwrap();
+        std::fs::write(
+            root.join("chart/templates/rules.yml"),
+            "groups:\n- name: api\n  rules:\n  - alert: A\n    expr: up == 0\n    for: {{ .Values.forDuration }}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("alertmanager.yml"),
+            "route:\n  receiver: default\nreceivers:\n- name: default\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(got.packets.is_empty(), "nothing literal to parse");
+        assert_eq!(
+            got.sightings,
+            vec![
+                FormatSighting {
+                    format: "alertmanager".into(),
+                    file_count: 1
+                },
+                FormatSighting {
+                    format: "prometheus-rules-templated".into(),
+                    file_count: 1
+                },
+            ]
         );
     }
 }

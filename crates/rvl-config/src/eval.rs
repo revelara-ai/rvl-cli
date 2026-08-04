@@ -38,6 +38,10 @@ pub fn pattern_matches(name: &str, value: &str) -> Option<bool> {
     match name {
         // A full 40-hex-char commit SHA: the action-pinning control.
         "sha40" => Some(value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())),
+        // Any non-empty value: presence-of-a-key controls where absence is
+        // an AUTHORED fact with no platform default behind it (e.g. an alert
+        // rule with no severity label — the packet's value is "").
+        "nonempty" => Some(!value.is_empty()),
         _ => None,
     }
 }
@@ -339,6 +343,29 @@ mod tests {
             "a spec newer than the scanner degrades to abstention, never a guess"
         );
         assert!(f.reason.contains("newer than this scanner"), "{}", f.reason);
+    }
+
+    #[test]
+    fn nonempty_pattern_decides_authored_absences() {
+        // The presence-of-a-key controls: an authored absence packet (value
+        // "") violates, any authored value satisfies.
+        let c = cache(
+            "rule.labels.severity",
+            ConfigExpect::Pattern {
+                name: "nonempty".into(),
+            },
+            0.9,
+        );
+        let ok = evaluate(
+            &packet("rule.labels.severity", Some("page"), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(ok.verdict, Verdict::Satisfies);
+        let bad = evaluate(
+            &packet("rule.labels.severity", Some(""), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(bad.verdict, Verdict::Violates);
     }
 
     #[test]
