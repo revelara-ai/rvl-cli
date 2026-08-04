@@ -42,6 +42,12 @@ pub fn pattern_matches(name: &str, value: &str) -> Option<bool> {
         // an AUTHORED fact with no platform default behind it (e.g. an alert
         // rule with no severity label — the packet's value is "").
         "nonempty" => Some(!value.is_empty()),
+        // Any real authored value at all: the presence judgment for
+        // decidable-absent keys, whose packets render the absence as
+        // [`crate::ABSENT_RENDERING`] (an automated Argo Application with no
+        // retry). An empty value — an authored absence, e.g. an unpinned
+        // `uses:` ref — is not configured either.
+        "configured" => Some(!value.is_empty() && value != crate::ABSENT_RENDERING),
         _ => None,
     }
 }
@@ -366,6 +372,37 @@ mod tests {
             &c,
         );
         assert_eq!(bad.verdict, Verdict::Violates);
+    }
+
+    #[test]
+    fn configured_pattern_judges_decidable_authored_absence() {
+        // The G6 family-6 lever: an as-authored-absent packet (value
+        // ABSENT_RENDERING, e.g. an automated Application without retry)
+        // violates a `configured` spec; any real authored value satisfies.
+        let c = cache(
+            "job.retry",
+            ConfigExpect::Pattern {
+                name: "configured".into(),
+            },
+            0.9,
+        );
+        let absent = evaluate(
+            &packet(
+                "job.retry",
+                Some(crate::ABSENT_RENDERING),
+                Resolution::AsAuthored,
+            ),
+            &c,
+        );
+        assert_eq!(absent.verdict, Verdict::Violates, "{}", absent.reason);
+        let set = evaluate(
+            &packet("job.retry", Some(r#"{"limit":5}"#), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(set.verdict, Verdict::Satisfies, "{}", set.reason);
+        // An empty value (an authored absence, e.g. an unpinned `uses:` ref)
+        // is not configured either.
+        assert_eq!(pattern_matches("configured", ""), Some(false));
     }
 
     #[test]

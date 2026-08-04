@@ -30,11 +30,19 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod argo_flux;
 pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
 pub mod prometheus;
+
+/// The canonical rendering of a decidable authored ABSENCE: a key the
+/// committed file decidably lacks, where no platform default fills in
+/// (wayfinder po-av01j.24: an Application with automated sync but no retry).
+/// Such packets are `Resolution::AsAuthored` with this value, and the
+/// `configured` spec pattern judges them.
+pub const ABSENT_RENDERING: &str = "absent";
 
 /// How the effective value of a config key was produced, ordered by
 /// decreasing evidentiary strength. This is the packet's confidence marker
@@ -162,6 +170,7 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(gitlab_ci::GitlabCi),
         Box::new(dep_manifests::DepManifests),
         Box::new(prometheus::PrometheusRules),
+        Box::new(argo_flux::ArgoFlux),
     ]
 }
 
@@ -243,6 +252,13 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     if is_yaml {
         // Bounded sniffs over the head of the file. Only the IDENTITY of the
         // format is recorded; the content is read locally and discarded.
+        // Argo/Flux CRs first: the recognized kinds route to the ArgoFlux
+        // retriever via matches_head before sighting is ever consulted; the
+        // rest classify by product here so the generic-kubernetes sniff
+        // below never absorbs them (the po-av01j.20 family boundary).
+        if let Some(fmt) = argo_flux::sight_unrecognized(head) {
+            return Some(fmt);
+        }
         let col0 = |k: &str| head.lines().any(|l| l.starts_with(k));
         if col0("apiVersion:") && col0("kind:") {
             return Some("kubernetes");
@@ -501,6 +517,54 @@ mod tests {
             ]
         );
         assert!(got.packets.is_empty());
+    }
+
+    #[test]
+    fn retrieve_repo_routes_argo_flux_crs_by_content_and_sights_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deploy")).unwrap();
+        // An Argo CD Application: no canonical path, claimed by content.
+        std::fs::write(
+            root.join("deploy/app.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  syncPolicy:\n    automated: {}\n",
+        )
+        .unwrap();
+        // An argoproj.io CR the family does not parse: a product sighting,
+        // never absorbed into the kubernetes bucket.
+        std::fs::write(
+            root.join("deploy/rollout.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        )
+        .unwrap();
+        // A generic Kubernetes manifest: NOT claimed (family po-av01j.20),
+        // still sighted as kubernetes.
+        std::fs::write(
+            root.join("deploy/web.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "argo-cd" && p.key == "application.syncPolicy.automated"),
+            "content routing must reach the ArgoFlux retriever: {:?}",
+            got.packets
+        );
+        assert_eq!(
+            got.sightings,
+            vec![
+                FormatSighting {
+                    format: "argo-rollouts".into(),
+                    file_count: 1
+                },
+                FormatSighting {
+                    format: "kubernetes".into(),
+                    file_count: 1
+                },
+            ]
+        );
     }
 
     #[test]
