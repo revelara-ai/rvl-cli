@@ -70,14 +70,80 @@ struct Entry {
     sites: Vec<Site>,
 }
 
+/// How long [`PacketIndex::open`] waits for a busy index before giving up.
+/// Deliberately short: an interactive command should report a busy index
+/// promptly rather than look like it hung.
+pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The index could not be acquired because another rvlscan process holds
+/// redb's exclusive lock.
+///
+/// redb permits exactly one process to have the database open, so this is a
+/// normal, transient condition (a scan, a status check, a background warm),
+/// not a corrupt index. It is its own error type so callers can
+/// `downcast_ref` and say "busy" instead of reporting a broken database.
+#[derive(Debug)]
+pub struct IndexBusy {
+    pub path: PathBuf,
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for IndexBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index busy: another rvlscan process holds {} (waited {:.1}s)",
+            self.path.display(),
+            self.waited.as_secs_f32()
+        )
+    }
+}
+
+impl std::error::Error for IndexBusy {}
+
 impl PacketIndex {
-    /// Open (creating if needed) the index at `path`.
+    /// Open (creating if needed) the index at `path`, waiting briefly for a
+    /// concurrent holder to finish. See [`PacketIndex::open_with_timeout`].
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_timeout(path, DEFAULT_OPEN_TIMEOUT)
+    }
+
+    /// Open (creating if needed) the index at `path`, waiting up to
+    /// `timeout` for another process to release redb's exclusive lock.
+    ///
+    /// Waiting matters most for the background warm: it is a batch job with
+    /// nobody watching, and failing instantly because a status check held
+    /// the lock for a few milliseconds throws away the whole reindex
+    /// (po-l3jo5).
+    ///
+    /// Only `DatabaseAlreadyOpen` is retried. A storage error or a required
+    /// format upgrade will not resolve itself, and retrying one for a minute
+    /// only delays the report.
+    pub fn open_with_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let db = redb::Database::create(path)
-            .with_context(|| format!("opening packet index at {}", path.display()))?;
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(25);
+        let db = loop {
+            match redb::Database::create(path) {
+                Ok(db) => break db,
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                    if started.elapsed() + backoff >= timeout {
+                        return Err(anyhow::Error::new(IndexBusy {
+                            path: path.to_path_buf(),
+                            waited: started.elapsed(),
+                        }));
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(250));
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("opening packet index at {}", path.display()))
+                }
+            }
+        };
         // Materialize the table so reads on a fresh index do not error.
         let tx = db.begin_write()?;
         {

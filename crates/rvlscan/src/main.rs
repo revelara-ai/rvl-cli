@@ -1342,6 +1342,17 @@ fn strip_detach_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
     args.into_iter().filter(|a| a != "--detach").collect()
 }
 
+/// Where a detached reindex child writes its output. One well-known path, so
+/// "the background warm did nothing" is always answerable.
+fn detached_log_path(cache_dir: &std::path::Path) -> PathBuf {
+    cache_dir.join("reindex.log")
+}
+
+/// How long a background warm waits for a busy index. Generous on purpose:
+/// it runs behind a commit with nobody watching, so waiting out a concurrent
+/// scan costs nothing while giving up loses the entire reindex.
+const INDEX_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `index init` / `index reindex`, both packet-stream and live modes.
 ///
 /// Live mode (no --retrieved) is the background warm a post-commit hook
@@ -1357,16 +1368,31 @@ fn run_index_build(
     detach: bool,
 ) -> anyhow::Result<ExitCode> {
     if detach {
-        // Respawn ourselves without --detach, fully detached: null stdio and
-        // (on unix) a new process group, so the hook's shell never waits and
-        // a terminal signal to the commit never kills the warm.
+        // Respawn ourselves without --detach and (on unix) in a new process
+        // group, so the hook's shell never waits and a terminal signal to the
+        // commit never kills the warm.
+        //
+        // The child's output goes to a log file, never to /dev/null. Nobody
+        // is watching a detached warm, so discarding its stderr means a
+        // failed reindex looks exactly like a successful one: the parent has
+        // already printed "detached ..." and exited 0 (po-l3jo5).
+        let log_path = detached_log_path(&cfg.cache_dir);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening detached reindex log at {}", log_path.display()))?;
+        let log_err = log.try_clone()?;
         let exe = std::env::current_exe()?;
         let args = strip_detach_args(std::env::args().skip(1));
         let mut cmd = std::process::Command::new(exe);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err));
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -1374,13 +1400,20 @@ fn run_index_build(
         }
         let child = cmd.spawn()?;
         println!(
-            "detached (pid {}): reindex continues in the background",
-            child.id()
+            "detached (pid {}): reindex continues in the background, logging to {}",
+            child.id(),
+            log_path.display()
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
+    // The warm waits a long time for a busy index. It is a background batch
+    // job; losing the whole reindex because a status check held the lock for
+    // a few milliseconds is the bug this timeout exists to prevent.
+    let idx = rvl_index::PacketIndex::open_with_timeout(
+        &cfg.index_dir.join("packets.redb"),
+        INDEX_WARM_TIMEOUT,
+    )?;
 
     if let Some(retrieved) = retrieved {
         let stream = std::fs::read_to_string(&retrieved)?;
@@ -1882,13 +1915,24 @@ fn run() -> anyhow::Result<ExitCode> {
                 detach,
             } => run_index_build(&cfg, path, retrieved, files, detach),
             IndexCmd::Status => {
-                let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
-                println!(
-                    "{} file(s) indexed at {}",
-                    idx.len()?,
-                    cfg.index_dir.display()
-                );
-                Ok(ExitCode::SUCCESS)
+                match rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb")) {
+                    Ok(idx) => {
+                        println!(
+                            "{} file(s) indexed at {}",
+                            idx.len()?,
+                            cfg.index_dir.display()
+                        );
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    // A busy index is a normal transient state, not a broken
+                    // one. Say so plainly instead of reporting it as a
+                    // failure to open the database.
+                    Err(e) if e.downcast_ref::<rvl_index::IndexBusy>().is_some() => {
+                        eprintln!("{e}");
+                        Ok(ExitCode::FAILURE)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         },
         Cmd::Cache { cmd } => match cmd {

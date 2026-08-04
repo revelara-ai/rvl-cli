@@ -217,3 +217,51 @@ fn strict_budget_fails_closed() {
         "strict mode must name the budget: {err}"
     );
 }
+
+// --- concurrent access (po-l3jo5) ---
+//
+// redb allows exactly one process to hold the database. Opening therefore has
+// to distinguish "someone else is using it right now" from "it is broken",
+// and has to wait, because the caller that loses this race is usually the
+// background warm and giving up throws away its entire reindex.
+
+/// A locked index surfaces as `IndexBusy`, and only after the open actually
+/// waited rather than failing on the first attempt.
+#[test]
+fn open_reports_busy_when_another_holder_keeps_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packets.redb");
+    let _held = PacketIndex::open(&path).unwrap();
+
+    let started = std::time::Instant::now();
+    let Err(err) = PacketIndex::open_with_timeout(&path, Duration::from_millis(300)) else {
+        panic!("a second open must not succeed while the first holder is alive");
+    };
+
+    assert!(
+        err.downcast_ref::<IndexBusy>().is_some(),
+        "a locked index must surface as IndexBusy, not a generic open failure: {err}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "open must retry before giving up, gave up after {:?}",
+        started.elapsed()
+    );
+}
+
+/// The whole point of waiting: a holder that releases mid-wait must not cost
+/// the caller its work. This is the background warm's path.
+#[test]
+fn open_succeeds_when_the_holder_releases_during_the_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packets.redb");
+    let held = PacketIndex::open(&path).unwrap();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+    });
+
+    PacketIndex::open_with_timeout(&path, Duration::from_secs(10))
+        .expect("open must wait out a transient holder rather than fail");
+}
