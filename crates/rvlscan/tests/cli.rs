@@ -1472,3 +1472,104 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
         "repo_structure record leaked into the site list: {stdout}"
     );
 }
+
+// --- G6 Argo/Flux family (po-av01j.24) ---
+
+/// A repo with GitOps CRs only (no code lane): an Argo CD Application that
+/// auto-syncs a floating branch with no retry and no selfHeal, a Flux
+/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// parse. Seed config-key specs cover the pin-shape and remediation keys.
+fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // The config lane is the subject; the code lane gets one unspecced Go
+    // site so the packet stream is non-empty (the scan requires sites).
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":3,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::create_dir_all(dir.join("deploy")).unwrap();
+    std::fs::write(
+        dir.join("deploy/app.yaml"),
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  project: default\n  source:\n    repoURL: https://example.com/repo.git\n    path: k8s\n    targetRevision: main\n  syncPolicy:\n    automated: {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/gitrepo.yaml"),
+        "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: podinfo\nspec:\n  interval: 1m\n  ref:\n    branch: main\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/rollout.yaml"),
+        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+    )
+    .unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "config_keys":[
+            {"format":"argo-cd","key":"application.targetRevision.shape","expect":{"kind":"equals","value":"pinned"},"confidence":0.9,"control":"RC-050","severity":"medium","fix":"pin targetRevision to a tag or commit SHA","rationale":"HEAD/branch refs float"},
+            {"format":"argo-cd","key":"application.syncPolicy.automated.selfHeal","expect":{"kind":"equals","value":"true"},"confidence":0.9,"control":"RC-036","severity":"medium","fix":"set syncPolicy.automated.selfHeal: true","rationale":"drift is not remediated by default"},
+            {"format":"argo-cd","key":"application.syncPolicy.retry","expect":{"kind":"pattern","name":"configured"},"confidence":0.9,"control":"RC-036","severity":"medium","fix":"set syncPolicy.retry (limit + backoff)","rationale":"an automated sync loop needs a bounded retry"},
+            {"format":"flux","key":"gitrepository.ref.shape","expect":{"kind":"one_of","values":["commit","semver","tag"]},"confidence":0.9,"control":"RC-050","severity":"medium","fix":"track a tag, semver range, or commit instead of a branch","rationale":"branch refs float"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_argo_flux_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The floating targetRevision violates the pin-shape spec.
+    assert!(
+        stdout.contains("argo-cd application.targetRevision.shape"),
+        "floating targetRevision must surface: {stdout}"
+    );
+    // Automated sync without selfHeal: the documented false default governs.
+    assert!(
+        stdout.contains("argo-cd application.syncPolicy.automated.selfHeal"),
+        "selfHeal-off must surface: {stdout}"
+    );
+    // The issue's canonical decidable absence: automated sync, no retry —
+    // an as-authored-absent packet judged by the `configured` pattern.
+    assert!(
+        stdout.contains("argo-cd application.syncPolicy.retry"),
+        "missing retry must surface: {stdout}"
+    );
+    // The Flux source tracks a branch: shape-only fact vs the pin spec.
+    assert!(
+        stdout.contains("flux gitrepository.ref.shape"),
+        "branch-tracking GitRepository must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-050"),
+        "the deciding spec's control rides into the ladder: {stdout}"
+    );
+    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // generic kubernetes one.
+    assert!(
+        stdout.contains("argo-rollouts (1)"),
+        "unrecognized argo kind must be sighted by product: {stdout}"
+    );
+    assert!(
+        !stdout.contains("kubernetes (1)"),
+        "argo/flux CRs must never sight as generic kubernetes: {stdout}"
+    );
+}
