@@ -730,12 +730,14 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
 /// coverage) alongside the triaged items and a `verbose` cache-status line.
 /// `verbose` gates the one-line "sites | specs" summary so `explain` stays quiet.
 /// Takes the already-resolved packet-stream text (see `resolve_packet_stream`).
+#[allow(clippy::too_many_arguments)]
 fn resolve_findings(
     store: &CacheStore,
     keyset: &Keyset,
     stream: &str,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    policy_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<(
     Vec<rvl_propagate::Finding>,
@@ -744,7 +746,15 @@ fn resolve_findings(
 )> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
-        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, verbose,
+        store,
+        keyset,
+        sites,
+        &repo_cfg,
+        skipped,
+        specs_file,
+        judgments,
+        policy_root,
+        verbose,
     )
 }
 
@@ -761,6 +771,7 @@ fn findings_from_sites(
     skipped: usize,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    policy_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<(
     Vec<rvl_propagate::Finding>,
@@ -803,7 +814,38 @@ fn findings_from_sites(
         !sites.is_empty(),
         "no parseable sites in the retrieved packet stream"
     );
-    let cache = rvl_spec::SpecCache::load(&specs_text)?;
+    let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
+    // Out-of-code bound declarations (po-3t3oj.30): repo policy in
+    // `.revelara.yaml` asserting a bound no retrieval can see (a prod
+    // statement_timeout, an infra deadline). Merged as exact-type
+    // whole-call this-client ConfigSpecs with the policy provenance; the
+    // declaration is committed to the repo, so the audit trail is git.
+    if let Some(root) = policy_root {
+        let declared =
+            waiver::load_declared_bounds(&root.join(".revelara.yaml"), &rvl_cache::today_utc());
+        if !declared.is_empty() {
+            eprintln!(
+                "applying {} declared bound(s) from .revelara.yaml",
+                declared.len()
+            );
+            let overlay = rvl_spec::SpecFile {
+                apis: vec![],
+                scopes: vec![],
+                configs: declared
+                    .into_iter()
+                    .map(|d| rvl_spec::ConfigSpec {
+                        type_name: d.client_type,
+                        bounds: rvl_spec::Bounds::WholeCall,
+                        scope: rvl_spec::Scope::ThisClient,
+                        confidence: 1.0,
+                        rationale: format!("declared in .revelara.yaml: {}", d.reason),
+                        declared: true,
+                    })
+                    .collect(),
+            };
+            cache.merge(rvl_spec::SpecCache::from_file(overlay));
+        }
+    }
     let served = cache.served_bound(repo_cfg);
     let client = cache.client_bound_by_family(repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
@@ -863,8 +905,15 @@ fn run_scan(
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (findings, items, sites) =
-        resolve_findings(store, keyset, &stream, specs_file, judgments, true)?;
+    let (findings, items, sites) = resolve_findings(
+        store,
+        keyset,
+        &stream,
+        specs_file,
+        judgments,
+        Some(path),
+        true,
+    )?;
     render_scan_output(
         state_path, path, &findings, &items, &sites, out, color, start,
     )
@@ -1432,6 +1481,7 @@ fn run_scan_incremental(
         0,
         specs_file,
         judgments,
+        Some(path),
         true,
     )?;
     render_scan_output(
@@ -1480,8 +1530,15 @@ fn run_explain(
         return Ok(ExitCode::SUCCESS);
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, items, _sites) =
-        resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
+    let (_findings, items, _sites) = resolve_findings(
+        store,
+        keyset,
+        &stream,
+        specs_file,
+        judgments,
+        Some(path),
+        false,
+    )?;
     let ladder_findings = triage_to_findings(&items);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
@@ -1528,8 +1585,15 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path)?;
-                let (_findings, items, _sites) =
-                    resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
+                let (_findings, items, _sites) = resolve_findings(
+                    store,
+                    keyset,
+                    &stream,
+                    specs_file,
+                    judgments,
+                    Some(scan_path),
+                    false,
+                )?;
                 let ladder_findings = triage_to_findings(&items);
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
@@ -1605,13 +1669,14 @@ fn run_report(
             0,
             specs_file,
             None,
+            Some(path),
             false,
         )?;
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path)?;
         let (findings, _items, sites) =
-            resolve_findings(store, keyset, &stream, specs_file, None, false)?;
+            resolve_findings(store, keyset, &stream, specs_file, None, Some(path), false)?;
         (findings, sites)
     };
 

@@ -55,6 +55,49 @@ struct WaiverFile {
 struct ScannerSection {
     #[serde(default)]
     waivers: Vec<Waiver>,
+    #[serde(default)]
+    bounds: Vec<DeclaredBound>,
+}
+
+/// One out-of-code bound declaration (po-3t3oj.30): a human assertion that a
+/// client type's calls are bounded by something no retrieval can see
+/// (statement_timeout on the prod database, an infra-level deadline). Narrow
+/// by design: exact `client_type` only, `whole_call` only — a declaration is
+/// the strongest possible claim, so anything weaker stays a finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredBound {
+    pub client_type: String,
+    #[serde(default)]
+    pub bounds: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// Same `YYYY-MM-DD` semantics as waivers; empty is open-ended.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires: String,
+}
+
+/// Load the active whole-call bound declarations from `.revelara.yaml`.
+/// Missing/unparseable file or section is simply empty — a declaration is an
+/// opt-in extra, never load-bearing for the scan itself.
+pub fn load_declared_bounds(path: &Path, today: &str) -> Vec<DeclaredBound> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(f) = serde_yaml::from_str::<WaiverFile>(&text) else {
+        return Vec::new();
+    };
+    f.scanner
+        .bounds
+        .into_iter()
+        .filter(|b| {
+            !b.client_type.is_empty()
+                && b.bounds == "whole_call"
+                && expiry_active(&b.expires, today)
+        })
+        .collect()
 }
 
 /// Whether `w` is still in force at `today` ("YYYY-MM-DD"). Mirrors
@@ -62,7 +105,12 @@ struct ScannerSection {
 /// otherwise active while `today <= expires`. ISO dates sort lexically, so a
 /// string compare is exact once both sides are well-formed `YYYY-MM-DD`.
 pub fn waiver_active(w: &Waiver, today: &str) -> bool {
-    let expires = w.expires.trim();
+    expiry_active(&w.expires, today)
+}
+
+/// Shared expiry rule for waivers and bound declarations.
+fn expiry_active(expires: &str, today: &str) -> bool {
+    let expires = expires.trim();
     if expires.is_empty() {
         return true;
     }

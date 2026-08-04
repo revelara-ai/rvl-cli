@@ -177,6 +177,12 @@ pub struct ConfigSpec {
     pub confidence: f64,
     #[serde(default)]
     pub rationale: String,
+    /// True when this spec is a repo-local `.revelara.yaml` bound declaration
+    /// rather than a factory-authored spec. Runtime-only overlay state: never
+    /// emitted by the factory, skipped on serialization, and used to carry the
+    /// policy provenance into the finding's reason.
+    #[serde(default, skip_serializing)]
+    pub declared: bool,
 }
 
 /// Whether the control governs a scope at all. Judged once per scope class,
@@ -465,6 +471,7 @@ mod tests {
                     scope: s,
                     confidence: c,
                     rationale: String::new(),
+                    declared: false,
                 })
                 .collect(),
         })
