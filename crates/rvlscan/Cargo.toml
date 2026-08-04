@@ -26,3 +26,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
+# Lets the CLI tests hold redb's exclusive index lock directly, so the
+# "index is busy" path is exercised deterministically instead of by racing
+# two processes (po-l3jo5).
+rvl-index = { path = "../rvl-index" }

@@ -475,24 +475,104 @@ fn index_reindex_detach_returns_immediately_and_child_indexes() {
     );
 
     // The child eventually lands packets in the index.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    wait_for_indexed(&dir.path().join("index"), &dir.path().join("cache"), 60);
+}
+
+/// Poll `index status` until the index reports a non-zero file count.
+///
+/// A *failed* status is not evidence of anything. While a reindex holds
+/// redb's exclusive lock, status cannot open the index at all: it exits
+/// non-zero and prints nothing on stdout. Treating that empty stdout as
+/// "populated" is exactly what made the original detach test vacuous
+/// (po-l3jo5), so only a SUCCESSFUL status with a non-zero count ends the
+/// wait; busy is a reason to keep waiting.
+fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut last;
     loop {
         let status = bin()
             .args(["index", "status"])
-            .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("RVLSCAN_INDEX_DIR", index_dir)
+            .env("RVLSCAN_CACHE_DIR", cache_dir)
             .output()
             .expect("failed to run rvlscan");
-        let s = String::from_utf8(status.stdout).unwrap();
-        if !s.starts_with("0 file(s)") {
-            break;
+        if status.status.success() {
+            let s = String::from_utf8(status.stdout).unwrap();
+            if !s.starts_with("0 file(s)") {
+                return;
+            }
+            last = s;
+        } else {
+            last = String::from_utf8_lossy(&status.stderr).trim().to_string();
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "detached child never populated the index: {s}"
+            "index never populated within {secs}s (last status: {last}); child log:\n{}",
+            reindex_log(cache_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// The detached child's log, or a marker when it never wrote one. A detached
+/// reindex that fails MUST leave this behind: "no log" is itself the finding.
+fn reindex_log(cache_dir: &std::path::Path) -> String {
+    let p = cache_dir.join("reindex.log");
+    std::fs::read_to_string(&p).unwrap_or_else(|e| format!("<no {}: {e}>", p.display()))
+}
+
+/// A detached reindex must not silently lose its work when another process
+/// already holds the index.
+///
+/// redb grants one process an exclusive lock on the database. Before
+/// po-l3jo5 the detached child called `PacketIndex::open` once, hit
+/// `DatabaseAlreadyOpen`, and died — invisibly, because the child's stdout
+/// AND stderr were `Stdio::null()` while the parent had already printed
+/// "detached ... continues in the background" and exited 0. The background
+/// warm a post-commit hook fires did nothing at all, and said nothing about
+/// it. This holds the lock deterministically rather than racing for it, so
+/// the regression cannot hide behind whichever process happens to win.
+#[test]
+fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let fixture = goindex_fixture();
+    let index_dir = dir.path().join("index");
+    let cache_dir = dir.path().join("cache");
+
+    // Hold the exclusive lock exactly as a concurrent scan or status would.
+    let held = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))
+        .expect("test must be able to open the index first");
+
+    let out = bin()
+        .args(["index", "reindex", "--detach"])
+        .arg(&fixture)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_INDEX_DIR", &index_dir)
+        .env("RVLSCAN_CACHE_DIR", &cache_dir)
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        out.status.success(),
+        "detach parent must exit 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Long enough that a child which gives up on a busy index is already gone.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    drop(held);
+
+    // A child that waited is still alive, and finishes the warm once free.
+    wait_for_indexed(&index_dir, &cache_dir, 30);
+
+    // ...and it is never silent again: the run left a readable trace.
+    let log = reindex_log(&cache_dir);
+    assert!(
+        !log.trim().is_empty(),
+        "detached child must log its run, got: {log}"
+    );
 }
 
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
