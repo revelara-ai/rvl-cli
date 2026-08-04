@@ -703,3 +703,48 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
         "an expired declaration and another type's declaration must both be inert: {v}"
     );
 }
+
+// --- G7 repo-structure lane (po-av01j.7) ---
+
+/// A `--retrieved` stream carrying a `repo_structure` record surfaces its
+/// violations in the ladder as ADVISORY findings with the control code, and
+/// the record itself never pollutes the site list.
+#[test]
+fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, specs) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(concat!(
+        r#"{"kind":"repo_structure","snapshot_id":"fixture","walk_complete":true,"#,
+        r#""ecosystems":[{"name":"go","source_files":40,"test_files":0,"integration_markers":[]}],"#,
+        r#""coverage_configs":[],"contract_frameworks":[],"manifests":[],"runbook_dirs":[]}"#,
+        "\n"
+    ));
+    std::fs::write(&packets_path, stream).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("RC-033"),
+        "untested-repo violation missing from the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("ADVISORY") && !stdout.contains("BLOCKING"),
+        "structure findings are advisory, never blocking: {stdout}"
+    );
+    // The sites|specs line counts only real sites: the structure record must
+    // not have been misparsed into a junk site (2 fixture sites, not 3).
+    assert!(
+        stdout.contains("sites 2"),
+        "repo_structure record leaked into the site list: {stdout}"
+    );
+}

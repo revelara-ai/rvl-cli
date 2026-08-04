@@ -362,9 +362,16 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 continue;
             }
         };
-        if v.get("kind").and_then(|k| k.as_str()) == Some("repo_config") {
-            if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
-                cfg = rc;
+        if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
+            // Repo-scoped records ride the same stream, tagged by `kind`.
+            // Only repo_config is consumed here; any other kind (e.g. the G7
+            // repo_structure record) belongs to its own consumer and must not
+            // fall through into Site parsing, where every-field-defaulted
+            // serde would mint a junk site out of it.
+            if kind == "repo_config" {
+                if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
+                    cfg = rc;
+                }
             }
             continue;
         }
@@ -429,6 +436,27 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(sites[0].id(), "a.go:7");
+    }
+
+    #[test]
+    fn unknown_repo_scoped_record_kinds_do_not_become_sites() {
+        // The stream carries repo-scoped records tagged by `kind`
+        // (repo_config today, repo_structure from the G7 retriever). A kind
+        // this parser does not recognize must be routed AWAY from the site
+        // list, not misparsed into an all-defaults junk Site.
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"kind":"repo_structure","snapshot_id":"x","ecosystems":[]}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(
+            sites.len(),
+            1,
+            "a repo-scoped record must not become an empty Site"
+        );
+        assert_eq!(skipped, 0, "another record kind is not a parse failure");
     }
 
     #[test]
