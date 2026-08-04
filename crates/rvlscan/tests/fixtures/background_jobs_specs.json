@@ -1,0 +1,65 @@
+{
+  "__comment": "SEED / test-grade spec fixtures for the G3 background-job lane (po-av01j.4): RC-060 background-process safety plus the job-altitude re-application of the existing timeout judgment (same machinery, new sites, declared via site_kinds). PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e tests exercise real verdicts, nothing more. The rq.Queue entry deliberately declares NO site_kinds: it is the classic-call-site control proving a G1 spec never decides a background_job site.",
+  "apis": [
+    {
+      "type": "github.com/robfig/cron/v3.Cron",
+      "method": "AddFunc",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["context"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060: a cron-registered job runs unattended against shared stores; the registration is the altitude where a run bound must exist (job-altitude re-application of the timeout judgment)",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "time.Ticker",
+      "method": "NewTicker",
+      "site_count": 1,
+      "blocking": "depends",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060: a ticker drives a worker loop only when ranged over; whether that loop mutates shared stores needs per-site judgment",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "celery",
+      "method": "shared_task",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["decorator"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060: celery bounds a task at its registration decorator (@shared_task(time_limit=...)); job-altitude re-application of the timeout judgment",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "celery.Celery",
+      "method": "task",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["decorator"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060: app-bound celery registration, same decorator bound as shared_task",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "bullmq.Queue",
+      "method": "add",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 0.9,
+      "rationale": "SEED job-altitude timeout: a bullmq dispatch accepts a per-job timeout option at the call",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "rq.Queue",
+      "method": "enqueue",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["context"],
+      "confidence": 0.9,
+      "rationale": "SEED applicability control: authored for classic call sites only (no site_kinds), so a background_job site with this api key must abstain, never inherit the judgment"
+    }
+  ],
+  "configs": []
+}

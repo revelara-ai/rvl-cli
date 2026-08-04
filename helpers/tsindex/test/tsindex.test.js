@@ -180,6 +180,56 @@ test('construction of a resolved client is retrievable', () => {
   );
 });
 
+test('background-job registrations carry site_kind', () => {
+  // G3 (po-av01j.4): scheduler/queue registrations ride the same packet
+  // stream marked site_kind="background_job"; classic call sites keep an
+  // empty site_kind. Detection is type-driven through the checker.
+  const records = retrieveRecords();
+  for (const rec of records) {
+    assert.ok('site_kind' in rec, 'site_kind must be on every packet');
+  }
+  const jobs = records.filter((r) => r.site_kind === 'background_job');
+
+  // bullmq dispatches: the bounded one carries its timeout option in the
+  // snippet, the bare one does not.
+  const adds = jobs.filter(
+    (r) => r.client_type === 'bullmq.Queue' && r.func === 'add',
+  );
+  assert.ok(adds.length >= 3, `want the bullmq add dispatches: ${JSON.stringify(jobs.map((j) => j.site_key))}`);
+  assert.ok(
+    adds.some((r) => r.snippet.includes('timeout: 5000')),
+    'the bounded dispatch must be visible in its snippet',
+  );
+
+  // The Worker construction IS the handler registration.
+  const worker = jobs.find(
+    (r) => r.client_type === 'bullmq.Worker' && r.func === 'constructor',
+  );
+  assert.ok(worker, `new Worker(...) must be a background_job site: ${JSON.stringify(jobs.map((j) => j.site_key))}`);
+  assert.strictEqual(worker.symbol, 'startWorker');
+  assert.ok(worker.provenance.client_type_resolved, 'worker registration resolves');
+
+  // node-cron schedule.
+  const cronSite = jobs.find(
+    (r) => r.client_type.startsWith('node-cron.') && r.func === 'schedule',
+  );
+  assert.ok(cronSite, `node-cron schedule must be kinded: ${JSON.stringify(jobs.map((j) => j.site_key))}`);
+
+  // Classic sites stay classic.
+  const pool = records.find((r) => r.client_type === 'pg.Pool');
+  assert.strictEqual(pool.site_kind, '');
+});
+
+test('untyped job lookalikes are never guessed at', () => {
+  // registry.schedule(...) on an `any` receiver: type-driven means the site
+  // is not emitted at all, let alone kinded.
+  const records = retrieveRecords();
+  assert.ok(
+    !records.some((r) => r.symbol === 'notAJob'),
+    'a lookalike on an untyped receiver must not become a site',
+  );
+});
+
 test('non-client noise is not emitted', () => {
   const records = retrieveRecords();
   const methods = new Set(records.map((r) => r.func));

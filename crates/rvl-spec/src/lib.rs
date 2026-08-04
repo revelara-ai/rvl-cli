@@ -65,6 +65,26 @@ pub struct ApiSpec {
     pub rationale: String,
     #[serde(default)]
     pub site_count: u32,
+    /// Which site kinds this spec governs (G3, po-av01j.4). Empty — every
+    /// spec authored before site kinds existed — means the classic G1 client
+    /// call site only (`Site::site_kind == ""`), so no existing spec silently
+    /// widens onto job-registration sites. A spec that re-applies timeout/
+    /// retry judgment at job altitude declares `["background_job"]`; one
+    /// governing both altitudes lists both `""` and `"background_job"`.
+    #[serde(default)]
+    pub site_kinds: Vec<String>,
+}
+
+impl ApiSpec {
+    /// Whether this spec governs a site of `site_kind`. The applicability
+    /// mechanism for job-altitude re-application: the JUDGMENT machinery is
+    /// unchanged, a spec merely declares which altitudes it covers.
+    pub fn applies_to(&self, site_kind: &str) -> bool {
+        if self.site_kinds.is_empty() {
+            return site_kind.is_empty();
+        }
+        self.site_kinds.iter().any(|k| k == site_kind)
+    }
 }
 
 /// What a config field actually bounds. The distinction is load-bearing: a
@@ -427,6 +447,7 @@ mod tests {
             confidence,
             rationale: String::new(),
             site_count: 1,
+            site_kinds: vec![],
         }
     }
 
@@ -563,6 +584,41 @@ mod tests {
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");
     }
+    #[test]
+    fn spec_applicability_defaults_to_classic_call_sites_only() {
+        // G3 (po-av01j.4): every existing spec was authored against G1 client
+        // call sites. An undeclared site_kinds list must therefore keep the
+        // spec scoped to classic sites — silently re-applying a call-site spec
+        // to a background-job registration would multiply an unreviewed
+        // judgment across a surface it never covered.
+        let s = api(Blocking::Yes, 0.9);
+        assert!(s.applies_to(""), "default specs govern classic call sites");
+        assert!(
+            !s.applies_to("background_job"),
+            "a spec that never declared job-altitude applicability must not decide job sites"
+        );
+    }
+
+    #[test]
+    fn declared_site_kinds_scope_the_spec_exactly() {
+        let mut job_only = api(Blocking::Yes, 0.9);
+        job_only.site_kinds = vec!["background_job".into()];
+        assert!(job_only.applies_to("background_job"));
+        assert!(
+            !job_only.applies_to(""),
+            "a job-altitude spec must not leak onto classic call sites"
+        );
+
+        // Both altitudes, declared explicitly: "" is the classic call site.
+        let mut both = api(Blocking::Yes, 0.9);
+        both.site_kinds = vec![String::new(), "background_job".into()];
+        assert!(both.applies_to("") && both.applies_to("background_job"));
+        assert!(
+            !both.applies_to("server_entry"),
+            "undeclared kinds stay out"
+        );
+    }
+
     #[test]
     fn client_family_classifies_the_real_corpus_types() {
         use super::{client_family, Family};

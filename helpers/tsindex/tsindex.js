@@ -102,6 +102,53 @@ const WEAK_IO_METHODS = new Set([
   'read', 'write', 'delete', 'fetch', 'exec', 'do',
 ]);
 
+// ---------------------------------------------------------------------------
+// G3 background-job registration surfaces (po-av01j.4).
+//
+// Schedulers, cron registrations, dispatchers, and worker handler
+// registrations ride the SAME packet stream, marked
+// site_kind="background_job". Like the I/O-method allowlists this is a
+// RETRIEVAL selection table, not a judgment: it picks which sites to mark;
+// whether a registration needs a bound is spec knowledge downstream
+// (ApiSpec.site_kinds). Detection is TYPE-driven through the checker — the
+// receiver (or constructed class) must resolve into the framework's npm
+// package — so an untyped lookalike is never guessed at (abstain-by-omission).
+// ---------------------------------------------------------------------------
+
+// Method calls that register/dispatch background work, keyed on the resolved
+// `<pkg>.<Type>` client type. `type: null` accepts any type from the package
+// (typings vary across cron libraries; the package identity is the signal).
+const JOB_REGISTRATIONS = [
+  { pkg: 'bullmq', type: 'Queue', methods: new Set(['add', 'addBulk']) },
+  { pkg: 'agenda', type: null, methods: new Set(['define', 'every', 'schedule']) },
+  { pkg: 'node-cron', type: null, methods: new Set(['schedule']) },
+];
+
+// Constructions that ARE registrations: `new Worker(name, processor)` hands
+// bullmq the handler, so the new-expression is the registration site.
+const JOB_CTOR_TYPES = [{ pkg: 'bullmq', type: 'Worker' }];
+
+// isJobRegistration reports whether a RESOLVED client method call registers
+// background work: `<pkg>.<Type>` must match an entry's package (and type,
+// when the entry pins one) and the method its set.
+function isJobRegistration(clientType, method) {
+  for (const entry of JOB_REGISTRATIONS) {
+    if (!entry.methods.has(method)) continue;
+    if (entry.type === null) {
+      if (clientType.startsWith(entry.pkg + '.')) return true;
+    } else if (clientType === entry.pkg + '.' + entry.type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// isJobCtor reports whether a resolved constructed type is a handler
+// registration (see JOB_CTOR_TYPES).
+function isJobCtor(clientType) {
+  return JOB_CTOR_TYPES.some((e) => clientType === e.pkg + '.' + e.type);
+}
+
 const NOISE_METHODS = new Set([
   // chainable / promise
   'then', 'catch', 'finally',
@@ -572,6 +619,10 @@ function runRetrieve(root, snapshot, filesArg) {
       ) {
         const rec = siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned);
         if (rec) records.push(rec);
+      } else if (ts.isNewExpression(node)) {
+        // G3: some constructions ARE handler registrations (bullmq Worker).
+        const rec = jobSiteFromNew(node, sf, relPath, snapshot, checker, program);
+        if (rec) records.push(rec);
       }
       ts.forEachChild(node, visit);
     };
@@ -766,6 +817,9 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     // (TypeScript has no macros; C/C++ sets it mechanically).
     const_args: constArgsOf(node, checker),
     macro_expansion: false,
+    // G3: a resolved scheduler/queue registration is a background-job site;
+    // everything else stays the classic call site.
+    site_kind: resolved && isJobRegistration(clientType, method) ? 'background_job' : '',
     client_construction: constructionFor(
       receiver,
       checker,
@@ -784,6 +838,54 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     lang: 'typescript',
   };
   return rec;
+}
+
+// jobSiteFromNew emits the background-job site for a construction that IS a
+// handler registration (`new Worker(name, processor)` in bullmq). The
+// constructed class must RESOLVE to a known framework package; any other
+// new-expression returns null and is not a site. `func` is "constructor",
+// matching how enclosingFunction names constructor bodies.
+function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
+  const callee = node.expression;
+  if (!callee) return null;
+  const { clientType, resolved, version } = resolveClientType(
+    callee,
+    checker,
+    program,
+  );
+  if (!resolved || !isJobCtor(clientType)) return null;
+
+  const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+  const enc = enclosingFunction(node);
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit()
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: line + 1,
+    symbol: enc.name,
+    func: 'constructor',
+    receiver: callee.getText(),
+    client_type: clientType,
+    client_version: version,
+    snippet: cap(node.getText()),
+    enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
+    callers: [],
+    callees: [],
+    const_args: constArgsOf(node, checker),
+    macro_expansion: false,
+    site_kind: 'background_job',
+    client_construction: [],
+    provenance: {
+      client_type_resolved: true,
+      confidence_tier: 'high',
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
 }
 
 // Write a string to fd 1 (stdout) SYNCHRONOUSLY and completely. process.exit()

@@ -772,6 +772,187 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
     );
 }
 
+// --- G3 background-job lane (po-av01j.4) ---
+
+/// The SEED spec fixture for the background-job lane (RC-060 + job-altitude
+/// timeout re-application). Production specs ride the LLM factory; this file
+/// exists so the e2e tests exercise real verdicts.
+fn background_jobs_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("background_jobs_specs.json")
+}
+
+fn helper_fixture(helper: &str) -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    workspace
+        .join("helpers")
+        .join(helper)
+        .join("testdata")
+        .join("fixture")
+}
+
+/// Run `rvlscan scan <fixture>` with the seed background-job specs and return
+/// the findings rows from `--out`. `envs` carries the helper override.
+fn scan_fixture_findings(
+    dir: &std::path::Path,
+    fixture: &std::path::Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Vec<serde_json::Value> {
+    let out_path = dir.join("findings.json");
+    let mut cmd = bin();
+    cmd.arg("scan")
+        .arg(fixture)
+        .arg("--specs-file")
+        .arg(background_jobs_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.join("cache"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    rows.as_array().expect("findings must be an array").clone()
+}
+
+/// (verdict, reason) of every finding whose site_id contains `path_frag`.
+fn verdicts_for(rows: &[serde_json::Value], path_frag: &str) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|r| r["site_id"].as_str().is_some_and(|s| s.contains(path_frag)))
+        .map(|r| {
+            (
+                r["verdict"].as_str().unwrap_or_default().to_string(),
+                r["reason"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Go e2e: goindex retrieves the cron/ticker fixture, and the job-altitude
+/// timeout judgment (existing machinery, new sites) tells the bare cron
+/// registration from the one whose closure derives a deadline.
+#[test]
+fn scan_decides_go_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("goindex"),
+        &[("RVLSCAN_GOINDEX", goindex_bin.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.go");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare cron registration must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("deadline derived in scope")),
+        "the deadline-deriving registration must satisfy: {jobs:?}"
+    );
+    // The ticker loop's seed spec is `depends`: routed to per-site judgment.
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the ticker worker loop must abstain on the depends spec: {jobs:?}"
+    );
+}
+
+/// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
+/// time_limit satisfies, the bare @app.task violates, and a classic-call-site
+/// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
+/// site (the applicability guard, end to end).
+#[test]
+fn scan_decides_python_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
+        return;
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("pyindex"),
+        &[("RVLSCAN_PYINDEX", pyindex.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.py");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("bounding decorator")),
+        "@shared_task(time_limit=120) must satisfy via the decorator bound: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare @app.task must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("site kind")),
+        "the classic rq.Queue.enqueue spec must not decide the background_job dispatch: {jobs:?}"
+    );
+}
+
+/// TypeScript e2e: the bullmq dispatch with a per-job timeout option
+/// satisfies via the call-arg mechanism; the bare dispatch violates.
+#[test]
+fn scan_decides_typescript_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
+        return;
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let tsindex_dir = workspace.join("helpers").join("tsindex");
+    if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
+        eprintln!(
+            "SKIP scan_decides_typescript_background_job_sites_end_to_end: run `npm install` in helpers/tsindex first"
+        );
+        return;
+    }
+    let tsindex_js = tsindex_dir.join("tsindex.js");
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("tsindex"),
+        &[("RVLSCAN_TSINDEX", tsindex_js.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.ts");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("timeout argument at the call")),
+        "the timeout-carrying dispatch must satisfy: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare dispatch must violate: {jobs:?}"
+    );
+}
+
 // --- G7 repo-structure lane (po-av01j.7) ---
 
 /// A `--retrieved` stream carrying a `repo_structure` record surfaces its

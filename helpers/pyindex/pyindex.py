@@ -111,6 +111,74 @@ def _is_io_method(method, resolved):
 
 
 # ---------------------------------------------------------------------------
+# G3 background-job registration surfaces (po-av01j.4).
+#
+# Schedulers, cron registrations, dispatchers, and worker loops ride the SAME
+# packet stream, marked site_kind="background_job". Like the I/O-method
+# allowlists this is a RETRIEVAL selection table, not a judgment: it picks
+# which sites to surface; whether a registration needs a bound is spec
+# knowledge downstream (ApiSpec.site_kinds). Detection is IMPORT-driven -- the
+# receiver or decorator must resolve through this module's imports into the
+# framework's package -- so a same-named method on an unresolved object is
+# never guessed at (abstain-by-omission).
+# ---------------------------------------------------------------------------
+
+# Registration/dispatch/loop methods called on a resolved framework object,
+# keyed by the ROOT package of the resolved client type.
+JOB_CALL_METHODS = {
+    "celery": frozenset({"send_task", "add_periodic_task"}),
+    "apscheduler": frozenset({"add_job"}),
+    "rq": frozenset({"enqueue", "enqueue_call", "enqueue_at", "enqueue_in",
+                     "work"}),
+}
+
+# Decorator ATTRIBUTES that register the decorated function as background
+# work (`@app.task`, `@sched.scheduled_job(...)`), keyed the same way.
+JOB_DECORATOR_ATTRS = {
+    "celery": frozenset({"task", "periodic_task"}),
+    "apscheduler": frozenset({"scheduled_job"}),
+}
+
+# Imported NAMES that are themselves registration decorators
+# (`from celery import shared_task`): dotted import -> (client_type, method).
+JOB_DECORATOR_IMPORTS = {
+    "celery.shared_task": ("celery", "shared_task"),
+    "celery.task": ("celery", "task"),
+}
+
+
+def _root_package(dotted):
+    return dotted.split(".", 1)[0] if dotted else ""
+
+
+def _is_job_call(method, client_type, resolved):
+    """A method call registers/dispatches background work only when its
+    receiver RESOLVED to a known scheduler/queue framework type."""
+    if not resolved:
+        return False
+    methods = JOB_CALL_METHODS.get(_root_package(client_type))
+    return bool(methods and method in methods)
+
+
+def _job_decorator(idx, dec):
+    """(client_type, method) when `dec` registers the decorated function as
+    background work, else None. Both idioms: an attribute decorator on a
+    resolved framework object, and a decorator imported from the framework."""
+    node = dec.func if isinstance(dec, ast.Call) else dec
+    if isinstance(node, ast.Attribute):
+        client_type, resolved = idx.resolve_receiver(node.value)
+        if resolved:
+            attrs = JOB_DECORATOR_ATTRS.get(_root_package(client_type))
+            if attrs and node.attr in attrs:
+                return client_type, node.attr
+    elif isinstance(node, ast.Name):
+        dotted = idx.imports.get(node.id)
+        if dotted in JOB_DECORATOR_IMPORTS:
+            return JOB_DECORATOR_IMPORTS[dotted]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Expression rendering
 # ---------------------------------------------------------------------------
 
@@ -400,7 +468,8 @@ def retrieve_file(abs_path, file_path, snapshot):
         method = func.attr
         recv = func.value
         client_type, resolved = idx.resolve_receiver(recv)
-        if not _is_io_method(method, resolved):
+        is_job = _is_job_call(method, client_type, resolved)
+        if not is_job and not _is_io_method(method, resolved):
             continue
 
         recv_str = expr_to_str(recv)
@@ -430,6 +499,9 @@ def retrieve_file(abs_path, file_path, snapshot):
             # flag (Python has no macros; C/C++ sets it mechanically).
             "const_args": _const_args(node, idx),
             "macro_expansion": False,
+            # G3: a resolved scheduler/queue registration is a background-job
+            # site; everything else stays the classic call site.
+            "site_kind": "background_job" if is_job else "",
             "provenance": {
                 "client_type_resolved": resolved,
                 "callers_total": 0,
@@ -440,6 +512,62 @@ def retrieve_file(abs_path, file_path, snapshot):
             "lang": "python",
         }
         out.append(record)
+    out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
+    return out
+
+
+def _job_decorator_records(tree, idx, source, file_path, snapshot):
+    """Background-job sites registered by DECORATOR (G3): `@app.task`,
+    `@shared_task(time_limit=...)`, `@sched.scheduled_job(...)`. The
+    registration site is the decorator itself; the decorated function is the
+    job body, emitted as the enclosing source. The function's decorators also
+    ride provenance.chain_roots as structural facts, so the existing
+    decorator-bound judgment mechanism downstream sees a time_limit without
+    any new machinery."""
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = ["@" + _segment(source, d) for d in node.decorator_list]
+        for dec in node.decorator_list:
+            hit = _job_decorator(idx, dec)
+            if hit is None:
+                continue
+            client_type, method = hit
+            head = dec.func if isinstance(dec, ast.Call) else dec
+            receiver = expr_to_str(
+                head.value if isinstance(head, ast.Attribute) else head)
+            out.append({
+                "packet_schema": PACKET_SCHEMA,
+                "site_key": "",  # stamped in emit()
+                "snapshot_id": snapshot,
+                "file_path": file_path,
+                "line_number": dec.lineno,
+                "symbol": node.name,
+                "func": method,
+                "receiver": receiver,
+                "client_type": client_type,
+                "snippet": "@" + _segment(source, dec),
+                "enclosing_function_body": _segment(source, node),
+                "callers": [],
+                "callees": [],
+                "client_construction": [],
+                "const_args": _const_args(dec, idx) if isinstance(dec, ast.Call) else [],
+                "macro_expansion": False,
+                "site_kind": "background_job",
+                "provenance": {
+                    "client_type_resolved": True,
+                    "callers_total": 0,
+                    "callers_included": 0,
+                    "callees_total": 0,
+                    "callees_included": 0,
+                    "chain_roots": [{
+                        "symbol": node.name,
+                        "decorators": decorators,
+                    }],
+                },
+                "lang": "python",
+            })
     return out
 
 

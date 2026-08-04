@@ -284,6 +284,16 @@ pub struct Site {
     /// for C/C++ (expansion locations); other languages emit false/absent.
     #[serde(default)]
     pub macro_expansion: bool,
+    /// What KIND of surface this site is. Empty means the classic G1 client
+    /// call site (every pre-G3 stream); `"background_job"` marks a G3
+    /// background-job entry point — a scheduler/cron registration, queue
+    /// worker handler registration, or dispatcher/worker-loop site
+    /// (po-av01j.4). Retrieval only: the retriever reports WHERE the
+    /// registration is; whether a control governs that kind of site is spec
+    /// knowledge (`ApiSpec::site_kinds`). Additive default-carrying field
+    /// within the unreleased v2 train — deliberately not a schema bump.
+    #[serde(default)]
+    pub site_kind: String,
 }
 
 impl Site {
@@ -534,6 +544,35 @@ mod tests {
         assert_eq!(got.const_args[0].index, 1);
         assert_eq!(got.const_args[0].value, "CURLOPT_TIMEOUT");
         assert_eq!(got.const_args[0].how, "named_constant");
+    }
+
+    #[test]
+    fn site_kind_rides_the_stream_and_defaults_to_classic_call_site() {
+        // G3 (po-av01j.4): background-job sites ride the SAME Site stream,
+        // distinguished by an additive `site_kind` field. Absent means the
+        // classic G1 call site, so every existing stream parses unchanged;
+        // a "background_job" stamp must survive parse -> serialize intact.
+        // Additive default-carrying field within the unreleased v2 train:
+        // deliberately NOT a schema bump.
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"file_path":"jobs.go","line_number":12,"func":"AddFunc","client_type":"github.com/robfig/cron/v3.Cron","site_kind":"background_job"}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0, "site_kind must not break parsing");
+        assert_eq!(sites.len(), 2);
+        let classic = serde_json::to_value(&sites[0]).unwrap();
+        let job = serde_json::to_value(&sites[1]).unwrap();
+        assert_eq!(
+            classic["site_kind"], "",
+            "absent site_kind must default to the classic G1 call site"
+        );
+        assert_eq!(
+            job["site_kind"], "background_job",
+            "a background_job stamp must round-trip through Site"
+        );
     }
 
     #[test]
