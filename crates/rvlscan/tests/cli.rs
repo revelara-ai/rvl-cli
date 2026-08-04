@@ -891,6 +891,68 @@ fn config_findings_are_waivable_by_format_key_rule() {
     );
 }
 
+// --- G6 dep-manifests family (po-av01j.22) ---
+
+/// A repo with a floating base image and a toolchain-less go.mod; SEED
+/// test-grade ConfigKeySpecs judge both (the production corpus is a factory
+/// follow-up). The G7 structure lane covers lockfile PRESENCE separately;
+/// these specs judge per-KEY resolved values, the config-spec altitude.
+#[test]
+fn scan_runs_the_dep_manifests_family_with_seed_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src = root.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = root.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::write(root.join("Dockerfile"), "FROM alpine:latest\nRUN true\n").unwrap();
+    std::fs::write(root.join("go.mod"), "module example.com/svc\n\ngo 1.22\n").unwrap();
+    let specs = root.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"dep-manifests","key":"dockerfile.base_image_pin","expect":{"kind":"one_of","values":["digest","tag"]},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin the base image to an immutable tag or digest","rationale":"a floating base image changes under you"},
+            {"format":"dep-manifests","key":"go_mod.toolchain","expect":{"kind":"present"},"confidence":0.9,"control":"RC-070","severity":"low","fix":"pin a toolchain directive in go.mod","rationale":"unpinned toolchain floats with the host"}
+        ]
+    }"#).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The floating base image violates the pin-shape spec (the seed-spec
+    // acceptance case) and the spec's control rides the ladder.
+    assert!(
+        stdout.contains("dep-manifests dockerfile.base_image_pin"),
+        "floating base image must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-045"),
+        "the pinning spec's control rides into the ladder: {stdout}"
+    );
+    // The absent toolchain resolves through the documented `local` default,
+    // which an explicit-Present spec judges as a violation.
+    assert!(
+        stdout.contains("dep-manifests go_mod.toolchain"),
+        "toolchain-less go.mod must surface: {stdout}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code

@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
@@ -148,6 +149,7 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
     vec![
         Box::new(github_actions::GithubActions),
         Box::new(gitlab_ci::GitlabCi),
+        Box::new(dep_manifests::DepManifests),
     ]
 }
 
@@ -210,6 +212,18 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     }
     if name == "kustomization.yaml" || name == "kustomization.yml" {
         return Some("kustomize");
+    }
+    // Dependency-manifest variants the dep-manifests retriever does not parse
+    // yet (family po-av01j.22): identity-only, pure basename, no read.
+    match name {
+        "pom.xml" => return Some("maven"),
+        "build.gradle" | "build.gradle.kts" => return Some("gradle"),
+        "Gemfile" => return Some("bundler"),
+        "composer.json" => return Some("composer"),
+        "Pipfile" => return Some("pipfile"),
+        "mix.exs" => return Some("mix"),
+        "build.sbt" => return Some("sbt"),
+        _ => {}
     }
     if is_yaml {
         // Bounded sniffs over the head of the file. Only the IDENTITY of the
@@ -387,6 +401,15 @@ mod tests {
         );
         assert_eq!(sight_format("docs/notes.yaml", "a: b\n"), None);
         assert_eq!(sight_format("src/main.go", ""), None);
+        // Dependency-manifest variants the dep-manifests retriever does not
+        // parse yet: identity-only, basename-shaped.
+        assert_eq!(sight_format("svc/pom.xml", ""), Some("maven"));
+        assert_eq!(sight_format("app/build.gradle.kts", ""), Some("gradle"));
+        assert_eq!(sight_format("Gemfile", ""), Some("bundler"));
+        assert_eq!(sight_format("composer.json", ""), Some("composer"));
+        assert_eq!(sight_format("Pipfile", ""), Some("pipfile"));
+        assert_eq!(sight_format("mix.exs", ""), Some("mix"));
+        assert_eq!(sight_format("build.sbt", ""), Some("sbt"));
     }
 
     #[test]
@@ -415,6 +438,43 @@ mod tests {
             ]
         );
         assert!(got.packets.is_empty());
+    }
+
+    #[test]
+    fn retrieve_repo_routes_dep_manifests_to_the_dep_manifests_retriever() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM alpine:latest\n").unwrap();
+        // A vendored manifest must NOT be retrieved.
+        std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        std::fs::write(root.join("node_modules/dep/package.json"), "{}").unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "dep-manifests" && p.key == "package_json.engines.node"),
+            "package.json routes to the dep-manifests retriever: {:?}",
+            got.packets
+        );
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.key == "dockerfile.base_image_pin"),
+            "Dockerfile routes to the dep-manifests retriever: {:?}",
+            got.packets
+        );
+        assert!(
+            !got.packets
+                .iter()
+                .any(|p| p.file_path.starts_with("node_modules/")),
+            "vendored manifests are never retrieved: {:?}",
+            got.packets
+        );
+        assert!(
+            got.sightings.is_empty(),
+            "a supported format is not sighted"
+        );
     }
 
     #[test]
