@@ -40,10 +40,10 @@ def _retrieve_records(*extra):
 
 
 class TestPacketSchema(unittest.TestCase):
-    def test_packet_schema_prints_one(self):
+    def test_packet_schema_prints_the_v2_version(self):
         code, out, _ = _run("--packet-schema")
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "1")
+        self.assertEqual(out.strip(), "2")
 
 
 class TestRetrievedPackets(unittest.TestCase):
@@ -51,7 +51,7 @@ class TestRetrievedPackets(unittest.TestCase):
         records = _retrieve_records()
         self.assertGreaterEqual(len(records), 1, "expected at least one site")
         for rec in records:
-            self.assertEqual(rec["packet_schema"], 1, "packet_schema must be 1")
+            self.assertEqual(rec["packet_schema"], 2, "packet_schema must be 2")
             self.assertTrue(rec["site_key"], "site_key must be stamped on every packet")
             self.assertEqual(rec["lang"], "python")
 
@@ -111,6 +111,46 @@ class TestRetrievedPackets(unittest.TestCase):
         methods = {r["func"] for r in records}
         self.assertNotIn("append", methods)
         self.assertNotIn("join", methods)
+
+    def test_const_args_and_macro_flag(self):
+        """Schema v2 (po-av01j.19): constant-valued arguments are evidence,
+        and every site carries the macro flag (false: Python has no macros)."""
+        records = _retrieve_records()
+        for rec in records:
+            self.assertIn("const_args", rec, "const_args must be on every packet")
+            self.assertIs(rec["macro_expansion"], False,
+                          "Python has no macros; macro_expansion must be False")
+
+        def const_by_name(rec, name):
+            return next((a for a in rec["const_args"] if a["name"] == name), None)
+
+        # A keyword literal: requests.get(url, timeout=5).
+        bounded = next(r for r in records
+                       if r["symbol"] == "fetch_user" and r["func"] == "get")
+        lit = const_by_name(bounded, "timeout")
+        self.assertIsNotNone(lit, bounded["const_args"])
+        self.assertEqual(lit["value"], "5")
+        self.assertEqual(lit["how"], "literal")
+
+        # A module-level named constant: requests.get(url, timeout=DEFAULT_TIMEOUT).
+        named_rec = next(r for r in records
+                         if r["symbol"] == "fetch_status" and r["func"] == "get")
+        named = const_by_name(named_rec, "timeout")
+        self.assertIsNotNone(named, named_rec["const_args"])
+        self.assertEqual(named["value"], "30")
+        self.assertEqual(named["how"], "named_constant")
+
+        # A positional string literal is a const arg at its written index.
+        health = next(r for r in records
+                      if r["symbol"] == "" and r["func"] == "get"
+                      and "health" in r["snippet"])
+        pos = next((a for a in health["const_args"] if a["index"] == 0), None)
+        self.assertIsNotNone(pos, health["const_args"])
+        self.assertEqual(pos["how"], "literal")
+
+        # A variable argument must NOT be reported: cache.get(key).
+        cached = next(r for r in records if r["symbol"] == "cached_lookup")
+        self.assertEqual(cached["const_args"], [])
 
     def test_files_filter_is_exact_path(self):
         # the incremental path emits only the listed file

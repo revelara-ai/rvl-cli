@@ -37,8 +37,12 @@ const path = require('path');
 // PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
 // helper churn behind this number: a consumer that does not know a version
 // refuses the stream rather than guessing at its shape. It MUST agree with
-// goindex's PacketSchema, pyindex's PACKET_SCHEMA, and rvl_index's schema.
-const PACKET_SCHEMA = 1;
+// goindex's PacketSchema, pyindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
+//
+// v2 adds const_args (constant-valued arguments at the call site) and
+// macro_expansion (always false for TypeScript, which has no macros;
+// mechanical for C/C++). v2 is a strict superset of v1.
+const PACKET_SCHEMA = 2;
 
 // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes and
 // pyindex's MAX_SNIPPET_BYTES. A pathologically long function body should not
@@ -630,6 +634,89 @@ function realOr(p) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Constant-valued arguments (schema v2).
+//
+// Evidence, never a verdict: the emitter reports that an argument's value is
+// knowable without running the program, and how it was determined. What the
+// value MEANS is spec-layer knowledge. Only literal tokens and one-hop named
+// constants (a `const` with a literal initializer, an enum member the checker
+// folds) are resolved — no deep constant propagation.
+// ---------------------------------------------------------------------------
+
+// literalText returns the source text of a literal expression, or null when
+// the expression is not a literal. Template literals WITH substitutions are
+// not literals; `-1` (a prefix minus on a numeric literal) is.
+function literalText(node) {
+  if (
+    ts.isStringLiteralLike(node) ||
+    ts.isNumericLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return node.getText();
+  }
+  if (
+    ts.isPrefixUnaryExpression(node) &&
+    node.operator === ts.SyntaxKind.MinusToken &&
+    ts.isNumericLiteral(node.operand)
+  ) {
+    return node.getText();
+  }
+  return null;
+}
+
+// namedConstantText resolves a reference one hop to its constant value:
+// an enum member access via the checker's own constant folding, or an
+// identifier declared `const` with a literal initializer. Returns the value's
+// source-level rendering, or null when the reference is not a constant.
+function namedConstantText(node, checker) {
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    let cv;
+    try {
+      cv = checker.getConstantValue(node);
+    } catch (_e) {
+      cv = undefined;
+    }
+    if (cv === undefined) return null;
+    return typeof cv === 'string' ? JSON.stringify(cv) : String(cv);
+  }
+  if (!ts.isIdentifier(node)) return null;
+  let sym;
+  try {
+    sym = checker.getSymbolAtLocation(node);
+  } catch (_e) {
+    return null;
+  }
+  if (!sym) return null;
+  const decl = sym.valueDeclaration;
+  if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer) return null;
+  if (!(ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const)) return null;
+  return literalText(decl.initializer);
+}
+
+// constArgsOf reports the constant-valued arguments of a call, as
+// {index, name, value, how}. `index` is the zero-based position as written;
+// `name` is always "" (TypeScript has no keyword arguments); `how` is
+// "literal" or "named_constant".
+function constArgsOf(node, checker) {
+  const out = [];
+  const args = node.arguments || [];
+  for (let i = 0; i < args.length; i++) {
+    const lit = literalText(args[i]);
+    if (lit !== null) {
+      out.push({ index: i, name: '', value: lit, how: 'literal' });
+      continue;
+    }
+    const named = namedConstantText(args[i], checker);
+    if (named !== null) {
+      out.push({ index: i, name: '', value: named, how: 'named_constant' });
+    }
+  }
+  return out;
+}
+
 function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned) {
   const prop = node.expression; // PropertyAccessExpression
   const receiver = prop.expression;
@@ -673,8 +760,12 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     client_version: version,
     snippet: cap(node.getText()),
     enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
-    callers: [], // empty in v1 (no cross-module call graph)
-    callees: [], // empty in v1
+    callers: [], // empty (no cross-module call graph yet)
+    callees: [], // empty
+    // Schema v2: constant-valued arguments as evidence, and the macro flag
+    // (TypeScript has no macros; C/C++ sets it mechanically).
+    const_args: constArgsOf(node, checker),
+    macro_expansion: false,
     client_construction: constructionFor(
       receiver,
       checker,

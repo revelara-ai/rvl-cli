@@ -116,8 +116,33 @@ type Provenance struct {
 // RetrievedSite is what the labeller's evidence packet is built from.
 // PacketSchema is the version of the emitted packet contract. rvlscan
 // absorbs helper churn behind this number: a consumer that does not know a
-// version refuses the stream rather than guessing at its shape.
-const PacketSchema = 1
+// version refuses the stream rather than guessing at its shape. It MUST
+// agree with pyindex's and tsindex's PACKET_SCHEMA and rvl_core::PACKET_SCHEMA.
+//
+// v2 adds const_args (constant-valued arguments at the call site) and
+// macro_expansion (always false for Go, which has no macros; mechanical for
+// C/C++). v2 is a strict superset of v1.
+const PacketSchema = 2
+
+// ConstArg is a constant-valued argument observed at the call site (schema
+// v2). Evidence, never a verdict: WHAT the value means (CURLOPT_TIMEOUT vs
+// CURLOPT_URL) is library knowledge and belongs to the spec layer. Only
+// literals and constants the type checker folds for free are reported — no
+// deep constant propagation.
+type ConstArg struct {
+	// Index is the zero-based position of the argument as written.
+	Index int `json:"index"`
+	// Name is the keyword/parameter name where the language surface has one;
+	// Go calls are purely positional, so it is always absent here.
+	Name string `json:"name,omitempty"`
+	// Value is the source-level rendering of the folded constant
+	// (go/constant's String: `"SELECT 1"` for strings, `50` for ints).
+	Value string `json:"value"`
+	// How the value was determined: "literal" for a literal token at the
+	// call, "named_constant" for a resolved constant reference or folded
+	// constant expression (2*time.Second).
+	How string `json:"how"`
+}
 
 type RetrievedSite struct {
 	// Schema is stamped on every record so a stream is self-describing even
@@ -149,6 +174,14 @@ type RetrievedSite struct {
 	Callees      []Snippet `json:"callees"`
 	Construction []Snippet `json:"client_construction"`
 	Prov         Provenance `json:"provenance"`
+
+	// ConstArgs: constant-valued arguments at this call site (schema v2).
+	// Emitted as [] when none resolve, so the packet shape is stable.
+	ConstArgs []ConstArg `json:"const_args"`
+	// MacroExpansion: whether the site sits inside a macro expansion. Go has
+	// no macros, so always false here; C/C++ retrievers set it mechanically
+	// from expansion locations.
+	MacroExpansion bool `json:"macro_expansion"`
 }
 
 type srcIndex struct {
@@ -282,6 +315,27 @@ func passesBoundedCtx(info *types.Info, caller *ast.FuncDecl, calleeID string,
 		return true
 	})
 	return sawCall && allBounded
+}
+
+// constArgs reports the arguments of `call` whose values the type checker
+// folds to constants, for free (schema v2). A literal token reports as
+// "literal"; a resolved constant reference or folded constant expression
+// (maxRetries, 2*time.Second) reports as "named_constant". Retrieval only:
+// no deep constant propagation, no opinion about what a value means.
+func constArgs(info *types.Info, call *ast.CallExpr) []ConstArg {
+	out := []ConstArg{}
+	for i, a := range call.Args {
+		tv, ok := info.Types[a]
+		if !ok || tv.Value == nil {
+			continue
+		}
+		how := "named_constant"
+		if _, isLit := a.(*ast.BasicLit); isLit {
+			how = "literal"
+		}
+		out = append(out, ConstArg{Index: i, Value: tv.Value.ExactString(), How: how})
+	}
+	return out
 }
 
 // runRetrieve builds the index and emits retrieved source per I/O call site.
@@ -567,6 +621,7 @@ func runRetrieve(root, name string) []RetrievedSite {
 						Receiver:  exprString(sel.X),
 						CallSite:  src.text(p, c, c),
 						Enclosing: src.text(p, fd, fd),
+						ConstArgs: constArgs(info, c),
 					}
 					if t := info.TypeOf(sel.X); t != nil {
 						rs.ClientType = strings.TrimPrefix(t.String(), "*")
