@@ -144,16 +144,30 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    /// Build the index from a retriever packet stream. Explicit and off the
-    /// hook path: a cold full load is never paid during a commit.
+    /// Build the index. Explicit and off the hook path: a cold full load is
+    /// never paid during a commit. With --retrieved, loads a prebuilt packet
+    /// stream; without, runs the language helpers over the repo itself.
     Init {
+        /// Repository root to index (defaults to the current directory).
+        path: Option<PathBuf>,
         #[arg(long)]
-        retrieved: PathBuf,
+        retrieved: Option<PathBuf>,
     },
-    /// Re-index from a packet stream. What a post-commit hook invokes.
+    /// Re-index. What a post-commit hook invokes: live mode (no --retrieved)
+    /// hash-gates the sources and re-retrieves only what changed.
     Reindex {
+        /// Repository root to re-index (defaults to the current directory).
+        path: Option<PathBuf>,
         #[arg(long)]
-        retrieved: PathBuf,
+        retrieved: Option<PathBuf>,
+        /// Comma-separated repo-relative files to consider (defaults to every
+        /// supported source file under the root).
+        #[arg(long)]
+        files: Option<String>,
+        /// Spawn the reindex detached and return immediately, so a commit
+        /// hook never waits on the warm.
+        #[arg(long)]
+        detach: bool,
     },
     /// Show how many files are indexed.
     Status,
@@ -851,7 +865,9 @@ fn run_scan(
     let stream = resolve_packet_stream(retrieved, path)?;
     let (findings, items, sites) =
         resolve_findings(store, keyset, &stream, specs_file, judgments, true)?;
-    render_scan_output(state_path, path, &findings, &items, &sites, out, color, start)
+    render_scan_output(
+        state_path, path, &findings, &items, &sites, out, color, start,
+    )
 }
 
 /// What `scan` persists for `explain`/`suppress` to resolve finding ids from.
@@ -1271,6 +1287,118 @@ fn incremental_scan_pass(
     })
 }
 
+/// The argv a detached reindex child re-runs: everything except `--detach`
+/// itself, or the respawn would fork forever.
+fn strip_detach_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    args.into_iter().filter(|a| a != "--detach").collect()
+}
+
+/// `index init` / `index reindex`, both packet-stream and live modes.
+///
+/// Live mode (no --retrieved) is the background warm a post-commit hook
+/// triggers: hash-gate the sources, re-retrieve ONLY the changed files
+/// through the language helpers, store the fresh packets. Deliberately NOT
+/// under the incremental wall budget — the budget protects the commit path,
+/// and this runs behind it (with --detach, literally in the background).
+fn run_index_build(
+    cfg: &Config,
+    path: Option<PathBuf>,
+    retrieved: Option<PathBuf>,
+    files: Option<String>,
+    detach: bool,
+) -> anyhow::Result<ExitCode> {
+    if detach {
+        // Respawn ourselves without --detach, fully detached: null stdio and
+        // (on unix) a new process group, so the hook's shell never waits and
+        // a terminal signal to the commit never kills the warm.
+        let exe = std::env::current_exe()?;
+        let args = strip_detach_args(std::env::args().skip(1));
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        println!(
+            "detached (pid {}): reindex continues in the background",
+            child.id()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
+
+    if let Some(retrieved) = retrieved {
+        let stream = std::fs::read_to_string(&retrieved)?;
+        let (sites, _, skipped) = rvl_core::parse_stream(&stream);
+        // Group by originating file so each entry is keyed by that
+        // file's current content hash.
+        let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
+            std::collections::BTreeMap::new();
+        for s in sites {
+            by_file.entry(s.file_path.clone()).or_default().push(s);
+        }
+        let (mut indexed, mut missing) = (0usize, 0usize);
+        for (file, packets) in by_file {
+            let path = PathBuf::from(&file);
+            match rvl_index::hash_file(&path) {
+                Ok(h) => {
+                    idx.put(&path, &h, &packets)?;
+                    indexed += 1;
+                }
+                // The stream can name files this checkout does not
+                // have (foreign corpus); count them, never fail.
+                Err(_) => missing += 1,
+            }
+        }
+        println!("indexed {indexed} file(s) | unreadable {missing} | unparseable lines {skipped}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Live mode: run the helpers ourselves over the changed files.
+    let root = path
+        .unwrap_or_else(|| PathBuf::from("."))
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve repository root: {e}"))?;
+    let candidates: Vec<PathBuf> = match files {
+        Some(list) => list
+            .split(',')
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| root.join(f.trim()))
+            .collect(),
+        None => walk_source_files(&root),
+    };
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no supported source files under {}; nothing to index",
+        root.display()
+    );
+
+    let name = snapshot_name(&root);
+    let retriever = HelperRetriever {
+        root: root.clone(),
+        name,
+    };
+    let scan = incremental_sites(&idx, &root, &candidates, |changed| {
+        let (sites, repo_cfg) = retriever.retrieve_full(changed)?;
+        Ok(RetrieveResult {
+            sites,
+            repo_cfg,
+            degraded_note: None,
+        })
+    })?;
+    println!(
+        "reindexed: reused {} unchanged, retrieved {} changed",
+        scan.reused_files, scan.retrieved_files
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan_incremental(
     store: &CacheStore,
@@ -1306,7 +1434,9 @@ fn run_scan_incremental(
         judgments,
         true,
     )?;
-    render_scan_output(state_path, path, &findings, &items, &sites, out, color, start)
+    render_scan_output(
+        state_path, path, &findings, &items, &sites, out, color, start,
+    )
 }
 
 /// Resolve a finding id the way the ladder's hint promises: from the LAST
@@ -1676,47 +1806,26 @@ fn run() -> anyhow::Result<ExitCode> {
                 cfg.offline,
             )))
         }
-        Cmd::Index { cmd } => {
-            let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
-            match cmd {
-                IndexCmd::Init { retrieved } | IndexCmd::Reindex { retrieved } => {
-                    let stream = std::fs::read_to_string(&retrieved)?;
-                    let (sites, _, skipped) = rvl_core::parse_stream(&stream);
-                    // Group by originating file so each entry is keyed by that
-                    // file's current content hash.
-                    let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
-                        std::collections::BTreeMap::new();
-                    for s in sites {
-                        by_file.entry(s.file_path.clone()).or_default().push(s);
-                    }
-                    let (mut indexed, mut missing) = (0usize, 0usize);
-                    for (file, packets) in by_file {
-                        let path = PathBuf::from(&file);
-                        match rvl_index::hash_file(&path) {
-                            Ok(h) => {
-                                idx.put(&path, &h, &packets)?;
-                                indexed += 1;
-                            }
-                            // The stream can name files this checkout does not
-                            // have (foreign corpus); count them, never fail.
-                            Err(_) => missing += 1,
-                        }
-                    }
-                    println!(
-                        "indexed {indexed} file(s) | unreadable {missing} | unparseable lines {skipped}"
-                    );
-                    Ok(ExitCode::SUCCESS)
-                }
-                IndexCmd::Status => {
-                    println!(
-                        "{} file(s) indexed at {}",
-                        idx.len()?,
-                        cfg.index_dir.display()
-                    );
-                    Ok(ExitCode::SUCCESS)
-                }
+        Cmd::Index { cmd } => match cmd {
+            IndexCmd::Init { path, retrieved } => {
+                run_index_build(&cfg, path, retrieved, None, false)
             }
-        }
+            IndexCmd::Reindex {
+                path,
+                retrieved,
+                files,
+                detach,
+            } => run_index_build(&cfg, path, retrieved, files, detach),
+            IndexCmd::Status => {
+                let idx = rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb"))?;
+                println!(
+                    "{} file(s) indexed at {}",
+                    idx.len()?,
+                    cfg.index_dir.display()
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Cmd::Cache { cmd } => match cmd {
             CacheCmd::Import { artifact, sig } => {
                 let sig = sig.unwrap_or_else(|| {
@@ -1787,6 +1896,23 @@ mod tests {
 
     // Serializes tests that mutate process-global env so they don't race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn strip_detach_removes_only_the_detach_flag() {
+        let args = vec![
+            "index".to_string(),
+            "reindex".to_string(),
+            "--detach".to_string(),
+            "/some/repo".to_string(),
+            "--files".to_string(),
+            "a.go,b.go".to_string(),
+        ];
+        assert_eq!(
+            strip_detach_args(args),
+            vec!["index", "reindex", "/some/repo", "--files", "a.go,b.go"],
+            "everything except --detach must survive, or the child re-forks forever"
+        );
+    }
 
     fn touch(path: &Path) {
         std::fs::write(path, "").unwrap();

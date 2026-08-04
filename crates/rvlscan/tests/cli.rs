@@ -338,3 +338,159 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
         "closing the pipe must not panic the scanner: {stderr}"
     );
 }
+
+// --- background re-index: live mode + --detach (po-3t3oj.14 slice C) ---
+
+/// Build goindex from source, or None when no Go toolchain is available (the
+/// test is then skipped with a log line, matching the scan e2e convention).
+fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let goindex_src = workspace.join("helpers").join("goindex");
+    let goindex_bin = dir.join("goindex");
+    match Command::new("go")
+        .args(["build", "-o"])
+        .arg(&goindex_bin)
+        .arg(".")
+        .current_dir(&goindex_src)
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(goindex_bin),
+        Ok(out) => {
+            eprintln!(
+                "SKIP: go build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP: go toolchain not available: {e}");
+            None
+        }
+    }
+}
+
+fn goindex_fixture() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    workspace
+        .join("helpers")
+        .join("goindex")
+        .join("testdata")
+        .join("fixture")
+}
+
+/// `index reindex <repo>` with NO --retrieved runs the helpers itself: this is
+/// the background warm a post-commit hook triggers, so it cannot depend on a
+/// pre-produced packet stream existing.
+#[test]
+fn index_reindex_live_mode_runs_the_go_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let fixture = goindex_fixture();
+
+    let out = bin()
+        .args(["index", "reindex"])
+        .arg(&fixture)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "live reindex failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("retrieved"),
+        "live reindex must report what it retrieved: {stdout}"
+    );
+
+    // The index now holds the fixture's files: a status check proves the
+    // background warm actually landed packets.
+    let status = bin()
+        .args(["index", "status"])
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let status_out = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        !status_out.starts_with("0 file(s)"),
+        "index must not be empty after a live reindex: {status_out}"
+    );
+
+    // A second live pass over unchanged content retrieves nothing: the
+    // hash-gate reuses everything, so the background warm is idempotent-cheap.
+    let again = bin()
+        .args(["index", "reindex"])
+        .arg(&fixture)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let again_out = String::from_utf8(again.stdout).unwrap();
+    assert!(
+        again_out.contains("retrieved 0"),
+        "unchanged content must be fully reused on the second pass: {again_out}"
+    );
+}
+
+/// `--detach` returns the parent immediately (this is the line a post-commit
+/// hook runs; the commit must not wait) while the child warms the index
+/// behind it.
+#[test]
+fn index_reindex_detach_returns_immediately_and_child_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let fixture = goindex_fixture();
+
+    let started = std::time::Instant::now();
+    let out = bin()
+        .args(["index", "reindex", "--detach"])
+        .arg(&fixture)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let parent_elapsed = started.elapsed();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "detach parent must exit 0: {stdout}");
+    assert!(
+        stdout.contains("detached"),
+        "parent must confirm the detached spawn: {stdout}"
+    );
+    // The whole point: the parent returns long before a helper run completes.
+    assert!(
+        parent_elapsed < std::time::Duration::from_secs(5),
+        "detached parent took {parent_elapsed:?}; it must not wait for the reindex"
+    );
+
+    // The child eventually lands packets in the index.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = bin()
+            .args(["index", "status"])
+            .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvlscan");
+        let s = String::from_utf8(status.stdout).unwrap();
+        if !s.starts_with("0 file(s)") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached child never populated the index: {s}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
