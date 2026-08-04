@@ -383,6 +383,61 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
         .collect()
 }
 
+// --- G7 repo-structure lane (po-av01j.7) ---
+
+/// Map repo-structure control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the facts record); every one
+/// renders ADVISORY — a structural shape never blocks a commit. The waiver
+/// key is `repo_structure.RC-XXX`, so `rvlscan suppress` and `.revelara.yaml`
+/// waivers work on these like any other finding.
+fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("repo_structure.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f.evidence.first().cloned().unwrap_or_else(|| "repo".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium/low severity + zero incident counts is
+                // exactly the Advisory cell of render::classify. Structure
+                // verdicts are judged by the evaluator itself, so they are
+                // not "unjudged" (which would print "severity unrated").
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
+/// The ladder findings for this scan's repo-structure lane. Live scans
+/// inventory the tree directly; a `--retrieved` scan has no tree, so the
+/// facts come from the `repo_structure` record riding the prebuilt stream
+/// (absent record = no facts = no findings, honestly).
+fn resolve_structure_findings(
+    retrieved: Option<&Path>,
+    stream: &str,
+    path: &Path,
+) -> Vec<render::Finding> {
+    let facts = if retrieved.is_some() {
+        rvl_structure::parse_record(stream)
+    } else {
+        Some(rvl_structure::retrieve(path, &snapshot_name(path)))
+    };
+    facts
+        .map(|f| structure_to_findings(&rvl_structure::evaluate(&f)))
+        .unwrap_or_default()
+}
+
 // --- single-command scan: language detection + helper orchestration (po-3t3oj.25) ---
 //
 // Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
@@ -1035,7 +1090,20 @@ fn run_scan(
     // alone and coverage reports zero API surfaces. Without content findings
     // the original fail-closed guidance stands.
     if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
-        return render_scan_output(state_path, path, &[], &citems, &[], out, color, start);
+        // Content-only repo: no packet stream exists, so the structure lane
+        // inventories the live tree directly (same as the incremental path).
+        let structure = resolve_structure_findings(None, "", path);
+        return render_scan_output(
+            state_path,
+            path,
+            &[],
+            &citems,
+            &[],
+            &structure,
+            out,
+            color,
+            start,
+        );
     }
     let stream = resolve_packet_stream(retrieved, path)?;
     let (findings, mut items, sites) = resolve_findings(
@@ -1048,8 +1116,9 @@ fn run_scan(
         true,
     )?;
     items.extend(citems);
+    let structure = resolve_structure_findings(retrieved, &stream, path);
     render_scan_output(
-        state_path, path, &findings, &items, &sites, out, color, start,
+        state_path, path, &findings, &items, &sites, &structure, out, color, start,
     )
 }
 
@@ -1116,6 +1185,7 @@ fn render_scan_output(
     findings: &[rvl_propagate::Finding],
     items: &[rvl_triage::TriagedItem],
     sites: &[rvl_core::Site],
+    structure: &[render::Finding],
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -1145,6 +1215,9 @@ fn render_scan_output(
         }
     }
     let mut ladder_findings = triage_to_findings(items);
+    // Repo-structure lane findings join the ladder (always Advisory) and the
+    // persisted last-scan state, so explain/suppress resolve their ids too.
+    ladder_findings.extend(structure.iter().cloned());
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -1655,8 +1728,11 @@ fn run_scan_incremental(
     // change with the binary, not the sources, so it runs FULL on every warm
     // scan rather than riding the packet index.
     items.extend(content_items(path));
+    // Incremental scans own the live tree, so the structure lane inventories
+    // it directly (one bounded walk; there is no packet stream to ride).
+    let structure = resolve_structure_findings(None, "", path);
     render_scan_output(
-        state_path, path, &findings, &items, &sites, out, color, start,
+        state_path, path, &findings, &items, &sites, &structure, out, color, start,
     )
 }
 
@@ -1715,7 +1791,8 @@ fn run_explain(
     if retrieved.is_none() {
         items.extend(content_items(path));
     }
-    let ladder_findings = triage_to_findings(&items);
+    let mut ladder_findings = triage_to_findings(&items);
+    ladder_findings.extend(resolve_structure_findings(retrieved, &stream, path));
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1774,7 +1851,8 @@ fn run_suppress(
                 if retrieved.is_none() {
                     items.extend(content_items(scan_path));
                 }
-                let ladder_findings = triage_to_findings(&items);
+                let mut ladder_findings = triage_to_findings(&items);
+                ladder_findings.extend(resolve_structure_findings(retrieved, &stream, scan_path));
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -2418,6 +2496,74 @@ mod tests {
 
     fn touch(path: &Path) {
         std::fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn structure_violations_render_advisory_never_blocking() {
+        let violate = rvl_structure::StructureFinding {
+            control: "RC-033",
+            control_name: "unit test coverage",
+            verdict: rvl_core::Verdict::Violates,
+            reason: "no test files: go (40 source files)".into(),
+            evidence: vec![],
+            fix: "add unit tests".into(),
+            severity: "medium",
+            weak: false,
+        };
+        let satisfies = rvl_structure::StructureFinding {
+            control: "RC-006",
+            control_name: "incident runbooks",
+            verdict: rvl_core::Verdict::Satisfies,
+            reason: "runbook directory present".into(),
+            evidence: vec!["docs/runbooks".into()],
+            fix: String::new(),
+            severity: "",
+            weak: true,
+        };
+        let fs = structure_to_findings(&[violate, satisfies]);
+        assert_eq!(fs.len(), 1, "only violations surface in the ladder");
+        let f = &fs[0];
+        assert_eq!(f.control, "RC-033", "control code rides into the ladder");
+        assert_eq!(
+            f.class_rule, "repo_structure.RC-033",
+            "waiver key lets suppress/.revelara.yaml target it"
+        );
+        assert_eq!(
+            render::classify(f),
+            render::Section::Advisory,
+            "a structural shape must never block a commit"
+        );
+    }
+
+    #[test]
+    fn live_scan_structure_findings_inventory_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.go")),
+                "package x\nfunc F() {}\n",
+            )
+            .unwrap();
+        }
+        let fs = resolve_structure_findings(None, "", dir.path());
+        assert!(
+            fs.iter().any(|f| f.control == "RC-033"),
+            "an untested live tree must surface RC-033: {fs:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_stream_without_a_record_yields_no_structure_findings() {
+        // A prebuilt stream may predate the G7 retriever; no facts means no
+        // findings — never a fabricated inventory of the CURRENT directory,
+        // which is a different repo than the stream describes.
+        let fs = resolve_structure_findings(
+            Some(Path::new("prebuilt.jsonl")),
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+            Path::new("."),
+        );
+        assert!(fs.is_empty(), "no record, no findings: {fs:?}");
     }
 
     #[test]
