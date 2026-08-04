@@ -839,6 +839,7 @@ fn stdout_color(mode: Option<&str>) -> bool {
 fn run_scan(
     store: &CacheStore,
     keyset: &Keyset,
+    state_path: &std::path::Path,
     path: &std::path::Path,
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
@@ -850,12 +851,68 @@ fn run_scan(
     let stream = resolve_packet_stream(retrieved, path)?;
     let (findings, items, sites) =
         resolve_findings(store, keyset, &stream, specs_file, judgments, true)?;
-    render_scan_output(path, &findings, &items, &sites, out, color, start)
+    render_scan_output(state_path, path, &findings, &items, &sites, out, color, start)
+}
+
+/// What `scan` persists for `explain`/`suppress` to resolve finding ids from.
+/// The ladder prints `explain: rvlscan explain <id>` as a copy-pasteable hint;
+/// without this state the hint silently re-scans the CURRENT directory with
+/// DEFAULT inputs, which is a different scan (po-3t3oj.38: a scan run with
+/// --retrieved/--specs-file printed ids that bare `explain` could never find).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LastScan {
+    /// Canonical root of the scanned repo; `suppress` writes its waiver here
+    /// when no path is given.
+    root: String,
+    findings: Vec<render::Finding>,
+}
+
+/// The last-scan state file: a sibling of the spec-cache dir, so it lives
+/// under the same RVLSCAN_CACHE_DIR umbrella and never touches the scanned
+/// repo.
+fn last_scan_path(cache_dir: &std::path::Path) -> PathBuf {
+    cache_dir
+        .parent()
+        .unwrap_or(cache_dir)
+        .join("last-scan.json")
+}
+
+/// Best-effort persist: a scan must never fail because its state file could
+/// not be written, but the degradation is said out loud because it breaks the
+/// verbatim `explain` hint.
+fn save_last_scan(state: &std::path::Path, root: &std::path::Path, findings: &[render::Finding]) {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let ls = LastScan {
+        root: canonical.to_string_lossy().into_owned(),
+        findings: findings.to_vec(),
+    };
+    let write = || -> anyhow::Result<()> {
+        if let Some(dir) = state.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(state, serde_json::to_string(&ls)?)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        eprintln!(
+            "warning: could not save scan state to {} ({e}); `rvlscan explain <id>` \
+             will need the same path/flags this scan used",
+            state.display()
+        );
+    }
+}
+
+/// Missing or unreadable state is simply "no last scan" (first run, cleared
+/// cache, or a corrupt file) -- callers fall back to a live re-scan.
+fn load_last_scan(state: &std::path::Path) -> Option<LastScan> {
+    serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()
 }
 
 /// Render the ladder + optional `--out` JSON for a completed scan. Shared by
 /// the packet-stream path and the incremental path so both report identically.
+#[allow(clippy::too_many_arguments)]
 fn render_scan_output(
+    state_path: &std::path::Path,
     path: &std::path::Path,
     findings: &[rvl_propagate::Finding],
     items: &[rvl_triage::TriagedItem],
@@ -902,6 +959,10 @@ fn render_scan_output(
             }
         }
     }
+
+    // Persist the ladder so the printed `explain:`/`suppress:` hints resolve
+    // verbatim, from any directory, without re-running this scan's inputs.
+    save_last_scan(state_path, path, &ladder_findings);
 
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
@@ -1215,6 +1276,7 @@ fn run_scan_incremental(
     store: &CacheStore,
     keyset: &Keyset,
     index_dir: &std::path::Path,
+    state_path: &std::path::Path,
     path: &std::path::Path,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
@@ -1244,13 +1306,31 @@ fn run_scan_incremental(
         judgments,
         true,
     )?;
-    render_scan_output(path, &findings, &items, &sites, out, color, start)
+    render_scan_output(state_path, path, &findings, &items, &sites, out, color, start)
+}
+
+/// Resolve a finding id the way the ladder's hint promises: from the LAST
+/// SCAN's persisted state. Only when no dev override flags are given -- an
+/// explicit --retrieved/--specs-file/--judgments asks for a live re-scan of
+/// exactly those inputs, and gets one.
+fn finding_from_last_scan(
+    state_path: &std::path::Path,
+    id: &str,
+    overridden: bool,
+) -> Option<(render::Finding, String)> {
+    if overridden {
+        return None;
+    }
+    let ls = load_last_scan(state_path)?;
+    let f = ls.findings.iter().find(|f| f.id == id)?.clone();
+    Some((f, ls.root))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_explain(
     store: &CacheStore,
     keyset: &Keyset,
+    state_path: &std::path::Path,
     id: &str,
     path: &std::path::Path,
     retrieved: Option<&std::path::Path>,
@@ -1258,13 +1338,26 @@ fn run_explain(
     judgments: Option<&std::path::Path>,
     color: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
+    let overridden = retrieved.is_some() || specs_file.is_some() || judgments.is_some();
+    // The id came from a ladder; the last scan's state is where it resolves.
+    if let Some((f, root)) = finding_from_last_scan(state_path, id, overridden) {
+        eprintln!("finding {id} from the last scan (of {root})");
+        let incidents: Vec<(String, bool, String)> = Vec::new();
+        print!(
+            "{}",
+            render::render_explain(&f, &incidents, stdout_color(color))
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let stream = resolve_packet_stream(retrieved, path)?;
     let (_findings, items, _sites) =
         resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
     let ladder_findings = triage_to_findings(&items);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
-            "no finding with id '{id}' in this scan (ids are shown in the ladder's 'explain:' hint)"
+            "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
+             ids come from `rvlscan scan` -- re-run it and use an id it prints",
+            path.display()
         );
         return Ok(ExitCode::FAILURE);
     };
@@ -1282,26 +1375,44 @@ fn run_explain(
 fn run_suppress(
     store: &CacheStore,
     keyset: &Keyset,
+    state_path: &std::path::Path,
     id: &str,
-    path: &std::path::Path,
+    path: Option<&std::path::Path>,
     reason: Option<&str>,
     expires: Option<&str>,
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
 ) -> anyhow::Result<ExitCode> {
-    // Re-run the same resolve -> triage pipeline explain uses so the id resolves
-    // to exactly the finding the user saw in the ladder.
-    let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, items, _sites) =
-        resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
-    let ladder_findings = triage_to_findings(&items);
-    let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
-        eprintln!(
-            "no finding with id '{id}' in this scan (ids are shown in the ladder's 'explain:' hint)"
-        );
-        return Ok(ExitCode::FAILURE);
-    };
+    let overridden = retrieved.is_some() || specs_file.is_some() || judgments.is_some();
+    let cwd = PathBuf::from(".");
+    // Resolve the id from the last scan first (the hint's contract), falling
+    // back to the live resolve -> triage pipeline explain uses. The waiver file
+    // goes to an explicitly given path, else the recorded scan root, else cwd.
+    let (found, target): (render::Finding, PathBuf) =
+        match finding_from_last_scan(state_path, id, overridden) {
+            Some((f, root)) => {
+                let target = path.map(Path::to_path_buf).unwrap_or(PathBuf::from(root));
+                (f, target)
+            }
+            None => {
+                let scan_path = path.unwrap_or(&cwd);
+                let stream = resolve_packet_stream(retrieved, scan_path)?;
+                let (_findings, items, _sites) =
+                    resolve_findings(store, keyset, &stream, specs_file, judgments, false)?;
+                let ladder_findings = triage_to_findings(&items);
+                let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
+                    eprintln!(
+                        "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
+                         ids come from `rvlscan scan` -- re-run it and use an id it prints",
+                        scan_path.display()
+                    );
+                    return Ok(ExitCode::FAILURE);
+                };
+                (f.clone(), scan_path.to_path_buf())
+            }
+        };
+    let f = &found;
 
     let w = waiver::Waiver {
         rule: f.class_rule.clone(),
@@ -1309,7 +1420,7 @@ fn run_suppress(
         expires: expires.unwrap_or("").trim().to_string(),
         reason: reason.unwrap_or("").trim().to_string(),
     };
-    let file = path.join(".revelara.yaml");
+    let file = target.join(".revelara.yaml");
     waiver::append_waiver(&file, &w)?;
 
     println!("waived rule `{}` (finding {})", f.class_rule, f.id);
@@ -1449,6 +1560,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
     let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
+    let state_path = last_scan_path(&cfg.cache_dir);
     match cmd {
         Cmd::Scan {
             path,
@@ -1468,6 +1580,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     &store,
                     &keyset,
                     &cfg.index_dir,
+                    &state_path,
                     &path,
                     specs_file.as_deref(),
                     judgments.as_deref(),
@@ -1479,6 +1592,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 run_scan(
                     &store,
                     &keyset,
+                    &state_path,
                     &path,
                     retrieved.as_deref(),
                     specs_file.as_deref(),
@@ -1516,6 +1630,7 @@ fn run() -> anyhow::Result<ExitCode> {
         } => run_explain(
             &store,
             &keyset,
+            &state_path,
             &id,
             &path.unwrap_or_else(|| PathBuf::from(".")),
             retrieved.as_deref(),
@@ -1534,8 +1649,9 @@ fn run() -> anyhow::Result<ExitCode> {
         } => run_suppress(
             &store,
             &keyset,
+            &state_path,
             &id,
-            &path.unwrap_or_else(|| PathBuf::from(".")),
+            path.as_deref(),
             reason.as_deref(),
             expires.as_deref(),
             retrieved.as_deref(),
@@ -2064,5 +2180,65 @@ mod tests {
         let resolved = resolve_helper(Lang::Go);
         std::env::remove_var("RVLSCAN_GOINDEX");
         assert!(resolved.is_err(), "a missing override path must error");
+    }
+
+    fn ladder_finding(id: &str) -> render::Finding {
+        render::Finding {
+            id: id.to_string(),
+            site: "src/a.ts:12".into(),
+            description: "no bound anywhere".into(),
+            disposition: "unjudged".into(),
+            severity: String::new(),
+            incident_count: 0,
+            critical_count: 0,
+            control: String::new(),
+            fix: String::new(),
+            site_count: 3,
+            example_sites: vec!["src/a.ts:12".into()],
+            class_rule: "kysely.SelectQueryBuilder.execute".into(),
+            suppressed: false,
+        }
+    }
+
+    #[test]
+    fn explain_hint_resolves_from_the_persisted_last_scan() {
+        // Regression (po-3t3oj.38): the ladder prints `rvlscan explain <id>`;
+        // that verbatim command must find the id WITHOUT re-running the scan's
+        // inputs. Persist a ladder, then resolve the id from the state file.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        save_last_scan(&state, dir.path(), &[ladder_finding("qocr")]);
+
+        let (f, root) =
+            finding_from_last_scan(&state, "qocr", false).expect("id must resolve from state");
+        assert_eq!(f.class_rule, "kysely.SelectQueryBuilder.execute");
+        assert_eq!(
+            std::path::PathBuf::from(&root),
+            std::fs::canonicalize(dir.path()).unwrap(),
+            "suppress needs the recorded scan root for its waiver file"
+        );
+        assert!(
+            finding_from_last_scan(&state, "zzzz", false).is_none(),
+            "an id from a different scan must fall through to a live re-scan"
+        );
+    }
+
+    #[test]
+    fn explicit_dev_overrides_bypass_the_last_scan_state() {
+        // --retrieved/--specs-file/--judgments ask for a live re-scan of those
+        // exact inputs; stale state must not shadow them.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        save_last_scan(&state, dir.path(), &[ladder_finding("qocr")]);
+        assert!(finding_from_last_scan(&state, "qocr", true).is_none());
+    }
+
+    #[test]
+    fn missing_or_corrupt_state_is_just_no_last_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        assert!(load_last_scan(&state).is_none(), "missing file");
+        std::fs::write(&state, "not json").unwrap();
+        assert!(load_last_scan(&state).is_none(), "corrupt file");
     }
 }
