@@ -10,6 +10,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The packet contract version this consumer understands. It MUST agree with
+/// the emitters' constants (goindex `PacketSchema`, pyindex `PACKET_SCHEMA`,
+/// tsindex `PACKET_SCHEMA`); each helper prints its version via
+/// `--packet-schema` so a consumer can negotiate before paying for a load.
+///
+/// v2 adds `const_args` (constant-valued arguments at the call site) and
+/// `macro_expansion` (per-site macro flag; C/C++ mechanical, other languages
+/// false/absent). v2 is a strict superset of v1: every v1 record parses as v2
+/// with the new fields defaulted, so v1 streams remain readable.
+pub const PACKET_SCHEMA: u32 = 2;
+
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
 /// this, 821 of 1525 real production records failed to parse and the scanner
@@ -65,6 +76,35 @@ impl Verdict {
             Verdict::NotApplicable => "not_applicable",
         }
     }
+}
+
+/// A constant-valued argument observed at a call site (schema v2).
+///
+/// This is RETRIEVAL: the emitter reports that an argument's value is knowable
+/// without running the program, and how it was determined. What the value MEANS
+/// (CURLOPT_TIMEOUT vs CURLOPT_URL, timeout=0 as "no timeout") is library
+/// knowledge and belongs to the spec layer. Emitters resolve only literals and
+/// cheaply-resolvable named constants — no deep constant propagation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConstArg {
+    /// Zero-based position of the argument at the call site as written.
+    #[serde(default)]
+    pub index: u32,
+    /// Keyword/parameter name when the language surface provides one
+    /// (`timeout=5` in Python), `""` for purely positional arguments.
+    #[serde(default)]
+    pub name: String,
+    /// Source-level rendering of the resolved value (language-specific:
+    /// `"5"`, `"'x'"`, `"2000000000"` for a folded Go constant expression).
+    #[serde(default)]
+    pub value: String,
+    /// How the value was determined: `"literal"` for a literal token at the
+    /// call, `"named_constant"` for a resolved constant reference or folded
+    /// constant expression. A string, not an enum, so a future emitter adding
+    /// a mechanism degrades to an unrecognized label rather than a parse
+    /// failure.
+    #[serde(default)]
+    pub how: String,
 }
 
 /// A piece of retrieved source with enough provenance to cite it.
@@ -229,6 +269,21 @@ pub struct Site {
     /// Present on the repo-scoped record that rides in the same stream.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The contract version the emitter stamped on this record (0 when the
+    /// stream predates stamping). `parse_stream` refuses records stamped with
+    /// a version newer than [`PACKET_SCHEMA`].
+    #[serde(default)]
+    pub packet_schema: u32,
+    /// Schema v2: constant-valued arguments observed at this call site.
+    /// Evidence, never a verdict — the libcurl/POSIX discrimination lives in
+    /// enum constants like CURLOPT_TIMEOUT, and the TS pool-timeout precision
+    /// fix needed exactly this shape.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub const_args: Vec<ConstArg>,
+    /// Schema v2: whether this site sits inside a macro expansion. Mechanical
+    /// for C/C++ (expansion locations); other languages emit false/absent.
+    #[serde(default)]
+    pub macro_expansion: bool,
 }
 
 impl Site {
@@ -347,6 +402,11 @@ pub struct RepoConfig {
 /// Parse a retriever's JSONL stream into sites plus the repo-scoped record.
 /// Unparseable lines are skipped rather than fatal: a retriever bug should
 /// degrade coverage, not abort a scan, and coverage is reported separately.
+///
+/// Version negotiation: a record stamped with a `packet_schema` newer than
+/// [`PACKET_SCHEMA`] is REFUSED (counted as skipped), never parsed on the
+/// guess that the shape still fits. Older stamps (and unstamped v1-era lines)
+/// are accepted: v2 is a strict superset, so their fields default cleanly.
 pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
     let mut sites = Vec::new();
     let mut cfg = RepoConfig::default();
@@ -362,6 +422,12 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 continue;
             }
         };
+        if let Some(version) = v.get("packet_schema").and_then(|s| s.as_u64()) {
+            if version > u64::from(PACKET_SCHEMA) {
+                skipped += 1;
+                continue;
+            }
+        }
         if v.get("kind").and_then(|k| k.as_str()) == Some("repo_config") {
             if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
                 cfg = rc;
@@ -429,6 +495,83 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(sites[0].id(), "a.go:7");
+    }
+
+    #[test]
+    fn schema_v2_fields_round_trip() {
+        // A v2 record survives serialize -> parse with its constant-argument
+        // evidence and macro flag intact. The contract is the boundary; losing
+        // a field in transit is how evidence silently disappears.
+        let s = Site {
+            file_path: "a.c".into(),
+            line_number: 9,
+            method: "curl_easy_setopt".into(),
+            packet_schema: PACKET_SCHEMA,
+            const_args: vec![ConstArg {
+                index: 1,
+                name: String::new(),
+                value: "CURLOPT_TIMEOUT".into(),
+                how: "named_constant".into(),
+            }],
+            macro_expansion: true,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&s).unwrap();
+        let (sites, _, skipped) = parse_stream(&line);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 1);
+        let got = &sites[0];
+        assert_eq!(got.packet_schema, PACKET_SCHEMA);
+        assert!(got.macro_expansion);
+        assert_eq!(got.const_args.len(), 1);
+        assert_eq!(got.const_args[0].index, 1);
+        assert_eq!(got.const_args[0].value, "CURLOPT_TIMEOUT");
+        assert_eq!(got.const_args[0].how, "named_constant");
+    }
+
+    #[test]
+    fn v1_records_still_parse_with_v2_defaults() {
+        // v2 is a strict superset of v1: an old stream (no packet_schema, no
+        // const_args, no macro_expansion) parses with defaults, and a Go-style
+        // present-but-null const_args does too (the nil-slice trap).
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"packet_schema":1,"file_path":"b.go","line_number":8,"func":"Do","const_args":null}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].packet_schema, 0);
+        assert!(sites[0].const_args.is_empty());
+        assert!(!sites[0].macro_expansion);
+        assert_eq!(sites[1].packet_schema, 1);
+        assert!(sites[1].const_args.is_empty());
+    }
+
+    #[test]
+    fn unknown_newer_schema_versions_are_refused_not_guessed_at() {
+        // The negotiation contract: a consumer that does not know a version
+        // refuses the record rather than guessing at its shape. A v3 stamp on
+        // an otherwise-parseable record must land in the skipped count, and a
+        // v3 repo_config must not overwrite the config either.
+        let stream = concat!(
+            r#"{"packet_schema":3,"file_path":"a.go","line_number":7,"func":"Query"}"#,
+            "\n",
+            r#"{"packet_schema":3,"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"t","fields":["Timeout"]}]}"#,
+            "\n",
+            r#"{"packet_schema":2,"file_path":"b.go","line_number":8,"func":"Do"}"#,
+            "\n"
+        );
+        let (sites, cfg, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 2, "both v3 records must be refused");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].id(), "b.go:8");
+        assert!(
+            cfg.constructions.is_empty(),
+            "a repo_config from an unknown schema must not be consumed"
+        );
     }
 
     #[test]

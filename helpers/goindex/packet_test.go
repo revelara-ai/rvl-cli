@@ -39,6 +39,61 @@ func TestEmittedPacketsCarrySchemaAndUniqueSiteKey(t *testing.T) {
 	}
 }
 
+// Schema v2 (po-av01j.19): constant-valued arguments at the call site are
+// evidence — the libcurl/POSIX discrimination lives in enum constants, and the
+// TS pool-timeout precision fix needed this same shape — and every site
+// carries the macro flag (mechanical for C/C++, always false for Go).
+func TestRetrievedSitesCarryConstArgsAndMacroFlag(t *testing.T) {
+	if PacketSchema != 2 {
+		t.Fatalf("const_args/macro_expansion are the v2 contract; PacketSchema = %d", PacketSchema)
+	}
+	sites := runRetrieve("testdata/fixture", "fixture")
+	if len(sites) == 0 {
+		t.Fatal("fixture retrieval produced no sites (does the fixture build?)")
+	}
+	byMethod := map[string]RetrievedSite{}
+	for _, s := range sites {
+		byMethod[s.Method] = s
+		if s.MacroExpansion {
+			t.Fatalf("Go has no macros; macro_expansion must be false on %s", s.File)
+		}
+	}
+
+	// A string literal argument resolves as a literal const arg.
+	q, ok := byMethod["QueryContext"]
+	if !ok {
+		t.Fatalf("expected a QueryContext site, have %v", byMethod)
+	}
+	lit := findConstArg(q.ConstArgs, 1)
+	if lit == nil || lit.How != "literal" || lit.Value != `"SELECT 1 WHERE id=$1"` {
+		t.Fatalf("QueryContext arg 1 must resolve as a literal const arg, got %+v", q.ConstArgs)
+	}
+
+	// A named package-level constant resolves through the type checker.
+	p, ok := byMethod["ExecContext"]
+	if !ok {
+		t.Fatalf("expected an ExecContext site, have %v", byMethod)
+	}
+	named := findConstArg(p.ConstArgs, 2)
+	if named == nil || named.How != "named_constant" || named.Value != "50" {
+		t.Fatalf("ExecContext arg 2 must resolve as named_constant 50, got %+v", p.ConstArgs)
+	}
+
+	// Non-constant arguments (ctx, a variable id) must NOT be reported.
+	if findConstArg(q.ConstArgs, 0) != nil || findConstArg(q.ConstArgs, 2) != nil {
+		t.Fatalf("non-constant args must not become const args: %+v", q.ConstArgs)
+	}
+}
+
+func findConstArg(args []ConstArg, index int) *ConstArg {
+	for i := range args {
+		if args[i].Index == index {
+			return &args[i]
+		}
+	}
+	return nil
+}
+
 // The incremental path (po-3t3oj.14) asks for packets from a subset of files.
 // Filtering must be exact-path, never prefix or substring, or a shallow
 // reload silently pulls in unrelated sites.

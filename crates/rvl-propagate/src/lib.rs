@@ -10,7 +10,7 @@
 //! and combines them mechanically. Every rule below traces to a measurement or
 //! to a human adjudication, not to intuition.
 
-use rvl_core::{scope_of, CtxEvidence, Site, Verdict};
+use rvl_core::{scope_of, ConstArg, CtxEvidence, Site, Verdict};
 use rvl_spec::{
     client_family, spec_gate, Bounds, Family, Mechanism, Scope, ServedBound, SpecCache,
 };
@@ -57,6 +57,17 @@ fn has_timeout_arg(call: &str) -> bool {
     ["timeout=", "timeout:", "deadline=", "deadline:"]
         .iter()
         .any(|k| lower.contains(k))
+}
+
+/// A schema-v2 constant argument whose KEYWORD NAME says it is a timeout.
+/// Name-keyed only: a bare positional constant says nothing about being a
+/// timeout — that would take the API's signature, which is spec knowledge.
+/// Mirrors the `timeout=`/`deadline=` text heuristic over structured evidence.
+fn const_timeout_arg(site: &Site) -> Option<&ConstArg> {
+    site.const_args.iter().find(|a| {
+        let name = a.name.to_ascii_lowercase();
+        name.contains("timeout") || name.contains("deadline")
+    })
 }
 
 /// A decorator or annotation carrying a time bound. Looks at the decorators the
@@ -191,8 +202,20 @@ pub fn propagate(
     }
     for m in &spec.bounded_by {
         match m {
-            Mechanism::CallArg if has_timeout_arg(&site.snippet) => {
-                whole.push("timeout argument at the call".into());
+            Mechanism::CallArg => {
+                // v2 evidence first: a constant-valued timeout argument
+                // carries its RESOLVED VALUE and provenance into the reason
+                // (the config-lane resolved-value principle), so the finding
+                // is auditable back to what the retriever actually saw. The
+                // snippet-text heuristic remains the v1 fallback.
+                if let Some(a) = const_timeout_arg(site) {
+                    whole.push(format!(
+                        "timeout argument at the call ({}={}, {})",
+                        a.name, a.value, a.how
+                    ));
+                } else if has_timeout_arg(&site.snippet) {
+                    whole.push("timeout argument at the call".into());
+                }
             }
             // ServerConfig looked ambient and is not. Whether a server's
             // deadline reaches a call depends on the call's cancellation
@@ -572,6 +595,56 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn a_const_timeout_arg_carries_its_resolved_value_into_the_reason() {
+        // Schema v2 evidence: the retriever resolved the timeout argument's
+        // VALUE, so the finding cites it with provenance (config-lane
+        // resolved-value principle) instead of a bare substring claim.
+        let mut s = site();
+        s.snippet = "pool.Query(sql, timeout=DEFAULT_TIMEOUT)".into();
+        s.const_args = vec![ConstArg {
+            index: 1,
+            name: "timeout".into(),
+            value: "5".into(),
+            how: "named_constant".into(),
+        }];
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::CallArg], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies);
+        assert!(
+            f.reason.contains("timeout=5") && f.reason.contains("named_constant"),
+            "the reason must cite the resolved value and how it was determined: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_positional_const_arg_without_a_name_is_not_credited_as_a_timeout() {
+        // A bare positional constant says nothing about BEING a timeout —
+        // only the spec knows the API's signature. Without a timeout-ish
+        // keyword name (and no timeout text in the snippet) CallArg finds
+        // nothing.
+        let mut s = site();
+        s.snippet = "pool.Query(sql, 5)".into();
+        s.const_args = vec![ConstArg {
+            index: 1,
+            name: String::new(),
+            value: "5".into(),
+            how: "literal".into(),
+        }];
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::CallArg], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates);
     }
 
     #[test]

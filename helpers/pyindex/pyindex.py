@@ -42,8 +42,12 @@ import sys
 # PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
 # helper churn behind this number: a consumer that does not know a version
 # refuses the stream rather than guessing at its shape. It MUST agree with
-# goindex's PacketSchema and rvl_index's schema.
-PACKET_SCHEMA = 1
+# goindex's PacketSchema, tsindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
+#
+# v2 adds const_args (constant-valued arguments at the call site) and
+# macro_expansion (always False for Python, which has no macros; mechanical
+# for C/C++). v2 is a strict superset of v1.
+PACKET_SCHEMA = 2
 
 # Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes. A pathologically
 # long function body should not blow up a packet line.
@@ -184,6 +188,10 @@ class FileIndex:
         self.ctor_by_var = {}       # var name -> [Snippet]
         self.ctor_by_selfattr = {}  # "self.x" -> [Snippet]
         self.ctor_by_type = {}      # client type -> [Snippet]
+        # name -> constant value, from `NAME = <literal>` assignments (schema
+        # v2 named-constant resolution). Same module-scoped, last-write-wins
+        # best effort as var_types; no deep constant propagation.
+        self.const_by_name = {}
 
     # -- import resolution ---------------------------------------------------
 
@@ -233,7 +241,17 @@ class FileIndex:
                 targets, value = node.targets, node.value
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
                 targets, value = [node.target], node.value
-            if targets is None or not isinstance(value, ast.Call):
+            if targets is None:
+                continue
+            # `NAME = <literal>` feeds named-constant argument resolution
+            # (schema v2). Only plain names and literal values: anything
+            # computed is not a constant we can cheaply stand behind.
+            if isinstance(value, ast.Constant):
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name):
+                        self.const_by_name[tgt.id] = value.value
+                continue
+            if not isinstance(value, ast.Call):
                 continue
             ctype = self.resolve_ctor(value.func)
             if not ctype:
@@ -288,6 +306,40 @@ class FileIndex:
         elif client_type and client_type in self.ctor_by_type:
             out = self.ctor_by_type[client_type]
         return out[:MAX_CTORS_EMITTED]
+
+
+def _const_args(call, idx):
+    """Constant-valued arguments at the call site (schema v2).
+
+    Literal tokens report as "literal"; names resolved through the module-level
+    constant map report as "named_constant". `index` is the zero-based position
+    of the argument as written; `name` is the keyword for keyword arguments,
+    "" for positional ones. Values render via repr() (source-level: 5, '5',
+    True, None). Retrieval only: no deep constant propagation, and no opinion
+    about what a value means — that is spec-layer knowledge.
+    """
+    def resolve(node):
+        if isinstance(node, ast.Constant):
+            return repr(node.value), "literal"
+        if isinstance(node, ast.Name) and node.id in idx.const_by_name:
+            return repr(idx.const_by_name[node.id]), "named_constant"
+        return None, None
+
+    out = []
+    pos = 0
+    for a in call.args:
+        value, how = (None, None) if isinstance(a, ast.Starred) else resolve(a)
+        if how:
+            out.append({"index": pos, "name": "", "value": value, "how": how})
+        pos += 1
+    for kw in call.keywords:
+        # kw.arg is None for a **kwargs expansion: a written argument slot,
+        # but not one carrying a per-argument name or constant value.
+        value, how = (None, None) if kw.arg is None else resolve(kw.value)
+        if how:
+            out.append({"index": pos, "name": kw.arg, "value": value, "how": how})
+        pos += 1
+    return out
 
 
 def _enclosing_functions(tree):
@@ -371,9 +423,13 @@ def retrieve_file(abs_path, file_path, snapshot):
             "client_type": client_type,
             "snippet": snippet,
             "enclosing_function_body": body,
-            "callers": [],   # empty in v1 (no cross-module call graph)
-            "callees": [],   # empty in v1
+            "callers": [],   # empty (no cross-module call graph yet)
+            "callees": [],   # empty
             "client_construction": constructions,
+            # Schema v2: constant-valued arguments as evidence, and the macro
+            # flag (Python has no macros; C/C++ sets it mechanically).
+            "const_args": _const_args(node, idx),
+            "macro_expansion": False,
             "provenance": {
                 "client_type_resolved": resolved,
                 "callers_total": 0,

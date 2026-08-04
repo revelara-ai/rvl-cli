@@ -18,10 +18,11 @@ One JSON object per line (JSONL) to stdout, one per detected call site. A site
 is a `receiver.method(...)` call whose method name is a plausible I/O verb.
 Every record carries:
 
-- `packet_schema` — the contract version (always `1`). rvlscan absorbs helper
-  churn behind this number; a consumer that does not know a version refuses the
-  stream rather than guessing at its shape. It agrees with goindex's
-  `PacketSchema` and `rvl_index::site_key`.
+- `packet_schema` — the contract version (currently `2`). rvlscan absorbs
+  helper churn behind this number; a consumer that does not know a version
+  refuses the stream rather than guessing at its shape. It agrees with
+  goindex's `PacketSchema`, tsindex's `PACKET_SCHEMA`, and
+  `rvl_core::PACKET_SCHEMA`.
 - `site_key` — `file:line:client_type:method`. A file:line is **not** unique:
   one location can resolve to several sites with different client types (and
   different verdicts), so downstream indexes and joins key on `site_key`, and
@@ -44,7 +45,17 @@ Every record carries:
   minimum `{client_type_resolved, callers_total, callers_included,
   callees_total, callees_included}`. `client_type_resolved` is the per-site
   confidence signal.
-- `callers`, `callees` — **empty arrays in v1** (see below).
+- `const_args` (v2) — constant-valued arguments at the call site, as
+  `{index, name, value, how}`. `index` is the zero-based position as written;
+  `name` is the keyword (`timeout=5` → `"timeout"`), `""` for positional
+  arguments. Literal tokens report `how: "literal"`; names resolved through
+  the module-level `NAME = <literal>` constant map report
+  `how: "named_constant"` (same module-scoped, last-write-wins best effort as
+  the assignment tracking — no deep constant propagation). Values render via
+  `repr()`. Evidence, never a verdict.
+- `macro_expansion` (v2) — always `false` for Python (no macros); mechanical
+  for C/C++ retrievers.
+- `callers`, `callees` — **empty arrays** (see below).
 - `lang` — `"python"`.
 
 ## Resolution engine: stdlib `ast`, and its confidence tradeoff

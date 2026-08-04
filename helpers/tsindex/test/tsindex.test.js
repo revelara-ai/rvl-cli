@@ -39,19 +39,58 @@ function repoConfig(...extra) {
   return cfgs[0];
 }
 
-test('--packet-schema prints 1', () => {
+test('--packet-schema prints 2', () => {
   const out = run('--packet-schema').trim();
-  assert.strictEqual(out, '1');
+  assert.strictEqual(out, '2');
 });
 
 test('retrieval emits records, each with schema and site_key', () => {
   const records = retrieveRecords();
   assert.ok(records.length >= 1, 'expected at least one site');
   for (const rec of records) {
-    assert.strictEqual(rec.packet_schema, 1, 'packet_schema must be 1');
+    assert.strictEqual(rec.packet_schema, 2, 'packet_schema must be 2');
     assert.ok(rec.site_key, 'site_key must be stamped on every packet');
     assert.strictEqual(rec.lang, 'typescript');
   }
+});
+
+test('const_args carry literal and named-constant evidence; macro flag false', () => {
+  // Schema v2 (po-av01j.19): constant-valued arguments are evidence (the TS
+  // pool-timeout precision fix was exactly this shape), and every site
+  // carries the macro flag (false: TypeScript has no macros).
+  const records = retrieveRecords();
+  for (const rec of records) {
+    assert.ok(Array.isArray(rec.const_args), 'const_args must be on every packet');
+    assert.strictEqual(rec.macro_expansion, false, 'macro_expansion must be false');
+  }
+
+  // A string-literal SQL argument reports as a literal const arg.
+  const pool = records.find(
+    (r) => r.client_type === 'pg.Pool' && r.symbol === 'loadUser',
+  );
+  assert.ok(pool, 'expected the loadUser pool.query site');
+  const lit = pool.const_args.find((a) => a.index === 0);
+  assert.ok(lit, `expected a const arg at index 0: ${JSON.stringify(pool.const_args)}`);
+  assert.strictEqual(lit.how, 'literal');
+  assert.ok(lit.value.includes('SELECT * FROM users'), lit.value);
+  // The [id] array argument is NOT constant and must not be reported.
+  assert.strictEqual(pool.const_args.some((a) => a.index === 1), false);
+
+  // A module-level `const` resolves as a named constant, one hop, no deep
+  // constant propagation.
+  const status = records.find(
+    (r) => r.client_type === 'ioredis.Redis' && r.symbol === 'statusOf',
+  );
+  assert.ok(status, 'expected the statusOf redis.get site');
+  const named = status.const_args.find((a) => a.how === 'named_constant');
+  assert.ok(named, `expected a named_constant arg: ${JSON.stringify(status.const_args)}`);
+  assert.strictEqual(named.index, 0);
+  assert.ok(named.value.includes('status:latest'), named.value);
+
+  // A plain variable/parameter argument yields no const args.
+  const raw = records.find((r) => r.func === 'execute' && r.client_type === '');
+  assert.ok(raw, 'expected the cursor.execute site');
+  assert.deepStrictEqual(raw.const_args, []);
 });
 
 test('site_keys are unique and equal the formula', () => {
@@ -164,7 +203,7 @@ test('--files restricts output to the listed file (exact path)', () => {
 test('repo_config packet is emitted, well-formed, and repo-scoped', () => {
   const cfg = repoConfig();
   assert.strictEqual(cfg.kind, 'repo_config', 'kind must be the literal repo_config');
-  assert.strictEqual(cfg.packet_schema, 1);
+  assert.strictEqual(cfg.packet_schema, 2);
   assert.ok(cfg.snapshot_id, 'snapshot_id must be set');
   assert.ok(Array.isArray(cfg.constructions), 'constructions must be an array');
 });
