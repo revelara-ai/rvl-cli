@@ -35,6 +35,7 @@ pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
+pub mod kubernetes;
 pub mod prometheus;
 pub mod terraform;
 
@@ -140,6 +141,11 @@ pub struct Retrieved {
     /// parsed or recognized. A retriever bug or a malformed file degrades
     /// coverage, never aborts a scan (same contract as `parse_stream`).
     pub unparseable: usize,
+    /// Identity-only sightings the retriever itself emits for VARIANTS of
+    /// its format it recognizes but cannot resolve honestly (an unvendored
+    /// helm chart, an unsupported kustomize patch). Same privacy contract as
+    /// the walk's sightings: format identity + count, nothing else.
+    pub sightings: Vec<FormatSighting>,
 }
 
 /// A per-format config retriever. Implementations parse ONE format and emit
@@ -164,18 +170,39 @@ pub trait ConfigRetriever {
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved;
     /// Parse ALL files this format claimed in one scan, path-sorted `(rel,
     /// contents)` pairs. The default forwards file-by-file to
-    /// [`ConfigRetriever::retrieve`]; a format whose effective values span
-    /// committed files (a tfvars assignment overriding a Terraform variable
-    /// default, a kustomize overlay) overrides this single entry point
-    /// instead, so cross-file resolution stays inside the format's module.
-    fn retrieve_all(&self, files: &[(String, String)], snapshot_id: &str) -> Retrieved {
+    /// [`ConfigRetriever::retrieve_with_root`]; a format whose effective
+    /// values span committed files (a tfvars assignment overriding a
+    /// Terraform variable default, a kustomize overlay) overrides this single
+    /// entry point instead, so cross-file resolution stays inside the
+    /// format's module.
+    fn retrieve_all(
+        &self,
+        root: &Path,
+        files: &[(String, String)],
+        snapshot_id: &str,
+    ) -> Retrieved {
         let mut out = Retrieved::default();
         for (rel, contents) in files {
-            let got = self.retrieve(rel, contents, snapshot_id);
+            let got = self.retrieve_with_root(root, rel, contents, snapshot_id);
             out.packets.extend(got.packets);
             out.unparseable += got.unparseable;
+            out.sightings.extend(got.sightings);
         }
         out
+    }
+
+    /// Root-aware retrieval for formats that must consult SIBLING files to
+    /// resolve honestly (kustomize bases and patches, helm values). Every
+    /// read stays under `root`; the default delegates to [`Self::retrieve`]
+    /// so single-file formats never notice the difference.
+    fn retrieve_with_root(
+        &self,
+        _root: &Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        self.retrieve(rel_path, contents, snapshot_id)
     }
 }
 
@@ -188,6 +215,10 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(prometheus::PrometheusRules),
         Box::new(argo_flux::ArgoFlux),
         Box::new(terraform::Terraform),
+        // Kubernetes stays LAST: its content claim (bare apiVersion+kind
+        // YAML) is the broadest, so narrower families (sloth CRDs, Argo/Flux
+        // CRs, rule files) must get first refusal.
+        Box::new(kubernetes::Kubernetes),
     ]
 }
 
@@ -303,12 +334,26 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
 pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     let retrievers = registry();
     let mut out = LaneRetrieval::default();
-    let mut sightings: std::collections::BTreeMap<&'static str, usize> =
+    let mut sightings: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     // Files each retriever claimed, retrieved in ONE batch after the walk so
     // formats whose resolution spans files see their whole claim at once
     // (see [`ConfigRetriever::retrieve_all`]).
     let mut claimed: Vec<Vec<(String, String)>> = retrievers.iter().map(|_| Vec::new()).collect();
+
+    /// Fold one retriever result into the lane totals, merging any
+    /// retriever-emitted sightings into the walk's identity+count map.
+    fn absorb(
+        out: &mut LaneRetrieval,
+        sightings: &mut std::collections::BTreeMap<String, usize>,
+        got: Retrieved,
+    ) {
+        out.packets.extend(got.packets);
+        out.unparseable_files += got.unparseable;
+        for s in got.sightings {
+            *sightings.entry(s.format).or_insert(0) += s.file_count;
+        }
+    }
 
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -354,15 +399,17 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
                         out.unparseable_files += 1;
                         continue;
                     };
-                    let got = r.retrieve(&rel, &contents, snapshot_id);
-                    out.packets.extend(got.packets);
-                    out.unparseable_files += got.unparseable;
+                    absorb(
+                        &mut out,
+                        &mut sightings,
+                        r.retrieve_with_root(root, &rel, &contents, snapshot_id),
+                    );
                     continue;
                 }
             }
             // Unsupported-format sighting.
             if let Some(fmt) = sight_format(&rel, &head) {
-                *sightings.entry(fmt).or_insert(0) += 1;
+                *sightings.entry(fmt.to_string()).or_insert(0) += 1;
             }
         }
     }
@@ -372,9 +419,11 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
             continue;
         }
         files.sort();
-        let got = retrievers[idx].retrieve_all(files, snapshot_id);
-        out.packets.extend(got.packets);
-        out.unparseable_files += got.unparseable;
+        absorb(
+            &mut out,
+            &mut sightings,
+            retrievers[idx].retrieve_all(root, files, snapshot_id),
+        );
     }
 
     out.sightings = sightings
@@ -569,6 +618,57 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_repo_routes_bare_manifests_by_content_sniff() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        std::fs::write(
+            root.join("k8s/deploy.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers: []\n",
+        )
+        .unwrap();
+        // A non-k8s YAML with no distinctive path stays unclaimed.
+        std::fs::write(root.join("k8s/notes.yaml"), "a: b\n").unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "kubernetes" && p.key == "workload.replicas"),
+            "content-matched manifests route to the kubernetes retriever: {:?}",
+            got.packets
+        );
+        assert!(
+            got.sightings.is_empty(),
+            "a supported format is not sighted: {:?}",
+            got.sightings
+        );
+    }
+
+    #[test]
+    fn retriever_emitted_sightings_surface_in_the_lane_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        // A templated manifest outside any chart: the kubernetes retriever
+        // claims it by content, then abstains with its own sighting — which
+        // must merge into the walk's identity+count map.
+        std::fs::write(
+            root.join("k8s/tpl.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ .Values.name }}\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert_eq!(
+            got.sightings,
+            vec![FormatSighting {
+                format: "kubernetes-templated".into(),
+                file_count: 1
+            }]
+        );
+        assert!(got.packets.is_empty());
+    }
+
+    #[test]
     fn retrieve_repo_routes_argo_flux_crs_by_content_and_sights_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -586,11 +686,11 @@ mod tests {
             "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
         )
         .unwrap();
-        // A generic Kubernetes manifest: NOT claimed (family po-av01j.20),
-        // still sighted as kubernetes.
+        // A generic Kubernetes manifest: claimed by the kubernetes family
+        // (po-av01j.20) — packets, not a sighting.
         std::fs::write(
             root.join("deploy/web.yaml"),
-            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers: []\n",
         )
         .unwrap();
         let got = retrieve_repo(root, "snap");
@@ -601,18 +701,46 @@ mod tests {
             "content routing must reach the ArgoFlux retriever: {:?}",
             got.packets
         );
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "kubernetes" && p.key == "workload.replicas"),
+            "a generic manifest is claimed by the kubernetes family: {:?}",
+            got.packets
+        );
+        // The argo-rollouts CR is declined by BOTH families (argo_flux does
+        // not parse Rollout; kubernetes refuses foreign apiVersion groups)
+        // and sights by product.
         assert_eq!(
             got.sightings,
-            vec![
-                FormatSighting {
-                    format: "argo-rollouts".into(),
-                    file_count: 1
-                },
-                FormatSighting {
-                    format: "kubernetes".into(),
-                    file_count: 1
-                },
-            ]
+            vec![FormatSighting {
+                format: "argo-rollouts".into(),
+                file_count: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn retrieve_repo_routes_workflow_files_to_the_gha_retriever() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps: []\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "github-actions" && p.key == "job.timeout-minutes"),
+            "workflow files route to the GitHub Actions retriever: {:?}",
+            got.packets
+        );
+        assert!(
+            got.sightings.is_empty(),
+            "a supported format is not sighted"
         );
     }
 

@@ -66,14 +66,19 @@ impl ConfigRetriever for Terraform {
     /// just no companions to consult.
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         let files = [(rel_path.to_string(), contents.to_string())];
-        self.retrieve_all(&files, snapshot_id)
+        self.retrieve_all(std::path::Path::new(""), &files, snapshot_id)
     }
 
     /// Directory-scoped retrieval: Terraform's unit of configuration is the
     /// module DIRECTORY, so resolution (variable defaults, tfvars overlays)
     /// spans the files the walk claimed. Local (relative-source) modules need
     /// no special following: their directory is a group here like any other.
-    fn retrieve_all(&self, files: &[(String, String)], snapshot_id: &str) -> Retrieved {
+    fn retrieve_all(
+        &self,
+        _root: &std::path::Path,
+        files: &[(String, String)],
+        snapshot_id: &str,
+    ) -> Retrieved {
         let mut out = Retrieved::default();
         let mut dirs: BTreeMap<&str, Vec<&(String, String)>> = BTreeMap::new();
         for f in files {
@@ -1095,7 +1100,7 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        Terraform.retrieve_all(&files, "snap")
+        Terraform.retrieve_all(std::path::Path::new(""), &files, "snap")
     }
 
     fn find<'a>(got: &'a Retrieved, unit: &str, key: &str) -> &'a ConfigPacket {

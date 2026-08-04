@@ -1949,3 +1949,102 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         "argo/flux CRs must never sight as generic kubernetes: {stdout}"
     );
 }
+
+// --- G6 config lane, Kubernetes family (po-av01j.20) ---
+
+/// A repo with a kustomize base+overlay pair and SEED (test-grade)
+/// Kubernetes config-key specs for three representative controls: probe
+/// presence (RC-020), resource-limit presence (RC-024), image pin shape
+/// (RC-045). The production spec corpus is factory-authored (HITL);
+/// these exist to prove the lane end to end.
+fn write_k8s_lane_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // A minimal code-lane fixture so the scan exercises both lanes at once.
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+
+    // Base: a deployment with limits but no probes, tag-pinned.
+    std::fs::create_dir_all(dir.join("k8s/base")).unwrap();
+    std::fs::write(
+        dir.join("k8s/base/deployment.yaml"),
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers:\n        - name: app\n          image: web:v1.2.3\n          resources:\n            limits:\n              cpu: 500m\n              memory: 256Mi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("k8s/base/kustomization.yaml"),
+        "resources:\n  - deployment.yaml\n",
+    )
+    .unwrap();
+    // Overlay: retags the image to latest — the violating pin shape must be
+    // the TRANSFORMED one, proving the overlay chain end to end.
+    std::fs::create_dir_all(dir.join("k8s/overlays/prod")).unwrap();
+    std::fs::write(
+        dir.join("k8s/overlays/prod/kustomization.yaml"),
+        "resources:\n  - ../../base\nimages:\n  - name: web\n    newTag: latest\n",
+    )
+    .unwrap();
+
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"kubernetes","key":"container.liveness-probe","expect":{"kind":"present"},"confidence":0.9,"control":"RC-020","severity":"medium","fix":"add a livenessProbe to the container","rationale":"no probe means no restart on hang"},
+            {"format":"kubernetes","key":"container.resources.limits.cpu","expect":{"kind":"present"},"confidence":0.9,"control":"RC-024","severity":"medium","fix":"set resources.limits.cpu","rationale":"unbounded cpu"},
+            {"format":"kubernetes","key":"container.image.pin","expect":{"kind":"one_of","values":["digest","tag"]},"confidence":0.9,"control":"RC-045","severity":"high","fix":"pin the image to a tag or digest","rationale":"latest is unpinned"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_kubernetes_config_family_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_k8s_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The missing probe violates the Present spec (both base and overlay
+    // units repeat it — one grouped class).
+    assert!(
+        stdout.contains("kubernetes container.liveness-probe"),
+        "missing probe must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-020"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // The cpu limit is authored in the base: RC-024 must NOT surface.
+    assert!(
+        !stdout.contains("kubernetes container.resources.limits.cpu"),
+        "an authored limit is not a finding: {stdout}"
+    );
+    // The overlay retagged web:v1.2.3 to :latest; the pin-shape violation
+    // proves the images transformer resolved the EFFECTIVE value.
+    assert!(
+        stdout.contains("kubernetes container.image.pin"),
+        "the overlay's latest tag must surface: {stdout}"
+    );
+    assert!(stdout.contains("RC-045"), "pin control missing: {stdout}");
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+}
