@@ -231,6 +231,12 @@ pub fn propagate(
                 if let Some(s) = specs.config(&site.client_type) {
                     if s.scope == Scope::ThisClient && s.confidence >= rvl_spec::MIN_CONFIDENCE {
                         match s.bounds {
+                            // A declared (.revelara.yaml) bound carries its
+                            // policy provenance into the reason: the finding
+                            // must be auditable back to the declaration.
+                            Bounds::WholeCall if s.declared => {
+                                whole.push(format!("bound {}", s.rationale))
+                            }
                             Bounds::WholeCall => {
                                 whole.push(format!("client config {}", site.client_type))
                             }
@@ -380,6 +386,7 @@ mod tests {
             scope: Scope::ThisClient,
             confidence: 0.9,
             rationale: String::new(),
+            declared: false,
         }
     }
 
@@ -616,6 +623,7 @@ mod tests {
                 scope: Scope::ThisClient,
                 confidence: 0.9,
                 rationale: String::new(),
+                declared: false,
             }],
         );
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());

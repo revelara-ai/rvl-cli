@@ -494,3 +494,132 @@ fn index_reindex_detach_returns_immediately_and_child_indexes() {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
+
+// --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
+
+/// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
+/// bound channel: prod-level settings (statement_timeout, infra deadlines)
+/// that NO retrieval depth can see. Declared whole-call this-client bounds
+/// flip the exact client_type's findings from violates to satisfies, with
+/// the policy provenance in the reason.
+#[test]
+fn declared_bound_converts_finding_to_satisfies_with_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { pool.Query(ctx, q) }\n").unwrap();
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"db.RLSPool\",\"snippet\":\"pool.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[{"type":"db.RLSPool","method":"Query","site_count":1,"blocking":"yes","bounded_by":["client_config"],"confidence":0.95,"rationale":"pool query blocks"}],"configs":[]}"#).unwrap();
+
+    let scan = |declared: bool| -> serde_json::Value {
+        if declared {
+            std::fs::write(
+                dir.path().join(".revelara.yaml"),
+                "scanner:\n  bounds:\n    - client_type: db.RLSPool\n      bounds: whole_call\n      reason: prod statement_timeout=15s bounds every pool query\n",
+            )
+            .unwrap();
+        } else {
+            let _ = std::fs::remove_file(dir.path().join(".revelara.yaml"));
+        }
+        let out_path = dir.path().join("findings.json");
+        let out = bin()
+            .arg("scan")
+            .arg(dir.path())
+            .arg("--retrieved")
+            .arg(&packets)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvlscan");
+        assert!(
+            out.status.success() || out.status.code() == Some(1),
+            "scan errored: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap()
+    };
+
+    // Without the declaration: no bound evidence anywhere -> a finding.
+    let without = scan(false);
+    let verdict = without[0]["verdict"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        verdict, "violates",
+        "without a declaration the call has no bound: {without}"
+    );
+
+    // With the declaration: satisfied, and the reason carries the policy
+    // provenance so the finding is auditable back to .revelara.yaml.
+    let with = scan(true);
+    let verdict = with[0]["verdict"].as_str().unwrap_or_default().to_string();
+    let reason = with[0]["reason"].as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        verdict, "satisfies",
+        "declared whole-call bound must satisfy: {with}"
+    );
+    assert!(
+        reason.contains("declared") && reason.contains("statement_timeout"),
+        "reason must carry the policy provenance: {reason}"
+    );
+}
+
+/// Declarations are narrow by design: expired entries and non-whole_call
+/// bounds are inert, and OTHER client types are never broadened.
+#[test]
+fn declared_bound_is_exact_type_and_expiry_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { c.Do(req) }\n").unwrap();
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Do\",\"client_type\":\"http.Client\",\"snippet\":\"c.Do(req)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[{"type":"http.Client","method":"Do","site_count":1,"blocking":"yes","bounded_by":["client_config"],"confidence":0.95,"rationale":"blocks"}],"configs":[]}"#).unwrap();
+    // A declaration for a DIFFERENT type, plus an expired one for this type.
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "scanner:\n  bounds:\n    - client_type: db.RLSPool\n      bounds: whole_call\n      reason: other client\n    - client_type: http.Client\n      bounds: whole_call\n      reason: long gone\n      expires: \"2020-01-01\"\n",
+    )
+    .unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(
+        v[0]["verdict"].as_str().unwrap_or_default(),
+        "violates",
+        "an expired declaration and another type's declaration must both be inert: {v}"
+    );
+}
