@@ -891,6 +891,94 @@ fn config_findings_are_waivable_by_format_key_rule() {
     );
 }
 
+// --- G6 Prometheus/sloth family (po-av01j.21) ---
+
+/// A repo with a literal Prometheus rules file (one alert missing `for:` and
+/// severity, one carrying both), a sloth SLO file, and an alertmanager
+/// config. Seed TEST-GRADE ConfigKeySpecs cover the family's two example
+/// controls: for-duration presence and severity-label presence (the
+/// production corpus is a follow-up factory bead).
+fn write_prometheus_family_fixtures(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    std::fs::create_dir_all(dir.join("deploy/alerts")).unwrap();
+    std::fs::write(
+        dir.join("deploy/alerts/api.yml"),
+        "groups:\n- name: api\n  rules:\n  - alert: HighErrorRate\n    expr: rate(errors[5m]) > 0.1\n  - alert: SlowRequests\n    expr: latency > 1\n    for: 5m\n    labels:\n      severity: page\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/alerts/slo.yml"),
+        "version: prometheus/v1\nservice: api\nslos:\n- name: availability\n  objective: 99.9\n  alerting:\n    page_alert:\n      labels:\n        severity: page\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("alertmanager.yml"),
+        "route:\n  receiver: default\nreceivers:\n- name: default\n",
+    )
+    .unwrap();
+    // One minimal code packet: a scan refuses an empty retrieved stream.
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":3,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"prometheus-rules","key":"rule.for","expect":{"kind":"present"},"confidence":0.9,"control":"RC-001","severity":"medium","fix":"set a for: duration so the alert requires a sustained breach","rationale":"test-grade seed: an absent for fires on first evaluation (0s default)"},
+            {"format":"prometheus-rules","key":"rule.labels.severity","expect":{"kind":"pattern","name":"nonempty"},"confidence":0.9,"control":"RC-001","severity":"medium","fix":"label the alert with a routing severity","rationale":"test-grade seed: unlabeled alerts cannot route"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_prometheus_family_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // HighErrorRate violates both seed specs (no for:, no severity); the
+    // SlowRequests alert satisfies both, so each class has one site.
+    assert!(
+        stdout.contains("prometheus-rules rule.for"),
+        "missing for: must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("prometheus-rules rule.labels.severity"),
+        "missing severity label must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-001"),
+        "the seed spec's control rides into the ladder: {stdout}"
+    );
+    // The sloth file contributes packets (unspecced: abstentions), and the
+    // alertmanager config is identified without being inventoried.
+    assert!(
+        stdout.contains("unsupported config formats sighted: alertmanager (1)"),
+        "alertmanager identity sighting: {stdout}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
