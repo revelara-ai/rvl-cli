@@ -44,15 +44,22 @@ pub fn class_of(site: &Site, reason: &str) -> ClassKey {
             site.client_type.clone()
         },
         method: site.method.clone(),
-        // The leading clause names the rule that fired; the tail carries
-        // site-specific detail that must not fragment the class.
+        // The class reason is the RULE NAME that fired: the leading `;` clause,
+        // stripped of any `:` tail. Both tails carry site-specific detail
+        // ("only phase bounds: connect_timeout=5s; ...") that must not fragment
+        // the class. What remains is a fixed phrase from the propagation
+        // layer's vocabulary, so it is stored and displayed WHOLE -- a length
+        // cap here once cut "no bound anywhere and the search was complete"
+        // to "...the search was com" in every ladder row (po-3t3oj.39).
         reason: reason
             .split(';')
             .next()
             .unwrap_or(reason)
-            .chars()
-            .take(40)
-            .collect(),
+            .split(':')
+            .next()
+            .unwrap_or(reason)
+            .trim()
+            .to_string(),
         scope: scope_of(&site.file_path).as_str().into(),
     }
 }
@@ -230,6 +237,23 @@ mod tests {
             fix: String::new(),
         }];
         assert!(triage(&s, &v, &j).is_empty());
+    }
+
+    #[test]
+    fn class_reason_is_the_whole_rule_name_never_cut_mid_word() {
+        // Regression (po-3t3oj.39): a 40-char cap displayed every ladder row as
+        // "no bound anywhere and the search was com". The rule name is a fixed
+        // phrase and must survive whole.
+        let s = site("a/f.ts", 1, "kysely.RawBuilder", "execute");
+        let k = class_of(&s, "no bound anywhere and the search was complete");
+        assert_eq!(k.reason, "no bound anywhere and the search was complete");
+
+        // Variable tails after ':' or ';' are site detail, not class identity:
+        // the rule name alone is the class, so detail cannot fragment it.
+        let a = class_of(&s, "only phase bounds: connect_timeout=5s; acquire=2s");
+        let b = class_of(&s, "only phase bounds: statement_timeout=30s");
+        assert_eq!(a.reason, "only phase bounds");
+        assert_eq!(a, b, "same rule with different detail is ONE class");
     }
 
     #[test]
