@@ -9,6 +9,7 @@ members = [
     "crates/rvl-spec",
     "crates/rvl-propagate",
     "crates/rvl-eval",
+    "crates/rvl-config",
 ]
 
 [workspace.package]

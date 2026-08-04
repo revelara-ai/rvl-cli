@@ -354,6 +354,7 @@ mod tests {
             }],
             configs,
             scopes: vec![],
+            config_keys: vec![],
         })
     }
 
@@ -420,6 +421,7 @@ mod tests {
             }],
             configs: vec![],
             scopes: vec![],
+            config_keys: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -742,6 +744,7 @@ mod tests {
                 site_count: 1,
             }],
             configs: vec![],
+            config_keys: vec![],
             scopes: vec![ScopeSpec {
                 scope: "dev_only".into(),
                 applies: false,
