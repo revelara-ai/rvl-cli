@@ -456,6 +456,140 @@ function constructionFor(receiver, checker, root, relPathOf, isScanned) {
 }
 
 // ---------------------------------------------------------------------------
+// G4 emission-point inventory (po-av01j.5).
+//
+// Log statements, span/trace instrumentation, and error-handling sites ride
+// the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
+// is the load-bearing constraint: emission packets are AGGREGATES -- one per
+// (enclosing function, framework identity, category), with the category and
+// call count riding const_args (emission_category / emission_count, how:
+// "aggregate") -- never one packet per log line.
+//
+// Classification is type-driven like G1: a call is an emission only when the
+// checker resolves its receiver into a known telemetry package (winston,
+// pino, @opentelemetry, @sentry), plus the two mechanical identities `console`
+// (receiver text) and `catch_clause` (the swallow fact below). The framework
+// list is the candidate extractor: it decides what gets inventoried, never
+// what a match means -- that is the spec layer's job (EmissionSpec).
+//
+// Recognized emission calls are routed OUT of the G1 site list: a logger.info
+// must not double-count as a client call site.
+// ---------------------------------------------------------------------------
+
+const SITE_KIND_EMISSION = 'emission_point';
+
+const EMISSION_LOG_METHODS = new Set([
+  'debug', 'info', 'warn', 'error', 'verbose', 'silly', 'fatal', 'trace', 'log',
+]);
+const CONSOLE_LOG_METHODS = new Set(['log', 'info', 'warn', 'error', 'debug', 'trace']);
+const EMISSION_TRACE_METHODS = new Set(['startSpan', 'startActiveSpan']);
+const EMISSION_CAPTURE_METHODS = new Set([
+  'captureException', 'captureMessage', 'captureEvent',
+]);
+
+// emissionIdentity classifies a call as an emission point, returning
+// {framework, category} or null. `clientType`/`resolved` come from the same
+// resolveClientType pass the G1 heuristic uses.
+function emissionIdentity(receiver, method, clientType, resolved, checker) {
+  const recvText = typeof receiver.getText === 'function' ? receiver.getText() : '';
+  if (recvText === 'console' && CONSOLE_LOG_METHODS.has(method)) {
+    return { framework: 'console', category: 'log' };
+  }
+  if (resolved && clientType) {
+    if (
+      (clientType.startsWith('winston.') || clientType === 'pino' || clientType.startsWith('pino.')) &&
+      EMISSION_LOG_METHODS.has(method)
+    ) {
+      return { framework: clientType, category: 'log' };
+    }
+    if (clientType.startsWith('@opentelemetry/') && EMISSION_TRACE_METHODS.has(method)) {
+      return { framework: clientType, category: 'trace' };
+    }
+    if (clientType.startsWith('@sentry/') && EMISSION_CAPTURE_METHODS.has(method)) {
+      return { framework: clientType, category: 'error_capture' };
+    }
+    return null;
+  }
+  // Namespace imports (import * as Sentry from '@sentry/node'): the receiver
+  // is a namespace whose TYPE does not resolve; attribute via the import.
+  if (EMISSION_CAPTURE_METHODS.has(method)) {
+    let sym;
+    try {
+      sym = checker.getSymbolAtLocation(receiver);
+    } catch (_e) {
+      sym = undefined;
+    }
+    const imp = packageFromImport(sym);
+    if (imp && imp.pkg.startsWith('@sentry/')) {
+      return { framework: imp.pkg, category: 'error_capture' };
+    }
+  }
+  return null;
+}
+
+// enclosingCatchClause returns the catch clause LEXICALLY containing `node`,
+// or null. Purely structural containment (no function-boundary stop): a log
+// written inside a catch -- directly or via a callback -- is on the error
+// path, and the same containment marks the catch as instrumented.
+function enclosingCatchClause(node) {
+  let cur = node.parent;
+  while (cur && !ts.isSourceFile(cur)) {
+    if (ts.isCatchClause(cur)) return cur;
+    cur = cur.parent;
+  }
+  return null;
+}
+
+// containsThrow reports whether a catch clause re-throws: a propagating
+// handler is NOT a swallow.
+function containsThrow(node) {
+  let found = false;
+  const scan = (n) => {
+    if (ts.isThrowStatement(n)) found = true;
+    else ts.forEachChild(n, scan);
+  };
+  scan(node);
+  return found;
+}
+
+// emissionRecord builds one aggregate packet. Function bodies are omitted on
+// purpose (volume); the category and count ride const_args.
+function emissionRecord(agg, relPath, snapshot) {
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit(), like every packet
+    site_kind: SITE_KIND_EMISSION,
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: agg.line,
+    symbol: agg.symbol,
+    func: agg.method,
+    receiver: '',
+    client_type: agg.framework,
+    snippet: agg.snippet,
+    enclosing_function_body: '',
+    callers: [],
+    callees: [],
+    client_construction: [],
+    const_args: [
+      { index: 0, name: 'emission_category', value: agg.category, how: 'aggregate' },
+      { index: 0, name: 'emission_count', value: String(agg.count), how: 'aggregate' },
+    ],
+    macro_expansion: false,
+    provenance: {
+      client_type_resolved:
+        agg.framework !== 'catch_clause' && agg.framework !== 'console',
+      confidence_tier: 'high',
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Program construction + file discovery
 // ---------------------------------------------------------------------------
 
@@ -565,17 +699,69 @@ function runRetrieve(root, snapshot, filesArg) {
     const relPath = relPathOf(sf.fileName);
     if (wanted && !wanted.has(relPath)) continue;
 
+    // Per-file G4 emission state: aggregates keyed (function, framework,
+    // category), plus the catch clauses seen and which of them emit.
+    const aggs = new Map();
+    const catchClauses = [];
+    const emittingCatches = new Set();
+    const aggregate = (node, framework, category, method) => {
+      const enc = enclosingFunction(node);
+      const key = `${enc.name} ${framework} ${category}`;
+      let agg = aggs.get(key);
+      if (!agg) {
+        const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+        agg = {
+          line: line + 1,
+          method,
+          snippet: method === 'catch' ? '' : cap(node.getText()),
+          framework,
+          category,
+          symbol: enc.name,
+          count: 0,
+        };
+        aggs.set(key, agg);
+      }
+      agg.count++;
+    };
+
     const visit = (node) => {
+      if (ts.isCatchClause(node)) catchClauses.push(node);
       if (
         ts.isCallExpression(node) &&
         ts.isPropertyAccessExpression(node.expression)
       ) {
-        const rec = siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned);
-        if (rec) records.push(rec);
+        const prop = node.expression;
+        const receiver = prop.expression;
+        const method = prop.name.getText();
+        const { clientType, resolved } = resolveClientType(receiver, checker, program);
+        const em = emissionIdentity(receiver, method, clientType, resolved, checker);
+        if (em) {
+          let category = em.category;
+          const cc = enclosingCatchClause(node);
+          if (cc) {
+            emittingCatches.add(cc);
+            // A log emission ON an error path is the capture fact.
+            if (category === 'log') category = 'error_capture';
+          }
+          aggregate(node, em.framework, category, method);
+        } else {
+          const rec = siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned);
+          if (rec) records.push(rec);
+        }
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
+
+    // Swallowed error paths: a catch that neither emits anything recognized
+    // nor re-throws, aggregated per enclosing function.
+    for (const cc of catchClauses) {
+      if (emittingCatches.has(cc) || containsThrow(cc)) continue;
+      aggregate(cc, 'catch_clause', 'error_capture', 'catch');
+    }
+    for (const agg of [...aggs.values()].sort((a, b) => a.line - b.line)) {
+      records.push(emissionRecord(agg, relPath, snapshot));
+    }
   }
 
   const repoConfig = collectRepoConfig(program, checker, snapshot, isScanned);

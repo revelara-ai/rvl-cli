@@ -12,6 +12,7 @@ members = [
     "crates/rvl-propagate",
     "crates/rvl-eval",
     "crates/rvl-structure",
+    "crates/rvl-emission",
 ]
 
 [workspace.package]

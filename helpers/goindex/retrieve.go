@@ -148,6 +148,11 @@ type RetrievedSite struct {
 	// Schema is stamped on every record so a stream is self-describing even
 	// when lines are split, filtered, or concatenated across helpers.
 	Schema int `json:"packet_schema"`
+	// SiteKind distinguishes what kind of site this packet describes. Empty
+	// (the default) is a classic G1 client-call site; "emission_point" marks
+	// a G4 emission aggregate (po-av01j.5). Additive within the unreleased
+	// v2 train — no schema bump.
+	SiteKind string `json:"site_kind,omitempty"`
 	// SiteKey uniquely identifies this site. A file:line is NOT unique: one
 	// location can resolve to several sites with different client types (and
 	// different verdicts), so downstream indexes and joins key on this.
@@ -731,6 +736,9 @@ func runRetrieve(root, name string) []RetrievedSite {
 			}
 		}
 	}
+	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
+	// ride the same stream, stamped site_kind: "emission_point".
+	out = append(out, collectEmissions(pkgs, src, root, name)...)
 	return out
 }
 

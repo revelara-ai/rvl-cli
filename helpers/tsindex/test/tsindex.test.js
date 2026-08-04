@@ -200,6 +200,96 @@ test('--files restricts output to the listed file (exact path)', () => {
   assert.strictEqual(sites.length, 0);
 });
 
+// --- G4 emission packets (po-av01j.5) ---
+//
+// Emission points ride the same stream as AGGREGATES — one packet per
+// (enclosing function, framework, category), never one per log line — stamped
+// site_kind: "emission_point" with category and count riding const_args.
+
+function emissionRecords() {
+  return retrieveRecords().filter((r) => r.site_kind === 'emission_point');
+}
+
+function constByName(rec, name) {
+  const a = rec.const_args.find((x) => x.name === name);
+  return a ? a.value : null;
+}
+
+test('log statements aggregate per function/framework/category', () => {
+  const emissions = emissionRecords();
+  assert.ok(emissions.length >= 1, 'expected emission packets from the fixture');
+  const noisy = emissions.filter(
+    (r) => r.symbol === 'noisy' && r.client_type === 'winston.Logger',
+  );
+  assert.strictEqual(
+    noisy.length,
+    1,
+    `four logger calls in one function must be ONE aggregate: ${JSON.stringify(noisy)}`,
+  );
+  assert.strictEqual(constByName(noisy[0], 'emission_category'), 'log');
+  assert.strictEqual(constByName(noisy[0], 'emission_count'), '4');
+  // Shared packet invariants hold for emission packets too.
+  assert.strictEqual(noisy[0].packet_schema, 2);
+  assert.ok(noisy[0].site_key);
+});
+
+test('span instrumentation is a trace-category emission', () => {
+  const emissions = emissionRecords();
+  const spans = emissions.filter(
+    (r) => r.symbol === 'traced' && r.client_type === '@opentelemetry/api.Tracer',
+  );
+  assert.strictEqual(spans.length, 1, JSON.stringify(emissions));
+  assert.strictEqual(constByName(spans[0], 'emission_category'), 'trace');
+});
+
+test('a log emission inside a catch is error_capture, and not a swallow', () => {
+  const emissions = emissionRecords();
+  const inCatch = emissions.filter(
+    (r) => r.symbol === 'catches' && r.client_type === 'winston.Logger',
+  );
+  assert.strictEqual(inCatch.length, 1, JSON.stringify(emissions));
+  assert.strictEqual(constByName(inCatch[0], 'emission_category'), 'error_capture');
+  for (const r of emissions) {
+    if (r.client_type === 'catch_clause') {
+      assert.notStrictEqual(r.symbol, 'catches', 'a logging catch is not a swallow');
+      assert.notStrictEqual(r.symbol, 'rethrows', 'a re-throwing catch is not a swallow');
+    }
+  }
+});
+
+test('a catch that neither emits nor re-throws is a catch_clause swallow', () => {
+  const emissions = emissionRecords();
+  const swallows = emissions.filter((r) => r.client_type === 'catch_clause');
+  assert.strictEqual(swallows.length, 1, JSON.stringify(swallows));
+  assert.strictEqual(swallows[0].symbol, 'swallows');
+  assert.strictEqual(constByName(swallows[0], 'emission_category'), 'error_capture');
+});
+
+test('console calls emit under the console identity', () => {
+  const emissions = emissionRecords();
+  const consoles = emissions.filter(
+    (r) => r.symbol === 'consoleUser' && r.client_type === 'console',
+  );
+  assert.strictEqual(consoles.length, 1, JSON.stringify(emissions));
+  assert.strictEqual(constByName(consoles[0], 'emission_count'), '2');
+});
+
+test('emission calls are routed OUT of the G1 site list; anchors stay in', () => {
+  const g1 = retrieveRecords().filter((r) => !r.site_kind);
+  // logger.info etc must not double-count as G1 client calls.
+  assert.ok(
+    !g1.some((r) => r.client_type === 'winston.Logger'),
+    'logger calls leaked into the G1 site list',
+  );
+  // The LLM SDK call is a G1 anchor (the RC-061 call-site half rides G1).
+  assert.ok(
+    g1.some((r) => r.client_type === 'openai.Completions' && r.func === 'create'),
+    `expected the openai.Completions.create G1 site: ${JSON.stringify(
+      g1.map((r) => r.client_type),
+    )}`,
+  );
+});
+
 test('repo_config packet is emitted, well-formed, and repo-scoped', () => {
   const cfg = repoConfig();
   assert.strictEqual(cfg.kind, 'repo_config', 'kind must be the literal repo_config');
