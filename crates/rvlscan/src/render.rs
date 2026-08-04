@@ -46,7 +46,9 @@ pub enum Section {
 /// One finding as the renderer sees it: a class plus the site and evidence to
 /// display. Built from a triaged item; the fields the incident corpus would
 /// enrich are optional so the output degrades gracefully when they are absent.
-#[derive(Debug, Clone)]
+/// Serde is derived because `scan` persists the rendered ladder to the
+/// last-scan state file that `explain`/`suppress` resolve ids from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     /// Stable short id for `rvlscan explain <id>` and durable suppression.
     pub id: String,
