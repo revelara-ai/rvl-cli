@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+mod agent;
 mod config_lane;
 mod render;
 mod report;
@@ -58,9 +59,17 @@ enum Cmd {
         /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
         /// one-line deprecation notice and runs the deterministic scan.
         /// Consented hook adjudication is configured separately
-        /// (po-av01j.15); this flag never invokes a model.
+        /// (po-av01j.15, `--hook`); this flag never invokes a model.
         #[arg(long)]
         agent: bool,
+        /// Name the git hook this scan runs under (pre-commit|pre-push).
+        /// With `--incremental`, enables the CONSENTED hook-mode agent
+        /// adjudication lane for delta-scoped undecided sites — OFF by
+        /// default at every layer; see `scanner.use_agent` and
+        /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
+        /// deterministic scan and its exit behavior are unchanged either way.
+        #[arg(long)]
+        hook: Option<String>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method` and a site count,
@@ -187,13 +196,16 @@ enum Cmd {
 }
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
-/// deterministic scan proceeds. po-av01j.15 extends this seam with the
-/// consented hook-adjudication pointer once that surface lands.
+/// deterministic scan proceeds. Extended per po-av01j.15 with the consented
+/// hook-adjudication pointer.
 fn agent_alias_notice() {
     eprintln!(
         "note: --agent is a deprecated rvl-cli compatibility alias; rvlscan runs its \
-         deterministic scan (no model calls) — drop --agent, and see 'rvlscan skills' \
-         for the agent-side workflow surface"
+         deterministic scan (no model calls) — drop --agent. For consented agent \
+         adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
+         scanner.agent_hooks in .revelara.yaml and run 'rvlscan scan --incremental \
+         --hook <pre-commit|pre-push>'; see 'rvlscan skills' for the agent-side \
+         workflow surface"
     );
 }
 
@@ -1268,6 +1280,7 @@ fn run_scan(
             &[],
             &structure,
             None,
+            None,
             out,
             color,
             start,
@@ -1298,6 +1311,7 @@ fn run_scan(
         &sites,
         &structure,
         Some(&lane),
+        None,
         out,
         color,
         start,
@@ -1369,6 +1383,7 @@ fn render_scan_output(
     sites: &[rvl_core::Site],
     structure: &[render::Finding],
     config: Option<&config_lane::LaneOutput>,
+    hook_agent: Option<&agent::HookOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -1407,6 +1422,15 @@ fn render_scan_output(
     if let Some(lane) = config {
         ladder_findings.extend(lane.findings.iter().cloned());
     }
+    // Hook-mode agent adjudication (po-av01j.15): gate-mode rows join the
+    // ladder BEFORE waivers (so `agent.<type>.<method>` waivers suppress them
+    // like any class) — this list is EMPTY unless the repo committed
+    // `scanner.agent_verdicts: gate`; advisory verdicts live only in the
+    // agent block printed after the ladder. The eval rows (`--out`) below are
+    // built from `findings`, which agent verdicts never touch.
+    if let Some(a) = hook_agent {
+        ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -1436,6 +1460,13 @@ fn render_scan_output(
             stdout_color(color)
         )
     );
+    // The agent block renders AFTER the ladder, in its own provenance-tagged
+    // section — agent output never mixes into the deterministic sections.
+    if let Some(a) = hook_agent {
+        if !a.block.is_empty() {
+            print!("\n{}", a.block);
+        }
+    }
 
     if let Some(p) = out {
         let rows: Vec<FindingOut> = findings
@@ -1638,6 +1669,11 @@ struct IncrementalScan {
     reused_files: usize,
     retrieved_files: usize,
     degraded_note: Option<String>,
+    /// Repo-relative paths of the files this pass considered CHANGED — the
+    /// delta the hook-mode agent adjudication lane is scoped to (po-av01j.15).
+    /// On a degraded pass the changed files were not retrieved, so they carry
+    /// no sites and the delta batch is naturally empty.
+    changed_files: Vec<String>,
 }
 
 /// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
@@ -1653,6 +1689,11 @@ where
     F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
 {
     let plan = index.plan_reload(candidates);
+    let changed_files: Vec<String> = plan
+        .changed
+        .iter()
+        .map(|f| repo_relative(root, f))
+        .collect();
 
     // Reuse indexed packets for the unchanged files.
     let mut reused = Vec::new();
@@ -1701,6 +1742,7 @@ where
         reused_files,
         retrieved_files,
         degraded_note: rr.degraded_note,
+        changed_files,
     })
 }
 
@@ -1895,6 +1937,7 @@ fn run_scan_incremental(
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
+    hook: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     let scan = incremental_scan_pass(index_dir, path, strict)?;
@@ -1931,6 +1974,22 @@ fn run_scan_incremental(
     // Config files are not content-hash indexed (parsing them is cheap): the
     // lane simply re-runs on every warm scan, so it can never be stale.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    // Hook-mode agent adjudication (po-av01j.15): runs AFTER the deterministic
+    // pipeline is fully assembled, under its own consent + budget, over the
+    // delta-scoped undecided sites only. Every failure path fails open; the
+    // deterministic result above is never at risk.
+    let hook_agent = hook.and_then(|h| {
+        agent::run_hook_adjudication(
+            h,
+            path,
+            &scan.changed_files,
+            &findings,
+            &sites,
+            &agent::telemetry_path_from_state(state_path),
+            env!("CARGO_PKG_VERSION"),
+            stdout_color(color),
+        )
+    });
     render_scan_output(
         state_path,
         path,
@@ -1939,6 +1998,7 @@ fn run_scan_incremental(
         &sites,
         &structure,
         Some(&lane),
+        hook_agent.as_ref(),
         out,
         color,
         start,
@@ -2503,6 +2563,7 @@ fn run() -> anyhow::Result<ExitCode> {
             incremental,
             strict,
             agent,
+            hook,
         } => {
             if agent {
                 agent_alias_notice();
@@ -2522,8 +2583,18 @@ fn run() -> anyhow::Result<ExitCode> {
                     out.as_deref(),
                     color.as_deref(),
                     strict,
+                    hook.as_deref(),
                 )
             } else {
+                // Hook adjudication is delta-scoped by definition; without
+                // the incremental changed-file gate there is no delta, so the
+                // lane cannot run (the scan itself is unaffected).
+                if hook.is_some() {
+                    eprintln!(
+                        "note: --hook agent adjudication is delta-scoped and only runs with \
+                         --incremental (and without --retrieved); proceeding deterministic-only"
+                    );
+                }
                 run_scan(
                     &store,
                     &keyset,
@@ -3388,6 +3459,30 @@ mod tests {
             Some(Cmd::Scan { agent, path, .. }) => {
                 assert!(agent);
                 assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn scan_hook_flag_parses_with_incremental() {
+        // The hook-adjudication surface (po-av01j.15): `--hook <name>` rides
+        // the normal scan invocation a git hook makes.
+        let cli = Cli::try_parse_from([
+            "rvlscan",
+            "scan",
+            "--incremental",
+            "--hook",
+            "pre-commit",
+            "some/path",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                hook, incremental, ..
+            }) => {
+                assert!(incremental);
+                assert_eq!(hook.as_deref(), Some("pre-commit"));
             }
             _ => panic!("expected scan"),
         }

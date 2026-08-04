@@ -1472,3 +1472,138 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
         "repo_structure record leaked into the site list: {stdout}"
     );
 }
+
+// --- hook-mode agent adjudication (po-av01j.15) ---
+
+/// Copy the goindex fixture into a writable temp repo so the test can commit
+/// consent into `.revelara.yaml` without touching the shared fixture tree.
+fn copy_fixture_to(dst: &std::path::Path) {
+    fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+    copy_dir(&goindex_fixture(), dst);
+}
+
+/// End-to-end hook lane: with EVERY consent layer on and a stub agent
+/// (RVLSCAN_AGENT_CMD), an incremental hook scan makes ONE batched invocation
+/// over the delta's undecided sites, renders the provenance-tagged AGENT
+/// block, and records identity-only telemetry locally. The stub replies `[]`
+/// (a valid, empty verdict set), so every site stays undecided and the
+/// deterministic result is visibly unchanged.
+#[cfg(unix)]
+#[test]
+fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let repo = dir.path().join("repo");
+    copy_fixture_to(&repo);
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        "scanner:\n  use_agent: allow\n  agent_hooks:\n    pre_commit:\n      enabled: true\n      budget_seconds: 20\n",
+    )
+    .unwrap();
+
+    // The stub approved agent: proof of invocation + a valid empty verdict set.
+    let stub = dir.path().join("agent-stub.sh");
+    std::fs::write(&stub, "#!/bin/sh\necho '[]'\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Empty specs: every fixture site abstains (no spec), i.e. is undecided.
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let home = dir.path().join("home"); // isolates org policy + user config
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["scan", "--incremental", "--hook", "pre-commit"])
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_AGENT_CMD", &stub)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("AGENT"),
+        "consented hook run must render the agent block: {stdout}"
+    );
+    assert!(
+        stdout.contains("stay undecided"),
+        "an empty verdict set leaves the sites undecided: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "advisory mode must never produce blocking rows: {stdout}"
+    );
+
+    // Identity-only telemetry landed locally, next to last-scan.json.
+    let telemetry = dir.path().join("agent-telemetry.jsonl");
+    let text = std::fs::read_to_string(&telemetry).expect("telemetry file must exist");
+    let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(row["hook"], "pre-commit");
+    assert_eq!(row["agent"], "custom");
+    assert!(row["latency_ms"].is_u64());
+    assert_eq!(row["timed_out"], false);
+    assert!(
+        !text.contains("svc.go") && !text.contains(repo.to_str().unwrap()),
+        "telemetry must never carry file paths: {text}"
+    );
+}
+
+/// The consent default: the SAME hook invocation with no `.revelara.yaml`
+/// consent renders no agent block, invokes nothing, and records no telemetry.
+#[test]
+fn hook_scan_without_consent_stays_deterministic_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let repo = dir.path().join("repo");
+    copy_fixture_to(&repo);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args(["scan", "--incremental", "--hook", "pre-commit"])
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("AGENT"),
+        "no consent must mean no agent block: {stdout}"
+    );
+    assert!(
+        !dir.path().join("agent-telemetry.jsonl").exists(),
+        "no consent must mean no telemetry"
+    );
+}
