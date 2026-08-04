@@ -85,6 +85,59 @@ func TestRetrievedSitesCarryConstArgsAndMacroFlag(t *testing.T) {
 	}
 }
 
+// G3 (po-av01j.4): background-job registrations ride the SAME packet stream,
+// marked by site_kind. Detection is TYPE-driven — the callee must resolve into
+// the scheduler/queue framework's package — so a same-named local method is
+// never guessed at, and ordinary client calls stay classic (empty site_kind).
+func TestBackgroundJobRegistrationsAreEmittedWithSiteKind(t *testing.T) {
+	sites := runRetrieve("testdata/fixture", "fixture")
+	if len(sites) == 0 {
+		t.Fatal("fixture retrieval produced no sites (does the fixture build?)")
+	}
+	byMethod := map[string][]RetrievedSite{}
+	for _, s := range sites {
+		if s.SiteKind == "background_job" {
+			byMethod[s.Method] = append(byMethod[s.Method], s)
+		} else if s.SiteKind != "" {
+			t.Fatalf("unexpected site_kind %q on %s:%d", s.SiteKind, s.File, s.Line)
+		}
+	}
+
+	// The two cron registrations, carrying the scheduler's resolved identity.
+	adds := byMethod["AddFunc"]
+	if len(adds) != 2 {
+		t.Fatalf("want 2 cron AddFunc background_job sites, got %+v", byMethod)
+	}
+	symbols := map[string]bool{}
+	for _, j := range adds {
+		if j.ClientType != "github.com/robfig/cron/v3.Cron" {
+			t.Fatalf("cron registration must carry the scheduler identity, got %q", j.ClientType)
+		}
+		symbols[j.Symbol] = true
+	}
+	if !symbols["scheduleHourly"] || !symbols["scheduleDaily"] {
+		t.Fatalf("job site symbols must be the registering functions, got %v", symbols)
+	}
+
+	// The ticker worker loop: a package-level callee, canonical identity.
+	ticks := byMethod["NewTicker"]
+	if len(ticks) != 1 || ticks[0].ClientType != "time.Ticker" {
+		t.Fatalf("want one ticker worker-loop site with client_type time.Ticker, got %+v", ticks)
+	}
+
+	// Classic G1 sites are untouched by the extension.
+	for _, s := range sites {
+		if s.Method == "QueryContext" && s.SiteKind != "" {
+			t.Fatalf("classic call sites must keep an empty site_kind, got %q", s.SiteKind)
+		}
+	}
+	// cron.Start is registration-adjacent but NOT a registration surface:
+	// abstain-by-omission, never guess.
+	if len(byMethod["Start"]) != 0 {
+		t.Fatalf("Start is not a registration; got %+v", byMethod["Start"])
+	}
+}
+
 func findConstArg(args []ConstArg, index int) *ConstArg {
 	for i := range args {
 		if args[i].Index == index {

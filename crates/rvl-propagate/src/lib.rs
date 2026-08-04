@@ -110,6 +110,27 @@ pub fn propagate(
     let key = site.api_key();
     let spec = specs.api(&key);
 
+    // Applicability by site kind (G3, po-av01j.4). A spec governs only the
+    // site kinds it declares (empty = the classic G1 call site), so a
+    // call-site judgment is never silently re-applied at job altitude, nor a
+    // job-altitude spec to classic calls. Wrong-altitude specs ABSTAIN — the
+    // site routes to a spec author, exactly like a missing spec, because a
+    // spec error is multiplied across every site using the API at once.
+    if let Some(s) = spec {
+        if !s.applies_to(&site.site_kind) {
+            let kind = if site.site_kind.is_empty() {
+                "call_site"
+            } else {
+                &site.site_kind
+            };
+            return Finding {
+                site_id: id,
+                verdict: Verdict::Abstain,
+                reason: format!("spec does not declare applicability to site kind {kind}"),
+            };
+        }
+    }
+
     if let Some((verdict, reason)) = spec_gate(spec) {
         return Finding {
             site_id: id,
@@ -374,6 +395,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: String::new(),
                 site_count: 1,
+                site_kinds: vec![],
             }],
             configs,
             scopes: vec![],
@@ -389,6 +411,142 @@ mod tests {
             client_type: "db.Pool".into(),
             ..Default::default()
         }
+    }
+
+    // --- G3 background-job sites: spec applicability by site_kind (po-av01j.4) ---
+
+    /// A job-altitude spec: the same timeout-judgment machinery, declared
+    /// applicable to background_job sites (RC-060 / job-altitude re-application).
+    fn job_cache(bounded_by: Vec<Mechanism>) -> SpecCache {
+        SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "github.com/robfig/cron/v3.Cron".into(),
+                method: "AddFunc".into(),
+                blocking: Blocking::Yes,
+                bounded_by,
+                confidence: 0.9,
+                rationale: "RC-060: a registered job runs unattended; the run bound must exist at registration altitude".into(),
+                site_count: 1,
+                site_kinds: vec!["background_job".into()],
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+        })
+    }
+
+    fn job_site() -> Site {
+        Site {
+            file_path: "internal/jobs/cron.go".into(),
+            line_number: 12,
+            method: "AddFunc".into(),
+            client_type: "github.com/robfig/cron/v3.Cron".into(),
+            site_kind: "background_job".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_classic_spec_never_decides_a_background_job_site() {
+        // The applicability guard: the cache holds only a G1 call-site spec
+        // for this api key. A background-job registration must ABSTAIN and
+        // route to a spec author, never inherit a judgment authored for a
+        // different altitude — spec error is multiplied, not isolated.
+        let mut s = site();
+        s.site_kind = "background_job".into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert!(
+            f.reason.contains("site kind"),
+            "the reason must name the applicability gap: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_job_altitude_spec_never_leaks_onto_classic_call_sites() {
+        // The reverse guard: a spec declared for background_job only must not
+        // decide a classic call site with the same api key.
+        let mut s = site();
+        s.method = "AddFunc".into();
+        s.client_type = "github.com/robfig/cron/v3.Cron".into();
+        let f = propagate(
+            &s,
+            &job_cache(vec![Mechanism::Context]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert!(f.reason.contains("site kind"), "{}", f.reason);
+    }
+
+    #[test]
+    fn an_unbounded_job_registration_with_complete_search_violates() {
+        // Job-altitude re-application of the EXISTING judgment: no bound
+        // anywhere, complete search -> violation, exactly as at G1 altitude.
+        let f = propagate(
+            &job_site(),
+            &job_cache(vec![Mechanism::Context]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates);
+    }
+
+    #[test]
+    fn a_deadline_derived_in_the_registered_closure_satisfies_at_job_altitude() {
+        // The registered closure derives its own deadline; the ambient
+        // deadline machinery (unchanged) must see it through the enclosing
+        // body, the same way it would for a G1 call site.
+        let mut s = job_site();
+        s.enclosing_function_body =
+            "func run() {\n  c.AddFunc(\"@hourly\", func() {\n    ctx, cancel := context.WithTimeout(context.Background(), time.Minute)\n    defer cancel()\n    work(ctx)\n  })\n}"
+                .into();
+        let f = propagate(
+            &s,
+            &job_cache(vec![Mechanism::Context]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn a_bounding_decorator_on_the_task_satisfies_at_job_altitude() {
+        // Celery's idiom: @shared_task(time_limit=120) IS the job bound. The
+        // existing Decorator mechanism applies unchanged at job altitude.
+        let mut s = Site {
+            file_path: "app/tasks.py".into(),
+            line_number: 8,
+            method: "shared_task".into(),
+            client_type: "celery".into(),
+            site_kind: "background_job".into(),
+            ..Default::default()
+        };
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef rebuild_index():\n    walk()".into();
+        let specs = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "celery".into(),
+                method: "shared_task".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::Decorator],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec!["background_job".into()],
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+        });
+        let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
+        assert_eq!(f.verdict, Verdict::Satisfies);
     }
 
     #[test]
@@ -441,6 +599,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: String::new(),
                 site_count: 1,
+                site_kinds: vec![],
             }],
             configs: vec![],
             scopes: vec![],
@@ -815,6 +974,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: String::new(),
                 site_count: 1,
+                site_kinds: vec![],
             }],
             configs: vec![],
             config_keys: vec![],

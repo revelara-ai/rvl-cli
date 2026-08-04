@@ -152,6 +152,48 @@ class TestRetrievedPackets(unittest.TestCase):
         cached = next(r for r in records if r["symbol"] == "cached_lookup")
         self.assertEqual(cached["const_args"], [])
 
+    def test_background_job_registrations_carry_site_kind(self):
+        """G3 (po-av01j.4): scheduler/queue registrations ride the same packet
+        stream marked site_kind="background_job"; classic call sites keep an
+        empty site_kind. Detection is import-resolution-driven."""
+        records = _retrieve_records()
+        for r in records:
+            self.assertIn("site_kind", r, "site_kind must be on every packet")
+            if r["file_path"] == "svc.py":
+                self.assertEqual(r["site_kind"], "",
+                                 "classic call sites must stay classic")
+        jobs = [r for r in records if r["site_kind"] == "background_job"]
+
+        # Celery decorator registrations, both idioms.
+        task = next(r for r in jobs if r["func"] == "task")
+        self.assertEqual(task["client_type"], "celery.Celery")
+        self.assertEqual(task["symbol"], "rebuild_index")
+        shared = next(r for r in jobs if r["func"] == "shared_task")
+        self.assertEqual(shared["client_type"], "celery")
+        self.assertEqual(shared["symbol"], "prune_old")
+        # The decorator facts ride chain_roots so the existing Decorator
+        # judgment mechanism downstream can see time_limit=120.
+        decs = [d for root in shared["provenance"]["chain_roots"]
+                for d in root["decorators"]]
+        self.assertTrue(any("time_limit" in d for d in decs), decs)
+
+        # apscheduler cron registration + rq dispatcher + rq worker loop.
+        cronreg = next(r for r in jobs if r["func"] == "scheduled_job")
+        self.assertTrue(cronreg["client_type"].startswith("apscheduler."),
+                        cronreg["client_type"])
+        enq = next(r for r in jobs if r["func"] == "enqueue")
+        self.assertEqual(enq["client_type"], "rq.Queue")
+        loop = next(r for r in jobs if r["func"] == "work")
+        self.assertEqual(loop["client_type"], "rq.Worker")
+
+    def test_unresolved_job_lookalikes_are_never_guessed(self):
+        """`registry.enqueue(...)` on an unresolved receiver must not be
+        emitted at all: type-driven means abstain rather than guess."""
+        records = _retrieve_records()
+        self.assertFalse(
+            [r for r in records if r["symbol"] == "not_a_job"],
+            "an unresolved enqueue lookalike must not become a site")
+
     def test_files_filter_is_exact_path(self):
         # the incremental path emits only the listed file
         records = _retrieve_records("--files", "svc.py")

@@ -182,6 +182,52 @@ type RetrievedSite struct {
 	// no macros, so always false here; C/C++ retrievers set it mechanically
 	// from expansion locations.
 	MacroExpansion bool `json:"macro_expansion"`
+	// SiteKind marks what KIND of surface this is: empty for the classic G1
+	// client call site, "background_job" for a G3 scheduler/queue
+	// registration or worker-loop entry (po-av01j.4). Additive
+	// default-carrying field within the v2 packet train — not a schema bump.
+	SiteKind string `json:"site_kind,omitempty"`
+}
+
+// --- G3 background-job registration surfaces (po-av01j.4) ---
+//
+// jobFrameworks lists the scheduler/queue surfaces whose registration calls
+// (and worker-loop entries) are emitted as background_job sites. Like
+// ioMethods this is a RETRIEVAL selection table, not a judgment: it picks
+// WHICH sites to surface; whether a registration needs a bound is spec
+// knowledge (ApiSpec.site_kinds downstream). Detection is TYPE-driven — the
+// callee must RESOLVE into the framework's package path — so an unresolved or
+// same-named local method is never guessed at (abstain-by-omission).
+var jobFrameworks = []struct {
+	pkg        string          // exact package path, or a path prefix (versioned modules append /vN)
+	methods    map[string]bool // registration / loop-entry functions
+	clientType string          // canonical identity when the receiver is not a typed value (package funcs)
+}{
+	{"github.com/robfig/cron", map[string]bool{"AddFunc": true, "AddJob": true, "Schedule": true}, "github.com/robfig/cron.Cron"},
+	{"github.com/hibiken/asynq", map[string]bool{"HandleFunc": true, "Handle": true}, "github.com/hibiken/asynq.ServeMux"},
+	{"github.com/riverqueue/river", map[string]bool{"AddWorker": true, "AddWorkerSafely": true}, "github.com/riverqueue/river"},
+	{"time", map[string]bool{"NewTicker": true, "Tick": true}, "time.Ticker"},
+}
+
+// jobFrameworkType returns the canonical framework identity for a callee that
+// registers background work, or "" when the callee is not a recognized
+// registration surface. Matching is on the callee's RESOLVED package path
+// (exact, or a subpackage/versioned suffix), never on the receiver's text.
+func jobFrameworkType(callee *types.Func) string {
+	pkg := callee.Pkg()
+	if pkg == nil {
+		return ""
+	}
+	path := pkg.Path()
+	for _, fw := range jobFrameworks {
+		if !fw.methods[callee.Name()] {
+			continue
+		}
+		if path == fw.pkg || strings.HasPrefix(path, fw.pkg+"/") {
+			return fw.clientType
+		}
+	}
+	return ""
 }
 
 type srcIndex struct {
@@ -607,10 +653,16 @@ func runRetrieve(root, name string) []RetrievedSite {
 						return true
 					}
 					callee, _ := info.Uses[sel.Sel].(*types.Func)
-					if callee == nil || !ioMethods[callee.Name()] {
+					if callee == nil {
 						return true
 					}
-					if len(c.Args) == 0 && (callee.Name() == "Query" ||
+					// A background-job registration surface (G3) or a classic
+					// I/O call (G1); anything else is not a site.
+					jobType := jobFrameworkType(callee)
+					if jobType == "" && !ioMethods[callee.Name()] {
+						return true
+					}
+					if jobType == "" && len(c.Args) == 0 && (callee.Name() == "Query" ||
 						callee.Name() == "QueryRow" || callee.Name() == "Exec") {
 						return true
 					}
@@ -626,6 +678,16 @@ func runRetrieve(root, name string) []RetrievedSite {
 					if t := info.TypeOf(sel.X); t != nil {
 						rs.ClientType = strings.TrimPrefix(t.String(), "*")
 						rs.Prov.ClientTypeKnown = true
+					}
+					if jobType != "" {
+						rs.SiteKind = "background_job"
+						// A package-function registration (time.NewTicker,
+						// river.AddWorker) has no typed receiver value; carry
+						// the canonical framework identity instead.
+						if rs.ClientType == "" || rs.ClientType == "invalid type" {
+							rs.ClientType = jobType
+							rs.Prov.ClientTypeKnown = true
+						}
 					}
 
 					anc, depth, roots, hitDepth := ancestors(me)
