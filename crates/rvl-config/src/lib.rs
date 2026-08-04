@@ -35,6 +35,7 @@ pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
 pub mod prometheus;
+pub mod terraform;
 
 /// How the effective value of a config key was produced, ordered by
 /// decreasing evidentiary strength. This is the packet's confidence marker
@@ -153,6 +154,21 @@ pub trait ConfigRetriever {
     }
     /// Parse one matching file into packets.
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved;
+    /// Parse ALL files this format claimed in one scan, path-sorted `(rel,
+    /// contents)` pairs. The default forwards file-by-file to
+    /// [`ConfigRetriever::retrieve`]; a format whose effective values span
+    /// committed files (a tfvars assignment overriding a Terraform variable
+    /// default, a kustomize overlay) overrides this single entry point
+    /// instead, so cross-file resolution stays inside the format's module.
+    fn retrieve_all(&self, files: &[(String, String)], snapshot_id: &str) -> Retrieved {
+        let mut out = Retrieved::default();
+        for (rel, contents) in files {
+            let got = self.retrieve(rel, contents, snapshot_id);
+            out.packets.extend(got.packets);
+            out.unparseable += got.unparseable;
+        }
+        out
+    }
 }
 
 /// Every supported config-format retriever, in deterministic order.
@@ -162,6 +178,7 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(gitlab_ci::GitlabCi),
         Box::new(dep_manifests::DepManifests),
         Box::new(prometheus::PrometheusRules),
+        Box::new(terraform::Terraform),
     ]
 }
 
@@ -183,6 +200,9 @@ const SKIP_DIRS: &[&str] = &[
     "vendor",
     "__pycache__",
     "testdata",
+    // `terraform init`'s cache: vendored third-party modules/providers whose
+    // .tf files are not this repo's configuration.
+    ".terraform",
 ];
 
 /// Everything the config lane retrieved from a repo.
@@ -218,9 +238,6 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     }
     if rel.starts_with(".buildkite/") && is_yaml {
         return Some("buildkite");
-    }
-    if rel.ends_with(".tf") {
-        return Some("terraform");
     }
     if name == "Chart.yaml" || name == "Chart.yml" {
         return Some("helm");
@@ -272,6 +289,10 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     let mut out = LaneRetrieval::default();
     let mut sightings: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
+    // Files each retriever claimed, retrieved in ONE batch after the walk so
+    // formats whose resolution spans files see their whole claim at once
+    // (see [`ConfigRetriever::retrieve_all`]).
+    let mut claimed: Vec<Vec<(String, String)>> = retrievers.iter().map(|_| Vec::new()).collect();
 
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -292,14 +313,12 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
                 continue;
             }
             let rel = repo_relative(root, &path);
-            if let Some(r) = retrievers.iter().find(|r| r.matches(&rel)) {
+            if let Some(idx) = retrievers.iter().position(|r| r.matches(&rel)) {
                 let Ok(contents) = std::fs::read_to_string(&path) else {
                     out.unparseable_files += 1;
                     continue;
                 };
-                let got = r.retrieve(&rel, &contents, snapshot_id);
-                out.packets.extend(got.packets);
-                out.unparseable_files += got.unparseable;
+                claimed[idx].push((rel, contents));
                 continue;
             }
             // Path shapes need no read; bare YAML gets a bounded head read
@@ -330,6 +349,16 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
                 *sightings.entry(fmt).or_insert(0) += 1;
             }
         }
+    }
+
+    for (idx, files) in claimed.iter_mut().enumerate() {
+        if files.is_empty() {
+            continue;
+        }
+        files.sort();
+        let got = retrievers[idx].retrieve_all(files, snapshot_id);
+        out.packets.extend(got.packets);
+        out.unparseable_files += got.unparseable;
     }
 
     out.sightings = sightings
@@ -424,7 +453,9 @@ mod tests {
     fn sight_format_classifies_by_path_and_bounded_sniff() {
         assert_eq!(sight_format(".circleci/config.yml", ""), Some("circleci"));
         assert_eq!(sight_format(".travis.yml", ""), Some("travis-ci"));
-        assert_eq!(sight_format("infra/main.tf", ""), Some("terraform"));
+        // Terraform graduated from a sighting to a supported format
+        // (po-av01j.23): .tf files route to the retriever, never here.
+        assert_eq!(sight_format("infra/main.tf", ""), None);
         assert_eq!(sight_format("deploy/chart/Chart.yaml", ""), Some("helm"));
         assert_eq!(
             sight_format("k8s/base/kustomization.yaml", ""),
@@ -483,24 +514,42 @@ mod tests {
         std::fs::write(root.join(".circleci/config.yml"), "version: 2\n").unwrap();
         std::fs::write(root.join("main.tf"), "resource \"x\" \"y\" {}\n").unwrap();
         std::fs::write(root.join("infra.tf"), "").unwrap();
-        // A vendored terraform file must NOT be sighted.
+        // Vendored terraform files must NOT be claimed or sighted — neither a
+        // `vendor/` copy nor `terraform init`'s own `.terraform/` cache.
         std::fs::create_dir_all(root.join("vendor")).unwrap();
-        std::fs::write(root.join("vendor/v.tf"), "").unwrap();
+        std::fs::write(root.join("vendor/v.tf"), "resource \"a\" \"b\" {}\n").unwrap();
+        std::fs::create_dir_all(root.join(".terraform/modules/m")).unwrap();
+        std::fs::write(
+            root.join(".terraform/modules/m/main.tf"),
+            "resource \"c\" \"d\" {}\n",
+        )
+        .unwrap();
         let got = retrieve_repo(root, "snap");
         assert_eq!(
             got.sightings,
-            vec![
-                FormatSighting {
-                    format: "circleci".into(),
-                    file_count: 1
-                },
-                FormatSighting {
-                    format: "terraform".into(),
-                    file_count: 2
-                },
-            ]
+            vec![FormatSighting {
+                format: "circleci".into(),
+                file_count: 1
+            }],
+            "terraform is a supported format now, never a sighting"
         );
-        assert!(got.packets.is_empty());
+        // The root .tf files route to the Terraform retriever...
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "terraform" && p.unit == "resource:x.y"),
+            "root .tf files route to the terraform retriever: {:?}",
+            got.packets
+        );
+        // ...and no packet comes from a vendored tree.
+        assert!(
+            got.packets
+                .iter()
+                .all(|p| !p.file_path.starts_with("vendor/")
+                    && !p.file_path.starts_with(".terraform/")),
+            "vendored .tf files must not be retrieved: {:?}",
+            got.packets
+        );
     }
 
     #[test]

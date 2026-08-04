@@ -1041,6 +1041,97 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
     );
 }
 
+// --- G6 Terraform family (po-av01j.23) ---
+
+/// A repo whose Terraform has one violation of each seed spec (an unpinned
+/// provider, no state backend) and one satisfied key (an exactly-pinned
+/// registry module), plus a Go call site so the scan mirrors the GHA fixture.
+fn write_terraform_lane_fixtures(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::write(
+        dir.join("main.tf"),
+        r#"terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws" }
+  }
+}
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.1.0"
+}
+"#,
+    )
+    .unwrap();
+    // SEED, test-grade config specs (the production corpus is a follow-up
+    // factory run): unpinned provider violates, missing remote state
+    // violates, an exact or ref pin satisfies.
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"terraform","key":"provider.version-constraint","expect":{"kind":"present"},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin provider versions in required_providers","rationale":"an unconstrained provider floats to the newest release"},
+            {"format":"terraform","key":"terraform.backend","expect":{"kind":"present"},"confidence":0.9,"control":"RC-030","severity":"medium","fix":"configure a remote state backend in the terraform block","rationale":"local state cannot be shared, locked, or recovered"},
+            {"format":"terraform","key":"module.pin-class","expect":{"kind":"one_of","values":["exact","ref-pinned"]},"confidence":0.9,"control":"RC-045","rationale":"registry/git modules pin to an exact version or ref"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_terraform_family_with_seed_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_terraform_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The two seeded violations surface as config classes...
+    assert!(
+        stdout.contains("terraform provider.version-constraint"),
+        "unpinned provider must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("terraform terraform.backend"),
+        "missing remote state must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-030"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // ...and the exactly-pinned registry module satisfies its spec, so
+    // pin-class never renders as a finding.
+    assert!(
+        !stdout.contains("terraform module.pin-class"),
+        "a satisfied config key is not a finding: {stdout}"
+    );
+    // Terraform is a supported format now: never sighted as unsupported.
+    assert!(
+        !stdout.contains("unsupported config formats sighted: terraform"),
+        "supported formats must not be sighted: {stdout}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
