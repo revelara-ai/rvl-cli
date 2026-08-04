@@ -1,0 +1,43 @@
+{
+  "controls": [
+    {
+      "control": {
+        "category": "fault_tolerance",
+        "control_code": "RC-018",
+        "name": "Timeouts \u0026 retries",
+        "type": "preventive"
+      },
+      "evidence_gaps": [
+        "code"
+      ],
+      "existing_evidence": []
+    }
+  ],
+  "graph_multiplier": {
+    "value": 1.25
+  },
+  "knowledge": {
+    "facts": [],
+    "patterns": [],
+    "procedures": []
+  },
+  "risk": {
+    "category": "data_management",
+    "id": "x",
+    "linked_services": [
+      "a"
+    ],
+    "risk_code": "R-001",
+    "score": 88,
+    "status": "applicable",
+    "title": "DB \u003cprimary\u003e \u0026 replica"
+  },
+  "score_factors": [
+    {
+      "description": "seen in 3 incidents",
+      "points": 30,
+      "source": "incidents"
+    }
+  ],
+  "zeta": true
+}

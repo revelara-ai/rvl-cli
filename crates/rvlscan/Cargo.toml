@@ -14,6 +14,7 @@ rvl-cache = { path = "../rvl-cache" }
 rvl-config = { path = "../rvl-config" }
 rvl-content = { path = "../rvl-content" }
 rvl-core = { path = "../rvl-core" }
+rvl-data = { path = "../rvl-data" }
 rvl-skills = { path = "../rvl-skills" }
 rvl-spec = { path = "../rvl-spec" }
 rvl-propagate = { path = "../rvl-propagate" }

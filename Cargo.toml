@@ -7,6 +7,7 @@ members = [
     "crates/rvl-triage",
     "crates/rvl-index",
     "crates/rvl-core",
+    "crates/rvl-data",
     "crates/rvl-skills",
     "crates/rvl-spec",
     "crates/rvl-propagate",

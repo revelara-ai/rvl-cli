@@ -55,6 +55,12 @@ enum Cmd {
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+        /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
+        /// one-line deprecation notice and runs the deterministic scan.
+        /// Consented hook adjudication is configured separately
+        /// (po-av01j.15); this flag never invokes a model.
+        #[arg(long)]
+        agent: bool,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method` and a site count,
@@ -149,6 +155,46 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+    // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
+    // contract (same subcommands/flags, byte-identical --format=json);
+    // implementations live in crates/rvl-data with golden-parity suites. ---
+    /// Configure Revelara API credentials interactively
+    Login,
+    /// Remove stored credentials from ~/.revelara/config.yaml
+    Logout,
+    /// Check connection and authentication status
+    Status,
+    /// Manage risk lifecycle (list, ready, show, context, stale, resolve, accept)
+    Risk {
+        #[command(subcommand)]
+        cmd: rvl_data::risk::RiskCmd,
+    },
+    /// Query the reliability controls catalog (list, show)
+    Control {
+        #[command(subcommand)]
+        cmd: rvl_data::control::ControlCmd,
+    },
+    /// Query the organizational knowledge base (search, facts, procedures, patterns)
+    Knowledge {
+        #[command(subcommand)]
+        cmd: rvl_data::knowledge::KnowledgeCmd,
+    },
+    /// Manage control evidence (submit, list, verify)
+    Evidence {
+        #[command(subcommand)]
+        cmd: rvl_data::evidence::EvidenceCmd,
+    },
+}
+
+/// The `scan --agent` compatibility notice. One line, stderr, then the
+/// deterministic scan proceeds. po-av01j.15 extends this seam with the
+/// consented hook-adjudication pointer once that surface lands.
+fn agent_alias_notice() {
+    eprintln!(
+        "note: --agent is a deprecated rvl-cli compatibility alias; rvlscan runs its \
+         deterministic scan (no model calls) — drop --agent, and see 'rvlscan skills' \
+         for the agent-side workflow surface"
+    );
 }
 
 #[derive(Subcommand)]
@@ -2379,6 +2425,19 @@ fn run() -> anyhow::Result<ExitCode> {
         Cli::command().print_help()?;
         return Ok(ExitCode::SUCCESS);
     };
+    // rvl-cli data-command port (po-av01j.17): these manage their own
+    // config/exit-code contract inside rvl-data (rvl-cli parity) and never
+    // touch the spec cache, so they dispatch before the store opens.
+    let cmd = match cmd {
+        Cmd::Login => return Ok(rvl_data::auth::run_login()),
+        Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
+        Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
+        Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
+        Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
+        Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
+        Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
+        other => other,
+    };
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
     let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
@@ -2393,7 +2452,11 @@ fn run() -> anyhow::Result<ExitCode> {
             color,
             incremental,
             strict,
+            agent,
         } => {
+            if agent {
+                agent_alias_notice();
+            }
             let path = path.unwrap_or_else(|| PathBuf::from("."));
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
@@ -2563,6 +2626,15 @@ fn run() -> anyhow::Result<ExitCode> {
             }
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
+        // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
+        // Evidence) returned before the store opened, above.
+        Cmd::Login
+        | Cmd::Logout
+        | Cmd::Status
+        | Cmd::Risk { .. }
+        | Cmd::Control { .. }
+        | Cmd::Knowledge { .. }
+        | Cmd::Evidence { .. } => unreachable!("data commands dispatch before the store opens"),
     }
 }
 
@@ -3138,5 +3210,136 @@ mod tests {
         assert!(load_last_scan(&state).is_none(), "missing file");
         std::fs::write(&state, "not json").unwrap();
         assert!(load_last_scan(&state).is_none(), "corrupt file");
+    }
+
+    // --- rvl-cli data-command surface (po-av01j.17): the ported commands
+    // parse with rvl-cli's subcommand/flag spelling, both --flag=value and
+    // --flag value forms, and unknown flags fail (clap exits 2). ---
+
+    #[test]
+    fn data_command_surface_parses_rvl_cli_spellings() {
+        for argv in [
+            vec!["rvlscan", "login"],
+            vec!["rvlscan", "logout"],
+            vec!["rvlscan", "status"],
+            vec![
+                "rvlscan",
+                "risk",
+                "list",
+                "--status=applicable",
+                "--service",
+                "checkout-api",
+                "--limit=50",
+            ],
+            vec![
+                "rvlscan",
+                "risk",
+                "ready",
+                "--limit",
+                "20",
+                "--category=change_management",
+            ],
+            vec!["rvlscan", "risk", "show", "R-001", "--format=json"],
+            vec!["rvlscan", "risk", "context", "CR-001", "--format", "json"],
+            vec!["rvlscan", "risk", "stale"],
+            vec![
+                "rvlscan",
+                "risk",
+                "resolve",
+                "R-001",
+                "--reason",
+                "Fixed by timeout",
+            ],
+            vec!["rvlscan", "risk", "accept", "R-001", "--reason=known cost"],
+            vec![
+                "rvlscan",
+                "control",
+                "list",
+                "--category=fault_tolerance",
+                "--format=json",
+            ],
+            vec!["rvlscan", "control", "show", "RC-018", "--format=json"],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "search",
+                "circuit",
+                "breaker",
+                "--limit=5",
+                "--min-class=best",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "facts",
+                "--vertical=fault-tolerance",
+                "--technology=go",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "procedures",
+                "--control=RC-018",
+                "--format=json",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "patterns",
+                "--type=failure_mode",
+                "--min-occurrences=3",
+            ],
+            vec![
+                "rvlscan",
+                "evidence",
+                "submit",
+                "--control=RC-018",
+                "--type=code",
+                "--name=CB impl",
+                "--url=https://x",
+                "--git-hash=abc",
+            ],
+            vec![
+                "rvlscan",
+                "evidence",
+                "list",
+                "--status=configured",
+                "--limit=5",
+            ],
+            vec!["rvlscan", "evidence", "verify", "ev-123", "--format=json"],
+        ] {
+            let joined = argv.join(" ");
+            assert!(Cli::try_parse_from(&argv).is_ok(), "must parse: {joined}");
+        }
+    }
+
+    #[test]
+    fn data_command_unknown_flags_fail_like_rvl_cli() {
+        for argv in [
+            vec!["rvlscan", "risk", "list", "--bogus"],
+            vec!["rvlscan", "risk", "stale", "--anything"],
+            vec!["rvlscan", "control", "show"], // missing required code
+            vec!["rvlscan", "knowledge", "search"], // missing required query
+        ] {
+            let joined = argv.join(" ");
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "must be a usage error: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_agent_alias_parses_and_stays_deterministic() {
+        // `rvl scan --agent` compat: the flag parses alongside normal scan
+        // inputs; run() prints a notice and takes the deterministic path.
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "--agent", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { agent, path, .. }) => {
+                assert!(agent);
+                assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
     }
 }

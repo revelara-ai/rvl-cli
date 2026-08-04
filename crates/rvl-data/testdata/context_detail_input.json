@@ -1,0 +1,1 @@
+{"id":"x","risk_code":"R-001","title":"DB <primary> & replica","score":88,"narrative":"a > b","mapped_controls":[{"control_code":"RC-018","name":"Timeouts & retries","category":"fault_tolerance","type":"preventive"}]}
