@@ -1,0 +1,600 @@
+//! Hermetic golden-parity tests against a mock HTTP backend: no live API
+//! calls, ever. The mock speaks just enough HTTP/1.1 for ureq and records
+//! every request (method, path, headers, body) for assertions.
+
+use rvl_data::client::{resolve_organization_id, validate_credentials, Client};
+use rvl_data::config::DataConfig;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)]
+struct Recorded {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Recorded {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A canned route: exact "METHOD /path?query" -> (status, body).
+type Routes = Vec<(&'static str, u16, &'static str)>;
+
+struct MockServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl MockServer {
+    /// Serve `routes` on an ephemeral port. Unmatched requests get 404
+    /// with an empty body. The accept loop thread lives until the test
+    /// process exits, which is fine for a test binary.
+    fn start(routes: Routes) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+        let reqs = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let _ = handle(stream, &routes, &reqs);
+            }
+        });
+        MockServer { base_url, requests }
+    }
+
+    fn client(&self) -> Client {
+        Client {
+            api_url: self.base_url.clone(),
+            api_key: "pk_test_key".into(),
+            org_id: Some("org-uuid-1".into()),
+        }
+    }
+
+    fn recorded(&self) -> Vec<Recorded> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn handle(
+    stream: std::net::TcpStream,
+    routes: &Routes,
+    reqs: &Arc<Mutex<Vec<Recorded>>>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let line = line.trim_end().to_string();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let (k, v) = (k.trim().to_string(), v.trim().to_string());
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            }
+            headers.push((k, v));
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
+    let key = format!("{method} {path}");
+    let (status, resp_body) = routes
+        .iter()
+        .find(|(route, _, _)| *route == key)
+        .map(|(_, s, b)| (*s, *b))
+        .unwrap_or((404, ""));
+
+    reqs.lock().unwrap().push(Recorded {
+        method,
+        path,
+        headers,
+        body,
+    });
+
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Status",
+    };
+    let mut out = stream;
+    write!(
+        out,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        resp_body.len()
+    )?;
+    out.write_all(resp_body.as_bytes())?;
+    Ok(())
+}
+
+// --- slice (a): auth + status ---
+
+#[test]
+fn validate_credentials_hits_risks_stats_with_auth_headers() {
+    let server = MockServer::start(vec![("GET /api/v1/risks/stats", 200, r#"{"total":0}"#)]);
+    let client = server.client();
+    validate_credentials(&client).expect("valid credentials");
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+    assert_eq!(reqs[0].header("X-Organization-ID"), Some("org-uuid-1"));
+}
+
+#[test]
+fn validate_credentials_maps_401_to_auth_failure() {
+    let server = MockServer::start(vec![("GET /api/v1/risks/stats", 401, "{}")]);
+    let err = validate_credentials(&server.client()).unwrap_err();
+    assert_eq!(err, "authentication failed (status 401)");
+}
+
+#[test]
+fn org_resolution_matches_case_insensitively() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/organizations",
+        200,
+        r#"{"organizations":[{"id":"org-1","name":"Acme Corp"},{"id":"org-2","name":"Beta"}]}"#,
+    )]);
+    let cfg = DataConfig {
+        api_url: server.base_url.clone(),
+        api_key: "pk".into(),
+        org_name: "acme corp".into(),
+    };
+    assert_eq!(
+        resolve_organization_id(&cfg).unwrap(),
+        Some("org-1".to_string())
+    );
+    // No org header on the resolution call itself (mirrors rvl-cli).
+    let reqs = server.recorded();
+    assert_eq!(reqs[0].header("X-Organization-ID"), None);
+}
+
+#[test]
+fn org_resolution_reports_available_names_on_mismatch() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/organizations",
+        200,
+        r#"{"organizations":[{"id":"org-1","name":"Acme"},{"id":"org-2","name":"Beta"}]}"#,
+    )]);
+    let cfg = DataConfig {
+        api_url: server.base_url.clone(),
+        api_key: "pk".into(),
+        org_name: "nope".into(),
+    };
+    let err = resolve_organization_id(&cfg).unwrap_err();
+    assert_eq!(
+        err,
+        "organization \"nope\" not found; available: Acme, Beta"
+    );
+}
+
+#[test]
+fn org_resolution_distinguishes_zero_accessible_orgs() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/organizations",
+        200,
+        r#"{"organizations":[]}"#,
+    )]);
+    let cfg = DataConfig {
+        api_url: server.base_url.clone(),
+        api_key: "pk".into(),
+        org_name: "acme".into(),
+    };
+    let err = resolve_organization_id(&cfg).unwrap_err();
+    assert!(err.contains("no organizations are accessible"), "{err}");
+    assert!(err.contains("support@revelara.ai"), "{err}");
+}
+
+#[test]
+fn status_output_reports_connected() {
+    let server = MockServer::start(vec![("GET /api/v1/risks/stats", 200, "{}")]);
+    let cfg = DataConfig {
+        api_url: server.base_url.clone(),
+        api_key: "pk_test_key_12345".into(),
+        org_name: "acme".into(),
+    };
+    let out = rvl_data::auth::status_output(&cfg, &server.client(), "0.1.0").unwrap();
+    assert!(out.contains("Status: Connected"), "{out}");
+    assert!(out.contains("Organization: acme"), "{out}");
+    assert!(!out.contains("pk_test_key_12345"), "key must be masked");
+}
+
+#[test]
+fn status_output_connection_failure_exits_1() {
+    let server = MockServer::start(vec![("GET /api/v1/risks/stats", 403, "{}")]);
+    let cfg = DataConfig {
+        api_url: server.base_url.clone(),
+        api_key: "pk".into(),
+        org_name: String::new(),
+    };
+    let f = rvl_data::auth::status_output(&cfg, &server.client(), "0.1.0").unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(
+        f.msg,
+        "Connection failed: authentication failed (status 403)"
+    );
+}
+
+// --- slice (b): evidence submit ---
+
+#[test]
+fn evidence_submit_resolves_control_then_posts_go_shaped_body() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-uuid-1","control_code":"RC-018","name":"Timeouts","expected_evidence_types":["code","test"]}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","control_id":"ctl-uuid-1","type":"code","name":"CB impl","status":"configured","created_at":"2026-08-04T00:00:00Z","updated_at":"2026-08-04T00:00:00Z"}"#,
+        ),
+    ]);
+    let client = server.client();
+    let out = rvl_data::evidence::submit_output(
+        &client,
+        "RC-018",
+        "code",
+        "CB impl",
+        "https://github.com/x",
+        "desc",
+        "abc123def",
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("Evidence submitted successfully."), "{out}");
+    assert!(out.contains("Control: RC-018 (Timeouts)"), "{out}");
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[1].method, "POST");
+    // The POST body is Go's sorted-key map marshal, byte-identical.
+    let body = String::from_utf8(reqs[1].body.clone()).unwrap();
+    assert_eq!(
+        body,
+        r#"{"control_id":"ctl-uuid-1","description":"desc","git_hash":"abc123def","name":"CB impl","type":"code","url_or_identifier":"https://github.com/x"}"#
+    );
+    assert_eq!(reqs[1].header("Content-Type"), Some("application/json"));
+}
+
+#[test]
+fn evidence_submit_json_mode_prints_server_body_verbatim() {
+    let raw = r#"{"id":"ev-1","type":"code","name":"n","status":"configured"}"#;
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-001",
+            200,
+            r#"{"id":"ctl-1","name":"C"}"#,
+        ),
+        ("POST /api/v1/evidence", 200, raw),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-001",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+}
+
+#[test]
+fn evidence_submit_unknown_control_is_a_runtime_error() {
+    let server = MockServer::start(vec![]); // everything 404s
+    let f = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-999",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg.starts_with("Error: control RC-999 not found:"),
+        "{}",
+        f.msg
+    );
+}
+
+// --- slice (c): risk / control / knowledge reads ---
+
+#[test]
+fn risk_list_json_is_raw_body_passthrough() {
+    // Key order in the server body is deliberately non-alphabetical: the
+    // passthrough must not re-encode.
+    let raw = r#"{"total":1,"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":5,"status":"applicable","linked_services":[]}],"page":1,"limit":50}"#;
+    let server = MockServer::start(vec![("GET /api/v1/risks?limit=50", 200, raw)]);
+    let out =
+        rvl_data::risk::list_output(&server.client(), None, None, None, 50, Some("json")).unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+}
+
+#[test]
+fn risk_list_encodes_filters_like_go_url_values() {
+    let raw = r#"{"risks":[],"total":0,"page":1,"limit":1000}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?category=fault_tolerance&limit=1000&service=a%26b&status=applicable",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::risk::list_output(
+        &server.client(),
+        Some("applicable"),
+        Some("fault_tolerance"),
+        Some("a&b"),
+        1000,
+        None,
+    )
+    .unwrap();
+    assert_eq!(out, "No risks found.\n");
+}
+
+#[test]
+fn risk_show_json_is_raw_and_code_is_path_escaped() {
+    let raw = r#"{"risk_code":"R-001","title":"T"}"#;
+    let server = MockServer::start(vec![("GET /api/v1/risks/R-001", 200, raw)]);
+    let out = rvl_data::risk::show_output(&server.client(), "R-001", Some("json")).unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+}
+
+#[test]
+fn risk_fetch_error_message_matches_rvl_cli() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks/R-404",
+        500,
+        r#"{"error":"internal","message":"boom"}"#,
+    )]);
+    let f = rvl_data::risk::show_output(&server.client(), "R-404", None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(
+        f.msg,
+        "Error fetching risk: server error (500): internal: boom"
+    );
+}
+
+#[test]
+fn risk_context_composes_detail_and_coverage() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/risks/R-001",
+            200,
+            r#"{"risk_code":"R-001","score":10}"#,
+        ),
+        (
+            "GET /api/v1/risks/R-001/context",
+            200,
+            r#"{"risk":{"risk_code":"R-001"},"controls":[]}"#,
+        ),
+        (
+            "GET /api/v1/risks/stats",
+            200,
+            r#"{"coverage":{"total_controls":10,"assessed_controls":5,"coverage_percentage":50.0}}"#,
+        ),
+    ]);
+    let out = rvl_data::risk::context_output(&server.client(), "R-001", Some("json")).unwrap();
+    // Sorted top-level keys: controls, coverage_gap, detail, risk.
+    let want = "{\n  \"controls\": [],\n  \"coverage_gap\": {\n    \"total_controls\": 10,\n    \"assessed_controls\": 5,\n    \"coverage_percentage\": 50\n  },\n  \"detail\": {\n    \"risk_code\": \"R-001\",\n    \"score\": 10\n  },\n  \"risk\": {\n    \"risk_code\": \"R-001\"\n  }\n}\n";
+    assert_eq!(out, want);
+}
+
+#[test]
+fn risk_context_both_fetches_failing_is_a_runtime_error() {
+    let server = MockServer::start(vec![("GET /api/v1/risks/stats", 200, "{}")]);
+    let f = rvl_data::risk::context_output(&server.client(), "R-9", None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg.starts_with("Error fetching risk context:"),
+        "{}",
+        f.msg
+    );
+}
+
+#[test]
+fn risk_resolve_posts_reason_and_reports() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/risks?limit=1000",
+            200,
+            r#"{"risks":[{"id":"uuid-9","risk_code":"R-009","title":"t","category":"c","score":1,"status":"applicable","linked_services":[]}],"total":1,"page":1,"limit":1000}"#,
+        ),
+        (
+            "POST /api/v1/risks/uuid-9/resolve",
+            200,
+            r#"{"id":"uuid-9","risk_code":"R-009","status":"mitigated","resolved_at":"2026-08-04T01:02:03Z"}"#,
+        ),
+    ]);
+    let out = rvl_data::risk::resolve_output(&server.client(), "R-009", "Fixed in deploy 42", None)
+        .unwrap();
+    assert!(out.contains("Risk R-009 resolved successfully."), "{out}");
+    assert!(out.contains("Status:      mitigated"), "{out}");
+    assert!(out.contains("Resolved At: 2026-08-04T01:02:03Z"), "{out}");
+    let reqs = server.recorded();
+    let body = String::from_utf8(reqs[1].body.clone()).unwrap();
+    assert_eq!(body, r#"{"reason":"Fixed in deploy 42"}"#);
+}
+
+#[test]
+fn risk_accept_patches_status_with_sorted_keys() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/risks?limit=1000",
+            200,
+            r#"{"risks":[{"id":"uuid-7","risk_code":"R-007","title":"t","category":"c","score":1,"status":"applicable","linked_services":[]}],"total":1,"page":1,"limit":1000}"#,
+        ),
+        ("PATCH /api/v1/risks/uuid-7/status", 200, "{}"),
+    ]);
+    let out = rvl_data::risk::accept_output(&server.client(), "R-007", "known cost").unwrap();
+    assert_eq!(out, "Risk R-007 accepted successfully.\n");
+    let reqs = server.recorded();
+    assert_eq!(reqs[1].method, "PATCH");
+    let body = String::from_utf8(reqs[1].body.clone()).unwrap();
+    assert_eq!(body, r#"{"reason":"known cost","status":"accepted"}"#);
+}
+
+#[test]
+fn compound_risk_show_lists_then_fetches_detail() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/compound-risks",
+            200,
+            r#"[{"id":"cr-uuid","risk_code":"CR-001","title":"Compound","category":"compound_failure","score":95,"status":"applicable","linked_services":["svc"]}]"#,
+        ),
+        (
+            "GET /api/v1/compound-risks/cr-uuid",
+            200,
+            r#"{"risk":{"id":"cr-uuid","risk_code":"CR-001","title":"Compound","score":95,"status":"applicable","linked_services":["svc"]},"rule":{"id":"r1","name":"No timeouts + no CB","control_codes":["RC-018","RC-012"],"min_control_count":2,"base_interaction_severity":9},"constituents":[{"id":"c1","risk_code":"R-001","title":"No timeout","status":"applicable","control_codes":["RC-018"],"service":"svc","score":70}]}"#,
+        ),
+    ]);
+    let out = rvl_data::risk::show_output(&server.client(), "CR-001", None).unwrap();
+    assert!(out.contains("Compound Risk: CR-001"), "{out}");
+    assert!(out.contains("No timeouts + no CB"), "{out}");
+    assert!(out.contains("R-001"), "{out}");
+
+    // JSON mode prints the raw detail body.
+    let out = rvl_data::risk::show_output(&server.client(), "CR-001", Some("json")).unwrap();
+    assert!(out.starts_with(r#"{"risk":{"id":"cr-uuid""#), "{out}");
+}
+
+#[test]
+fn control_list_and_show_json_are_raw_passthrough() {
+    let list_raw = r#"{"controls":[{"control_code":"RC-018","name":"Timeouts","category":"fault_tolerance","type":"preventive","weight":9}],"total":1,"page":1,"limit":200}"#;
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls?limit=200", 200, list_raw),
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+    ]);
+    let out = rvl_data::control::list_output(&server.client(), None, 200, Some("json")).unwrap();
+    assert_eq!(out, format!("{list_raw}\n"));
+    let out = rvl_data::control::show_output(&server.client(), "RC-018", Some("json")).unwrap();
+    assert_eq!(out, format!("{show_raw}\n"));
+}
+
+#[test]
+fn knowledge_search_posts_go_shaped_body_with_min_class() {
+    let raw = r#"{"results":[],"total":0}"#;
+    let server = MockServer::start(vec![
+        ("POST /api/knowledge/search", 200, raw),
+        ("POST /api/knowledge/search?min_class=best", 200, raw),
+    ]);
+    let out = rvl_data::knowledge::search_output(
+        &server.client(),
+        "circuit breaker",
+        20,
+        0,
+        None,
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+    rvl_data::knowledge::search_output(
+        &server.client(),
+        "circuit breaker",
+        5,
+        10,
+        Some("best"),
+        Some("json"),
+    )
+    .unwrap();
+    let reqs = server.recorded();
+    assert_eq!(
+        String::from_utf8(reqs[0].body.clone()).unwrap(),
+        r#"{"limit":20,"offset":0,"query":"circuit breaker"}"#
+    );
+    assert_eq!(reqs[1].path, "/api/knowledge/search?min_class=best");
+    assert_eq!(
+        String::from_utf8(reqs[1].body.clone()).unwrap(),
+        r#"{"limit":5,"offset":10,"query":"circuit breaker"}"#
+    );
+}
+
+#[test]
+fn knowledge_procedures_control_filter_reemits_filtered_json() {
+    let raw = r#"{"procedures":[{"id":"p1","title":"A","vertical":"v","procedure_type":"runbook","related_controls":["RC-018"],"effectiveness_score":0.9,"applied_count":1,"success_count":1,"confidence":0.8},{"id":"p2","title":"B","vertical":"v","procedure_type":"runbook","related_controls":["RC-043"],"effectiveness_score":0.5,"applied_count":0,"success_count":0,"confidence":0.6}],"total":2}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/procedures?limit=20&q=RC-018",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::knowledge::procedures_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        Some("RC-018"),
+        20,
+        0,
+        Some("json"),
+    )
+    .unwrap();
+    // Filtered to p1 only, re-marshaled Go-style.
+    assert!(out.contains("\"id\": \"p1\""), "{out}");
+    assert!(!out.contains("\"id\": \"p2\""), "{out}");
+    assert!(out.contains("\"total\": 1"), "{out}");
+    assert!(out.contains("\"effectiveness_score\": 0.9"), "{out}");
+}
+
+#[test]
+fn knowledge_facts_builds_sorted_query_and_passes_json_through() {
+    let raw = r#"{"facts":[],"total":0}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/facts?limit=20&technology=go&vertical=fault-tolerance",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::knowledge::facts_output(
+        &server.client(),
+        Some("fault-tolerance"),
+        Some("go"),
+        None,
+        20,
+        0,
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+}
+
+#[test]
+fn auth_error_message_matches_rvl_cli_401_contract() {
+    let server = MockServer::start(vec![("GET /api/v1/risks?limit=1000", 401, "{}")]);
+    let f =
+        rvl_data::risk::list_output(&server.client(), None, None, None, 1000, None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg
+            .contains("authentication failed (401) - run 'rvlscan login' to reconfigure"),
+        "{}",
+        f.msg
+    );
+}
