@@ -108,18 +108,21 @@ pub fn propagate(
 ) -> Finding {
     let id = site.id();
 
-    // Spec applicability filters on site_kind (G4, po-av01j.5): a G1 API spec
-    // judges client calls only. An emission-point aggregate riding the same
-    // stream is routed to the emission lane by the scan pipeline; if one
-    // reaches here anyway (eval harness, a stream fed straight in), it is
-    // out of this control's scope by construction — never a blocking call,
-    // never an abstention that pollutes the no-spec mint queue.
-    if !site.is_call_site() {
+    // Spec applicability filters on site_kind (G4, po-av01j.5): an API spec
+    // judges CALLS. An emission-point aggregate riding the same stream is
+    // routed to the emission lane by the scan pipeline; if one reaches here
+    // anyway (eval harness, a stream fed straight in), it is out of this
+    // control's scope by construction — never a blocking call, never an
+    // abstention that pollutes the no-spec mint queue. Deliberately narrow:
+    // ONLY emission points short-circuit here — other site kinds (e.g. the
+    // G3 background_job altitude) are call surfaces and flow through the
+    // per-spec applicability machinery like any call site.
+    if site.is_emission_point() {
         return Finding {
             site_id: id,
             verdict: Verdict::NotApplicable,
             reason: format!(
-                "{} site: not a client-call surface, G1 specs do not apply",
+                "{} site: not a client-call surface, API specs do not apply",
                 site.site_kind
             ),
         };
