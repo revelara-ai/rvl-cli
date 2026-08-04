@@ -205,6 +205,61 @@ pub struct ScopeSpec {
     pub rationale: String,
 }
 
+/// What satisfies a config-key spec. This is the factory's authoring grammar
+/// for the G6 config lane, deliberately small and enumerable: every variant is
+/// auditable by reading it, and there is no user-supplied regex to reason
+/// about. Patterns are NAMED and resolved by the scanner (see the config
+/// lane's pattern table); a name this binary does not know yields an
+/// abstention, never a guess — that is how a spec authored for a newer scanner
+/// degrades safely on an older one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigExpect {
+    /// An EXPLICIT setting must be present in the repo. A platform default
+    /// governing the key does not count: the control asks for an authored
+    /// bound, and "the platform picked one for you" is the finding.
+    Present,
+    /// The resolved value must equal `value` (string-compared on the packet's
+    /// canonical rendering).
+    Equals { value: String },
+    /// The resolved value must be one of `values`.
+    OneOf { values: Vec<String> },
+    /// The resolved value must match the NAMED pattern (e.g. "sha40" = a full
+    /// 40-hex-char commit SHA, the action-pinning control).
+    Pattern { name: String },
+}
+
+/// A spec about one config key in one config format — the G6 analog of
+/// [`ApiSpec`]. It answers a question about the FORMAT ("a GitHub Actions job
+/// without an explicit timeout-minutes runs under the 6h platform default"),
+/// never about a repository, so it is earned once and applies everywhere.
+///
+/// Unlike the call-site lane, where class judgment (severity/fix) lives in a
+/// separate judgment file, a config-key spec IS its finding class: one spec is
+/// one reader-facing class, so severity and fix ride on the spec. Empty means
+/// unjudged, and unjudged findings surface as advisory, never blocking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigKeySpec {
+    /// The config format id, e.g. "github-actions", "gitlab-ci".
+    pub format: String,
+    /// The canonical key identity within the format, e.g. "job.timeout-minutes".
+    pub key: String,
+    pub expect: ConfigExpect,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+    /// The control this key evidences (e.g. "RC-013"), empty if unmapped.
+    #[serde(default)]
+    pub control: String,
+    /// Judged severity: high | medium | low | "" (unjudged).
+    #[serde(default)]
+    pub severity: String,
+    /// Suggested fix for the explain view.
+    #[serde(default)]
+    pub fix: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpecFile {
     #[serde(default)]
@@ -213,6 +268,11 @@ pub struct SpecFile {
     pub configs: Vec<ConfigSpec>,
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
+    /// G6 config-lane specs. Serde-defaulted: caches predating the lane parse
+    /// unchanged, and an old binary ignores the section (serde skips unknown
+    /// fields), so the envelope schema version does not move.
+    #[serde(default)]
+    pub config_keys: Vec<ConfigKeySpec>,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -232,6 +292,7 @@ pub struct SpecCache {
     apis: HashMap<(String, String), ApiSpec>,
     configs: HashMap<String, ConfigSpec>,
     scopes: HashMap<String, ScopeSpec>,
+    config_keys: HashMap<(String, String), ConfigKeySpec>,
 }
 
 impl SpecCache {
@@ -250,6 +311,9 @@ impl SpecCache {
         }
         for s in f.scopes {
             c.scopes.insert(s.scope.clone(), s);
+        }
+        for s in f.config_keys {
+            c.config_keys.insert((s.format.clone(), s.key.clone()), s);
         }
         c
     }
@@ -270,8 +334,12 @@ impl SpecCache {
     pub fn config(&self, type_name: &str) -> Option<&ConfigSpec> {
         self.configs.get(type_name)
     }
+    /// The G6 config-lane lookup: the spec for one (format, key) identity.
+    pub fn config_key(&self, format: &str, key: &str) -> Option<&ConfigKeySpec> {
+        self.config_keys.get(&(format.to_string(), key.to_string()))
+    }
     pub fn len(&self) -> usize {
-        self.apis.len() + self.configs.len() + self.scopes.len()
+        self.apis.len() + self.configs.len() + self.scopes.len() + self.config_keys.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -294,6 +362,14 @@ impl SpecCache {
                 Some(existing) if existing.confidence >= v.confidence => {}
                 _ => {
                     self.configs.insert(k, v);
+                }
+            }
+        }
+        for (k, v) in other.config_keys {
+            match self.config_keys.get(&k) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                _ => {
+                    self.config_keys.insert(k, v);
                 }
             }
         }
@@ -463,6 +539,7 @@ mod tests {
         SpecCache::from_file(SpecFile {
             scopes: vec![],
             apis: vec![],
+            config_keys: vec![],
             configs: specs
                 .into_iter()
                 .map(|(t, b, s, c)| ConfigSpec {
@@ -551,6 +628,7 @@ mod tests {
             scopes: vec![],
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
+            config_keys: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -558,11 +636,107 @@ mod tests {
             scopes: vec![],
             apis: vec![better],
             configs: vec![],
+            config_keys: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");
     }
+    #[test]
+    fn config_key_specs_parse_from_a_spec_file_and_are_looked_up() {
+        // The G6 lane's spec kind rides the SAME SpecFile the signed cache
+        // carries. `config_keys` is serde-defaulted so every existing cache
+        // (which lacks the section) still parses — the envelope schema does
+        // not change.
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "scopes": [],
+            "config_keys": [
+                {"format": "github-actions", "key": "job.timeout-minutes",
+                 "expect": {"kind": "present"},
+                 "confidence": 0.9, "control": "RC-013",
+                 "rationale": "a job without an explicit timeout runs 6h"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).unwrap();
+        let spec = cache
+            .config_key("github-actions", "job.timeout-minutes")
+            .expect("the config-key spec is retrievable by (format, key)");
+        assert_eq!(spec.control, "RC-013");
+        assert!(matches!(spec.expect, ConfigExpect::Present));
+        assert!(cache
+            .config_key("github-actions", "job.concurrency")
+            .is_none());
+        // Counted in len() so the scan's "specs N" line reflects the lane.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn spec_file_without_config_keys_section_still_parses() {
+        // Backward compatibility: the shipped 2026 caches have no config_keys.
+        let cache = SpecCache::load(r#"{"apis": [], "configs": [], "scopes": []}"#).unwrap();
+        assert!(cache
+            .config_key("github-actions", "job.timeout-minutes")
+            .is_none());
+    }
+
+    #[test]
+    fn config_key_merge_prefers_higher_confidence() {
+        let mk = |confidence: f64, rationale: &str| SpecFile {
+            config_keys: vec![ConfigKeySpec {
+                format: "github-actions".into(),
+                key: "job.timeout-minutes".into(),
+                expect: ConfigExpect::Present,
+                confidence,
+                rationale: rationale.into(),
+                control: String::new(),
+                severity: String::new(),
+                fix: String::new(),
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, "base"));
+        base.merge(SpecCache::from_file(mk(0.95, "better")));
+        assert_eq!(
+            base.config_key("github-actions", "job.timeout-minutes")
+                .unwrap()
+                .rationale,
+            "better"
+        );
+        base.merge(SpecCache::from_file(mk(0.5, "worse")));
+        assert_eq!(
+            base.config_key("github-actions", "job.timeout-minutes")
+                .unwrap()
+                .rationale,
+            "better",
+            "a lower-confidence spec never displaces a higher one"
+        );
+    }
+
+    #[test]
+    fn config_expect_serde_round_trips_every_variant() {
+        // The expect grammar is the factory's authoring contract; a variant
+        // that cannot round-trip would corrupt the signed cache silently.
+        let variants = vec![
+            ConfigExpect::Present,
+            ConfigExpect::Equals {
+                value: "false".into(),
+            },
+            ConfigExpect::OneOf {
+                values: vec!["a".into(), "b".into()],
+            },
+            ConfigExpect::Pattern {
+                name: "sha40".into(),
+            },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: ConfigExpect = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back, "{json}");
+        }
+    }
+
     #[test]
     fn client_family_classifies_the_real_corpus_types() {
         use super::{client_family, Family};

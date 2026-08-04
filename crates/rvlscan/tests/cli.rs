@@ -643,6 +643,118 @@ fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
     );
 }
 
+// --- G6 config lane (po-av01j.2) ---
+
+/// A repo with one Go call site, one GitHub Actions workflow, and one
+/// unsupported-format config file; specs cover the call AND two config keys.
+fn write_config_lane_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(
+        dir.join(".github/workflows/ci.yml"),
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join(".circleci")).unwrap();
+    std::fs::write(dir.join(".circleci/config.yml"), "version: 2\n").unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"github-actions","key":"job.timeout-minutes","expect":{"kind":"present"},"confidence":0.9,"control":"RC-013","severity":"medium","fix":"set jobs.<id>.timeout-minutes","rationale":"6h default"},
+            {"format":"github-actions","key":"step.uses.ref","expect":{"kind":"pattern","name":"sha40"},"confidence":0.9,"control":"RC-045","rationale":"pin actions to full SHAs"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_config_lane_and_reports_config_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_config_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // Two config findings surface: the missing job timeout (explicit-Present
+    // spec vs the 360-minute platform default) and the tag-pinned action
+    // (sha40 pattern vs "v4").
+    assert!(
+        stdout.contains("github-actions job.timeout-minutes"),
+        "missing timeout must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("github-actions step.uses.ref"),
+        "unpinned action must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-013"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // Coverage: the lane reports its own resolution line and the
+    // identity-only sighting of the unsupported CircleCI config.
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsupported config formats sighted: circleci (1)"),
+        "sightings line: {stdout}"
+    );
+}
+
+#[test]
+fn config_findings_are_waivable_by_format_key_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_config_lane_fixtures(dir.path());
+    // Waive both config classes via .revelara.yaml, the same mechanism code
+    // classes use; the rule is `<format>.<key>`.
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "scanner:\n  waivers:\n    - matcher: github-actions.job.timeout-minutes\n      reason: accepted for now\n    - matcher: github-actions.step.uses.ref\n      reason: dependabot keeps refs fresh\n",
+    )
+    .unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}");
+    assert!(
+        !stdout.contains("github-actions job.timeout-minutes"),
+        "waived config class must not render: {stdout}"
+    );
+    assert!(
+        stdout.contains("suppressed"),
+        "waived config classes are counted in the footer: {stdout}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code

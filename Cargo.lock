@@ -824,6 +824,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvl-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rvl-core",
+ "rvl-spec",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "rvl-content"
 version = "0.1.0"
 dependencies = [
@@ -940,6 +953,7 @@ dependencies = [
  "clap",
  "libc",
  "rvl-cache",
+ "rvl-config",
  "rvl-content",
  "rvl-core",
  "rvl-index",

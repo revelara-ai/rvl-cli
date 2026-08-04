@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+mod config_lane;
 mod render;
 mod report;
 mod shared_config;
@@ -818,6 +819,16 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
 /// coverage) alongside the triaged items and a `verbose` cache-status line.
 /// `verbose` gates the one-line "sites | specs" summary so `explain` stays quiet.
 /// Takes the already-resolved packet-stream text (see `resolve_packet_stream`).
+/// What the resolve pipeline hands back: propagation findings, triaged
+/// items, the sites both index against (1:1), and the loaded spec cache so
+/// callers can run the G6 config lane against the same specs.
+type ResolvedScan = (
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+    rvl_spec::SpecCache,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_findings(
     store: &CacheStore,
@@ -827,11 +838,7 @@ fn resolve_findings(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
         store,
@@ -850,6 +857,10 @@ fn resolve_findings(
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
 /// directly, skipping `parse_stream`.
+/// Also returns the loaded [`rvl_spec::SpecCache`] so callers can run the G6
+/// config lane against the SAME specs the code lane used (one signed artifact
+/// carries both; loading twice would double the verification and the
+/// staleness chatter).
 #[allow(clippy::too_many_arguments)]
 fn findings_from_sites(
     store: &CacheStore,
@@ -861,11 +872,7 @@ fn findings_from_sites(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<ResolvedScan> {
     let specs_text = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
@@ -919,6 +926,7 @@ fn findings_from_sites(
             let overlay = rvl_spec::SpecFile {
                 apis: vec![],
                 scopes: vec![],
+                config_keys: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -962,7 +970,7 @@ fn findings_from_sites(
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
     let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
-    Ok((findings, items, sites))
+    Ok((findings, items, sites, cache))
 }
 
 // --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---
@@ -1092,6 +1100,8 @@ fn run_scan(
     if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
         // Content-only repo: no packet stream exists, so the structure lane
         // inventories the live tree directly (same as the incremental path).
+        // The config lane is skipped on this early path (no spec cache gets
+        // resolved before the return) -- follow-up tracked on the epic.
         let structure = resolve_structure_findings(None, "", path);
         return render_scan_output(
             state_path,
@@ -1100,13 +1110,14 @@ fn run_scan(
             &citems,
             &[],
             &structure,
+            None,
             out,
             color,
             start,
         );
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (findings, mut items, sites) = resolve_findings(
+    let (findings, mut items, sites, specs) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1117,8 +1128,19 @@ fn run_scan(
     )?;
     items.extend(citems);
     let structure = resolve_structure_findings(retrieved, &stream, path);
+    // The G6 config lane: same repo, same specs, per-format retrievers.
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
     render_scan_output(
-        state_path, path, &findings, &items, &sites, &structure, out, color, start,
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        &structure,
+        Some(&lane),
+        out,
+        color,
+        start,
     )
 }
 
@@ -1186,6 +1208,7 @@ fn render_scan_output(
     items: &[rvl_triage::TriagedItem],
     sites: &[rvl_core::Site],
     structure: &[render::Finding],
+    config: Option<&config_lane::LaneOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -1218,6 +1241,12 @@ fn render_scan_output(
     // Repo-structure lane findings join the ladder (always Advisory) and the
     // persisted last-scan state, so explain/suppress resolve their ids too.
     ladder_findings.extend(structure.iter().cloned());
+    // Config-lane findings join the ladder as ordinary rows BEFORE waivers,
+    // so a `.revelara.yaml` waiver on `<format>.<key>` suppresses them the
+    // same way it suppresses a code class.
+    if let Some(lane) = config {
+        ladder_findings.extend(lane.findings.iter().cloned());
+    }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -1239,7 +1268,13 @@ fn render_scan_output(
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
         "{}",
-        render::render_ladder(&ladder_findings, coverage, &elapsed, stdout_color(color))
+        render::render_ladder(
+            &ladder_findings,
+            coverage,
+            config.map(|lane| &lane.coverage),
+            &elapsed,
+            stdout_color(color)
+        )
     );
 
     if let Some(p) = out {
@@ -1713,7 +1748,7 @@ fn run_scan_incremental(
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
-    let (findings, mut items, sites) = findings_from_sites(
+    let (findings, mut items, sites, specs) = findings_from_sites(
         store,
         keyset,
         scan.sites,
@@ -1731,8 +1766,20 @@ fn run_scan_incremental(
     // Incremental scans own the live tree, so the structure lane inventories
     // it directly (one bounded walk; there is no packet stream to ride).
     let structure = resolve_structure_findings(None, "", path);
+    // Config files are not content-hash indexed (parsing them is cheap): the
+    // lane simply re-runs on every warm scan, so it can never be stale.
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
     render_scan_output(
-        state_path, path, &findings, &items, &sites, &structure, out, color, start,
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        &structure,
+        Some(&lane),
+        out,
+        color,
+        start,
     )
 }
 
@@ -1777,7 +1824,7 @@ fn run_explain(
         return Ok(ExitCode::SUCCESS);
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, mut items, _sites) = resolve_findings(
+    let (_findings, mut items, _sites, specs) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1793,6 +1840,9 @@ fn run_explain(
     }
     let mut ladder_findings = triage_to_findings(&items);
     ladder_findings.extend(resolve_structure_findings(retrieved, &stream, path));
+    // Config-lane ids resolve here too: the fresh scan mirrors what the
+    // ladder printed, config rows included.
+    ladder_findings.extend(config_lane::run(path, &specs, &snapshot_name(path)).findings);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1838,7 +1888,7 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path)?;
-                let (_findings, mut items, _sites) = resolve_findings(
+                let (_findings, mut items, _sites, specs) = resolve_findings(
                     store,
                     keyset,
                     &stream,
@@ -1853,6 +1903,9 @@ fn run_suppress(
                 }
                 let mut ladder_findings = triage_to_findings(&items);
                 ladder_findings.extend(resolve_structure_findings(retrieved, &stream, scan_path));
+                ladder_findings.extend(
+                    config_lane::run(scan_path, &specs, &snapshot_name(scan_path)).findings,
+                );
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1919,7 +1972,7 @@ fn run_report(
         if let Some(note) = &scan.degraded_note {
             eprintln!("incremental: degraded (fail-open): {note}");
         }
-        let (findings, _items, sites) = findings_from_sites(
+        let (findings, _items, sites, _specs) = findings_from_sites(
             store,
             keyset,
             scan.sites,
@@ -1933,7 +1986,7 @@ fn run_report(
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path)?;
-        let (findings, _items, sites) =
+        let (findings, _items, sites, _specs) =
             resolve_findings(store, keyset, &stream, specs_file, None, Some(path), false)?;
         (findings, sites)
     };

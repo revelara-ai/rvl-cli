@@ -107,6 +107,37 @@ impl Coverage {
     }
 }
 
+/// Coverage for the G6 config lane, rendered inside the COVERAGE section when
+/// the lane saw anything. Mirrors [`Coverage`]'s lever-based abstain
+/// breakdown, plus the identity-only sightings of unsupported config formats
+/// (format id + file count, nothing else — the privacy contract).
+#[derive(Debug, Clone, Default)]
+pub struct ConfigCoverage {
+    /// Config settings the lane reached a conclusion on.
+    pub resolved: usize,
+    pub total: usize,
+    /// No spec for the (format, key) — the factory's authoring lever.
+    pub abstain_no_spec: usize,
+    /// The effective value lives outside the repo (org/project setting).
+    pub abstain_outside_repo: usize,
+    /// Any other undecided outcome (low-confidence spec, unknown pattern).
+    pub abstain_other: usize,
+    /// Config files a retriever claimed but could not parse.
+    pub unparseable_files: usize,
+    /// Unsupported-format sightings: (format identity, file count).
+    pub sightings: Vec<(String, usize)>,
+}
+
+impl ConfigCoverage {
+    pub fn abstain_total(&self) -> usize {
+        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other
+    }
+    /// Nothing to render: the lane saw no config at all.
+    pub fn is_empty(&self) -> bool {
+        self.total == 0 && self.unparseable_files == 0 && self.sightings.is_empty()
+    }
+}
+
 /// A short, stable id for a finding class, for explain/suppress references.
 /// Deterministic so the same finding keeps the same id across scans.
 pub fn finding_id(class_key: &str) -> String {
@@ -152,8 +183,16 @@ fn paint(s: &str, code: &str, color: bool) -> String {
 }
 
 /// Render the severity-ladder hook output. `elapsed` is a caller-formatted
-/// timing string (e.g. "0.4s (warm)").
-pub fn render_ladder(findings: &[Finding], cov: Coverage, elapsed: &str, color: bool) -> String {
+/// timing string (e.g. "0.4s (warm)"). `config` is the G6 config lane's
+/// coverage (None or empty renders nothing extra); config FINDINGS themselves
+/// ride in `findings` like any other finding, only the coverage lines differ.
+pub fn render_ladder(
+    findings: &[Finding],
+    cov: Coverage,
+    config: Option<&ConfigCoverage>,
+    elapsed: &str,
+    color: bool,
+) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -218,6 +257,52 @@ pub fn render_ladder(findings: &[Finding], cov: Coverage, elapsed: &str, color: 
         }
         let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
         let _ = writeln!(o, "{}", paint(&aline, "2", color));
+    }
+    if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
+        if cc.total > 0 {
+            let pct = 100 * cc.resolved / cc.total.max(1);
+            let cline = format!(
+                "  config: {}/{} settings resolved ({}%)",
+                cc.resolved, cc.total, pct
+            );
+            let _ = writeln!(o, "{}", paint(&cline, "2", color));
+            let ab = cc.abstain_total();
+            if ab > 0 {
+                let mut parts: Vec<String> = Vec::new();
+                if cc.abstain_no_spec > 0 {
+                    parts.push(format!("{} no spec", cc.abstain_no_spec));
+                }
+                if cc.abstain_outside_repo > 0 {
+                    parts.push(format!("{} set outside repo", cc.abstain_outside_repo));
+                }
+                if cc.abstain_other > 0 {
+                    parts.push(format!("{} other", cc.abstain_other));
+                }
+                let aline = format!("  config abstain \u{2014} {}", parts.join(" \u{00b7} "));
+                let _ = writeln!(o, "{}", paint(&aline, "2", color));
+            }
+        }
+        if cc.unparseable_files > 0 {
+            let uline = format!(
+                "  {} config file{} unparseable",
+                cc.unparseable_files,
+                if cc.unparseable_files == 1 { "" } else { "s" }
+            );
+            let _ = writeln!(o, "{}", paint(&uline, "2", color));
+        }
+        if !cc.sightings.is_empty() {
+            // Identity-only telemetry: format id + count, never content.
+            let list: Vec<String> = cc
+                .sightings
+                .iter()
+                .map(|(f, n)| format!("{f} ({n})"))
+                .collect();
+            let sline = format!(
+                "  unsupported config formats sighted: {}",
+                list.join(" \u{00b7} ")
+            );
+            let _ = writeln!(o, "{}", paint(&sline, "2", color));
+        }
     }
     o.push('\n');
 

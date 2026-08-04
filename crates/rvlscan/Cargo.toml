@@ -11,6 +11,7 @@ homepage.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 rvl-cache = { path = "../rvl-cache" }
+rvl-config = { path = "../rvl-config" }
 rvl-content = { path = "../rvl-content" }
 rvl-core = { path = "../rvl-core" }
 rvl-skills = { path = "../rvl-skills" }
