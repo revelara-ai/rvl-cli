@@ -19,7 +19,29 @@ use serde::{Deserialize, Serialize};
 /// `macro_expansion` (per-site macro flag; C/C++ mechanical, other languages
 /// false/absent). v2 is a strict superset of v1: every v1 record parses as v2
 /// with the new fields defaulted, so v1 streams remain readable.
+///
+/// `site_kind` (G4, po-av01j.5) rides the v2 train WITHOUT a version bump: v2
+/// is unreleased, and the field is additive with a carrying default (absent =
+/// classic G1 call site), so every existing stream parses unchanged.
 pub const PACKET_SCHEMA: u32 = 2;
+
+/// The `site_kind` value stamped on emission-point packets (G4): log
+/// statements, span/trace instrumentation, and error-handling sites. An empty
+/// `site_kind` remains the classic G1 client-call site.
+pub const SITE_KIND_EMISSION: &str = "emission_point";
+
+/// The `const_args` entry name carrying an emission aggregate's category
+/// (`log` | `trace` | `error_capture`). Emission packets are AGGREGATES — one
+/// per (enclosing function, framework, category), never one per log line —
+/// and the category and count ride `const_args` (with `how: "aggregate"`)
+/// rather than new fields, keeping the addition to the v2 train minimal.
+pub const CONST_ARG_EMISSION_CATEGORY: &str = "emission_category";
+
+/// The `const_args` entry name carrying how many emission calls the aggregate
+/// stands for. Log statements are the highest-volume site class in any
+/// codebase; the count is the volume-control contract (a polaris-sized repo
+/// must not produce tens of thousands of emission Sites).
+pub const CONST_ARG_EMISSION_COUNT: &str = "emission_count";
 
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
@@ -291,7 +313,8 @@ pub struct Site {
     /// own kind: [`SITE_KIND_SERVER_ENTRY`] for HTTP handler/route/middleware
     /// registrations (po-av01j.3), `"background_job"` for G3 scheduler/cron
     /// registrations, queue worker handlers, and dispatcher/worker-loop sites
-    /// (po-av01j.4). Retrieval only: the retriever reports WHERE the site is;
+    /// (po-av01j.4), [`SITE_KIND_EMISSION`] for G4 emission points
+    /// (po-av01j.5). Retrieval only: the retriever reports WHERE the site is;
     /// whether a control governs that kind is spec knowledge
     /// (`ApiSpec::site_kinds`), and each kind is judged by its own lane so G1
     /// specs never fire on a server-entry site or vice versa.
@@ -306,6 +329,34 @@ pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 impl Site {
     pub fn id(&self) -> String {
         format!("{}:{}", self.file_path, self.line_number)
+    }
+    /// A classic G1 client-call site (empty `site_kind`, the pre-G4 default).
+    pub fn is_call_site(&self) -> bool {
+        self.site_kind.is_empty()
+    }
+    /// A G4 emission-point aggregate (log/trace/error-capture inventory).
+    pub fn is_emission_point(&self) -> bool {
+        self.site_kind == SITE_KIND_EMISSION
+    }
+    /// The emission aggregate's category (`log` | `trace` | `error_capture`),
+    /// read from the [`CONST_ARG_EMISSION_CATEGORY`] const-args entry. `None`
+    /// on call sites and on malformed emission packets — the caller abstains
+    /// rather than guessing a category.
+    pub fn emission_category(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_EMISSION_CATEGORY)
+            .map(|a| a.value.as_str())
+    }
+    /// How many emission calls this aggregate stands for, read from the
+    /// [`CONST_ARG_EMISSION_COUNT`] const-args entry. Defaults to 1: an
+    /// aggregate exists because at least one emission call did.
+    pub fn emission_count(&self) -> u32 {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_EMISSION_COUNT)
+            .and_then(|a| a.value.parse().ok())
+            .unwrap_or(1)
     }
     /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
     /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
@@ -670,6 +721,37 @@ mod tests {
     }
 
     #[test]
+    fn emission_site_kind_survives_the_round_trip() {
+        // G4 (po-av01j.5): emission-point sites ride the SAME Site stream,
+        // distinguished by the additive `site_kind` field. Absent = classic G1
+        // call site. The field must survive parse -> serialize, or an
+        // emission packet silently becomes a call site in the next pass.
+        let stream = concat!(
+            r#"{"packet_schema":2,"file_path":"a.go","line_number":7,"func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point"}"#,
+            "\n",
+            r#"{"packet_schema":2,"file_path":"b.go","line_number":8,"func":"Do","client_type":"net/http.Client"}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 2);
+        let back = serde_json::to_string(&sites[0]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+        assert_eq!(
+            v.get("site_kind").and_then(|k| k.as_str()),
+            Some("emission_point"),
+            "site_kind must survive the round trip: {back}"
+        );
+        let back1 = serde_json::to_string(&sites[1]).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&back1).unwrap();
+        assert_eq!(
+            v1.get("site_kind").and_then(|k| k.as_str()).unwrap_or(""),
+            "",
+            "a classic G1 site defaults to an empty site_kind"
+        );
+    }
+
+    #[test]
     fn site_kind_defaults_to_the_g1_call_site() {
         // Every v1/v2 record predating the field parses as a classic G1 call
         // site: the empty default IS the G1 marker, so no schema bump is
@@ -683,6 +765,44 @@ mod tests {
             Some(""),
             "a record predating the field must parse as a G1 call site"
         );
+    }
+
+    #[test]
+    fn emission_accessors_read_the_aggregate_const_args() {
+        // The category and count of an emission aggregate ride const_args
+        // (how: "aggregate") rather than new fields. The accessors are the one
+        // shared parser for that convention.
+        let s = Site {
+            file_path: "svc/log.go".into(),
+            line_number: 12,
+            method: "Error".into(),
+            client_type: "log/slog.Logger".into(),
+            site_kind: SITE_KIND_EMISSION.into(),
+            const_args: vec![
+                ConstArg {
+                    name: CONST_ARG_EMISSION_CATEGORY.into(),
+                    value: "log".into(),
+                    how: "aggregate".into(),
+                    ..Default::default()
+                },
+                ConstArg {
+                    name: CONST_ARG_EMISSION_COUNT.into(),
+                    value: "17".into(),
+                    how: "aggregate".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_emission_point() && !s.is_call_site());
+        assert_eq!(s.emission_category(), Some("log"));
+        assert_eq!(s.emission_count(), 17);
+
+        // A classic G1 site: empty kind, no category, count defaults to 1.
+        let g1 = Site::default();
+        assert!(g1.is_call_site() && !g1.is_emission_point());
+        assert_eq!(g1.emission_category(), None);
+        assert_eq!(g1.emission_count(), 1);
     }
 
     #[test]

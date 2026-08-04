@@ -1119,6 +1119,116 @@ fn scan_decides_go_background_job_sites_end_to_end() {
     );
 }
 
+// --- G4 emission lane (po-av01j.5) ---
+
+/// A `--retrieved` stream carrying emission-point aggregates surfaces the
+/// emission-lane findings (RC-027 swallow gap, RC-046 tracing gap) as
+/// ADVISORY ladder items, while the aggregates themselves stay OUT of the G1
+/// pipeline: coverage counts only the real call site, and `--out` rows carry
+/// only G1 verdicts.
+#[test]
+fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let packets = dir.path().join("retrieved.jsonl");
+    let cat = |c: &str, n: u32| {
+        format!(
+            r#"[{{"index":0,"name":"emission_category","value":"{c}","how":"aggregate"}},{{"index":0,"name":"emission_count","value":"{n}","how":"aggregate"}}]"#
+        )
+    };
+    std::fs::write(
+        &packets,
+        format!(
+            "{}\n{}\n{}\n",
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":"recover","client_type":"recover_block","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
+                cat("error_capture", 2)
+            ),
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
+                cat("log", 7)
+            ),
+        ),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""emissions":["#,
+        r#"{"type":"recover_block","category":"error_capture","control":"RC-027","role":"violates","confidence":0.9,"rationale":"a recover with no emission swallows the panic"},"#,
+        r#"{"type":"log/slog.Logger","category":"log","control":"RC-061","role":"satisfies","confidence":0.9,"rationale":"structured log emission"},"#,
+        r#"{"type":"go.opentelemetry.io/otel/trace.Tracer","category":"trace","control":"RC-046","role":"satisfies","confidence":0.9,"rationale":"otel span"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The emission lane surfaces both gaps, control-mapped and advisory.
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "RC-027 swallow gap missing from the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-046"),
+        "RC-046 tracing gap missing from the ladder: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+    // The aggregates stay out of the G1 surface count (1 call site, not 3).
+    assert!(
+        stdout.contains("sites 1 "),
+        "emission aggregates leaked into the G1 site list: {stdout}"
+    );
+    // --out rows are the G1 eval contract: one row, the call site.
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED emission-spec corpus (test-grade; the production
+/// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
+fn g4_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("g4_seed_specs.json")
+}
+
+fn helpers_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .join("helpers")
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
@@ -1198,6 +1308,123 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         jobs.iter()
             .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
         "the bare dispatch must violate: {jobs:?}"
+    );
+}
+
+/// Go, live end to end: goindex inventories the fixture's emissions (slog
+/// aggregates, the recover_block swallow), the seed specs judge them, and the
+/// ladder surfaces RC-027 (swallow) and RC-046 (no spans at I/O boundaries)
+/// as advisory emission findings.
+#[test]
+fn live_go_scan_surfaces_g4_emission_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture())
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the recover_block swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-046"),
+        "untraced I/O boundaries must surface under RC-046: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories except-blocks that swallow
+/// vs log, and the seed specs surface the RC-027 gap.
+#[test]
+fn live_py_scan_surfaces_g4_emission_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let pyindex = helpers_dir().join("pyindex").join("pyindex.py");
+    let fixture = helpers_dir()
+        .join("pyindex")
+        .join("testdata")
+        .join("fixture");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_PYINDEX", &pyindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the except_handler swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+}
+
+/// TypeScript, live end to end: the fixture's openai call has no surrounding
+/// emission, so the seed specs surface the RC-061 emission-half gap (the LLM
+/// call-site half rides G1). Skipped when node or the tsindex `typescript`
+/// dependency is unavailable, matching the goindex skip convention.
+#[test]
+fn live_ts_scan_surfaces_llm_observability_gap() {
+    let tsdir = helpers_dir().join("tsindex");
+    let ready = Command::new("node")
+        .args(["-e", "require('typescript')"])
+        .current_dir(&tsdir)
+        .output();
+    match ready {
+        Ok(out) if out.status.success() => {}
+        Ok(_) => {
+            eprintln!("SKIP live_ts_scan: tsindex needs `npm install` (typescript missing)");
+            return;
+        }
+        Err(e) => {
+            eprintln!("SKIP live_ts_scan: node not available: {e}");
+            return;
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(tsdir.join("testdata").join("fixture"))
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_TSINDEX", tsdir.join("tsindex.js"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-061"),
+        "the uninstrumented LLM call must surface under RC-061: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027"),
+        "the catch_clause swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
     );
 }
 

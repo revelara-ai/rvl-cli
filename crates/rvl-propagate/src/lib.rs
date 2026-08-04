@@ -125,6 +125,22 @@ pub fn propagate(
             ),
         };
     }
+    // Same for G4 emission points (po-av01j.5): an API spec judges CALLS. An
+    // emission-point aggregate is routed to the emission lane by the scan
+    // pipeline; if one reaches here anyway (eval harness, a stream fed
+    // straight in), it is out of this control's scope by construction —
+    // never a blocking call, never an abstention that pollutes the no-spec
+    // mint queue.
+    if site.is_emission_point() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "{} site: not a client-call surface, API specs do not apply",
+                site.site_kind
+            ),
+        };
+    }
     let key = site.api_key();
     let spec = specs.api(&key);
 
@@ -433,6 +449,7 @@ mod tests {
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
         })
     }
 
@@ -466,6 +483,7 @@ mod tests {
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
         })
     }
 
@@ -579,6 +597,7 @@ mod tests {
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -602,6 +621,35 @@ mod tests {
         assert!(
             f.reason.contains("server_entry"),
             "the reason must name the kind that was routed away: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn emission_point_sites_are_never_judged_by_g1_specs() {
+        // G4 (po-av01j.5): spec applicability filters on site_kind. An
+        // emission aggregate whose (client_type, method) happens to collide
+        // with a G1 API spec must NOT be judged as a blocking call — the G1
+        // control does not govern emission points. The scan pipeline also
+        // partitions emission sites out before propagation; this guard is the
+        // defense for every other caller (eval harness, future lanes).
+        let mut s = site();
+        s.site_kind = rvl_core::SITE_KIND_EMISSION.into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::NotApplicable,
+            "an emission point is not a client-call surface: {}",
+            f.reason
+        );
+        assert!(
+            f.reason.contains("emission"),
+            "the reason must name the routing: {}",
             f.reason
         );
     }
@@ -662,6 +710,7 @@ mod tests {
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -1036,13 +1085,14 @@ mod tests {
             }],
             configs: vec![],
             config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
             scopes: vec![ScopeSpec {
                 scope: "dev_only".into(),
                 applies: false,
                 confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
-            server: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(

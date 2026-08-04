@@ -1009,6 +1009,13 @@ fn findings_from_sites(
     let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
         .into_iter()
         .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
+    // G4 (po-av01j.5): emission-point aggregates ride the same stream but are
+    // NOT client-call surfaces. Partition them out before propagation so they
+    // never enter G1 coverage totals, `--out` eval rows, or triage classes;
+    // the emission lane consumes them below. (rvl_propagate::propagate also
+    // guards on site_kind — defense in depth for other stream consumers.)
+    let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_emission_point());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
@@ -1028,6 +1035,7 @@ fn findings_from_sites(
                 scopes: vec![],
                 config_keys: vec![],
                 server: vec![],
+                emissions: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -1076,8 +1084,50 @@ fn findings_from_sites(
         .zip(sites.iter())
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
-    let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    let mut items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    // Emission lane (G4): judge the emission inventory against RC-027/RC-046/
+    // RC-061 with the cache's emission specs. Only violations surface, as
+    // triage items keyed `emission.RC-XXX` — the same waiver/suppress surface
+    // every other finding uses. Advisory by construction (severity is never
+    // "high"): an observability gap warrants a conversation, not a blocked
+    // commit.
+    items.extend(emission_items(
+        &sites,
+        &emission_sites,
+        cache.emission_specs(),
+    ));
     Ok((findings, items, sites, cache, server_findings))
+}
+
+/// Map emission-lane violations into triage items. The class key is
+/// (`emission`, control code), so the ladder renders `emission.RC-XXX — <why>`
+/// and `.revelara.yaml` waivers / `rvlscan suppress` match on
+/// `emission.RC-XXX` like any other class rule.
+fn emission_items(
+    call_sites: &[rvl_core::Site],
+    emission_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::EmissionSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_emission::evaluate(call_sites, emission_sites, specs)
+        .into_iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "emission".into(),
+                method: f.control.to_string(),
+                // The control name leads so the ladder line reads
+                // "emission.RC-046 — distributed tracing: <why>".
+                reason: format!("{}: {}", f.control_name, f.reason),
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            control: f.control.to_string(),
+            site_count: f.evidence.len().max(1),
+            example_sites: f.evidence.into_iter().take(3).collect(),
+        })
+        .collect()
 }
 
 // --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---

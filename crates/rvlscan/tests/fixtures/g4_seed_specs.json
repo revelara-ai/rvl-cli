@@ -1,0 +1,44 @@
+{
+  "_comment": "G4 SEED emission-spec corpus (po-av01j.5): test-grade, hand-authored, sufficient for the per-language e2e tests. Covers RC-027 (centralized error monitoring: error paths that capture vs swallow), RC-046 (distributed tracing at I/O boundaries), and the emission half of RC-061 (LLM observability; the call-site half rides G1). PRODUCTION corpus authoring rides the LLM factory with human review - see the follow-up bead under po-av01j.",
+  "apis": [],
+  "configs": [],
+  "emissions": [
+    {"type": "recover_block", "category": "error_capture", "control": "RC-027", "role": "violates", "confidence": 0.9, "rationale": "a recover() with no capture or log emission swallows the panic: the error path is invisible to any monitoring (RC-027)"},
+    {"type": "except_handler", "category": "error_capture", "control": "RC-027", "role": "violates", "confidence": 0.9, "rationale": "an except block that neither emits nor re-raises swallows the failure: invisible to centralized error monitoring (RC-027)"},
+    {"type": "catch_clause", "category": "error_capture", "control": "RC-027", "role": "violates", "confidence": 0.9, "rationale": "a catch that neither emits nor re-throws swallows the failure: invisible to centralized error monitoring (RC-027)"},
+
+    {"type": "github.com/getsentry/sentry-go", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.9, "rationale": "sentry captures aggregate errors centrally with alerting"},
+    {"type": "sentry_sdk", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.9, "rationale": "sentry captures aggregate errors centrally with alerting"},
+    {"type": "@sentry/node", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.9, "rationale": "sentry captures aggregate errors centrally with alerting"},
+    {"type": "logging.Logger", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.85, "rationale": "a structured log emission on the error path feeds central log aggregation (weaker than a tracker capture, still monitored)"},
+    {"type": "winston.Logger", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.85, "rationale": "a structured log emission on the error path feeds central log aggregation"},
+    {"type": "log/slog.Logger", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.85, "rationale": "a structured log emission on the error path feeds central log aggregation"},
+    {"type": "loguru.logger", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.85, "rationale": "a structured log emission on the error path feeds central log aggregation"},
+    {"type": "console", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.65, "rationale": "console output on the error path is weak evidence: monitored only when stdout ships to aggregation"},
+
+    {"type": "go.opentelemetry.io/otel/trace.Tracer", "category": "trace", "control": "RC-046", "role": "satisfies", "confidence": 0.9, "rationale": "an OTel span at the I/O boundary carries trace context end to end"},
+    {"type": "@opentelemetry/api.Tracer", "category": "trace", "control": "RC-046", "role": "satisfies", "confidence": 0.9, "rationale": "an OTel span at the I/O boundary carries trace context end to end"},
+    {"type": "opentelemetry.trace.Tracer", "category": "trace", "control": "RC-046", "role": "satisfies", "confidence": 0.9, "rationale": "an OTel span at the I/O boundary carries trace context end to end"},
+
+    {"type": "log/slog.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "a structured log around an LLM call is minimal queryable telemetry (a GenAI span is the full RC-061 answer)"},
+    {"type": "log/slog", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "package-level slog emission: minimal queryable telemetry"},
+    {"type": "go.uber.org/zap.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "go.uber.org/zap.SugaredLogger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "github.com/sirupsen/logrus", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "github.com/rs/zerolog.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "winston.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "pino.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "logging.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "structlog", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "loguru.logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "console", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.65, "rationale": "console output is weak telemetry: queryable only when stdout ships to aggregation"},
+
+    {"type": "openai.Completions", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "an openai chat.completions.create call is an LLM call site whose surroundings must emit telemetry"},
+    {"type": "openai.OpenAI", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "openai SDK client call"},
+    {"type": "@anthropic-ai/sdk.Anthropic", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "anthropic SDK client call"},
+    {"type": "@anthropic-ai/sdk.Messages", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "anthropic messages.create call"},
+    {"type": "github.com/sashabaranov/go-openai.Client", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "go-openai client call"},
+    {"type": "google.golang.org/genai.Client", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "google genai client call"},
+    {"type": "anthropic.Anthropic", "category": "", "control": "RC-061", "role": "anchor", "confidence": 0.9, "rationale": "anthropic python SDK client call"}
+  ]
+}

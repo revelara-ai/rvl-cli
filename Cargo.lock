@@ -871,6 +871,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvl-emission"
+version = "0.1.0"
+dependencies = [
+ "rvl-core",
+ "rvl-spec",
+]
+
+[[package]]
 name = "rvl-eval"
 version = "0.1.0"
 dependencies = [
@@ -971,6 +979,7 @@ dependencies = [
  "rvl-content",
  "rvl-core",
  "rvl-data",
+ "rvl-emission",
  "rvl-index",
  "rvl-propagate",
  "rvl-skills",

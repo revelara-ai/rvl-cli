@@ -16,10 +16,13 @@ func TestServerEntrySitesAreInventoriedFromTheFixture(t *testing.T) {
 		if s.SiteKind == siteKindServerEntry {
 			entries = append(entries, s)
 		} else {
-			if s.SiteKind != "" {
+			// The fixture also exercises the G3/G4 lanes; only unknown kinds fail.
+			if s.SiteKind != "" && s.SiteKind != "background_job" && s.SiteKind != "emission_point" {
 				t.Fatalf("unexpected site_kind %q on %s:%d", s.SiteKind, s.File, s.Line)
 			}
-			g1 = append(g1, s)
+			if s.SiteKind == "" {
+				g1 = append(g1, s)
+			}
 		}
 	}
 	// Two ServeMux.HandleFunc registrations + one package-level http.Handle.

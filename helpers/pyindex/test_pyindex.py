@@ -265,5 +265,82 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertEqual(out.strip(), "")
 
 
+class TestEmissionPackets(unittest.TestCase):
+    """G4 (po-av01j.5): emission points ride the same stream as AGGREGATES —
+    one packet per (enclosing function, framework, category), never one per
+    log line — stamped site_kind: "emission_point" with category and count
+    riding const_args."""
+
+    def _emissions(self):
+        return [r for r in _retrieve_records()
+                if r.get("site_kind") == "emission_point"]
+
+    def _const(self, rec, name):
+        return next((a["value"] for a in rec["const_args"] if a["name"] == name),
+                    None)
+
+    def test_log_statements_aggregate_per_function(self):
+        emissions = self._emissions()
+        self.assertTrue(emissions, "expected emission packets from the fixture")
+        chatty = [r for r in emissions
+                  if r["symbol"] == "chatty"
+                  and r["client_type"] == "logging.Logger"]
+        self.assertEqual(len(chatty), 1,
+                         "five log calls in one function must be ONE aggregate: "
+                         "{}".format(chatty))
+        self.assertEqual(self._const(chatty[0], "emission_category"), "log")
+        self.assertEqual(self._const(chatty[0], "emission_count"), "5")
+        # Shared packet invariants hold for emission packets too.
+        self.assertEqual(chatty[0]["packet_schema"], 2)
+        self.assertTrue(chatty[0]["site_key"])
+        self.assertEqual(chatty[0]["lang"], "python")
+
+    def test_log_in_except_block_is_error_capture(self):
+        emissions = self._emissions()
+        guarded = [r for r in emissions if r["symbol"] == "guarded"]
+        self.assertEqual(len(guarded), 1, guarded)
+        self.assertEqual(guarded[0]["client_type"], "logging.Logger")
+        self.assertEqual(self._const(guarded[0], "emission_category"),
+                         "error_capture")
+
+    def test_swallowing_except_blocks_aggregate_with_count(self):
+        emissions = self._emissions()
+        swallows = [r for r in emissions
+                    if r["client_type"] == "except_handler"]
+        self.assertEqual(len(swallows), 1,
+                         "only swallowing() has uninstrumented handlers: "
+                         "{}".format(swallows))
+        self.assertEqual(swallows[0]["symbol"], "swallowing")
+        self.assertEqual(self._const(swallows[0], "emission_category"),
+                         "error_capture")
+        self.assertEqual(self._const(swallows[0], "emission_count"), "2")
+
+    def test_reraising_and_logging_handlers_are_not_swallows(self):
+        emissions = self._emissions()
+        for r in emissions:
+            if r["client_type"] != "except_handler":
+                continue
+            self.assertNotIn(r["symbol"], ("guarded", "reraising"),
+                             "a handler that logs or re-raises is not a swallow")
+
+    def test_sentry_capture_is_error_capture(self):
+        emissions = self._emissions()
+        captured = [r for r in emissions if r["symbol"] == "captured"]
+        self.assertEqual(len(captured), 1, captured)
+        self.assertEqual(captured[0]["client_type"], "sentry_sdk")
+        self.assertEqual(self._const(captured[0], "emission_category"),
+                         "error_capture")
+
+    def test_g1_sites_carry_no_site_kind(self):
+        # The fixture also exercises the G2/G3 lanes: only records outside the
+        # known kinds must stay classic G1 (empty site_kind).
+        known_kinds = {"emission_point", "background_job", "server_entry"}
+        for r in _retrieve_records():
+            if r.get("site_kind") in known_kinds:
+                continue
+            self.assertFalse(r.get("site_kind"),
+                             "G1 packets must not grow a site_kind: {}".format(r))
+
+
 if __name__ == "__main__":
     unittest.main()

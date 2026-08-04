@@ -1,0 +1,11 @@
+[package]
+name = "rvl-emission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rvl-core = { path = "../rvl-core" }
+rvl-spec = { path = "../rvl-spec" }

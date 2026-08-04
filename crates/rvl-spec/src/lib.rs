@@ -187,6 +187,46 @@ pub fn client_family(type_name: &str) -> Option<Family> {
     None
 }
 
+/// A G4 emission spec (po-av01j.5): what a matched emission aggregate MEANS
+/// for an observability control. Like every spec, this is library/judgment
+/// knowledge kept out of the retrievers: the emitter reports "17 slog.Logger
+/// log calls in this function" and only a spec says that counts as error
+/// monitoring, tracing, or neither.
+///
+/// `role` is what a match implies for the control:
+///   - `"satisfies"`: presence of this emission shape is evidence the control
+///     is implemented (a sentry capture for RC-027, an otel span for RC-046).
+///   - `"violates"`: presence of this shape is evidence of a gap (an
+///     `except_handler`/`catch_clause`/`recover_block` aggregate — an error
+///     path that swallows with no capture or log emission).
+///   - `"anchor"`: this CLIENT type marks a G1 call site the control governs
+///     (RC-061: the LLM SDK call whose surroundings must emit telemetry).
+///
+/// A role this consumer does not recognize matches nothing — additive
+/// degradation, mirroring `ConstArg::how`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmissionSpec {
+    /// The identity the emitter stamped: a telemetry framework
+    /// (`log/slog.Logger`, `winston.Logger`, `logging.Logger`), an
+    /// error-path construct (`except_handler`), or — for `role: "anchor"` —
+    /// a G1 client type (`openai.OpenAI`).
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// The emission category the aggregate carries (`log` | `trace` |
+    /// `error_capture`); empty for `anchor` specs, which match call sites.
+    #[serde(default)]
+    pub category: String,
+    /// The control this spec serves: RC-027, RC-046, or RC-061.
+    pub control: String,
+    /// `satisfies` | `violates` | `anchor` — see the type docs.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSpec {
     #[serde(rename = "type")]
@@ -335,6 +375,11 @@ pub struct SpecFile {
     /// the lane still loads, and the evaluator abstains without specs.
     #[serde(default)]
     pub server: Vec<ServerSpec>,
+    /// G4 emission specs. Additive with a carrying default: every pre-G4
+    /// cache loads with an empty list, and a cache carrying entries loads in
+    /// a pre-G4 consumer with the field ignored — compatible both ways.
+    #[serde(default)]
+    pub emissions: Vec<EmissionSpec>,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -356,6 +401,7 @@ pub struct SpecCache {
     scopes: HashMap<String, ScopeSpec>,
     config_keys: HashMap<(String, String), ConfigKeySpec>,
     server: Vec<ServerSpec>,
+    emissions: Vec<EmissionSpec>,
 }
 
 impl SpecCache {
@@ -379,6 +425,7 @@ impl SpecCache {
             c.config_keys.insert((s.format.clone(), s.key.clone()), s);
         }
         c.server = f.server;
+        c.emissions = f.emissions;
         c
     }
 
@@ -412,12 +459,19 @@ impl SpecCache {
     pub fn config_key(&self, format: &str, key: &str) -> Option<&ConfigKeySpec> {
         self.config_keys.get(&(format.to_string(), key.to_string()))
     }
+    /// The G4 emission specs, for the emission lane's evaluator. A slice, not
+    /// a keyed lookup: the lane's matches are (type, category, control, role)
+    /// combinations and the corpus is small (tens of entries).
+    pub fn emission_specs(&self) -> &[EmissionSpec] {
+        &self.emissions
+    }
     pub fn len(&self) -> usize {
         self.apis.len()
             + self.configs.len()
             + self.scopes.len()
             + self.config_keys.len()
             + self.server.len()
+            + self.emissions.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -460,6 +514,17 @@ impl SpecCache {
                 Some(existing) if existing.confidence >= v.confidence => {}
                 Some(existing) => *existing = v,
                 None => self.server.push(v),
+            }
+        }
+        // Emission specs merge on (type, category, control), preferring the
+        // higher-confidence entry — same policy as apis/configs.
+        for v in other.emissions {
+            match self.emissions.iter_mut().find(|e| {
+                e.type_name == v.type_name && e.category == v.category && e.control == v.control
+            }) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.emissions.push(v),
             }
         }
     }
@@ -628,9 +693,10 @@ mod tests {
     fn cache(specs: Vec<(&str, Bounds, Scope, f64)>) -> SpecCache {
         SpecCache::from_file(SpecFile {
             scopes: vec![],
-            apis: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
+            apis: vec![],
             configs: specs
                 .into_iter()
                 .map(|(t, b, s, c)| ConfigSpec {
@@ -717,19 +783,21 @@ mod tests {
     fn merge_prefers_higher_confidence() {
         let mut base = SpecCache::from_file(SpecFile {
             scopes: vec![],
-            apis: vec![api(Blocking::Yes, 0.7)],
-            configs: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
+            apis: vec![api(Blocking::Yes, 0.7)],
+            configs: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
         base.merge(SpecCache::from_file(SpecFile {
             scopes: vec![],
-            apis: vec![better],
-            configs: vec![],
             config_keys: vec![],
             server: vec![],
+            emissions: vec![],
+            apis: vec![better],
+            configs: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -823,6 +891,82 @@ mod tests {
     }
 
     #[test]
+    fn emission_specs_merge_on_identity_preferring_confidence() {
+        let e = |conf: f64, rationale: &str| EmissionSpec {
+            type_name: "log/slog.Logger".into(),
+            category: "log".into(),
+            control: "RC-061".into(),
+            role: "satisfies".into(),
+            confidence: conf,
+            rationale: rationale.into(),
+        };
+        let mut base = SpecCache::from_file(SpecFile {
+            apis: vec![],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![e(0.7, "base")],
+        });
+        base.merge(SpecCache::from_file(SpecFile {
+            apis: vec![],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![
+                e(0.9, "better"),
+                EmissionSpec {
+                    type_name: "except_handler".into(),
+                    category: "error_capture".into(),
+                    control: "RC-027".into(),
+                    role: "violates".into(),
+                    confidence: 0.9,
+                    rationale: "new".into(),
+                },
+            ],
+        }));
+        let specs = base.emission_specs();
+        assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
+        let slog = specs
+            .iter()
+            .find(|s| s.type_name == "log/slog.Logger")
+            .unwrap();
+        assert_eq!(slog.rationale, "better", "higher confidence wins");
+    }
+
+    #[test]
+    fn emission_specs_load_from_the_spec_file() {
+        // G4 (po-av01j.5): the spec file gains an additive `emissions` list.
+        // Old caches (no field) load with an empty list; a cache carrying
+        // entries exposes them through the accessor and counts them in len().
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "emissions": [
+                {"type": "log/slog.Logger", "category": "log", "control": "RC-027",
+                 "role": "satisfies", "confidence": 0.9, "rationale": "structured log emission"},
+                {"type": "except_handler", "category": "error_capture", "control": "RC-027",
+                 "role": "violates", "confidence": 0.9,
+                 "rationale": "an error path with no emission swallows the failure"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).expect("emissions must parse");
+        assert_eq!(cache.len(), 2, "emission specs count toward the cache size");
+        let specs = cache.emission_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].type_name, "log/slog.Logger");
+        assert_eq!(specs[0].role, "satisfies");
+        assert_eq!(specs[1].role, "violates");
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(
+            empty.emission_specs().is_empty(),
+            "a pre-G4 cache has no emission specs"
+        );
+    }
+
+    #[test]
     fn config_expect_serde_round_trips_every_variant() {
         // The expect grammar is the factory's authoring contract; a variant
         // that cannot round-trip would corrupt the signed cache silently.
@@ -898,6 +1042,7 @@ mod tests {
     }
 
     #[test]
+
     fn client_family_classifies_the_real_corpus_types() {
         use super::{client_family, Family};
         // DB configs + calls (twenty/immich): must classify Database.

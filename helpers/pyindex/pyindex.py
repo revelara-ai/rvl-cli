@@ -500,6 +500,166 @@ def _const_args(call, idx):
     return out
 
 
+# ---------------------------------------------------------------------------
+# G4 emission-point inventory (po-av01j.5).
+#
+# Log statements, span/trace instrumentation, and error-handling sites ride
+# the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
+# is the load-bearing constraint: emission packets are AGGREGATES -- one per
+# (enclosing function, framework identity, category), with the category and
+# call count riding const_args (emission_category / emission_count, how:
+# "aggregate") -- never one packet per log line.
+#
+# Classification is import-resolved like every other receiver in this helper:
+# a call is an emission only when its receiver resolves into a known telemetry
+# framework. Unresolved receivers are skipped -- abstain rather than guess.
+# The framework list is the candidate extractor (like STRONG_IO_METHODS for
+# G1): it decides what gets inventoried, never what a match means -- that is
+# the spec layer's job (EmissionSpec).
+# ---------------------------------------------------------------------------
+
+SITE_KIND_EMISSION = "emission_point"
+
+# Emit-verb allowlists per category: a framework module also exports
+# non-emitting surface (logging.getLogger, sentry_sdk.init) that must not
+# count as emission calls.
+_EMISSION_METHODS = {
+    "log": frozenset({
+        "debug", "info", "warning", "warn", "error", "exception", "critical",
+        "success", "trace", "log", "msg",
+    }),
+    "trace": frozenset({"start_span", "start_as_current_span"}),
+    "error_capture": frozenset({
+        "capture_exception", "capture_message", "capture_event",
+    }),
+}
+
+
+def _emission_identity(ctype):
+    """Map a resolved dotted receiver path to (framework identity, category).
+
+    The identity is NORMALIZED to the framework's canonical surface
+    (`logging.getLogger` -> `logging.Logger`) so the spec corpus keys on one
+    string per framework. Returns (None, None) for everything else."""
+    if not ctype:
+        return None, None
+    root = ctype.split(".")[0]
+    if root == "logging":
+        return "logging.Logger", "log"
+    if root == "structlog":
+        return "structlog", "log"
+    if root == "loguru":
+        return "loguru.logger", "log"
+    if root == "sentry_sdk":
+        return "sentry_sdk", "error_capture"
+    if root == "opentelemetry":
+        return "opentelemetry.trace.Tracer", "trace"
+    return None, None
+
+
+def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
+    """Return the file's emission-point aggregate records.
+
+    Also inventories the SWALLOW fact RC-027's capture-vs-swallow question
+    needs: an except handler that neither emits anything recognized nor
+    re-raises is an error path with no capture, aggregated per function under
+    the `except_handler` identity. A handler that logs, captures, or raises
+    is instrumented (or propagating), never a swallow."""
+    handler_nodes = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.ExceptHandler)]
+    contained = {}   # id(node) -> index of the handler containing it
+    reraises = []    # per handler: body contains a raise
+    for i, h in enumerate(handler_nodes):
+        for n in ast.walk(h):
+            contained.setdefault(id(n), i)
+        reraises.append(any(isinstance(n, ast.Raise) for n in ast.walk(h)))
+    handler_emits = [False] * len(handler_nodes)
+
+    aggs = {}  # (symbol, framework, category) -> agg dict
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        method = func.attr
+        ctype, _resolved = idx.resolve_receiver(func.value)
+        framework, category = _emission_identity(ctype)
+        if framework is None or method not in _EMISSION_METHODS[category]:
+            continue
+        h = contained.get(id(node))
+        if h is not None:
+            handler_emits[h] = True
+            if category == "log":
+                # A log emission ON an error path is the capture fact.
+                category = "error_capture"
+        symbol, _fn = enclosing.get(id(node), ("", None))
+        key = (symbol, framework, category)
+        agg = aggs.get(key)
+        if agg is None:
+            aggs[key] = agg = {
+                "line": node.lineno,
+                "method": method,
+                "snippet": _segment(source, node),
+                "count": 0,
+            }
+        agg["count"] += 1
+
+    # Swallowed error paths: no recognized emission, no re-raise.
+    for i, h in enumerate(handler_nodes):
+        if handler_emits[i] or reraises[i]:
+            continue
+        symbol, _fn = enclosing.get(id(h), ("", None))
+        key = (symbol, "except_handler", "error_capture")
+        agg = aggs.get(key)
+        if agg is None:
+            aggs[key] = agg = {
+                "line": h.lineno,
+                "method": "except",
+                "snippet": "",
+                "count": 0,
+            }
+        agg["count"] += 1
+
+    records = []
+    for (symbol, framework, category), agg in sorted(
+            aggs.items(), key=lambda kv: kv[1]["line"]):
+        records.append({
+            "packet_schema": PACKET_SCHEMA,
+            "site_key": "",  # stamped in emit(), like every packet
+            "site_kind": SITE_KIND_EMISSION,
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": agg["line"],
+            "symbol": symbol,
+            "func": agg["method"],
+            "receiver": "",
+            "client_type": framework,
+            "snippet": agg["snippet"],
+            # Volume control: no function body on aggregates.
+            "enclosing_function_body": "",
+            "callers": [],
+            "callees": [],
+            "client_construction": [],
+            "const_args": [
+                {"index": 0, "name": "emission_category",
+                 "value": category, "how": "aggregate"},
+                {"index": 0, "name": "emission_count",
+                 "value": str(agg["count"]), "how": "aggregate"},
+            ],
+            "macro_expansion": False,
+            "provenance": {
+                "client_type_resolved": framework != "except_handler",
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+            },
+            "lang": "python",
+        })
+    return records
+
+
 def _enclosing_functions(tree):
     """Map every AST node to the innermost enclosing FunctionDef/AsyncFunctionDef.
 
@@ -645,6 +805,8 @@ def retrieve_file(abs_path, file_path, snapshot):
         }
         out.append(record)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
+    # G4 emission inventory rides the same stream (po-av01j.5).
+    out.extend(collect_emissions(tree, source, idx, enclosing, file_path, snapshot))
     return out
 
 
