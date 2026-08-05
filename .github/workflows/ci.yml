@@ -11,17 +11,44 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Runner selection follows the org convention: the `CI_RUNNER` variable selects
+# the self-hosted fleet, and an unset variable falls back to GitHub-hosted.
+# rvlscan goes PUBLIC at cutover (po-av01j.18), and public repos are kept on
+# free GitHub-hosted minutes rather than the shared fleet -- at that point set a
+# REPO-level `CI_RUNNER=""` to override the org value, no workflow edit needed.
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
+      # Self-hosted runners reuse the workspace across jobs, and a container
+      # job elsewhere in the org (Semgrep runs as root) can leave root-owned
+      # files this job's checkout cannot clean. Reclaim ownership first.
+      # Skipped on GitHub-hosted runners, where every job is a fresh VM.
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: |
+          # GitHub-hosted images ship rustup; the self-hosted fleet was
+          # provisioned for Go/Node, so a runner joining it may not have it.
+          # Install once rather than letting a new runner break the gate.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      # On self-hosted runners the cargo registry and target dir persist on
+      # local disk between jobs, so the GHA cache is a redundant multi-GB round
+      # trip (it has already exceeded the 10 GB limit elsewhere in the org).
       - uses: Swatinem/rust-cache@v2
+        if: ${{ vars.CI_RUNNER == '' }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -29,19 +56,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Builds cindex so the C/C++ live e2e runs instead of skipping itself.
+      # A helper the suite never builds is a lane the suite never covers.
+      - name: Build the in-workspace helpers
+        run: cargo build -p cindex -p rustindex
+
       - name: Test
         run: cargo test --workspace
 
   helpers:
     name: go helper (vet + test)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: helpers/goindex/go.mod
           cache-dependency-path: helpers/goindex/go.sum
+          # Same reasoning as the Rust cache above: the module and build cache
+          # already persist on local disk on the self-hosted fleet.
+          cache: ${{ vars.CI_RUNNER == '' }}
 
       - name: Verify pinned dependencies
         working-directory: helpers/goindex
