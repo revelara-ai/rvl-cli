@@ -1,0 +1,77 @@
+{
+  "_comment": "SEED/test-grade Rust spec corpus (po-av01j.11): RC-019 timeout judgment at the Rust identities the wayfinder named (reqwest client timeout, sqlx pool acquire_timeout). Hand-authored, sufficient for e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review. RC-022 (retries) has no G1 lane shape yet — tracked on the parent epic, do not fake it here.",
+  "apis": [
+    {
+      "type": "reqwest::Client",
+      "method": "get",
+      "blocking": "no",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "seed: builds a RequestBuilder; no I/O happens until send"
+    },
+    {
+      "type": "reqwest::RequestBuilder",
+      "method": "send",
+      "blocking": "yes",
+      "bounded_by": ["call_arg", "client_config"],
+      "confidence": 0.9,
+      "rationale": "seed RC-019: performs the HTTP request; bounded by RequestBuilder::timeout on the chain or ClientBuilder::timeout at construction"
+    },
+    {
+      "type": "sqlx::PgPool",
+      "method": "execute",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "seed RC-019: statement I/O; PoolOptions::acquire_timeout bounds only the acquire phase, a statement bound needs statement_timeout"
+    },
+    {
+      "type": "dyn sqlx::Executor",
+      "method": "execute",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.85,
+      "rationale": "seed RC-019: trait-level dispatch (mid tier) carries the same judgment as the concrete executor"
+    },
+    {
+      "type": "sqlx::PgPool",
+      "method": "acquire",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "seed RC-019: pool acquisition; PoolOptions::acquire_timeout is the bound"
+    },
+    {
+      "type": "redis::Connection",
+      "method": "get",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.85,
+      "rationale": "seed RC-019: synchronous redis I/O"
+    },
+    {
+      "type": "redis::Connection",
+      "method": "set",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.85,
+      "rationale": "seed RC-019: synchronous redis I/O"
+    }
+  ],
+  "configs": [
+    {
+      "type": "reqwest::Client",
+      "bounds": "whole_call",
+      "scope": "this_client",
+      "confidence": 0.9,
+      "rationale": "seed RC-019: ClientBuilder::timeout bounds every request made through the built client"
+    },
+    {
+      "type": "sqlx::pool::PoolOptions",
+      "bounds": "phase_only",
+      "scope": "this_client",
+      "confidence": 0.9,
+      "rationale": "seed RC-019: acquire_timeout bounds the acquire phase, not statement execution"
+    }
+  ]
+}

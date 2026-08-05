@@ -1,10 +1,13 @@
 # rvlscan build + helper packaging.
 #
 # The scanner binary discovers its language retriever helpers (goindex,
-# pyindex) at runtime in this order: an env override (RVLSCAN_GOINDEX /
-# RVLSCAN_PYINDEX), then a helper sitting NEXT TO the rvlscan binary, then
-# PATH. The `helpers` target populates that adjacent slot so a locally built
-# `rvlscan scan` needs no env var — the same layout a release archive ships.
+# pyindex, rustindex) at runtime in this order: an env override
+# (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_RUSTINDEX), then a helper
+# sitting NEXT TO the rvlscan binary, then PATH. The `helpers` target
+# populates that adjacent slot so a locally built `rvlscan scan` needs no env
+# var — the same layout a release archive ships. rustindex is a workspace
+# crate, so a plain `cargo build` already lands it next to rvlscan; it needs
+# rust-analyzer at runtime (`rustup component add rust-analyzer`).
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).
@@ -35,13 +38,14 @@ build:
 rebuild:
 	$(CARGO) build $(CARGO_FLAGS) -p rvlscan
 
-## install: release-build rvlscan + goindex/pyindex and put them on PATH (BINDIR)
+## install: release-build rvlscan + goindex/pyindex/rustindex and put them on PATH (BINDIR)
 install:
-	$(CARGO) build --release -p rvlscan
+	$(CARGO) build --release -p rvlscan -p rustindex
 	$(GO) build -C helpers/goindex -o $(abspath target/release)/goindex .
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
 	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
+	install -m 0755 target/release/rustindex "$(BINDIR)/rustindex"
 	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
 	@# TypeScript: tsindex is a Node script needing `typescript`. Install
 	@# tsindex.js adjacent to the binary and put its `typescript` dep in
@@ -62,15 +66,16 @@ install:
 
 ## uninstall: remove the installed binary + helpers from BINDIR
 uninstall:
-	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/rustindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
 	rm -rf "$(PREFIX)/node_modules/typescript"
-	@echo "removed rvlscan + goindex + pyindex.py + tsindex.js from $(BINDIR)"
+	@echo "removed rvlscan + goindex + rustindex + pyindex.py + tsindex.js from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex next to the rvlscan binary
+## (rustindex is a workspace bin: `build` already put it there)
 helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py
-	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py)"
+	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py, rustindex)"
 
 ## dev: build the binary and its helpers for local zero-env `rvlscan scan`
 dev: helpers

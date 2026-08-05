@@ -1669,6 +1669,95 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
     );
 }
 
+// --- Rust G1 lane (po-av01j.11) ---
+
+/// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
+/// sqlx identities — the production corpus rides the LLM factory, HITL).
+fn rust_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("testdata")
+        .join("rust_seed_specs.json")
+}
+
+/// Rust, live end to end: `rvlscan scan <fixture>` must detect Rust, run the
+/// rustindex helper (a workspace binary — built by cargo next to rvlscan, the
+/// same adjacency a release ships), and feed its packets through the pipeline
+/// with the seed specs. Skipped when rust-analyzer is unavailable, matching
+/// the goindex skip convention.
+#[test]
+fn live_rust_scan_runs_the_rustindex_helper() {
+    match Command::new("rust-analyzer").arg("--version").output() {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!("SKIP live_rust_scan: rust-analyzer not available (rustup component)");
+            return;
+        }
+    }
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
+    // The helper is a workspace bin: usually already built next to rvlscan.
+    let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+        .parent()
+        .unwrap()
+        .join("rustindex");
+    if !rustindex.is_file() {
+        let build = Command::new("cargo")
+            .args(["build", "-p", "rustindex"])
+            .current_dir(&workspace)
+            .output();
+        match build {
+            Ok(o) if o.status.success() && rustindex.is_file() => {}
+            Ok(o) => {
+                eprintln!(
+                    "SKIP live_rust_scan: cargo build -p rustindex failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP live_rust_scan: cargo not available: {e}");
+                return;
+            }
+        }
+    }
+    let fixture = workspace
+        .join("crates")
+        .join("rustindex")
+        .join("testdata")
+        .join("fixture");
+    assert!(fixture.join("Cargo.toml").is_file(), "fixture missing");
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(rust_seed_specs())
+        .env("RVLSCAN_RUSTINDEX", &rustindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("sites ") && !stdout.contains("sites 0 "),
+        "the fixture must yield parsed G1 sites: {stdout}"
+    );
+    assert!(
+        stdout.contains("server-entry 2"),
+        "both .route() registrations must ride the G2 partition: {stdout}"
+    );
+    assert!(
+        stdout.contains("COVERAGE"),
+        "ladder must render a coverage section: {stdout}"
+    );
+}
+
 // --- G7 repo-structure lane (po-av01j.7) ---
 
 /// A `--retrieved` stream carrying a `repo_structure` record surfaces its
