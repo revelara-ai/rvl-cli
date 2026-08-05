@@ -37,8 +37,12 @@ const path = require('path');
 // PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
 // helper churn behind this number: a consumer that does not know a version
 // refuses the stream rather than guessing at its shape. It MUST agree with
-// goindex's PacketSchema, pyindex's PACKET_SCHEMA, and rvl_index's schema.
-const PACKET_SCHEMA = 1;
+// goindex's PacketSchema, pyindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
+//
+// v2 adds const_args (constant-valued arguments at the call site) and
+// macro_expansion (always false for TypeScript, which has no macros;
+// mechanical for C/C++). v2 is a strict superset of v1.
+const PACKET_SCHEMA = 2;
 
 // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes and
 // pyindex's MAX_SNIPPET_BYTES. A pathologically long function body should not
@@ -97,6 +101,95 @@ const WEAK_IO_METHODS = new Set([
   'get', 'send', 'connect', 'call', 'run', 'query', 'invoke',
   'read', 'write', 'delete', 'fetch', 'exec', 'do',
 ]);
+
+// ---------------------------------------------------------------------------
+// G3 background-job registration surfaces (po-av01j.4).
+//
+// Schedulers, cron registrations, dispatchers, and worker handler
+// registrations ride the SAME packet stream, marked
+// site_kind="background_job". Like the I/O-method allowlists this is a
+// RETRIEVAL selection table, not a judgment: it picks which sites to mark;
+// whether a registration needs a bound is spec knowledge downstream
+// (ApiSpec.site_kinds). Detection is TYPE-driven through the checker — the
+// receiver (or constructed class) must resolve into the framework's npm
+// package — so an untyped lookalike is never guessed at (abstain-by-omission).
+// ---------------------------------------------------------------------------
+
+// Method calls that register/dispatch background work, keyed on the resolved
+// `<pkg>.<Type>` client type. `type: null` accepts any type from the package
+// (typings vary across cron libraries; the package identity is the signal).
+const JOB_REGISTRATIONS = [
+  { pkg: 'bullmq', type: 'Queue', methods: new Set(['add', 'addBulk']) },
+  { pkg: 'agenda', type: null, methods: new Set(['define', 'every', 'schedule']) },
+  { pkg: 'node-cron', type: null, methods: new Set(['schedule']) },
+];
+
+// Constructions that ARE registrations: `new Worker(name, processor)` hands
+// bullmq the handler, so the new-expression is the registration site.
+const JOB_CTOR_TYPES = [{ pkg: 'bullmq', type: 'Worker' }];
+
+// isJobRegistration reports whether a RESOLVED client method call registers
+// background work: `<pkg>.<Type>` must match an entry's package (and type,
+// when the entry pins one) and the method its set.
+function isJobRegistration(clientType, method) {
+  for (const entry of JOB_REGISTRATIONS) {
+    if (!entry.methods.has(method)) continue;
+    if (entry.type === null) {
+      if (clientType.startsWith(entry.pkg + '.')) return true;
+    } else if (clientType === entry.pkg + '.' + entry.type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// isJobCtor reports whether a resolved constructed type is a handler
+// registration (see JOB_CTOR_TYPES).
+function isJobCtor(clientType) {
+  return JOB_CTOR_TYPES.some((e) => clientType === e.pkg + '.' + e.type);
+}
+
+// G2 server-entry detection (po-av01j.3).
+//
+// Server-entry sites (HTTP handler registrations, route definitions,
+// middleware attachments) ride the SAME packet stream, distinguished by the
+// additive `site_kind` field. Detection is deliberately conservative and
+// TYPED: a registration is emitted only when the receiver RESOLVES to a type
+// from a known server framework package (express, fastify), or a route
+// decorator's identifier resolves to @nestjs/common. An unresolved
+// `app.get(...)` could as easily be an HTTP client, so it abstains from this
+// lane (and falls through to the ordinary G1 rules).
+// ---------------------------------------------------------------------------
+
+// Mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+const SITE_KIND_SERVER_ENTRY = 'server_entry';
+
+// npm packages whose resolved types are server frameworks.
+const SERVER_PACKAGES = new Set(['express', 'fastify']);
+
+// Route-registration verbs on a server framework receiver (lowercased).
+const SERVER_ROUTE_METHODS = new Set([
+  'get', 'post', 'put', 'delete', 'patch', 'options', 'head', 'all', 'route',
+]);
+
+// Middleware-chain attachment verbs on a server framework receiver
+// (lowercased; `register`/`addhook` are fastify's plugin/hook surface).
+const SERVER_MIDDLEWARE_METHODS = new Set(['use', 'register', 'addhook']);
+
+// NestJS route decorators, matched by name AND by the identifier resolving to
+// @nestjs/common (a local helper named Get never matches).
+const NEST_ROUTE_DECORATORS = new Set([
+  'Get', 'Post', 'Put', 'Delete', 'Patch', 'Options', 'Head', 'All',
+]);
+
+// isServerFrameworkType reports whether a resolved `<pkg>.<Type>` client type
+// belongs to a known server framework package.
+function isServerFrameworkType(clientType) {
+  const i = clientType.lastIndexOf('.');
+  if (i < 0) return false;
+  return SERVER_PACKAGES.has(clientType.slice(0, i));
+
+}
 
 const NOISE_METHODS = new Set([
   // chainable / promise
@@ -452,6 +545,140 @@ function constructionFor(receiver, checker, root, relPathOf, isScanned) {
 }
 
 // ---------------------------------------------------------------------------
+// G4 emission-point inventory (po-av01j.5).
+//
+// Log statements, span/trace instrumentation, and error-handling sites ride
+// the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
+// is the load-bearing constraint: emission packets are AGGREGATES -- one per
+// (enclosing function, framework identity, category), with the category and
+// call count riding const_args (emission_category / emission_count, how:
+// "aggregate") -- never one packet per log line.
+//
+// Classification is type-driven like G1: a call is an emission only when the
+// checker resolves its receiver into a known telemetry package (winston,
+// pino, @opentelemetry, @sentry), plus the two mechanical identities `console`
+// (receiver text) and `catch_clause` (the swallow fact below). The framework
+// list is the candidate extractor: it decides what gets inventoried, never
+// what a match means -- that is the spec layer's job (EmissionSpec).
+//
+// Recognized emission calls are routed OUT of the G1 site list: a logger.info
+// must not double-count as a client call site.
+// ---------------------------------------------------------------------------
+
+const SITE_KIND_EMISSION = 'emission_point';
+
+const EMISSION_LOG_METHODS = new Set([
+  'debug', 'info', 'warn', 'error', 'verbose', 'silly', 'fatal', 'trace', 'log',
+]);
+const CONSOLE_LOG_METHODS = new Set(['log', 'info', 'warn', 'error', 'debug', 'trace']);
+const EMISSION_TRACE_METHODS = new Set(['startSpan', 'startActiveSpan']);
+const EMISSION_CAPTURE_METHODS = new Set([
+  'captureException', 'captureMessage', 'captureEvent',
+]);
+
+// emissionIdentity classifies a call as an emission point, returning
+// {framework, category} or null. `clientType`/`resolved` come from the same
+// resolveClientType pass the G1 heuristic uses.
+function emissionIdentity(receiver, method, clientType, resolved, checker) {
+  const recvText = typeof receiver.getText === 'function' ? receiver.getText() : '';
+  if (recvText === 'console' && CONSOLE_LOG_METHODS.has(method)) {
+    return { framework: 'console', category: 'log' };
+  }
+  if (resolved && clientType) {
+    if (
+      (clientType.startsWith('winston.') || clientType === 'pino' || clientType.startsWith('pino.')) &&
+      EMISSION_LOG_METHODS.has(method)
+    ) {
+      return { framework: clientType, category: 'log' };
+    }
+    if (clientType.startsWith('@opentelemetry/') && EMISSION_TRACE_METHODS.has(method)) {
+      return { framework: clientType, category: 'trace' };
+    }
+    if (clientType.startsWith('@sentry/') && EMISSION_CAPTURE_METHODS.has(method)) {
+      return { framework: clientType, category: 'error_capture' };
+    }
+    return null;
+  }
+  // Namespace imports (import * as Sentry from '@sentry/node'): the receiver
+  // is a namespace whose TYPE does not resolve; attribute via the import.
+  if (EMISSION_CAPTURE_METHODS.has(method)) {
+    let sym;
+    try {
+      sym = checker.getSymbolAtLocation(receiver);
+    } catch (_e) {
+      sym = undefined;
+    }
+    const imp = packageFromImport(sym);
+    if (imp && imp.pkg.startsWith('@sentry/')) {
+      return { framework: imp.pkg, category: 'error_capture' };
+    }
+  }
+  return null;
+}
+
+// enclosingCatchClause returns the catch clause LEXICALLY containing `node`,
+// or null. Purely structural containment (no function-boundary stop): a log
+// written inside a catch -- directly or via a callback -- is on the error
+// path, and the same containment marks the catch as instrumented.
+function enclosingCatchClause(node) {
+  let cur = node.parent;
+  while (cur && !ts.isSourceFile(cur)) {
+    if (ts.isCatchClause(cur)) return cur;
+    cur = cur.parent;
+  }
+  return null;
+}
+
+// containsThrow reports whether a catch clause re-throws: a propagating
+// handler is NOT a swallow.
+function containsThrow(node) {
+  let found = false;
+  const scan = (n) => {
+    if (ts.isThrowStatement(n)) found = true;
+    else ts.forEachChild(n, scan);
+  };
+  scan(node);
+  return found;
+}
+
+// emissionRecord builds one aggregate packet. Function bodies are omitted on
+// purpose (volume); the category and count ride const_args.
+function emissionRecord(agg, relPath, snapshot) {
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit(), like every packet
+    site_kind: SITE_KIND_EMISSION,
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: agg.line,
+    symbol: agg.symbol,
+    func: agg.method,
+    receiver: '',
+    client_type: agg.framework,
+    snippet: agg.snippet,
+    enclosing_function_body: '',
+    callers: [],
+    callees: [],
+    client_construction: [],
+    const_args: [
+      { index: 0, name: 'emission_category', value: agg.category, how: 'aggregate' },
+      { index: 0, name: 'emission_count', value: String(agg.count), how: 'aggregate' },
+    ],
+    macro_expansion: false,
+    provenance: {
+      client_type_resolved:
+        agg.framework !== 'catch_clause' && agg.framework !== 'console',
+      confidence_tier: 'high',
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Program construction + file discovery
 // ---------------------------------------------------------------------------
 
@@ -561,17 +788,79 @@ function runRetrieve(root, snapshot, filesArg) {
     const relPath = relPathOf(sf.fileName);
     if (wanted && !wanted.has(relPath)) continue;
 
+    // Per-file G4 emission state: aggregates keyed (function, framework,
+    // category), plus the catch clauses seen and which of them emit.
+    const aggs = new Map();
+    const catchClauses = [];
+    const emittingCatches = new Set();
+    const aggregate = (node, framework, category, method) => {
+      const enc = enclosingFunction(node);
+      const key = `${enc.name} ${framework} ${category}`;
+      let agg = aggs.get(key);
+      if (!agg) {
+        const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+        agg = {
+          line: line + 1,
+          method,
+          snippet: method === 'catch' ? '' : cap(node.getText()),
+          framework,
+          category,
+          symbol: enc.name,
+          count: 0,
+        };
+        aggs.set(key, agg);
+      }
+      agg.count++;
+    };
+
     const visit = (node) => {
+      if (ts.isCatchClause(node)) catchClauses.push(node);
       if (
         ts.isCallExpression(node) &&
         ts.isPropertyAccessExpression(node.expression)
       ) {
-        const rec = siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned);
+        // G4 (po-av01j.5): emission calls are aggregated per (function,
+        // framework, category) and routed OUT of the G1 site list; anything
+        // else falls through to the ordinary call-site retrieval.
+        const prop = node.expression;
+        const receiver = prop.expression;
+        const method = prop.name.getText();
+        const { clientType, resolved } = resolveClientType(receiver, checker, program);
+        const em = emissionIdentity(receiver, method, clientType, resolved, checker);
+        if (em) {
+          let category = em.category;
+          const cc = enclosingCatchClause(node);
+          if (cc) {
+            emittingCatches.add(cc);
+            // A log emission ON an error path is the capture fact.
+            if (category === 'log') category = 'error_capture';
+          }
+          aggregate(node, em.framework, category, method);
+        } else {
+          const rec = siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned);
+          if (rec) records.push(rec);
+        }
+      } else if (ts.isNewExpression(node)) {
+        // G3: some constructions ARE handler registrations (bullmq Worker).
+        const rec = jobSiteFromNew(node, sf, relPath, snapshot, checker, program);
         if (rec) records.push(rec);
+      } else if (ts.isMethodDeclaration(node)) {
+        // G2: NestJS route decorators register the decorated class method.
+        records.push(...nestRouteRecords(node, sf, relPath, snapshot, checker));
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
+
+    // Swallowed error paths: a catch that neither emits anything recognized
+    // nor re-throws, aggregated per enclosing function.
+    for (const cc of catchClauses) {
+      if (emittingCatches.has(cc) || containsThrow(cc)) continue;
+      aggregate(cc, 'catch_clause', 'error_capture', 'catch');
+    }
+    for (const agg of [...aggs.values()].sort((a, b) => a.line - b.line)) {
+      records.push(emissionRecord(agg, relPath, snapshot));
+    }
   }
 
   const repoConfig = collectRepoConfig(program, checker, snapshot, isScanned);
@@ -630,6 +919,89 @@ function realOr(p) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Constant-valued arguments (schema v2).
+//
+// Evidence, never a verdict: the emitter reports that an argument's value is
+// knowable without running the program, and how it was determined. What the
+// value MEANS is spec-layer knowledge. Only literal tokens and one-hop named
+// constants (a `const` with a literal initializer, an enum member the checker
+// folds) are resolved — no deep constant propagation.
+// ---------------------------------------------------------------------------
+
+// literalText returns the source text of a literal expression, or null when
+// the expression is not a literal. Template literals WITH substitutions are
+// not literals; `-1` (a prefix minus on a numeric literal) is.
+function literalText(node) {
+  if (
+    ts.isStringLiteralLike(node) ||
+    ts.isNumericLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return node.getText();
+  }
+  if (
+    ts.isPrefixUnaryExpression(node) &&
+    node.operator === ts.SyntaxKind.MinusToken &&
+    ts.isNumericLiteral(node.operand)
+  ) {
+    return node.getText();
+  }
+  return null;
+}
+
+// namedConstantText resolves a reference one hop to its constant value:
+// an enum member access via the checker's own constant folding, or an
+// identifier declared `const` with a literal initializer. Returns the value's
+// source-level rendering, or null when the reference is not a constant.
+function namedConstantText(node, checker) {
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    let cv;
+    try {
+      cv = checker.getConstantValue(node);
+    } catch (_e) {
+      cv = undefined;
+    }
+    if (cv === undefined) return null;
+    return typeof cv === 'string' ? JSON.stringify(cv) : String(cv);
+  }
+  if (!ts.isIdentifier(node)) return null;
+  let sym;
+  try {
+    sym = checker.getSymbolAtLocation(node);
+  } catch (_e) {
+    return null;
+  }
+  if (!sym) return null;
+  const decl = sym.valueDeclaration;
+  if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer) return null;
+  if (!(ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const)) return null;
+  return literalText(decl.initializer);
+}
+
+// constArgsOf reports the constant-valued arguments of a call, as
+// {index, name, value, how}. `index` is the zero-based position as written;
+// `name` is always "" (TypeScript has no keyword arguments); `how` is
+// "literal" or "named_constant".
+function constArgsOf(node, checker) {
+  const out = [];
+  const args = node.arguments || [];
+  for (let i = 0; i < args.length; i++) {
+    const lit = literalText(args[i]);
+    if (lit !== null) {
+      out.push({ index: i, name: '', value: lit, how: 'literal' });
+      continue;
+    }
+    const named = namedConstantText(args[i], checker);
+    if (named !== null) {
+      out.push({ index: i, name: '', value: named, how: 'named_constant' });
+    }
+  }
+  return out;
+}
+
 function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, relPathOf, isScanned) {
   const prop = node.expression; // PropertyAccessExpression
   const receiver = prop.expression;
@@ -640,6 +1012,48 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     checker,
     program,
   );
+
+  // G2 server-entry registrations are checked FIRST: `app.get('/x', h)` on a
+  // resolved express receiver would otherwise emit as a G1 client call. A
+  // matched registration emits one server_entry record and never a G1 site.
+  if (resolved && isServerFrameworkType(clientType)) {
+    const lower = method.toLowerCase();
+    if (SERVER_ROUTE_METHODS.has(lower) || SERVER_MIDDLEWARE_METHODS.has(lower)) {
+      const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+      const enc = enclosingFunction(node);
+      return {
+        packet_schema: PACKET_SCHEMA,
+        site_key: '', // stamped in emit()
+        snapshot_id: snapshot,
+        file_path: relPath,
+        line_number: line + 1,
+        symbol: enc.name,
+        func: method,
+        receiver: receiver.getText(),
+        client_type: clientType,
+        client_version: version,
+        snippet: cap(node.getText()),
+        enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
+        callers: [],
+        callees: [],
+        // The route path (a literal in the mainstream frameworks) rides the
+        // existing const_args machinery.
+        const_args: constArgsOf(node, checker),
+        macro_expansion: false,
+        client_construction: [],
+        site_kind: SITE_KIND_SERVER_ENTRY,
+        provenance: {
+          client_type_resolved: true,
+          confidence_tier: 'high',
+          callers_total: 0,
+          callers_included: 0,
+          callees_total: 0,
+          callees_included: 0,
+        },
+        lang: 'typescript',
+      };
+    }
+  }
 
   // Emission decision (documented in the header):
   //   * a resolved external client emits regardless of method name, unless the
@@ -673,8 +1087,15 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     client_version: version,
     snippet: cap(node.getText()),
     enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
-    callers: [], // empty in v1 (no cross-module call graph)
-    callees: [], // empty in v1
+    callers: [], // empty (no cross-module call graph yet)
+    callees: [], // empty
+    // Schema v2: constant-valued arguments as evidence, and the macro flag
+    // (TypeScript has no macros; C/C++ sets it mechanically).
+    const_args: constArgsOf(node, checker),
+    macro_expansion: false,
+    // G3: a resolved scheduler/queue registration is a background-job site;
+    // everything else stays the classic call site.
+    site_kind: resolved && isJobRegistration(clientType, method) ? 'background_job' : '',
     client_construction: constructionFor(
       receiver,
       checker,
@@ -693,6 +1114,119 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     lang: 'typescript',
   };
   return rec;
+}
+
+// jobSiteFromNew emits the background-job site for a construction that IS a
+// handler registration (`new Worker(name, processor)` in bullmq). The
+// constructed class must RESOLVE to a known framework package; any other
+// new-expression returns null and is not a site. `func` is "constructor",
+// matching how enclosingFunction names constructor bodies.
+function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
+  const callee = node.expression;
+  if (!callee) return null;
+  const { clientType, resolved, version } = resolveClientType(
+    callee,
+    checker,
+    program,
+  );
+  if (!resolved || !isJobCtor(clientType)) return null;
+
+  const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+  const enc = enclosingFunction(node);
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit()
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: line + 1,
+    symbol: enc.name,
+    func: 'constructor',
+    receiver: callee.getText(),
+    client_type: clientType,
+    client_version: version,
+    snippet: cap(node.getText()),
+    enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
+    callers: [],
+    callees: [],
+    const_args: constArgsOf(node, checker),
+    macro_expansion: false,
+    site_kind: 'background_job',
+    client_construction: [],
+    provenance: {
+      client_type_resolved: true,
+      confidence_tier: 'high',
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// nestRouteRecords emits one server-entry record per NestJS route decorator
+// (`@Get('/x')`) on a class method. Conservative and typed: the decorator's
+// identifier must RESOLVE to @nestjs/common through its import binding; a
+// same-named local decorator abstains. The record's symbol is the decorated
+// handler method; the route path rides const_args like every other literal.
+function nestRouteRecords(node, sf, relPath, snapshot, checker) {
+  const out = [];
+  const decorators =
+    typeof ts.canHaveDecorators === 'function' && ts.canHaveDecorators(node)
+      ? ts.getDecorators(node)
+      : node.decorators;
+  if (!decorators) return out;
+  for (const dec of decorators) {
+    const expr = dec.expression;
+    if (!ts.isCallExpression(expr) || !ts.isIdentifier(expr.expression)) {
+      continue;
+    }
+    const name = expr.expression.text;
+    if (!NEST_ROUTE_DECORATORS.has(name)) continue;
+    let sym;
+    try {
+      sym = checker.getSymbolAtLocation(expr.expression);
+    } catch (_e) {
+      sym = undefined;
+    }
+    const imp = packageFromImport(sym);
+    if (!imp || imp.pkg !== '@nestjs/common') continue;
+    const { line } = sf.getLineAndCharacterOfPosition(dec.getStart());
+    out.push({
+      packet_schema: PACKET_SCHEMA,
+      site_key: '', // stamped in emit()
+      snapshot_id: snapshot,
+      file_path: relPath,
+      line_number: line + 1,
+      symbol:
+        node.name && typeof node.name.getText === 'function'
+          ? node.name.getText()
+          : '',
+      func: name,
+      receiver: '',
+      client_type: '@nestjs/common.' + name,
+      client_version: '',
+      snippet: cap(dec.getText()),
+      enclosing_function_body: cap(node.getText()),
+      callers: [],
+      callees: [],
+      const_args: constArgsOf(expr, checker),
+      macro_expansion: false,
+      client_construction: [],
+      site_kind: SITE_KIND_SERVER_ENTRY,
+      provenance: {
+        client_type_resolved: true,
+        confidence_tier: 'high',
+        callers_total: 0,
+        callers_included: 0,
+        callees_total: 0,
+        callees_included: 0,
+      },
+      lang: 'typescript',
+    });
+  }
+  return out;
+
 }
 
 // Write a string to fd 1 (stdout) SYNCHRONOUSLY and completely. process.exit()

@@ -65,6 +65,26 @@ pub struct ApiSpec {
     pub rationale: String,
     #[serde(default)]
     pub site_count: u32,
+    /// Which site kinds this spec governs (G3, po-av01j.4). Empty — every
+    /// spec authored before site kinds existed — means the classic G1 client
+    /// call site only (`Site::site_kind == ""`), so no existing spec silently
+    /// widens onto job-registration sites. A spec that re-applies timeout/
+    /// retry judgment at job altitude declares `["background_job"]`; one
+    /// governing both altitudes lists both `""` and `"background_job"`.
+    #[serde(default)]
+    pub site_kinds: Vec<String>,
+}
+
+impl ApiSpec {
+    /// Whether this spec governs a site of `site_kind`. The applicability
+    /// mechanism for job-altitude re-application: the JUDGMENT machinery is
+    /// unchanged, a spec merely declares which altitudes it covers.
+    pub fn applies_to(&self, site_kind: &str) -> bool {
+        if self.site_kinds.is_empty() {
+            return site_kind.is_empty();
+        }
+        self.site_kinds.iter().any(|k| k == site_kind)
+    }
 }
 
 /// What a config field actually bounds. The distinction is load-bearing: a
@@ -167,6 +187,46 @@ pub fn client_family(type_name: &str) -> Option<Family> {
     None
 }
 
+/// A G4 emission spec (po-av01j.5): what a matched emission aggregate MEANS
+/// for an observability control. Like every spec, this is library/judgment
+/// knowledge kept out of the retrievers: the emitter reports "17 slog.Logger
+/// log calls in this function" and only a spec says that counts as error
+/// monitoring, tracing, or neither.
+///
+/// `role` is what a match implies for the control:
+///   - `"satisfies"`: presence of this emission shape is evidence the control
+///     is implemented (a sentry capture for RC-027, an otel span for RC-046).
+///   - `"violates"`: presence of this shape is evidence of a gap (an
+///     `except_handler`/`catch_clause`/`recover_block` aggregate — an error
+///     path that swallows with no capture or log emission).
+///   - `"anchor"`: this CLIENT type marks a G1 call site the control governs
+///     (RC-061: the LLM SDK call whose surroundings must emit telemetry).
+///
+/// A role this consumer does not recognize matches nothing — additive
+/// degradation, mirroring `ConstArg::how`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmissionSpec {
+    /// The identity the emitter stamped: a telemetry framework
+    /// (`log/slog.Logger`, `winston.Logger`, `logging.Logger`), an
+    /// error-path construct (`except_handler`), or — for `role: "anchor"` —
+    /// a G1 client type (`openai.OpenAI`).
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// The emission category the aggregate carries (`log` | `trace` |
+    /// `error_capture`); empty for `anchor` specs, which match call sites.
+    #[serde(default)]
+    pub category: String,
+    /// The control this spec serves: RC-027, RC-046, or RC-061.
+    pub control: String,
+    /// `satisfies` | `violates` | `anchor` — see the type docs.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSpec {
     #[serde(rename = "type")]
@@ -205,6 +265,99 @@ pub struct ScopeSpec {
     pub rationale: String,
 }
 
+/// What satisfies a config-key spec. This is the factory's authoring grammar
+/// for the G6 config lane, deliberately small and enumerable: every variant is
+/// auditable by reading it, and there is no user-supplied regex to reason
+/// about. Patterns are NAMED and resolved by the scanner (see the config
+/// lane's pattern table); a name this binary does not know yields an
+/// abstention, never a guess — that is how a spec authored for a newer scanner
+/// degrades safely on an older one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigExpect {
+    /// An EXPLICIT setting must be present in the repo. A platform default
+    /// governing the key does not count: the control asks for an authored
+    /// bound, and "the platform picked one for you" is the finding.
+    Present,
+    /// The resolved value must equal `value` (string-compared on the packet's
+    /// canonical rendering).
+    Equals { value: String },
+    /// The resolved value must be one of `values`.
+    OneOf { values: Vec<String> },
+    /// The resolved value must match the NAMED pattern (e.g. "sha40" = a full
+    /// 40-hex-char commit SHA, the action-pinning control).
+    Pattern { name: String },
+}
+
+/// A spec about one config key in one config format — the G6 analog of
+/// [`ApiSpec`]. It answers a question about the FORMAT ("a GitHub Actions job
+/// without an explicit timeout-minutes runs under the 6h platform default"),
+/// never about a repository, so it is earned once and applies everywhere.
+///
+/// Unlike the call-site lane, where class judgment (severity/fix) lives in a
+/// separate judgment file, a config-key spec IS its finding class: one spec is
+/// one reader-facing class, so severity and fix ride on the spec. Empty means
+/// unjudged, and unjudged findings surface as advisory, never blocking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigKeySpec {
+    /// The config format id, e.g. "github-actions", "gitlab-ci".
+    pub format: String,
+    /// The canonical key identity within the format, e.g. "job.timeout-minutes".
+    pub key: String,
+    pub expect: ConfigExpect,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+    /// The control this key evidences (e.g. "RC-013"), empty if unmapped.
+    #[serde(default)]
+    pub control: String,
+    /// Judged severity: high | medium | low | "" (unjudged).
+    #[serde(default)]
+    pub severity: String,
+    /// Suggested fix for the explain view.
+    #[serde(default)]
+    pub fix: String,
+}
+
+/// The `kind` of a [`ServerSpec`]: route paths that count as a health-check
+/// endpoint (RC-020).
+pub const SERVER_KIND_HEALTH_PATH: &str = "health_path";
+/// The `kind` of a [`ServerSpec`]: middleware/handler identities that
+/// rate-limit (RC-069).
+pub const SERVER_KIND_RATE_LIMIT: &str = "rate_limit_middleware";
+/// The `kind` of a [`ServerSpec`]: middleware/handler identities that provide
+/// a degraded-response path (RC-018, the G2 half).
+pub const SERVER_KIND_DEGRADED_RESPONSE: &str = "degraded_response";
+
+/// A spec for a control that rides the G2 server-entry lane (po-av01j.3).
+///
+/// Unlike an [`ApiSpec`] (a question about one API), a server spec carries the
+/// JUDGEMENT patterns the server-entry evaluator matches against the
+/// inventoried registrations: which route paths count as a health endpoint,
+/// which middleware identities rate-limit, which provide degraded responses.
+/// The retrievers stay neutral — they inventory registrations; what a path or
+/// identity MEANS lives here, factory-authored like every other spec.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerSpec {
+    /// Control code this spec serves ("RC-020" | "RC-069" | "RC-018").
+    pub control: String,
+    /// What the patterns match (`SERVER_KIND_*`). A string, not an enum, so a
+    /// future factory adding a kind degrades to an ignored spec rather than a
+    /// cache-wide parse failure.
+    #[serde(default)]
+    pub kind: String,
+    /// Case-insensitive match targets: route paths for `health_path`,
+    /// identity substrings for the middleware kinds.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpecFile {
     #[serde(default)]
@@ -213,6 +366,20 @@ pub struct SpecFile {
     pub configs: Vec<ConfigSpec>,
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
+    /// G6 config-lane specs. Serde-defaulted: caches predating the lane parse
+    /// unchanged, and an old binary ignores the section (serde skips unknown
+    /// fields), so the envelope schema version does not move.
+    #[serde(default)]
+    pub config_keys: Vec<ConfigKeySpec>,
+    /// G2 server-entry control specs. Defaults empty: every cache predating
+    /// the lane still loads, and the evaluator abstains without specs.
+    #[serde(default)]
+    pub server: Vec<ServerSpec>,
+    /// G4 emission specs. Additive with a carrying default: every pre-G4
+    /// cache loads with an empty list, and a cache carrying entries loads in
+    /// a pre-G4 consumer with the field ignored — compatible both ways.
+    #[serde(default)]
+    pub emissions: Vec<EmissionSpec>,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -232,6 +399,9 @@ pub struct SpecCache {
     apis: HashMap<(String, String), ApiSpec>,
     configs: HashMap<String, ConfigSpec>,
     scopes: HashMap<String, ScopeSpec>,
+    config_keys: HashMap<(String, String), ConfigKeySpec>,
+    server: Vec<ServerSpec>,
+    emissions: Vec<EmissionSpec>,
 }
 
 impl SpecCache {
@@ -251,7 +421,22 @@ impl SpecCache {
         for s in f.scopes {
             c.scopes.insert(s.scope.clone(), s);
         }
+        for s in f.config_keys {
+            c.config_keys.insert((s.format.clone(), s.key.clone()), s);
+        }
+        c.server = f.server;
+        c.emissions = f.emissions;
         c
+    }
+
+    /// The usable G2 server-entry specs: everything at or above the
+    /// confidence floor. A shaky server spec is ignored entirely — it applies
+    /// to every registration in the repo at once, the same multiplier that
+    /// set [`MIN_CONFIDENCE`].
+    pub fn server_specs(&self) -> impl Iterator<Item = &ServerSpec> {
+        self.server
+            .iter()
+            .filter(|s| s.confidence >= MIN_CONFIDENCE)
     }
 
     /// True when the control does not govern this scope. Absent or
@@ -270,8 +455,23 @@ impl SpecCache {
     pub fn config(&self, type_name: &str) -> Option<&ConfigSpec> {
         self.configs.get(type_name)
     }
+    /// The G6 config-lane lookup: the spec for one (format, key) identity.
+    pub fn config_key(&self, format: &str, key: &str) -> Option<&ConfigKeySpec> {
+        self.config_keys.get(&(format.to_string(), key.to_string()))
+    }
+    /// The G4 emission specs, for the emission lane's evaluator. A slice, not
+    /// a keyed lookup: the lane's matches are (type, category, control, role)
+    /// combinations and the corpus is small (tens of entries).
+    pub fn emission_specs(&self) -> &[EmissionSpec] {
+        &self.emissions
+    }
     pub fn len(&self) -> usize {
-        self.apis.len() + self.configs.len() + self.scopes.len()
+        self.apis.len()
+            + self.configs.len()
+            + self.scopes.len()
+            + self.config_keys.len()
+            + self.server.len()
+            + self.emissions.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -295,6 +495,36 @@ impl SpecCache {
                 _ => {
                     self.configs.insert(k, v);
                 }
+            }
+        }
+        for (k, v) in other.config_keys {
+            match self.config_keys.get(&k) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                _ => {
+                    self.config_keys.insert(k, v);
+                }
+            }
+        }
+        for v in other.server {
+            match self
+                .server
+                .iter_mut()
+                .find(|s| s.control == v.control && s.kind == v.kind)
+            {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.server.push(v),
+            }
+        }
+        // Emission specs merge on (type, category, control), preferring the
+        // higher-confidence entry — same policy as apis/configs.
+        for v in other.emissions {
+            match self.emissions.iter_mut().find(|e| {
+                e.type_name == v.type_name && e.category == v.category && e.control == v.control
+            }) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.emissions.push(v),
             }
         }
     }
@@ -427,6 +657,7 @@ mod tests {
             confidence,
             rationale: String::new(),
             site_count: 1,
+            site_kinds: vec![],
         }
     }
 
@@ -462,6 +693,9 @@ mod tests {
     fn cache(specs: Vec<(&str, Bounds, Scope, f64)>) -> SpecCache {
         SpecCache::from_file(SpecFile {
             scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
             apis: vec![],
             configs: specs
                 .into_iter()
@@ -549,6 +783,9 @@ mod tests {
     fn merge_prefers_higher_confidence() {
         let mut base = SpecCache::from_file(SpecFile {
             scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
         });
@@ -556,6 +793,9 @@ mod tests {
         better.rationale = "local".into();
         base.merge(SpecCache::from_file(SpecFile {
             scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
             apis: vec![better],
             configs: vec![],
         }));
@@ -564,6 +804,245 @@ mod tests {
         assert_eq!(got.rationale, "local");
     }
     #[test]
+    fn config_key_specs_parse_from_a_spec_file_and_are_looked_up() {
+        // The G6 lane's spec kind rides the SAME SpecFile the signed cache
+        // carries. `config_keys` is serde-defaulted so every existing cache
+        // (which lacks the section) still parses — the envelope schema does
+        // not change.
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "scopes": [],
+            "config_keys": [
+                {"format": "github-actions", "key": "job.timeout-minutes",
+                 "expect": {"kind": "present"},
+                 "confidence": 0.9, "control": "RC-013",
+                 "rationale": "a job without an explicit timeout runs 6h"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).unwrap();
+        let spec = cache
+            .config_key("github-actions", "job.timeout-minutes")
+            .expect("the config-key spec is retrievable by (format, key)");
+        assert_eq!(spec.control, "RC-013");
+        assert!(matches!(spec.expect, ConfigExpect::Present));
+        assert!(cache
+            .config_key("github-actions", "job.concurrency")
+            .is_none());
+        // Counted in len() so the scan's "specs N" line reflects the lane.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn spec_file_without_config_keys_section_still_parses() {
+        // Backward compatibility: the shipped 2026 caches have no config_keys.
+        let cache = SpecCache::load(r#"{"apis": [], "configs": [], "scopes": []}"#).unwrap();
+        assert!(cache
+            .config_key("github-actions", "job.timeout-minutes")
+            .is_none());
+    }
+
+    #[test]
+    fn config_key_merge_prefers_higher_confidence() {
+        let mk = |confidence: f64, rationale: &str| SpecFile {
+            config_keys: vec![ConfigKeySpec {
+                format: "github-actions".into(),
+                key: "job.timeout-minutes".into(),
+                expect: ConfigExpect::Present,
+                confidence,
+                rationale: rationale.into(),
+                control: String::new(),
+                severity: String::new(),
+                fix: String::new(),
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, "base"));
+        base.merge(SpecCache::from_file(mk(0.95, "better")));
+        assert_eq!(
+            base.config_key("github-actions", "job.timeout-minutes")
+                .unwrap()
+                .rationale,
+            "better"
+        );
+        base.merge(SpecCache::from_file(mk(0.5, "worse")));
+        assert_eq!(
+            base.config_key("github-actions", "job.timeout-minutes")
+                .unwrap()
+                .rationale,
+            "better",
+            "a lower-confidence spec never displaces a higher one"
+        );
+    }
+
+    #[test]
+    fn spec_applicability_defaults_to_classic_call_sites_only() {
+        // G3 (po-av01j.4): every existing spec was authored against G1 client
+        // call sites. An undeclared site_kinds list must therefore keep the
+        // spec scoped to classic sites — silently re-applying a call-site spec
+        // to a background-job registration would multiply an unreviewed
+        // judgment across a surface it never covered.
+        let s = api(Blocking::Yes, 0.9);
+        assert!(s.applies_to(""), "default specs govern classic call sites");
+        assert!(
+            !s.applies_to("background_job"),
+            "a spec that never declared job-altitude applicability must not decide job sites"
+        );
+    }
+
+    #[test]
+    fn emission_specs_merge_on_identity_preferring_confidence() {
+        let e = |conf: f64, rationale: &str| EmissionSpec {
+            type_name: "log/slog.Logger".into(),
+            category: "log".into(),
+            control: "RC-061".into(),
+            role: "satisfies".into(),
+            confidence: conf,
+            rationale: rationale.into(),
+        };
+        let mut base = SpecCache::from_file(SpecFile {
+            apis: vec![],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![e(0.7, "base")],
+        });
+        base.merge(SpecCache::from_file(SpecFile {
+            apis: vec![],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![
+                e(0.9, "better"),
+                EmissionSpec {
+                    type_name: "except_handler".into(),
+                    category: "error_capture".into(),
+                    control: "RC-027".into(),
+                    role: "violates".into(),
+                    confidence: 0.9,
+                    rationale: "new".into(),
+                },
+            ],
+        }));
+        let specs = base.emission_specs();
+        assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
+        let slog = specs
+            .iter()
+            .find(|s| s.type_name == "log/slog.Logger")
+            .unwrap();
+        assert_eq!(slog.rationale, "better", "higher confidence wins");
+    }
+
+    #[test]
+    fn emission_specs_load_from_the_spec_file() {
+        // G4 (po-av01j.5): the spec file gains an additive `emissions` list.
+        // Old caches (no field) load with an empty list; a cache carrying
+        // entries exposes them through the accessor and counts them in len().
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "emissions": [
+                {"type": "log/slog.Logger", "category": "log", "control": "RC-027",
+                 "role": "satisfies", "confidence": 0.9, "rationale": "structured log emission"},
+                {"type": "except_handler", "category": "error_capture", "control": "RC-027",
+                 "role": "violates", "confidence": 0.9,
+                 "rationale": "an error path with no emission swallows the failure"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).expect("emissions must parse");
+        assert_eq!(cache.len(), 2, "emission specs count toward the cache size");
+        let specs = cache.emission_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].type_name, "log/slog.Logger");
+        assert_eq!(specs[0].role, "satisfies");
+        assert_eq!(specs[1].role, "violates");
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(
+            empty.emission_specs().is_empty(),
+            "a pre-G4 cache has no emission specs"
+        );
+    }
+
+    #[test]
+    fn config_expect_serde_round_trips_every_variant() {
+        // The expect grammar is the factory's authoring contract; a variant
+        // that cannot round-trip would corrupt the signed cache silently.
+        let variants = vec![
+            ConfigExpect::Present,
+            ConfigExpect::Equals {
+                value: "false".into(),
+            },
+            ConfigExpect::OneOf {
+                values: vec!["a".into(), "b".into()],
+            },
+            ConfigExpect::Pattern {
+                name: "sha40".into(),
+            },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: ConfigExpect = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back, "{json}");
+        }
+    }
+
+    #[test]
+    fn declared_site_kinds_scope_the_spec_exactly() {
+        let mut job_only = api(Blocking::Yes, 0.9);
+        job_only.site_kinds = vec!["background_job".into()];
+        assert!(job_only.applies_to("background_job"));
+        assert!(
+            !job_only.applies_to(""),
+            "a job-altitude spec must not leak onto classic call sites"
+        );
+
+        // Both altitudes, declared explicitly: "" is the classic call site.
+        let mut both = api(Blocking::Yes, 0.9);
+        both.site_kinds = vec![String::new(), "background_job".into()];
+        assert!(both.applies_to("") && both.applies_to("background_job"));
+        assert!(
+            !both.applies_to("server_entry"),
+            "undeclared kinds stay out"
+        );
+    }
+
+    #[test]
+    fn server_specs_ride_the_spec_file_and_low_confidence_ones_are_ignored() {
+        // G2 (po-av01j.3): the controls that ride the server-entry lane
+        // (RC-020 health checks, RC-069 rate limiting, RC-018 degraded
+        // response) are spec-driven like everything else. A spec below the
+        // confidence floor decides nothing — spec error is multiplied.
+        let text = r#"{
+            "apis": [], "configs": [],
+            "server": [
+                {"control":"RC-020","kind":"health_path",
+                 "patterns":["/healthz","/health"],
+                 "confidence":0.9,"rationale":"seed"},
+                {"control":"RC-069","kind":"rate_limit_middleware",
+                 "patterns":["ratelimit"],
+                 "confidence":0.3,"rationale":"too shaky to apply"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).unwrap();
+        let usable: Vec<_> = cache.server_specs().collect();
+        assert_eq!(usable.len(), 1, "the 0.3-confidence spec must be ignored");
+        assert_eq!(usable[0].control, "RC-020");
+        assert_eq!(usable[0].kind, SERVER_KIND_HEALTH_PATH);
+        assert_eq!(usable[0].patterns, vec!["/healthz", "/health"]);
+    }
+
+    #[test]
+    fn a_spec_file_without_a_server_section_still_loads() {
+        // Every production cache today predates the section; it must default.
+        let cache = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert_eq!(cache.server_specs().count(), 0);
+    }
+
+    #[test]
+
     fn client_family_classifies_the_real_corpus_types() {
         use super::{client_family, Family};
         // DB configs + calls (twenty/immich): must classify Database.

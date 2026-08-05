@@ -252,6 +252,210 @@ fn scan_without_retrieved_on_empty_dir_fails_with_guidance() {
     );
 }
 
+// --- G5 content lane: secrets, RC-043 (po-av01j.6) ---
+
+/// End-to-end: a repo with NO Go/Py/TS source but a planted (fake) token gets
+/// a content-lane scan: the ladder names the `secret.<rule>` class, maps it to
+/// RC-043, never prints the raw token, and blocks. A `.revelara.yaml` waiver
+/// with the class matcher (the po-3t3oj.27 engine, unchanged) suppresses it.
+#[test]
+fn scan_detects_planted_secret_and_waiver_suppresses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "content-only scan must succeed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "ladder must name the secret class: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-043"),
+        "finding must be born control-mapped: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&token),
+        "the raw secret must never render: {stdout}"
+    );
+    assert!(
+        stdout.contains("BLOCKING"),
+        "a live token in runtime scope must block: {stdout}"
+    );
+
+    // Waive the class and re-scan: suppressed, not blocking.
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n",
+    )
+    .unwrap();
+    let out2 = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout2 = String::from_utf8(out2.stdout).unwrap();
+    assert!(out2.status.success(), "waived scan must succeed: {stdout2}");
+    assert!(
+        !stdout2.contains("BLOCKING"),
+        "a waived finding must not block: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("suppressed"),
+        "footer must report the suppression: {stdout2}"
+    );
+}
+
+// --- G2 server-entry lane (po-av01j.3) ---
+
+/// The hand-authored SEED server-spec corpus (RC-020/RC-069/RC-018); the
+/// production corpus rides the LLM factory.
+const SERVER_SPECS_SEED: &str = include_str!("testdata/server_specs_seed.json");
+
+/// One JSONL server-entry registration record for a fixture stream.
+fn server_entry_line(file: &str, line: u32, method: &str, snippet: &str) -> String {
+    serde_json::json!({
+        "snapshot_id": "fixture",
+        "file_path": file,
+        "line_number": line,
+        "func": method,
+        "client_type": "net/http.ServeMux",
+        "snippet": snippet,
+        "lang": "go",
+        "site_kind": "server_entry",
+    })
+    .to_string()
+}
+
+/// End-to-end: a `--retrieved` stream carrying server-entry registrations is
+/// judged by the G2 lane against the seed specs. A route surface with no
+/// health endpoint and no rate limiter surfaces RC-020 and RC-069 as ADVISORY
+/// findings; the server-entry records stay out of the G1 site count and out
+/// of the `--out` eval rows.
+#[test]
+fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        "HandleFunc",
+        r#"mux.HandleFunc("/users", usersHandler)"#,
+    ));
+    stream.push('\n');
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        11,
+        "HandleFunc",
+        r#"mux.HandleFunc("/orders", ordersHandler)"#,
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("RC-020"),
+        "missing health-endpoint violation must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-069"),
+        "missing rate-limiter violation must surface: {stdout}"
+    );
+    assert!(
+        !stdout.contains("RC-018"),
+        "RC-018 is a judgement control; absence must abstain, never surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("ADVISORY") && !stdout.contains("BLOCKING"),
+        "server-entry findings are advisory, never blocking: {stdout}"
+    );
+    // The G1 site count excludes server-entry records (2 fixture G1 sites),
+    // and the verbose line reports the server-entry inventory separately.
+    assert!(
+        stdout.contains("sites 2") && stdout.contains("server-entry 2"),
+        "server-entry records must not inflate the G1 site count: {stdout}"
+    );
+    // The --out eval rows are the G1 lane only.
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        2,
+        "server-entry records must not become eval rows: {rows}"
+    );
+}
+
+/// The healthy shape: a health route plus rate-limiting middleware satisfies
+/// RC-020/RC-069 and nothing from the server lane surfaces in the ladder.
+#[test]
+fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        "HandleFunc",
+        r#"mux.HandleFunc("/healthz", healthHandler)"#,
+    ));
+    stream.push('\n');
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        12,
+        "Use",
+        "r.Use(middleware.Throttle(100))",
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}");
+    assert!(
+        !stdout.contains("RC-020") && !stdout.contains("RC-069"),
+        "a satisfied server-entry control must not surface: {stdout}"
+    );
+}
+
 // --- incremental index surface (po-3t3oj.14) ---
 
 #[test]
@@ -575,6 +779,359 @@ fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
     );
 }
 
+// --- G6 config lane (po-av01j.2) ---
+
+/// A repo with one Go call site, one GitHub Actions workflow, and one
+/// unsupported-format config file; specs cover the call AND two config keys.
+fn write_config_lane_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(
+        dir.join(".github/workflows/ci.yml"),
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join(".circleci")).unwrap();
+    std::fs::write(dir.join(".circleci/config.yml"), "version: 2\n").unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"github-actions","key":"job.timeout-minutes","expect":{"kind":"present"},"confidence":0.9,"control":"RC-013","severity":"medium","fix":"set jobs.<id>.timeout-minutes","rationale":"6h default"},
+            {"format":"github-actions","key":"step.uses.ref","expect":{"kind":"pattern","name":"sha40"},"confidence":0.9,"control":"RC-045","rationale":"pin actions to full SHAs"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_config_lane_and_reports_config_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_config_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // Two config findings surface: the missing job timeout (explicit-Present
+    // spec vs the 360-minute platform default) and the tag-pinned action
+    // (sha40 pattern vs "v4").
+    assert!(
+        stdout.contains("github-actions job.timeout-minutes"),
+        "missing timeout must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("github-actions step.uses.ref"),
+        "unpinned action must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-013"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // Coverage: the lane reports its own resolution line and the
+    // identity-only sighting of the unsupported CircleCI config.
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsupported config formats sighted: circleci (1)"),
+        "sightings line: {stdout}"
+    );
+}
+
+#[test]
+fn config_findings_are_waivable_by_format_key_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_config_lane_fixtures(dir.path());
+    // Waive both config classes via .revelara.yaml, the same mechanism code
+    // classes use; the rule is `<format>.<key>`.
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "scanner:\n  waivers:\n    - matcher: github-actions.job.timeout-minutes\n      reason: accepted for now\n    - matcher: github-actions.step.uses.ref\n      reason: dependabot keeps refs fresh\n",
+    )
+    .unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}");
+    assert!(
+        !stdout.contains("github-actions job.timeout-minutes"),
+        "waived config class must not render: {stdout}"
+    );
+    assert!(
+        stdout.contains("suppressed"),
+        "waived config classes are counted in the footer: {stdout}"
+    );
+}
+
+// --- G6 dep-manifests family (po-av01j.22) ---
+
+/// A repo with a floating base image and a toolchain-less go.mod; SEED
+/// test-grade ConfigKeySpecs judge both (the production corpus is a factory
+/// follow-up). The G7 structure lane covers lockfile PRESENCE separately;
+/// these specs judge per-KEY resolved values, the config-spec altitude.
+#[test]
+fn scan_runs_the_dep_manifests_family_with_seed_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src = root.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = root.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::write(root.join("Dockerfile"), "FROM alpine:latest\nRUN true\n").unwrap();
+    std::fs::write(root.join("go.mod"), "module example.com/svc\n\ngo 1.22\n").unwrap();
+    let specs = root.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"dep-manifests","key":"dockerfile.base_image_pin","expect":{"kind":"one_of","values":["digest","tag"]},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin the base image to an immutable tag or digest","rationale":"a floating base image changes under you"},
+            {"format":"dep-manifests","key":"go_mod.toolchain","expect":{"kind":"present"},"confidence":0.9,"control":"RC-070","severity":"low","fix":"pin a toolchain directive in go.mod","rationale":"unpinned toolchain floats with the host"}
+        ]
+    }"#).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The floating base image violates the pin-shape spec (the seed-spec
+    // acceptance case) and the spec's control rides the ladder.
+    assert!(
+        stdout.contains("dep-manifests dockerfile.base_image_pin"),
+        "floating base image must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-045"),
+        "the pinning spec's control rides into the ladder: {stdout}"
+    );
+    // The absent toolchain resolves through the documented `local` default,
+    // which an explicit-Present spec judges as a violation.
+    assert!(
+        stdout.contains("dep-manifests go_mod.toolchain"),
+        "toolchain-less go.mod must surface: {stdout}"
+    );
+}
+
+// --- G6 Prometheus/sloth family (po-av01j.21) ---
+
+/// A repo with a literal Prometheus rules file (one alert missing `for:` and
+/// severity, one carrying both), a sloth SLO file, and an alertmanager
+/// config. Seed TEST-GRADE ConfigKeySpecs cover the family's two example
+/// controls: for-duration presence and severity-label presence (the
+/// production corpus is a follow-up factory bead).
+fn write_prometheus_family_fixtures(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    std::fs::create_dir_all(dir.join("deploy/alerts")).unwrap();
+    std::fs::write(
+        dir.join("deploy/alerts/api.yml"),
+        "groups:\n- name: api\n  rules:\n  - alert: HighErrorRate\n    expr: rate(errors[5m]) > 0.1\n  - alert: SlowRequests\n    expr: latency > 1\n    for: 5m\n    labels:\n      severity: page\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/alerts/slo.yml"),
+        "version: prometheus/v1\nservice: api\nslos:\n- name: availability\n  objective: 99.9\n  alerting:\n    page_alert:\n      labels:\n        severity: page\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("alertmanager.yml"),
+        "route:\n  receiver: default\nreceivers:\n- name: default\n",
+    )
+    .unwrap();
+    // One minimal code packet: a scan refuses an empty retrieved stream.
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":3,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"prometheus-rules","key":"rule.for","expect":{"kind":"present"},"confidence":0.9,"control":"RC-001","severity":"medium","fix":"set a for: duration so the alert requires a sustained breach","rationale":"test-grade seed: an absent for fires on first evaluation (0s default)"},
+            {"format":"prometheus-rules","key":"rule.labels.severity","expect":{"kind":"pattern","name":"nonempty"},"confidence":0.9,"control":"RC-001","severity":"medium","fix":"label the alert with a routing severity","rationale":"test-grade seed: unlabeled alerts cannot route"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_prometheus_family_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // HighErrorRate violates both seed specs (no for:, no severity); the
+    // SlowRequests alert satisfies both, so each class has one site.
+    assert!(
+        stdout.contains("prometheus-rules rule.for"),
+        "missing for: must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("prometheus-rules rule.labels.severity"),
+        "missing severity label must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-001"),
+        "the seed spec's control rides into the ladder: {stdout}"
+    );
+    // The sloth file contributes packets (unspecced: abstentions), and the
+    // alertmanager config is identified without being inventoried.
+    assert!(
+        stdout.contains("unsupported config formats sighted: alertmanager (1)"),
+        "alertmanager identity sighting: {stdout}"
+    );
+}
+
+// --- G6 Terraform family (po-av01j.23) ---
+
+/// A repo whose Terraform has one violation of each seed spec (an unpinned
+/// provider, no state backend) and one satisfied key (an exactly-pinned
+/// registry module), plus a Go call site so the scan mirrors the GHA fixture.
+fn write_terraform_lane_fixtures(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::write(
+        dir.join("main.tf"),
+        r#"terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws" }
+  }
+}
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.1.0"
+}
+"#,
+    )
+    .unwrap();
+    // SEED, test-grade config specs (the production corpus is a follow-up
+    // factory run): unpinned provider violates, missing remote state
+    // violates, an exact or ref pin satisfies.
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"terraform","key":"provider.version-constraint","expect":{"kind":"present"},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin provider versions in required_providers","rationale":"an unconstrained provider floats to the newest release"},
+            {"format":"terraform","key":"terraform.backend","expect":{"kind":"present"},"confidence":0.9,"control":"RC-030","severity":"medium","fix":"configure a remote state backend in the terraform block","rationale":"local state cannot be shared, locked, or recovered"},
+            {"format":"terraform","key":"module.pin-class","expect":{"kind":"one_of","values":["exact","ref-pinned"]},"confidence":0.9,"control":"RC-045","rationale":"registry/git modules pin to an exact version or ref"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_terraform_family_with_seed_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_terraform_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The two seeded violations surface as config classes...
+    assert!(
+        stdout.contains("terraform provider.version-constraint"),
+        "unpinned provider must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("terraform terraform.backend"),
+        "missing remote state must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-030"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // ...and the exactly-pinned registry module satisfies its spec, so
+    // pin-class never renders as a finding.
+    assert!(
+        !stdout.contains("terraform module.pin-class"),
+        "a satisfied config key is not a finding: {stdout}"
+    );
+    // Terraform is a supported format now: never sighted as unsupported.
+    assert!(
+        !stdout.contains("unsupported config formats sighted: terraform"),
+        "supported formats must not be sighted: {stdout}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
@@ -701,5 +1258,1342 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
         v[0]["verdict"].as_str().unwrap_or_default(),
         "violates",
         "an expired declaration and another type's declaration must both be inert: {v}"
+    );
+}
+
+// --- G3 background-job lane (po-av01j.4) ---
+
+/// The SEED spec fixture for the background-job lane (RC-060 + job-altitude
+/// timeout re-application). Production specs ride the LLM factory; this file
+/// exists so the e2e tests exercise real verdicts.
+fn background_jobs_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("background_jobs_specs.json")
+}
+
+fn helper_fixture(helper: &str) -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    workspace
+        .join("helpers")
+        .join(helper)
+        .join("testdata")
+        .join("fixture")
+}
+
+/// Run `rvlscan scan <fixture>` with the seed background-job specs and return
+/// the findings rows from `--out`. `envs` carries the helper override.
+fn scan_fixture_findings(
+    dir: &std::path::Path,
+    fixture: &std::path::Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Vec<serde_json::Value> {
+    let out_path = dir.join("findings.json");
+    let mut cmd = bin();
+    cmd.arg("scan")
+        .arg(fixture)
+        .arg("--specs-file")
+        .arg(background_jobs_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.join("cache"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    rows.as_array().expect("findings must be an array").clone()
+}
+
+/// (verdict, reason) of every finding whose site_id contains `path_frag`.
+fn verdicts_for(rows: &[serde_json::Value], path_frag: &str) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|r| r["site_id"].as_str().is_some_and(|s| s.contains(path_frag)))
+        .map(|r| {
+            (
+                r["verdict"].as_str().unwrap_or_default().to_string(),
+                r["reason"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Go e2e: goindex retrieves the cron/ticker fixture, and the job-altitude
+/// timeout judgment (existing machinery, new sites) tells the bare cron
+/// registration from the one whose closure derives a deadline.
+#[test]
+fn scan_decides_go_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("goindex"),
+        &[("RVLSCAN_GOINDEX", goindex_bin.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.go");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare cron registration must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("deadline derived in scope")),
+        "the deadline-deriving registration must satisfy: {jobs:?}"
+    );
+    // The ticker loop's seed spec is `depends`: routed to per-site judgment.
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the ticker worker loop must abstain on the depends spec: {jobs:?}"
+    );
+}
+
+// --- G4 emission lane (po-av01j.5) ---
+
+/// A `--retrieved` stream carrying emission-point aggregates surfaces the
+/// emission-lane findings (RC-027 swallow gap, RC-046 tracing gap) as
+/// ADVISORY ladder items, while the aggregates themselves stay OUT of the G1
+/// pipeline: coverage counts only the real call site, and `--out` rows carry
+/// only G1 verdicts.
+#[test]
+fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let packets = dir.path().join("retrieved.jsonl");
+    let cat = |c: &str, n: u32| {
+        format!(
+            r#"[{{"index":0,"name":"emission_category","value":"{c}","how":"aggregate"}},{{"index":0,"name":"emission_count","value":"{n}","how":"aggregate"}}]"#
+        )
+    };
+    std::fs::write(
+        &packets,
+        format!(
+            "{}\n{}\n{}\n",
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":"recover","client_type":"recover_block","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
+                cat("error_capture", 2)
+            ),
+            format_args!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
+                cat("log", 7)
+            ),
+        ),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""emissions":["#,
+        r#"{"type":"recover_block","category":"error_capture","control":"RC-027","role":"violates","confidence":0.9,"rationale":"a recover with no emission swallows the panic"},"#,
+        r#"{"type":"log/slog.Logger","category":"log","control":"RC-061","role":"satisfies","confidence":0.9,"rationale":"structured log emission"},"#,
+        r#"{"type":"go.opentelemetry.io/otel/trace.Tracer","category":"trace","control":"RC-046","role":"satisfies","confidence":0.9,"rationale":"otel span"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The emission lane surfaces both gaps, control-mapped and advisory.
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "RC-027 swallow gap missing from the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-046"),
+        "RC-046 tracing gap missing from the ladder: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+    // The aggregates stay out of the G1 surface count (1 call site, not 3).
+    assert!(
+        stdout.contains("sites 1 "),
+        "emission aggregates leaked into the G1 site list: {stdout}"
+    );
+    // --out rows are the G1 eval contract: one row, the call site.
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED emission-spec corpus (test-grade; the production
+/// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
+fn g4_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("g4_seed_specs.json")
+}
+
+fn helpers_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .join("helpers")
+}
+
+/// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
+/// time_limit satisfies, the bare @app.task violates, and a classic-call-site
+/// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
+/// site (the applicability guard, end to end).
+#[test]
+fn scan_decides_python_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
+        return;
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("pyindex"),
+        &[("RVLSCAN_PYINDEX", pyindex.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.py");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("bounding decorator")),
+        "@shared_task(time_limit=120) must satisfy via the decorator bound: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare @app.task must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("site kind")),
+        "the classic rq.Queue.enqueue spec must not decide the background_job dispatch: {jobs:?}"
+    );
+}
+
+/// TypeScript e2e: the bullmq dispatch with a per-job timeout option
+/// satisfies via the call-arg mechanism; the bare dispatch violates.
+#[test]
+fn scan_decides_typescript_background_job_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
+        return;
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let tsindex_dir = workspace.join("helpers").join("tsindex");
+    if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
+        eprintln!(
+            "SKIP scan_decides_typescript_background_job_sites_end_to_end: run `npm install` in helpers/tsindex first"
+        );
+        return;
+    }
+    let tsindex_js = tsindex_dir.join("tsindex.js");
+    let rows = scan_fixture_findings(
+        dir.path(),
+        &helper_fixture("tsindex"),
+        &[("RVLSCAN_TSINDEX", tsindex_js.as_os_str())],
+    );
+    let jobs = verdicts_for(&rows, "jobs.ts");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("timeout argument at the call")),
+        "the timeout-carrying dispatch must satisfy: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare dispatch must violate: {jobs:?}"
+    );
+}
+
+// --- C/C++ G1 lane (po-av01j.12) ---
+
+/// Locate the cindex helper (a workspace bin built alongside rvlscan) and
+/// verify its libclang engine loads. None (with a SKIP log line) when the
+/// binary is missing or no libclang is installed — the e2e is exercised
+/// wherever the engine exists, and the environment gap is loud, not silent.
+fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+        .parent()
+        .unwrap()
+        .join("cindex");
+    if !bin.is_file() {
+        eprintln!("SKIP {test}: cindex not built (run `cargo build -p cindex`)");
+        return None;
+    }
+    match std::process::Command::new(&bin)
+        .arg("--engine-check")
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(bin),
+        Ok(out) => {
+            eprintln!(
+                "SKIP {test}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP {test}: cannot run cindex: {e}");
+            None
+        }
+    }
+}
+
+/// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
+/// compile_commands.json, helper via RVLSCAN_CINDEX), the seed specs judge
+/// the C identities, and the judgments map the surfaced classes to RC-019 /
+/// RC-022 on the ladder. The macro-wrapped perform site flows through the
+/// pipeline like any other — the v2 macro flag is packet evidence, never a
+/// verdict gate.
+#[test]
+fn scan_decides_c_sites_end_to_end_with_seed_specs() {
+    let Some(cindex) = cindex_helper("scan_decides_c_sites_end_to_end_with_seed_specs") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-c");
+    let fixtures = manifest.join("tests").join("fixtures");
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(fixtures.join("c_seed_specs.json"))
+        .arg("--judgments")
+        .arg(fixtures.join("c_seed_judgments.json"))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CINDEX", &cindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().expect("findings must be an array").clone();
+    let main_c = verdicts_for(&rows, "src/main.c");
+
+    // Every planted blocking identity with no visible bound violates: two
+    // curl_easy_perform sites (the macro-wrapped one included), PQexec,
+    // PQconnectdb, redisCommand, redisConnect, connect, recv.
+    let violates = main_c
+        .iter()
+        .filter(|(v, r)| v == "violates" && r.contains("no bound anywhere"))
+        .count();
+    assert_eq!(
+        violates, 8,
+        "planted blocking sites must violate: {main_c:?}"
+    );
+    // The non-blocking setopt sites resolve as not_applicable, never noise.
+    let not_applicable = main_c
+        .iter()
+        .filter(|(v, r)| v == "not_applicable" && r.contains("does not block"))
+        .count();
+    assert_eq!(
+        not_applicable, 2,
+        "both setopt sites are non-blocking: {main_c:?}"
+    );
+
+    // The judgments map the surfaced classes to their controls on the ladder.
+    assert!(
+        stdout.contains("RC-019"),
+        "the curl/libpq timeout class must surface control-mapped: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-022"),
+        "the hiredis retry class must surface control-mapped: {stdout}"
+    );
+}
+
+/// Go, live end to end: goindex inventories the fixture's emissions (slog
+/// aggregates, the recover_block swallow), the seed specs judge them, and the
+/// ladder surfaces RC-027 (swallow) and RC-046 (no spans at I/O boundaries)
+/// as advisory emission findings.
+#[test]
+fn live_go_scan_surfaces_g4_emission_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture())
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the recover_block swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-046"),
+        "untraced I/O boundaries must surface under RC-046: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories except-blocks that swallow
+/// vs log, and the seed specs surface the RC-027 gap.
+#[test]
+fn live_py_scan_surfaces_g4_emission_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let pyindex = helpers_dir().join("pyindex").join("pyindex.py");
+    let fixture = helpers_dir()
+        .join("pyindex")
+        .join("testdata")
+        .join("fixture");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_PYINDEX", &pyindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the except_handler swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+}
+
+/// TypeScript, live end to end: the fixture's openai call has no surrounding
+/// emission, so the seed specs surface the RC-061 emission-half gap (the LLM
+/// call-site half rides G1). Skipped when node or the tsindex `typescript`
+/// dependency is unavailable, matching the goindex skip convention.
+#[test]
+fn live_ts_scan_surfaces_llm_observability_gap() {
+    let tsdir = helpers_dir().join("tsindex");
+    let ready = Command::new("node")
+        .args(["-e", "require('typescript')"])
+        .current_dir(&tsdir)
+        .output();
+    match ready {
+        Ok(out) if out.status.success() => {}
+        Ok(_) => {
+            eprintln!("SKIP live_ts_scan: tsindex needs `npm install` (typescript missing)");
+            return;
+        }
+        Err(e) => {
+            eprintln!("SKIP live_ts_scan: node not available: {e}");
+            return;
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(tsdir.join("testdata").join("fixture"))
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVLSCAN_TSINDEX", tsdir.join("tsindex.js"))
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("emission.RC-061"),
+        "the uninstrumented LLM call must surface under RC-061: {stdout}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027"),
+        "the catch_clause swallow must surface under RC-027: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "emission findings are advisory, never blocking: {stdout}"
+    );
+}
+
+// --- Java lane (po-av01j.9) ---
+
+/// The hand-authored SEED Java spec corpus (test-grade; RC-019 timeouts,
+/// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
+/// emission section). The production corpus rides the LLM factory, HITL.
+fn java_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("java_seed_specs.json")
+}
+
+/// The javaindex helper source, iff a JDK is available (the helper runs in
+/// JEP 330 source-file mode and needs javac). Skip-if-no-jdk, matching the
+/// goindex/node skip convention.
+fn javaindex_ready() -> Option<std::path::PathBuf> {
+    match std::process::Command::new("javac").arg("-version").output() {
+        Ok(out) if out.status.success() => {}
+        _ => {
+            eprintln!("SKIP java scan: no JDK (javac not available)");
+            return None;
+        }
+    }
+    Some(helpers_dir().join("javaindex").join("javaindex.java"))
+}
+
+/// Java e2e: javaindex retrieves the fixture, and the seed specs decide all
+/// three ways. The bare @Scheduled registration violates (job altitude, no
+/// bound), the @Scheduled next to @Transactional(timeout = 30) satisfies via
+/// the bounding-decorator mechanism, the classic-only java.util.Timer spec
+/// abstains on a background_job site (applicability control), and the JDBC
+/// executeQuery with no bound anywhere violates on the G1 lane.
+#[test]
+fn scan_decides_java_sites_end_to_end() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("javaindex"))
+        .arg("--specs-file")
+        .arg(java_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_JAVAINDEX", &javaindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().expect("findings must be an array").clone();
+
+    let jobs = verdicts_for(&rows, "Jobs.java");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare @Scheduled registration must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("bounding decorator")),
+        "@Scheduled beside @Transactional(timeout = 30) must satisfy via the decorator bound: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("site kind")),
+        "the classic java.util.Timer spec must not decide the background_job site: {jobs:?}"
+    );
+
+    let svc = verdicts_for(&rows, "Service.java");
+    assert!(
+        svc.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the unbounded JDBC executeQuery must violate: {svc:?}"
+    );
+}
+
+/// Java, live end to end: javaindex inventories the fixture's emissions (the
+/// slf4j aggregates, the swallowing catch), and the seed specs surface the
+/// RC-027 swallow gap in the ladder.
+#[test]
+fn live_java_scan_surfaces_g4_emission_findings() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("javaindex"))
+        .arg("--specs-file")
+        .arg(java_seed_specs())
+        .env("RVLSCAN_JAVAINDEX", &javaindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the swallowing catch must surface under RC-027: {stdout}"
+    );
+}
+
+// --- Rust G1 lane (po-av01j.11) ---
+
+/// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
+/// sqlx identities — the production corpus rides the LLM factory, HITL).
+fn rust_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("testdata")
+        .join("rust_seed_specs.json")
+}
+
+/// Rust, live end to end: `rvlscan scan <fixture>` must detect Rust, run the
+/// rustindex helper (a workspace binary — built by cargo next to rvlscan, the
+/// same adjacency a release ships), and feed its packets through the pipeline
+/// with the seed specs. Skipped when rust-analyzer is unavailable, matching
+/// the goindex skip convention.
+#[test]
+fn live_rust_scan_runs_the_rustindex_helper() {
+    match Command::new("rust-analyzer").arg("--version").output() {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!("SKIP live_rust_scan: rust-analyzer not available (rustup component)");
+            return;
+        }
+    }
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
+    // The helper is a workspace bin: usually already built next to rvlscan.
+    let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+        .parent()
+        .unwrap()
+        .join("rustindex");
+    if !rustindex.is_file() {
+        let build = Command::new("cargo")
+            .args(["build", "-p", "rustindex"])
+            .current_dir(&workspace)
+            .output();
+        match build {
+            Ok(o) if o.status.success() && rustindex.is_file() => {}
+            Ok(o) => {
+                eprintln!(
+                    "SKIP live_rust_scan: cargo build -p rustindex failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP live_rust_scan: cargo not available: {e}");
+                return;
+            }
+        }
+    }
+    let fixture = workspace
+        .join("crates")
+        .join("rustindex")
+        .join("testdata")
+        .join("fixture");
+    assert!(fixture.join("Cargo.toml").is_file(), "fixture missing");
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(rust_seed_specs())
+        .env("RVLSCAN_RUSTINDEX", &rustindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("sites ") && !stdout.contains("sites 0 "),
+        "the fixture must yield parsed G1 sites: {stdout}"
+    );
+    assert!(
+        stdout.contains("server-entry 2"),
+        "both .route() registrations must ride the G2 partition: {stdout}"
+    );
+    assert!(
+        stdout.contains("COVERAGE"),
+        "ladder must render a coverage section: {stdout}"
+    );
+}
+
+// --- G7 repo-structure lane (po-av01j.7) ---
+
+/// A `--retrieved` stream carrying a `repo_structure` record surfaces its
+/// violations in the ladder as ADVISORY findings with the control code, and
+/// the record itself never pollutes the site list.
+#[test]
+fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, specs) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(concat!(
+        r#"{"kind":"repo_structure","snapshot_id":"fixture","walk_complete":true,"#,
+        r#""ecosystems":[{"name":"go","source_files":40,"test_files":0,"integration_markers":[]}],"#,
+        r#""coverage_configs":[],"contract_frameworks":[],"manifests":[],"runbook_dirs":[]}"#,
+        "\n"
+    ));
+    std::fs::write(&packets_path, stream).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("RC-033"),
+        "untested-repo violation missing from the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("ADVISORY") && !stdout.contains("BLOCKING"),
+        "structure findings are advisory, never blocking: {stdout}"
+    );
+    // The sites|specs line counts only real sites: the structure record must
+    // not have been misparsed into a junk site (2 fixture sites, not 3).
+    assert!(
+        stdout.contains("sites 2"),
+        "repo_structure record leaked into the site list: {stdout}"
+    );
+}
+
+// --- hook-mode agent adjudication (po-av01j.15) ---
+
+/// Copy the goindex fixture into a writable temp repo so the test can commit
+/// consent into `.revelara.yaml` without touching the shared fixture tree.
+fn copy_fixture_to(dst: &std::path::Path) {
+    fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+    copy_dir(&goindex_fixture(), dst);
+}
+
+/// End-to-end hook lane: with EVERY consent layer on and a stub agent
+/// (RVLSCAN_AGENT_CMD), an incremental hook scan makes ONE batched invocation
+/// over the delta's undecided sites, renders the provenance-tagged AGENT
+/// block, and records identity-only telemetry locally. The stub replies `[]`
+/// (a valid, empty verdict set), so every site stays undecided and the
+/// deterministic result is visibly unchanged.
+#[cfg(unix)]
+#[test]
+fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let repo = dir.path().join("repo");
+    copy_fixture_to(&repo);
+    // Pre-warm the Go build/list cache: the first packages.Load on a cold CI
+    // runner can exceed the hook's 10s deterministic fail-open cap on its
+    // own, which would degrade this scan to zero sites and starve the agent
+    // lane the test exists to exercise.
+    let _ = std::process::Command::new(&goindex_bin)
+        .args(["--retrieve", "--root"])
+        .arg(&repo)
+        .args(["--name", "warm"])
+        .output();
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        "scanner:\n  use_agent: allow\n  agent_hooks:\n    pre_commit:\n      enabled: true\n      budget_seconds: 20\n",
+    )
+    .unwrap();
+
+    // The stub approved agent: proof of invocation + a valid empty verdict set.
+    let stub = dir.path().join("agent-stub.sh");
+    std::fs::write(&stub, "#!/bin/sh\necho '[]'\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Empty specs: every fixture site abstains (no spec), i.e. is undecided.
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let home = dir.path().join("home"); // isolates org policy + user config
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["scan", "--incremental", "--hook", "pre-commit"])
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVLSCAN_AGENT_CMD", &stub)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("AGENT"),
+        "consented hook run must render the agent block: {stdout}"
+    );
+    assert!(
+        stdout.contains("stay undecided"),
+        "an empty verdict set leaves the sites undecided: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "advisory mode must never produce blocking rows: {stdout}"
+    );
+
+    // Identity-only telemetry landed locally, next to last-scan.json.
+    let telemetry = dir.path().join("agent-telemetry.jsonl");
+    let text = std::fs::read_to_string(&telemetry).expect("telemetry file must exist");
+    let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(row["hook"], "pre-commit");
+    assert_eq!(row["agent"], "custom");
+    assert!(row["latency_ms"].is_u64());
+    assert_eq!(row["timed_out"], false);
+    assert!(
+        !text.contains("svc.go") && !text.contains(repo.to_str().unwrap()),
+        "telemetry must never carry file paths: {text}"
+    );
+}
+
+/// The consent default: the SAME hook invocation with no `.revelara.yaml`
+/// consent renders no agent block, invokes nothing, and records no telemetry.
+#[test]
+fn hook_scan_without_consent_stays_deterministic_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let repo = dir.path().join("repo");
+    copy_fixture_to(&repo);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args(["scan", "--incremental", "--hook", "pre-commit"])
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_GOINDEX", &goindex_bin)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("AGENT"),
+        "no consent must mean no agent block: {stdout}"
+    );
+    assert!(
+        !dir.path().join("agent-telemetry.jsonl").exists(),
+        "no consent must mean no telemetry"
+    );
+}
+
+// --- G6 Argo/Flux family (po-av01j.24) ---
+
+/// A repo with GitOps CRs only (no code lane): an Argo CD Application that
+/// auto-syncs a floating branch with no retry and no selfHeal, a Flux
+/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// parse. Seed config-key specs cover the pin-shape and remediation keys.
+fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // The config lane is the subject; the code lane gets one unspecced Go
+    // site so the packet stream is non-empty (the scan requires sites).
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":3,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+    std::fs::create_dir_all(dir.join("deploy")).unwrap();
+    std::fs::write(
+        dir.join("deploy/app.yaml"),
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  project: default\n  source:\n    repoURL: https://example.com/repo.git\n    path: k8s\n    targetRevision: main\n  syncPolicy:\n    automated: {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/gitrepo.yaml"),
+        "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: podinfo\nspec:\n  interval: 1m\n  ref:\n    branch: main\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/rollout.yaml"),
+        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+    )
+    .unwrap();
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "config_keys":[
+            {"format":"argo-cd","key":"application.targetRevision.shape","expect":{"kind":"equals","value":"pinned"},"confidence":0.9,"control":"RC-050","severity":"medium","fix":"pin targetRevision to a tag or commit SHA","rationale":"HEAD/branch refs float"},
+            {"format":"argo-cd","key":"application.syncPolicy.automated.selfHeal","expect":{"kind":"equals","value":"true"},"confidence":0.9,"control":"RC-036","severity":"medium","fix":"set syncPolicy.automated.selfHeal: true","rationale":"drift is not remediated by default"},
+            {"format":"argo-cd","key":"application.syncPolicy.retry","expect":{"kind":"pattern","name":"configured"},"confidence":0.9,"control":"RC-036","severity":"medium","fix":"set syncPolicy.retry (limit + backoff)","rationale":"an automated sync loop needs a bounded retry"},
+            {"format":"flux","key":"gitrepository.ref.shape","expect":{"kind":"one_of","values":["commit","semver","tag"]},"confidence":0.9,"control":"RC-050","severity":"medium","fix":"track a tag, semver range, or commit instead of a branch","rationale":"branch refs float"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_argo_flux_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The floating targetRevision violates the pin-shape spec.
+    assert!(
+        stdout.contains("argo-cd application.targetRevision.shape"),
+        "floating targetRevision must surface: {stdout}"
+    );
+    // Automated sync without selfHeal: the documented false default governs.
+    assert!(
+        stdout.contains("argo-cd application.syncPolicy.automated.selfHeal"),
+        "selfHeal-off must surface: {stdout}"
+    );
+    // The issue's canonical decidable absence: automated sync, no retry —
+    // an as-authored-absent packet judged by the `configured` pattern.
+    assert!(
+        stdout.contains("argo-cd application.syncPolicy.retry"),
+        "missing retry must surface: {stdout}"
+    );
+    // The Flux source tracks a branch: shape-only fact vs the pin spec.
+    assert!(
+        stdout.contains("flux gitrepository.ref.shape"),
+        "branch-tracking GitRepository must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-050"),
+        "the deciding spec's control rides into the ladder: {stdout}"
+    );
+    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // generic kubernetes one.
+    assert!(
+        stdout.contains("argo-rollouts (1)"),
+        "unrecognized argo kind must be sighted by product: {stdout}"
+    );
+    assert!(
+        !stdout.contains("kubernetes (1)"),
+        "argo/flux CRs must never sight as generic kubernetes: {stdout}"
+    );
+}
+
+// --- G6 config lane, Kubernetes family (po-av01j.20) ---
+
+/// A repo with a kustomize base+overlay pair and SEED (test-grade)
+/// Kubernetes config-key specs for three representative controls: probe
+/// presence (RC-020), resource-limit presence (RC-024), image pin shape
+/// (RC-045). The production spec corpus is factory-authored (HITL);
+/// these exist to prove the lane end to end.
+fn write_k8s_lane_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // A minimal code-lane fixture so the scan exercises both lanes at once.
+    let src = dir.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let packets = dir.join("retrieved.jsonl");
+    std::fs::write(&packets, format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{db:?},\"line_number\":10,\"func\":\"Query\",\"client_type\":\"github.com/jackc/pgx/v5.Tx\",\"snippet\":\"tx.Query(ctx, q)\",\"lang\":\"go\"}}\n",
+        db = db_go.to_str().unwrap(),
+    )).unwrap();
+
+    // Base: a deployment with limits but no probes, tag-pinned.
+    std::fs::create_dir_all(dir.join("k8s/base")).unwrap();
+    std::fs::write(
+        dir.join("k8s/base/deployment.yaml"),
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers:\n        - name: app\n          image: web:v1.2.3\n          resources:\n            limits:\n              cpu: 500m\n              memory: 256Mi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("k8s/base/kustomization.yaml"),
+        "resources:\n  - deployment.yaml\n",
+    )
+    .unwrap();
+    // Overlay: retags the image to latest — the violating pin shape must be
+    // the TRANSFORMED one, proving the overlay chain end to end.
+    std::fs::create_dir_all(dir.join("k8s/overlays/prod")).unwrap();
+    std::fs::write(
+        dir.join("k8s/overlays/prod/kustomization.yaml"),
+        "resources:\n  - ../../base\nimages:\n  - name: web\n    newTag: latest\n",
+    )
+    .unwrap();
+
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],
+        "configs":[],
+        "config_keys":[
+            {"format":"kubernetes","key":"container.liveness-probe","expect":{"kind":"present"},"confidence":0.9,"control":"RC-020","severity":"medium","fix":"add a livenessProbe to the container","rationale":"no probe means no restart on hang"},
+            {"format":"kubernetes","key":"container.resources.limits.cpu","expect":{"kind":"present"},"confidence":0.9,"control":"RC-024","severity":"medium","fix":"set resources.limits.cpu","rationale":"unbounded cpu"},
+            {"format":"kubernetes","key":"container.image.pin","expect":{"kind":"one_of","values":["digest","tag"]},"confidence":0.9,"control":"RC-045","severity":"high","fix":"pin the image to a tag or digest","rationale":"latest is unpinned"}
+        ]
+    }"#).unwrap();
+    (packets, specs)
+}
+
+#[test]
+fn scan_runs_the_kubernetes_config_family_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_k8s_lane_fixtures(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .arg("--retrieved")
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    // The missing probe violates the Present spec (both base and overlay
+    // units repeat it — one grouped class).
+    assert!(
+        stdout.contains("kubernetes container.liveness-probe"),
+        "missing probe must surface: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-020"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    // The cpu limit is authored in the base: RC-024 must NOT surface.
+    assert!(
+        !stdout.contains("kubernetes container.resources.limits.cpu"),
+        "an authored limit is not a finding: {stdout}"
+    );
+    // The overlay retagged web:v1.2.3 to :latest; the pin-shape violation
+    // proves the images transformer resolved the EFFECTIVE value.
+    assert!(
+        stdout.contains("kubernetes container.image.pin"),
+        "the overlay's latest tag must surface: {stdout}"
+    );
+    assert!(stdout.contains("RC-045"), "pin control missing: {stdout}");
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+}
+
+// --- C# lane (po-av01j.10) ---
+
+/// The hand-authored SEED C# spec corpus (test-grade): RC-019 timeout and
+/// RC-022 retry judgments at C# identities, plus the C# emission identities
+/// for the G4 lane. The production corpus rides the LLM factory, HITL — see
+/// the gate-set mint bead under po-av01j.
+fn csharp_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("csharp_seed_specs.json")
+}
+
+/// C#, golden packet stream: a `--retrieved` stream shaped exactly like
+/// csindex output is decided by the seed C# specs WITHOUT a dotnet SDK
+/// present. This is the contract test for the Rust side of the lane: the
+/// satisfies / violates / abstain shapes, G2 registrations routed out of the
+/// G1 lane, and a G4 catch_clause swallow surfacing under RC-027.
+#[test]
+fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let packets = dir.path().join("retrieved.jsonl");
+    let mk = |line: u32, symbol: &str, func: &str, ctype: &str, snippet: &str, extra: &str| {
+        format!(
+            r#"{{"packet_schema":2,"snapshot_id":"fx","file_path":"Svc.cs","line_number":{line},"symbol":{symbol:?},"func":{func:?},"receiver":"_c","client_type":{ctype:?},"snippet":{snippet:?},"lang":"csharp"{extra}}}"#
+        )
+    };
+    let stream = [
+        // Satisfies: HttpClient carries a whole-call default Timeout (100s),
+        // spec knowledge riding the this_client config spec.
+        mk(
+            10,
+            "FetchUser",
+            "GetAsync",
+            "System.Net.Http.HttpClient",
+            "await _c.GetAsync(url)",
+            "",
+        ),
+        // Violates: a gRPC call has NO default deadline; the seed spec says
+        // the bound rides CallOptions at the call, and none is present.
+        mk(
+            20,
+            "SayHello",
+            "AsyncUnaryCall",
+            "Grpc.Core.CallInvoker",
+            "_c.AsyncUnaryCall(method, host, options, req)",
+            "",
+        ),
+        // Abstain: librdkafka retries internally; whether app-level retry
+        // wrapping is needed is per-site judgment (RC-022 seed, depends).
+        mk(
+            30,
+            "Publish",
+            "ProduceAsync",
+            "Confluent.Kafka.IProducer",
+            "await _c.ProduceAsync(topic, msg)",
+            "",
+        ),
+        // A G2 route registration must be routed OUT of the G1 lane.
+        mk(
+            40,
+            "MapRoutes",
+            "MapGet",
+            "Microsoft.AspNetCore.Builder.WebApplication",
+            "app.MapGet(\"/health\", handler)",
+            r#","site_kind":"server_entry""#,
+        ),
+        // A G4 catch_clause swallow aggregate surfaces under RC-027.
+        mk(
+            50,
+            "Handle",
+            "catch",
+            "catch_clause",
+            "",
+            r#","site_kind":"emission_point","const_args":[{"index":0,"name":"emission_category","value":"error_capture","how":"aggregate"},{"index":0,"name":"emission_count","value":"1","how":"aggregate"}]"#,
+        ),
+    ]
+    .join("\n");
+    std::fs::write(&packets, stream + "\n").unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(csharp_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap().clone();
+    let g1 = verdicts_for(&rows, "Svc.cs");
+    assert!(
+        g1.iter().any(
+            |(v, r)| v == "satisfies" && r.contains("client config System.Net.Http.HttpClient")
+        ),
+        "HttpClient's default whole-call Timeout must satisfy via the config spec: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the deadline-less gRPC call must violate: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the Kafka produce must abstain on the depends spec: {g1:?}"
+    );
+    // The route registration and the emission aggregate stay OUT of the G1
+    // verdict rows (their lanes judge them).
+    assert!(
+        !g1.iter().any(|(_, r)| r.contains("MapGet")),
+        "a server_entry registration must not be judged as a client call: {g1:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        3,
+        "only the three G1 call sites belong in --out: {rows:?}"
+    );
+    // The G4 swallow surfaces in the ladder, control-mapped and advisory.
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the catch_clause swallow must surface under RC-027: {stdout}"
+    );
+}
+
+/// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
+/// its NuGet restore (Roslyn) is unavailable — matching the tsindex
+/// "run npm install first" skip convention.
+fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if std::process::Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP csindex e2e: no dotnet SDK");
+        return None;
+    }
+    let csdir = helpers_dir().join("csindex");
+    let out_dir = dir.join("csindex-build");
+    let out = std::process::Command::new("dotnet")
+        .args(["build", "-c", "Release", "-o"])
+        .arg(&out_dir)
+        .current_dir(&csdir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "SKIP csindex e2e: dotnet build failed (NuGet restore for Roslyn needed?): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    let dll = out_dir.join("csindex.dll");
+    if dll.is_file() {
+        Some(dll)
+    } else {
+        eprintln!("SKIP csindex e2e: csindex.dll not produced");
+        None
+    }
+}
+
+/// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
+/// the seed specs decide the same three shapes the golden-stream test pins,
+/// plus the catch_clause swallow from the fixture's emitters.
+#[test]
+fn scan_decides_csharp_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("csindex"))
+        .arg("--specs-file")
+        .arg(csharp_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CSINDEX", &csindex_dll)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap().clone();
+    let g1 = verdicts_for(&rows, "Svc.cs");
+    assert!(
+        g1.iter().any(
+            |(v, r)| v == "satisfies" && r.contains("client config System.Net.Http.HttpClient")
+        ),
+        "the fixture's HttpClient call must satisfy: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the fixture's deadline-less gRPC call must violate: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the fixture's Kafka produce must abstain: {g1:?}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the fixture's swallowing catch must surface under RC-027: {stdout}"
     );
 }

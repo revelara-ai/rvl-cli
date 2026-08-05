@@ -1,0 +1,23 @@
+{
+  "procedures": [
+    {
+      "id": "proc_1",
+      "title": "Add circuit breaker",
+      "vertical": "fault-tolerance",
+      "procedure_type": "runbook",
+      "related_controls": [
+        "RC-018",
+        "RC-012"
+      ],
+      "technologies": [
+        "go"
+      ],
+      "effectiveness_score": 0.9,
+      "applied_count": 4,
+      "success_count": 3,
+      "confidence": 0.8,
+      "score": 1.5
+    }
+  ],
+  "total": 1
+}

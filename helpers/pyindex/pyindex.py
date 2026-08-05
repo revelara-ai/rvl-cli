@@ -42,8 +42,12 @@ import sys
 # PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
 # helper churn behind this number: a consumer that does not know a version
 # refuses the stream rather than guessing at its shape. It MUST agree with
-# goindex's PacketSchema and rvl_index's schema.
-PACKET_SCHEMA = 1
+# goindex's PacketSchema, tsindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
+#
+# v2 adds const_args (constant-valued arguments at the call site) and
+# macro_expansion (always False for Python, which has no macros; mechanical
+# for C/C++). v2 is a strict superset of v1.
+PACKET_SCHEMA = 2
 
 # Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes. A pathologically
 # long function body should not blow up a packet line.
@@ -105,6 +109,164 @@ def _is_io_method(method, resolved):
         return True
     return False
 
+
+# ---------------------------------------------------------------------------
+# G3 background-job registration surfaces (po-av01j.4).
+#
+# Schedulers, cron registrations, dispatchers, and worker loops ride the SAME
+# packet stream, marked site_kind="background_job". Like the I/O-method
+# allowlists this is a RETRIEVAL selection table, not a judgment: it picks
+# which sites to surface; whether a registration needs a bound is spec
+# knowledge downstream (ApiSpec.site_kinds). Detection is IMPORT-driven -- the
+# receiver or decorator must resolve through this module's imports into the
+# framework's package -- so a same-named method on an unresolved object is
+# never guessed at (abstain-by-omission).
+# ---------------------------------------------------------------------------
+
+# Registration/dispatch/loop methods called on a resolved framework object,
+# keyed by the ROOT package of the resolved client type.
+JOB_CALL_METHODS = {
+    "celery": frozenset({"send_task", "add_periodic_task"}),
+    "apscheduler": frozenset({"add_job"}),
+    "rq": frozenset({"enqueue", "enqueue_call", "enqueue_at", "enqueue_in",
+                     "work"}),
+}
+
+# Decorator ATTRIBUTES that register the decorated function as background
+# work (`@app.task`, `@sched.scheduled_job(...)`), keyed the same way.
+JOB_DECORATOR_ATTRS = {
+    "celery": frozenset({"task", "periodic_task"}),
+    "apscheduler": frozenset({"scheduled_job"}),
+}
+
+# Imported NAMES that are themselves registration decorators
+# (`from celery import shared_task`): dotted import -> (client_type, method).
+JOB_DECORATOR_IMPORTS = {
+    "celery.shared_task": ("celery", "shared_task"),
+    "celery.task": ("celery", "task"),
+}
+
+
+def _root_package(dotted):
+    return dotted.split(".", 1)[0] if dotted else ""
+
+
+def _is_job_call(method, client_type, resolved):
+    """A method call registers/dispatches background work only when its
+    receiver RESOLVED to a known scheduler/queue framework type."""
+    if not resolved:
+        return False
+    methods = JOB_CALL_METHODS.get(_root_package(client_type))
+    return bool(methods and method in methods)
+
+
+def _job_decorator(idx, dec):
+    """(client_type, method) when `dec` registers the decorated function as
+    background work, else None. Both idioms: an attribute decorator on a
+    resolved framework object, and a decorator imported from the framework."""
+    node = dec.func if isinstance(dec, ast.Call) else dec
+    if isinstance(node, ast.Attribute):
+        client_type, resolved = idx.resolve_receiver(node.value)
+        if resolved:
+            attrs = JOB_DECORATOR_ATTRS.get(_root_package(client_type))
+            if attrs and node.attr in attrs:
+                return client_type, node.attr
+    elif isinstance(node, ast.Name):
+        dotted = idx.imports.get(node.id)
+        if dotted in JOB_DECORATOR_IMPORTS:
+            return JOB_DECORATOR_IMPORTS[dotted]
+    return None
+# G2 server-entry detection (po-av01j.3).
+#
+# Server-entry sites (HTTP handler registrations, route definitions,
+# middleware attachments) ride the SAME packet stream, distinguished by the
+# additive `site_kind` field. Detection is deliberately conservative: a
+# registration is emitted only when the receiver RESOLVES (via imports /
+# assignments) to a known framework type, or the called name resolves to a
+# django.urls function -- an unresolved `app.get(...)` could as easily be an
+# HTTP client, so it abstains from this lane rather than guessing.
+# ---------------------------------------------------------------------------
+
+# Mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+SITE_KIND_SERVER_ENTRY = "server_entry"
+
+# Framework types whose route/middleware methods register server entries.
+_SERVER_TYPES = frozenset({
+    "flask.Flask", "flask.Blueprint", "fastapi.FastAPI", "fastapi.APIRouter",
+})
+
+# Route-registration verbs on those types (flask app.route / add_url_rule,
+# FastAPI's per-verb decorators and router mounting surface).
+_SERVER_ROUTE_METHODS = frozenset({
+    "route", "get", "post", "put", "delete", "patch", "options", "head",
+    "api_route", "add_api_route", "add_url_rule", "websocket",
+})
+
+# Middleware-chain attachment verbs on those types.
+_SERVER_MIDDLEWARE_METHODS = frozenset({
+    "add_middleware", "middleware", "before_request", "after_request",
+    "include_router",
+})
+
+# django URL-configuration functions, matched by their import-resolved dotted
+# names (a local helper named `path` never matches).
+_DJANGO_URL_FUNCS = frozenset({
+    "django.urls.path", "django.urls.re_path", "django.conf.urls.url",
+})
+
+
+def _server_entry_target(target, idx):
+    """(client_type, method) when `target` -- the callable expression of a call
+    or decorator -- is a server-entry registration surface, else None."""
+    if isinstance(target, ast.Attribute):
+        method = target.attr
+        if (method not in _SERVER_ROUTE_METHODS
+                and method not in _SERVER_MIDDLEWARE_METHODS):
+            return None
+        client_type, resolved = idx.resolve_receiver(target.value)
+        if resolved and client_type in _SERVER_TYPES:
+            return client_type, method
+        return None
+    if isinstance(target, ast.Name):
+        dotted = idx.imports.get(target.id)
+        if dotted in _DJANGO_URL_FUNCS:
+            mod, name = dotted.rsplit(".", 1)
+            return mod, name
+    return None
+
+
+def _server_entry_record(snapshot, file_path, line, symbol, method, client_type,
+                         receiver, snippet, body, const_args):
+    """One server-entry packet. Same shape as a G1 record plus the site_kind
+    stamp; the route path (a literal in the mainstream frameworks) rides the
+    existing const_args machinery."""
+    return {
+        "packet_schema": PACKET_SCHEMA,
+        "site_key": "",  # stamped in emit()
+        "snapshot_id": snapshot,
+        "file_path": file_path,
+        "line_number": line,
+        "symbol": symbol,
+        "func": method,
+        "receiver": receiver,
+        "client_type": client_type,
+        "snippet": snippet,
+        "enclosing_function_body": body,
+        "callers": [],
+        "callees": [],
+        "client_construction": [],
+        "const_args": const_args,
+        "macro_expansion": False,
+        "site_kind": SITE_KIND_SERVER_ENTRY,
+        "provenance": {
+            "client_type_resolved": True,
+            "callers_total": 0,
+            "callers_included": 0,
+            "callees_total": 0,
+            "callees_included": 0,
+        },
+        "lang": "python",
+    }
 
 # ---------------------------------------------------------------------------
 # Expression rendering
@@ -184,6 +346,10 @@ class FileIndex:
         self.ctor_by_var = {}       # var name -> [Snippet]
         self.ctor_by_selfattr = {}  # "self.x" -> [Snippet]
         self.ctor_by_type = {}      # client type -> [Snippet]
+        # name -> constant value, from `NAME = <literal>` assignments (schema
+        # v2 named-constant resolution). Same module-scoped, last-write-wins
+        # best effort as var_types; no deep constant propagation.
+        self.const_by_name = {}
 
     # -- import resolution ---------------------------------------------------
 
@@ -233,7 +399,17 @@ class FileIndex:
                 targets, value = node.targets, node.value
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
                 targets, value = [node.target], node.value
-            if targets is None or not isinstance(value, ast.Call):
+            if targets is None:
+                continue
+            # `NAME = <literal>` feeds named-constant argument resolution
+            # (schema v2). Only plain names and literal values: anything
+            # computed is not a constant we can cheaply stand behind.
+            if isinstance(value, ast.Constant):
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name):
+                        self.const_by_name[tgt.id] = value.value
+                continue
+            if not isinstance(value, ast.Call):
                 continue
             ctype = self.resolve_ctor(value.func)
             if not ctype:
@@ -290,6 +466,200 @@ class FileIndex:
         return out[:MAX_CTORS_EMITTED]
 
 
+def _const_args(call, idx):
+    """Constant-valued arguments at the call site (schema v2).
+
+    Literal tokens report as "literal"; names resolved through the module-level
+    constant map report as "named_constant". `index` is the zero-based position
+    of the argument as written; `name` is the keyword for keyword arguments,
+    "" for positional ones. Values render via repr() (source-level: 5, '5',
+    True, None). Retrieval only: no deep constant propagation, and no opinion
+    about what a value means — that is spec-layer knowledge.
+    """
+    def resolve(node):
+        if isinstance(node, ast.Constant):
+            return repr(node.value), "literal"
+        if isinstance(node, ast.Name) and node.id in idx.const_by_name:
+            return repr(idx.const_by_name[node.id]), "named_constant"
+        return None, None
+
+    out = []
+    pos = 0
+    for a in call.args:
+        value, how = (None, None) if isinstance(a, ast.Starred) else resolve(a)
+        if how:
+            out.append({"index": pos, "name": "", "value": value, "how": how})
+        pos += 1
+    for kw in call.keywords:
+        # kw.arg is None for a **kwargs expansion: a written argument slot,
+        # but not one carrying a per-argument name or constant value.
+        value, how = (None, None) if kw.arg is None else resolve(kw.value)
+        if how:
+            out.append({"index": pos, "name": kw.arg, "value": value, "how": how})
+        pos += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# G4 emission-point inventory (po-av01j.5).
+#
+# Log statements, span/trace instrumentation, and error-handling sites ride
+# the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
+# is the load-bearing constraint: emission packets are AGGREGATES -- one per
+# (enclosing function, framework identity, category), with the category and
+# call count riding const_args (emission_category / emission_count, how:
+# "aggregate") -- never one packet per log line.
+#
+# Classification is import-resolved like every other receiver in this helper:
+# a call is an emission only when its receiver resolves into a known telemetry
+# framework. Unresolved receivers are skipped -- abstain rather than guess.
+# The framework list is the candidate extractor (like STRONG_IO_METHODS for
+# G1): it decides what gets inventoried, never what a match means -- that is
+# the spec layer's job (EmissionSpec).
+# ---------------------------------------------------------------------------
+
+SITE_KIND_EMISSION = "emission_point"
+
+# Emit-verb allowlists per category: a framework module also exports
+# non-emitting surface (logging.getLogger, sentry_sdk.init) that must not
+# count as emission calls.
+_EMISSION_METHODS = {
+    "log": frozenset({
+        "debug", "info", "warning", "warn", "error", "exception", "critical",
+        "success", "trace", "log", "msg",
+    }),
+    "trace": frozenset({"start_span", "start_as_current_span"}),
+    "error_capture": frozenset({
+        "capture_exception", "capture_message", "capture_event",
+    }),
+}
+
+
+def _emission_identity(ctype):
+    """Map a resolved dotted receiver path to (framework identity, category).
+
+    The identity is NORMALIZED to the framework's canonical surface
+    (`logging.getLogger` -> `logging.Logger`) so the spec corpus keys on one
+    string per framework. Returns (None, None) for everything else."""
+    if not ctype:
+        return None, None
+    root = ctype.split(".")[0]
+    if root == "logging":
+        return "logging.Logger", "log"
+    if root == "structlog":
+        return "structlog", "log"
+    if root == "loguru":
+        return "loguru.logger", "log"
+    if root == "sentry_sdk":
+        return "sentry_sdk", "error_capture"
+    if root == "opentelemetry":
+        return "opentelemetry.trace.Tracer", "trace"
+    return None, None
+
+
+def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
+    """Return the file's emission-point aggregate records.
+
+    Also inventories the SWALLOW fact RC-027's capture-vs-swallow question
+    needs: an except handler that neither emits anything recognized nor
+    re-raises is an error path with no capture, aggregated per function under
+    the `except_handler` identity. A handler that logs, captures, or raises
+    is instrumented (or propagating), never a swallow."""
+    handler_nodes = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.ExceptHandler)]
+    contained = {}   # id(node) -> index of the handler containing it
+    reraises = []    # per handler: body contains a raise
+    for i, h in enumerate(handler_nodes):
+        for n in ast.walk(h):
+            contained.setdefault(id(n), i)
+        reraises.append(any(isinstance(n, ast.Raise) for n in ast.walk(h)))
+    handler_emits = [False] * len(handler_nodes)
+
+    aggs = {}  # (symbol, framework, category) -> agg dict
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        method = func.attr
+        ctype, _resolved = idx.resolve_receiver(func.value)
+        framework, category = _emission_identity(ctype)
+        if framework is None or method not in _EMISSION_METHODS[category]:
+            continue
+        h = contained.get(id(node))
+        if h is not None:
+            handler_emits[h] = True
+            if category == "log":
+                # A log emission ON an error path is the capture fact.
+                category = "error_capture"
+        symbol, _fn = enclosing.get(id(node), ("", None))
+        key = (symbol, framework, category)
+        agg = aggs.get(key)
+        if agg is None:
+            aggs[key] = agg = {
+                "line": node.lineno,
+                "method": method,
+                "snippet": _segment(source, node),
+                "count": 0,
+            }
+        agg["count"] += 1
+
+    # Swallowed error paths: no recognized emission, no re-raise.
+    for i, h in enumerate(handler_nodes):
+        if handler_emits[i] or reraises[i]:
+            continue
+        symbol, _fn = enclosing.get(id(h), ("", None))
+        key = (symbol, "except_handler", "error_capture")
+        agg = aggs.get(key)
+        if agg is None:
+            aggs[key] = agg = {
+                "line": h.lineno,
+                "method": "except",
+                "snippet": "",
+                "count": 0,
+            }
+        agg["count"] += 1
+
+    records = []
+    for (symbol, framework, category), agg in sorted(
+            aggs.items(), key=lambda kv: kv[1]["line"]):
+        records.append({
+            "packet_schema": PACKET_SCHEMA,
+            "site_key": "",  # stamped in emit(), like every packet
+            "site_kind": SITE_KIND_EMISSION,
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": agg["line"],
+            "symbol": symbol,
+            "func": agg["method"],
+            "receiver": "",
+            "client_type": framework,
+            "snippet": agg["snippet"],
+            # Volume control: no function body on aggregates.
+            "enclosing_function_body": "",
+            "callers": [],
+            "callees": [],
+            "client_construction": [],
+            "const_args": [
+                {"index": 0, "name": "emission_category",
+                 "value": category, "how": "aggregate"},
+                {"index": 0, "name": "emission_count",
+                 "value": str(agg["count"]), "how": "aggregate"},
+            ],
+            "macro_expansion": False,
+            "provenance": {
+                "client_type_resolved": framework != "except_handler",
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+            },
+            "lang": "python",
+        })
+    return records
+
+
 def _enclosing_functions(tree):
     """Map every AST node to the innermost enclosing FunctionDef/AsyncFunctionDef.
 
@@ -338,17 +708,60 @@ def retrieve_file(abs_path, file_path, snapshot):
     enclosing = _enclosing_functions(tree)
 
     out = []
+    # G2 pre-pass: decorator registrations. @app.route("/x") / @api.get("/y")
+    # attach the route to the DECORATED handler, so the record's symbol is the
+    # handler and its enclosing body is the handler's source. Registered
+    # decorator Call nodes are skipped by the main walk below, or @api.get
+    # would ALSO emit as a G1 client call (get is a weak I/O verb on a
+    # resolved receiver).
+    decorator_nodes = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            call = dec if isinstance(dec, ast.Call) else None
+            target = call.func if call is not None else dec
+            se = _server_entry_target(target, idx)
+            if se is None:
+                continue
+            decorator_nodes.add(id(dec))
+            client_type, method = se
+            recv = target.value if isinstance(target, ast.Attribute) else None
+            out.append(_server_entry_record(
+                snapshot, file_path, dec.lineno, node.name, method, client_type,
+                expr_to_str(recv) if recv is not None else "",
+                _segment(source, dec), _segment(source, node),
+                _const_args(call, idx) if call is not None else []))
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        if id(node) in decorator_nodes:
+            continue  # already emitted as a decorator registration
         func = node.func
+        # G2 call-form registrations: app.add_middleware(...), app.add_url_rule,
+        # api.include_router(...), django's path()/re_path()/url(). Checked
+        # BEFORE the G1 gate so a registration never emits as a client call.
+        se = _server_entry_target(func, idx)
+        if se is not None:
+            client_type, method = se
+            func_name, func_node = enclosing.get(id(node), ("", None))
+            recv = func.value if isinstance(func, ast.Attribute) else None
+            out.append(_server_entry_record(
+                snapshot, file_path, node.lineno, func_name, method, client_type,
+                expr_to_str(recv) if recv is not None else "",
+                _segment(source, node),
+                _segment(source, func_node) if func_node is not None else "",
+                _const_args(node, idx)))
+            continue
         if not isinstance(func, ast.Attribute):
             # only receiver.method(...) shapes are call sites
             continue
         method = func.attr
         recv = func.value
         client_type, resolved = idx.resolve_receiver(recv)
-        if not _is_io_method(method, resolved):
+        is_job = _is_job_call(method, client_type, resolved)
+        if not is_job and not _is_io_method(method, resolved):
             continue
 
         recv_str = expr_to_str(recv)
@@ -371,9 +784,16 @@ def retrieve_file(abs_path, file_path, snapshot):
             "client_type": client_type,
             "snippet": snippet,
             "enclosing_function_body": body,
-            "callers": [],   # empty in v1 (no cross-module call graph)
-            "callees": [],   # empty in v1
+            "callers": [],   # empty (no cross-module call graph yet)
+            "callees": [],   # empty
             "client_construction": constructions,
+            # Schema v2: constant-valued arguments as evidence, and the macro
+            # flag (Python has no macros; C/C++ sets it mechanically).
+            "const_args": _const_args(node, idx),
+            "macro_expansion": False,
+            # G3: a resolved scheduler/queue registration is a background-job
+            # site; everything else stays the classic call site.
+            "site_kind": "background_job" if is_job else "",
             "provenance": {
                 "client_type_resolved": resolved,
                 "callers_total": 0,
@@ -384,6 +804,64 @@ def retrieve_file(abs_path, file_path, snapshot):
             "lang": "python",
         }
         out.append(record)
+    out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
+    # G4 emission inventory rides the same stream (po-av01j.5).
+    out.extend(collect_emissions(tree, source, idx, enclosing, file_path, snapshot))
+    return out
+
+
+def _job_decorator_records(tree, idx, source, file_path, snapshot):
+    """Background-job sites registered by DECORATOR (G3): `@app.task`,
+    `@shared_task(time_limit=...)`, `@sched.scheduled_job(...)`. The
+    registration site is the decorator itself; the decorated function is the
+    job body, emitted as the enclosing source. The function's decorators also
+    ride provenance.chain_roots as structural facts, so the existing
+    decorator-bound judgment mechanism downstream sees a time_limit without
+    any new machinery."""
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = ["@" + _segment(source, d) for d in node.decorator_list]
+        for dec in node.decorator_list:
+            hit = _job_decorator(idx, dec)
+            if hit is None:
+                continue
+            client_type, method = hit
+            head = dec.func if isinstance(dec, ast.Call) else dec
+            receiver = expr_to_str(
+                head.value if isinstance(head, ast.Attribute) else head)
+            out.append({
+                "packet_schema": PACKET_SCHEMA,
+                "site_key": "",  # stamped in emit()
+                "snapshot_id": snapshot,
+                "file_path": file_path,
+                "line_number": dec.lineno,
+                "symbol": node.name,
+                "func": method,
+                "receiver": receiver,
+                "client_type": client_type,
+                "snippet": "@" + _segment(source, dec),
+                "enclosing_function_body": _segment(source, node),
+                "callers": [],
+                "callees": [],
+                "client_construction": [],
+                "const_args": _const_args(dec, idx) if isinstance(dec, ast.Call) else [],
+                "macro_expansion": False,
+                "site_kind": "background_job",
+                "provenance": {
+                    "client_type_resolved": True,
+                    "callers_total": 0,
+                    "callers_included": 0,
+                    "callees_total": 0,
+                    "callees_included": 0,
+                    "chain_roots": [{
+                        "symbol": node.name,
+                        "decorators": decorators,
+                    }],
+                },
+                "lang": "python",
+            })
     return out
 
 

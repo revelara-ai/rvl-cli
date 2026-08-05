@@ -10,6 +10,39 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The packet contract version this consumer understands. It MUST agree with
+/// the emitters' constants (goindex `PacketSchema`, pyindex `PACKET_SCHEMA`,
+/// tsindex `PACKET_SCHEMA`); each helper prints its version via
+/// `--packet-schema` so a consumer can negotiate before paying for a load.
+///
+/// v2 adds `const_args` (constant-valued arguments at the call site) and
+/// `macro_expansion` (per-site macro flag; C/C++ mechanical, other languages
+/// false/absent). v2 is a strict superset of v1: every v1 record parses as v2
+/// with the new fields defaulted, so v1 streams remain readable.
+///
+/// `site_kind` (G4, po-av01j.5) rides the v2 train WITHOUT a version bump: v2
+/// is unreleased, and the field is additive with a carrying default (absent =
+/// classic G1 call site), so every existing stream parses unchanged.
+pub const PACKET_SCHEMA: u32 = 2;
+
+/// The `site_kind` value stamped on emission-point packets (G4): log
+/// statements, span/trace instrumentation, and error-handling sites. An empty
+/// `site_kind` remains the classic G1 client-call site.
+pub const SITE_KIND_EMISSION: &str = "emission_point";
+
+/// The `const_args` entry name carrying an emission aggregate's category
+/// (`log` | `trace` | `error_capture`). Emission packets are AGGREGATES — one
+/// per (enclosing function, framework, category), never one per log line —
+/// and the category and count ride `const_args` (with `how: "aggregate"`)
+/// rather than new fields, keeping the addition to the v2 train minimal.
+pub const CONST_ARG_EMISSION_CATEGORY: &str = "emission_category";
+
+/// The `const_args` entry name carrying how many emission calls the aggregate
+/// stands for. Log statements are the highest-volume site class in any
+/// codebase; the count is the volume-control contract (a large backend repo
+/// must not produce tens of thousands of emission Sites).
+pub const CONST_ARG_EMISSION_COUNT: &str = "emission_count";
+
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
 /// this, 821 of 1525 real production records failed to parse and the scanner
@@ -65,6 +98,35 @@ impl Verdict {
             Verdict::NotApplicable => "not_applicable",
         }
     }
+}
+
+/// A constant-valued argument observed at a call site (schema v2).
+///
+/// This is RETRIEVAL: the emitter reports that an argument's value is knowable
+/// without running the program, and how it was determined. What the value MEANS
+/// (CURLOPT_TIMEOUT vs CURLOPT_URL, timeout=0 as "no timeout") is library
+/// knowledge and belongs to the spec layer. Emitters resolve only literals and
+/// cheaply-resolvable named constants — no deep constant propagation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConstArg {
+    /// Zero-based position of the argument at the call site as written.
+    #[serde(default)]
+    pub index: u32,
+    /// Keyword/parameter name when the language surface provides one
+    /// (`timeout=5` in Python), `""` for purely positional arguments.
+    #[serde(default)]
+    pub name: String,
+    /// Source-level rendering of the resolved value (language-specific:
+    /// `"5"`, `"'x'"`, `"2000000000"` for a folded Go constant expression).
+    #[serde(default)]
+    pub value: String,
+    /// How the value was determined: `"literal"` for a literal token at the
+    /// call, `"named_constant"` for a resolved constant reference or folded
+    /// constant expression. A string, not an enum, so a future emitter adding
+    /// a mechanism degrades to an unrecognized label rather than a parse
+    /// failure.
+    #[serde(default)]
+    pub how: String,
 }
 
 /// A piece of retrieved source with enough provenance to cite it.
@@ -227,13 +289,77 @@ pub struct Site {
     #[serde(default)]
     pub lang: String,
     /// Present on the repo-scoped record that rides in the same stream.
-    #[serde(default)]
+    /// Skipped when absent so a Site serialized by an in-workspace emitter
+    /// (rustindex) matches the sibling helpers' wire shape exactly — G1
+    /// records carry no `kind` field at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The contract version the emitter stamped on this record (0 when the
+    /// stream predates stamping). `parse_stream` refuses records stamped with
+    /// a version newer than [`PACKET_SCHEMA`].
+    #[serde(default)]
+    pub packet_schema: u32,
+    /// Schema v2: constant-valued arguments observed at this call site.
+    /// Evidence, never a verdict — the libcurl/POSIX discrimination lives in
+    /// enum constants like CURLOPT_TIMEOUT, and the TS pool-timeout precision
+    /// fix needed exactly this shape.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub const_args: Vec<ConstArg>,
+    /// Schema v2: whether this site sits inside a macro expansion. Mechanical
+    /// for C/C++ (expansion locations); other languages emit false/absent.
+    #[serde(default)]
+    pub macro_expansion: bool,
+    /// Which KIND of site this record inventories. Empty (the default) is the
+    /// classic G1 client-call site every existing emitter produces, so v1/v2
+    /// G1 streams parse unchanged — an additive default-carrying field within
+    /// the v2 train, deliberately NOT a schema bump. G2+ emitters stamp their
+    /// own kind: [`SITE_KIND_SERVER_ENTRY`] for HTTP handler/route/middleware
+    /// registrations (po-av01j.3), `"background_job"` for G3 scheduler/cron
+    /// registrations, queue worker handlers, and dispatcher/worker-loop sites
+    /// (po-av01j.4), [`SITE_KIND_EMISSION`] for G4 emission points
+    /// (po-av01j.5). Retrieval only: the retriever reports WHERE the site is;
+    /// whether a control governs that kind is spec knowledge
+    /// (`ApiSpec::site_kinds`), and each kind is judged by its own lane so G1
+    /// specs never fire on a server-entry site or vice versa.
+    #[serde(default)]
+    pub site_kind: String,
 }
+
+/// The `site_kind` a G2 server-entry record carries: an HTTP handler, route,
+/// or middleware-chain registration inventoried by a typed retriever.
+pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
 impl Site {
     pub fn id(&self) -> String {
         format!("{}:{}", self.file_path, self.line_number)
+    }
+    /// A classic G1 client-call site (empty `site_kind`, the pre-G4 default).
+    pub fn is_call_site(&self) -> bool {
+        self.site_kind.is_empty()
+    }
+    /// A G4 emission-point aggregate (log/trace/error-capture inventory).
+    pub fn is_emission_point(&self) -> bool {
+        self.site_kind == SITE_KIND_EMISSION
+    }
+    /// The emission aggregate's category (`log` | `trace` | `error_capture`),
+    /// read from the [`CONST_ARG_EMISSION_CATEGORY`] const-args entry. `None`
+    /// on call sites and on malformed emission packets — the caller abstains
+    /// rather than guessing a category.
+    pub fn emission_category(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_EMISSION_CATEGORY)
+            .map(|a| a.value.as_str())
+    }
+    /// How many emission calls this aggregate stands for, read from the
+    /// [`CONST_ARG_EMISSION_COUNT`] const-args entry. Defaults to 1: an
+    /// aggregate exists because at least one emission call did.
+    pub fn emission_count(&self) -> u32 {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_EMISSION_COUNT)
+            .and_then(|a| a.value.parse().ok())
+            .unwrap_or(1)
     }
     /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
     /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
@@ -347,6 +473,11 @@ pub struct RepoConfig {
 /// Parse a retriever's JSONL stream into sites plus the repo-scoped record.
 /// Unparseable lines are skipped rather than fatal: a retriever bug should
 /// degrade coverage, not abort a scan, and coverage is reported separately.
+///
+/// Version negotiation: a record stamped with a `packet_schema` newer than
+/// [`PACKET_SCHEMA`] is REFUSED (counted as skipped), never parsed on the
+/// guess that the shape still fits. Older stamps (and unstamped v1-era lines)
+/// are accepted: v2 is a strict superset, so their fields default cleanly.
 pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
     let mut sites = Vec::new();
     let mut cfg = RepoConfig::default();
@@ -362,9 +493,22 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 continue;
             }
         };
-        if v.get("kind").and_then(|k| k.as_str()) == Some("repo_config") {
-            if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
-                cfg = rc;
+        if let Some(version) = v.get("packet_schema").and_then(|s| s.as_u64()) {
+            if version > u64::from(PACKET_SCHEMA) {
+                skipped += 1;
+                continue;
+            }
+        }
+        if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
+            // Repo-scoped records ride the same stream, tagged by `kind`.
+            // Only repo_config is consumed here; any other kind (e.g. the G7
+            // repo_structure record) belongs to its own consumer and must not
+            // fall through into Site parsing, where every-field-defaulted
+            // serde would mint a junk site out of it.
+            if kind == "repo_config" {
+                if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
+                    cfg = rc;
+                }
             }
             continue;
         }
@@ -429,6 +573,239 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(sites[0].id(), "a.go:7");
+    }
+
+    #[test]
+    fn schema_v2_fields_round_trip() {
+        // A v2 record survives serialize -> parse with its constant-argument
+        // evidence and macro flag intact. The contract is the boundary; losing
+        // a field in transit is how evidence silently disappears.
+        let s = Site {
+            file_path: "a.c".into(),
+            line_number: 9,
+            method: "curl_easy_setopt".into(),
+            packet_schema: PACKET_SCHEMA,
+            const_args: vec![ConstArg {
+                index: 1,
+                name: String::new(),
+                value: "CURLOPT_TIMEOUT".into(),
+                how: "named_constant".into(),
+            }],
+            macro_expansion: true,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&s).unwrap();
+        let (sites, _, skipped) = parse_stream(&line);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 1);
+        let got = &sites[0];
+        assert_eq!(got.packet_schema, PACKET_SCHEMA);
+        assert!(got.macro_expansion);
+        assert_eq!(got.const_args.len(), 1);
+        assert_eq!(got.const_args[0].index, 1);
+        assert_eq!(got.const_args[0].value, "CURLOPT_TIMEOUT");
+        assert_eq!(got.const_args[0].how, "named_constant");
+    }
+
+    #[test]
+    fn site_kind_rides_the_stream_and_defaults_to_classic_call_site() {
+        // G3 (po-av01j.4): background-job sites ride the SAME Site stream,
+        // distinguished by an additive `site_kind` field. Absent means the
+        // classic G1 call site, so every existing stream parses unchanged;
+        // a "background_job" stamp must survive parse -> serialize intact.
+        // Additive default-carrying field within the unreleased v2 train:
+        // deliberately NOT a schema bump.
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"file_path":"jobs.go","line_number":12,"func":"AddFunc","client_type":"github.com/robfig/cron/v3.Cron","site_kind":"background_job"}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0, "site_kind must not break parsing");
+        assert_eq!(sites.len(), 2);
+        let classic = serde_json::to_value(&sites[0]).unwrap();
+        let job = serde_json::to_value(&sites[1]).unwrap();
+        assert_eq!(
+            classic["site_kind"], "",
+            "absent site_kind must default to the classic G1 call site"
+        );
+        assert_eq!(
+            job["site_kind"], "background_job",
+            "a background_job stamp must round-trip through Site"
+        );
+    }
+
+    #[test]
+    fn v1_records_still_parse_with_v2_defaults() {
+        // v2 is a strict superset of v1: an old stream (no packet_schema, no
+        // const_args, no macro_expansion) parses with defaults, and a Go-style
+        // present-but-null const_args does too (the nil-slice trap).
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"packet_schema":1,"file_path":"b.go","line_number":8,"func":"Do","const_args":null}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].packet_schema, 0);
+        assert!(sites[0].const_args.is_empty());
+        assert!(!sites[0].macro_expansion);
+        assert_eq!(sites[1].packet_schema, 1);
+        assert!(sites[1].const_args.is_empty());
+    }
+
+    #[test]
+    fn unknown_newer_schema_versions_are_refused_not_guessed_at() {
+        // The negotiation contract: a consumer that does not know a version
+        // refuses the record rather than guessing at its shape. A v3 stamp on
+        // an otherwise-parseable record must land in the skipped count, and a
+        // v3 repo_config must not overwrite the config either.
+        let stream = concat!(
+            r#"{"packet_schema":3,"file_path":"a.go","line_number":7,"func":"Query"}"#,
+            "\n",
+            r#"{"packet_schema":3,"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"t","fields":["Timeout"]}]}"#,
+            "\n",
+            r#"{"packet_schema":2,"file_path":"b.go","line_number":8,"func":"Do"}"#,
+            "\n"
+        );
+        let (sites, cfg, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 2, "both v3 records must be refused");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].id(), "b.go:8");
+        assert!(
+            cfg.constructions.is_empty(),
+            "a repo_config from an unknown schema must not be consumed"
+        );
+    }
+
+    #[test]
+    fn unknown_repo_scoped_record_kinds_do_not_become_sites() {
+        // The stream carries repo-scoped records tagged by `kind`
+        // (repo_config today, repo_structure from the G7 retriever). A kind
+        // this parser does not recognize must be routed AWAY from the site
+        // list, not misparsed into an all-defaults junk Site.
+        let stream = concat!(
+            r#"{"file_path":"a.go","line_number":7,"func":"Query","client_type":"db.Pool"}"#,
+            "\n",
+            r#"{"kind":"repo_structure","snapshot_id":"x","ecosystems":[]}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(
+            sites.len(),
+            1,
+            "a repo-scoped record must not become an empty Site"
+        );
+        assert_eq!(skipped, 0, "another record kind is not a parse failure");
+    }
+
+    #[test]
+    fn site_kind_survives_a_parse_serialize_round_trip() {
+        // G2 (po-av01j.3): server-entry sites ride the SAME Site stream,
+        // distinguished by the additive `site_kind` field. Losing it in
+        // transit (parse -> index -> reload) would silently demote a
+        // server-entry record back to a G1 call site.
+        let line = concat!(
+            r#"{"file_path":"routes.go","line_number":12,"func":"HandleFunc","#,
+            r#""client_type":"net/http.ServeMux","site_kind":"server_entry"}"#
+        );
+        let (sites, _, skipped) = parse_stream(line);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 1);
+        let back = serde_json::to_value(&sites[0]).unwrap();
+        assert_eq!(
+            back.get("site_kind").and_then(|v| v.as_str()),
+            Some("server_entry"),
+            "site_kind must survive the Site round trip"
+        );
+    }
+
+    #[test]
+    fn emission_site_kind_survives_the_round_trip() {
+        // G4 (po-av01j.5): emission-point sites ride the SAME Site stream,
+        // distinguished by the additive `site_kind` field. Absent = classic G1
+        // call site. The field must survive parse -> serialize, or an
+        // emission packet silently becomes a call site in the next pass.
+        let stream = concat!(
+            r#"{"packet_schema":2,"file_path":"a.go","line_number":7,"func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point"}"#,
+            "\n",
+            r#"{"packet_schema":2,"file_path":"b.go","line_number":8,"func":"Do","client_type":"net/http.Client"}"#,
+            "\n"
+        );
+        let (sites, _, skipped) = parse_stream(stream);
+        assert_eq!(skipped, 0);
+        assert_eq!(sites.len(), 2);
+        let back = serde_json::to_string(&sites[0]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+        assert_eq!(
+            v.get("site_kind").and_then(|k| k.as_str()),
+            Some("emission_point"),
+            "site_kind must survive the round trip: {back}"
+        );
+        let back1 = serde_json::to_string(&sites[1]).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&back1).unwrap();
+        assert_eq!(
+            v1.get("site_kind").and_then(|k| k.as_str()).unwrap_or(""),
+            "",
+            "a classic G1 site defaults to an empty site_kind"
+        );
+    }
+
+    #[test]
+    fn site_kind_defaults_to_the_g1_call_site() {
+        // Every v1/v2 record predating the field parses as a classic G1 call
+        // site: the empty default IS the G1 marker, so no schema bump is
+        // needed (additive default-carrying field within the v2 train).
+        let (sites, _, skipped) =
+            parse_stream(r#"{"file_path":"a.go","line_number":7,"func":"Query"}"#);
+        assert_eq!(skipped, 0);
+        let back = serde_json::to_value(&sites[0]).unwrap();
+        assert_eq!(
+            back.get("site_kind").and_then(|v| v.as_str()),
+            Some(""),
+            "a record predating the field must parse as a G1 call site"
+        );
+    }
+
+    #[test]
+    fn emission_accessors_read_the_aggregate_const_args() {
+        // The category and count of an emission aggregate ride const_args
+        // (how: "aggregate") rather than new fields. The accessors are the one
+        // shared parser for that convention.
+        let s = Site {
+            file_path: "svc/log.go".into(),
+            line_number: 12,
+            method: "Error".into(),
+            client_type: "log/slog.Logger".into(),
+            site_kind: SITE_KIND_EMISSION.into(),
+            const_args: vec![
+                ConstArg {
+                    name: CONST_ARG_EMISSION_CATEGORY.into(),
+                    value: "log".into(),
+                    how: "aggregate".into(),
+                    ..Default::default()
+                },
+                ConstArg {
+                    name: CONST_ARG_EMISSION_COUNT.into(),
+                    value: "17".into(),
+                    how: "aggregate".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_emission_point() && !s.is_call_site());
+        assert_eq!(s.emission_category(), Some("log"));
+        assert_eq!(s.emission_count(), 17);
+
+        // A classic G1 site: empty kind, no category, count defaults to 1.
+        let g1 = Site::default();
+        assert!(g1.is_call_site() && !g1.is_emission_point());
+        assert_eq!(g1.emission_category(), None);
+        assert_eq!(g1.emission_count(), 1);
     }
 
     #[test]

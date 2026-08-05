@@ -57,6 +57,28 @@ rvlscan explain <id> --retrieved packets.jsonl
 The signed spec cache is used by default (run `rvlscan sync` to populate it).
 `--specs-file` is a loudly-announced dev override.
 
+### Workflow skills and lenses
+
+`rvlscan skills` installs the Revelara workflow skills and lenses (the
+`/rvl:scan` lens set, CAST/STPA interrogatory workflows, assessment skills)
+into your coding-agent harness, so agentic scans and analyses keep working
+without `rvl-cli`:
+
+```sh
+rvlscan skills install            # install into every detected harness
+rvlscan skills install claude     # or name one: claude, codex, gemini,
+                                  # cursor, copilot, windsurf
+rvlscan skills update             # refresh previously installed harnesses
+rvlscan skills status             # installed vs served versions (drift)
+```
+
+Content is served by the Revelara plugin system (the same content
+`rvl plugin install` ships), verified (transport checksum + signed integrity
+manifest), and cached under `~/.revelara/cache/skills` so installs keep
+working offline (`RVLSCAN_OFFLINE=1` or network failure fall back to the
+verified cached copy). This surface only downloads; it never uploads
+anything.
+
 ## Privacy
 
 **Customer code never leaves the machine.** `rvlscan` is open source so this is

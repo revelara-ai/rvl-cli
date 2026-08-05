@@ -1,0 +1,78 @@
+{
+  "__comment": "SEED / test-grade spec fixtures at Java identities (po-av01j.9): RC-019 timeouts and RC-022 retry-posture rationale on the G1 lane, RC-060 job-altitude re-application on the G3 lane (site_kinds), and a self-contained G4 emission section so the Java e2e needs only this file. PRODUCTION corpus authoring rides the LLM factory and is HITL (gate mint bead under po-av01j) - these entries exist so the e2e tests exercise real verdicts, nothing more. NOTE: there is no in-engine retry lane; RC-022 is carried as seed rationale on the identities where the retry decision lives (client construction / resilience decorators), recorded for the factory to expand. The java.util.Timer entry deliberately declares NO site_kinds: it is the classic-call-site control proving a G1 spec never decides a background_job site.",
+  "apis": [
+    {
+      "type": "java.sql.PreparedStatement",
+      "method": "executeQuery",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg", "client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: a JDBC query blocks its thread until the driver returns; the bound is setQueryTimeout on the statement or a datasource-level socket/query timeout"
+    },
+    {
+      "type": "java.net.http.HttpClient",
+      "method": "send",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg", "client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: HttpClient.send blocks; bounded by HttpRequest.timeout(...) per call or connectTimeout at the builder (connect phase only)"
+    },
+    {
+      "type": "okhttp3.Call",
+      "method": "execute",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019 + RC-022 posture: Call.execute blocks; bounds live on the OkHttpClient.Builder (callTimeout/readTimeout), and retryOnConnectionFailure at the same builder is where the RC-022 retry decision lives"
+    },
+    {
+      "type": "redis.clients.jedis.Jedis",
+      "method": "get",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: a Jedis command blocks on the socket; bounded by the connection/socket timeout at client construction"
+    },
+    {
+      "type": "org.springframework.web.client.RestTemplate",
+      "method": "getForObject",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019 + RC-022 posture: RestTemplate blocks; bounds live on the request factory (connect/read timeout), and retries belong to a resilience decorator (@Retryable / resilience4j) around the call - the RC-022 surface for the factory to expand"
+    },
+    {
+      "type": "org.springframework.scheduling.annotation.Scheduled",
+      "method": "Scheduled",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["decorator"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060: a @Scheduled method runs unattended against shared stores; the registration is the altitude where a run bound must exist (a neighbouring bounding annotation such as @Transactional(timeout=...))",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "java.util.Timer",
+      "method": "schedule",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["context"],
+      "confidence": 0.9,
+      "rationale": "SEED applicability control: authored for classic call sites only (no site_kinds), so a background_job site with this api key must abstain, never inherit the judgment"
+    }
+  ],
+  "configs": [],
+  "emissions": [
+    {"type": "catch_clause", "category": "error_capture", "control": "RC-027", "role": "violates", "confidence": 0.9, "rationale": "a catch that neither emits nor re-throws swallows the failure: invisible to centralized error monitoring (RC-027)"},
+    {"type": "org.slf4j.Logger", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.85, "rationale": "a structured log emission on the error path feeds central log aggregation"},
+    {"type": "org.slf4j.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.8, "rationale": "structured log emission: minimal queryable telemetry"},
+    {"type": "java.util.logging.Logger", "category": "log", "control": "RC-061", "role": "satisfies", "confidence": 0.75, "rationale": "JUL emission feeds log aggregation when a handler ships it"},
+    {"type": "io.sentry.Sentry", "category": "error_capture", "control": "RC-027", "role": "satisfies", "confidence": 0.9, "rationale": "sentry captures aggregate errors centrally with alerting"},
+    {"type": "io.opentelemetry.api.trace.Tracer", "category": "trace", "control": "RC-046", "role": "satisfies", "confidence": 0.9, "rationale": "an OTel span at the I/O boundary carries trace context end to end"}
+  ]
+}

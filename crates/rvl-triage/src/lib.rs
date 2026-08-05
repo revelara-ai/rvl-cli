@@ -76,6 +76,11 @@ pub struct ClassJudgment {
     pub severity: String,
     #[serde(default)]
     pub fix: String,
+    /// Control reference (e.g. "RC-043"), empty if the judgment names none.
+    /// This is how a finding is born control-mapped: the judgment layer owns
+    /// the mapping and triage only carries it through.
+    #[serde(default)]
+    pub control: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +89,8 @@ pub struct TriagedItem {
     pub disposition: String,
     pub severity: String,
     pub fix: String,
+    /// Control reference carried from the class judgment (e.g. "RC-043").
+    pub control: String,
     pub site_count: usize,
     pub example_sites: Vec<String>,
 }
@@ -138,6 +145,7 @@ pub fn triage(
                     .unwrap_or_else(|| "unjudged".into()),
                 severity: j.map(|j| j.severity.clone()).unwrap_or_default(),
                 fix: j.map(|j| j.fix.clone()).unwrap_or_default(),
+                control: j.map(|j| j.control.clone()).unwrap_or_default(),
                 site_count: ids.len(),
                 example_sites: ids.into_iter().take(3).collect(),
                 class: k,
@@ -235,8 +243,36 @@ mod tests {
             verdict: "low_value".into(),
             severity: "low".into(),
             fix: String::new(),
+            control: String::new(),
         }];
         assert!(triage(&s, &v, &j).is_empty());
+    }
+
+    #[test]
+    fn judgment_control_reference_flows_to_the_triaged_item() {
+        // A finding is born control-mapped: the judgment names the control and
+        // triage must carry it through, never invent or drop it.
+        let s = vec![site("app/cfg.py", 3, "secret", "aws_access_key_id")];
+        let v = vec![(
+            s[0].site_key(),
+            Verdict::Violates,
+            "hardcoded AWS access key ID".to_string(),
+        )];
+        let j = vec![ClassJudgment {
+            api: "secret.aws_access_key_id".into(),
+            scope: "runtime".into(),
+            verdict: "surface".into(),
+            severity: "high".into(),
+            fix: "rotate and move to a secret manager".into(),
+            control: "RC-043".into(),
+        }];
+        let items = triage(&s, &v, &j);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].control, "RC-043");
+        assert_eq!(items[0].disposition, "surface");
+        // An unjudged class carries no control.
+        let bare = triage(&s, &v, &[]);
+        assert_eq!(bare[0].control, "");
     }
 
     #[test]

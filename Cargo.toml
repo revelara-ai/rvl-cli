@@ -3,13 +3,26 @@ resolver = "2"
 members = [
     "crates/rvlscan",
     "crates/rvl-cache",
+    "crates/rvl-content",
     "crates/rvl-triage",
     "crates/rvl-index",
     "crates/rvl-core",
+    "crates/rvl-data",
+    "crates/rvl-skills",
     "crates/rvl-spec",
     "crates/rvl-propagate",
     "crates/rvl-eval",
+    "crates/rvl-config",
+    "crates/rvl-structure",
+    "crates/rvl-emission",
+    "crates/cindex",
+    "crates/rustindex",
 ]
+
+# The rustindex fixture is its own cargo workspace (stub crates named like the
+# real reqwest/sqlx/... so SCIP monikers are realistic); keep cargo from
+# treating it as part of this one.
+exclude = ["crates/rustindex/testdata/fixture"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,12 +37,15 @@ serde_json = "1"
 serde_yaml = "0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 ureq = "2"
+tar = "0.4"
+flate2 = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]

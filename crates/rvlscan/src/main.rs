@@ -1,4 +1,6 @@
 use std::io::IsTerminal;
+mod agent;
+mod config_lane;
 mod render;
 mod report;
 mod shared_config;
@@ -54,6 +56,20 @@ enum Cmd {
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+        /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
+        /// one-line deprecation notice and runs the deterministic scan.
+        /// Consented hook adjudication is configured separately
+        /// (po-av01j.15, `--hook`); this flag never invokes a model.
+        #[arg(long)]
+        agent: bool,
+        /// Name the git hook this scan runs under (pre-commit|pre-push).
+        /// With `--incremental`, enables the CONSENTED hook-mode agent
+        /// adjudication lane for delta-scoped undecided sites — OFF by
+        /// default at every layer; see `scanner.use_agent` and
+        /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
+        /// deterministic scan and its exit behavior are unchanged either way.
+        #[arg(long)]
+        hook: Option<String>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method` and a site count,
@@ -140,6 +156,82 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    /// Install the Revelara workflow skills and lenses (the /rvl:scan lens
+    /// set, CAST/STPA interrogatory workflows, assessment skills) into your
+    /// coding-agent harness. Download-only: content is fetched from the
+    /// Revelara API, verified, and cached; nothing leaves this machine.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+    // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
+    // contract (same subcommands/flags, byte-identical --format=json);
+    // implementations live in crates/rvl-data with golden-parity suites. ---
+    /// Configure Revelara API credentials interactively
+    Login,
+    /// Remove stored credentials from ~/.revelara/config.yaml
+    Logout,
+    /// Check connection and authentication status
+    Status,
+    /// Manage risk lifecycle (list, ready, show, context, stale, resolve, accept)
+    Risk {
+        #[command(subcommand)]
+        cmd: rvl_data::risk::RiskCmd,
+    },
+    /// Query the reliability controls catalog (list, show)
+    Control {
+        #[command(subcommand)]
+        cmd: rvl_data::control::ControlCmd,
+    },
+    /// Query the organizational knowledge base (search, facts, procedures, patterns)
+    Knowledge {
+        #[command(subcommand)]
+        cmd: rvl_data::knowledge::KnowledgeCmd,
+    },
+    /// Manage control evidence (submit, list, verify)
+    Evidence {
+        #[command(subcommand)]
+        cmd: rvl_data::evidence::EvidenceCmd,
+    },
+}
+
+/// The `scan --agent` compatibility notice. One line, stderr, then the
+/// deterministic scan proceeds. Extended per po-av01j.15 with the consented
+/// hook-adjudication pointer.
+fn agent_alias_notice() {
+    eprintln!(
+        "note: --agent is a deprecated rvl-cli compatibility alias; rvlscan runs its \
+         deterministic scan (no model calls) — drop --agent. For consented agent \
+         adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
+         scanner.agent_hooks in .revelara.yaml and run 'rvlscan scan --incremental \
+         --hook <pre-commit|pre-push>'; see 'rvlscan skills' for the agent-side \
+         workflow surface"
+    );
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// Install skills into a harness. With no name, installs into every
+    /// detected harness (Claude Code first).
+    Install {
+        /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
+        harness: Option<String>,
+        /// Stage files but do not run the harness's plugin registration
+        /// commands (Claude Code); they are printed for manual use instead.
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Update installed skills to the served version. With no name, updates
+    /// every harness recorded by a previous install.
+    Update {
+        /// Harness name; defaults to everything previously installed.
+        harness: Option<String>,
+        /// Stage files but do not run registration commands (Claude Code).
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Show installed, cached, and served skill versions (drift report).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -337,13 +429,111 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                 severity: it.severity.clone(),
                 incident_count: 0,
                 critical_count: 0,
-                control: String::new(),
+                control: it.control.clone(),
                 fix: it.fix.clone(),
                 site_count: it.site_count,
                 example_sites: it.example_sites.clone(),
                 // The waiver key: the readable class key `client_type.method`.
                 // Matched against `.revelara.yaml` waivers; written by suppress.
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
+// --- G7 repo-structure lane (po-av01j.7) ---
+
+/// Map repo-structure control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the facts record); every one
+/// renders ADVISORY — a structural shape never blocks a commit. The waiver
+/// key is `repo_structure.RC-XXX`, so `rvlscan suppress` and `.revelara.yaml`
+/// waivers work on these like any other finding.
+fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("repo_structure.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f.evidence.first().cloned().unwrap_or_else(|| "repo".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium/low severity + zero incident counts is
+                // exactly the Advisory cell of render::classify. Structure
+                // verdicts are judged by the evaluator itself, so they are
+                // not "unjudged" (which would print "severity unrated").
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
+/// The ladder findings for this scan's repo-structure lane. Live scans
+/// inventory the tree directly; a `--retrieved` scan has no tree, so the
+/// facts come from the `repo_structure` record riding the prebuilt stream
+/// (absent record = no facts = no findings, honestly).
+fn resolve_structure_findings(
+    retrieved: Option<&Path>,
+    stream: &str,
+    path: &Path,
+) -> Vec<render::Finding> {
+    let facts = if retrieved.is_some() {
+        rvl_structure::parse_record(stream)
+    } else {
+        Some(rvl_structure::retrieve(path, &snapshot_name(path)))
+    };
+    facts
+        .map(|f| structure_to_findings(&rvl_structure::evaluate(&f)))
+        .unwrap_or_default()
+}
+
+// --- G2 server-entry lane (po-av01j.3) ---
+
+/// Map server-entry control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the lane's record); every one
+/// renders ADVISORY — a missing health endpoint or rate limiter is real
+/// exposure but not a commit-blocker, and limiting may live at a gateway the
+/// scanner cannot see. The waiver key is `server_entry.RC-XXX`, so
+/// `rvlscan suppress` and `.revelara.yaml` waivers work on these like any
+/// other finding.
+fn server_to_findings(
+    findings: &[rvl_propagate::server_entry::ServerEntryFinding],
+) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("server_entry.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f
+                    .evidence
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "server".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium severity + zero incident counts is the
+                // Advisory cell of render::classify, same as the structure
+                // lane: judged by the evaluator, so never "unjudged".
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
                 suppressed: false,
             }
         })
@@ -360,14 +550,21 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript) makes it a stable `BTreeMap` key, so a
-/// multi-language incremental retrieval runs helpers in the same deterministic
-/// order the single-command path documents.
+/// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
+/// stable `BTreeMap` key, so a multi-language incremental retrieval runs
+/// helpers in the same
+/// deterministic order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
+    Rust,
     TypeScript,
+    CSharp,
+    Java,
+    /// One retriever for both C and C++ (cindex, po-av01j.12): the compile
+    /// db, not the extension, decides how a TU parses.
+    CCpp,
 }
 
 impl Lang {
@@ -376,7 +573,11 @@ impl Lang {
         match self {
             Lang::Go => "goindex",
             Lang::Python => "pyindex",
+            Lang::Rust => "rustindex",
             Lang::TypeScript => "tsindex",
+            Lang::CSharp => "csindex",
+            Lang::Java => "javaindex",
+            Lang::CCpp => "cindex",
         }
     }
     /// The env var that overrides helper discovery for this language.
@@ -384,7 +585,11 @@ impl Lang {
         match self {
             Lang::Go => "RVLSCAN_GOINDEX",
             Lang::Python => "RVLSCAN_PYINDEX",
+            Lang::Rust => "RVLSCAN_RUSTINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
+            Lang::CSharp => "RVLSCAN_CSINDEX",
+            Lang::Java => "RVLSCAN_JAVAINDEX",
+            Lang::CCpp => "RVLSCAN_CINDEX",
         }
     }
 }
@@ -394,19 +599,29 @@ impl std::fmt::Display for Lang {
         f.write_str(match self {
             Lang::Go => "Go",
             Lang::Python => "Python",
+            Lang::Rust => "Rust",
             Lang::TypeScript => "TypeScript",
+            Lang::CSharp => "C#",
+            Lang::Java => "Java",
+            Lang::CCpp => "C/C++",
         })
     }
 }
 
-/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex
-/// executable on PATH) runs directly; a pyindex `.py` script runs under
-/// `python3`, and a tsindex `.js` script runs under `node`.
+/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex/
+/// javaindex executable on PATH) runs directly; a pyindex `.py` script runs
+/// under `python3`, a tsindex `.js` script runs under `node`, a javaindex
+/// `.java` source file runs under `java` (JEP 330 source-file mode: in-memory
+/// compile, no packaging step, JDK 11+), and a csindex `.dll` (a
+/// framework-dependent .NET build) runs under `dotnet`. A csindex published
+/// with an apphost is a plain executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
     Executable,
     PyScript,
     NodeScript,
+    DotnetAssembly,
+    JavaSource,
 }
 
 /// A helper located on disk, ready to be turned into a command.
@@ -427,18 +642,49 @@ fn is_declaration_ts(path: &Path) -> bool {
         .is_some_and(|n| n.ends_with(".d.ts"))
 }
 
+/// Whether the root directory itself carries a C# project marker (`*.csproj`
+/// or `*.sln`). Unlike `go.mod`/`tsconfig.json` the marker's NAME varies per
+/// project, so this is a single non-recursive `read_dir` over root, not a
+/// fixed-name `is_file` probe.
+fn has_csharp_marker(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x == "csproj" || x == "sln")
+    })
+}
+
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`) short-circuit, otherwise a walk that skips vendored/build
-/// dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`). Order is
-/// stable (Go, Python, TypeScript) so a multi-language repo runs its helpers in
-/// a deterministic order.
+/// `Cargo.toml`, `tsconfig.json`, a root `*.csproj`/`*.sln`, `pom.xml`,
+/// `build.gradle`, `build.gradle.kts`, `compile_commands.json`)
+/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
+/// `*.go` / `*.py` / `*.rs` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` /
+/// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
+/// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
+/// helpers in a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
+    let mut rs = root.join("Cargo.toml").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
-    if !(go && py && ts) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts);
+    let mut cs = has_csharp_marker(root);
+    let mut java = root.join("pom.xml").is_file()
+        || root.join("build.gradle").is_file()
+        || root.join("build.gradle.kts").is_file();
+    // The compile db is the C/C++ marker (and the retrieval tier gate); bare
+    // sources without one still detect via the walk and ride the allowlist
+    // fallback tier.
+    let mut cc = root.join("compile_commands.json").is_file()
+        || root.join("build").join("compile_commands.json").is_file();
+    if !(go && py && rs && ts && cs && java && cc) {
+        walk_for_sources(
+            root, &mut go, &mut py, &mut rs, &mut ts, &mut cs, &mut java, &mut cc,
+        );
     }
     let mut out = Vec::new();
     if go {
@@ -447,20 +693,42 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if py {
         out.push(Lang::Python);
     }
+    if rs {
+        out.push(Lang::Rust);
+    }
     if ts {
         out.push(Lang::TypeScript);
+    }
+    if cs {
+        out.push(Lang::CSharp);
+    }
+    if java {
+        out.push(Lang::Java);
+    }
+    if cc {
+        out.push(Lang::CCpp);
     }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts` when a `.go`/`.py`/`.ts`|`.tsx`
-/// (non-`.d.ts`) file is seen, and stops early once all three are found. Skips
-/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout
-/// does not turn detection into a full-tree crawl.
-fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
+/// Bounded directory walk: sets `go`/`py`/`rs`/`ts`/`cs`/`java`/`cc` when a
+/// matching source file is seen, and stops early once all are found. Skips
+/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big
+/// checkout does not turn detection into a full-tree crawl.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_sources(
+    root: &Path,
+    go: &mut bool,
+    py: &mut bool,
+    rs: &mut bool,
+    ts: &mut bool,
+    cs: &mut bool,
+    java: &mut bool,
+    cc: &mut bool,
+) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts {
+        if *go && *py && *rs && *ts && *cs && *java && *cc {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -478,7 +746,11 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("go") => *go = true,
                     Some("py") => *py = true,
+                    Some("rs") => *rs = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("cs" | "csproj" | "sln") => *cs = true,
+                    Some("java") => *java = true,
+                    Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
                     _ => {}
                 }
             }
@@ -486,18 +758,25 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
     }
 }
 
-/// Classify a resolved helper path into how it must be invoked. Go helpers are
-/// always executables; a Python helper is a `python3` script when it ends in
-/// `.py`, a TypeScript helper is a `node` script when it ends in `.js`,
+/// Classify a resolved helper path into how it must be invoked. Go, Rust, and
+/// C/C++ helpers are always executables (rustindex and cindex are workspace
+/// binaries built next to rvlscan); a Python helper is a `python3` script when
+/// it ends in `.py`, a TypeScript helper is a `node` script when it ends in
+/// `.js`, a Java helper is a `java` source-file script when it ends in
+/// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
 /// otherwise an executable on PATH.
 fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
     let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
-        Lang::Go => HelperKind::Executable,
+        Lang::Go | Lang::Rust | Lang::CCpp => HelperKind::Executable,
         Lang::Python if ext == Some("py") => HelperKind::PyScript,
         Lang::Python => HelperKind::Executable,
         Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
         Lang::TypeScript => HelperKind::Executable,
+        Lang::CSharp if ext == Some("dll") => HelperKind::DotnetAssembly,
+        Lang::CSharp => HelperKind::Executable,
+        Lang::Java if ext == Some("java") => HelperKind::JavaSource,
+        Lang::Java => HelperKind::Executable,
     };
     ResolvedHelper {
         path: path.to_path_buf(),
@@ -537,7 +816,9 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     let script_name = match lang {
         Lang::Python => Some(format!("{base}.py")),
         Lang::TypeScript => Some(format!("{base}.js")),
-        Lang::Go => None,
+        Lang::CSharp => Some(format!("{base}.dll")),
+        Lang::Java => Some(format!("{base}.java")),
+        Lang::Go | Lang::Rust | Lang::CCpp => None,
     };
     // (2) adjacent to the rvlscan binary.
     if let Ok(exe) = std::env::current_exe() {
@@ -599,6 +880,14 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
             .chain(std::iter::once(helper_path))
             .chain(tail)
             .collect(),
+        HelperKind::DotnetAssembly => std::iter::once("dotnet".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::JavaSource => std::iter::once("java".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
     }
 }
 
@@ -639,10 +928,11 @@ fn snapshot_name(path: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
-/// Collect the candidate source files (`*.go` / `*.py`) under `root` for the
-/// incremental hash-gate, using the same bounded, vendored-dir-skipping walk
-/// `detect_languages` relies on. Paths are `root`-prefixed so they hash
-/// directly and strip cleanly back to the repo-relative form the helpers emit.
+/// Collect the candidate source files (`*.go` / `*.py` / `*.ts` / `*.cs`)
+/// under `root` for the incremental hash-gate, using the same bounded,
+/// vendored-dir-skipping walk `detect_languages` relies on. Paths are
+/// `root`-prefixed so they hash directly and strip cleanly back to the
+/// repo-relative form the helpers emit.
 fn walk_source_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -660,7 +950,9 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py") => out.push(path),
+                    Some("go" | "py" | "rs" | "cs" | "java" | "c" | "cc" | "cpp" | "cxx") => {
+                        out.push(path)
+                    }
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
@@ -685,11 +977,18 @@ fn repo_relative(root: &Path, file: &Path) -> String {
 
 /// The language whose helper retrieves a given source file, by extension. A
 /// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
+/// C/C++ HEADERS map to no helper: which TUs a changed header invalidates
+/// needs the include graph, so header edits ride the full-rescan path rather
+/// than guessing an incremental subset (follow-up bead under po-av01j.12).
 fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
+        Some("rs") => Some(Lang::Rust),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("cs") => Some(Lang::CSharp),
+        Some("java") => Some(Lang::Java),
+        Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
 }
@@ -722,6 +1021,19 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
     Ok(combined)
 }
 
+/// What the resolve -> propagate -> triage pipeline hands back: the G1
+/// findings and triaged items, the G1 sites they are index-aligned with
+/// (server-entry sites are partitioned out), the loaded spec cache so callers
+/// can run the G6 config lane against the same specs, and the G2 server-entry
+/// lane's control findings (po-av01j.3).
+type ResolvedScan = (
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+    rvl_spec::SpecCache,
+    Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+);
+
 /// The scan: packets + verified specs -> propagation -> triage.
 /// Deterministic, no model calls. Undecided outcomes are reported in the
 /// coverage section, never promoted to a violation.
@@ -739,11 +1051,7 @@ fn resolve_findings(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
         store,
@@ -762,6 +1070,10 @@ fn resolve_findings(
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
 /// directly, skipping `parse_stream`.
+/// Also returns the loaded [`rvl_spec::SpecCache`] so callers can run the G6
+/// config lane against the SAME specs the code lane used (one signed artifact
+/// carries both; loading twice would double the verification and the
+/// staleness chatter).
 #[allow(clippy::too_many_arguments)]
 fn findings_from_sites(
     store: &CacheStore,
@@ -773,11 +1085,7 @@ fn findings_from_sites(
     judgments: Option<&std::path::Path>,
     policy_root: Option<&std::path::Path>,
     verbose: bool,
-) -> anyhow::Result<(
-    Vec<rvl_propagate::Finding>,
-    Vec<rvl_triage::TriagedItem>,
-    Vec<rvl_core::Site>,
-)> {
+) -> anyhow::Result<ResolvedScan> {
     let specs_text = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
@@ -814,6 +1122,21 @@ fn findings_from_sites(
         !sites.is_empty(),
         "no parseable sites in the retrieved packet stream"
     );
+    // G2 (po-av01j.3): server-entry records ride the same stream but are
+    // judged by their own lane. Partition them out BEFORE propagation so the
+    // G1 coverage numbers, the `--out` eval rows, and the shape-only report
+    // all stay client-call-only (server-entry surfaces are control-level spec
+    // questions, not API-spec mint candidates).
+    let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
+        .into_iter()
+        .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
+    // G4 (po-av01j.5): emission-point aggregates ride the same stream but are
+    // NOT client-call surfaces. Partition them out before propagation so they
+    // never enter G1 coverage totals, `--out` eval rows, or triage classes;
+    // the emission lane consumes them below. (rvl_propagate::propagate also
+    // guards on site_kind — defense in depth for other stream consumers.)
+    let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_emission_point());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
@@ -831,6 +1154,9 @@ fn findings_from_sites(
             let overlay = rvl_spec::SpecFile {
                 apis: vec![],
                 scopes: vec![],
+                config_keys: vec![],
+                server: vec![],
+                emissions: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -849,10 +1175,16 @@ fn findings_from_sites(
     let served = cache.served_bound(repo_cfg);
     let client = cache.client_bound_by_family(repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
+    let server_findings = rvl_propagate::server_entry::evaluate(&server_sites, &cache);
 
     if verbose {
+        let server_note = if server_sites.is_empty() {
+            String::new()
+        } else {
+            format!(" | server-entry {}", server_sites.len())
+        };
         println!(
-            "sites {} | specs {} | unparseable lines {skipped}",
+            "sites {}{server_note} | specs {} | unparseable lines {skipped}",
             sites.len(),
             cache.len()
         );
@@ -873,8 +1205,134 @@ fn findings_from_sites(
         .zip(sites.iter())
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
-    let items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
-    Ok((findings, items, sites))
+    let mut items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    // Emission lane (G4): judge the emission inventory against RC-027/RC-046/
+    // RC-061 with the cache's emission specs. Only violations surface, as
+    // triage items keyed `emission.RC-XXX` — the same waiver/suppress surface
+    // every other finding uses. Advisory by construction (severity is never
+    // "high"): an observability gap warrants a conversation, not a blocked
+    // commit.
+    items.extend(emission_items(
+        &sites,
+        &emission_sites,
+        cache.emission_specs(),
+    ));
+    Ok((findings, items, sites, cache, server_findings))
+}
+
+/// Map emission-lane violations into triage items. The class key is
+/// (`emission`, control code), so the ladder renders `emission.RC-XXX — <why>`
+/// and `.revelara.yaml` waivers / `rvlscan suppress` match on
+/// `emission.RC-XXX` like any other class rule.
+fn emission_items(
+    call_sites: &[rvl_core::Site],
+    emission_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::EmissionSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_emission::evaluate(call_sites, emission_sites, specs)
+        .into_iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "emission".into(),
+                method: f.control.to_string(),
+                // The control name leads so the ladder line reads
+                // "emission.RC-046 — distributed tracing: <why>".
+                reason: format!("{}: {}", f.control_name, f.reason),
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            control: f.control.to_string(),
+            site_count: f.evidence.len().max(1),
+            example_sites: f.evidence.into_iter().take(3).collect(),
+        })
+        .collect()
+}
+
+// --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---
+//
+// A pure-Rust in-process lane (crates/rvl-content), not an external helper:
+// content-pattern scanning needs no language toolchain, so the helper model's
+// per-target packaging cost buys nothing here. Content findings ride the same
+// packet schema (`client_type` "secret", `method` = rule id, snippet = masked
+// preview ONLY) and the same triage/waiver/render machinery, but they are kept
+// OUT of the spec-lane plumbing on purpose: never in coverage totals (they are
+// not API surfaces), never in `--out` eval rows (the eval harness scores spec
+// verdicts), and never in the shape-only report (their sites carry file paths,
+// which the report contract forbids).
+
+/// The control every content-lane secret finding maps to: RC-043, centralized
+/// secret management. The judgment layer owns control mapping; the content
+/// lane's judgments are built in, so its findings are born mapped.
+const SECRETS_CONTROL: &str = "RC-043";
+
+/// Fix guidance, from RC-043's remediation: an exposed secret is compromised
+/// the moment it is committed, so rotation is part of the fix, not an option.
+const SECRETS_FIX: &str = "remove the secret from source, rotate it immediately, and load it \
+     from a centralized secret manager (RC-043)";
+
+/// Built-in class judgments for content findings, one per rule x scope class.
+/// Token shapes are high severity (blocking) everywhere except test support,
+/// where a planted fixture credential is the common case; the generic entropy
+/// rule stays medium (advisory) everywhere because shape alone is weak
+/// evidence. `verdict` is always `surface`: a matched secret is never spam.
+fn content_judgments(findings: &[rvl_content::ContentFinding]) -> Vec<rvl_triage::ClassJudgment> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for f in findings {
+        if !seen.insert((f.rule_id.clone(), f.severity.clone())) {
+            continue;
+        }
+        for scope in [
+            "runtime",
+            "migration",
+            "test_support",
+            "dev_only",
+            "backfill",
+        ] {
+            let severity = if scope == "test_support" || f.severity != "high" {
+                "medium"
+            } else {
+                "high"
+            };
+            out.push(rvl_triage::ClassJudgment {
+                api: format!("secret.{}", f.rule_id),
+                scope: scope.to_string(),
+                verdict: "surface".to_string(),
+                severity: severity.to_string(),
+                fix: SECRETS_FIX.to_string(),
+                control: SECRETS_CONTROL.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Run the content lane over `path` and triage its findings into ladder items.
+/// Verdicts are pre-decided (`Violates`): a content-pattern match IS the
+/// evidence, there is no spec question to propagate. The waiver key downstream
+/// is the class rule `secret.<rule_id>`, so `rvlscan suppress` and hand-written
+/// `.revelara.yaml` waivers work unchanged (po-3t3oj.27).
+fn content_items(path: &Path) -> Vec<rvl_triage::TriagedItem> {
+    let findings = rvl_content::scan_root(path);
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let sites = rvl_content::to_sites(&findings, &snapshot_name(path));
+    let rows: Vec<(String, rvl_core::Verdict, String)> = sites
+        .iter()
+        .zip(findings.iter())
+        .map(|(s, f)| {
+            (
+                s.site_key(),
+                rvl_core::Verdict::Violates,
+                f.description.clone(),
+            )
+        })
+        .collect();
+    rvl_triage::triage(&sites, &rows, &content_judgments(&findings))
 }
 
 /// Resolve the color decision, honoring `--color` then NO_COLOR and a non-tty
@@ -904,8 +1362,41 @@ fn run_scan(
     color: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+    // Content lane first: it is language-agnostic, so it must not depend on
+    // the language pipeline having anything to do. With `--retrieved` the scan
+    // is an escape-hatch replay of a prebuilt stream, possibly from another
+    // tree entirely, so scanning PATH's content would mix two repos: skip.
+    let citems = if retrieved.is_none() {
+        content_items(path)
+    } else {
+        Vec::new()
+    };
+    // A repo with no supported languages but WITH content findings (an
+    // .env/terraform tree) still gets a scan: the ladder is the content lane
+    // alone and coverage reports zero API surfaces. Without content findings
+    // the original fail-closed guidance stands.
+    if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
+        // Content-only repo: no packet stream exists, so the structure lane
+        // inventories the live tree directly (same as the incremental path).
+        // The config lane is skipped on this early path (no spec cache gets
+        // resolved before the return) -- follow-up tracked on the epic.
+        let structure = resolve_structure_findings(None, "", path);
+        return render_scan_output(
+            state_path,
+            path,
+            &[],
+            &citems,
+            &[],
+            &structure,
+            None,
+            None,
+            out,
+            color,
+            start,
+        );
+    }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (findings, items, sites) = resolve_findings(
+    let (findings, mut items, sites, specs, server) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -914,8 +1405,25 @@ fn run_scan(
         Some(path),
         true,
     )?;
+    items.extend(citems);
+    // Structure + server-entry lanes join the ladder at the same seam: both
+    // are control-mapped advisory findings outside the per-class triage.
+    let mut structure = resolve_structure_findings(retrieved, &stream, path);
+    structure.extend(server_to_findings(&server));
+    // The G6 config lane: same repo, same specs, per-format retrievers.
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
     render_scan_output(
-        state_path, path, &findings, &items, &sites, out, color, start,
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        &structure,
+        Some(&lane),
+        None,
+        out,
+        color,
+        start,
     )
 }
 
@@ -982,6 +1490,9 @@ fn render_scan_output(
     findings: &[rvl_propagate::Finding],
     items: &[rvl_triage::TriagedItem],
     sites: &[rvl_core::Site],
+    structure: &[render::Finding],
+    config: Option<&config_lane::LaneOutput>,
+    hook_agent: Option<&agent::HookOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -1011,6 +1522,24 @@ fn render_scan_output(
         }
     }
     let mut ladder_findings = triage_to_findings(items);
+    // Repo-structure lane findings join the ladder (always Advisory) and the
+    // persisted last-scan state, so explain/suppress resolve their ids too.
+    ladder_findings.extend(structure.iter().cloned());
+    // Config-lane findings join the ladder as ordinary rows BEFORE waivers,
+    // so a `.revelara.yaml` waiver on `<format>.<key>` suppresses them the
+    // same way it suppresses a code class.
+    if let Some(lane) = config {
+        ladder_findings.extend(lane.findings.iter().cloned());
+    }
+    // Hook-mode agent adjudication (po-av01j.15): gate-mode rows join the
+    // ladder BEFORE waivers (so `agent.<type>.<method>` waivers suppress them
+    // like any class) — this list is EMPTY unless the repo committed
+    // `scanner.agent_verdicts: gate`; advisory verdicts live only in the
+    // agent block printed after the ladder. The eval rows (`--out`) below are
+    // built from `findings`, which agent verdicts never touch.
+    if let Some(a) = hook_agent {
+        ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -1032,8 +1561,21 @@ fn render_scan_output(
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
         "{}",
-        render::render_ladder(&ladder_findings, coverage, &elapsed, stdout_color(color))
+        render::render_ladder(
+            &ladder_findings,
+            coverage,
+            config.map(|lane| &lane.coverage),
+            &elapsed,
+            stdout_color(color)
+        )
     );
+    // The agent block renders AFTER the ladder, in its own provenance-tagged
+    // section — agent output never mixes into the deterministic sections.
+    if let Some(a) = hook_agent {
+        if !a.block.is_empty() {
+            print!("\n{}", a.block);
+        }
+    }
 
     if let Some(p) = out {
         let rows: Vec<FindingOut> = findings
@@ -1236,6 +1778,11 @@ struct IncrementalScan {
     reused_files: usize,
     retrieved_files: usize,
     degraded_note: Option<String>,
+    /// Repo-relative paths of the files this pass considered CHANGED — the
+    /// delta the hook-mode agent adjudication lane is scoped to (po-av01j.15).
+    /// On a degraded pass the changed files were not retrieved, so they carry
+    /// no sites and the delta batch is naturally empty.
+    changed_files: Vec<String>,
 }
 
 /// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
@@ -1251,6 +1798,11 @@ where
     F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
 {
     let plan = index.plan_reload(candidates);
+    let changed_files: Vec<String> = plan
+        .changed
+        .iter()
+        .map(|f| repo_relative(root, f))
+        .collect();
 
     // Reuse indexed packets for the unchanged files.
     let mut reused = Vec::new();
@@ -1299,6 +1851,7 @@ where
         reused_files,
         retrieved_files,
         degraded_note: rr.degraded_note,
+        changed_files,
     })
 }
 
@@ -1493,6 +2046,7 @@ fn run_scan_incremental(
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
+    hook: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     let scan = incremental_scan_pass(index_dir, path, strict)?;
@@ -1506,7 +2060,7 @@ fn run_scan_incremental(
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
-    let (findings, items, sites) = findings_from_sites(
+    let (findings, mut items, sites, specs, server) = findings_from_sites(
         store,
         keyset,
         scan.sites,
@@ -1517,8 +2071,46 @@ fn run_scan_incremental(
         Some(path),
         true,
     )?;
+    // The content lane is cheap (one regex pass over the tree) and its rules
+    // change with the binary, not the sources, so it runs FULL on every warm
+    // scan rather than riding the packet index.
+    items.extend(content_items(path));
+    // Incremental scans own the live tree, so the structure lane inventories
+    // it directly (one bounded walk; there is no packet stream to ride). The
+    // server-entry lane rode the packet index like every other site.
+    let mut structure = resolve_structure_findings(None, "", path);
+    structure.extend(server_to_findings(&server));
+    // Config files are not content-hash indexed (parsing them is cheap): the
+    // lane simply re-runs on every warm scan, so it can never be stale.
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    // Hook-mode agent adjudication (po-av01j.15): runs AFTER the deterministic
+    // pipeline is fully assembled, under its own consent + budget, over the
+    // delta-scoped undecided sites only. Every failure path fails open; the
+    // deterministic result above is never at risk.
+    let hook_agent = hook.and_then(|h| {
+        agent::run_hook_adjudication(
+            h,
+            path,
+            &scan.changed_files,
+            &findings,
+            &sites,
+            &agent::telemetry_path_from_state(state_path),
+            env!("CARGO_PKG_VERSION"),
+            stdout_color(color),
+        )
+    });
     render_scan_output(
-        state_path, path, &findings, &items, &sites, out, color, start,
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        &structure,
+        Some(&lane),
+        hook_agent.as_ref(),
+        out,
+        color,
+        start,
     )
 }
 
@@ -1563,7 +2155,7 @@ fn run_explain(
         return Ok(ExitCode::SUCCESS);
     }
     let stream = resolve_packet_stream(retrieved, path)?;
-    let (_findings, items, _sites) = resolve_findings(
+    let (_findings, mut items, _sites, specs, server) = resolve_findings(
         store,
         keyset,
         &stream,
@@ -1572,7 +2164,17 @@ fn run_explain(
         Some(path),
         false,
     )?;
-    let ladder_findings = triage_to_findings(&items);
+    // Mirror the scan's content lane so a `secret.*` finding id resolves in
+    // the live fallback too (skipped for --retrieved, same as scan).
+    if retrieved.is_none() {
+        items.extend(content_items(path));
+    }
+    let mut ladder_findings = triage_to_findings(&items);
+    ladder_findings.extend(resolve_structure_findings(retrieved, &stream, path));
+    ladder_findings.extend(server_to_findings(&server));
+    // Config-lane ids resolve here too: the fresh scan mirrors what the
+    // ladder printed, config rows included.
+    ladder_findings.extend(config_lane::run(path, &specs, &snapshot_name(path)).findings);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1618,7 +2220,7 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path)?;
-                let (_findings, items, _sites) = resolve_findings(
+                let (_findings, mut items, _sites, specs, server) = resolve_findings(
                     store,
                     keyset,
                     &stream,
@@ -1627,7 +2229,16 @@ fn run_suppress(
                     Some(scan_path),
                     false,
                 )?;
-                let ladder_findings = triage_to_findings(&items);
+                // Same content-lane mirror as explain's live fallback.
+                if retrieved.is_none() {
+                    items.extend(content_items(scan_path));
+                }
+                let mut ladder_findings = triage_to_findings(&items);
+                ladder_findings.extend(resolve_structure_findings(retrieved, &stream, scan_path));
+                ladder_findings.extend(server_to_findings(&server));
+                ladder_findings.extend(
+                    config_lane::run(scan_path, &specs, &snapshot_name(scan_path)).findings,
+                );
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -1694,7 +2305,10 @@ fn run_report(
         if let Some(note) = &scan.degraded_note {
             eprintln!("incremental: degraded (fail-open): {note}");
         }
-        let (findings, _items, sites) = findings_from_sites(
+        // Server-entry sites were partitioned out of `sites` inside the
+        // pipeline: they are control-level spec questions, never candidates
+        // for the shape-only API-surface report.
+        let (findings, _items, sites, _specs, _server) = findings_from_sites(
             store,
             keyset,
             scan.sites,
@@ -1708,7 +2322,7 @@ fn run_report(
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path)?;
-        let (findings, _items, sites) =
+        let (findings, _items, sites, _specs, _server) =
             resolve_findings(store, keyset, &stream, specs_file, None, Some(path), false)?;
         (findings, sites)
     };
@@ -1777,6 +2391,251 @@ fn render_report_human(report: &report::Report) -> String {
     s
 }
 
+// --- skills distribution: install workflow skills/lenses into harnesses (po-av01j.14) ---
+
+/// Is `binary` a file on PATH? Used only to decide between running the
+/// Claude Code registration commands and printing them for manual use.
+fn binary_on_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|d| d.join(binary).is_file())
+}
+
+/// Print a registration's commands in copy-pasteable form.
+fn print_registration_commands(reg: &rvl_skills::harness::Registration) {
+    for argv in &reg.commands {
+        println!("  {} {}", reg.binary, argv.join(" "));
+    }
+}
+
+/// Run the harness registration commands (e.g. `claude plugin marketplace
+/// add`). The first command is cleanup and may fail harmlessly; any later
+/// failure falls back to printing the remaining commands for manual use.
+fn run_registration(reg: &rvl_skills::harness::Registration) {
+    for (i, argv) in reg.commands.iter().enumerate() {
+        let result = std::process::Command::new(reg.binary).args(argv).output();
+        let ok = match &result {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+        if ok || i == 0 {
+            continue; // cleanup (i == 0) is best-effort: nothing to remove is fine
+        }
+        let detail = match result {
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        eprintln!(
+            "registration step '{} {}' failed: {detail}",
+            reg.binary,
+            argv.join(" ")
+        );
+        eprintln!("finish registration manually:");
+        for argv in &reg.commands[i..] {
+            eprintln!("  {} {}", reg.binary, argv.join(" "));
+        }
+        return;
+    }
+    println!("registered with {}", reg.binary);
+}
+
+/// Print one install's outcome and handle its registration step.
+fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: bool) {
+    let source = if report.from_cache {
+        " (from cache)"
+    } else {
+        ""
+    };
+    println!(
+        "installed {} skills {}{source}: {} file(s) at {}",
+        report.harness,
+        report.version,
+        report.receipt.files_written,
+        report.receipt.location.display()
+    );
+    for w in &report.warnings {
+        eprintln!("  warning: {w}");
+    }
+    if let Some(reg) = &report.receipt.register {
+        if no_register {
+            println!("skipping registration (--no-register); to register manually:");
+            print_registration_commands(reg);
+        } else if binary_on_path(reg.binary) {
+            run_registration(reg);
+        } else {
+            println!(
+                "'{}' not found on PATH; to register once it is:",
+                reg.binary
+            );
+            print_registration_commands(reg);
+        }
+    }
+    println!("  {}", report.receipt.note);
+}
+
+/// Install or update the named harness, or every relevant one when omitted
+/// (install: detected harnesses; update: previously installed harnesses,
+/// falling back to detection). Mirrors `rvl plugin install/update`.
+fn run_skills_install(
+    env: &rvl_skills::flow::Env,
+    harness: Option<String>,
+    no_register: bool,
+    update: bool,
+) -> anyhow::Result<ExitCode> {
+    let supported = || rvl_skills::harness::supported_names().join(", ");
+    let targets: Vec<String> = match harness {
+        Some(name) => {
+            anyhow::ensure!(
+                rvl_skills::harness::by_name(&name).is_some(),
+                "unsupported harness: {name} (supported: {})",
+                supported()
+            );
+            vec![name]
+        }
+        None => {
+            let mut names: Vec<String> = if update {
+                env.store.read_installed().keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            if names.is_empty() {
+                names = rvl_skills::harness::detect_installed(env.home);
+            }
+            if names.is_empty() {
+                println!(
+                    "No supported coding-agent harness detected (supported: {}).",
+                    supported()
+                );
+                println!("Install one, or name it explicitly: rvlscan skills install <harness>");
+                return Ok(ExitCode::SUCCESS);
+            }
+            names
+        }
+    };
+
+    let mut failed = 0usize;
+    for name in &targets {
+        // by_name is total over `targets` by construction; skip defensively.
+        let Some(h) = rvl_skills::harness::by_name(name) else {
+            continue;
+        };
+        match rvl_skills::flow::install_one(env, h.as_ref()) {
+            Ok(report) => render_install_report(&report, no_register),
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Render the drift report, mirroring `rvl plugin list`'s UX.
+fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
+    match (&report.served_version, &report.server_note) {
+        (Some(v), _) => println!("Served plugin version: {v}"),
+        (None, Some(note)) => println!("Served plugin version: unknown ({note})"),
+        (None, None) => println!("Served plugin version: unknown"),
+    }
+
+    if report.harnesses.is_empty() {
+        println!("\nNo skills installed. Run 'rvlscan skills install'.");
+    } else {
+        println!("\nInstalled:");
+        let mut drift = false;
+        for h in &report.harnesses {
+            let state = match &h.update_available {
+                Some(v) => {
+                    drift = true;
+                    format!("update available: {v}")
+                }
+                None if report.served_version.is_some() => "up to date".to_string(),
+                None => "server version unknown".to_string(),
+            };
+            println!(
+                "  {:<10} {:<10} ({state})  {}",
+                h.harness, h.installed_version, h.location
+            );
+        }
+        if drift {
+            println!("\nRun 'rvlscan skills update' to upgrade.");
+        }
+    }
+
+    if !report.cached.is_empty() {
+        println!("\nCached:");
+        for c in &report.cached {
+            println!(
+                "  {:<10} {:<10} (fetched {})",
+                c.editor, c.version, c.fetched_at
+            );
+        }
+    }
+}
+
+/// `rvlscan skills`: resolve env/config once, then dispatch. Uses the same
+/// base URL/org key resolution as `sync` (rvlscan env > rvl-cli env >
+/// shared config file) and the spec cache's offline kill switch.
+fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
+    let skills_cache_dir = std::env::var_os("RVLSCAN_SKILLS_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
+    let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
+    let fetcher = rvl_skills::fetch::HttpFetcher {
+        base_url: cfg.base_url.clone(),
+        org_key: cfg.org_key.clone(),
+    };
+    let env = rvl_skills::flow::Env {
+        store: &store,
+        fetcher: &fetcher,
+        home: &home,
+        offline: cfg.offline,
+        allow_unsigned: std::env::var("RVLSCAN_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
+        allow_missing_checksum: std::env::var("RVLSCAN_ALLOW_MISSING_CHECKSUM")
+            .ok()
+            .as_deref()
+            == Some("1"),
+    };
+    let require_key = || {
+        anyhow::ensure!(
+            cfg.offline || !cfg.org_key.is_empty(),
+            "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
+             `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1 \
+             to install from the local cache)"
+        );
+        Ok(())
+    };
+    match cmd {
+        SkillsCmd::Install {
+            harness,
+            no_register,
+        } => {
+            require_key()?;
+            run_skills_install(&env, harness, no_register, false)
+        }
+        SkillsCmd::Update {
+            harness,
+            no_register,
+        } => {
+            require_key()?;
+            run_skills_install(&env, harness, no_register, true)
+        }
+        SkillsCmd::Status => {
+            render_skills_status(&rvl_skills::flow::status(&env));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -1784,6 +2643,19 @@ fn run() -> anyhow::Result<ExitCode> {
         use clap::CommandFactory;
         Cli::command().print_help()?;
         return Ok(ExitCode::SUCCESS);
+    };
+    // rvl-cli data-command port (po-av01j.17): these manage their own
+    // config/exit-code contract inside rvl-data (rvl-cli parity) and never
+    // touch the spec cache, so they dispatch before the store opens.
+    let cmd = match cmd {
+        Cmd::Login => return Ok(rvl_data::auth::run_login()),
+        Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
+        Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
+        Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
+        Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
+        Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
+        Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
+        other => other,
     };
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
@@ -1799,7 +2671,12 @@ fn run() -> anyhow::Result<ExitCode> {
             color,
             incremental,
             strict,
+            agent,
+            hook,
         } => {
+            if agent {
+                agent_alias_notice();
+            }
             let path = path.unwrap_or_else(|| PathBuf::from("."));
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
@@ -1815,8 +2692,18 @@ fn run() -> anyhow::Result<ExitCode> {
                     out.as_deref(),
                     color.as_deref(),
                     strict,
+                    hook.as_deref(),
                 )
             } else {
+                // Hook adjudication is delta-scoped by definition; without
+                // the incremental changed-file gate there is no delta, so the
+                // lane cannot run (the scan itself is unaffected).
+                if hook.is_some() {
+                    eprintln!(
+                        "note: --hook agent adjudication is delta-scoped and only runs with \
+                         --incremental (and without --retrieved); proceeding deterministic-only"
+                    );
+                }
                 run_scan(
                     &store,
                     &keyset,
@@ -1968,6 +2855,16 @@ fn run() -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Cmd::Skills { cmd } => run_skills(&cfg, cmd),
+        // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
+        // Evidence) returned before the store opened, above.
+        Cmd::Login
+        | Cmd::Logout
+        | Cmd::Status
+        | Cmd::Risk { .. }
+        | Cmd::Control { .. }
+        | Cmd::Knowledge { .. }
+        | Cmd::Evidence { .. } => unreachable!("data commands dispatch before the store opens"),
     }
 }
 
@@ -2028,6 +2925,74 @@ mod tests {
     }
 
     #[test]
+    fn structure_violations_render_advisory_never_blocking() {
+        let violate = rvl_structure::StructureFinding {
+            control: "RC-033",
+            control_name: "unit test coverage",
+            verdict: rvl_core::Verdict::Violates,
+            reason: "no test files: go (40 source files)".into(),
+            evidence: vec![],
+            fix: "add unit tests".into(),
+            severity: "medium",
+            weak: false,
+        };
+        let satisfies = rvl_structure::StructureFinding {
+            control: "RC-006",
+            control_name: "incident runbooks",
+            verdict: rvl_core::Verdict::Satisfies,
+            reason: "runbook directory present".into(),
+            evidence: vec!["docs/runbooks".into()],
+            fix: String::new(),
+            severity: "",
+            weak: true,
+        };
+        let fs = structure_to_findings(&[violate, satisfies]);
+        assert_eq!(fs.len(), 1, "only violations surface in the ladder");
+        let f = &fs[0];
+        assert_eq!(f.control, "RC-033", "control code rides into the ladder");
+        assert_eq!(
+            f.class_rule, "repo_structure.RC-033",
+            "waiver key lets suppress/.revelara.yaml target it"
+        );
+        assert_eq!(
+            render::classify(f),
+            render::Section::Advisory,
+            "a structural shape must never block a commit"
+        );
+    }
+
+    #[test]
+    fn live_scan_structure_findings_inventory_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.go")),
+                "package x\nfunc F() {}\n",
+            )
+            .unwrap();
+        }
+        let fs = resolve_structure_findings(None, "", dir.path());
+        assert!(
+            fs.iter().any(|f| f.control == "RC-033"),
+            "an untested live tree must surface RC-033: {fs:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_stream_without_a_record_yields_no_structure_findings() {
+        // A prebuilt stream may predate the G7 retriever; no facts means no
+        // findings — never a fabricated inventory of the CURRENT directory,
+        // which is a different repo than the stream describes.
+        let fs = resolve_structure_findings(
+            Some(Path::new("prebuilt.jsonl")),
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+            Path::new("."),
+        );
+        assert!(fs.is_empty(), "no record, no findings: {fs:?}");
+    }
+
+    #[test]
     fn detect_go_only() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("main.go"));
@@ -2064,6 +3029,38 @@ mod tests {
     }
 
     #[test]
+    fn detect_csharp_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_via_project_markers() {
+        // The marker's NAME varies per project (Svc.csproj, App.sln), so the
+        // root probe is extension-driven, unlike go.mod/tsconfig.json.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Svc.csproj"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+
+        let sln = tempfile::tempdir().unwrap();
+        touch(&sln.path().join("App.sln"));
+        assert_eq!(detect_languages(sln.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_orders_after_typescript() {
+        // Deterministic helper order: Go < Python < TypeScript < CSharp.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::CSharp]
+        );
+    }
+
+    #[test]
     fn detect_tsx_counts_but_dts_does_not() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("component.tsx"));
@@ -2076,10 +3073,127 @@ mod tests {
     }
 
     #[test]
+    fn detect_java_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("App.java"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Java]);
+    }
+
+    #[test]
+    fn detect_java_via_marker_files() {
+        for marker in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(marker));
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::Java],
+                "{marker} must mark a Java repo"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_java_orders_after_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("App.java"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::Java]
+        );
+    }
+
+    #[test]
+    fn detect_rust_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("lib.rs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_via_cargo_toml_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Cargo.toml"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_orders_between_python_and_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.py"));
+        touch(&dir.path().join("main.rs"));
+        touch(&dir.path().join("app.ts"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::Python, Lang::Rust, Lang::TypeScript]
+        );
+    }
+
+    #[test]
+    fn detect_rust_skips_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+        touch(&nested.join("build_script.rs"));
+        // The only .rs file is under target/, which is skipped.
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rust_helper_is_an_executable_and_rs_maps_to_rust() {
+        assert_eq!(
+            classify_helper(Lang::Rust, Path::new("/x/rustindex")).kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::Rust.helper_base(), "rustindex");
+        assert_eq!(Lang::Rust.env_override(), "RVLSCAN_RUSTINDEX");
+        assert_eq!(lang_of_path(Path::new("src/lib.rs")), Some(Lang::Rust));
+    }
+
+    #[test]
+
     fn detect_neither_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("README.md"));
         assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_c_cpp_via_compile_db_marker() {
+        // The compile db is the C/C++ marker even before any source is seen
+        // (and the tier gate: db-listed TUs parse with their exact flags).
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("compile_commands.json"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp]);
+
+        // The CMake build/ layout counts too.
+        let cmake = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cmake.path().join("build")).unwrap();
+        touch(&cmake.path().join("build").join("compile_commands.json"));
+        assert_eq!(detect_languages(cmake.path()), vec![Lang::CCpp]);
+    }
+
+    #[test]
+    fn detect_c_cpp_sources_without_a_db_still_detect() {
+        // Bare sources ride cindex's allowlist fallback tier; detection must
+        // not silently skip them. Headers alone do NOT detect: a header-only
+        // tree has no TU to parse.
+        for ext in ["c", "cc", "cpp", "cxx"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(format!("main.{ext}")));
+            assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp], "{ext}");
+        }
+        let headers_only = tempfile::tempdir().unwrap();
+        touch(&headers_only.path().join("api.h"));
+        assert!(detect_languages(headers_only.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_order_puts_c_cpp_last() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("main.go"));
+        touch(&dir.path().join("native.c"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::CCpp]);
     }
 
     #[test]
@@ -2160,6 +3274,126 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    #[test]
+    fn csharp_dll_argv_runs_under_dotnet() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/csindex.dll"),
+            kind: HelperKind::DotnetAssembly,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "dotnet",
+                "/opt/csindex.dll",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_cpp_helper_is_a_direct_executable() {
+        assert_eq!(
+            classify_helper(Lang::CCpp, Path::new("/x/cindex")).kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::CCpp.helper_base(), "cindex");
+        assert_eq!(Lang::CCpp.env_override(), "RVLSCAN_CINDEX");
+        let argv = helper_argv(
+            &classify_helper(Lang::CCpp, Path::new("/opt/cindex")),
+            Path::new("/repo"),
+            "repo",
+            &[],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/cindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_csharp_dll_is_an_assembly_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex.dll")).kind,
+            HelperKind::DotnetAssembly
+        );
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_cs() {
+        assert_eq!(
+            lang_of_path(Path::new("svc/Service.cs")),
+            Some(Lang::CSharp)
+        );
+        // A .csproj is a marker for detection, not a retrievable source file.
+        assert_eq!(lang_of_path(Path::new("svc/Svc.csproj")), None);
+    }
+
+    #[test]
+    fn lang_of_path_maps_c_cpp_sources_but_not_headers() {
+        assert_eq!(lang_of_path(Path::new("src/io.c")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cc")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cpp")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cxx")), Some(Lang::CCpp));
+        // Headers map to no helper: invalidating the right TUs needs the
+        // include graph (follow-up), so header edits take the full-rescan path.
+        assert_eq!(lang_of_path(Path::new("src/io.h")), None);
+        assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
+    }
+
+    #[test]
+    fn java_source_argv_runs_under_java() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/javaindex.java"),
+            kind: HelperKind::JavaSource,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "java",
+                "/opt/javaindex.java",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_java_source_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex.java")).kind,
+            HelperKind::JavaSource
+        );
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_java() {
+        assert_eq!(lang_of_path(Path::new("svc/App.java")), Some(Lang::Java));
     }
 
     #[test]
@@ -2475,5 +3709,160 @@ mod tests {
         assert!(load_last_scan(&state).is_none(), "missing file");
         std::fs::write(&state, "not json").unwrap();
         assert!(load_last_scan(&state).is_none(), "corrupt file");
+    }
+
+    // --- rvl-cli data-command surface (po-av01j.17): the ported commands
+    // parse with rvl-cli's subcommand/flag spelling, both --flag=value and
+    // --flag value forms, and unknown flags fail (clap exits 2). ---
+
+    #[test]
+    fn data_command_surface_parses_rvl_cli_spellings() {
+        for argv in [
+            vec!["rvlscan", "login"],
+            vec!["rvlscan", "logout"],
+            vec!["rvlscan", "status"],
+            vec![
+                "rvlscan",
+                "risk",
+                "list",
+                "--status=applicable",
+                "--service",
+                "checkout-api",
+                "--limit=50",
+            ],
+            vec![
+                "rvlscan",
+                "risk",
+                "ready",
+                "--limit",
+                "20",
+                "--category=change_management",
+            ],
+            vec!["rvlscan", "risk", "show", "R-001", "--format=json"],
+            vec!["rvlscan", "risk", "context", "CR-001", "--format", "json"],
+            vec!["rvlscan", "risk", "stale"],
+            vec![
+                "rvlscan",
+                "risk",
+                "resolve",
+                "R-001",
+                "--reason",
+                "Fixed by timeout",
+            ],
+            vec!["rvlscan", "risk", "accept", "R-001", "--reason=known cost"],
+            vec![
+                "rvlscan",
+                "control",
+                "list",
+                "--category=fault_tolerance",
+                "--format=json",
+            ],
+            vec!["rvlscan", "control", "show", "RC-018", "--format=json"],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "search",
+                "circuit",
+                "breaker",
+                "--limit=5",
+                "--min-class=best",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "facts",
+                "--vertical=fault-tolerance",
+                "--technology=go",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "procedures",
+                "--control=RC-018",
+                "--format=json",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "patterns",
+                "--type=failure_mode",
+                "--min-occurrences=3",
+            ],
+            vec![
+                "rvlscan",
+                "evidence",
+                "submit",
+                "--control=RC-018",
+                "--type=code",
+                "--name=CB impl",
+                "--url=https://x",
+                "--git-hash=abc",
+            ],
+            vec![
+                "rvlscan",
+                "evidence",
+                "list",
+                "--status=configured",
+                "--limit=5",
+            ],
+            vec!["rvlscan", "evidence", "verify", "ev-123", "--format=json"],
+        ] {
+            let joined = argv.join(" ");
+            assert!(Cli::try_parse_from(&argv).is_ok(), "must parse: {joined}");
+        }
+    }
+
+    #[test]
+    fn data_command_unknown_flags_fail_like_rvl_cli() {
+        for argv in [
+            vec!["rvlscan", "risk", "list", "--bogus"],
+            vec!["rvlscan", "risk", "stale", "--anything"],
+            vec!["rvlscan", "control", "show"], // missing required code
+            vec!["rvlscan", "knowledge", "search"], // missing required query
+        ] {
+            let joined = argv.join(" ");
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "must be a usage error: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_agent_alias_parses_and_stays_deterministic() {
+        // `rvl scan --agent` compat: the flag parses alongside normal scan
+        // inputs; run() prints a notice and takes the deterministic path.
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "--agent", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { agent, path, .. }) => {
+                assert!(agent);
+                assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn scan_hook_flag_parses_with_incremental() {
+        // The hook-adjudication surface (po-av01j.15): `--hook <name>` rides
+        // the normal scan invocation a git hook makes.
+        let cli = Cli::try_parse_from([
+            "rvlscan",
+            "scan",
+            "--incremental",
+            "--hook",
+            "pre-commit",
+            "some/path",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                hook, incremental, ..
+            }) => {
+                assert!(incremental);
+                assert_eq!(hook.as_deref(), Some("pre-commit"));
+            }
+            _ => panic!("expected scan"),
+        }
     }
 }

@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -c src/main.c",
+    "file": "src/main.c"
+  }
+]

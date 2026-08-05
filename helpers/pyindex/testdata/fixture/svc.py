@@ -15,11 +15,20 @@ session = requests.Session()
 cache = Redis(host="localhost", port=6379, socket_timeout=2)
 
 
+# Module-level named constant: schema v2 resolves it when passed as an argument.
+DEFAULT_TIMEOUT = 30
+
+
 def fetch_user(user_id):
     """Bounded HTTP call: the timeout= is on the call itself, visible in snippet."""
     url = os.path.join("https://api.example.com/users", str(user_id))  # noise: os.path.join
     resp = requests.get(url, timeout=5)
     return resp
+
+
+def fetch_status():
+    """Named-constant timeout: resolvable via the module-level constant map."""
+    return requests.get("https://api.example.com/status", timeout=DEFAULT_TIMEOUT)
 
 
 def refresh(session_id):

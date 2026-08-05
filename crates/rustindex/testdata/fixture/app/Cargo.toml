@@ -1,0 +1,12 @@
+[package]
+name = "fixture-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { path = "../stubs/reqwest" }
+sqlx = { path = "../stubs/sqlx" }
+tokio = { path = "../stubs/tokio" }
+axum = { path = "../stubs/axum" }
+tracing = { path = "../stubs/tracing" }
+redis = { path = "../stubs/redis" }

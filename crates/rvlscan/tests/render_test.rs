@@ -108,7 +108,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_judge: 0,
         abstain_other: 0,
     };
-    let out = render_ladder(&findings, cov, "0.4s (warm)", false);
+    let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
     assert!(out.contains("BLOCKING"), "blocking section present");
     assert!(out.contains("ADVISORY"), "advisory section present");
@@ -158,6 +158,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         false,
     );
@@ -190,6 +191,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         false,
     );
@@ -213,6 +215,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         false,
     );
@@ -232,6 +235,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         false,
     );
@@ -250,6 +254,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         true,
     );
@@ -273,6 +278,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_judge: 0,
             abstain_other: 0,
         },
+        None,
         "0.1s",
         false,
     );
@@ -280,6 +286,71 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     assert!(
         !out.contains("rvl.ai/i/"),
         "named incident links belong in explain, not the ladder"
+    );
+}
+
+// --- config lane coverage ---
+
+#[test]
+fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
+    let cc = ConfigCoverage {
+        resolved: 3,
+        total: 6,
+        abstain_no_spec: 1,
+        abstain_outside_repo: 2,
+        abstain_other: 0,
+        unparseable_files: 1,
+        sightings: vec![("circleci".to_string(), 1), ("terraform".to_string(), 4)],
+    };
+    let out = render_ladder(
+        &[],
+        Coverage {
+            resolved: 1,
+            total: 1,
+            abstain_no_spec: 0,
+            abstain_bounds: 0,
+            abstain_judge: 0,
+            abstain_other: 0,
+        },
+        Some(&cc),
+        "0.1s",
+        false,
+    );
+    assert!(out.contains("config: 3/6 settings resolved"), "{out}");
+    assert!(
+        out.contains("1 no spec") && out.contains("2 set outside repo"),
+        "abstain levers named: {out}"
+    );
+    assert!(out.contains("1 config file unparseable"), "{out}");
+    assert!(
+        out.contains("unsupported config formats sighted: circleci (1) \u{00b7} terraform (4)"),
+        "identity-only sightings rendered: {out}"
+    );
+}
+
+#[test]
+fn empty_config_coverage_renders_nothing_extra() {
+    let empty = ConfigCoverage::default();
+    let base = |cfg| {
+        render_ladder(
+            &[],
+            Coverage {
+                resolved: 1,
+                total: 1,
+                abstain_no_spec: 0,
+                abstain_bounds: 0,
+                abstain_judge: 0,
+                abstain_other: 0,
+            },
+            cfg,
+            "0.1s",
+            false,
+        )
+    };
+    assert_eq!(
+        base(None),
+        base(Some(&empty)),
+        "an empty lane leaves the ladder untouched"
     );
 }
 

@@ -116,8 +116,33 @@ type Provenance struct {
 // RetrievedSite is what the labeller's evidence packet is built from.
 // PacketSchema is the version of the emitted packet contract. rvlscan
 // absorbs helper churn behind this number: a consumer that does not know a
-// version refuses the stream rather than guessing at its shape.
-const PacketSchema = 1
+// version refuses the stream rather than guessing at its shape. It MUST
+// agree with pyindex's and tsindex's PACKET_SCHEMA and rvl_core::PACKET_SCHEMA.
+//
+// v2 adds const_args (constant-valued arguments at the call site) and
+// macro_expansion (always false for Go, which has no macros; mechanical for
+// C/C++). v2 is a strict superset of v1.
+const PacketSchema = 2
+
+// ConstArg is a constant-valued argument observed at the call site (schema
+// v2). Evidence, never a verdict: WHAT the value means (CURLOPT_TIMEOUT vs
+// CURLOPT_URL) is library knowledge and belongs to the spec layer. Only
+// literals and constants the type checker folds for free are reported — no
+// deep constant propagation.
+type ConstArg struct {
+	// Index is the zero-based position of the argument as written.
+	Index int `json:"index"`
+	// Name is the keyword/parameter name where the language surface has one;
+	// Go calls are purely positional, so it is always absent here.
+	Name string `json:"name,omitempty"`
+	// Value is the source-level rendering of the folded constant
+	// (go/constant's String: `"SELECT 1"` for strings, `50` for ints).
+	Value string `json:"value"`
+	// How the value was determined: "literal" for a literal token at the
+	// call, "named_constant" for a resolved constant reference or folded
+	// constant expression (2*time.Second).
+	How string `json:"how"`
+}
 
 type RetrievedSite struct {
 	// Schema is stamped on every record so a stream is self-describing even
@@ -149,6 +174,163 @@ type RetrievedSite struct {
 	Callees      []Snippet `json:"callees"`
 	Construction []Snippet `json:"client_construction"`
 	Prov         Provenance `json:"provenance"`
+
+	// ConstArgs: constant-valued arguments at this call site (schema v2).
+	// Emitted as [] when none resolve, so the packet shape is stable.
+	ConstArgs []ConstArg `json:"const_args"`
+	// MacroExpansion: whether the site sits inside a macro expansion. Go has
+	// no macros, so always false here; C/C++ retrievers set it mechanically
+	// from expansion locations.
+	MacroExpansion bool `json:"macro_expansion"`
+	// SiteKind distinguishes what this record inventories. Empty = classic G1
+	// client-call site; "server_entry" = an HTTP handler/route/middleware
+	// registration (G2, po-av01j.3); "background_job" = a G3 scheduler/queue
+	// registration or worker-loop entry (po-av01j.4); "emission_point" = a G4
+	// emission aggregate (po-av01j.5). Additive default-carrying field within
+	// the v2 packet train — not a schema bump.
+	SiteKind string `json:"site_kind,omitempty"`
+}
+
+// --- G3 background-job registration surfaces (po-av01j.4) ---
+//
+// jobFrameworks lists the scheduler/queue surfaces whose registration calls
+// (and worker-loop entries) are emitted as background_job sites. Like
+// ioMethods this is a RETRIEVAL selection table, not a judgment: it picks
+// WHICH sites to surface; whether a registration needs a bound is spec
+// knowledge (ApiSpec.site_kinds downstream). Detection is TYPE-driven — the
+// callee must RESOLVE into the framework's package path — so an unresolved or
+// same-named local method is never guessed at (abstain-by-omission).
+var jobFrameworks = []struct {
+	pkg        string          // exact package path, or a path prefix (versioned modules append /vN)
+	methods    map[string]bool // registration / loop-entry functions
+	clientType string          // canonical identity when the receiver is not a typed value (package funcs)
+}{
+	{"github.com/robfig/cron", map[string]bool{"AddFunc": true, "AddJob": true, "Schedule": true}, "github.com/robfig/cron.Cron"},
+	{"github.com/hibiken/asynq", map[string]bool{"HandleFunc": true, "Handle": true}, "github.com/hibiken/asynq.ServeMux"},
+	{"github.com/riverqueue/river", map[string]bool{"AddWorker": true, "AddWorkerSafely": true}, "github.com/riverqueue/river"},
+	{"time", map[string]bool{"NewTicker": true, "Tick": true}, "time.Ticker"},
+}
+
+// jobFrameworkType returns the canonical framework identity for a callee that
+// registers background work, or "" when the callee is not a recognized
+// registration surface. Matching is on the callee's RESOLVED package path
+// (exact, or a subpackage/versioned suffix), never on the receiver's text.
+func jobFrameworkType(callee *types.Func) string {
+	pkg := callee.Pkg()
+	if pkg == nil {
+		return ""
+	}
+	path := pkg.Path()
+	for _, fw := range jobFrameworks {
+		if !fw.methods[callee.Name()] {
+			continue
+		}
+		if path == fw.pkg || strings.HasPrefix(path, fw.pkg+"/") {
+			return fw.clientType
+		}
+	}
+	return ""
+}
+
+// siteKindServerEntry mirrors rvl_core::SITE_KIND_SERVER_ENTRY.
+const siteKindServerEntry = "server_entry"
+
+// serverEntryFrameworks maps a framework router TYPE (version-normalized, see
+// normalizeVersionedType) to the registration methods that inventory a
+// server-entry point on it. RETRIEVAL, not judgement: the table names the
+// mainstream framework surfaces the type information can identify
+// mechanically; an unknown router type abstains (no emission) rather than
+// guessing. Middleware attachment verbs (Use, Mount, Route) ride the same
+// table — the evaluator downstream distinguishes them by method name.
+var serverEntryFrameworks = map[string]map[string]bool{
+	"net/http.ServeMux": {"Handle": true, "HandleFunc": true},
+	"github.com/gorilla/mux.Router": {
+		"Handle": true, "HandleFunc": true, "Use": true,
+	},
+	"github.com/gin-gonic/gin.Engine": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Handle": true, "Use": true,
+	},
+	"github.com/gin-gonic/gin.RouterGroup": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Handle": true, "Use": true,
+	},
+	"github.com/labstack/echo.Echo": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Add": true, "Use": true,
+	},
+	"github.com/labstack/echo.Group": {
+		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+		"HEAD": true, "OPTIONS": true, "Any": true, "Add": true, "Use": true,
+	},
+	"github.com/go-chi/chi.Mux": {
+		"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+		"Head": true, "Options": true, "Handle": true, "HandleFunc": true,
+		"Method": true, "MethodFunc": true, "Use": true, "Route": true, "Mount": true,
+	},
+	"github.com/go-chi/chi.Router": {
+		"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+		"Head": true, "Options": true, "Handle": true, "HandleFunc": true,
+		"Method": true, "MethodFunc": true, "Use": true, "Route": true, "Mount": true,
+	},
+}
+
+// Package-level registration functions (no receiver type to resolve), keyed
+// by the type checker's FullName.
+var serverEntryPkgFuncs = map[string]string{
+	"net/http.Handle":     "net/http",
+	"net/http.HandleFunc": "net/http",
+}
+
+// normalizeVersionedType strips a Go-modules major-version segment from a
+// type string's package path ("github.com/go-chi/chi/v5.Mux" ->
+// "github.com/go-chi/chi.Mux") so one table row covers every major version.
+func normalizeVersionedType(t string) string {
+	dot := strings.LastIndex(t, ".")
+	if dot < 0 {
+		return t
+	}
+	pkg, name := t[:dot], t[dot+1:]
+	if slash := strings.LastIndex(pkg, "/"); slash >= 0 {
+		last := pkg[slash+1:]
+		if len(last) >= 2 && last[0] == 'v' && isAllDigits(last[1:]) {
+			pkg = pkg[:slash]
+		}
+	}
+	return pkg + "." + name
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// serverEntryClientType reports whether a selector call is a server-entry
+// registration the table recognizes, and the framework identity to stamp as
+// client_type. Resolution is fully typed: a receiver whose type does not
+// resolve to a known router type abstains, never guesses.
+func serverEntryClientType(info *types.Info, sel *ast.SelectorExpr, callee *types.Func) (string, bool) {
+	if callee == nil {
+		return "", false
+	}
+	if ct, ok := serverEntryPkgFuncs[callee.FullName()]; ok {
+		return ct, true
+	}
+	t := info.TypeOf(sel.X)
+	if t == nil {
+		return "", false
+	}
+	typeStr := strings.TrimPrefix(t.String(), "*")
+	methods, known := serverEntryFrameworks[normalizeVersionedType(typeStr)]
+	if !known || !methods[callee.Name()] {
+		return "", false
+	}
+	return typeStr, true
+
 }
 
 type srcIndex struct {
@@ -282,6 +464,27 @@ func passesBoundedCtx(info *types.Info, caller *ast.FuncDecl, calleeID string,
 		return true
 	})
 	return sawCall && allBounded
+}
+
+// constArgs reports the arguments of `call` whose values the type checker
+// folds to constants, for free (schema v2). A literal token reports as
+// "literal"; a resolved constant reference or folded constant expression
+// (maxRetries, 2*time.Second) reports as "named_constant". Retrieval only:
+// no deep constant propagation, no opinion about what a value means.
+func constArgs(info *types.Info, call *ast.CallExpr) []ConstArg {
+	out := []ConstArg{}
+	for i, a := range call.Args {
+		tv, ok := info.Types[a]
+		if !ok || tv.Value == nil {
+			continue
+		}
+		how := "named_constant"
+		if _, isLit := a.(*ast.BasicLit); isLit {
+			how = "literal"
+		}
+		out = append(out, ConstArg{Index: i, Value: tv.Value.ExactString(), How: how})
+	}
+	return out
 }
 
 // runRetrieve builds the index and emits retrieved source per I/O call site.
@@ -553,10 +756,36 @@ func runRetrieve(root, name string) []RetrievedSite {
 						return true
 					}
 					callee, _ := info.Uses[sel.Sel].(*types.Func)
-					if callee == nil || !ioMethods[callee.Name()] {
+					// G2 server-entry registrations are checked FIRST: chi's
+					// r.Get would otherwise collide with the G1 ioMethods
+					// gate and emit a route registration as a client call. A
+					// matched registration emits one server_entry record and
+					// never a G1 site.
+					if ct, isServer := serverEntryClientType(info, sel, callee); isServer {
+						file, line := rel(p, c)
+						out = append(out, RetrievedSite{
+							Snapshot: name, File: file, Line: line,
+							Symbol: fd.Name.Name, Method: callee.Name(),
+							Receiver:   exprString(sel.X),
+							ClientType: ct,
+							CallSite:   src.text(p, c, c),
+							Enclosing:  src.text(p, fd, fd),
+							ConstArgs:  constArgs(info, c),
+							SiteKind:   siteKindServerEntry,
+							Prov:       Provenance{ClientTypeKnown: true},
+						})
 						return true
 					}
-					if len(c.Args) == 0 && (callee.Name() == "Query" ||
+					if callee == nil {
+						return true
+					}
+					// A background-job registration surface (G3) or a classic
+					// I/O call (G1); anything else is not a site.
+					jobType := jobFrameworkType(callee)
+					if jobType == "" && !ioMethods[callee.Name()] {
+						return true
+					}
+					if jobType == "" && len(c.Args) == 0 && (callee.Name() == "Query" ||
 						callee.Name() == "QueryRow" || callee.Name() == "Exec") {
 						return true
 					}
@@ -567,10 +796,21 @@ func runRetrieve(root, name string) []RetrievedSite {
 						Receiver:  exprString(sel.X),
 						CallSite:  src.text(p, c, c),
 						Enclosing: src.text(p, fd, fd),
+						ConstArgs: constArgs(info, c),
 					}
 					if t := info.TypeOf(sel.X); t != nil {
 						rs.ClientType = strings.TrimPrefix(t.String(), "*")
 						rs.Prov.ClientTypeKnown = true
+					}
+					if jobType != "" {
+						rs.SiteKind = "background_job"
+						// A package-function registration (time.NewTicker,
+						// river.AddWorker) has no typed receiver value; carry
+						// the canonical framework identity instead.
+						if rs.ClientType == "" || rs.ClientType == "invalid type" {
+							rs.ClientType = jobType
+							rs.Prov.ClientTypeKnown = true
+						}
 					}
 
 					anc, depth, roots, hitDepth := ancestors(me)
@@ -676,6 +916,9 @@ func runRetrieve(root, name string) []RetrievedSite {
 			}
 		}
 	}
+	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
+	// ride the same stream, stamped site_kind: "emission_point".
+	out = append(out, collectEmissions(pkgs, src, root, name)...)
 	return out
 }
 

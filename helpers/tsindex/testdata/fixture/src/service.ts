@@ -37,6 +37,14 @@ export async function cachedProfile(key: string): Promise<any> {
   return { combo, viaInstance };
 }
 
+// A module-level named constant exercised as an argument: schema v2 resolves
+// it one hop through the checker (const declaration -> literal initializer).
+const STATUS_KEY = 'status:latest';
+
+export async function statusOf(): Promise<string | null> {
+  return redis.get(STATUS_KEY);
+}
+
 export class Repo {
   private db: Pool;
 

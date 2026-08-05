@@ -18,10 +18,11 @@ to the rvlscan binary → `PATH`.
 One JSON object per line (JSONL) to stdout, one per detected call site. A site
 is a `receiver.method(...)` call. Every record carries:
 
-- `packet_schema` — the contract version (always `1`). rvlscan absorbs helper
-  churn behind this number; a consumer that does not know a version refuses the
-  stream rather than guessing at its shape. It agrees with goindex's
-  `PacketSchema`, pyindex's `PACKET_SCHEMA`, and `rvl_index::site_key`.
+- `packet_schema` — the contract version (currently `2`). rvlscan absorbs
+  helper churn behind this number; a consumer that does not know a version
+  refuses the stream rather than guessing at its shape. It agrees with
+  goindex's `PacketSchema`, pyindex's `PACKET_SCHEMA`, and
+  `rvl_core::PACKET_SCHEMA`.
 - `site_key` — `file:line:client_type:method`. A file:line is **not** unique:
   one location can resolve to several sites with different client types (and
   different verdicts), so downstream indexes and joins key on `site_key`. Two
@@ -50,7 +51,17 @@ is a `receiver.method(...)` call. Every record carries:
   `{client_type_resolved, confidence_tier, callers_total, callers_included,
   callees_total, callees_included}`. `client_type_resolved` and
   `confidence_tier` are the per-site confidence signals.
-- `callers`, `callees` — **empty arrays in v1** (see below).
+- `const_args` (v2) — constant-valued arguments at the call site, as
+  `{index, name, value, how}`. `index` is the zero-based position as written;
+  `name` is always `""` (TypeScript has no keyword arguments). Literal tokens
+  (string/numeric/`true`/`false`/`null`, incl. substitution-free templates and
+  `-1`) report `how: "literal"`; one-hop named constants (an identifier
+  declared `const` with a literal initializer, or an enum member the checker
+  folds via `getConstantValue`) report `how: "named_constant"`. Evidence,
+  never a verdict — no deep constant propagation.
+- `macro_expansion` (v2) — always `false` for TypeScript (no macros);
+  mechanical for C/C++ retrievers.
+- `callers`, `callees` — **empty arrays** (see below).
 - `lang` — `"typescript"`.
 
 ## The `repo_config` record (one per run)
@@ -58,7 +69,7 @@ is a `receiver.method(...)` call. Every record carries:
 In addition to the per-site packets, tsindex emits **exactly one** repo-scoped
 line, mirroring goindex's `RepoConfig`:
 
-    {"packet_schema":1,"kind":"repo_config","snapshot_id":"<name>",
+    {"packet_schema":2,"kind":"repo_config","snapshot_id":"<name>",
      "constructions":[{"type":"typeorm.DataSource","fields":["query_timeout"]}]}
 
 Its `kind` is the literal `"repo_config"`; `rvl_core::parse_stream` keys on that
