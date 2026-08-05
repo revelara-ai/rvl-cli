@@ -18,6 +18,12 @@ Every emitted record carries:
   different verdicts. Measured on a 1528-site corpus: 1528 distinct site keys
   vs 1526 distinct file:line pairs. Downstream indexes and joins key on
   `site_key`, and `rvl_index::site_key` must agree with `siteKey` here.
+- `lang` — always `"go"`. Named the same way the sibling helpers name theirs
+  (`"python"`, `"typescript"`, `"csharp"`, `"java"`, `"rust"`, `"c_cpp"`), and
+  stamped in `encodeRetrieved` next to `packet_schema` and `site_key` so every
+  record kind carries it. Go emitted nothing here until po-av01j.63, which made
+  a Go site indistinguishable from one whose language could not be resolved —
+  and a consumer that cannot tell those apart has to treat both as unknown.
 - `const_args` (v2) — constant-valued arguments at the call site, as
   `{index, name, value, how}`. Literal tokens report `how: "literal"`;
   constants the Go type checker folds for free (a named `const`, a folded

@@ -39,6 +39,44 @@ func TestEmittedPacketsCarrySchemaAndUniqueSiteKey(t *testing.T) {
 	}
 }
 
+// Every packet names the language it was retrieved from, exactly as the other
+// helpers do ("python", "typescript", "csharp", "java", "rust", "c_cpp"). Go
+// used to be the ONE language that emitted nothing here, which made a Go site
+// indistinguishable from a site whose language could not be resolved — and the
+// spec factory, unable to tell them apart, could state no language for either.
+// Stamped in encodeRetrieved alongside packet_schema and site_key so it lands
+// on EVERY record kind (G1 call sites, G2 server entries, G3 job
+// registrations, G4 emission aggregates) and on any kind added later.
+func TestEveryEmittedPacketNamesItsLanguage(t *testing.T) {
+	sites := runRetrieve("testdata/fixture", "fixture")
+	if len(sites) == 0 {
+		t.Fatal("fixture retrieval produced no sites (does the fixture build?)")
+	}
+	// A literal record built outside runRetrieve is stamped too: the funnel is
+	// the encoder, not any one construction site.
+	sites = append(sites, RetrievedSite{File: "svc/x.go", Line: 1, Method: "Do"})
+
+	var sb strings.Builder
+	encodeRetrieved(&sb, sites)
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(sb.String()), "\n") {
+		// Decoded as a map, not as RetrievedSite: the contract is the WIRE
+		// key `lang`, which is what every sibling helper's test asserts and
+		// what the factory reads.
+		var got map[string]any
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("emitted line is not valid JSON: %v", err)
+		}
+		if got["lang"] != "go" {
+			t.Fatalf("lang = %v, want \"go\" on %v:%v", got["lang"], got["file_path"], got["line_number"])
+		}
+		n++
+	}
+	if n != len(sites) {
+		t.Fatalf("encoded %d records, want %d", n, len(sites))
+	}
+}
+
 // Schema v2 (po-av01j.19): constant-valued arguments at the call site are
 // evidence — the libcurl/POSIX discrimination lives in enum constants, and the
 // TS pool-timeout precision fix needed this same shape — and every site

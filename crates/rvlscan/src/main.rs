@@ -72,11 +72,12 @@ enum Cmd {
         hook: Option<String>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
-    /// unknown API surfaces: shape only — `client_type.method` and a site count,
-    /// NEVER source, file paths, or line numbers. This visibility IS the privacy
-    /// feature; you can audit precisely what would ever leave this machine.
-    /// Reporting is LOCAL-ONLY today: this command shows/writes the payload, it
-    /// does not transmit it. Mirrors `scan`'s inputs.
+    /// unknown API surfaces: shape only — `client_type.method`, the language it
+    /// was written in, and a site count, NEVER source, file paths, or line
+    /// numbers. This visibility IS the privacy feature; you can audit precisely
+    /// what would ever leave this machine. Reporting is LOCAL-ONLY today: this
+    /// command shows/writes the payload, it does not transmit it. Mirrors
+    /// `scan`'s inputs.
     Report {
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
@@ -2291,7 +2292,8 @@ fn run_report(
     // does not transmit it.
     eprintln!(
         "note: reporting is local-only; this shows exactly what a scan WOULD send \
-         to the spec factory (shape + counts only), it does not transmit anything"
+         to the spec factory (shape + language + counts only), it does not \
+         transmit anything"
     );
 
     // Same resolve->scan pipeline scan uses, via the shared building blocks.
@@ -2346,14 +2348,17 @@ fn run_report(
 }
 
 /// The human-readable report: an explicit header stating precisely what would
-/// leave and that it carries no source/paths, the `site_count  client_type.method`
-/// table, and a total-surface footer. This visibility IS the privacy feature.
+/// leave and that it carries no source/paths, the
+/// `site_count  lang  client_type.method` table, and a total-surface footer.
+/// This visibility IS the privacy feature, so the table shows EVERY field the
+/// payload carries — a column missing here would make the header a lie.
 fn render_report_human(report: &report::Report) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     s.push_str(
         "This is EXACTLY what a scan would send to the Revelara spec factory.\n\
-         It contains ONLY API shape (client_type.method) and a per-surface count.\n\
+         It contains ONLY API shape (client_type.method), the language that shape \
+         was written in, and a per-surface count.\n\
          No source code, no file paths, no line numbers, nothing repo-identifying \
          ever leaves this machine.\n\n",
     );
@@ -2363,7 +2368,8 @@ fn render_report_human(report: &report::Report) -> String {
         return s;
     }
 
-    // Width the count column to the widest count for a clean right-aligned table.
+    // Width each column to its widest cell for a clean table.
+    const NO_LANG: &str = "-";
     let w = report
         .surfaces
         .iter()
@@ -2371,16 +2377,46 @@ fn render_report_human(report: &report::Report) -> String {
         .max()
         .unwrap_or(1)
         .max("sites".len());
-    let _ = writeln!(s, "  {:>w$}  surface", "sites", w = w);
-    let _ = writeln!(s, "  {:>w$}  -------", "-".repeat(w), w = w);
+    let lw = report
+        .surfaces
+        .iter()
+        .map(|r| r.lang.len().max(NO_LANG.len()))
+        .max()
+        .unwrap_or(NO_LANG.len())
+        .max("lang".len());
+    let _ = writeln!(
+        s,
+        "  {:>w$}  {:<lw$}  surface",
+        "sites",
+        "lang",
+        w = w,
+        lw = lw
+    );
+    let _ = writeln!(
+        s,
+        "  {:>w$}  {:<lw$}  -------",
+        "-".repeat(w),
+        "-".repeat(lw),
+        w = w,
+        lw = lw
+    );
+    let mut any_unstated = false;
     for r in &report.surfaces {
+        let lang = if r.lang.is_empty() {
+            any_unstated = true;
+            NO_LANG
+        } else {
+            &r.lang
+        };
         let _ = writeln!(
             s,
-            "  {:>w$}  {}.{}",
+            "  {:>w$}  {:<lw$}  {}.{}",
             r.site_count,
+            lang,
             r.client_type,
             r.method,
-            w = w
+            w = w,
+            lw = lw
         );
     }
     let _ = writeln!(
@@ -2388,6 +2424,14 @@ fn render_report_human(report: &report::Report) -> String {
         "\n{} unknown API surface(s) would be reported.",
         report.surfaces.len()
     );
+    if any_unstated {
+        let _ = writeln!(
+            s,
+            "\"{NO_LANG}\" in the lang column: no language is claimed — either the \
+             scanner did not resolve one,\nor the shape was seen in more than one \
+             language and naming either would be wrong."
+        );
+    }
     s
 }
 
