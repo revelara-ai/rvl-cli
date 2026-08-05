@@ -2,6 +2,7 @@
 // (construction-time Timeout), a deadline-less gRPC call, a Kafka produce,
 // Redis, and ADO.NET command execution.
 
+using System.Net.Http;
 using Confluent.Kafka;
 using Grpc.Core;
 using Microsoft.Data.SqlClient;

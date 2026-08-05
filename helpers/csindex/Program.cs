@@ -49,12 +49,6 @@ internal static class Program
     // PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
     private const int PacketSchema = 2;
 
-    // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes.
-    private const int MaxSnippetBytes = 2400;
-
-    // Construction snippets to include per site (mirrors goindex).
-    private const int MaxCtorsEmitted = 2;
-
     private static int Main(string[] args)
     {
         bool packetSchema = false, retrieve = false;
@@ -187,6 +181,12 @@ internal sealed class Provenance
 
 internal static class Retriever
 {
+    // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes.
+    private const int MaxSnippetBytes = 2400;
+
+    // Construction snippets to include per site (mirrors goindex).
+    private const int MaxCtorsEmitted = 2;
+
     // Mirrors rvl_core's site-kind constants.
     private const string SiteKindServerEntry = "server_entry";
     private const string SiteKindBackgroundJob = "background_job";
