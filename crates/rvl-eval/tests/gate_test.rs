@@ -285,3 +285,118 @@ fn too_few_decided_is_refused() {
         }
     );
 }
+
+// --- The minikube DEV/DOGFOOD spec cache (po-av01j.80) ---
+//
+// A spec corpus can be usable and still be worthless as evidence. This one is:
+// the 2026-08-03 mint (po-av01j.68) authored specs from packet streams over
+// four repos reserved for minting gate sets, then hardcoded
+// repo='seed/minikube-test' on every surface, so quarantine enforcement passed
+// by MISLABELLING rather than by the data being clean. Withdrawing the specs
+// whose api_type is internal to a quarantined repo removes what is
+// identifiable; the relabelling made the rest unidentifiable, and no amount of
+// filtering recovers it.
+//
+// So the rebuilt cache is fenced off from gate mode two ways, and both are
+// pinned here. The first is nominal and the second is structural — which is
+// why both exist.
+
+/// The artifact's identity, as published: `spec_cache_artifacts.content_version`,
+/// the storage key, and what `rvlscan cache status` prints.
+const DEV_CACHE_CONTENT_VERSION: &str = "2026-08-05.3e263575";
+
+/// The repos that may have taught the surviving shared-library specs. All four
+/// Go entries are status=qualified in quarantine.yaml, i.e. the entire
+/// qualified Go gate-mint pool. Mirrors
+/// rvlscan-eval registry/grounding/2026-08-05.3e263575.txt.
+const DEV_CACHE_GROUNDING: &[&str] = &[
+    "go-gitea/gitea",
+    "influxdata/telegraf",
+    "minio/minio",
+    "temporalio/temporal",
+    "twentyhq/twenty",
+];
+
+/// Verbatim from rvlscan-eval registry/seed_sets.yaml (trimmed to the fields
+/// the harness reads). If the registry entry is ever dropped, this test still
+/// passes but stops describing reality — which is why
+/// `dev_cache_grounding_refuses_every_qualified_go_gate_set` below does not
+/// depend on the registry at all.
+const DEV_CACHE_SEED_SETS_YAML: &str = r#"
+registry_version: 1
+updated: "2026-08-05"
+seed_sets:
+  - name: ppi-labels
+    artifact: artifacts/ppi_labels.json
+    gate_eligible: false
+    reason: packet-conditional labels
+  - name: "2026-08-05.3e263575"
+    artifact: spec-cache/2026-08-05.3e263575.json
+    gate_eligible: false
+    reason: quarantine-derived specs removed BUT shared-library provenance unrecoverable
+"#;
+
+#[test]
+fn dev_cache_is_registered_as_a_seed_set_and_refused_by_identity() {
+    let names = parse_seed_set_names(DEV_CACHE_SEED_SETS_YAML).unwrap();
+    assert!(
+        names.iter().any(|n| n == DEV_CACHE_CONTENT_VERSION),
+        "the dev cache must be designated in seed_sets.yaml under its content_version"
+    );
+
+    let mut m = parse_manifest(MANIFEST_OK).unwrap();
+    m.set_id = DEV_CACHE_CONTENT_VERSION.into();
+    let err = validate_gate_set(&m, &names, &registry(), &[]).unwrap_err();
+
+    assert_eq!(err, Refusal::SeedSet(DEV_CACHE_CONTENT_VERSION.into()));
+    assert_eq!(
+        err.to_string(),
+        "refused: 2026-08-05.3e263575 is a seed set (permanently gate-ineligible)"
+    );
+}
+
+/// The load-bearing one. The seed-set check only fires when the artifact is
+/// submitted under its own name, which a gate set named `eval-go-v1` never
+/// would. The grounding check needs no cooperation: ship this cache's
+/// grounding manifest and EVERY gate set pinned to a repo that may have taught
+/// it is refused, whatever that set is called. Since the manifest lists the
+/// whole qualified Go pool, no Go gate set can be scored against this cache.
+#[test]
+fn dev_cache_grounding_refuses_every_qualified_go_gate_set() {
+    let grounding: Vec<String> = DEV_CACHE_GROUNDING.iter().map(|s| s.to_string()).collect();
+
+    for repo in [
+        "go-gitea/gitea",
+        "influxdata/telegraf",
+        "minio/minio",
+        "temporalio/temporal",
+    ] {
+        let mut m = parse_manifest(MANIFEST_OK).unwrap();
+        m.set_id = "eval-go-v1".into(); // NOT the seed-set name: nominal check cannot help
+        m.repos[0].repo = repo.into();
+
+        let reg = Registry {
+            registry_version: 2,
+            repos: DEV_CACHE_GROUNDING.iter().map(|s| s.to_string()).collect(),
+        };
+        let err = validate_gate_set(&m, &[], &reg, &grounding).unwrap_err();
+
+        assert_eq!(err, Refusal::GroundingOverlap(repo.into()));
+        assert_eq!(
+            err.to_string(),
+            format!("refused: gate-set repo {repo} present in grounding corpus")
+        );
+    }
+}
+
+/// The fence must not be so wide it refuses the recovery path. Re-authoring
+/// from a signed-off corpus (po-av01j.78 -> .69) yields a cache whose grounding
+/// does NOT include the gate pool, and a gate set pinned to a quarantined repo
+/// must then validate normally. A check that refuses everything proves nothing.
+#[test]
+fn a_clean_grounding_corpus_still_validates() {
+    let m = parse_manifest(MANIFEST_OK).unwrap();
+    let clean = vec!["revelara-ai/backend".to_string(), "zulip/zulip".to_string()];
+    let v = validate_gate_set(&m, &["ppi-labels".into()], &registry(), &clean).unwrap();
+    assert_eq!(v, 1);
+}
