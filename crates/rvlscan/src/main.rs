@@ -550,7 +550,7 @@ fn server_to_findings(
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript < CSharp < C/C++) makes it a stable
+/// order Go < Python < TypeScript < CSharp < Java < C/C++) makes it a stable
 /// `BTreeMap` key, so a multi-language incremental retrieval runs helpers in
 /// the same
 /// deterministic order the single-command path documents.
@@ -560,6 +560,7 @@ enum Lang {
     Python,
     TypeScript,
     CSharp,
+    Java,
     /// One retriever for both C and C++ (cindex, po-av01j.12): the compile
     /// db, not the extension, decides how a TU parses.
     CCpp,
@@ -573,6 +574,7 @@ impl Lang {
             Lang::Python => "pyindex",
             Lang::TypeScript => "tsindex",
             Lang::CSharp => "csindex",
+            Lang::Java => "javaindex",
             Lang::CCpp => "cindex",
         }
     }
@@ -583,6 +585,7 @@ impl Lang {
             Lang::Python => "RVLSCAN_PYINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
             Lang::CSharp => "RVLSCAN_CSINDEX",
+            Lang::Java => "RVLSCAN_JAVAINDEX",
             Lang::CCpp => "RVLSCAN_CINDEX",
         }
     }
@@ -595,15 +598,18 @@ impl std::fmt::Display for Lang {
             Lang::Python => "Python",
             Lang::TypeScript => "TypeScript",
             Lang::CSharp => "C#",
+            Lang::Java => "Java",
             Lang::CCpp => "C/C++",
         })
     }
 }
 
-/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex
-/// executable on PATH) runs directly; a pyindex `.py` script runs under
-/// `python3`, a tsindex `.js` script runs under `node`, and a csindex `.dll`
-/// (a framework-dependent .NET build) runs under `dotnet`. A csindex published
+/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex/
+/// javaindex executable on PATH) runs directly; a pyindex `.py` script runs
+/// under `python3`, a tsindex `.js` script runs under `node`, a javaindex
+/// `.java` source file runs under `java` (JEP 330 source-file mode: in-memory
+/// compile, no packaging step, JDK 11+), and a csindex `.dll` (a
+/// framework-dependent .NET build) runs under `dotnet`. A csindex published
 /// with an apphost is a plain executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
@@ -611,6 +617,7 @@ enum HelperKind {
     PyScript,
     NodeScript,
     DotnetAssembly,
+    JavaSource,
 }
 
 /// A helper located on disk, ready to be turned into a command.
@@ -649,23 +656,28 @@ fn has_csharp_marker(root: &Path) -> bool {
 
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`, a root `*.csproj`/`*.sln`, `compile_commands.json`)
-/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
-/// `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` /
+/// `tsconfig.json`, a root `*.csproj`/`*.sln`, `pom.xml`, `build.gradle`,
+/// `build.gradle.kts`, `compile_commands.json`) short-circuit, otherwise a
+/// walk that skips vendored/build dirs looks for `*.go` / `*.py` /
+/// `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` / `*.java` /
 /// `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python, TypeScript, C#,
-/// C/C++) so a multi-language repo runs its helpers in a deterministic order.
+/// Java, C/C++) so a multi-language repo runs its helpers in a deterministic
+/// order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
     let mut cs = has_csharp_marker(root);
+    let mut java = root.join("pom.xml").is_file()
+        || root.join("build.gradle").is_file()
+        || root.join("build.gradle.kts").is_file();
     // The compile db is the C/C++ marker (and the retrieval tier gate); bare
     // sources without one still detect via the walk and ride the allowlist
     // fallback tier.
     let mut cc = root.join("compile_commands.json").is_file()
         || root.join("build").join("compile_commands.json").is_file();
-    if !(go && py && ts && cs && cc) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs, &mut cc);
+    if !(go && py && ts && cs && java && cc) {
+        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs, &mut java, &mut cc);
     }
     let mut out = Vec::new();
     if go {
@@ -680,27 +692,32 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if cs {
         out.push(Lang::CSharp);
     }
+    if java {
+        out.push(Lang::Java);
+    }
     if cc {
         out.push(Lang::CCpp);
     }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts`/`cs`/`cc` when a matching
-/// source file is seen, and stops early once all are found. Skips `.git`,
-/// `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout does
-/// not turn detection into a full-tree crawl.
+/// Bounded directory walk: sets `go`/`py`/`ts`/`cs`/`java`/`cc` when a
+/// matching source file is seen, and stops early once all are found. Skips
+/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big
+/// checkout does not turn detection into a full-tree crawl.
+#[allow(clippy::too_many_arguments)]
 fn walk_for_sources(
     root: &Path,
     go: &mut bool,
     py: &mut bool,
     ts: &mut bool,
     cs: &mut bool,
+    java: &mut bool,
     cc: &mut bool,
 ) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts && *cs && *cc {
+        if *go && *py && *ts && *cs && *java && *cc {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -720,6 +737,7 @@ fn walk_for_sources(
                     Some("py") => *py = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
                     Some("cs" | "csproj" | "sln") => *cs = true,
+                    Some("java") => *java = true,
                     Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
                     _ => {}
                 }
@@ -743,6 +761,8 @@ fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
         Lang::TypeScript => HelperKind::Executable,
         Lang::CSharp if ext == Some("dll") => HelperKind::DotnetAssembly,
         Lang::CSharp => HelperKind::Executable,
+        Lang::Java if ext == Some("java") => HelperKind::JavaSource,
+        Lang::Java => HelperKind::Executable,
     };
     ResolvedHelper {
         path: path.to_path_buf(),
@@ -783,6 +803,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         Lang::Python => Some(format!("{base}.py")),
         Lang::TypeScript => Some(format!("{base}.js")),
         Lang::CSharp => Some(format!("{base}.dll")),
+        Lang::Java => Some(format!("{base}.java")),
         Lang::Go | Lang::CCpp => None,
     };
     // (2) adjacent to the rvlscan binary.
@@ -849,6 +870,10 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
             .chain(std::iter::once(helper_path))
             .chain(tail)
             .collect(),
+        HelperKind::JavaSource => std::iter::once("java".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
     }
 }
 
@@ -911,7 +936,9 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py" | "cs" | "c" | "cc" | "cpp" | "cxx") => out.push(path),
+                    Some("go" | "py" | "cs" | "java" | "c" | "cc" | "cpp" | "cxx") => {
+                        out.push(path)
+                    }
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
@@ -945,6 +972,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("py") => Some(Lang::Python),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
         Some("cs") => Some(Lang::CSharp),
+        Some("java") => Some(Lang::Java),
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
@@ -3030,6 +3058,37 @@ mod tests {
     }
 
     #[test]
+    fn detect_java_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("App.java"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Java]);
+    }
+
+    #[test]
+    fn detect_java_via_marker_files() {
+        for marker in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(marker));
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::Java],
+                "{marker} must mark a Java repo"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_java_orders_after_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("App.java"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::Java]
+        );
+    }
+
+    #[test]
     fn detect_neither_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("README.md"));
@@ -3234,6 +3293,44 @@ mod tests {
         // include graph (follow-up), so header edits take the full-rescan path.
         assert_eq!(lang_of_path(Path::new("src/io.h")), None);
         assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
+    }
+
+    #[test]
+    fn java_source_argv_runs_under_java() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/javaindex.java"),
+            kind: HelperKind::JavaSource,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "java",
+                "/opt/javaindex.java",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_java_source_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex.java")).kind,
+            HelperKind::JavaSource
+        );
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_java() {
+        assert_eq!(lang_of_path(Path::new("svc/App.java")), Some(Lang::Java));
     }
 
     #[test]
