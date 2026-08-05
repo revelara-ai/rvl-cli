@@ -124,6 +124,18 @@ type Provenance struct {
 // C/C++). v2 is a strict superset of v1.
 const PacketSchema = 2
 
+// Lang names the language every packet from this helper was retrieved from,
+// spelled the way the sibling helpers spell theirs ("python", "typescript",
+// "csharp", "java", "rust", "c_cpp"). It is a constant because it is a property
+// of the HELPER, not of any site: goindex only ever reads Go.
+//
+// Go was the one language that emitted no language at all, which made a Go site
+// indistinguishable on the wire from a site whose language could not be
+// resolved — and a consumer that cannot tell those apart has to treat both as
+// unknown, so the language of every Go surface was silently unavailable
+// downstream (po-av01j.63).
+const Lang = "go"
+
 // ConstArg is a constant-valued argument observed at the call site (schema
 // v2). Evidence, never a verdict: WHAT the value means (CURLOPT_TIMEOUT vs
 // CURLOPT_URL) is library knowledge and belongs to the spec layer. Only
@@ -152,6 +164,11 @@ type RetrievedSite struct {
 	// location can resolve to several sites with different client types (and
 	// different verdicts), so downstream indexes and joins key on this.
 	SiteKey string `json:"site_key"`
+	// Lang is the language this site was retrieved from, always [Lang] here.
+	// Stamped by encodeRetrieved rather than by each construction site, for the
+	// same reason Schema and SiteKey are: one funnel means no record kind can
+	// be added later that forgets it.
+	Lang string `json:"lang"`
 
 	Snapshot   string `json:"snapshot_id"`
 	File       string `json:"file_path"`
@@ -969,14 +986,16 @@ func siteKey(s RetrievedSite) string {
 	return fmt.Sprintf("%s:%d:%s:%s", s.File, s.Line, s.ClientType, s.Method)
 }
 
-// encodeRetrieved stamps the schema and site key on every record and writes
-// the stream. One choke point: a record that reaches a consumer unstamped is
-// a record no index can key.
+// encodeRetrieved stamps the schema, site key and language on every record and
+// writes the stream. One choke point: a record that reaches a consumer
+// unstamped is a record no index can key, and one whose language is missing is
+// a record no consumer can tell apart from an unresolved one.
 func encodeRetrieved(w io.Writer, sites []RetrievedSite) {
 	enc := json.NewEncoder(w)
 	for _, s := range sites {
 		s.Schema = PacketSchema
 		s.SiteKey = siteKey(s)
+		s.Lang = Lang
 		_ = enc.Encode(s)
 	}
 }

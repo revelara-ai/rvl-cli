@@ -2680,3 +2680,86 @@ fn scan_decides_csharp_sites_end_to_end() {
         "the fixture's swallowing catch must surface under RC-027: {stdout}"
     );
 }
+
+// --- the shape-only report on the wire (po-av01j.63) ---
+
+/// End to end through the real binary: the report payload names the language
+/// each surface was written in, and a shape seen in TWO languages names
+/// NEITHER. Unit tests cover the fold; this covers the plumbing — the language
+/// has to survive packet parse, propagation, and serialization to be worth
+/// anything, and none of that is exercised by testing `build_report` directly.
+///
+/// It is also the end-to-end privacy audit: the fixture's packets carry real
+/// snippets and real absolute file paths, and neither may appear in the payload.
+#[test]
+fn report_payload_names_each_surface_language_and_never_carries_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, specs) = write_scan_fixtures(dir.path());
+
+    // Two sites, one shape, two languages: an unresolved receiver emits a bare
+    // `HttpClient` in both C# and Java.
+    let mixed_src = dir.path().join("Svc.cs");
+    std::fs::write(&mixed_src, "class Svc { void M() { c.SendThing(r); } }\n").unwrap();
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    for lang in ["csharp", "java"] {
+        stream.push_str(
+            &serde_json::json!({
+                "snapshot_id": "fixture",
+                "file_path": mixed_src.to_str().unwrap(),
+                "line_number": 30,
+                "func": "SendThing",
+                "client_type": "HttpClient",
+                "snippet": "c.SendThing(r)",
+                "lang": lang,
+            })
+            .to_string(),
+        );
+        stream.push('\n');
+    }
+    std::fs::write(&packets_path, stream).unwrap();
+
+    let out = bin()
+        .args(["report", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--json")
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "report failed: {stdout} {stderr}");
+
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let surfaces = payload["surfaces"].as_array().unwrap();
+    let find = |ct: &str| {
+        surfaces
+            .iter()
+            .find(|s| s["client_type"] == ct)
+            .unwrap_or_else(|| panic!("{ct} missing from the payload: {stdout}"))
+    };
+
+    // The spec'd pgx call is DECIDED and never reported; the unknown Go call is.
+    let unknown = find("x.Unknown");
+    assert_eq!(unknown["lang"], "go", "a Go surface must say so: {stdout}");
+    assert_eq!(unknown["site_count"], 1);
+
+    // Two languages, one shape: still ONE surface, and it names neither.
+    let mixed = find("HttpClient");
+    assert_eq!(
+        mixed["lang"], "",
+        "a shape seen in two languages must claim neither: {stdout}"
+    );
+    assert_eq!(mixed["site_count"], 2, "both sites still count: {stdout}");
+
+    // The privacy contract, on the real payload: no snippets, no paths.
+    assert!(
+        !stdout.contains("u.Mystery()") && !stdout.contains("c.SendThing(r)"),
+        "a snippet leaked into the report payload: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unknown.go") && !stdout.contains("Svc.cs"),
+        "a file path leaked into the report payload: {stdout}"
+    );
+}
