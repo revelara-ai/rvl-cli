@@ -550,8 +550,9 @@ fn server_to_findings(
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript < CSharp) makes it a stable `BTreeMap` key,
-/// so a multi-language incremental retrieval runs helpers in the same
+/// order Go < Python < TypeScript < CSharp < C/C++) makes it a stable
+/// `BTreeMap` key, so a multi-language incremental retrieval runs helpers in
+/// the same
 /// deterministic order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
@@ -559,6 +560,9 @@ enum Lang {
     Python,
     TypeScript,
     CSharp,
+    /// One retriever for both C and C++ (cindex, po-av01j.12): the compile
+    /// db, not the extension, decides how a TU parses.
+    CCpp,
 }
 
 impl Lang {
@@ -569,6 +573,7 @@ impl Lang {
             Lang::Python => "pyindex",
             Lang::TypeScript => "tsindex",
             Lang::CSharp => "csindex",
+            Lang::CCpp => "cindex",
         }
     }
     /// The env var that overrides helper discovery for this language.
@@ -578,6 +583,7 @@ impl Lang {
             Lang::Python => "RVLSCAN_PYINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
             Lang::CSharp => "RVLSCAN_CSINDEX",
+            Lang::CCpp => "RVLSCAN_CINDEX",
         }
     }
 }
@@ -589,6 +595,7 @@ impl std::fmt::Display for Lang {
             Lang::Python => "Python",
             Lang::TypeScript => "TypeScript",
             Lang::CSharp => "C#",
+            Lang::CCpp => "C/C++",
         })
     }
 }
@@ -642,17 +649,23 @@ fn has_csharp_marker(root: &Path) -> bool {
 
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`, a root `*.csproj`/`*.sln`) short-circuit, otherwise a walk
-/// that skips vendored/build dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx`
-/// (never `*.d.ts`) / `*.cs`. Order is stable (Go, Python, TypeScript, C#) so
-/// a multi-language repo runs its helpers in a deterministic order.
+/// `tsconfig.json`, a root `*.csproj`/`*.sln`, `compile_commands.json`)
+/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
+/// `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` /
+/// `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python, TypeScript, C#,
+/// C/C++) so a multi-language repo runs its helpers in a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
     let mut cs = has_csharp_marker(root);
-    if !(go && py && ts && cs) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs);
+    // The compile db is the C/C++ marker (and the retrieval tier gate); bare
+    // sources without one still detect via the walk and ride the allowlist
+    // fallback tier.
+    let mut cc = root.join("compile_commands.json").is_file()
+        || root.join("build").join("compile_commands.json").is_file();
+    if !(go && py && ts && cs && cc) {
+        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs, &mut cc);
     }
     let mut out = Vec::new();
     if go {
@@ -667,18 +680,27 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if cs {
         out.push(Lang::CSharp);
     }
+    if cc {
+        out.push(Lang::CCpp);
+    }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts`/`cs` when a
-/// `.go`/`.py`/`.ts`|`.tsx` (non-`.d.ts`)/`.cs`|`.csproj`|`.sln` file is seen,
-/// and stops early once all are found. Skips `.git`, `node_modules`, `target`,
-/// `vendor`, `__pycache__` so a big checkout does not turn detection into a
-/// full-tree crawl.
-fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool, cs: &mut bool) {
+/// Bounded directory walk: sets `go`/`py`/`ts`/`cs`/`cc` when a matching
+/// source file is seen, and stops early once all are found. Skips `.git`,
+/// `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout does
+/// not turn detection into a full-tree crawl.
+fn walk_for_sources(
+    root: &Path,
+    go: &mut bool,
+    py: &mut bool,
+    ts: &mut bool,
+    cs: &mut bool,
+    cc: &mut bool,
+) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts && *cs {
+        if *go && *py && *ts && *cs && *cc {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -698,6 +720,7 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool, cs
                     Some("py") => *py = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
                     Some("cs" | "csproj" | "sln") => *cs = true,
+                    Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
                     _ => {}
                 }
             }
@@ -713,7 +736,7 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool, cs
 fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
     let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
-        Lang::Go => HelperKind::Executable,
+        Lang::Go | Lang::CCpp => HelperKind::Executable,
         Lang::Python if ext == Some("py") => HelperKind::PyScript,
         Lang::Python => HelperKind::Executable,
         Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
@@ -760,7 +783,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         Lang::Python => Some(format!("{base}.py")),
         Lang::TypeScript => Some(format!("{base}.js")),
         Lang::CSharp => Some(format!("{base}.dll")),
-        Lang::Go => None,
+        Lang::Go | Lang::CCpp => None,
     };
     // (2) adjacent to the rvlscan binary.
     if let Ok(exe) = std::env::current_exe() {
@@ -888,7 +911,7 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py" | "cs") => out.push(path),
+                    Some("go" | "py" | "cs" | "c" | "cc" | "cpp" | "cxx") => out.push(path),
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
@@ -913,12 +936,16 @@ fn repo_relative(root: &Path, file: &Path) -> String {
 
 /// The language whose helper retrieves a given source file, by extension. A
 /// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
+/// C/C++ HEADERS map to no helper: which TUs a changed header invalidates
+/// needs the include graph, so header edits ride the full-rescan path rather
+/// than guessing an incremental subset (follow-up bead under po-av01j.12).
 fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
         Some("cs") => Some(Lang::CSharp),
+        Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
 }
@@ -3010,6 +3037,44 @@ mod tests {
     }
 
     #[test]
+    fn detect_c_cpp_via_compile_db_marker() {
+        // The compile db is the C/C++ marker even before any source is seen
+        // (and the tier gate: db-listed TUs parse with their exact flags).
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("compile_commands.json"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp]);
+
+        // The CMake build/ layout counts too.
+        let cmake = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cmake.path().join("build")).unwrap();
+        touch(&cmake.path().join("build").join("compile_commands.json"));
+        assert_eq!(detect_languages(cmake.path()), vec![Lang::CCpp]);
+    }
+
+    #[test]
+    fn detect_c_cpp_sources_without_a_db_still_detect() {
+        // Bare sources ride cindex's allowlist fallback tier; detection must
+        // not silently skip them. Headers alone do NOT detect: a header-only
+        // tree has no TU to parse.
+        for ext in ["c", "cc", "cpp", "cxx"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(format!("main.{ext}")));
+            assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp], "{ext}");
+        }
+        let headers_only = tempfile::tempdir().unwrap();
+        touch(&headers_only.path().join("api.h"));
+        assert!(detect_languages(headers_only.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_order_puts_c_cpp_last() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("main.go"));
+        touch(&dir.path().join("native.c"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::CCpp]);
+    }
+
+    #[test]
     fn detect_via_marker_files() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("go.mod"));
@@ -3111,6 +3176,33 @@ mod tests {
     }
 
     #[test]
+    fn c_cpp_helper_is_a_direct_executable() {
+        assert_eq!(
+            classify_helper(Lang::CCpp, Path::new("/x/cindex")).kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::CCpp.helper_base(), "cindex");
+        assert_eq!(Lang::CCpp.env_override(), "RVLSCAN_CINDEX");
+        let argv = helper_argv(
+            &classify_helper(Lang::CCpp, Path::new("/opt/cindex")),
+            Path::new("/repo"),
+            "repo",
+            &[],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/cindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
     fn classify_csharp_dll_is_an_assembly_but_bin_is_executable() {
         assert_eq!(
             classify_helper(Lang::CSharp, Path::new("/x/csindex.dll")).kind,
@@ -3130,6 +3222,18 @@ mod tests {
         );
         // A .csproj is a marker for detection, not a retrievable source file.
         assert_eq!(lang_of_path(Path::new("svc/Svc.csproj")), None);
+    }
+
+    #[test]
+    fn lang_of_path_maps_c_cpp_sources_but_not_headers() {
+        assert_eq!(lang_of_path(Path::new("src/io.c")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cc")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cpp")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cxx")), Some(Lang::CCpp));
+        // Headers map to no helper: invalidating the right TUs needs the
+        // include graph (follow-up), so header edits take the full-rescan path.
+        assert_eq!(lang_of_path(Path::new("src/io.h")), None);
+        assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
     }
 
     #[test]

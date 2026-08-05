@@ -35,13 +35,14 @@ build:
 rebuild:
 	$(CARGO) build $(CARGO_FLAGS) -p rvlscan
 
-## install: release-build rvlscan + goindex/pyindex and put them on PATH (BINDIR)
+## install: release-build rvlscan + goindex/pyindex/cindex and put them on PATH (BINDIR)
 install:
-	$(CARGO) build --release -p rvlscan
+	$(CARGO) build --release -p rvlscan -p cindex
 	$(GO) build -C helpers/goindex -o $(abspath target/release)/goindex .
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
 	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
+	install -m 0755 target/release/cindex "$(BINDIR)/cindex"
 	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
 	@# TypeScript: tsindex is a Node script needing `typescript`. Install
 	@# tsindex.js adjacent to the binary and put its `typescript` dep in
@@ -62,15 +63,18 @@ install:
 
 ## uninstall: remove the installed binary + helpers from BINDIR
 uninstall:
-	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/cindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
 	rm -rf "$(PREFIX)/node_modules/typescript"
-	@echo "removed rvlscan + goindex + pyindex.py + tsindex.js from $(BINDIR)"
+	@echo "removed rvlscan + goindex + cindex + pyindex.py + tsindex.js from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex next to the rvlscan binary
+## (cindex is a workspace bin: `build` already drops it in the adjacent slot;
+## scanning C/C++ additionally needs a system libclang until releases vendor
+## a pinned LLVM)
 helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py
-	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py)"
+	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py, cindex)"
 
 ## helpers-csindex: build the C# retriever (needs a .NET 8 SDK + NuGet for Roslyn)
 helpers-csindex:
