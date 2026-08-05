@@ -15,6 +15,7 @@ members = [
     "crates/rvl-config",
     "crates/rvl-structure",
     "crates/rvl-emission",
+    "crates/cindex",
 ]
 
 [workspace.package]

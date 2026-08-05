@@ -1552,6 +1552,117 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
     );
 }
 
+// --- C/C++ G1 lane (po-av01j.12) ---
+
+/// Locate the cindex helper (a workspace bin built alongside rvlscan) and
+/// verify its libclang engine loads. None (with a SKIP log line) when the
+/// binary is missing or no libclang is installed — the e2e is exercised
+/// wherever the engine exists, and the environment gap is loud, not silent.
+fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+        .parent()
+        .unwrap()
+        .join("cindex");
+    if !bin.is_file() {
+        eprintln!("SKIP {test}: cindex not built (run `cargo build -p cindex`)");
+        return None;
+    }
+    match std::process::Command::new(&bin)
+        .arg("--engine-check")
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(bin),
+        Ok(out) => {
+            eprintln!(
+                "SKIP {test}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP {test}: cannot run cindex: {e}");
+            None
+        }
+    }
+}
+
+/// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
+/// compile_commands.json, helper via RVLSCAN_CINDEX), the seed specs judge
+/// the C identities, and the judgments map the surfaced classes to RC-019 /
+/// RC-022 on the ladder. The macro-wrapped perform site flows through the
+/// pipeline like any other — the v2 macro flag is packet evidence, never a
+/// verdict gate.
+#[test]
+fn scan_decides_c_sites_end_to_end_with_seed_specs() {
+    let Some(cindex) = cindex_helper("scan_decides_c_sites_end_to_end_with_seed_specs") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-c");
+    let fixtures = manifest.join("tests").join("fixtures");
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(fixtures.join("c_seed_specs.json"))
+        .arg("--judgments")
+        .arg(fixtures.join("c_seed_judgments.json"))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CINDEX", &cindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().expect("findings must be an array").clone();
+    let main_c = verdicts_for(&rows, "src/main.c");
+
+    // Every planted blocking identity with no visible bound violates: two
+    // curl_easy_perform sites (the macro-wrapped one included), PQexec,
+    // PQconnectdb, redisCommand, redisConnect, connect, recv.
+    let violates = main_c
+        .iter()
+        .filter(|(v, r)| v == "violates" && r.contains("no bound anywhere"))
+        .count();
+    assert_eq!(
+        violates, 8,
+        "planted blocking sites must violate: {main_c:?}"
+    );
+    // The non-blocking setopt sites resolve as not_applicable, never noise.
+    let not_applicable = main_c
+        .iter()
+        .filter(|(v, r)| v == "not_applicable" && r.contains("does not block"))
+        .count();
+    assert_eq!(
+        not_applicable, 2,
+        "both setopt sites are non-blocking: {main_c:?}"
+    );
+
+    // The judgments map the surfaced classes to their controls on the ladder.
+    assert!(
+        stdout.contains("RC-019"),
+        "the curl/libpq timeout class must surface control-mapped: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-022"),
+        "the hiredis retry class must surface control-mapped: {stdout}"
+    );
+}
+
 /// Go, live end to end: goindex inventories the fixture's emissions (slog
 /// aggregates, the recover_block swallow), the seed specs judge them, and the
 /// ladder surfaces RC-027 (swallow) and RC-046 (no spans at I/O boundaries)

@@ -1,0 +1,26 @@
+[
+  {
+    "api": "libcurl.CURL.curl_easy_perform",
+    "scope": "runtime",
+    "verdict": "surface",
+    "severity": "high",
+    "fix": "Set CURLOPT_TIMEOUT (or CURLOPT_TIMEOUT_MS) on the handle before curl_easy_perform; pair with CURLOPT_CONNECTTIMEOUT for the dial phase",
+    "control": "RC-019"
+  },
+  {
+    "api": "hiredis.redisContext.redisCommand",
+    "scope": "runtime",
+    "verdict": "surface",
+    "severity": "medium",
+    "fix": "Connect with redisConnectWithTimeout and set a command timeout via redisSetTimeout; wrap transient failures in bounded retries with backoff",
+    "control": "RC-022"
+  },
+  {
+    "api": "libpq.PGconn.PQexec",
+    "scope": "runtime",
+    "verdict": "surface",
+    "severity": "high",
+    "fix": "Set statement_timeout on the session (or connect_timeout in the conninfo for the dial phase) so a stuck query cannot hang the caller",
+    "control": "RC-019"
+  }
+]

@@ -1,0 +1,70 @@
+{
+  "_comment": "SEED / test-grade C/C++ G1 spec corpus (po-av01j.12): RC-019 timeout judgments at the C identities cindex emits. Hand-authored, sufficient for the e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review, and the C/C++ gate set (compile-db gate population) is minted HITL - see the gate-set bead under po-av01j. The CURLOPT_TIMEOUT-class enum discrimination rides schema-v2 const_args as retrieval evidence; consuming it in judgment (a setopt-with-CURLOPT_TIMEOUT bounding the handle's perform) is spec-factory work, deliberately not hand-coded here.",
+  "apis": [
+    {
+      "type": "libcurl.CURL",
+      "method": "curl_easy_perform",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: curl_easy_perform blocks until transfer completion and is unbounded unless CURLOPT_TIMEOUT(_MS) was set on the handle; the setopt's const_args carry that evidence"
+    },
+    {
+      "type": "libcurl.CURL",
+      "method": "curl_easy_setopt",
+      "blocking": "no",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "SEED: setopt configures the handle and performs no I/O; its const_args (CURLOPT_TIMEOUT vs CURLOPT_URL) are evidence about the handle, not a blocking call"
+    },
+    {
+      "type": "libpq.PGconn",
+      "method": "PQexec",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: PQexec blocks for the full query round trip; statement_timeout / connect_timeout class config bounds it"
+    },
+    {
+      "type": "libpq.PGconn",
+      "method": "PQconnectdb",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: connection establishment blocks; connect_timeout in the conninfo bounds it"
+    },
+    {
+      "type": "hiredis.redisContext",
+      "method": "redisCommand",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019/RC-022: blocks on the command round trip; redisConnectWithTimeout / redisSetTimeout bound it, and transient failures need bounded retries"
+    },
+    {
+      "type": "hiredis.redisContext",
+      "method": "redisConnect",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: redisConnect has no timeout parameter; redisConnectWithTimeout is the bounded variant"
+    },
+    {
+      "type": "posix.socket",
+      "method": "connect",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.85,
+      "rationale": "SEED RC-019: a blocking connect(2); SO_SNDTIMEO or non-blocking mode with poll bounds it"
+    },
+    {
+      "type": "posix.socket",
+      "method": "recv",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.85,
+      "rationale": "SEED RC-019: a blocking recv(2); SO_RCVTIMEO bounds it"
+    }
+  ],
+  "configs": []
+}

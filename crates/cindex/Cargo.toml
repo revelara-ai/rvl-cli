@@ -1,0 +1,23 @@
+[package]
+name = "cindex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "C/C++ retriever helper for rvlscan (libclang C API, runtime-loaded)"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The engine pin (po-ae75b.9): the libclang C API, never LibTooling. The
+# `runtime` feature dlopens libclang at process start, so the WORKSPACE builds
+# on machines with no libclang installed; only running a retrieval needs the
+# library, and the helper fails closed with actionable guidance when it is
+# absent. Release packaging vendors a pinned, checksummed LLVM (follow-up
+# bead); a dev build uses the system library (LIBCLANG_PATH overrides).
+clang-sys = { version = "1.8", features = ["runtime", "clang_6_0"] }
+
+[dev-dependencies]
+tempfile = "3"
