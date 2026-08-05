@@ -2066,6 +2066,15 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
     };
     let repo = dir.path().join("repo");
     copy_fixture_to(&repo);
+    // Pre-warm the Go build/list cache: the first packages.Load on a cold CI
+    // runner can exceed the hook's 10s deterministic fail-open cap on its
+    // own, which would degrade this scan to zero sites and starve the agent
+    // lane the test exists to exercise.
+    let _ = std::process::Command::new(&goindex_bin)
+        .args(["--retrieve", "--root"])
+        .arg(&repo)
+        .args(["--name", "warm"])
+        .output();
     std::fs::write(
         repo.join(".revelara.yaml"),
         "scanner:\n  use_agent: allow\n  agent_hooks:\n    pre_commit:\n      enabled: true\n      budget_seconds: 20\n",
