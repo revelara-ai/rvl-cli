@@ -1,10 +1,11 @@
 # rvlscan build + helper packaging.
 #
 # The scanner binary discovers its language retriever helpers (goindex,
-# pyindex) at runtime in this order: an env override (RVLSCAN_GOINDEX /
-# RVLSCAN_PYINDEX), then a helper sitting NEXT TO the rvlscan binary, then
-# PATH. The `helpers` target populates that adjacent slot so a locally built
-# `rvlscan scan` needs no env var — the same layout a release archive ships.
+# pyindex, tsindex, javaindex) at runtime in this order: an env override
+# (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_TSINDEX / RVLSCAN_JAVAINDEX),
+# then a helper sitting NEXT TO the rvlscan binary, then PATH. The `helpers`
+# target populates that adjacent slot so a locally built `rvlscan scan` needs
+# no env var — the same layout a release archive ships.
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).
@@ -43,6 +44,9 @@ install:
 	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
 	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
 	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
+	@# Java: javaindex is a single source file run in JEP 330 source-file mode
+	@# (`java javaindex.java`) -- no build step; scanning Java needs a JDK 11+.
+	install -m 0644 helpers/javaindex/javaindex.java "$(BINDIR)/javaindex.java"
 	@# TypeScript: tsindex is a Node script needing `typescript`. Install
 	@# tsindex.js adjacent to the binary and put its `typescript` dep in
 	@# $(PREFIX)/node_modules, which Node resolves by walking up from BINDIR.
@@ -52,25 +56,26 @@ install:
 	  install -m 0644 helpers/tsindex/tsindex.js "$(BINDIR)/tsindex.js"; \
 	  mkdir -p "$(PREFIX)/node_modules"; \
 	  cp -R helpers/tsindex/node_modules/typescript "$(PREFIX)/node_modules/"; \
-	  echo "installed rvlscan + goindex + pyindex.py + tsindex.js to $(BINDIR)"; \
-	  echo "  Go, Python, and TypeScript scanning all work with zero env."; \
+	  echo "installed rvlscan + goindex + pyindex.py + tsindex.js + javaindex.java to $(BINDIR)"; \
+	  echo "  Go, Python, and TypeScript scanning work with zero env; Java needs a JDK 11+ on PATH."; \
 	else \
-	  echo "installed rvlscan + goindex + pyindex.py to $(BINDIR)"; \
-	  echo "  Go + Python work out of the box; TypeScript needs Node (install it, then re-run 'make install')."; \
+	  echo "installed rvlscan + goindex + pyindex.py + javaindex.java to $(BINDIR)"; \
+	  echo "  Go + Python work out of the box; TypeScript needs Node; Java needs a JDK 11+."; \
 	fi
 	@case ":$$PATH:" in *":$(BINDIR):"*) : ;; *) echo "  NOTE: $(BINDIR) is not on your PATH — add it, then: rvlscan scan <path>";; esac
 
 ## uninstall: remove the installed binary + helpers from BINDIR
 uninstall:
-	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js"
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js" "$(BINDIR)/javaindex.java"
 	rm -rf "$(PREFIX)/node_modules/typescript"
-	@echo "removed rvlscan + goindex + pyindex.py + tsindex.js from $(BINDIR)"
+	@echo "removed rvlscan + goindex + pyindex.py + tsindex.js + javaindex.java from $(BINDIR)"
 
-## helpers: build goindex and place goindex + pyindex next to the rvlscan binary
+## helpers: build goindex and place goindex + pyindex + javaindex next to the rvlscan binary
 helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py
-	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py)"
+	cp helpers/javaindex/javaindex.java $(BIN_DIR)/javaindex.java
+	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py, javaindex.java)"
 
 ## dev: build the binary and its helpers for local zero-env `rvlscan scan`
 dev: helpers

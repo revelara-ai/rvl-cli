@@ -1669,6 +1669,121 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
     );
 }
 
+// --- Java lane (po-av01j.9) ---
+
+/// The hand-authored SEED Java spec corpus (test-grade; RC-019 timeouts,
+/// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
+/// emission section). The production corpus rides the LLM factory, HITL.
+fn java_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("java_seed_specs.json")
+}
+
+/// The javaindex helper source, iff a JDK is available (the helper runs in
+/// JEP 330 source-file mode and needs javac). Skip-if-no-jdk, matching the
+/// goindex/node skip convention.
+fn javaindex_ready() -> Option<std::path::PathBuf> {
+    match std::process::Command::new("javac").arg("-version").output() {
+        Ok(out) if out.status.success() => {}
+        _ => {
+            eprintln!("SKIP java scan: no JDK (javac not available)");
+            return None;
+        }
+    }
+    Some(helpers_dir().join("javaindex").join("javaindex.java"))
+}
+
+/// Java e2e: javaindex retrieves the fixture, and the seed specs decide all
+/// three ways. The bare @Scheduled registration violates (job altitude, no
+/// bound), the @Scheduled next to @Transactional(timeout = 30) satisfies via
+/// the bounding-decorator mechanism, the classic-only java.util.Timer spec
+/// abstains on a background_job site (applicability control), and the JDBC
+/// executeQuery with no bound anywhere violates on the G1 lane.
+#[test]
+fn scan_decides_java_sites_end_to_end() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("javaindex"))
+        .arg("--specs-file")
+        .arg(java_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_JAVAINDEX", &javaindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().expect("findings must be an array").clone();
+
+    let jobs = verdicts_for(&rows, "Jobs.java");
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the bare @Scheduled registration must violate: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("bounding decorator")),
+        "@Scheduled beside @Transactional(timeout = 30) must satisfy via the decorator bound: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("site kind")),
+        "the classic java.util.Timer spec must not decide the background_job site: {jobs:?}"
+    );
+
+    let svc = verdicts_for(&rows, "Service.java");
+    assert!(
+        svc.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the unbounded JDBC executeQuery must violate: {svc:?}"
+    );
+}
+
+/// Java, live end to end: javaindex inventories the fixture's emissions (the
+/// slf4j aggregates, the swallowing catch), and the seed specs surface the
+/// RC-027 swallow gap in the ladder.
+#[test]
+fn live_java_scan_surfaces_g4_emission_findings() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("javaindex"))
+        .arg("--specs-file")
+        .arg(java_seed_specs())
+        .env("RVLSCAN_JAVAINDEX", &javaindex)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the swallowing catch must surface under RC-027: {stdout}"
+    );
+}
+
 // --- G7 repo-structure lane (po-av01j.7) ---
 
 /// A `--retrieved` stream carrying a `repo_structure` record surfaces its

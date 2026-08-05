@@ -550,14 +550,15 @@ fn server_to_findings(
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript) makes it a stable `BTreeMap` key, so a
-/// multi-language incremental retrieval runs helpers in the same deterministic
-/// order the single-command path documents.
+/// order Go < Python < TypeScript < Java) makes it a stable `BTreeMap` key, so
+/// a multi-language incremental retrieval runs helpers in the same
+/// deterministic order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
     TypeScript,
+    Java,
 }
 
 impl Lang {
@@ -567,6 +568,7 @@ impl Lang {
             Lang::Go => "goindex",
             Lang::Python => "pyindex",
             Lang::TypeScript => "tsindex",
+            Lang::Java => "javaindex",
         }
     }
     /// The env var that overrides helper discovery for this language.
@@ -575,6 +577,7 @@ impl Lang {
             Lang::Go => "RVLSCAN_GOINDEX",
             Lang::Python => "RVLSCAN_PYINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
+            Lang::Java => "RVLSCAN_JAVAINDEX",
         }
     }
 }
@@ -585,18 +588,22 @@ impl std::fmt::Display for Lang {
             Lang::Go => "Go",
             Lang::Python => "Python",
             Lang::TypeScript => "TypeScript",
+            Lang::Java => "Java",
         })
     }
 }
 
-/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex
-/// executable on PATH) runs directly; a pyindex `.py` script runs under
-/// `python3`, and a tsindex `.js` script runs under `node`.
+/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex/
+/// javaindex executable on PATH) runs directly; a pyindex `.py` script runs
+/// under `python3`, a tsindex `.js` script runs under `node`, and a javaindex
+/// `.java` source file runs under `java` (JEP 330 source-file mode: in-memory
+/// compile, no packaging step, JDK 11+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
     Executable,
     PyScript,
     NodeScript,
+    JavaSource,
 }
 
 /// A helper located on disk, ready to be turned into a command.
@@ -619,16 +626,20 @@ fn is_declaration_ts(path: &Path) -> bool {
 
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`) short-circuit, otherwise a walk that skips vendored/build
-/// dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`). Order is
-/// stable (Go, Python, TypeScript) so a multi-language repo runs its helpers in
-/// a deterministic order.
+/// `tsconfig.json`, `pom.xml`, `build.gradle`, `build.gradle.kts`)
+/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
+/// `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.java`. Order is
+/// stable (Go, Python, TypeScript, Java) so a multi-language repo runs its
+/// helpers in a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
-    if !(go && py && ts) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts);
+    let mut java = root.join("pom.xml").is_file()
+        || root.join("build.gradle").is_file()
+        || root.join("build.gradle.kts").is_file();
+    if !(go && py && ts && java) {
+        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut java);
     }
     let mut out = Vec::new();
     if go {
@@ -640,17 +651,20 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if ts {
         out.push(Lang::TypeScript);
     }
+    if java {
+        out.push(Lang::Java);
+    }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts` when a `.go`/`.py`/`.ts`|`.tsx`
-/// (non-`.d.ts`) file is seen, and stops early once all three are found. Skips
-/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout
-/// does not turn detection into a full-tree crawl.
-fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
+/// Bounded directory walk: sets `go`/`py`/`ts`/`java` when a `.go`/`.py`/
+/// `.ts`|`.tsx` (non-`.d.ts`)/`.java` file is seen, and stops early once all
+/// are found. Skips `.git`, `node_modules`, `target`, `vendor`, `__pycache__`
+/// so a big checkout does not turn detection into a full-tree crawl.
+fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool, java: &mut bool) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts {
+        if *go && *py && *ts && *java {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -669,6 +683,7 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
                     Some("go") => *go = true,
                     Some("py") => *py = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("java") => *java = true,
                     _ => {}
                 }
             }
@@ -688,6 +703,8 @@ fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
         Lang::Python => HelperKind::Executable,
         Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
         Lang::TypeScript => HelperKind::Executable,
+        Lang::Java if ext == Some("java") => HelperKind::JavaSource,
+        Lang::Java => HelperKind::Executable,
     };
     ResolvedHelper {
         path: path.to_path_buf(),
@@ -727,6 +744,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     let script_name = match lang {
         Lang::Python => Some(format!("{base}.py")),
         Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::Java => Some(format!("{base}.java")),
         Lang::Go => None,
     };
     // (2) adjacent to the rvlscan binary.
@@ -786,6 +804,10 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
             .chain(tail)
             .collect(),
         HelperKind::NodeScript => std::iter::once("node".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::JavaSource => std::iter::once("java".to_string())
             .chain(std::iter::once(helper_path))
             .chain(tail)
             .collect(),
@@ -850,7 +872,7 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py") => out.push(path),
+                    Some("go" | "py" | "java") => out.push(path),
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
@@ -880,6 +902,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("java") => Some(Lang::Java),
         _ => None,
     }
 }
@@ -2932,6 +2955,37 @@ mod tests {
     }
 
     #[test]
+    fn detect_java_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("App.java"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Java]);
+    }
+
+    #[test]
+    fn detect_java_via_marker_files() {
+        for marker in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(marker));
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::Java],
+                "{marker} must mark a Java repo"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_java_orders_after_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("App.java"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::Java]
+        );
+    }
+
+    #[test]
     fn detect_neither_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("README.md"));
@@ -3016,6 +3070,59 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    #[test]
+    fn java_source_argv_runs_under_java() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/javaindex.java"),
+            kind: HelperKind::JavaSource,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "java",
+                "/opt/javaindex.java",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_java_source_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex.java")).kind,
+            HelperKind::JavaSource
+        );
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_java() {
+        assert_eq!(lang_of_path(Path::new("svc/App.java")), Some(Lang::Java));
+    }
+
+    #[test]
+    fn java_helper_resolves_adjacent_script_name() {
+        // resolve_helper's adjacent-slot lookup must also try javaindex.java,
+        // the scripted-helper filename `make helpers` installs.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("javaindex.java");
+        touch(&fake);
+        std::env::set_var("RVLSCAN_JAVAINDEX", &fake);
+        let resolved = resolve_helper(Lang::Java);
+        std::env::remove_var("RVLSCAN_JAVAINDEX");
+        let resolved = resolved.expect("env override must resolve");
+        assert_eq!(resolved.kind, HelperKind::JavaSource);
+        assert_eq!(resolved.path, fake);
     }
 
     #[test]
