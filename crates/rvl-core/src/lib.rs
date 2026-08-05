@@ -39,7 +39,7 @@ pub const CONST_ARG_EMISSION_CATEGORY: &str = "emission_category";
 
 /// The `const_args` entry name carrying how many emission calls the aggregate
 /// stands for. Log statements are the highest-volume site class in any
-/// codebase; the count is the volume-control contract (a polaris-sized repo
+/// codebase; the count is the volume-control contract (a large backend repo
 /// must not produce tens of thousands of emission Sites).
 pub const CONST_ARG_EMISSION_COUNT: &str = "emission_count";
 

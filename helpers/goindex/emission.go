@@ -13,7 +13,7 @@
 // AGGREGATES: one per (enclosing function, framework identity, category),
 // with the category and call count riding const_args entries
 // (emission_category / emission_count, how: "aggregate") rather than one
-// packet per log line. A polaris-sized repo must not produce tens of
+// packet per log line. A large backend repo must not produce tens of
 // thousands of emission sites.
 //
 // Classification is TYPE-DRIVEN: a call is an emission only when the type

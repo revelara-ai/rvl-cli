@@ -42,7 +42,7 @@ func TestLogStatementsAggregatePerFunctionFrameworkCategory(t *testing.T) {
 
 	// Emitter() calls slog.Logger methods three times: ONE aggregate with
 	// count 3, not three packets. This is the volume-control contract — a
-	// polaris-sized repo must not produce tens of thousands of emission sites.
+	// large backend repo must not produce tens of thousands of emission sites.
 	var loggerAggs []RetrievedSite
 	for _, s := range emissions {
 		if s.Symbol == "Emitter" && s.ClientType == "log/slog.Logger" {
