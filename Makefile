@@ -1,11 +1,14 @@
 # rvlscan build + helper packaging.
 #
 # The scanner binary discovers its language retriever helpers (goindex,
-# pyindex, tsindex, javaindex) at runtime in this order: an env override
-# (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_TSINDEX / RVLSCAN_JAVAINDEX),
-# then a helper sitting NEXT TO the rvlscan binary, then PATH. The `helpers`
-# target populates that adjacent slot so a locally built `rvlscan scan` needs
-# no env var — the same layout a release archive ships.
+# pyindex, tsindex, javaindex, rustindex) at runtime in this order: an env
+# override (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_TSINDEX /
+# RVLSCAN_JAVAINDEX / RVLSCAN_RUSTINDEX), then a helper sitting NEXT TO the
+# rvlscan binary, then PATH. The `helpers` target populates that adjacent slot
+# so a locally built `rvlscan scan` needs no env var — the same layout a
+# release archive ships. rustindex is a workspace crate, so a plain `cargo
+# build` already lands it next to rvlscan; it needs rust-analyzer at runtime
+# (`rustup component add rust-analyzer`).
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).
@@ -36,14 +39,15 @@ build:
 rebuild:
 	$(CARGO) build $(CARGO_FLAGS) -p rvlscan
 
-## install: release-build rvlscan + goindex/pyindex/cindex and put them on PATH (BINDIR)
+## install: release-build rvlscan + goindex/pyindex/cindex/rustindex and put them on PATH (BINDIR)
 install:
-	$(CARGO) build --release -p rvlscan -p cindex
+	$(CARGO) build --release -p rvlscan -p cindex -p rustindex
 	$(GO) build -C helpers/goindex -o $(abspath target/release)/goindex .
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/rvlscan "$(BINDIR)/rvlscan"
 	install -m 0755 target/release/goindex "$(BINDIR)/goindex"
 	install -m 0755 target/release/cindex "$(BINDIR)/cindex"
+	install -m 0755 target/release/rustindex "$(BINDIR)/rustindex"
 	install -m 0644 helpers/pyindex/pyindex.py "$(BINDIR)/pyindex.py"
 	@# Java: javaindex is a single source file run in JEP 330 source-file mode
 	@# (`java javaindex.java`) -- no build step; scanning Java needs a JDK 11+.
@@ -67,19 +71,19 @@ install:
 
 ## uninstall: remove the installed binary + helpers from BINDIR
 uninstall:
-	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/cindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js" "$(BINDIR)/javaindex.java"
+	rm -f "$(BINDIR)/rvlscan" "$(BINDIR)/goindex" "$(BINDIR)/cindex" "$(BINDIR)/rustindex" "$(BINDIR)/pyindex.py" "$(BINDIR)/tsindex.js" "$(BINDIR)/javaindex.java"
 	rm -rf "$(PREFIX)/node_modules/typescript"
-	@echo "removed rvlscan + goindex + cindex + pyindex.py + tsindex.js + javaindex.java from $(BINDIR)"
+	@echo "removed rvlscan + goindex + cindex + rustindex + pyindex.py + tsindex.js + javaindex.java from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex + javaindex next to the rvlscan binary
-## (cindex is a workspace bin: `build` already drops it in the adjacent slot;
-## scanning C/C++ additionally needs a system libclang until releases vendor
-## a pinned LLVM)
+## (cindex and rustindex are workspace bins: `build` already drops them in the
+## adjacent slot; scanning C/C++ additionally needs a system libclang until
+## releases vendor a pinned LLVM; scanning Rust needs rust-analyzer at runtime)
 helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py
 	cp helpers/javaindex/javaindex.java $(BIN_DIR)/javaindex.java
-	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py, javaindex.java, cindex)"
+	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py, javaindex.java, cindex, rustindex)"
 
 ## helpers-csindex: build the C# retriever (needs a .NET 8 SDK + NuGet for Roslyn)
 helpers-csindex:

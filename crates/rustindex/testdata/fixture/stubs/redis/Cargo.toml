@@ -1,0 +1,4 @@
+[package]
+name = "redis"
+version = "0.24.0"
+edition = "2021"

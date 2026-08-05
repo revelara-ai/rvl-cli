@@ -289,7 +289,10 @@ pub struct Site {
     #[serde(default)]
     pub lang: String,
     /// Present on the repo-scoped record that rides in the same stream.
-    #[serde(default)]
+    /// Skipped when absent so a Site serialized by an in-workspace emitter
+    /// (rustindex) matches the sibling helpers' wire shape exactly — G1
+    /// records carry no `kind` field at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// The contract version the emitter stamped on this record (0 when the
     /// stream predates stamping). `parse_stream` refuses records stamped with

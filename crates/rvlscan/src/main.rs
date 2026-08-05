@@ -550,14 +550,15 @@ fn server_to_findings(
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript < CSharp < Java < C/C++) makes it a stable
-/// `BTreeMap` key, so a multi-language incremental retrieval runs helpers in
-/// the same
+/// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
+/// stable `BTreeMap` key, so a multi-language incremental retrieval runs
+/// helpers in the same
 /// deterministic order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
+    Rust,
     TypeScript,
     CSharp,
     Java,
@@ -572,6 +573,7 @@ impl Lang {
         match self {
             Lang::Go => "goindex",
             Lang::Python => "pyindex",
+            Lang::Rust => "rustindex",
             Lang::TypeScript => "tsindex",
             Lang::CSharp => "csindex",
             Lang::Java => "javaindex",
@@ -583,6 +585,7 @@ impl Lang {
         match self {
             Lang::Go => "RVLSCAN_GOINDEX",
             Lang::Python => "RVLSCAN_PYINDEX",
+            Lang::Rust => "RVLSCAN_RUSTINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
             Lang::CSharp => "RVLSCAN_CSINDEX",
             Lang::Java => "RVLSCAN_JAVAINDEX",
@@ -596,6 +599,7 @@ impl std::fmt::Display for Lang {
         f.write_str(match self {
             Lang::Go => "Go",
             Lang::Python => "Python",
+            Lang::Rust => "Rust",
             Lang::TypeScript => "TypeScript",
             Lang::CSharp => "C#",
             Lang::Java => "Java",
@@ -656,16 +660,17 @@ fn has_csharp_marker(root: &Path) -> bool {
 
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`, a root `*.csproj`/`*.sln`, `pom.xml`, `build.gradle`,
-/// `build.gradle.kts`, `compile_commands.json`) short-circuit, otherwise a
-/// walk that skips vendored/build dirs looks for `*.go` / `*.py` /
-/// `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` / `*.java` /
-/// `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python, TypeScript, C#,
-/// Java, C/C++) so a multi-language repo runs its helpers in a deterministic
-/// order.
+/// `Cargo.toml`, `tsconfig.json`, a root `*.csproj`/`*.sln`, `pom.xml`,
+/// `build.gradle`, `build.gradle.kts`, `compile_commands.json`)
+/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
+/// `*.go` / `*.py` / `*.rs` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` /
+/// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
+/// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
+/// helpers in a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
+    let mut rs = root.join("Cargo.toml").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
     let mut cs = has_csharp_marker(root);
     let mut java = root.join("pom.xml").is_file()
@@ -676,8 +681,10 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     // fallback tier.
     let mut cc = root.join("compile_commands.json").is_file()
         || root.join("build").join("compile_commands.json").is_file();
-    if !(go && py && ts && cs && java && cc) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs, &mut java, &mut cc);
+    if !(go && py && rs && ts && cs && java && cc) {
+        walk_for_sources(
+            root, &mut go, &mut py, &mut rs, &mut ts, &mut cs, &mut java, &mut cc,
+        );
     }
     let mut out = Vec::new();
     if go {
@@ -685,6 +692,9 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     }
     if py {
         out.push(Lang::Python);
+    }
+    if rs {
+        out.push(Lang::Rust);
     }
     if ts {
         out.push(Lang::TypeScript);
@@ -701,7 +711,7 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts`/`cs`/`java`/`cc` when a
+/// Bounded directory walk: sets `go`/`py`/`rs`/`ts`/`cs`/`java`/`cc` when a
 /// matching source file is seen, and stops early once all are found. Skips
 /// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big
 /// checkout does not turn detection into a full-tree crawl.
@@ -710,6 +720,7 @@ fn walk_for_sources(
     root: &Path,
     go: &mut bool,
     py: &mut bool,
+    rs: &mut bool,
     ts: &mut bool,
     cs: &mut bool,
     java: &mut bool,
@@ -717,7 +728,7 @@ fn walk_for_sources(
 ) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts && *cs && *java && *cc {
+        if *go && *py && *rs && *ts && *cs && *java && *cc {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -735,6 +746,7 @@ fn walk_for_sources(
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("go") => *go = true,
                     Some("py") => *py = true,
+                    Some("rs") => *rs = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
                     Some("cs" | "csproj" | "sln") => *cs = true,
                     Some("java") => *java = true,
@@ -746,15 +758,17 @@ fn walk_for_sources(
     }
 }
 
-/// Classify a resolved helper path into how it must be invoked. Go helpers are
-/// always executables; a Python helper is a `python3` script when it ends in
-/// `.py`, a TypeScript helper is a `node` script when it ends in `.js`, a C#
-/// helper is a `dotnet` assembly when it ends in `.dll` (a framework-dependent
-/// build), otherwise an executable on PATH.
+/// Classify a resolved helper path into how it must be invoked. Go, Rust, and
+/// C/C++ helpers are always executables (rustindex and cindex are workspace
+/// binaries built next to rvlscan); a Python helper is a `python3` script when
+/// it ends in `.py`, a TypeScript helper is a `node` script when it ends in
+/// `.js`, a Java helper is a `java` source-file script when it ends in
+/// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
+/// otherwise an executable on PATH.
 fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
     let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
-        Lang::Go | Lang::CCpp => HelperKind::Executable,
+        Lang::Go | Lang::Rust | Lang::CCpp => HelperKind::Executable,
         Lang::Python if ext == Some("py") => HelperKind::PyScript,
         Lang::Python => HelperKind::Executable,
         Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
@@ -804,7 +818,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         Lang::TypeScript => Some(format!("{base}.js")),
         Lang::CSharp => Some(format!("{base}.dll")),
         Lang::Java => Some(format!("{base}.java")),
-        Lang::Go | Lang::CCpp => None,
+        Lang::Go | Lang::Rust | Lang::CCpp => None,
     };
     // (2) adjacent to the rvlscan binary.
     if let Ok(exe) = std::env::current_exe() {
@@ -936,7 +950,7 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py" | "cs" | "java" | "c" | "cc" | "cpp" | "cxx") => {
+                    Some("go" | "py" | "rs" | "cs" | "java" | "c" | "cc" | "cpp" | "cxx") => {
                         out.push(path)
                     }
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
@@ -970,6 +984,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
+        Some("rs") => Some(Lang::Rust),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
         Some("cs") => Some(Lang::CSharp),
         Some("java") => Some(Lang::Java),
@@ -3089,6 +3104,54 @@ mod tests {
     }
 
     #[test]
+    fn detect_rust_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("lib.rs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_via_cargo_toml_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Cargo.toml"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_orders_between_python_and_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.py"));
+        touch(&dir.path().join("main.rs"));
+        touch(&dir.path().join("app.ts"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::Python, Lang::Rust, Lang::TypeScript]
+        );
+    }
+
+    #[test]
+    fn detect_rust_skips_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+        touch(&nested.join("build_script.rs"));
+        // The only .rs file is under target/, which is skipped.
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rust_helper_is_an_executable_and_rs_maps_to_rust() {
+        assert_eq!(
+            classify_helper(Lang::Rust, Path::new("/x/rustindex")).kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::Rust.helper_base(), "rustindex");
+        assert_eq!(Lang::Rust.env_override(), "RVLSCAN_RUSTINDEX");
+        assert_eq!(lang_of_path(Path::new("src/lib.rs")), Some(Lang::Rust));
+    }
+
+    #[test]
+
     fn detect_neither_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("README.md"));

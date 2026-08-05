@@ -1,0 +1,17 @@
+# rustindex fixture workspace. Self-contained and OFFLINE: the "reqwest",
+# "sqlx", "tokio", "axum", "tracing", and "redis" dependencies are local stub
+# crates with the same package names, so rust-analyzer's SCIP output carries
+# the same crate-keyed monikers a real repo produces without fetching (or
+# building) the real dependency trees. Its own [workspace] table keeps cargo
+# from walking up into the rvlscan workspace.
+[workspace]
+resolver = "2"
+members = [
+    "app",
+    "stubs/reqwest",
+    "stubs/sqlx",
+    "stubs/tokio",
+    "stubs/axum",
+    "stubs/tracing",
+    "stubs/redis",
+]

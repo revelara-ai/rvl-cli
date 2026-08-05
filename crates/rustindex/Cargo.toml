@@ -1,0 +1,17 @@
+[package]
+name = "rustindex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The packet contract types come from rvl-core DIRECTLY: rustindex lives in
+# the same workspace as its consumer, so unlike goindex/pyindex/tsindex (which
+# hand-mirror the contract in their own languages) field agreement here is by
+# construction, not by convention.
+rvl-core = { path = "../rvl-core" }
+scip = "0.5"
+protobuf = "3"
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

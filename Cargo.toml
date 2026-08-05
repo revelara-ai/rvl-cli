@@ -16,7 +16,13 @@ members = [
     "crates/rvl-structure",
     "crates/rvl-emission",
     "crates/cindex",
+    "crates/rustindex",
 ]
+
+# The rustindex fixture is its own cargo workspace (stub crates named like the
+# real reqwest/sqlx/... so SCIP monikers are realistic); keep cargo from
+# treating it as part of this one.
+exclude = ["crates/rustindex/testdata/fixture"]
 
 [workspace.package]
 version = "0.1.0"
