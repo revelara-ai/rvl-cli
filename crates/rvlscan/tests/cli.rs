@@ -187,11 +187,13 @@ fn scan_without_retrieved_runs_the_go_helper() {
     match build {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
-            eprintln!(
-                "SKIP scan_without_retrieved_runs_the_go_helper: `go build` failed: {}",
+            // A toolchain we do not have is a skip; OUR code failing to build
+            // is a defect. Swallowing this as a skip is how a helper that
+            // could not compile shipped once already (po-av01j.47).
+            panic!(
+                "goindex failed to build: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            return;
         }
         Err(e) => {
             eprintln!("SKIP scan_without_retrieved_runs_the_go_helper: `go` not available: {e}");
@@ -561,11 +563,11 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     {
         Ok(out) if out.status.success() => Some(goindex_bin),
         Ok(out) => {
-            eprintln!(
-                "SKIP: go build failed: {}",
+            // See above: our own build failing is never a skip.
+            panic!(
+                "goindex failed to build: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            None
         }
         Err(e) => {
             eprintln!("SKIP: go toolchain not available: {e}");
@@ -2017,11 +2019,11 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         match build {
             Ok(o) if o.status.success() && rustindex.is_file() => {}
             Ok(o) => {
-                eprintln!(
-                    "SKIP live_rust_scan: cargo build -p rustindex failed: {}",
+                // Our own crate failing to build is a defect, not a skip.
+                panic!(
+                    "rustindex failed to build: {}",
                     String::from_utf8_lossy(&o.stderr)
                 );
-                return;
             }
             Err(e) => {
                 eprintln!("SKIP live_rust_scan: cargo not available: {e}");
@@ -2609,18 +2611,20 @@ fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .output()
         .ok()?;
     if !out.status.success() {
-        eprintln!(
-            "SKIP csindex e2e: dotnet build failed (NuGet restore for Roslyn needed?): {}",
+        // The SDK being absent is a skip (handled above); the SDK being
+        // present while OUR helper fails to compile is a defect. This exact
+        // branch hid four CS0103 errors through an entire epic (po-av01j.47),
+        // because a green skip reads identically to a green pass.
+        panic!(
+            "csindex failed to build: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        return None;
     }
     let dll = out_dir.join("csindex.dll");
     if dll.is_file() {
         Some(dll)
     } else {
-        eprintln!("SKIP csindex e2e: csindex.dll not produced");
-        None
+        panic!("csindex built but produced no csindex.dll at {out_dir:?}")
     }
 }
 
