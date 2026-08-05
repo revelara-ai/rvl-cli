@@ -550,14 +550,15 @@ fn server_to_findings(
 // adjacent to the rvlscan binary, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
-/// order Go < Python < TypeScript) makes it a stable `BTreeMap` key, so a
-/// multi-language incremental retrieval runs helpers in the same deterministic
-/// order the single-command path documents.
+/// order Go < Python < TypeScript < CSharp) makes it a stable `BTreeMap` key,
+/// so a multi-language incremental retrieval runs helpers in the same
+/// deterministic order the single-command path documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Go,
     Python,
     TypeScript,
+    CSharp,
 }
 
 impl Lang {
@@ -567,6 +568,7 @@ impl Lang {
             Lang::Go => "goindex",
             Lang::Python => "pyindex",
             Lang::TypeScript => "tsindex",
+            Lang::CSharp => "csindex",
         }
     }
     /// The env var that overrides helper discovery for this language.
@@ -575,6 +577,7 @@ impl Lang {
             Lang::Go => "RVLSCAN_GOINDEX",
             Lang::Python => "RVLSCAN_PYINDEX",
             Lang::TypeScript => "RVLSCAN_TSINDEX",
+            Lang::CSharp => "RVLSCAN_CSINDEX",
         }
     }
 }
@@ -585,18 +588,22 @@ impl std::fmt::Display for Lang {
             Lang::Go => "Go",
             Lang::Python => "Python",
             Lang::TypeScript => "TypeScript",
+            Lang::CSharp => "C#",
         })
     }
 }
 
 /// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex
 /// executable on PATH) runs directly; a pyindex `.py` script runs under
-/// `python3`, and a tsindex `.js` script runs under `node`.
+/// `python3`, a tsindex `.js` script runs under `node`, and a csindex `.dll`
+/// (a framework-dependent .NET build) runs under `dotnet`. A csindex published
+/// with an apphost is a plain executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
     Executable,
     PyScript,
     NodeScript,
+    DotnetAssembly,
 }
 
 /// A helper located on disk, ready to be turned into a command.
@@ -617,18 +624,35 @@ fn is_declaration_ts(path: &Path) -> bool {
         .is_some_and(|n| n.ends_with(".d.ts"))
 }
 
+/// Whether the root directory itself carries a C# project marker (`*.csproj`
+/// or `*.sln`). Unlike `go.mod`/`tsconfig.json` the marker's NAME varies per
+/// project, so this is a single non-recursive `read_dir` over root, not a
+/// fixed-name `is_file` probe.
+fn has_csharp_marker(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x == "csproj" || x == "sln")
+    })
+}
+
 /// Detect which supported languages have source under `root`. Pure and
 /// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
-/// `tsconfig.json`) short-circuit, otherwise a walk that skips vendored/build
-/// dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx` (never `*.d.ts`). Order is
-/// stable (Go, Python, TypeScript) so a multi-language repo runs its helpers in
-/// a deterministic order.
+/// `tsconfig.json`, a root `*.csproj`/`*.sln`) short-circuit, otherwise a walk
+/// that skips vendored/build dirs looks for `*.go` / `*.py` / `*.ts`|`*.tsx`
+/// (never `*.d.ts`) / `*.cs`. Order is stable (Go, Python, TypeScript, C#) so
+/// a multi-language repo runs its helpers in a deterministic order.
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut ts = root.join("tsconfig.json").is_file();
-    if !(go && py && ts) {
-        walk_for_sources(root, &mut go, &mut py, &mut ts);
+    let mut cs = has_csharp_marker(root);
+    if !(go && py && ts && cs) {
+        walk_for_sources(root, &mut go, &mut py, &mut ts, &mut cs);
     }
     let mut out = Vec::new();
     if go {
@@ -640,17 +664,21 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     if ts {
         out.push(Lang::TypeScript);
     }
+    if cs {
+        out.push(Lang::CSharp);
+    }
     out
 }
 
-/// Bounded directory walk: sets `go`/`py`/`ts` when a `.go`/`.py`/`.ts`|`.tsx`
-/// (non-`.d.ts`) file is seen, and stops early once all three are found. Skips
-/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big checkout
-/// does not turn detection into a full-tree crawl.
-fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
+/// Bounded directory walk: sets `go`/`py`/`ts`/`cs` when a
+/// `.go`/`.py`/`.ts`|`.tsx` (non-`.d.ts`)/`.cs`|`.csproj`|`.sln` file is seen,
+/// and stops early once all are found. Skips `.git`, `node_modules`, `target`,
+/// `vendor`, `__pycache__` so a big checkout does not turn detection into a
+/// full-tree crawl.
+fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool, cs: &mut bool) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if *go && *py && *ts {
+        if *go && *py && *ts && *cs {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -669,6 +697,7 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
                     Some("go") => *go = true,
                     Some("py") => *py = true,
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("cs" | "csproj" | "sln") => *cs = true,
                     _ => {}
                 }
             }
@@ -678,8 +707,9 @@ fn walk_for_sources(root: &Path, go: &mut bool, py: &mut bool, ts: &mut bool) {
 
 /// Classify a resolved helper path into how it must be invoked. Go helpers are
 /// always executables; a Python helper is a `python3` script when it ends in
-/// `.py`, a TypeScript helper is a `node` script when it ends in `.js`,
-/// otherwise an executable on PATH.
+/// `.py`, a TypeScript helper is a `node` script when it ends in `.js`, a C#
+/// helper is a `dotnet` assembly when it ends in `.dll` (a framework-dependent
+/// build), otherwise an executable on PATH.
 fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
     let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
@@ -688,6 +718,8 @@ fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
         Lang::Python => HelperKind::Executable,
         Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
         Lang::TypeScript => HelperKind::Executable,
+        Lang::CSharp if ext == Some("dll") => HelperKind::DotnetAssembly,
+        Lang::CSharp => HelperKind::Executable,
     };
     ResolvedHelper {
         path: path.to_path_buf(),
@@ -727,6 +759,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     let script_name = match lang {
         Lang::Python => Some(format!("{base}.py")),
         Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::CSharp => Some(format!("{base}.dll")),
         Lang::Go => None,
     };
     // (2) adjacent to the rvlscan binary.
@@ -789,6 +822,10 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
             .chain(std::iter::once(helper_path))
             .chain(tail)
             .collect(),
+        HelperKind::DotnetAssembly => std::iter::once("dotnet".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
     }
 }
 
@@ -829,10 +866,11 @@ fn snapshot_name(path: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
-/// Collect the candidate source files (`*.go` / `*.py`) under `root` for the
-/// incremental hash-gate, using the same bounded, vendored-dir-skipping walk
-/// `detect_languages` relies on. Paths are `root`-prefixed so they hash
-/// directly and strip cleanly back to the repo-relative form the helpers emit.
+/// Collect the candidate source files (`*.go` / `*.py` / `*.ts` / `*.cs`)
+/// under `root` for the incremental hash-gate, using the same bounded,
+/// vendored-dir-skipping walk `detect_languages` relies on. Paths are
+/// `root`-prefixed so they hash directly and strip cleanly back to the
+/// repo-relative form the helpers emit.
 fn walk_source_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -850,7 +888,7 @@ fn walk_source_files(root: &Path) -> Vec<PathBuf> {
             } else if ft.is_file() {
                 let path = entry.path();
                 match path.extension().and_then(|e| e.to_str()) {
-                    Some("go" | "py") => out.push(path),
+                    Some("go" | "py" | "cs") => out.push(path),
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
                     _ => {}
                 }
@@ -880,6 +918,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("go") => Some(Lang::Go),
         Some("py") => Some(Lang::Python),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("cs") => Some(Lang::CSharp),
         _ => None,
     }
 }
@@ -2920,6 +2959,38 @@ mod tests {
     }
 
     #[test]
+    fn detect_csharp_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_via_project_markers() {
+        // The marker's NAME varies per project (Svc.csproj, App.sln), so the
+        // root probe is extension-driven, unlike go.mod/tsconfig.json.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Svc.csproj"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+
+        let sln = tempfile::tempdir().unwrap();
+        touch(&sln.path().join("App.sln"));
+        assert_eq!(detect_languages(sln.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_orders_after_typescript() {
+        // Deterministic helper order: Go < Python < TypeScript < CSharp.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::CSharp]
+        );
+    }
+
+    #[test]
     fn detect_tsx_counts_but_dts_does_not() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("component.tsx"));
@@ -3016,6 +3087,49 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    #[test]
+    fn csharp_dll_argv_runs_under_dotnet() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/csindex.dll"),
+            kind: HelperKind::DotnetAssembly,
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "dotnet",
+                "/opt/csindex.dll",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_csharp_dll_is_an_assembly_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex.dll")).kind,
+            HelperKind::DotnetAssembly
+        );
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex")).kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_cs() {
+        assert_eq!(
+            lang_of_path(Path::new("svc/Service.cs")),
+            Some(Lang::CSharp)
+        );
+        // A .csproj is a marker for detection, not a retrievable source file.
+        assert_eq!(lang_of_path(Path::new("svc/Svc.csproj")), None);
     }
 
     #[test]

@@ -25,7 +25,7 @@ endif
 
 BIN_DIR := target/$(PROFILE)
 
-.PHONY: build rebuild install uninstall helpers dev test lint fmt fmt-check clippy clean help
+.PHONY: build rebuild install uninstall helpers helpers-csindex dev test lint fmt fmt-check clippy clean help
 
 ## build: compile the rvlscan workspace binaries
 build:
@@ -71,6 +71,11 @@ helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py
 	@echo "helpers installed next to $(BIN_DIR)/rvlscan (goindex, pyindex.py)"
+
+## helpers-csindex: build the C# retriever (needs a .NET 8 SDK + NuGet for Roslyn)
+helpers-csindex:
+	dotnet build helpers/csindex -c Release -o $(BIN_DIR)/csindex-build
+	@echo "csindex built; C# scanning works via RVLSCAN_CSINDEX=$(abspath $(BIN_DIR))/csindex-build/csindex.dll"
 
 ## dev: build the binary and its helpers for local zero-env `rvlscan scan`
 dev: helpers

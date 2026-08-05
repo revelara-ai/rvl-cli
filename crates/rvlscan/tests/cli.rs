@@ -2048,3 +2048,228 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
         "config coverage line: {stdout}"
     );
 }
+
+// --- C# lane (po-av01j.10) ---
+
+/// The hand-authored SEED C# spec corpus (test-grade): RC-019 timeout and
+/// RC-022 retry judgments at C# identities, plus the C# emission identities
+/// for the G4 lane. The production corpus rides the LLM factory, HITL — see
+/// the gate-set mint bead under po-av01j.
+fn csharp_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("csharp_seed_specs.json")
+}
+
+/// C#, golden packet stream: a `--retrieved` stream shaped exactly like
+/// csindex output is decided by the seed C# specs WITHOUT a dotnet SDK
+/// present. This is the contract test for the Rust side of the lane: the
+/// satisfies / violates / abstain shapes, G2 registrations routed out of the
+/// G1 lane, and a G4 catch_clause swallow surfacing under RC-027.
+#[test]
+fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let packets = dir.path().join("retrieved.jsonl");
+    let mk = |line: u32, symbol: &str, func: &str, ctype: &str, snippet: &str, extra: &str| {
+        format!(
+            r#"{{"packet_schema":2,"snapshot_id":"fx","file_path":"Svc.cs","line_number":{line},"symbol":{symbol:?},"func":{func:?},"receiver":"_c","client_type":{ctype:?},"snippet":{snippet:?},"lang":"csharp"{extra}}}"#
+        )
+    };
+    let stream = [
+        // Satisfies: HttpClient carries a whole-call default Timeout (100s),
+        // spec knowledge riding the this_client config spec.
+        mk(
+            10,
+            "FetchUser",
+            "GetAsync",
+            "System.Net.Http.HttpClient",
+            "await _c.GetAsync(url)",
+            "",
+        ),
+        // Violates: a gRPC call has NO default deadline; the seed spec says
+        // the bound rides CallOptions at the call, and none is present.
+        mk(
+            20,
+            "SayHello",
+            "AsyncUnaryCall",
+            "Grpc.Core.CallInvoker",
+            "_c.AsyncUnaryCall(method, host, options, req)",
+            "",
+        ),
+        // Abstain: librdkafka retries internally; whether app-level retry
+        // wrapping is needed is per-site judgment (RC-022 seed, depends).
+        mk(
+            30,
+            "Publish",
+            "ProduceAsync",
+            "Confluent.Kafka.IProducer",
+            "await _c.ProduceAsync(topic, msg)",
+            "",
+        ),
+        // A G2 route registration must be routed OUT of the G1 lane.
+        mk(
+            40,
+            "MapRoutes",
+            "MapGet",
+            "Microsoft.AspNetCore.Builder.WebApplication",
+            "app.MapGet(\"/health\", handler)",
+            r#","site_kind":"server_entry""#,
+        ),
+        // A G4 catch_clause swallow aggregate surfaces under RC-027.
+        mk(
+            50,
+            "Handle",
+            "catch",
+            "catch_clause",
+            "",
+            r#","site_kind":"emission_point","const_args":[{"index":0,"name":"emission_category","value":"error_capture","how":"aggregate"},{"index":0,"name":"emission_count","value":"1","how":"aggregate"}]"#,
+        ),
+    ]
+    .join("\n");
+    std::fs::write(&packets, stream + "\n").unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(csharp_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap().clone();
+    let g1 = verdicts_for(&rows, "Svc.cs");
+    assert!(
+        g1.iter().any(
+            |(v, r)| v == "satisfies" && r.contains("client config System.Net.Http.HttpClient")
+        ),
+        "HttpClient's default whole-call Timeout must satisfy via the config spec: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the deadline-less gRPC call must violate: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the Kafka produce must abstain on the depends spec: {g1:?}"
+    );
+    // The route registration and the emission aggregate stay OUT of the G1
+    // verdict rows (their lanes judge them).
+    assert!(
+        !g1.iter().any(|(_, r)| r.contains("MapGet")),
+        "a server_entry registration must not be judged as a client call: {g1:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        3,
+        "only the three G1 call sites belong in --out: {rows:?}"
+    );
+    // The G4 swallow surfaces in the ladder, control-mapped and advisory.
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the catch_clause swallow must surface under RC-027: {stdout}"
+    );
+}
+
+/// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
+/// its NuGet restore (Roslyn) is unavailable — matching the tsindex
+/// "run npm install first" skip convention.
+fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if std::process::Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP csindex e2e: no dotnet SDK");
+        return None;
+    }
+    let csdir = helpers_dir().join("csindex");
+    let out_dir = dir.join("csindex-build");
+    let out = std::process::Command::new("dotnet")
+        .args(["build", "-c", "Release", "-o"])
+        .arg(&out_dir)
+        .current_dir(&csdir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "SKIP csindex e2e: dotnet build failed (NuGet restore for Roslyn needed?): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    let dll = out_dir.join("csindex.dll");
+    if dll.is_file() {
+        Some(dll)
+    } else {
+        eprintln!("SKIP csindex e2e: csindex.dll not produced");
+        None
+    }
+}
+
+/// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
+/// the seed specs decide the same three shapes the golden-stream test pins,
+/// plus the catch_clause swallow from the fixture's emitters.
+#[test]
+fn scan_decides_csharp_sites_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(helper_fixture("csindex"))
+        .arg("--specs-file")
+        .arg(csharp_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVLSCAN_CSINDEX", &csindex_dll)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows.as_array().unwrap().clone();
+    let g1 = verdicts_for(&rows, "Svc.cs");
+    assert!(
+        g1.iter().any(
+            |(v, r)| v == "satisfies" && r.contains("client config System.Net.Http.HttpClient")
+        ),
+        "the fixture's HttpClient call must satisfy: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "violates" && r.contains("no bound anywhere")),
+        "the fixture's deadline-less gRPC call must violate: {g1:?}"
+    );
+    assert!(
+        g1.iter()
+            .any(|(v, r)| v == "abstain" && r.contains("depends")),
+        "the fixture's Kafka produce must abstain: {g1:?}"
+    );
+    assert!(
+        stdout.contains("emission.RC-027") && stdout.contains("swallow"),
+        "the fixture's swallowing catch must surface under RC-027: {stdout}"
+    );
+}

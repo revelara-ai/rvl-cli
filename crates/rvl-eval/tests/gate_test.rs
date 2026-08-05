@@ -123,6 +123,22 @@ fn valid_set_passes_and_reports_registry_version() {
     assert_eq!(v, 1);
 }
 
+/// C# gate-set scaffolding (po-av01j.10): the gate machinery is
+/// language-generic, and this pins that a `language: csharp` manifest flows
+/// through provenance validation under the same terms as Go — the mint
+/// workflow (HITL, per the po-ae75b.2 relative-formula protocol) relies on
+/// this path existing before any eval-csharp-v1 set is minted.
+#[test]
+fn csharp_manifest_validates_under_the_same_terms() {
+    let yaml = MANIFEST_OK
+        .replace("set_id: eval-go-v1", "set_id: eval-csharp-v1")
+        .replace("language: go", "language: csharp");
+    let m = parse_manifest(&yaml).unwrap();
+    assert_eq!(m.language, "csharp");
+    let v = validate_gate_set(&m, &["ppi-labels".into()], &registry(), &[]).unwrap();
+    assert_eq!(v, 1);
+}
+
 #[test]
 fn seed_set_is_refused() {
     let mut m = parse_manifest(MANIFEST_OK).unwrap();
