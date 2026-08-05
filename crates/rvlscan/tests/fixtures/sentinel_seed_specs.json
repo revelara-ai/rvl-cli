@@ -1,0 +1,36 @@
+{
+  "__comment": "SEED / test-grade G1 spec corpus carrying UNBOUNDED SENTINELS (po-av01j.25). The call-arg mechanism is value-aware: `unbounded_sentinels` lists the values of an API's own timeout argument that mean NO bound, so a resolved sentinel violates (citing the value and how it was resolved) instead of crediting a bound. Which values carry that meaning is library knowledge and therefore lives here, never in propagation. PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e test exercises real verdicts at identities pyindex actually emits, nothing more.",
+  "apis": [
+    {
+      "type": "requests",
+      "method": "get",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: requests.get blocks until the response completes; the bound is the per-call timeout= argument. requests documents timeout=None as 'wait forever', so the argument being PRESENT is not the question - its value is.",
+      "unbounded_sentinels": ["None"]
+    },
+    {
+      "type": "requests",
+      "method": "post",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 0.9,
+      "rationale": "SEED RC-019: same surface as requests.get; timeout=None blocks forever",
+      "unbounded_sentinels": ["None"]
+    },
+    {
+      "type": "socket.socket",
+      "method": "settimeout",
+      "site_count": 1,
+      "blocking": "no",
+      "bounded_by": ["call_arg"],
+      "confidence": 0.85,
+      "rationale": "SEED RC-019: settimeout configures the socket rather than performing I/O, and both of its sentinels are documented: None restores blocking mode (no bound) and 0 selects non-blocking mode (not a bound either)",
+      "unbounded_sentinels": ["None", "0"]
+    }
+  ],
+  "configs": []
+}

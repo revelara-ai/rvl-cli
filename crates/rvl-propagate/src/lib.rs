@@ -54,11 +54,32 @@ fn has_session_bound(src: &str) -> bool {
         && lower.contains("set")
 }
 
-fn has_timeout_arg(call: &str) -> bool {
+/// The timeout-ish argument a call's SNIPPET TEXT shows, as `(key, value)`.
+///
+/// This is the v1 substring heuristic, returning the value it saw instead of a
+/// bare bool. The boolean answer ("does this call mention a timeout argument?")
+/// is unchanged -- same keys, same order, same hit -- but `timeout=0` is
+/// textual evidence of a VALUE, and a spec that declares `0` unbounded has to
+/// be able to see it. Without this the fallback path kept the exact false pass
+/// the const-args path was fixed for (po-av01j.25).
+///
+/// The value is the token after the separator, up to whitespace or an
+/// argument/call delimiter; empty when the text shows nothing parseable, which
+/// is the honest answer for `timeout=cfg.Timeout` -- a name, not a value.
+fn snippet_timeout_arg(call: &str) -> Option<(&'static str, String)> {
     let lower = call.to_ascii_lowercase();
-    ["timeout=", "timeout:", "deadline=", "deadline:"]
-        .iter()
-        .any(|k| lower.contains(k))
+    for key in ["timeout=", "timeout:", "deadline=", "deadline:"] {
+        let Some(at) = lower.find(key) else { continue };
+        let value: String = call
+            .get(at + key.len()..)
+            .unwrap_or_default()
+            .trim_start()
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !"),;]}".contains(*c))
+            .collect();
+        return Some((key.trim_end_matches(['=', ':']), value));
+    }
+    None
 }
 
 /// A schema-v2 constant argument whose KEYWORD NAME says it is a timeout.
@@ -206,8 +227,14 @@ pub fn propagate(
 
     let mut whole: Vec<String> = Vec::new();
     let mut phase: Vec<String> = Vec::new();
+    // Positive evidence that the call is UNBOUNDED: a resolved argument value
+    // the spec declares as an unbounded sentinel (po-av01j.25).
+    let mut unbounded: Vec<String> = Vec::new();
     let mut served_unresolved = false;
     let mut client_unresolved = false;
+    // A timeout argument whose value the retriever could not resolve, on an API
+    // whose spec says SOME values of it mean no bound.
+    let mut value_unresolved = false;
 
     // AMBIENT mechanisms are checked for every blocking API, regardless of what
     // the spec lists. The distinction the first version missed: bounded_by
@@ -277,13 +304,62 @@ pub fn propagate(
                 // (the config-lane resolved-value principle), so the finding
                 // is auditable back to what the retriever actually saw. The
                 // snippet-text heuristic remains the v1 fallback.
+                //
+                // VALUE-AWARE (po-av01j.25): the name of the argument is not
+                // the question, its value is. Many libraries spell "no
+                // timeout" as a value of the timeout argument itself --
+                // requests' `timeout=None` blocks forever, `CURLOPT_TIMEOUT 0`
+                // never fires, JDBC's `setQueryTimeout(0)` means no limit --
+                // so crediting any timeout-named argument reproduces exactly
+                // the false pass the v1 substring heuristic had. WHICH values
+                // mean that is library knowledge, so it is read off the spec
+                // (`unbounded_sentinels`) and never decided here; a spec that
+                // declares none behaves exactly as before.
                 if let Some(a) = const_timeout_arg(site) {
-                    whole.push(format!(
-                        "timeout argument at the call ({}={}, {})",
-                        a.name, a.value, a.how
-                    ));
-                } else if has_timeout_arg(&site.snippet) {
-                    whole.push("timeout argument at the call".into());
+                    if !spec.unbounded_sentinels.is_empty() && a.value.trim().is_empty() {
+                        // UNRESOLVED, not unbounded. The retriever saw the
+                        // argument but could not fold its value, and this API
+                        // has values that mean no bound -- so we genuinely do
+                        // not know which case this is. That is the abstain
+                        // case: it routes to a human rather than passing
+                        // silently, and it is deliberately NOT a violation,
+                        // because ignorance is not evidence.
+                        value_unresolved = true;
+                    } else if spec.is_unbounded_sentinel(&a.value) {
+                        // RESOLVED sentinel: positive evidence of
+                        // unboundedness, not absence of evidence. The author
+                        // wrote the value that turns the bound off, so this
+                        // decides a violation (below) with the value and its
+                        // provenance cited -- the distinction from the abstain
+                        // case above is exactly resolved-vs-unknown.
+                        unbounded.push(format!(
+                            "the timeout argument at the call is the spec-declared unbounded sentinel {}={} ({})",
+                            a.name, a.value, a.how
+                        ));
+                    } else {
+                        whole.push(format!(
+                            "timeout argument at the call ({}={}, {})",
+                            a.name, a.value, a.how
+                        ));
+                    }
+                } else if let Some((key, value)) = snippet_timeout_arg(&site.snippet) {
+                    // The v1 fallback carries the same false-pass surface for
+                    // literal `timeout=0` text, so it is gated the same way.
+                    // Its provenance is weaker (snippet text, not a resolved
+                    // constant) and the reason says so.
+                    //
+                    // A NON-CONSTANT argument (`timeout=cfg.Timeout`) still
+                    // credits a bound here, as it always has. Whether it should
+                    // abstain instead under a sentinel-declaring spec is a
+                    // large population and a measurable precision swing, so it
+                    // is gated on the eval set rather than assumed: po-av01j.59.
+                    if !value.is_empty() && spec.is_unbounded_sentinel(&value) {
+                        unbounded.push(format!(
+                            "the timeout argument at the call is the spec-declared unbounded sentinel {key}={value} (snippet text)"
+                        ));
+                    } else {
+                        whole.push("timeout argument at the call".into());
+                    }
                 }
             }
             // ServerConfig looked ambient and is not. Whether a server's
@@ -369,6 +445,10 @@ pub fn propagate(
         }
     }
 
+    // A whole-call bound found by ANY mechanism still wins over a sentinel: a
+    // celery time_limit or a client-level timeout really does bound a call
+    // whose own timeout argument was disabled, and reporting a violation there
+    // would be a false positive on a genuinely bounded call.
     if !whole.is_empty() {
         return Finding {
             site_id: id,
@@ -376,6 +456,11 @@ pub fn propagate(
             reason: whole.join("; "),
         };
     }
+    // The unresolved-conflict abstentions come FIRST, ahead of the sentinel
+    // violation below: they mean the lane cannot see whether an independent
+    // whole-call bound exists, and asserting a violation on top of an admitted
+    // blind spot claims more than the evidence supports. The site routes to a
+    // human either way -- the conflict is itself the thing to fix.
     if served_unresolved {
         return Finding {
             site_id: id,
@@ -388,6 +473,25 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting client-config specs in this family".into(),
+        };
+    }
+    // Resolved sentinel with nothing else bounding the call: decided, and
+    // stronger than the phase-only case below, because the value is not merely
+    // a partial bound -- it is the bound switched off.
+    if !unbounded.is_empty() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Violates,
+            reason: unbounded.join("; "),
+        };
+    }
+    if value_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason:
+                "the timeout argument's value did not resolve, and this API has values that mean no bound"
+                    .into(),
         };
     }
     // A phase-only bound is worse than no bound found, not better: it means the
@@ -434,6 +538,18 @@ mod tests {
     use std::collections::HashMap;
 
     fn cache(bounded_by: Vec<Mechanism>, configs: Vec<ConfigSpec>) -> SpecCache {
+        cache_with_sentinels(bounded_by, configs, vec![])
+    }
+
+    /// The same cache, with the API declaring which argument values mean "no
+    /// bound" (po-av01j.25). `vec![]` is every spec authored before the field
+    /// existed, which is what makes the declared/undeclared pairs below a
+    /// parity test rather than two unrelated cases.
+    fn cache_with_sentinels(
+        bounded_by: Vec<Mechanism>,
+        configs: Vec<ConfigSpec>,
+        unbounded_sentinels: Vec<String>,
+    ) -> SpecCache {
         SpecCache::from_file(SpecFile {
             apis: vec![ApiSpec {
                 type_name: "db.Pool".into(),
@@ -444,6 +560,7 @@ mod tests {
                 rationale: String::new(),
                 site_count: 1,
                 site_kinds: vec![],
+                unbounded_sentinels,
             }],
             configs,
             scopes: vec![],
@@ -478,6 +595,7 @@ mod tests {
                 rationale: "RC-060: a registered job runs unattended; the run bound must exist at registration altitude".into(),
                 site_count: 1,
                 site_kinds: vec!["background_job".into()],
+                unbounded_sentinels: vec![],
             }],
             configs: vec![],
             scopes: vec![],
@@ -592,6 +710,7 @@ mod tests {
                 rationale: String::new(),
                 site_count: 1,
                 site_kinds: vec!["background_job".into()],
+                unbounded_sentinels: vec![],
             }],
             configs: vec![],
             scopes: vec![],
@@ -705,6 +824,7 @@ mod tests {
                 rationale: String::new(),
                 site_count: 1,
                 site_kinds: vec![],
+                unbounded_sentinels: vec![],
             }],
             configs: vec![],
             scopes: vec![],
@@ -890,6 +1010,205 @@ mod tests {
             "the reason must cite the resolved value and how it was determined: {}",
             f.reason
         );
+    }
+
+    /// A site whose call carries a resolved `timeout=None`.
+    fn sentinel_site() -> Site {
+        let mut s = site();
+        s.snippet = "requests.get(url, timeout=None)".into();
+        s.const_args = vec![ConstArg {
+            index: 1,
+            name: "timeout".into(),
+            value: "None".into(),
+            how: "literal".into(),
+        }];
+        s
+    }
+
+    #[test]
+    fn a_resolved_unbounded_sentinel_violates_instead_of_satisfying() {
+        // po-av01j.25, THE false-pass this issue exists for: requests'
+        // timeout=None blocks forever, so a resolved sentinel value must not
+        // credit a bound. It VIOLATES rather than abstains because a resolved
+        // sentinel is positive evidence of unboundedness -- the author
+        // explicitly turned the bound off -- not absence of evidence.
+        let f = propagate(
+            &sentinel_site(),
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::Violates,
+            "a declared unbounded sentinel must never satisfy: {}",
+            f.reason
+        );
+        assert!(
+            f.reason.contains("timeout=None") && f.reason.contains("literal"),
+            "the reason must cite the resolved value and how it was determined: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn an_undeclared_sentinel_value_still_satisfies_the_parity_guard() {
+        // The compatibility half of the pair above: the SAME site under a spec
+        // that declares no sentinels -- every spec authored before this field
+        // existed -- behaves exactly as it did, so the new field changes
+        // nothing until someone declares knowledge.
+        let f = propagate(
+            &sentinel_site(),
+            &cache(vec![Mechanism::CallArg], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::Satisfies,
+            "undeclared sentinels must leave the call-arg mechanism untouched: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_sentinel_in_snippet_text_violates_through_the_v1_fallback() {
+        // The substring fallback carried the identical false pass: with no
+        // const_args to consume, `timeout=0` text credited a bound. It is now
+        // gated on the same spec knowledge, with weaker provenance named in
+        // the reason.
+        let mut s = site();
+        s.snippet = "pool.Query(sql, timeout=0)".into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["0".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(
+            f.reason.contains("timeout=0") && f.reason.contains("snippet text"),
+            "the reason must cite the value and its weaker provenance: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_colon_separated_sentinel_option_is_read_the_same_way() {
+        // The TypeScript/option-object idiom (`{ timeout: 0 }`) reaches the
+        // fallback as `timeout:` text, and must not credit a bound either.
+        let mut s = site();
+        s.snippet = "queue.add('rebuild', data, { timeout: 0 })".into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["0".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(f.reason.contains("timeout=0"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_non_sentinel_value_still_satisfies_under_a_sentinel_declaring_spec() {
+        // Declaring sentinels must not turn the mechanism off: a real timeout
+        // still bounds the call, and still cites its resolved value.
+        let mut s = sentinel_site();
+        s.const_args[0].value = "5".into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(
+                vec![Mechanism::CallArg],
+                vec![],
+                vec!["None".into(), "0".into()],
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(f.reason.contains("timeout=5"), "{}", f.reason);
+    }
+
+    #[test]
+    fn an_unresolved_timeout_value_abstains_rather_than_guessing() {
+        // The other half of the resolved/unknown distinction: the retriever
+        // reported the argument but no value, on an API where some values mean
+        // no bound. Neither "bounded" nor "unbounded" is supported by that, so
+        // the site routes to a human instead of either.
+        let mut s = sentinel_site();
+        s.const_args[0].value = String::new();
+        s.const_args[0].how = "unresolved".into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::Abstain,
+            "an unknown value is ignorance, not evidence: {}",
+            f.reason
+        );
+        assert!(f.reason.contains("did not resolve"), "{}", f.reason);
+    }
+
+    #[test]
+    fn an_independent_bound_outranks_a_sentinel_no_false_positive() {
+        // A sentinel says the call's OWN timeout is off, not that nothing
+        // bounds the call. `requests.get(timeout=None)` inside
+        // @shared_task(time_limit=120) is killed at 120s, so reporting a
+        // violation there would be a false positive on a bounded call.
+        let mut s = sentinel_site();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef sync():\n    requests.get(url, timeout=None)".into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            f.verdict,
+            Verdict::Satisfies,
+            "an ambient whole-call bound still bounds the call: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_sentinel_does_not_override_an_admitted_blind_spot() {
+        // Conflicting client-config specs mean the lane cannot see whether an
+        // independent whole-call bound exists. Asserting a violation on top of
+        // that would claim more than the evidence supports, so the conflict
+        // abstention still wins and the human resolves the conflict first.
+        let mut s = sentinel_site();
+        s.client_type = "typeorm.QueryRunner".into();
+        s.method = "query".into();
+        let specs = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "typeorm.QueryRunner".into(),
+                method: "query".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::CallArg, Mechanism::ClientConfig],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec!["None".into()],
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+        });
+        let client = HashMap::from([(
+            Family::Database,
+            ServedBound::Conflict(vec!["a".into(), "b".into()]),
+        )]);
+        let f = propagate(&s, &specs, &ServedBound::None, &client);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
     }
 
     #[test]
@@ -1082,6 +1401,7 @@ mod tests {
                 rationale: String::new(),
                 site_count: 1,
                 site_kinds: vec![],
+                unbounded_sentinels: vec![],
             }],
             configs: vec![],
             config_keys: vec![],
