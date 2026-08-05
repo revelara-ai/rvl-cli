@@ -396,7 +396,7 @@ fn dev_cache_grounding_refuses_every_qualified_go_gate_set() {
 #[test]
 fn a_clean_grounding_corpus_still_validates() {
     let m = parse_manifest(MANIFEST_OK).unwrap();
-    let clean = vec!["revelara-ai/polaris".to_string(), "zulip/zulip".to_string()];
+    let clean = vec!["revelara-ai/backend".to_string(), "zulip/zulip".to_string()];
     let v = validate_gate_set(&m, &["ppi-labels".into()], &registry(), &clean).unwrap();
     assert_eq!(v, 1);
 }
