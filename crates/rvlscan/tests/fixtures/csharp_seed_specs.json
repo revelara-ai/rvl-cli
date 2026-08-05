@@ -62,7 +62,8 @@
       "blocking": "yes",
       "bounded_by": ["call_arg"],
       "confidence": 0.9,
-      "rationale": "SEED RC-019: a gRPC call has NO default deadline and waits forever; the bound is a deadline in CallOptions at the call"
+      "rationale": "SEED RC-019: a gRPC call has NO default deadline and waits forever; the bound is a deadline in CallOptions at the call. DateTime.MaxValue is gRPC's spelling of 'no deadline', so a deadline argument set to it is the unbounded case wearing a bound's name (po-av01j.25)",
+      "unbounded_sentinels": ["DateTime.MaxValue"]
     },
     {
       "type": "Confluent.Kafka.IProducer",

@@ -73,9 +73,42 @@ pub struct ApiSpec {
     /// governing both altitudes lists both `""` and `"background_job"`.
     #[serde(default)]
     pub site_kinds: Vec<String>,
+    /// Values of THIS API's call-argument timeout that mean "no bound"
+    /// (po-av01j.25). Library knowledge, so it lives in the spec and never in
+    /// propagation: `requests.get(timeout=None)` blocks forever,
+    /// `socket.settimeout(0)` is non-blocking rather than bounded,
+    /// `CURLOPT_TIMEOUT 0` never times out, JDBC's `setQueryTimeout(0)` means
+    /// no limit. Which token carries that meaning differs per API, so the
+    /// answer belongs to the API's own spec.
+    ///
+    /// Empty — every spec authored before this field existed — leaves the
+    /// call-arg mechanism exactly as it was: a named timeout argument credits
+    /// a whole-call bound. Declaring values makes the mechanism VALUE-AWARE
+    /// (see the propagation arm), which is the only way a resolved sentinel
+    /// stops reading as a bound.
+    ///
+    /// Values are the packet's canonical source-level rendering (`"0"`,
+    /// `"None"`, `"-1"`, `"DateTime.MaxValue"`), string-compared like
+    /// [`ConfigExpect::Equals`].
+    #[serde(default)]
+    pub unbounded_sentinels: Vec<String>,
 }
 
 impl ApiSpec {
+    /// Whether `value` is a declared unbounded sentinel for this API.
+    ///
+    /// Comparison is trimmed and ASCII-case-insensitive, deliberately more
+    /// forgiving than exact equality: a loose match errs toward NOT crediting
+    /// a bound, and on a safety property that is the only direction it is safe
+    /// to be wrong in. A spec that declares nothing matches nothing, so the
+    /// pre-sentinel behaviour is unchanged rather than merely similar.
+    pub fn is_unbounded_sentinel(&self, value: &str) -> bool {
+        let v = value.trim();
+        self.unbounded_sentinels
+            .iter()
+            .any(|s| s.trim().eq_ignore_ascii_case(v))
+    }
+
     /// Whether this spec governs a site of `site_kind`. The applicability
     /// mechanism for job-altitude re-application: the JUDGMENT machinery is
     /// unchanged, a spec merely declares which altitudes it covers.
@@ -658,6 +691,7 @@ mod tests {
             rationale: String::new(),
             site_count: 1,
             site_kinds: vec![],
+            unbounded_sentinels: vec![],
         }
     }
 
@@ -872,6 +906,72 @@ mod tests {
                 .rationale,
             "better",
             "a lower-confidence spec never displaces a higher one"
+        );
+    }
+
+    #[test]
+    fn a_pre_sentinel_cache_parses_and_declares_nothing() {
+        // Compatibility (po-av01j.25): every cache in production predates the
+        // field. It must parse, and the resulting spec must match NO value --
+        // not "match leniently", not "match zero" -- so propagation's call-arg
+        // mechanism is bit-for-bit what it was.
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":0.9}],"configs":[]}"#,
+        )
+        .expect("a cache without the section must still parse");
+        let spec = cache.api(&("requests".into(), "get".into())).unwrap();
+        assert!(spec.unbounded_sentinels.is_empty());
+        for v in ["0", "None", "-1", ""] {
+            assert!(
+                !spec.is_unbounded_sentinel(v),
+                "an undeclared spec must match nothing, including {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_sentinels_parse_and_match_on_the_canonical_rendering() {
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":0.9,
+                 "unbounded_sentinels":["None","0"]}],"configs":[]}"#,
+        )
+        .unwrap();
+        let spec = cache.api(&("requests".into(), "get".into())).unwrap();
+        assert!(spec.is_unbounded_sentinel("None"));
+        assert!(spec.is_unbounded_sentinel("0"));
+        // Trimmed and case-insensitive on purpose: a loose match errs toward
+        // NOT crediting a bound, the only safe direction on this property.
+        assert!(spec.is_unbounded_sentinel(" none "));
+        // A real timeout is still a real timeout.
+        assert!(!spec.is_unbounded_sentinel("5"));
+        assert!(!spec.is_unbounded_sentinel("None()"));
+    }
+
+    #[test]
+    fn merge_carries_the_winning_specs_sentinels() {
+        // Sentinels ride the api entry, so the merge policy that already
+        // decides which spec wins decides which sentinel list is in effect --
+        // a stale spec must not leave its knowledge behind on the winner.
+        let mk = |confidence: f64, sentinels: Vec<String>| SpecFile {
+            apis: vec![ApiSpec {
+                unbounded_sentinels: sentinels,
+                ..api(Blocking::Yes, confidence)
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, vec![]));
+        base.merge(SpecCache::from_file(mk(0.95, vec!["0".into()])));
+        assert!(base
+            .api(&("t".into(), "Do".into()))
+            .unwrap()
+            .is_unbounded_sentinel("0"));
+        base.merge(SpecCache::from_file(mk(0.5, vec!["-1".into()])));
+        let got = base.api(&("t".into(), "Do".into())).unwrap();
+        assert!(
+            got.is_unbounded_sentinel("0") && !got.is_unbounded_sentinel("-1"),
+            "a lower-confidence spec never displaces the winner's sentinels"
         );
     }
 

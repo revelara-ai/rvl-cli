@@ -1470,6 +1470,85 @@ fn helpers_dir() -> std::path::PathBuf {
         .join("helpers")
 }
 
+/// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
+/// an API's own timeout argument that mean no bound.
+fn sentinel_seed_specs() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("sentinel_seed_specs.json")
+}
+
+/// Python, live end to end: the whole pipeline (pyindex retrieval → schema-v2
+/// const_args → value-aware propagation) must tell `timeout=5` from
+/// `timeout=None`. Both calls carry a timeout ARGUMENT, so the pre-sentinel
+/// engine passed both; only the resolved VALUE separates them, and the seed
+/// corpus — not the engine — is where that knowledge lives.
+#[test]
+fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_violates_a_sentinel_timeout_argument_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import requests\n\n\
+         def bounded():\n    \
+             return requests.get(\"https://api.example.com/a\", timeout=5)\n\n\
+         def unbounded():\n    \
+             return requests.get(\"https://api.example.com/b\", timeout=None)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(sentinel_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVLSCAN_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = verdicts_for(rows.as_array().unwrap(), "svc.py");
+    assert!(
+        rows.iter()
+            .any(|(v, r)| v == "satisfies" && r.contains("timeout=5")),
+        "a real timeout still bounds the call: {rows:?}"
+    );
+    let (verdict, reason) = rows
+        .iter()
+        .find(|(_, r)| r.contains("None"))
+        .unwrap_or_else(|| panic!("no finding cited the sentinel value: {rows:?}"));
+    assert_eq!(
+        verdict, "violates",
+        "timeout=None blocks forever and must not credit a bound: {reason}"
+    );
+    assert!(
+        reason.contains("timeout=None") && reason.contains("literal"),
+        "the reason must cite the resolved value and how it was determined: {reason}"
+    );
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
