@@ -1,1 +1,5 @@
 /target
+
+# .NET build artifacts (csindex + its test fixture)
+obj/
+bin/
