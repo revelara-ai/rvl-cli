@@ -400,3 +400,127 @@ fn a_clean_grounding_corpus_still_validates() {
     let v = validate_gate_set(&m, &["ppi-labels".into()], &registry(), &clean).unwrap();
     assert_eq!(v, 1);
 }
+
+// ---------------------------------------------------------------------------
+// TypeScript gate sets need lockfile provenance, not just a frozen SHA
+// (po-av01j.117).
+//
+// Go and Python retrieval work on a bare checkout. TypeScript does not: tsindex
+// resolves client types through the TS compiler, which needs node_modules, and
+// on a bare clone that resolution fails SILENTLY rather than erroring. Measured
+// on infisical at one fixed SHA, changing only whether deps were installed:
+// 1,911 -> 83,927 sites. Same commit, 44x the stream.
+//
+// So for TypeScript a frozen SHA does not determine the packet stream, and a
+// manifest carrying only a SHA is claiming a reproducibility it cannot deliver.
+// ---------------------------------------------------------------------------
+
+const TS_MANIFEST_NO_DEPS: &str = r#"
+set_id: eval-ts-v1
+language: typescript
+minted: "2026-08-06"
+registry_version: 4
+consumed: false
+repos:
+  - repo: n8n-io/n8n
+    frozen_sha: "b1c2d3e4f5a60718293a4b5c6d7e8f9012345678"
+sampling_frame: >
+  Placeholder frame; this manifest exists to prove a TS set without dependency
+  provenance is refused.
+sample_size: 50
+adjudication:
+  protocol: three-lens panel
+  panel: "3x model panel"
+  adjudicator: "Joseph Bironas"
+  date: "2026-08-06"
+"#;
+
+const TS_MANIFEST_WITH_DEPS: &str = r#"
+set_id: eval-ts-v1
+language: typescript
+minted: "2026-08-06"
+registry_version: 4
+consumed: false
+repos:
+  - repo: n8n-io/n8n
+    frozen_sha: "b1c2d3e4f5a60718293a4b5c6d7e8f9012345678"
+    deps:
+      - package_manager: "pnpm@10.33.2"
+        lockfile: "pnpm-lock.yaml"
+        lockfile_sha256: "3b1f0c9d8e7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c"
+sampling_frame: >
+  Placeholder frame with dependency provenance pinned.
+sample_size: 50
+adjudication:
+  protocol: three-lens panel
+  panel: "3x model panel"
+  adjudicator: "Joseph Bironas"
+  date: "2026-08-06"
+"#;
+
+fn ts_registry() -> Registry {
+    let mut r = registry();
+    r.repos.push("n8n-io/n8n".to_string());
+    r
+}
+
+#[test]
+fn typescript_set_without_dependency_provenance_is_refused() {
+    let m = parse_manifest(TS_MANIFEST_NO_DEPS).expect("manifest itself is well-formed");
+    let err = validate_gate_set(&m, &[], &ts_registry(), &[]).unwrap_err();
+    match err {
+        Refusal::MissingDepsProvenance { repo, .. } => assert_eq!(repo, "n8n-io/n8n"),
+        other => panic!("expected MissingDepsProvenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn typescript_set_with_dependency_provenance_validates() {
+    let m = parse_manifest(TS_MANIFEST_WITH_DEPS).expect("must parse");
+    validate_gate_set(&m, &[], &ts_registry(), &[]).expect("pinned deps must validate");
+}
+
+#[test]
+fn non_typescript_sets_do_not_require_dependency_provenance() {
+    // The Go and Python retrievers read a bare checkout, so demanding a
+    // lockfile there would be ceremony. eval-go-v1 is already minted without
+    // one and must keep validating -- this is the backward-compatibility pin.
+    let m = parse_manifest(MANIFEST_OK).expect("must parse");
+    validate_gate_set(&m, &["ppi-labels".into()], &registry(), &[])
+        .expect("a Go set needs no dependency provenance");
+}
+
+#[test]
+fn dependency_provenance_rejects_a_blank_lockfile_hash() {
+    // An empty hash would satisfy "a deps block is present" while pinning
+    // nothing at all, which is worse than omitting it: it looks like provenance
+    // in review. Fail closed.
+    let yaml = TS_MANIFEST_WITH_DEPS.replace(
+        "3b1f0c9d8e7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+        "",
+    );
+    let m = parse_manifest(&yaml).expect("parses");
+    let err = validate_gate_set(&m, &[], &ts_registry(), &[]).unwrap_err();
+    assert!(
+        matches!(err, Refusal::MissingDepsProvenance { .. }),
+        "blank lockfile hash must refuse, got {err:?}"
+    );
+}
+
+#[test]
+fn lockfile_hash_mismatch_is_detected_against_a_checkout() {
+    // The mint-time check: what is on disk must be what the manifest pins.
+    let pinned = DepsPin {
+        package_manager: "npm@10.2.4".into(),
+        lockfile: "package-lock.json".into(),
+        lockfile_sha256: "a".repeat(64),
+    };
+    // sha256("") is the well-known empty-string digest.
+    let actual = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    assert!(check_lockfile_matches(&pinned, actual).is_err());
+    let ok = DepsPin {
+        lockfile_sha256: actual.to_string(),
+        ..pinned
+    };
+    assert!(check_lockfile_matches(&ok, actual).is_ok());
+}

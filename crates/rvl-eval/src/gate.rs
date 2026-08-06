@@ -13,6 +13,39 @@ use std::path::Path;
 pub struct RepoPin {
     pub repo: String,
     pub frozen_sha: String,
+    /// Dependency provenance, required for languages whose retrieval depends on
+    /// installed packages (see `language_requires_deps`). Defaulted so the
+    /// already-minted Go set, and any future bare-checkout language, keeps
+    /// parsing without ceremony.
+    #[serde(default)]
+    pub deps: Vec<DepsPin>,
+}
+
+/// One installed dependency tree a TypeScript gate set depends on.
+///
+/// A frozen SHA does not determine the TypeScript packet stream. tsindex
+/// resolves client types through the TS compiler, which needs `node_modules`,
+/// and on a bare clone that resolution fails SILENTLY rather than erroring:
+/// measured on infisical at one fixed SHA, installing dependencies took the
+/// stream from 1,911 sites to 83,927. Same commit, 44x the data.
+///
+/// So a TS manifest that pins only a SHA claims a reproducibility it cannot
+/// deliver. Pinning the lockfile content hash closes that: the resolved tree is
+/// part of the evidence, not an ambient property of the machine that minted it.
+///
+/// Monorepos install per workspace, hence a list: infisical needs root,
+/// `backend/` and `frontend/`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepsPin {
+    /// The `packageManager` field's value, e.g. `pnpm@10.33.2`. The five TS
+    /// candidates surveyed used three different managers, each version-pinned,
+    /// so the mint step has to honour this rather than assume npm.
+    pub package_manager: String,
+    /// Repo-relative path to the lockfile, e.g. `backend/package-lock.json`.
+    pub lockfile: String,
+    /// sha256 of the lockfile's bytes.
+    pub lockfile_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +128,10 @@ pub enum Refusal {
     },
     /// Fewer decided adjudications than the manifest's sample_size claims.
     GoldTooSmall { decided: usize, required: usize },
+    /// A gate set in a language whose retrieval depends on installed packages
+    /// pinned a commit but no dependency tree (po-av01j.117). The SHA alone
+    /// does not determine the packet stream, so the set is not reproducible.
+    MissingDepsProvenance { repo: String, language: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -110,6 +147,13 @@ impl std::fmt::Display for Refusal {
                 "refused: {set_id} is already consumed ({reason}). Gate sets are single-use per version; mint a fresh set rather than re-running this one."
             ),
             Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < 50"),
+            Refusal::MissingDepsProvenance { repo, language } => write!(
+                f,
+                "refused: {repo} pins a commit but no dependency tree, and {language} retrieval reads installed packages. \
+                 The SHA alone does not determine the packet stream (measured: 1,911 -> 83,927 sites at one fixed commit, \
+                 depending only on whether dependencies were installed). Pin each workspace's lockfile path, sha256 and \
+                 packageManager under `deps:`."
+            ),
             Refusal::RegistryUnavailable(e) => write!(
                 f,
                 "refused (fail-closed): quarantine registry unavailable: {e}"
@@ -386,6 +430,32 @@ pub fn load_gate_inputs(
 
 /// Validate a gate set's provenance before any scoring. Returns the registry
 /// version to record in the gate report.
+/// Languages whose retrieval reads an INSTALLED dependency tree, so a commit
+/// alone is not sufficient provenance for a gate set.
+///
+/// Go and Python retrievers read a bare checkout, so demanding a lockfile there
+/// would be ceremony with no reproducibility gain. TypeScript genuinely needs
+/// it. Kept as an explicit list rather than a default-on rule so adding a
+/// language is a deliberate decision with this comment in front of it.
+pub fn language_requires_deps(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "typescript" | "javascript" | "ts" | "js"
+    )
+}
+
+/// Compare a pinned lockfile hash against what is actually on disk at mint or
+/// run time. Split out as a pure function so it is testable without a checkout.
+pub fn check_lockfile_matches(pin: &DepsPin, actual_sha256: &str) -> Result<(), Refusal> {
+    if pin.lockfile_sha256.eq_ignore_ascii_case(actual_sha256) {
+        return Ok(());
+    }
+    Err(Refusal::EvidenceUnreadable(format!(
+        "lockfile {} does not match the manifest: pinned {}, found {}",
+        pin.lockfile, pin.lockfile_sha256, actual_sha256
+    )))
+}
+
 pub fn validate_gate_set(
     manifest: &GateManifest,
     seed_set_names: &[String],
@@ -404,6 +474,22 @@ pub fn validate_gate_set(
     for pin in &manifest.repos {
         if !registry.repos.contains(&pin.repo) {
             return Err(Refusal::RepoNotQuarantined(pin.repo.clone()));
+        }
+        // A SHA alone does not determine the packet stream in these languages;
+        // see DepsPin. A deps block whose hash is blank pins nothing while
+        // LOOKING like provenance in review, which is worse than omitting it,
+        // so require every entry to carry a non-empty lockfile hash.
+        if language_requires_deps(&manifest.language)
+            && (pin.deps.is_empty()
+                || pin
+                    .deps
+                    .iter()
+                    .any(|d| d.lockfile_sha256.trim().is_empty() || d.lockfile.trim().is_empty()))
+        {
+            return Err(Refusal::MissingDepsProvenance {
+                repo: pin.repo.clone(),
+                language: manifest.language.clone(),
+            });
         }
         // Normalize BOTH sides, HERE, rather than trusting the caller to have
         // done it. parse_grounding_manifest already normalizes, but this
