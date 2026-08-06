@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use rvl_core::parse_stream;
 use rvl_eval::compare::{self, Finding};
 use rvl_eval::stats::{paired_bootstrap, wilson_interval};
-use rvl_eval::{gate, latency, load_findings, load_jsonl};
+use rvl_eval::{consumption, gate, latency, load_findings, load_jsonl};
 use rvl_propagate::propagate_all;
 use rvl_spec::SpecCache;
 use serde::Deserialize;
@@ -116,6 +116,12 @@ enum Cmd {
         /// Wilson-LB precision target.
         #[arg(long, default_value_t = 0.90)]
         target: f64,
+        /// Append-only single-use ledger (po-av01j.89). Defaults to
+        /// `consumed.jsonl` beside the gate-set directories, so one committed
+        /// file covers every set. COMMIT IT: a ledger that lives only on the
+        /// machine that ran the gate does not stop the next machine.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
     /// Latency replay: warm staged-diff p95 and hook triage-count targets.
     Latency {
@@ -265,6 +271,38 @@ fn wilson_half_width(p: f64, n: f64) -> f64 {
     let (lo, hi) = wilson_interval(successes, n as u64);
     // Report the larger side so the comparison against PPI is never flattering.
     (hi - p).abs().max((p - lo).abs())
+}
+
+/// UTC timestamp for the consumption ledger. Hand-rolled rather than pulling in
+/// `chrono`: this is an audit string a human reads, nothing parses it, and a
+/// gate must not gain a dependency for a log line.
+fn now_utc_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // days since epoch -> civil date (Howard Hinnant's algorithm)
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 fn main() -> Result<()> {
@@ -608,6 +646,7 @@ specs borrowed by method for {borrowed} rows",
             registry,
             grounding_manifest,
             target,
+            ledger,
         } => {
             // Exit contract: 0 pass, 1 metric fail, 2 refusal. EVERY input
             // problem is a refusal (fail-closed) so a CI wrapper can tell
@@ -649,6 +688,43 @@ specs borrowed by method for {borrowed} rows",
                 manifest.adjudication.adjudicator,
                 manifest.adjudication.date
             );
+
+            // SINGLE-USE, ENFORCED (po-av01j.89). Recorded BEFORE scoring, on
+            // purpose: consumption is the act of LOOKING at the gold, not the
+            // act of liking what it says. Writing after would leave a failing
+            // run unconsumed, which is the tune-and-retry loop that made the
+            // old `consumed: true` self-declaration worthless.
+            let ledger_path = ledger.unwrap_or_else(|| consumption::default_ledger_path(&set));
+            let verdicts_sha = match std::fs::read(set.join("verdicts.jsonl")) {
+                Ok(b) => consumption::sha256_hex(&b),
+                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
+                    "verdicts.jsonl for hashing: {e}"
+                ))),
+            };
+            let manifest_sha = match std::fs::read(set.join("manifest.yaml")) {
+                Ok(b) => consumption::sha256_hex(&b),
+                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
+                    "manifest.yaml for hashing: {e}"
+                ))),
+            };
+            let prior = match consumption::read_ledger(&ledger_path) {
+                Ok(l) => l,
+                Err(r) => refuse(&r),
+            };
+            if let Err(r) = consumption::check_unconsumed(&prior, &manifest.set_id, &verdicts_sha) {
+                refuse(&r);
+            }
+            let record = consumption::ConsumptionRecord {
+                set_id: manifest.set_id.clone(),
+                verdicts_sha256: verdicts_sha,
+                manifest_sha256: manifest_sha,
+                target,
+                run_at: now_utc_rfc3339(),
+            };
+            if let Err(r) = consumption::append_consumption(&ledger_path, &record) {
+                refuse(&r);
+            }
+            println!("  consumed: recorded in {}", ledger_path.display());
 
             let s = match gate::score_gate(&rows, manifest.sample_size, target) {
                 Ok(s) => s,
