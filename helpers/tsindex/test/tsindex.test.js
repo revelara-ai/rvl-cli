@@ -499,3 +499,38 @@ test('no emitted client_type contains a filesystem path', () => {
       `client_type carries an unresolved import() spelling: ${ct}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Resolving to an external package does not make a call a CLIENT call
+// (po-av01j.116).
+//
+// The old rule was "a resolved external client emits regardless of method
+// name". That holds for pg/axios/ioredis, and fails for pure-computation
+// packages: on infisical, 82,645 of 83,042 resolved sites (99.5%) had no I/O
+// verb, and zod + knex builders alone were 86.5% of them.
+//
+// A package blocklist is the wrong axis, because knex is BOTH a real query
+// client and a schema builder (`knex.ColumnBuilder.notNullable`). The test that
+// separates them is structural: a call that crosses a process, network or disk
+// boundary is awaitable, and a synchronous fluent builder is not.
+// ---------------------------------------------------------------------------
+
+test('synchronous fluent builder calls are not emitted as client sites', () => {
+  const recs = retrieveAll().filter((r) => (r.file_path || '').endsWith('schemas.ts'));
+  const emitted = recs.filter((r) => !r.kind && r.client_type);
+  assert.deepStrictEqual(
+    emitted.map((r) => `${r.client_type}.${r.func}`),
+    [],
+    'schema-builder chains must not appear as client call sites',
+  );
+});
+
+test('awaitable client calls are still emitted', () => {
+  // The guard against over-dropping: the real clients in the fixture must
+  // survive the builder exclusion untouched.
+  const all = retrieveAll().filter((r) => !r.kind && r.client_type);
+  const pkgs = new Set(all.map((r) => r.client_type.split('.')[0]));
+  for (const want of ['pg', 'axios', 'ioredis']) {
+    assert.ok(pkgs.has(want), `real client package ${want} must still be retrieved`);
+  }
+});
