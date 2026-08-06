@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use std::path::Path;
 
 pub mod compare;
+pub mod consumption;
 pub mod gate;
 pub mod latency;
 pub mod stats;

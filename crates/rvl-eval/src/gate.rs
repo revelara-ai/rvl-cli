@@ -70,6 +70,11 @@ pub enum Refusal {
     SeedSet(String),
     /// `consumed: true` — single-use per version, never reset.
     Consumed(String),
+    /// The consumption ledger already records this set, or this exact gold
+    /// under another name (po-av01j.89). Distinct from `Consumed`, which is
+    /// the manifest's self-declaration; this one is a fact the gate process
+    /// wrote itself and therefore the one that can actually be trusted.
+    AlreadyConsumed { set_id: String, reason: String },
     /// sample_size below the n>=50 bar (po-ipkfg.1).
     SampleTooSmall(usize),
     /// Quarantine registry missing or unreadable.
@@ -93,6 +98,10 @@ impl std::fmt::Display for Refusal {
                 "refused: {s} is a seed set (permanently gate-ineligible)"
             ),
             Refusal::Consumed(s) => write!(f, "refused: {s} is consumed (single-use per version)"),
+            Refusal::AlreadyConsumed { set_id, reason } => write!(
+                f,
+                "refused: {set_id} is already consumed ({reason}). Gate sets are single-use per version; mint a fresh set rather than re-running this one."
+            ),
             Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < 50"),
             Refusal::RegistryUnavailable(e) => write!(
                 f,
