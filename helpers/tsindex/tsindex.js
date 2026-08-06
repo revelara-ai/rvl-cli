@@ -445,6 +445,57 @@ function packageFromImport(symbol) {
 // resolved package client.
 // ---------------------------------------------------------------------------
 
+// Does this call return something awaitable?
+//
+// Resolving to an external package is not sufficient to make a call a CLIENT
+// call. Validation, assertion, date and query-BUILDER packages all resolve
+// cleanly while crossing no boundary at all: on infisical, 99.5% of resolved
+// sites carried no I/O verb, and zod + knex builders were 86.5% of those.
+//
+// A package blocklist is the wrong axis -- knex is both a real query client
+// (`knex.raw`) and a schema builder (`knex.ColumnBuilder.notNullable`), so the
+// package name cannot separate them. What does separate them is structural: a
+// call that crosses a process, network or disk boundary is awaitable in
+// TypeScript, and a synchronous fluent builder is not. knex's query builders
+// are thenable and stay in; its ColumnBuilder is not and drops out.
+//
+// Fails OPEN (returns true) on any uncertainty. Dropping a site is the
+// destructive direction -- it silently costs recall -- so an unreadable or
+// unresolved type keeps the site rather than guessing it away.
+// Keyed by `<client_type>.<method>`, not by call site: whether a method returns
+// something awaitable is a property of its signature, so the answer is the same
+// at every call. Without this the checker materializes a type per call site --
+// 82k of them on infisical, which exhausts the V8 heap outright. Overloads that
+// differ in awaitability by argument type would be collapsed here; that is
+// vanishingly rare and worth the ~70x reduction in checker work.
+const _thenableCache = new Map();
+
+function callReturnsThenable(call, checker, cacheKey) {
+  if (cacheKey && _thenableCache.has(cacheKey)) return _thenableCache.get(cacheKey);
+  const answer = _computeReturnsThenable(call, checker);
+  if (cacheKey) _thenableCache.set(cacheKey, answer);
+  return answer;
+}
+
+function _computeReturnsThenable(call, checker) {
+  let t;
+  try {
+    t = checker.getTypeAtLocation(call);
+  } catch (_e) {
+    return true;
+  }
+  if (!t) return true;
+  if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return true;
+  try {
+    // A union counts as awaitable when any constituent is: `T | Promise<T>`
+    // still performs I/O on the branch that matters.
+    const parts = t.isUnion && t.isUnion() ? t.types : [t];
+    return parts.some((p) => !!checker.getPropertyOfType(p, 'then'));
+  } catch (_e) {
+    return true;
+  }
+}
+
 function resolveClientType(receiver, checker, program) {
   const unresolved = { clientType: '', resolved: false, version: '' };
   let type;
@@ -1100,8 +1151,23 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
   let emit = false;
   let tier = 'low';
   if (resolved && !NOISE_METHODS.has(method)) {
-    emit = true;
-    tier = 'high';
+    // A named I/O verb is evidence enough on its own; otherwise the call must
+    // at least be awaitable to count as crossing a boundary. See
+    // callReturnsThenable for why the package name cannot make this call.
+    //
+    // G3 background-job REGISTRATIONS are exempt: `cron.schedule(...)` and
+    // friends are registrations, not I/O, and are usually synchronous. That
+    // altitude has its own type-driven selection table (isJobRegistration), so
+    // a G1 awaitability heuristic must not silently veto it.
+    const namedIO = STRONG_IO_METHODS.has(method) || WEAK_IO_METHODS.has(method);
+    if (
+      namedIO ||
+      isJobRegistration(clientType, method) ||
+      callReturnsThenable(node, checker, clientType + '.' + method)
+    ) {
+      emit = true;
+      tier = 'high';
+    }
   } else if (STRONG_IO_METHODS.has(method)) {
     emit = true;
     tier = resolved ? 'high' : 'low';
