@@ -86,6 +86,13 @@ pub enum Refusal {
     RepoNotQuarantined(String),
     /// A gate-set repo appears in the engine's grounding corpus.
     GroundingOverlap(String),
+    /// The artifact under test declares a grounding manifest and the run was
+    /// handed a different one (po-av01j.90).
+    GroundingManifestMismatch {
+        artifact: String,
+        declared: String,
+        supplied: String,
+    },
     /// Fewer decided adjudications than the manifest's sample_size claims.
     GoldTooSmall { decided: usize, required: usize },
 }
@@ -114,6 +121,14 @@ impl std::fmt::Display for Refusal {
             Refusal::GroundingOverlap(r) => {
                 write!(f, "refused: gate-set repo {r} present in grounding corpus")
             }
+            Refusal::GroundingManifestMismatch {
+                artifact,
+                declared,
+                supplied,
+            } => write!(
+                f,
+                "refused: {artifact} declares grounding manifest {declared} but the run supplied {supplied}. The manifest must belong to the artifact under test."
+            ),
             Refusal::GoldTooSmall { decided, required } => {
                 write!(
                     f,
@@ -121,6 +136,75 @@ impl std::fmt::Display for Refusal {
                 )
             }
         }
+    }
+}
+
+/// Normalize a repo identity to lowercase `owner_repo`.
+///
+/// A PORT, not a new convention: `tools/quarantine_check.py::normalize` in
+/// rvlscan-eval is the source of truth, and it exists because the collection
+/// pipeline's manifest.json labels repos as `getsentry_sentry`, not
+/// `getsentry/sentry`. The gate compared raw strings with exact byte equality,
+/// so a real pipeline manifest matched NOTHING and the overlap refusal --
+/// the fence that stops a gate repo that taught the engine -- silently found
+/// zero every time (po-av01j.90).
+///
+/// Keep this in step with the Python. Two normalizers that drift are worse
+/// than one that is wrong, because the drift is invisible until it admits
+/// something.
+pub fn normalize_repo_id(s: &str) -> String {
+    s.trim().to_ascii_lowercase().replace('/', "_")
+}
+
+/// Parse a grounding manifest in either shape the ecosystem actually produces.
+///
+/// `.txt`: one `owner/name` per line, `#` comments allowed. This is the
+/// hand-written form po-av01j.80 shipped.
+///
+/// `.json`: the collection pipeline's own manifest, an array of objects each
+/// carrying a `label`. This is the form an operator would honestly reach for,
+/// and the old line-based reader parsed it as junk lines (`[`, `{"label": ...},`)
+/// with no error and zero matches -- a fail-open that looked like a clean run.
+///
+/// Returns NORMALIZED identities.
+pub fn parse_grounding_manifest(text: &str) -> Vec<String> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+            let mut out = Vec::new();
+            collect_labels(&v, &mut out);
+            return out;
+        }
+        // Looks like JSON and did NOT parse: return nothing so the caller
+        // refuses. Falling through to the line reader here would turn
+        // `{ this is not json` into a junk "identity", which is non-empty,
+        // which means the empty-manifest refusal never fires and the run
+        // passes on a manifest nobody could read. That is fail-open path (b)
+        // from po-av01j.90 wearing a different hat.
+        return Vec::new();
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(normalize_repo_id)
+        .collect()
+}
+
+/// Pull every `label` (and `repo`) string out of a pipeline manifest, whatever
+/// nesting it uses. Tolerant on purpose: the manifest is someone else's format
+/// and this side should not break when it gains a wrapper object.
+fn collect_labels(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_labels(x, out)),
+        serde_json::Value::Object(m) => {
+            for key in ["label", "repo"] {
+                if let Some(serde_json::Value::String(s)) = m.get(key) {
+                    out.push(normalize_repo_id(s));
+                }
+            }
+            m.values().for_each(|x| collect_labels(x, out));
+        }
+        _ => {}
     }
 }
 
@@ -132,6 +216,20 @@ pub fn parse_manifest(yaml: &str) -> anyhow::Result<GateManifest> {
 #[derive(Debug, Deserialize)]
 struct SeedSetEntry {
     name: String,
+    /// Per-artifact grounding manifest (registry/seed_sets.yaml). Parsed away
+    /// and never read before po-av01j.90, so NOTHING bound the manifest an
+    /// operator passed on the command line to the artifact actually under
+    /// test: you could hand the gate any manifest and it would be believed.
+    #[serde(default)]
+    grounding_manifest: Option<String>,
+}
+
+/// One seed-set designation: its name and, when declared, the grounding
+/// manifest that belongs to it.
+#[derive(Debug, Clone)]
+pub struct SeedSet {
+    pub name: String,
+    pub grounding_manifest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,8 +239,56 @@ struct SeedSetsFile {
 
 /// Names of seed sets from registry/seed_sets.yaml content.
 pub fn parse_seed_set_names(yaml: &str) -> anyhow::Result<Vec<String>> {
+    Ok(parse_seed_sets(yaml)?.into_iter().map(|s| s.name).collect())
+}
+
+/// Seed-set designations WITH their declared grounding manifests.
+pub fn parse_seed_sets(yaml: &str) -> anyhow::Result<Vec<SeedSet>> {
     let f: SeedSetsFile = serde_yaml::from_str(yaml)?;
-    Ok(f.seed_sets.into_iter().map(|s| s.name).collect())
+    Ok(f.seed_sets
+        .into_iter()
+        .map(|s| SeedSet {
+            name: s.name,
+            grounding_manifest: s.grounding_manifest,
+        })
+        .collect())
+}
+
+/// Refuse when a designated artifact declares a grounding manifest and the run
+/// was handed a different one (po-av01j.90).
+///
+/// Without this the CLI-supplied manifest is unbound: the registry can say
+/// "artifact X was grounded by manifest Y" and the gate will happily check
+/// against manifest Z, which is the same shape of hole as a guard trusting a
+/// label the guarded party supplies.
+///
+/// Only artifacts that DECLARE a manifest are checked. A seed set with no
+/// declaration makes no claim, and inventing one for it would refuse honest
+/// runs.
+pub fn check_manifest_matches_artifact(
+    seed_sets: &[SeedSet],
+    artifact_name: &str,
+    supplied_manifest: &Path,
+) -> Result<(), Refusal> {
+    let Some(entry) = seed_sets.iter().find(|s| s.name == artifact_name) else {
+        return Ok(());
+    };
+    let Some(declared) = entry.grounding_manifest.as_deref() else {
+        return Ok(());
+    };
+    // Compare on file name: the registry stores a repo-relative path and the
+    // operator passes a path on their own disk, so the directories legitimately
+    // differ while the artifact identity does not.
+    let declared_file = Path::new(declared).file_name();
+    let supplied_file = supplied_manifest.file_name();
+    if declared_file != supplied_file {
+        return Err(Refusal::GroundingManifestMismatch {
+            artifact: artifact_name.to_string(),
+            declared: declared.to_string(),
+            supplied: supplied_manifest.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Quarantine registry: version + quarantined repo names.
@@ -209,12 +355,19 @@ pub fn load_gate_inputs(
     let seed_set_names = parse_seed_set_names(&read(seed_sets)?)
         .map_err(|e| Refusal::EvidenceUnreadable(format!("{}: {e}", seed_sets.display())))?;
     let registry = load_registry(registry)?;
-    let grounding_repos: Vec<String> = read(grounding_manifest)?
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect();
+    let grounding_repos: Vec<String> = parse_grounding_manifest(&read(grounding_manifest)?);
+    // A manifest that yields NO identities is not "no overlap", it is no
+    // evidence. Empty files, comment-only files, and JSON the reader could not
+    // understand all landed here as a silent pass before po-av01j.90; the
+    // overlap check is the fence that stops a gate repo which taught the
+    // engine, so an unusable manifest must refuse.
+    if grounding_repos.is_empty() {
+        return Err(Refusal::EvidenceUnreadable(format!(
+            "grounding manifest {} yielded zero repo identities (empty, comment-only, or an \
+             unrecognised format). The overlap check cannot pass on no evidence.",
+            grounding_manifest.display()
+        )));
+    }
     let verdicts_path = set_dir.join("verdicts.jsonl");
     let rows: Vec<GoldRow> = read(&verdicts_path)?
         .lines()
@@ -252,7 +405,16 @@ pub fn validate_gate_set(
         if !registry.repos.contains(&pin.repo) {
             return Err(Refusal::RepoNotQuarantined(pin.repo.clone()));
         }
-        if grounding_repos.contains(&pin.repo) {
+        // Normalize BOTH sides, HERE, rather than trusting the caller to have
+        // done it. parse_grounding_manifest already normalizes, but this
+        // function is public and takes a plain Vec<String>; an unnormalized
+        // caller would silently get zero matches, which is the same fail-open
+        // this bead exists to close. A guard that depends on its caller having
+        // been careful is not a guard.
+        if grounding_repos
+            .iter()
+            .any(|g| normalize_repo_id(g) == normalize_repo_id(&pin.repo))
+        {
             return Err(Refusal::GroundingOverlap(pin.repo.clone()));
         }
     }
