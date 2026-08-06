@@ -347,6 +347,36 @@ function packageFromDeclPath(fileName) {
   return { pkg, dir };
 }
 
+// When a module has no nameable symbol, the checker falls back to spelling the
+// type as the module's ABSOLUTE path (`"/abs/.../zod/v3/external"`, or the
+// `typeof import("...")` form). That path is machine-local, and client_type is
+// part of site_key (`file:line:client_type:method`) -- so letting it through
+// makes the key depend on where the repo happens to sit on disk, and no
+// published spec can ever match it. It is also a shape leak: reports carry
+// client_type, and an absolute path exposes the caller's directory layout.
+//
+// Rewrite such a name to the package-relative module subpath, which names the
+// same module identically on every host. Returns '' when no stable name can be
+// derived, which the caller treats as unresolved: dropping the site is strictly
+// better than emitting a machine-dependent key.
+function stableTypeName(typeName, pkgInfo, declFileName) {
+  if (!typeName) return '';
+  const looksLikePath = typeName.includes('/') || typeName.includes('import(');
+  if (!looksLikePath) return typeName;
+
+  if (!pkgInfo || !pkgInfo.dir || !declFileName) return '';
+  const dir = pkgInfo.dir.replace(/\\/g, '/').replace(/\/+$/, '');
+  const decl = declFileName.replace(/\\/g, '/');
+  if (!decl.startsWith(dir + '/')) return '';
+
+  // Package-relative, minus the declaration extension: `v3/external`.
+  const sub = decl
+    .slice(dir.length + 1)
+    .replace(/\.d\.[cm]?ts$/, '')
+    .replace(/\.[cm]?tsx?$/, '');
+  return sub || '';
+}
+
 // Cache package.json version lookups by package dir.
 const _versionCache = new Map();
 function packageVersion(pkgDir) {
@@ -452,8 +482,11 @@ function resolveClientType(receiver, checker, program) {
   // Primary: declaration under node_modules/<pkg>/.
   const pkgInfo = packageFromDeclPath(declFile.fileName);
   if (pkgInfo) {
+    // Never let a machine-local path reach client_type; see stableTypeName.
+    const stable = stableTypeName(typeName, pkgInfo, declFile.fileName);
+    if (!stable) return unresolved;
     return {
-      clientType: pkgInfo.pkg + '.' + typeName,
+      clientType: pkgInfo.pkg + '.' + stable,
       resolved: true,
       version: packageVersion(pkgInfo.dir),
     };
@@ -469,7 +502,11 @@ function resolveClientType(receiver, checker, program) {
   }
   const imp = packageFromImport(recvSym) || packageFromImport(sym);
   if (imp) {
-    return { clientType: imp.pkg + '.' + typeName, resolved: true, version: '' };
+    // No package dir here to make a subpath from, so a path-shaped name has no
+    // stable spelling available: fail closed rather than emit a local path.
+    const stable = stableTypeName(typeName, null, null);
+    if (!stable) return unresolved;
+    return { clientType: imp.pkg + '.' + stable, resolved: true, version: '' };
   }
   return unresolved;
 }
@@ -795,7 +832,7 @@ function runRetrieve(root, snapshot, filesArg) {
     const emittingCatches = new Set();
     const aggregate = (node, framework, category, method) => {
       const enc = enclosingFunction(node);
-      const key = `${enc.name} ${framework} ${category}`;
+      const key = `${enc.name}\0${framework}\0${category}`;
       let agg = aggs.get(key);
       if (!agg) {
         const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
@@ -1349,6 +1386,7 @@ module.exports = {
   NOISE_METHODS,
   isTimeoutish,
   collectTimeoutFields,
+  stableTypeName,
 };
 
 if (require.main === module) {

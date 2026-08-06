@@ -427,3 +427,75 @@ test('repo_config records timeout-ish constructions and skips no-timeout ones', 
     assert.ok(Array.isArray(c.fields) && c.fields.length >= 1);
   }
 });
+
+// ---------------------------------------------------------------------------
+// client_type must never carry a filesystem path (po-av01j.115).
+//
+// site_key is `file:line:client_type:method`, so anything machine-dependent in
+// client_type makes the key machine-dependent too: the same repo checked out at
+// a different path yields different keys, and joins, caches and gate sets stop
+// matching across hosts. Specs also key on client_type, so a path-qualified
+// type can never be matched by any published spec.
+//
+// This only fires when node_modules is present -- on a bare clone the external
+// resolution fails silently and the fallback never runs -- which is why it went
+// unnoticed until a dependency-installed probe.
+// ---------------------------------------------------------------------------
+
+const { stableTypeName } = require('../tsindex.js');
+
+test('stableTypeName leaves an ordinary type name alone', () => {
+  const pkg = { pkg: 'pg', dir: '/w/node_modules/pg' };
+  assert.strictEqual(stableTypeName('Pool', pkg, '/w/node_modules/pg/lib/index.d.ts'), 'Pool');
+  assert.strictEqual(stableTypeName('AxiosStatic', pkg, '/w/node_modules/pg/x.d.ts'), 'AxiosStatic');
+});
+
+test('stableTypeName replaces an absolute module path with the package subpath', () => {
+  // The observed real case: zod's re-export module has no nameable symbol, so
+  // the checker falls back to the module's absolute path.
+  const pkg = { pkg: 'zod', dir: '/home/someone/repo/backend/node_modules/zod' };
+  const decl = '/home/someone/repo/backend/node_modules/zod/v3/external.d.ts';
+  const got = stableTypeName('"/home/someone/repo/backend/node_modules/zod/v3/external"', pkg, decl);
+  assert.strictEqual(got, 'v3/external');
+});
+
+test('stableTypeName handles the typeof import(...) spelling', () => {
+  const pkg = { pkg: 'zod', dir: '/a/node_modules/zod' };
+  const decl = '/a/node_modules/zod/lib/external.d.ts';
+  const got = stableTypeName('typeof import("/a/node_modules/zod/lib/external")', pkg, decl);
+  assert.strictEqual(got, 'lib/external');
+});
+
+test('stableTypeName is identical for the same package at different checkouts', () => {
+  // The property that actually matters: the name must not depend on where the
+  // repo happens to live on disk.
+  const a = stableTypeName('"/tmp/scratch/x/node_modules/zod/v3/external"',
+    { pkg: 'zod', dir: '/tmp/scratch/x/node_modules/zod' },
+    '/tmp/scratch/x/node_modules/zod/v3/external.d.ts');
+  const b = stableTypeName('"/home/ci/build/node_modules/zod/v3/external"',
+    { pkg: 'zod', dir: '/home/ci/build/node_modules/zod' },
+    '/home/ci/build/node_modules/zod/v3/external.d.ts');
+  assert.strictEqual(a, b, 'same package+module must name identically on any host');
+});
+
+test('stableTypeName fails closed when it cannot derive a stable name', () => {
+  // Better to drop the site than to emit a machine-dependent key. '' tells the
+  // caller to treat the receiver as unresolved.
+  assert.strictEqual(stableTypeName('"/some/where/else/mod"', null, '/some/where/else/mod.d.ts'), '');
+  assert.strictEqual(
+    stableTypeName('"/a/node_modules/zod/v3/x"', { pkg: 'zod', dir: '/completely/other' }, '/nope.d.ts'),
+    '');
+});
+
+test('no emitted client_type contains a filesystem path', () => {
+  for (const rec of retrieveAll()) {
+    const ct = rec.client_type;
+    if (!ct) continue;
+    assert.ok(!ct.includes('/node_modules/'),
+      `client_type embeds a node_modules path: ${ct}`);
+    assert.ok(!/(^|[.("])\//.test(ct),
+      `client_type embeds an absolute path: ${ct}`);
+    assert.ok(!ct.includes('import('),
+      `client_type carries an unresolved import() spelling: ${ct}`);
+  }
+});
