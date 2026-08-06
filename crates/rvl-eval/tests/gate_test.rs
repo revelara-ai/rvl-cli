@@ -161,6 +161,112 @@ fn consumed_set_is_refused() {
     assert_eq!(err, Refusal::Consumed("eval-go-v1".into()));
 }
 
+// --- Withdrawal (po-av01j.119) ---
+
+/// A withdrawal block appended to an otherwise valid manifest.
+fn withdrawn(yaml: &str) -> String {
+    format!(
+        "{yaml}
+withdrawn:
+  date: \"2026-08-06\"
+  by: \"Joseph Bironas\"
+  reason: >
+    Minted against spec cache 2026-08-06.3ee53dec, whose own provenance stamp
+    reads NEVER valid as gate evidence, as a precision claim, or as a
+    comparator baseline. See po-av01j.119.
+"
+    )
+}
+
+#[test]
+fn absent_withdrawal_is_the_default_and_still_validates() {
+    // Backward compatibility in the safe direction: no block means not
+    // withdrawn, which is the only reading that lets existing sets parse.
+    let m = parse_manifest(MANIFEST_OK).unwrap();
+    assert!(m.withdrawn.is_none());
+    assert!(validate_gate_set(&m, &[], &registry(), &[]).is_ok());
+}
+
+#[test]
+fn withdrawn_set_is_refused_with_its_reason() {
+    let m = parse_manifest(&withdrawn(MANIFEST_OK)).unwrap();
+    let w = m.withdrawn.as_ref().expect("withdrawal must parse");
+    assert_eq!(w.by, "Joseph Bironas");
+    let err = validate_gate_set(&m, &[], &registry(), &[]).unwrap_err();
+    match err {
+        Refusal::Withdrawn {
+            ref set_id,
+            ref reason,
+        } => {
+            assert_eq!(set_id, "eval-go-v1");
+            // The reason travels INTO the refusal. A bare "withdrawn" would
+            // send the reader back to the file that is already refusing them.
+            assert!(reason.contains("2026-08-06.3ee53dec"));
+        }
+        other => panic!("expected Withdrawn, got {other:?}"),
+    }
+    // and it must say so in the operator-visible message
+    assert!(err.to_string().contains("withdrawn"));
+}
+
+#[test]
+fn withdrawal_outranks_every_other_refusal() {
+    // A withdrawn set is usually ALSO wrong in some mechanical way, and the
+    // mechanical complaint is the less useful one: "repo not quarantined"
+    // invites fixing the registry entry and re-running. Order the check first
+    // so the answer is the human decision, not the symptom.
+    let mut m = parse_manifest(&withdrawn(MANIFEST_OK)).unwrap();
+    m.consumed = true;
+    m.sample_size = 3;
+    m.repos[0].repo = "torvalds/linux".into();
+    let err = validate_gate_set(
+        &m,
+        &["eval-go-v1".into()],
+        &registry(),
+        &["go-gitea/gitea".into()],
+    )
+    .unwrap_err();
+    assert!(matches!(err, Refusal::Withdrawn { .. }), "got {err:?}");
+}
+
+#[test]
+fn withdrawal_without_a_reason_refuses_at_parse() {
+    // A withdrawal that records no reason is not a withdrawal record. It would
+    // refuse the set while telling the next reader nothing about why, which is
+    // how a bad number gets quietly re-minted.
+    let blank = MANIFEST_OK.to_string()
+        + "
+withdrawn:
+  date: \"2026-08-06\"
+  by: \"Joseph Bironas\"
+  reason: \"   \"
+";
+    assert!(parse_manifest(&blank).is_err());
+    let missing = MANIFEST_OK.to_string()
+        + "
+withdrawn:
+  date: \"2026-08-06\"
+  by: \"Joseph Bironas\"
+";
+    assert!(parse_manifest(&missing).is_err());
+}
+
+#[test]
+fn withdrawal_cannot_declare_itself_rescinded() {
+    // deny_unknown_fields, for the same reason provenance_check.py refuses
+    // unknown stamp keys: an invented field ("rescinded: true") reads as
+    // authoritative to a human and is enforced by nothing.
+    let sneaky = MANIFEST_OK.to_string()
+        + "
+withdrawn:
+  date: \"2026-08-06\"
+  by: \"Joseph Bironas\"
+  reason: \"contaminated cache\"
+  rescinded: true
+";
+    assert!(parse_manifest(&sneaky).is_err());
+}
+
 #[test]
 fn small_sample_is_refused() {
     let mut m = parse_manifest(MANIFEST_OK).unwrap();
