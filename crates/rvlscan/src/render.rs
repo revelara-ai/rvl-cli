@@ -174,6 +174,17 @@ pub fn classify(f: &Finding) -> Section {
     }
 }
 
+/// How many findings land in BLOCKING after waivers/dispositions — i.e.
+/// whether the ladder's footer says "blocked". The scan's exit code is derived
+/// from this same function the footer uses, so the printed verdict and the
+/// process status can never disagree (po-av01j.94: they did, for months).
+pub fn blocking_count(findings: &[Finding]) -> usize {
+    findings
+        .iter()
+        .filter(|f| classify(f) == Section::Blocking)
+        .count()
+}
+
 fn paint(s: &str, code: &str, color: bool) -> String {
     if color {
         format!("\x1b[{code}m{s}\x1b[0m")

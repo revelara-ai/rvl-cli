@@ -12,6 +12,26 @@ use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, SyncOutcome};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// EXIT-CODE CONTRACT (po-av01j.94). `rvlscan scan` is wired into pre-commit
+/// hooks and CI gates, so the exit code IS the gate:
+///
+/// * `0` — the scan completed and nothing blocking remains after waivers
+///   ("commit clean").
+/// * `1` — the scan could not complete: no verifiable spec cache, a retriever
+///   error under `--strict`, an IO failure. The SCANNER broke; the code was
+///   never judged. (`ExitCode::FAILURE`, and `rvl_data::Failure::runtime`.)
+/// * `2` — usage error: an unknown or invalid flag/argument. (clap's default,
+///   and `rvl_data::Failure::usage`.)
+/// * `3` — the scan completed and BLOCKING findings remain: fix or suppress
+///   them. This is the gate firing.
+///
+/// "Blocked" gets its own code instead of reusing `1` because a hook must be
+/// able to distinguish "your code has a problem" from "the scanner is broken",
+/// and `1`/`2` already mean the latter two things throughout this binary. That
+/// makes the contract additive: no previously non-zero code changed meaning,
+/// only the previously-and-wrongly-zero blocked case moved.
+const EXIT_BLOCKED: u8 = 3;
+
 #[derive(Parser)]
 #[command(name = "rvlscan", version, about = "Revelara reliability scanner")]
 struct Cli {
@@ -25,6 +45,9 @@ enum Cmd {
     /// triage. Deterministic, no model calls. With no `--retrieved`, rvlscan
     /// detects the languages under PATH and runs the matching retriever helper
     /// itself; `--retrieved` is an escape hatch for a prebuilt packet stream.
+    ///
+    /// Exit codes: 0 = clean, 3 = BLOCKING findings remain (the gate fires),
+    /// 1 = the scan could not complete, 2 = usage error.
     Scan {
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
@@ -67,7 +90,10 @@ enum Cmd {
         /// adjudication lane for delta-scoped undecided sites — OFF by
         /// default at every layer; see `scanner.use_agent` and
         /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
-        /// deterministic scan and its exit behavior are unchanged either way.
+        /// deterministic scan is unchanged either way; advisory agent verdicts
+        /// cannot affect the exit code, and gate-mode verdicts
+        /// (`scanner.agent_verdicts: gate`) block exactly like any other
+        /// BLOCKING row — see EXIT_BLOCKED.
         #[arg(long)]
         hook: Option<String>,
     },
@@ -1592,6 +1618,13 @@ fn render_scan_output(
             .collect();
         std::fs::write(p, serde_json::to_string_pretty(&rows)?)?;
         println!("\nwrote {}", p.display());
+    }
+    // The gate. Both scan paths (packet stream and incremental) funnel through
+    // here, so this is the single place the blocking verdict becomes a process
+    // status — derived from the same `classify` the footer used, never a second
+    // opinion. See EXIT_BLOCKED for the full contract.
+    if render::blocking_count(&ladder_findings) > 0 {
+        return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
 }

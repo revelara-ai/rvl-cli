@@ -57,6 +57,28 @@ rvlscan explain <id> --retrieved packets.jsonl
 The signed spec cache is used by default (run `rvlscan sync` to populate it).
 `--specs-file` is a loudly-announced dev override.
 
+### Exit codes
+
+`rvlscan scan` is meant to sit on a pre-commit hook or in a CI gate, so its
+exit code is the gate:
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Scan completed; nothing blocking remains after waivers (`commit clean`). |
+| `1`  | Scan could not complete — no verifiable spec cache, a retriever error under `--strict`, an IO failure. The scanner broke; your code was never judged. |
+| `2`  | Usage error: unknown or invalid flag/argument. |
+| `3`  | Scan completed and **BLOCKING** findings remain (`✗ blocked`). Fix them, or waive them in `.revelara.yaml`. |
+
+Blocked has its own code so a hook can tell "your code has a problem" (`3`)
+from "the scanner is broken" (`1`) — a broken scanner must not be silently
+read as a clean tree. Advisory findings never affect the exit code.
+
+Any non-zero exit fails the gate, so the simple form is enough for most CI:
+
+```sh
+rvlscan scan .          # non-zero => the job fails
+```
+
 ### Workflow skills and lenses
 
 `rvlscan skills` installs the Revelara workflow skills and lenses (the
