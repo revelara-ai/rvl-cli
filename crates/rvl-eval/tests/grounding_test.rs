@@ -29,7 +29,7 @@ fn the_pipeline_json_manifest_is_understood() {
     let json = r#"[
       {"label": "getsentry_sentry", "commit": "abc"},
       {"label": "go-gitea_gitea", "commit": "def"},
-      {"label": "polaris"}
+      {"label": "acme_service"}
     ]"#;
     let got = parse_grounding_manifest(json);
     assert!(got.contains(&"go-gitea_gitea".to_string()), "got {got:?}");
