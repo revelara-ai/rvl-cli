@@ -122,6 +122,14 @@ enum Cmd {
         /// machine that ran the gate does not stop the next machine.
         #[arg(long)]
         ledger: Option<PathBuf>,
+        /// Retriever packet stream for the pinned repos, retrieved AT the
+        /// manifest's frozen_sha (po-av01j.95). With this the gate measures the
+        /// ENGINE; without it, it can only re-read the panel's static file.
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        /// Spec cache to measure. Required with --retrieved.
+        #[arg(long)]
+        specs: Option<PathBuf>,
     },
     /// Latency replay: warm staged-diff p95 and hook triage-count targets.
     Latency {
@@ -647,6 +655,8 @@ specs borrowed by method for {borrowed} rows",
             grounding_manifest,
             target,
             ledger,
+            retrieved,
+            specs,
         } => {
             // Exit contract: 0 pass, 1 metric fail, 2 refusal. EVERY input
             // problem is a refusal (fail-closed) so a CI wrapper can tell
@@ -726,13 +736,82 @@ specs borrowed by method for {borrowed} rows",
             }
             println!("  consumed: recorded in {}", ledger_path.display());
 
-            let s = match gate::score_gate(&rows, manifest.sample_size, target) {
+            // MEASURE THE ENGINE, not the file (po-av01j.95). Without
+            // --retrieved/--specs the only thing available is the panel's
+            // static confirmation rate, which is correct for whatever engine
+            // produced verdicts.jsonl and unchanged by any engine change since.
+            // That is not a gate, so it REFUSES rather than quietly scoring the
+            // weaker thing: a number that looks identical but means something
+            // else is the failure this whole bead is about.
+            let (retrieved, specs) = match (retrieved, specs) {
+                (Some(r), Some(s)) => (r, s),
+                _ => refuse(&gate::Refusal::EvidenceUnreadable(
+                    "--retrieved and --specs are required: the gate measures the engine, \
+                     not verdicts.jsonl. Retrieve the pinned repos at their frozen_sha and \
+                     pass the packet stream plus the spec cache under test."
+                        .to_string(),
+                )),
+            };
+            let packet_text = match std::fs::read_to_string(&retrieved) {
+                Ok(t) => t,
+                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
+                    "packet stream {}: {e}",
+                    retrieved.display()
+                ))),
+            };
+            let (sites, cfg, skipped) = parse_stream(&packet_text);
+            let cache = match std::fs::read_to_string(&specs)
+                .map_err(|e| e.to_string())
+                .and_then(|s| SpecCache::load(&s).map_err(|e| e.to_string()))
+            {
+                Ok(c) => c,
+                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
+                    "spec cache {}: {e}",
+                    specs.display()
+                ))),
+            };
+            let served = cache.served_bound(&cfg);
+            let client = cache.client_bound_by_family(&cfg);
+            let engine_findings = propagate_all(&sites, &cache, &served, &client);
+            println!(
+                "\n  ENGINE RUN  sites {} | specs {} | unparseable lines {skipped}",
+                sites.len(),
+                cache.len()
+            );
+
+            let engine_sites: Vec<(String, u64, bool)> = sites
+                .iter()
+                .zip(engine_findings.iter())
+                .map(|(s, f)| {
+                    (
+                        s.file_path.clone(),
+                        // Site carries u32, GoldRow u64. Widening is lossless.
+                        u64::from(s.line_number),
+                        f.verdict == rvl_core::Verdict::Violates,
+                    )
+                })
+                .collect();
+            let joined = gate::join_gold_to_engine(&rows, &engine_sites);
+
+            let s = match gate::score_gate_against_engine(&joined, manifest.sample_size, target) {
                 Ok(s) => s,
                 Err(r) => refuse(&r),
             };
             println!(
-                "\n  decided {} (unsure {} excluded) | confirmed violates {}",
-                s.n_decided, s.n_unsure, s.confirmed_violates
+                "  gold {} | still flagged {} | no longer flagged {} | unmatched {} | unsure {}",
+                rows.len(),
+                s.n_scored,
+                s.no_longer_flagged,
+                s.unmatched,
+                s.n_unsure
+            );
+            println!(
+                "\n  scored {} (engine-flagged AND panel-decided)",
+                s.n_scored
+            );
+            println!(
+                "  confirmed violates {} | FALSE POSITIVES {}",
+                s.confirmed_violates, s.false_positives
             );
             println!(
                 "  precision {:.3} | Wilson 95% LB {:.3} | target {target:.2}",
