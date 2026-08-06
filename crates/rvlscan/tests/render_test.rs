@@ -91,6 +91,47 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
     assert_eq!(classify(&u), Section::Advisory);
 }
 
+// --- the exit-code predicate (po-av01j.94) ---
+
+/// Coverage is orthogonal to the blocking verdict; these tests don't assert on
+/// it, so one fully-resolved value serves.
+fn cov() -> Coverage {
+    Coverage {
+        resolved: 1,
+        total: 1,
+        abstain_no_spec: 0,
+        abstain_bounds: 0,
+        abstain_judge: 0,
+        abstain_other: 0,
+    }
+}
+
+#[test]
+fn blocking_count_agrees_with_the_footer_it_gates_on() {
+    // `blocking_count` is what `scan` turns into its exit code. It must count
+    // exactly what the ladder puts under BLOCKING — never a second opinion,
+    // or the printed verdict and the process status can diverge again.
+    let findings = vec![
+        f("b1", "high", "surface", 0),   // blocking: base severity
+        f("b2", "medium", "surface", 3), // blocking: elevated by incidents
+        f("a1", "medium", "surface", 0), // advisory
+        f("s1", "high", "low_value", 0), // suppressed by disposition
+        f("u1", "", "unjudged", 0),      // advisory: never blocks alone
+    ];
+    assert_eq!(blocking_count(&findings), 2);
+    assert!(render_ladder(&findings, cov(), None, "0.1s", false).contains("blocked"));
+
+    // A waived high-severity surface finding is not blocking, so the gate
+    // opens: this is the whole point of the waiver apparatus.
+    let mut waived = f("w1", "high", "surface", 4);
+    waived.suppressed = true;
+    assert_eq!(blocking_count(&[waived.clone()]), 0);
+    assert!(render_ladder(&[waived], cov(), None, "0.1s", false).contains("commit clean"));
+
+    // Nothing at all is trivially clean.
+    assert_eq!(blocking_count(&[]), 0);
+}
+
 // --- ladder ---
 
 #[test]

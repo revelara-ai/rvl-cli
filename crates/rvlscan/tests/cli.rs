@@ -22,6 +22,20 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rvlscan"))
 }
 
+/// The `scan` exit code that means "BLOCKING findings remain" — the gate
+/// firing. Kept distinct from 1 (scanner broke) and 2 (usage error) so a CI
+/// gate can tell "your code has a problem" from "the scanner is broken".
+/// Mirrors `EXIT_BLOCKED` in `crates/rvlscan/src/main.rs`.
+const EXIT_BLOCKED: i32 = 3;
+
+/// "The scan RAN" — it reached a verdict, clean (0) or blocked (EXIT_BLOCKED).
+/// For tests that assert on a lane's OUTPUT rather than on the gate: they must
+/// not care whether the fixture happens to block, but they must still fail on
+/// 1 (scanner error) and 2 (usage error).
+fn scan_reached_a_verdict(out: &std::process::Output) -> bool {
+    matches!(out.status.code(), Some(0) | Some(EXIT_BLOCKED))
+}
+
 #[test]
 fn cache_status_reports_empty_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -277,9 +291,13 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
         .expect("failed to run rvlscan");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(
-        out.status.success(),
-        "content-only scan must succeed: {stdout}\n{stderr}"
+    // The scan RAN (it is not a scanner error), and it BLOCKED. Asserting
+    // `success()` here is what let the gate ship broken for months: the
+    // footer said "blocked" while the shell said 0 (po-av01j.94).
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a blocking content-lane scan must exit {EXIT_BLOCKED}: {stdout}\n{stderr}"
     );
     assert!(
         stdout.contains("secret.github_token"),
@@ -319,6 +337,106 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     assert!(
         stdout2.contains("suppressed"),
         "footer must report the suppression: {stdout2}"
+    );
+    // ...and a waived-clean scan is exit 0: waiving is how a repo un-blocks.
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "a waived (clean) scan must exit 0: {stdout2}"
+    );
+}
+
+// --- exit-code contract (po-av01j.94) ---
+//
+// `rvlscan scan` is wired into pre-commit hooks and CI gates, so its exit code
+// IS the gate. The contract, in one place:
+//
+//   0  scan completed, nothing blocking remains after waivers
+//   1  scan could not complete (scanner error)
+//   2  usage error (bad flag/argument)
+//   3  scan completed, BLOCKING findings remain  <- the gate firing
+//
+// These two tests are the whole contract for the blocking axis: a blocking
+// result must be non-zero and specifically 3, an advisory-only result must be
+// 0. Every other scan test asserts on printed strings; without these, exit-0
+// -while-blocking regresses silently.
+
+/// A blocking finding must fail the process, and with the dedicated blocked
+/// code rather than the generic error code — a hook has to distinguish
+/// "your code has a problem" from "the scanner is broken".
+#[test]
+fn blocking_scan_exits_with_the_blocked_code_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // Guard against a vacuous pass: the run must actually have blocked.
+    assert!(
+        stdout.contains("BLOCKING") && stdout.contains("blocked"),
+        "fixture must produce a blocking ladder: {stdout}\n{stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a blocking scan must exit {EXIT_BLOCKED} so a CI gate fails: {stdout}\n{stderr}"
+    );
+}
+
+/// The other half of the contract: advisory findings inform, they do not
+/// block. An advisory-only scan stays exit 0, or the gate cries wolf and
+/// teams disable it.
+#[test]
+fn advisory_only_scan_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    // Server-entry registrations with no health endpoint and no rate limiter:
+    // RC-020/RC-069 surface, and the G2 lane is advisory by construction.
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        "HandleFunc",
+        r#"mux.HandleFunc("/users", usersHandler)"#,
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // Guard against a vacuous pass: there must be findings, just not blocking.
+    assert!(
+        stdout.contains("ADVISORY") && !stdout.contains("BLOCKING"),
+        "fixture must produce an advisory-only ladder: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("commit clean"),
+        "advisory-only must print the clean footer: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "advisory findings must not fail the process: {stdout}\n{stderr}"
     );
 }
 
@@ -1703,8 +1821,11 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         .expect("failed to run rvlscan");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // This fixture plants blocking identities, so a working scan exits
+    // EXIT_BLOCKED, not 0. Exit 1 stays tolerated: cindex can be present but
+    // fail at runtime without a system libclang.
     assert!(
-        out.status.success() || out.status.code() == Some(1),
+        scan_reached_a_verdict(&out) || out.status.code() == Some(1),
         "scan errored: {stdout}\n{stderr}"
     );
     let rows: serde_json::Value =
@@ -2424,7 +2545,14 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
         .expect("failed to run rvlscan");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    // The `:latest` retag below is a high-severity config violation, so this
+    // lane BLOCKS: exit EXIT_BLOCKED, not 0. (It exited 0 before po-av01j.94 —
+    // proof the config lane's gate was decorative too.)
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "blocking config lane must exit {EXIT_BLOCKED}: {stdout} {stderr}"
+    );
 
     // The missing probe violates the Present spec (both base and overlay
     // units repeat it — one grouped class).
