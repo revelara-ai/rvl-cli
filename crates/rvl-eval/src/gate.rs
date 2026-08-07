@@ -56,6 +56,37 @@ pub struct AdjudicationMeta {
     pub date: String,
 }
 
+/// A gate set retracted after minting (po-av01j.119).
+///
+/// A set can be mechanically well-formed and still not be evidence. eval-go-v1
+/// parsed, pinned four quarantined repos at frozen SHAs, and carried a properly
+/// adjudicated 75-row sample -- and was measured against a spec cache whose own
+/// provenance stamp says "NEVER valid as gate evidence". Every check the gate
+/// ran passed, because none of them looked at the cache.
+///
+/// WHY WITHDRAWAL IS RECORDED IN THE SET RATHER THAN BY DELETING IT: the
+/// withdrawal record is the useful artifact. Deleting the set removes the
+/// counter-record while leaving the number fully citable from git history, from
+/// the merged PR, and from anyone's notes. A withdrawn set that refuses loudly
+/// is worth more than an absent one that refuses nothing.
+///
+/// ON SELF-DECLARATION: `tools/provenance_check.py` refuses to let an artifact
+/// declare its own eligibility, and this block is exactly such a declaration --
+/// in the opposite direction. It can only ever refuse a set, never admit one,
+/// so forging it achieves nothing and forgetting it changes nothing that was
+/// previously true. That asymmetry is the whole reason it is safe here and the
+/// reason `gate_eligible` must NOT be added alongside it (po-av01j.120).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Withdrawal {
+    pub date: String,
+    /// Who made the call. A withdrawal is a judgment, and judgments are owned.
+    pub by: String,
+    /// Why, in full. This text is carried into the refusal, so the operator who
+    /// hits it does not have to go and read the file that just refused them.
+    pub reason: String,
+}
+
 /// manifest.yaml for a minted gate set (POPULATION_TEMPLATE.md schema).
 /// Every field is required: a manifest missing any of them fails to parse,
 /// and a gate set without a complete population document is not valid gate
@@ -72,6 +103,11 @@ pub struct GateManifest {
     pub sampling_frame: String,
     pub sample_size: usize,
     pub adjudication: AdjudicationMeta,
+    /// Present only on a retracted set. Absent means not withdrawn, which is
+    /// the only default that lets an already-minted set keep parsing -- and is
+    /// safe precisely because the block can only subtract eligibility.
+    #[serde(default)]
+    pub withdrawn: Option<Withdrawal>,
 }
 
 /// Panel verdict domain. Typed so a typo'd adjudication value refuses at
@@ -99,6 +135,11 @@ pub struct GoldRow {
 /// evidence is refusal, never a skipped check.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
+    /// The set carries a `withdrawn:` block: retracted after minting by a
+    /// human decision (po-av01j.119). Checked before everything else, because
+    /// a withdrawn set is usually also wrong mechanically and the mechanical
+    /// complaint invites fixing the symptom and re-running.
+    Withdrawn { set_id: String, reason: String },
     /// The set is designated as a seed set (permanently gate-ineligible).
     SeedSet(String),
     /// `consumed: true` — single-use per version, never reset.
@@ -137,6 +178,11 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Refusal::Withdrawn { set_id, reason } => write!(
+                f,
+                "refused: {set_id} is withdrawn and is not evidence. {reason} \
+                 A withdrawn set is never rescinded in place; mint a fresh version."
+            ),
             Refusal::SeedSet(s) => write!(
                 f,
                 "refused: {s} is a seed set (permanently gate-ineligible)"
@@ -254,7 +300,20 @@ fn collect_labels(v: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Parse a manifest.yaml string.
 pub fn parse_manifest(yaml: &str) -> anyhow::Result<GateManifest> {
-    Ok(serde_yaml::from_str(yaml)?)
+    let manifest: GateManifest = serde_yaml::from_str(yaml)?;
+    if let Some(w) = &manifest.withdrawn {
+        // A withdrawal that records no reason still refuses the set, and tells
+        // the next reader nothing about why -- which is how a bad number gets
+        // quietly re-minted from the same bad inputs.
+        for (field, value) in [("reason", &w.reason), ("date", &w.date), ("by", &w.by)] {
+            if value.trim().is_empty() {
+                anyhow::bail!(
+                    "withdrawn.{field} is empty: a withdrawal that records nothing is not a record"
+                );
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,6 +521,16 @@ pub fn validate_gate_set(
     registry: &Registry,
     grounding_repos: &[String],
 ) -> Result<u64, Refusal> {
+    // FIRST, ahead of every mechanical check. A withdrawn set typically also
+    // trips one of the checks below, and answering "repo not quarantined"
+    // invites an operator to fix the registry entry and re-run something a
+    // human already ruled out.
+    if let Some(w) = &manifest.withdrawn {
+        return Err(Refusal::Withdrawn {
+            set_id: manifest.set_id.clone(),
+            reason: w.reason.clone(),
+        });
+    }
     if seed_set_names.iter().any(|n| n == &manifest.set_id) {
         return Err(Refusal::SeedSet(manifest.set_id.clone()));
     }
