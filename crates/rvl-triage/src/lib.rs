@@ -293,17 +293,51 @@ mod tests {
 
     #[test]
     fn low_value_classes_are_suppressed_only_when_judged_so() {
+        // po-av01j.97: this test used to key the verdict on `id()` ("file:line")
+        // while triage keys `by_key` on `site_key()`
+        // ("file:line:client_type:method"). The verdict never rematched, so NO
+        // class was ever formed and the function returned empty for reasons
+        // that had nothing to do with suppression. Proved before fixing: the
+        // old body was also empty with ZERO judgments, and empty with a
+        // `surface` judgment that must never suppress, so the assertion would
+        // have held even with the low_value filter deleted outright.
+        //
+        // The three arms below are what make it non-vacuous: the class must be
+        // FORMED first, `surface` must NOT suppress it, and only `low_value`
+        // may remove it.
         let s = vec![site("a/f.go", 1, "pgx.Tx", "Exec")];
-        let v = vec![(s[0].id(), Verdict::Violates, "no bound".to_string())];
-        let j = vec![ClassJudgment {
-            api: "pgx.Tx.Exec()".into(),
-            scope: "runtime".into(),
-            verdict: "low_value".into(),
-            severity: "low".into(),
-            fix: String::new(),
-            control: String::new(),
-        }];
-        assert!(triage(&s, &v, &j).is_empty());
+        let v = vec![(s[0].site_key(), Verdict::Violates, "no bound".to_string())];
+        let judgment = |verdict: &str| {
+            vec![ClassJudgment {
+                api: "pgx.Tx.Exec()".into(),
+                scope: "runtime".into(),
+                verdict: verdict.into(),
+                severity: "low".into(),
+                fix: String::new(),
+                control: String::new(),
+            }]
+        };
+
+        // 1. the class forms at all — without this the other two prove nothing
+        let unjudged = triage(&s, &v, &[]);
+        assert_eq!(
+            unjudged.len(),
+            1,
+            "the violate must form a class to begin with"
+        );
+        assert_eq!(unjudged[0].disposition, "unjudged");
+
+        // 2. a judgment that is not low_value must leave it standing
+        let surfaced = triage(&s, &v, &judgment("surface"));
+        assert_eq!(
+            surfaced.len(),
+            1,
+            "only low_value suppresses, not any judgment"
+        );
+        assert_eq!(surfaced[0].disposition, "surface");
+
+        // 3. and low_value removes it
+        assert!(triage(&s, &v, &judgment("low_value")).is_empty());
     }
 
     #[test]
