@@ -1144,7 +1144,7 @@ struct RetrievedStream {
 ///
 /// A helper that abstains or fails degrades ITS OWN language and no other
 /// (po-av01j.102). Before this, one `?` here discarded every other language's
-/// stream: polaris has 1660 .go files and one .rs test fixture, and that single
+/// stream: the dogfood repo has 1660 .go files and one .rs test fixture, and that single
 /// fixture made the whole repo unscannable because rustindex correctly declines
 /// a tree with no Cargo.toml. See `retrieval_verdict` for when degradation is
 /// still fatal.

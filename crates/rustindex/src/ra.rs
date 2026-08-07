@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_tree_with_no_cargo_manifest_abstains_rather_than_erroring() {
-        // The reported case (po-av01j.102): polaris holds 1660 .go files and a
+        // The reported case (po-av01j.102): the dogfood repo holds 1660 .go files and a
         // single .rs test fixture, with no Cargo.toml anywhere. Declining is
         // correct; being INDISTINGUISHABLE from a broken toolchain is not,
         // because rvlscan uses that difference to decide whether to keep
