@@ -116,23 +116,45 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
     })
 }
 
+/// rustindex ran correctly and is DECLINING to analyse this tree.
+///
+/// Typed, rather than a plain error string, so `main` can exit with the
+/// ABSTAIN code instead of the generic error code. rvlscan degrades the Rust
+/// language and scans the rest of the repo on the first, and reports a broken
+/// toolchain on the second — and it can only tell them apart if this
+/// distinction survives the process boundary (po-av01j.102).
+#[derive(Debug)]
+pub struct Abstain(pub String);
+
+impl std::fmt::Display for Abstain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Abstain {}
+
 /// The build-dep gate (binding): the cargo workspace must LOAD — metadata,
 /// dependency resolution, and by extension build scripts and the proc-macro
 /// server rust-analyzer runs on top of it. A workspace that fails to load
-/// ABSTAINS: exit with an error, never fall back to a heuristic tier.
+/// ABSTAINS: decline, never fall back to a heuristic tier.
 pub fn require_workspace_loads(root: &Path) -> anyhow::Result<()> {
     let out = Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .current_dir(root)
         .output()
         .context("running cargo metadata (is cargo installed?)")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "cargo workspace under {} failed to load; rustindex abstains rather than guessing \
-         (no heuristic tier, per the engine charter). cargo metadata said: {}",
-        root.display(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    if !out.status.success() {
+        // A tree with no Cargo.toml is the common case here, and it is not a
+        // malfunction: a repo can hold one .rs file and no Rust project at all.
+        return Err(Abstain(format!(
+            "cargo workspace under {} failed to load; rustindex abstains rather than guessing \
+             (no heuristic tier, per the engine charter). cargo metadata said: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .into());
+    }
     Ok(())
 }
 
@@ -197,4 +219,27 @@ pub fn run_scip(ra: &RaIdentity, root: &Path) -> anyhow::Result<scip::types::Ind
     let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes)
         .context("parsing SCIP protobuf from rust-analyzer")?;
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_with_no_cargo_manifest_abstains_rather_than_erroring() {
+        // The reported case (po-av01j.102): the dogfood repo holds 1660 .go files and a
+        // single .rs test fixture, with no Cargo.toml anywhere. Declining is
+        // correct; being INDISTINGUISHABLE from a broken toolchain is not,
+        // because rvlscan uses that difference to decide whether to keep
+        // scanning the other 1660 files.
+        let dir = std::env::temp_dir().join(format!("rustindex-abstain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = require_workspace_loads(&dir).unwrap_err();
+        assert!(
+            err.downcast_ref::<Abstain>().is_some(),
+            "a manifest-less tree must be a typed Abstain, got: {err:#}"
+        );
+        assert!(err.to_string().contains("abstains rather than guessing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

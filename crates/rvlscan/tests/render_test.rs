@@ -103,6 +103,7 @@ fn cov() -> Coverage {
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
+        degraded: Vec::new(),
     }
 }
 
@@ -148,6 +149,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
+        degraded: Vec::new(),
     };
     let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
@@ -198,6 +200,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -231,6 +234,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -255,6 +259,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -275,6 +280,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -294,6 +300,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -318,6 +325,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         None,
         "0.1s",
@@ -352,6 +360,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
+            degraded: Vec::new(),
         },
         Some(&cc),
         "0.1s",
@@ -382,6 +391,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 abstain_bounds: 0,
                 abstain_judge: 0,
                 abstain_other: 0,
+                degraded: Vec::new(),
             },
             cfg,
             "0.1s",
