@@ -122,7 +122,7 @@ fn judgment_client_type<'a>(api: &'a str, method: &str) -> Option<&'a str> {
 ///
 /// The old guard tested `j.api.contains(&k.method)` and friends, which meant
 /// `"db.RLSPool.QueryRow".contains("Query")` silenced the whole `Query` class —
-/// 184 real sites on a polaris scan, dropped without anyone deciding to. Three
+/// 184 real sites on a dogfood scan, dropped without anyone deciding to. Three
 /// more holes came from the same shape: an unresolved client type (`"?"`)
 /// skipped the type guard entirely and so absorbed any judgment in scope, an
 /// empty method made `contains("")` universally true, and `find` returned file
@@ -360,7 +360,7 @@ mod tests {
     fn a_judgment_for_query_row_does_not_silence_query() {
         // THE reported bug: "db.RLSPool.QueryRow".contains("Query") is true, so
         // a low_value judgment on QueryRow dropped the whole Query class —
-        // 184 real sites in the polaris dogfood scan, silently.
+        // 184 real sites in a dogfood scan of a Go backend, silently.
         let j = vec![judgment("db.RLSPool.QueryRow", "low_value")];
         assert_eq!(
             disposition_of("db.RLSPool", "Query", &j),
