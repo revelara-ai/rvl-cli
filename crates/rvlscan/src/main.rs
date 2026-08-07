@@ -79,6 +79,16 @@ enum Cmd {
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+        /// Report and gate ONLY on findings in the files this change touched
+        /// (po-av01j.127). Requires `--incremental`, which is where the changed
+        /// set comes from. Without it, `--incremental` is an index-reuse
+        /// optimization only: it re-retrieves just the changed files but still
+        /// reports the WHOLE repo, so a one-file docs commit surfaces the same
+        /// rows as a nine-file code commit. That is the right shape for a
+        /// manual audit and the wrong one for a commit hook, where findings you
+        /// did not introduce are noise you learn to ignore.
+        #[arg(long)]
+        changed_only: bool,
         /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
         /// one-line deprecation notice and runs the deterministic scan.
         /// Consented hook adjudication is configured separately
@@ -1127,6 +1137,30 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
+}
+
+/// Normalize a repo-relative path for delta comparison: strip a leading `./`
+/// and collapse backslashes, so a "./" on one side of the comparison cannot
+/// silently drop every finding.
+fn normalize_rel(p: &str) -> String {
+    p.trim_start_matches("./").replace('\\', "/")
+}
+
+/// The changed-file set for `--changed-only`, normalized once.
+fn changed_set(changed: &[String]) -> std::collections::BTreeSet<String> {
+    changed.iter().map(|f| normalize_rel(f)).collect()
+}
+
+/// Is this site's file part of the change under scan (po-av01j.127)?
+///
+/// Deliberately fails CLOSED on an empty set: a change-scoped run with no
+/// changed files reports nothing, rather than falling open to the whole repo
+/// while still claiming to be scoped. The opposite bias is how `po-t8acf`
+/// shipped a vacuous gate -- there the scope argument was misparsed and the
+/// gate silently scanned nothing; here the danger is the mirror image, a gate
+/// that silently scans everything.
+fn site_is_changed(file_path: &str, changed: &std::collections::BTreeSet<String>) -> bool {
+    changed.contains(&normalize_rel(file_path))
 }
 
 /// A resolved packet stream plus whatever it cost to get one.
@@ -2298,6 +2332,7 @@ fn run_scan_incremental(
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
+    changed_only: bool,
     hook: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
@@ -2312,10 +2347,24 @@ fn run_scan_incremental(
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
+    // SCOPE TO THE CHANGE, at the SITE level and before triage
+    // (po-av01j.127). Filtering the rendered ladder instead would leave
+    // class site_counts describing the whole repo and, worse, leave the exit
+    // code derived from unscoped findings -- the printed verdict and the
+    // process status diverging is exactly po-av01j.94.
+    let delta = changed_set(&scan.changed_files);
+    let scan_sites = if changed_only {
+        scan.sites
+            .into_iter()
+            .filter(|s| site_is_changed(&s.file_path, &delta))
+            .collect()
+    } else {
+        scan.sites
+    };
     let (findings, mut items, sites, specs, server) = findings_from_sites(
         store,
         keyset,
-        scan.sites,
+        scan_sites,
         &scan.repo_cfg,
         0,
         specs_file,
@@ -2326,11 +2375,31 @@ fn run_scan_incremental(
     // The content lane is cheap (one regex pass over the tree) and its rules
     // change with the binary, not the sources, so it runs FULL on every warm
     // scan rather than riding the packet index.
-    items.extend(content_items(path));
+    // The content lane walks the live tree, so it needs the same scoping or a
+    // secret in an untouched file reappears on every commit.
+    let mut content = content_items(path);
+    if changed_only {
+        content.retain(|t| {
+            t.example_sites
+                .iter()
+                .any(|s| site_is_changed(s.rsplit_once(':').map_or(s.as_str(), |(f, _)| f), &delta))
+        });
+    }
+    items.extend(content);
     // Incremental scans own the live tree, so the structure lane inventories
     // it directly (one bounded walk; there is no packet stream to ride). The
     // server-entry lane rode the packet index like every other site.
-    let mut structure = resolve_structure_findings(None, "", path);
+    //
+    // Structure findings are REPO-level ("no test files for python"), so they
+    // are not attributable to a change at all. Under --changed-only they are
+    // dropped rather than shown: telling someone their one-line docs edit
+    // failed because the repo has no JS tests is the disproportionality this
+    // flag exists to remove.
+    let mut structure = if changed_only {
+        Vec::new()
+    } else {
+        resolve_structure_findings(None, "", path)
+    };
     structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
     // lane simply re-runs on every warm scan, so it can never be stale.
@@ -2981,6 +3050,7 @@ fn run() -> anyhow::Result<ExitCode> {
             color,
             incremental,
             strict,
+            changed_only,
             agent,
             hook,
         } => {
@@ -2988,6 +3058,16 @@ fn run() -> anyhow::Result<ExitCode> {
                 agent_alias_notice();
             }
             let path = path.unwrap_or_else(|| PathBuf::from("."));
+            // --changed-only has no changed set to scope to without the
+            // incremental pass. Refuse rather than silently scanning the whole
+            // repo while the caller believes it is scoped -- a gate that lies
+            // about its scope is worse than no gate (po-av01j.127).
+            anyhow::ensure!(
+                !changed_only || (incremental && retrieved.is_none()),
+                "--changed-only requires --incremental (and is incompatible with --retrieved): \
+                 the changed-file set comes from the incremental pass, so there is nothing to \
+                 scope to without it"
+            );
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
             if incremental && retrieved.is_none() {
@@ -3002,6 +3082,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     out.as_deref(),
                     color.as_deref(),
                     strict,
+                    changed_only,
                     hook.as_deref(),
                 )
             } else {
@@ -3213,6 +3294,40 @@ mod tests {
 
     // Serializes tests that mutate process-global env so they don't race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // --- Changed-only scoping (po-av01j.127) ---
+
+    #[test]
+    fn changed_only_keeps_sites_in_the_delta_and_drops_the_rest() {
+        // The reported gap: a one-file docs commit reported the same nine rows
+        // as a nine-file Java commit, because --incremental reuses the INDEX
+        // but still reports the whole repo.
+        let changed = changed_set(&["src/a.go".into(), "src/b.go".into()]);
+        assert!(site_is_changed("src/a.go", &changed));
+        assert!(site_is_changed("src/b.go", &changed));
+        assert!(!site_is_changed("src/untouched.go", &changed));
+    }
+
+    #[test]
+    fn changed_only_normalizes_leading_dot_slash() {
+        // Helpers emit repo-relative paths and the index computes its own; a
+        // "./" on one side must not silently drop every finding, which would
+        // be a vacuous gate (po-t8acf shipped exactly that class of bug).
+        let changed = changed_set(&["./src/a.go".into()]);
+        assert!(site_is_changed("src/a.go", &changed));
+        let changed = changed_set(&["src/a.go".into()]);
+        assert!(site_is_changed("./src/a.go", &changed));
+    }
+
+    #[test]
+    fn an_empty_delta_scopes_to_nothing_not_to_everything() {
+        // The failure direction that matters. If the changed set is empty and
+        // the filter fell open, a hook would report the entire repo while
+        // claiming to be change-scoped -- worse than not scoping at all,
+        // because it looks correct.
+        let changed = changed_set(&[]);
+        assert!(!site_is_changed("src/a.go", &changed));
+    }
 
     // --- Retriever abstain vs error, and per-language degradation (po-av01j.102) ---
 
