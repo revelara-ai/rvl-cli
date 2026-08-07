@@ -86,7 +86,10 @@ pub struct Finding {
 /// the large set of calls the specs correctly resolve as non-blocking, making
 /// coverage read far worse than it is. The remaining sites `abstain`, broken
 /// out by lever so the reader sees WHY each is unresolved.
-#[derive(Debug, Clone, Copy)]
+// No longer `Copy`: `degraded` is a Vec. Default is derived so a caller can
+// build one with `..Default::default()` rather than restating every abstain
+// bucket, which is how a new bucket gets silently forgotten at a call site.
+#[derive(Debug, Clone, Default)]
 pub struct Coverage {
     pub resolved: usize,
     pub total: usize,
@@ -99,6 +102,43 @@ pub struct Coverage {
     pub abstain_judge: usize,
     /// Any other undecided outcome.
     pub abstain_other: usize,
+    /// Languages that contributed no packets at all (po-av01j.102). Distinct
+    /// from the abstain buckets above, which count SITES the scanner reached
+    /// and could not decide. These are languages it never got to look at, so
+    /// the resolved/total ratio says nothing about them.
+    pub degraded: Vec<DegradedLang>,
+}
+
+/// The COVERAGE lines naming languages that contributed no packets
+/// (po-av01j.102). Split out as a pure function so the abstained/failed
+/// distinction is testable without building a whole ladder.
+///
+/// Rendered in yellow, not the dim grey the abstain buckets use: an abstain
+/// bucket is a normal scan outcome, whereas a whole language going unscanned
+/// changes what the resolved percentage above it means.
+pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    for d in &cov.degraded {
+        let line = if d.abstained {
+            format!("  {}: abstained \u{2014} {}", d.lang, d.reason)
+        } else {
+            format!("  {}: retriever failed \u{2014} {}", d.lang, d.reason)
+        };
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
+    }
+    o
+}
+
+/// One language that produced no packets, as rendered to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedLang {
+    pub lang: String,
+    /// The helper ran and declined, as opposed to failing. Kept as a flag
+    /// rather than folded into `reason` because the two must not read alike:
+    /// an abstention is the tool working correctly, a failure is not.
+    pub abstained: bool,
+    pub reason: String,
 }
 
 impl Coverage {
@@ -269,6 +309,7 @@ pub fn render_ladder(
         let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
         let _ = writeln!(o, "{}", paint(&aline, "2", color));
     }
+    o.push_str(&render_coverage_degradations(&cov, color));
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
             let pct = 100 * cc.resolved / cc.total.max(1);

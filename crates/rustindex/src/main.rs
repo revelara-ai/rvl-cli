@@ -11,10 +11,21 @@
 
 use anyhow::Context;
 
+/// Exit code meaning "I ran correctly and am declining to analyse this tree".
+/// Must agree with `HELPER_EXIT_ABSTAIN` in rvlscan (po-av01j.102): rvlscan
+/// degrades this language and scans the rest of the repo, instead of aborting.
+/// 2 stays the generic failure code, so the two are never confused.
+const EXIT_ABSTAIN: i32 = 3;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("rustindex: {e:#}");
-        std::process::exit(2);
+        let code = if e.downcast_ref::<rustindex::ra::Abstain>().is_some() {
+            EXIT_ABSTAIN
+        } else {
+            2
+        };
+        std::process::exit(code);
     }
 }
 

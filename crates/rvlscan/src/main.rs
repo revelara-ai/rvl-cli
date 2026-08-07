@@ -918,29 +918,138 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
     }
 }
 
+/// Exit code by which a retriever helper says "I ran correctly and am
+/// DECLINING to analyse this tree" (po-av01j.102).
+///
+/// A distinct code is necessary because the obvious candidates are already
+/// taken by real failures: rustindex exits 2 from its generic error arm and
+/// cindex exits 2 on a usage error, so 2 cannot also mean "declined". Without
+/// a separate value the orchestrator has only the stderr text to go on, and
+/// classifying behaviour by log wording silently reclassifies the day someone
+/// rewords a message.
+const HELPER_EXIT_ABSTAIN: i32 = 3;
+
+/// Why a language contributed no packets to the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradeKind {
+    /// The helper ran and deliberately declined: it can tell it has no basis
+    /// to analyse this tree (rustindex with no cargo workspace) and refuses to
+    /// guess. Not an error, and must not be reported as one.
+    Abstained,
+    /// The helper crashed, was missing, or exited non-zero for any other
+    /// reason. Something is broken.
+    Failed,
+}
+
+/// One language that produced no packets, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LangDegradation {
+    lang: Lang,
+    kind: DegradeKind,
+    reason: String,
+}
+
+/// Classify a helper's non-success exit. Success is handled by the caller;
+/// everything that reaches here is a degradation of some kind.
+///
+/// `None` means the process was killed by a signal, which is a failure rather
+/// than a decline: the helper never got as far as deciding anything.
+fn classify_helper_exit(code: Option<i32>) -> DegradeKind {
+    match code {
+        Some(HELPER_EXIT_ABSTAIN) => DegradeKind::Abstained,
+        _ => DegradeKind::Failed,
+    }
+}
+
+/// Is this retrieval result fatal to the scan?
+///
+/// Default is fail-OPEN per language, which is what `--strict`'s own help text
+/// has always promised ("Fail CLOSED when ... a retriever errors (CI). Default
+/// is fail-open"). Two things override that:
+///
+///   `strict`  CI asked for a whole answer or none.
+///   ALL detected languages degraded. Degrading to zero languages is not
+///             degradation, it is a total failure rendered as "0 findings".
+///             A clean report over nothing scanned is the single outcome that
+///             must never be quiet, so this is fatal at any strictness.
+fn retrieval_verdict(
+    detected: usize,
+    degraded: &[LangDegradation],
+    strict: bool,
+) -> anyhow::Result<()> {
+    if degraded.is_empty() {
+        return Ok(());
+    }
+    let summary = degraded
+        .iter()
+        .map(|d| format!("{} ({})", d.lang, d.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detected > 0 && degraded.len() >= detected {
+        anyhow::bail!(
+            "every detected language failed to retrieve, so nothing was scanned: {summary}. \
+             Reporting zero findings here would be a clean bill of health over an empty scan."
+        );
+    }
+    anyhow::ensure!(
+        !strict,
+        "--strict: retrieval degraded for {summary}. Re-run without --strict to scan the \
+         remaining languages."
+    );
+    Ok(())
+}
+
 /// Run a resolved helper over `root` and return its stdout (the JSONL packet
 /// stream). When `files` is non-empty the helper emits only those files'
-/// packets. A non-zero exit surfaces the helper's stderr in the error.
+/// packets.
+///
+/// A non-zero exit is returned as a typed degradation rather than an error:
+/// deciding whether one language's silence should sink the whole scan is the
+/// orchestrator's call, not this function's.
 fn run_helper(
     helper: &ResolvedHelper,
     root: &Path,
     name: &str,
     files: &[String],
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
     let argv = helper_argv(helper, root, name, files);
     let (program, args) = argv.split_first().expect("argv always has a program");
     let output = std::process::Command::new(program)
         .args(args)
         .output()
         .with_context(|| format!("running retriever helper `{program}`"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "retriever helper `{}` exited {}: {}",
-        program,
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if !output.status.success() {
+        let kind = classify_helper_exit(output.status.code());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(Err((
+            kind,
+            helper_degrade_reason(kind, &output.status, &stderr),
+        )));
+    }
+    Ok(Ok(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// A one-line reason for a degradation, for the COVERAGE block.
+///
+/// An abstaining helper explains itself in its last stderr line, and that
+/// sentence is the useful one ("cargo workspace ... failed to load"). A failed
+/// helper's stderr is a crash dump, so the exit status leads and the detail
+/// follows.
+fn helper_degrade_reason(
+    kind: DegradeKind,
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no detail on stderr")
+        .trim();
+    match kind {
+        DegradeKind::Abstained => last.to_string(),
+        DegradeKind::Failed => format!("{status}: {last}"),
+    }
 }
 
 /// Derive the snapshot tag for a scan target: the canonical base name of
@@ -1020,14 +1129,37 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
     }
 }
 
+/// A resolved packet stream plus whatever it cost to get one.
+struct RetrievedStream {
+    text: String,
+    /// Languages that contributed nothing, and why. Reported in COVERAGE; a
+    /// skipped language is never silent.
+    degraded: Vec<LangDegradation>,
+}
+
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
 /// that file is read verbatim (the escape hatch). Otherwise rvlscan detects the
 /// languages under `path`, runs each matching helper, and concatenates their
 /// stdout.
-fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Result<String> {
+///
+/// A helper that abstains or fails degrades ITS OWN language and no other
+/// (po-av01j.102). Before this, one `?` here discarded every other language's
+/// stream: polaris has 1660 .go files and one .rs test fixture, and that single
+/// fixture made the whole repo unscannable because rustindex correctly declines
+/// a tree with no Cargo.toml. See `retrieval_verdict` for when degradation is
+/// still fatal.
+fn resolve_packet_stream(
+    retrieved: Option<&Path>,
+    path: &Path,
+    strict: bool,
+) -> anyhow::Result<RetrievedStream> {
     if let Some(p) = retrieved {
-        return std::fs::read_to_string(p)
-            .with_context(|| format!("reading --retrieved {}", p.display()));
+        let text = std::fs::read_to_string(p)
+            .with_context(|| format!("reading --retrieved {}", p.display()))?;
+        return Ok(RetrievedStream {
+            text,
+            degraded: Vec::new(),
+        });
     }
     let langs = detect_languages(path);
     anyhow::ensure!(
@@ -1036,16 +1168,39 @@ fn resolve_packet_stream(retrieved: Option<&Path>, path: &Path) -> anyhow::Resul
         path.display()
     );
     let name = snapshot_name(path);
+    let detected = langs.len();
     let mut combined = String::new();
+    let mut degraded: Vec<LangDegradation> = Vec::new();
     for lang in langs {
-        let helper = resolve_helper(lang)?;
-        let out = run_helper(&helper, path, &name, &[])?;
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
+        // A helper that cannot be FOUND is a degradation of that language too,
+        // not a fatal error: an unrelated language's toolchain being absent is
+        // exactly the polyglot case this bead exists for.
+        let helper = match resolve_helper(lang) {
+            Ok(h) => h,
+            Err(e) => {
+                degraded.push(LangDegradation {
+                    lang,
+                    kind: DegradeKind::Failed,
+                    reason: format!("{e:#}"),
+                });
+                continue;
+            }
+        };
+        match run_helper(&helper, path, &name, &[])? {
+            Ok(out) => {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&out);
+            }
+            Err((kind, reason)) => degraded.push(LangDegradation { lang, kind, reason }),
         }
-        combined.push_str(&out);
     }
-    Ok(combined)
+    retrieval_verdict(detected, &degraded, strict)?;
+    Ok(RetrievedStream {
+        text: combined,
+        degraded,
+    })
 }
 
 /// What the resolve -> propagate -> triage pipeline hands back: the G1
@@ -1387,6 +1542,7 @@ fn run_scan(
     judgments: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
+    strict: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // Content lane first: it is language-agnostic, so it must not depend on
@@ -1420,13 +1576,15 @@ fn run_scan(
             out,
             color,
             start,
+            // No language was detected on this path, so nothing could degrade.
+            &[],
         );
     }
-    let stream = resolve_packet_stream(retrieved, path)?;
+    let stream = resolve_packet_stream(retrieved, path, strict)?;
     let (findings, mut items, sites, specs, server) = resolve_findings(
         store,
         keyset,
-        &stream,
+        &stream.text,
         specs_file,
         judgments,
         Some(path),
@@ -1435,7 +1593,7 @@ fn run_scan(
     items.extend(citems);
     // Structure + server-entry lanes join the ladder at the same seam: both
     // are control-mapped advisory findings outside the per-class triage.
-    let mut structure = resolve_structure_findings(retrieved, &stream, path);
+    let mut structure = resolve_structure_findings(retrieved, &stream.text, path);
     structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
@@ -1451,6 +1609,7 @@ fn run_scan(
         out,
         color,
         start,
+        &stream.degraded,
     )
 }
 
@@ -1523,6 +1682,7 @@ fn render_scan_output(
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
+    degraded: &[LangDegradation],
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -1532,10 +1692,18 @@ fn render_scan_output(
     let mut coverage = render::Coverage {
         resolved,
         total: sites.len(),
-        abstain_no_spec: 0,
-        abstain_bounds: 0,
-        abstain_judge: 0,
-        abstain_other: 0,
+        // A language that never retrieved is NOT an abstaining site: it is
+        // absent from `total` entirely, so it has to be reported separately or
+        // the percentage silently describes a smaller repo than the user has.
+        degraded: degraded
+            .iter()
+            .map(|d| render::DegradedLang {
+                lang: d.lang.to_string(),
+                abstained: d.kind == DegradeKind::Abstained,
+                reason: d.reason.clone(),
+            })
+            .collect(),
+        ..Default::default()
     };
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
@@ -1656,9 +1824,26 @@ const INCREMENTAL_WALL_BUDGET: std::time::Duration = std::time::Duration::from_s
 struct HelperRetriever {
     root: PathBuf,
     name: String,
+    /// Languages that degraded during an incremental re-retrieve
+    /// (po-av01j.102). Shared rather than owned because the retriever is moved
+    /// into the wall-budget thread, so the caller needs a handle that survives
+    /// the move; `rvl_index::Retriever` also only hands out `&self`. The
+    /// alternative is letting one language's refusal abort the whole delta,
+    /// which is the same bug this bead fixes on the full path.
+    degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>>,
 }
 
 impl HelperRetriever {
+    /// Record a language that contributed nothing. A poisoned lock is ignored
+    /// rather than propagated: losing a COVERAGE line is not worth failing a
+    /// scan that otherwise succeeded, and the poison can only come from a
+    /// panic that is already being reported.
+    fn push_degradation(&self, d: LangDegradation) {
+        if let Ok(mut g) = self.degraded.lock() {
+            g.push(d);
+        }
+    }
+
     /// Retrieve packets for `changed` (absolute paths), returning the sites and
     /// the repo-scoped construction facts (carried by whichever helper ran).
     /// Sites keep the repo-relative `file_path` the helpers emit.
@@ -1680,8 +1865,24 @@ impl HelperRetriever {
         let mut sites = Vec::new();
         let mut repo_cfg = rvl_core::RepoConfig::default();
         for (lang, files) in by_lang {
-            let helper = resolve_helper(lang)?;
-            let stream = run_helper(&helper, &self.root, &self.name, &files)?;
+            let helper = match resolve_helper(lang) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.push_degradation(LangDegradation {
+                        lang,
+                        kind: DegradeKind::Failed,
+                        reason: format!("{e:#}"),
+                    });
+                    continue;
+                }
+            };
+            let stream = match run_helper(&helper, &self.root, &self.name, &files)? {
+                Ok(s) => s,
+                Err((kind, reason)) => {
+                    self.push_degradation(LangDegradation { lang, kind, reason });
+                    continue;
+                }
+            };
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
             // The last non-empty construction record wins; helpers emit
@@ -1817,6 +2018,10 @@ struct IncrementalScan {
     /// On a degraded pass the changed files were not retrieved, so they carry
     /// no sites and the delta batch is naturally empty.
     changed_files: Vec<String>,
+    /// Languages whose helper abstained or failed during this pass
+    /// (po-av01j.102). Distinct from `degraded_note`, which is about the wall
+    /// budget: this is about a language contributing nothing at all.
+    lang_degraded: Vec<LangDegradation>,
 }
 
 /// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
@@ -1886,6 +2091,9 @@ where
         retrieved_files,
         degraded_note: rr.degraded_note,
         changed_files,
+        // Filled in by the caller that owns the retriever handle; this function
+        // is retriever-agnostic so a fake can drive it in tests.
+        lang_degraded: Vec::new(),
     })
 }
 
@@ -1908,9 +2116,14 @@ fn incremental_scan_pass(
     let name = snapshot_name(path);
     let root = path.to_path_buf();
 
-    incremental_sites(&index, path, &candidates, |changed| {
+    // Shared with the retriever so degradations survive its move into the
+    // budget thread.
+    let lang_degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
+    let collector = std::sync::Arc::clone(&lang_degraded);
+    let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
         // Budget only the potentially-slow helper retrieval.
         let retriever = HelperRetriever {
+            degraded: std::sync::Arc::clone(&collector),
             root: root.clone(),
             name: name.clone(),
         };
@@ -1920,7 +2133,11 @@ fn incremental_scan_pass(
             retriever.retrieve_full(&changed_owned)
         });
         resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
-    })
+    })?;
+    if let Ok(mut g) = lang_degraded.lock() {
+        scan.lang_degraded = std::mem::take(&mut g);
+    }
+    Ok(scan)
 }
 
 /// The argv a detached reindex child re-runs: everything except `--detach`
@@ -2050,6 +2267,7 @@ fn run_index_build(
 
     let name = snapshot_name(&root);
     let retriever = HelperRetriever {
+        degraded: Default::default(),
         root: root.clone(),
         name,
     };
@@ -2145,6 +2363,7 @@ fn run_scan_incremental(
         out,
         color,
         start,
+        &scan.lang_degraded,
     )
 }
 
@@ -2188,11 +2407,14 @@ fn run_explain(
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let stream = resolve_packet_stream(retrieved, path)?;
+    // `explain` is lenient on purpose: it exists to resolve one finding id, so
+    // a degraded language must not stop it printing the finding the user asked
+    // about. Strictness belongs to `scan`, which is what gates.
+    let stream = resolve_packet_stream(retrieved, path, false)?;
     let (_findings, mut items, _sites, specs, server) = resolve_findings(
         store,
         keyset,
-        &stream,
+        &stream.text,
         specs_file,
         judgments,
         Some(path),
@@ -2204,7 +2426,7 @@ fn run_explain(
         items.extend(content_items(path));
     }
     let mut ladder_findings = triage_to_findings(&items);
-    ladder_findings.extend(resolve_structure_findings(retrieved, &stream, path));
+    ladder_findings.extend(resolve_structure_findings(retrieved, &stream.text, path));
     ladder_findings.extend(server_to_findings(&server));
     // Config-lane ids resolve here too: the fresh scan mirrors what the
     // ladder printed, config rows included.
@@ -2253,11 +2475,11 @@ fn run_suppress(
             }
             None => {
                 let scan_path = path.unwrap_or(&cwd);
-                let stream = resolve_packet_stream(retrieved, scan_path)?;
+                let stream = resolve_packet_stream(retrieved, scan_path, false)?;
                 let (_findings, mut items, _sites, specs, server) = resolve_findings(
                     store,
                     keyset,
-                    &stream,
+                    &stream.text,
                     specs_file,
                     judgments,
                     Some(scan_path),
@@ -2268,7 +2490,11 @@ fn run_suppress(
                     items.extend(content_items(scan_path));
                 }
                 let mut ladder_findings = triage_to_findings(&items);
-                ladder_findings.extend(resolve_structure_findings(retrieved, &stream, scan_path));
+                ladder_findings.extend(resolve_structure_findings(
+                    retrieved,
+                    &stream.text,
+                    scan_path,
+                ));
                 ladder_findings.extend(server_to_findings(&server));
                 ladder_findings.extend(
                     config_lane::run(scan_path, &specs, &snapshot_name(scan_path)).findings,
@@ -2356,9 +2582,16 @@ fn run_report(
         )?;
         (findings, sites)
     } else {
-        let stream = resolve_packet_stream(retrieved, path)?;
-        let (findings, _items, sites, _specs, _server) =
-            resolve_findings(store, keyset, &stream, specs_file, None, Some(path), false)?;
+        let stream = resolve_packet_stream(retrieved, path, false)?;
+        let (findings, _items, sites, _specs, _server) = resolve_findings(
+            store,
+            keyset,
+            &stream.text,
+            specs_file,
+            None,
+            Some(path),
+            false,
+        )?;
         (findings, sites)
     };
 
@@ -2791,6 +3024,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     judgments.as_deref(),
                     out.as_deref(),
                     color.as_deref(),
+                    strict,
                 )
             }
         }
@@ -2979,6 +3213,116 @@ mod tests {
 
     // Serializes tests that mutate process-global env so they don't race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // --- Retriever abstain vs error, and per-language degradation (po-av01j.102) ---
+
+    fn degraded(lang: Lang, kind: DegradeKind) -> LangDegradation {
+        LangDegradation {
+            lang,
+            kind,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn abstain_is_a_distinct_exit_code_from_error() {
+        // The helper contract's whole point: a deliberate decline must not be
+        // indistinguishable from a crash. rustindex exits 2 from its generic
+        // error arm and cindex exits 2 on usage, so 2 cannot mean "declined".
+        assert_eq!(
+            classify_helper_exit(Some(HELPER_EXIT_ABSTAIN)),
+            DegradeKind::Abstained
+        );
+        for code in [1, 2, 101, 127] {
+            assert_eq!(
+                classify_helper_exit(Some(code)),
+                DegradeKind::Failed,
+                "exit {code} is a failure, not a decline"
+            );
+        }
+        // Killed by a signal. Not a decline: the helper never got to decide.
+        assert_eq!(classify_helper_exit(None), DegradeKind::Failed);
+    }
+
+    #[test]
+    fn one_language_degrading_does_not_sink_the_scan() {
+        // The reported bug: 1660 .go files and ONE .rs fixture, and the Go scan
+        // is discarded because rustindex declines a repo with no Cargo.toml.
+        let d = vec![degraded(Lang::Rust, DegradeKind::Abstained)];
+        assert!(retrieval_verdict(2, &d, false).is_ok());
+    }
+
+    #[test]
+    fn a_helper_error_also_degrades_by_default() {
+        // --strict's help text promises this for errors too: "Fail CLOSED when
+        // ... a retriever errors (CI). Default is fail-open."
+        let d = vec![degraded(Lang::Rust, DegradeKind::Failed)];
+        assert!(retrieval_verdict(2, &d, false).is_ok());
+    }
+
+    #[test]
+    fn strict_makes_any_degradation_fatal() {
+        for kind in [DegradeKind::Abstained, DegradeKind::Failed] {
+            let d = vec![degraded(Lang::Rust, kind)];
+            assert!(
+                retrieval_verdict(2, &d, true).is_err(),
+                "--strict must refuse a partial answer"
+            );
+        }
+    }
+
+    #[test]
+    fn every_language_degrading_is_fatal_even_without_strict() {
+        // The false-pass guard. Degrading to ZERO languages is not degradation,
+        // it is a total failure rendered as "0 findings" — a clean report over
+        // nothing scanned, which is the one outcome that must never be quiet.
+        let d = vec![
+            degraded(Lang::Rust, DegradeKind::Abstained),
+            degraded(Lang::Go, DegradeKind::Failed),
+        ];
+        let err = retrieval_verdict(2, &d, false).unwrap_err();
+        assert!(
+            err.to_string().contains("every detected language"),
+            "the message must say nothing was scanned, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_clean_run_is_unaffected() {
+        assert!(retrieval_verdict(2, &[], false).is_ok());
+        assert!(retrieval_verdict(2, &[], true).is_ok());
+    }
+
+    #[test]
+    fn degraded_languages_are_named_in_the_coverage_block() {
+        // Silence would trade a loud crash for a quiet false pass. The user has
+        // to be able to see that a language was skipped, and which kind of
+        // skip it was.
+        let cov = render::Coverage {
+            resolved: 10,
+            total: 12,
+            degraded: vec![
+                render::DegradedLang {
+                    lang: "Rust".into(),
+                    abstained: true,
+                    reason: "no cargo workspace".into(),
+                },
+                render::DegradedLang {
+                    lang: "Java".into(),
+                    abstained: false,
+                    reason: "exit 2".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render::render_coverage_degradations(&cov, false);
+        assert!(out.contains("Rust: abstained"), "got: {out}");
+        assert!(out.contains("no cargo workspace"), "got: {out}");
+        assert!(out.contains("Java: retriever failed"), "got: {out}");
+        // "abstained" and "failed" must not be rendered with the same word,
+        // or the distinction the exit code buys is thrown away at the last step.
+        assert!(!out.contains("Java: abstained"), "got: {out}");
+    }
 
     #[test]
     fn strip_detach_removes_only_the_detach_flag() {
