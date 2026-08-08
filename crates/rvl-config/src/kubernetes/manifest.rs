@@ -448,10 +448,10 @@ pub(super) fn retrieve_plain(rel_path: &str, contents: &str, snapshot_id: &str) 
     // garbage values. Outside a chart no committed input can render it
     // honestly: an unsupported variant, sighted by identity only.
     if contents.contains("{{") {
-        out.sightings.push(FormatSighting {
-            format: "kubernetes-templated".to_string(),
-            file_count: 1,
-        });
+        out.sightings.push(FormatSighting::declined(
+            "kubernetes-templated".to_string(),
+            1,
+        ));
         return out;
     }
     let (docs, failed) = parse_docs(contents);
@@ -842,10 +842,7 @@ spec:
         assert_eq!(got.unparseable, 0);
         assert_eq!(
             got.sightings,
-            vec![crate::FormatSighting {
-                format: "kubernetes-templated".into(),
-                file_count: 1
-            }]
+            vec![crate::FormatSighting::declined("kubernetes-templated", 1)]
         );
     }
 }

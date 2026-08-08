@@ -44,7 +44,7 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         sightings: retrieval
             .sightings
             .iter()
-            .map(|s| (s.format.clone(), s.file_count))
+            .map(|s| (s.format.clone(), s.file_count, s.retriever_exists))
             .collect(),
         ..Default::default()
     };

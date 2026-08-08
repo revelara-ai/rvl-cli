@@ -349,7 +349,10 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         abstain_outside_repo: 2,
         abstain_other: 0,
         unparseable_files: 1,
-        sightings: vec![("circleci".to_string(), 1), ("terraform".to_string(), 4)],
+        sightings: vec![
+            ("circleci".to_string(), 1, false),
+            ("terraform".to_string(), 4, false),
+        ],
     };
     let out = render_ladder(
         &[],
@@ -434,5 +437,77 @@ fn explain_shows_named_incidents_control_and_fix() {
     assert!(
         out.contains(&format!("rvlscan suppress {}", finding.id)),
         "suppress hint shown"
+    );
+}
+
+// po-av01j.136 defect 2. One line saying "unsupported config formats" for both
+// cases was actively misleading: on a Terraform repo it reported 109 Gatekeeper
+// policies as unsupported Kubernetes, in a run where the Kubernetes lane
+// resolved 288 settings. A supported format with nothing to retrieve is not a
+// coverage gap and must not be counted as one.
+#[test]
+fn sightings_split_unsupported_formats_from_supported_ones_with_nothing_to_take() {
+    let cc = ConfigCoverage {
+        resolved: 288,
+        total: 910,
+        sightings: vec![
+            ("kubernetes".to_string(), 109, true),
+            ("skaffold".to_string(), 13, false),
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+
+    let unsupported = out
+        .lines()
+        .find(|l| l.contains("unsupported config formats sighted"))
+        .unwrap_or_default();
+    assert!(
+        unsupported.contains("skaffold (13)"),
+        "a format with no retriever belongs in the authoring queue: {out}"
+    );
+    assert!(
+        !unsupported.contains("kubernetes"),
+        "a SUPPORTED format must never be listed as unsupported: {out}"
+    );
+
+    let supported = out
+        .lines()
+        .find(|l| l.contains("supported formats, nothing to retrieve"))
+        .unwrap_or_default();
+    assert!(
+        supported.contains("kubernetes (109)"),
+        "the count is still reported, under an accurate label: {out}"
+    );
+    assert!(
+        !supported.contains("skaffold"),
+        "the two categories must not bleed: {out}"
+    );
+}
+
+// Neither line may appear when its category is empty -- a heading with nothing
+// under it reads as a finding of its own.
+#[test]
+fn a_category_with_no_sightings_prints_no_line() {
+    let only_supported = ConfigCoverage {
+        resolved: 1,
+        total: 1,
+        sightings: vec![("kubernetes".to_string(), 4, true)],
+        ..Default::default()
+    };
+    let out = render_ladder(
+        &[],
+        Coverage::default(),
+        Some(&only_supported),
+        "0.1s",
+        false,
+    );
+    assert!(
+        !out.contains("unsupported config formats sighted"),
+        "no unsupported formats were sighted, so that line must be absent: {out}"
+    );
+    assert!(
+        out.contains("supported formats, nothing to retrieve"),
+        "{out}"
     );
 }

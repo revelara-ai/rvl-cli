@@ -603,10 +603,10 @@ pub(crate) fn retrieve(
             .unwrap_or(false)
     };
     if deps.iter().any(|d| !vendored(d)) {
-        out.sightings.push(FormatSighting {
-            format: "helm-unvendored-dependencies".to_string(),
-            file_count: 1,
-        });
+        out.sightings.push(FormatSighting::declined(
+            "helm-unvendored-dependencies".to_string(),
+            1,
+        ));
         return out;
     }
 
@@ -667,10 +667,10 @@ pub(crate) fn retrieve(
         out.packets.extend(em.out);
     }
     if unrendered > 0 {
-        out.sightings.push(FormatSighting {
-            format: "helm-unrendered-template".to_string(),
-            file_count: unrendered,
-        });
+        out.sightings.push(FormatSighting::declined(
+            "helm-unrendered-template".to_string(),
+            unrendered,
+        ));
     }
     out
 }
