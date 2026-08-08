@@ -1410,6 +1410,50 @@ function parseArgs(argv) {
   return args;
 }
 
+// Workspaces that DECLARE dependencies but have none installed (po-av01j.132).
+//
+// Per workspace, not per repo: monorepos install per package, and the gate-set
+// contract already records that infisical has six workspaces where its layout
+// suggests three. One uninstalled workspace silently removes its whole subtree
+// from resolution.
+//
+// A package.json with no dependencies and no devDependencies needs no install,
+// so it is not reported. Skips node_modules itself and the usual vendored trees.
+function missingDependencyTrees(root) {
+  const skip = new Set(['node_modules', '.git', 'dist', 'build', 'out', 'target', 'vendor']);
+  const missing = [];
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const hasPkg = entries.some((e) => e.isFile() && e.name === 'package.json');
+    if (hasPkg) {
+      let declares = false;
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+        declares =
+          Object.keys(pkg.dependencies || {}).length > 0 ||
+          Object.keys(pkg.devDependencies || {}).length > 0;
+      } catch {
+        // An unreadable package.json is not evidence of anything; leave it.
+        declares = false;
+      }
+      if (declares && !fs.existsSync(path.join(dir, 'node_modules'))) {
+        missing.push(path.relative(root, dir) || '.');
+      }
+    }
+    for (const e of entries) {
+      if (e.isDirectory() && !skip.has(e.name)) walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  walk(root, 0);
+  return missing;
+}
+
 function main(argv) {
   const args = parseArgs(argv || process.argv.slice(2));
 
@@ -1422,6 +1466,39 @@ function main(argv) {
   if (args.retrieve) {
     const root = path.resolve(args.root);
     const snapshot = args.name || path.basename(root) || root;
+
+    // ABSTAIN ON AN UNINSTALLED DEPENDENCY TREE (po-av01j.132).
+    //
+    // tsindex resolves client types through the TypeScript compiler, which
+    // reads node_modules. Without it, resolution fails SILENTLY rather than
+    // erroring: the interesting receivers (axios, octokit, a query builder)
+    // come back unresolved and are skipped, so the run reports a small number
+    // of sites and exit 0 -- which reads as "scanned, and this repo is mostly
+    // clean".
+    //
+    // Measured, identical source and tsconfig, only node_modules differing:
+    // 0 sites without, 1 site (axios.AxiosStatic) with. On a real repo the
+    // same effect returned 3 sites from 90 .ts files, and the gate-set
+    // contract already records 1,911 -> 83,927 sites at one fixed commit on a
+    // larger repo. A PARTIAL result that looks complete is worse than none.
+    //
+    // Same charter as rustindex on an unloadable cargo workspace and goindex
+    // with no module: abstain rather than guess. Exit 3 is the helper ABSTAIN
+    // code rvlscan reads (po-av01j.102), so it surfaces as a COVERAGE line.
+    const missing = missingDependencyTrees(root);
+    if (missing.length > 0) {
+      process.stderr.write(
+        `tsindex: ${missing.length} workspace(s) declare dependencies but have no ` +
+          `installed node_modules (${missing.slice(0, 3).join(', ')}` +
+          `${missing.length > 3 ? ', ...' : ''}). TypeScript type resolution reads ` +
+          `node_modules, and without it client receivers resolve to nothing and are ` +
+          `silently skipped -- so tsindex abstains rather than reporting a partial ` +
+          `scan as a complete one. Install dependencies (npm ci / pnpm install ` +
+          `--frozen-lockfile / yarn install --immutable) and re-run.\n`,
+      );
+      return 3;
+    }
+
     const { records, repoConfig } = runRetrieve(root, snapshot, args.files);
     emit(records);
     // One repo-scoped record per run, after the site packets. rvl_core's
