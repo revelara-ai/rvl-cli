@@ -256,6 +256,61 @@ pub struct LaneRetrieval {
     pub sightings: Vec<FormatSighting>,
 }
 
+/// Kubernetes API groups that are NOT DNS subdomains: the historical set that
+/// predates the convention. Every other real group is dotted (`*.k8s.io`, or a
+/// vendor domain like `networking.istio.io`), so these have to be enumerated.
+const CORE_ADJACENT_GROUPS: &[&str] = &["apps", "batch", "autoscaling", "extensions", "policy"];
+
+/// Tools that borrowed Kubernetes' `apiVersion:` + `kind:` convention without
+/// being Kubernetes. Keyed by API group, which is the part that identifies the
+/// tool. Deliberately short: it holds what has actually been OBSERVED, and a
+/// tool nobody has seen is not added on speculation.
+const NON_KUBERNETES_API_GROUPS: &[(&str, &str)] = &[("skaffold", "skaffold")];
+
+/// The value of the first column-0 `apiVersion:` line, unquoted.
+fn api_version_value(head: &str) -> &str {
+    head.lines()
+        .find(|l| l.starts_with("apiVersion:"))
+        .map(|l| {
+            l["apiVersion:".len()..]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+        })
+        .unwrap_or("")
+}
+
+/// A version token: `v1`, `v1beta1`, `v2alpha1`.
+fn is_version_token(v: &str) -> bool {
+    let mut c = v.chars();
+    c.next() == Some('v') && c.next().is_some_and(|d| d.is_ascii_digit())
+}
+
+/// Does this apiVersion name a KUBERNETES group/version?
+///
+/// Either a bare core version (`v1`) or `group/version` where the group is a
+/// DNS subdomain. The dot test alone would reject `apps/v1`, which is why the
+/// historical dotless groups are enumerated above rather than inferred.
+fn is_kubernetes_api_version(v: &str) -> bool {
+    match v.split_once('/') {
+        None => is_version_token(v),
+        Some((group, version)) => {
+            !group.is_empty()
+                && is_version_token(version)
+                && (group.contains('.') || CORE_ADJACENT_GROUPS.contains(&group))
+        }
+    }
+}
+
+/// The tool identity for an apiVersion belonging to a known non-Kubernetes
+/// tool, or None.
+fn non_kubernetes_api_group(v: &str) -> Option<&'static str> {
+    let group = v.split_once('/').map(|(g, _)| g).unwrap_or(v);
+    NON_KUBERNETES_API_GROUPS
+        .iter()
+        .find(|(g, _)| *g == group)
+        .map(|(_, fmt)| *fmt)
+}
+
 /// Classify an unsupported config format by path shape (and, for bare YAML, a
 /// bounded content sniff). Returns the format identity only.
 fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
@@ -309,7 +364,23 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
         }
         let col0 = |k: &str| head.lines().any(|l| l.starts_with(k));
         if col0("apiVersion:") && col0("kind:") {
-            return Some("kubernetes");
+            // apiVersion + kind is NOT enough to call a file Kubernetes. Other
+            // tools borrowed the convention wholesale, and on the dogfood repo
+            // this labelled skaffold.yaml (apiVersion: skaffold/v3) as a
+            // Kubernetes manifest (po-av01j.136). Sightings are the authoring
+            // queue -- prevalence ranks which format to build vocabulary for
+            // next -- so a miscounted identity misdirects real work.
+            let api = api_version_value(head);
+            if let Some(fmt) = non_kubernetes_api_group(api) {
+                return Some(fmt);
+            }
+            if is_kubernetes_api_version(api) {
+                return Some("kubernetes");
+            }
+            // apiVersion/kind-shaped but from a group we cannot name. Falls
+            // through to None, the same as any other unrecognized YAML; naming
+            // it would be inventing an identity the evidence does not support.
+            return None;
         }
         if col0("groups:") && head.contains("expr:") {
             // The literal-YAML variants are claimed by the retriever before
@@ -515,6 +586,38 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_api_version_admits_real_groups_and_rejects_impostors() {
+        // Core group, bare version.
+        for v in ["v1", "v1beta1", "v2alpha1"] {
+            assert!(is_kubernetes_api_version(v), "{v} is a core apiVersion");
+        }
+        // Dotless historical groups. A plain "the group must contain a dot"
+        // rule would reject all of these, which is why they are enumerated.
+        for v in ["apps/v1", "batch/v1", "autoscaling/v2", "policy/v1"] {
+            assert!(is_kubernetes_api_version(v), "{v} is a Kubernetes group");
+        }
+        // Dotted groups: CRDs, cloud vendors, service meshes.
+        for v in [
+            "networking.k8s.io/v1",
+            "networking.istio.io/v1alpha3",
+            "cloud.google.com/v1",
+            "networking.gke.io/v1",
+        ] {
+            assert!(
+                is_kubernetes_api_version(v),
+                "{v} is a Kubernetes CRD group"
+            );
+        }
+        // The impostors. skaffold/v3 is the one observed in the wild.
+        for v in ["skaffold/v3", "skaffold/v4beta6", "tekton/v1", ""] {
+            assert!(
+                !is_kubernetes_api_version(v),
+                "{v} is not a Kubernetes apiVersion"
+            );
+        }
+    }
+
+    #[test]
     fn sight_format_classifies_by_path_and_bounded_sniff() {
         assert_eq!(sight_format(".circleci/config.yml", ""), Some("circleci"));
         assert_eq!(sight_format(".travis.yml", ""), Some("travis-ci"));
@@ -560,6 +663,14 @@ mod tests {
         );
         assert_eq!(sight_format("docs/notes.yaml", "a: b\n"), None);
         assert_eq!(sight_format("src/main.go", ""), None);
+        // po-av01j.136: apiVersion + kind is not enough. skaffold.yaml carries
+        // both and is not a Kubernetes manifest; on the dogfood repo it was
+        // counted as one, and sightings are the authoring queue.
+        assert_eq!(
+            sight_format("skaffold.yaml", "apiVersion: skaffold/v3\nkind: Config\n"),
+            Some("skaffold"),
+            "a tool that borrows the convention sights under its own identity"
+        );
         // Dependency-manifest variants the dep-manifests retriever does not
         // parse yet: identity-only, basename-shaped.
         assert_eq!(sight_format("svc/pom.xml", ""), Some("maven"));
