@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"go/ast"
 	"go/types"
 	"os"
@@ -507,11 +508,15 @@ func constArgs(info *types.Info, call *ast.CallExpr) []ConstArg {
 // runRetrieve builds the index and emits retrieved source per I/O call site.
 var lastRepoConfig RepoConfig
 
-func runRetrieve(root, name string) []RetrievedSite {
+// runRetrieveModule loads ONE module. `moduleDir` is where packages are loaded
+// from; `root` stays the REPO root so every emitted file_path is repo-relative
+// regardless of which module produced it -- downstream (--changed-only, the
+// packet index) keys on repo-relative paths.
+func runRetrieveModule(moduleDir, root, name string) []RetrievedSite {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-		Dir: root, Tests: false,
+		Dir: moduleDir, Tests: false,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
@@ -741,7 +746,7 @@ func runRetrieve(root, name string) []RetrievedSite {
 		return ordered, depth, roots, len(frontier) > 0
 	}
 
-	lastRepoConfig = RepoConfig{Kind: "repo_config", Snapshot: name, Constructions: configFacts}
+	lastRepoConfig = RepoConfig{Kind: "repo_config", Snapshot: name, Constructions: append(lastRepoConfig.Constructions, configFacts...)}
 
 	var out []RetrievedSite
 	for _, p := range pkgs {
@@ -1006,4 +1011,69 @@ func emitRetrieved(sites []RetrievedSite) {
 
 func emitRepoConfig(rc RepoConfig) {
 	_ = json.NewEncoder(os.Stdout).Encode(rc)
+}
+
+// discoverModules returns the module roots to load under `root` (po-av01j.131).
+//
+// goindex used to assume a module lived AT the scan root and load "./..." from
+// there. On a monorepo whose services each carry their own go.mod that finds
+// nothing, and the old code returned an empty stream with exit 0 -- so a scan
+// reported "Go was scanned and is clean" when Go had never been looked at.
+// Measured on two real polyglot repos: 0 sites where four modules existed.
+//
+// A go.mod AT the root means one module and no descent: a single-module repo
+// must not fan out into its vendored copies. Otherwise walk for per-service
+// modules, and do NOT descend into a module once found -- its own nested
+// go.mod files are its dependencies' business, not ours.
+//
+// An empty result is NOT a scan of zero sites. The caller must turn it into an
+// ABSTENTION, the same charter rustindex follows for an unloadable cargo
+// workspace: no heuristic tier, abstain rather than guess.
+func discoverModules(root string) []string {
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+		return []string{root}
+	}
+	var mods []string
+	skip := map[string]bool{
+		"vendor": true, "node_modules": true, ".git": true,
+		"target": true, "dist": true, "build": true,
+	}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if p != root && skip[d.Name()] {
+			return filepath.SkipDir
+		}
+		if _, e := os.Stat(filepath.Join(p, "go.mod")); e == nil {
+			mods = append(mods, p)
+			// Stop here: nested go.mod files below a module are its
+			// dependencies, not additional services to scan.
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return mods
+}
+
+// runRetrieve loads every module under `root` and concatenates their sites
+// (po-av01j.131).
+//
+// Returns the module count alongside the sites so the caller can tell an
+// HONEST ZERO ("modules loaded, no client calls found") from an ABSTENTION
+// ("no module to load"). Collapsing those two is the bug this replaces: the old
+// code returned an empty slice for both and exited 0, so a monorepo scan
+// reported Go as scanned and clean when Go was never looked at.
+func runRetrieve(root, name string) []RetrievedSite {
+	sites, _ := runRetrieveAll(root, name)
+	return sites
+}
+
+func runRetrieveAll(root, name string) ([]RetrievedSite, int) {
+	mods := discoverModules(root)
+	var all []RetrievedSite
+	for _, m := range mods {
+		all = append(all, runRetrieveModule(m, root, name)...)
+	}
+	return all, len(mods)
 }

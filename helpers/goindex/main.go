@@ -523,7 +523,23 @@ func main() {
 		if snap == "" {
 			snap = filepath.Base(abs2)
 		}
-		sites := runRetrieve(abs2, snap)
+		sites, modules := runRetrieveAll(abs2, snap)
+		// ABSTAIN, never a silent zero (po-av01j.131). No module means goindex
+		// had nothing to load, which is a different claim from "loaded the code
+		// and found no client calls". Returning an empty stream with exit 0 for
+		// both made a monorepo scan report Go as scanned and clean when Go was
+		// never looked at. Exit 3 is the helper ABSTAIN code rvlscan reads
+		// (po-av01j.102); rustindex already does this for an unloadable cargo
+		// workspace and this is the same charter: no heuristic tier, abstain
+		// rather than guess.
+		if modules == 0 {
+			fmt.Fprintf(os.Stderr,
+				"goindex: no go.mod under %s, so there is no module to load; goindex abstains "+
+					"rather than reporting an empty scan as a clean one. If this is a monorepo, "+
+					"each service's go.mod is discovered automatically -- none was found here.\n",
+				abs2)
+			os.Exit(3)
+		}
 		if *files != "" {
 			sites = filterToFiles(sites, strings.Split(*files, ","))
 		}
