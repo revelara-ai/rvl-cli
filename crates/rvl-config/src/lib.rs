@@ -230,7 +230,52 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
 pub struct FormatSighting {
     pub format: String,
     pub file_count: usize,
+    /// Whether a retriever for this format EXISTS. Both cases are "no retriever
+    /// claimed these files", and they are very different statements to a reader
+    /// (po-av01j.136 defect 2).
+    ///
+    /// false: nothing here handles the format at all. This is the AUTHORING
+    /// QUEUE, prevalence-ranked -- the number means missing coverage.
+    ///
+    /// true: the format is supported and the retriever declined these
+    /// particular files, normally because they carry nothing any spec asks
+    /// about. A Kubernetes CRD with no containers is the common case, and
+    /// reporting it as an unsupported format made a repo look uncovered when it
+    /// was fully covered -- 109 Gatekeeper policies on one Terraform repo, in a
+    /// run where the same format resolved 288 settings.
+    pub retriever_exists: bool,
 }
+
+impl FormatSighting {
+    /// A sighting emitted BY a retriever: it recognized the file and declined
+    /// it, so a retriever for the format exists by construction. This is the
+    /// one classification that needs no lookup and cannot be wrong.
+    pub fn declined(format: impl Into<String>, file_count: usize) -> Self {
+        Self {
+            format: format.into(),
+            file_count,
+            retriever_exists: true,
+        }
+    }
+}
+
+/// Walk-sighted identities that name a VARIANT of a format a registered
+/// retriever handles, rather than a format nothing handles.
+///
+/// Kept explicit and short because every entry is a claim that something else
+/// in this crate can parse the family, and an entry added on a guess would put
+/// a real coverage gap in the wrong column. Each of these is emitted by
+/// `sight_format` itself, so the set is closed and verifiable by reading it.
+const VARIANTS_OF_SUPPORTED: &[&str] = &[
+    // sight_format's own templated-variant of prometheus-rules, whose literal
+    // form the PrometheusRules retriever claims.
+    "prometheus-rules-templated",
+    // The Kubernetes retriever carries helm and kustomize submodules; a bare
+    // Chart.yaml/kustomization.yaml sighting is one it declined, not a format
+    // with no support.
+    "helm",
+    "kustomize",
+];
 
 /// Directory names never worth descending into (mirrors the code lane).
 const SKIP_DIRS: &[&str] = &[
@@ -423,6 +468,8 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     let mut out = LaneRetrieval::default();
     let mut sightings: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    // Identities a retriever itself declined; see absorb().
+    let mut declined: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Files each retriever claimed, retrieved in ONE batch after the walk so
     // formats whose resolution spans files see their whole claim at once
     // (see [`ConfigRetriever::retrieve_all`]).
@@ -433,11 +480,16 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     fn absorb(
         out: &mut LaneRetrieval,
         sightings: &mut std::collections::BTreeMap<String, usize>,
+        declined: &mut std::collections::BTreeSet<String>,
         got: Retrieved,
     ) {
         out.packets.extend(got.packets);
         out.unparseable_files += got.unparseable;
         for s in got.sightings {
+            // Emitted by a retriever, so the format is handled by construction.
+            // Recorded here because the two sighting sources merge into one map
+            // and provenance cannot be recovered afterwards from the name.
+            declined.insert(s.format.clone());
             *sightings.entry(s.format).or_insert(0) += s.file_count;
         }
     }
@@ -489,12 +541,15 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
                     absorb(
                         &mut out,
                         &mut sightings,
+                        &mut declined,
                         r.retrieve_with_root(root, &rel, &contents, snapshot_id),
                     );
                     continue;
                 }
             }
-            // Unsupported-format sighting.
+            // No retriever claimed this file. Whether that means the format is
+            // unsupported or merely that this file carries nothing to retrieve
+            // is decided once, below, where the registry is in scope.
             if let Some(fmt) = sight_format(&rel, &head) {
                 *sightings.entry(fmt.to_string()).or_insert(0) += 1;
             }
@@ -509,15 +564,28 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         absorb(
             &mut out,
             &mut sightings,
+            &mut declined,
             retrievers[idx].retrieve_all(root, files, snapshot_id),
         );
     }
 
+    // Which sighted identities have a retriever behind them (po-av01j.136
+    // defect 2). Three sources, in decreasing order of certainty: emitted BY a
+    // retriever (recorded above, cannot be wrong), names a registered
+    // format_id exactly, or is a known variant of a registered family.
+    let registered: std::collections::BTreeSet<&str> =
+        retrievers.iter().map(|r| r.format_id()).collect();
     out.sightings = sightings
         .into_iter()
-        .map(|(format, file_count)| FormatSighting {
-            format: format.to_string(),
-            file_count,
+        .map(|(format, file_count)| {
+            let retriever_exists = declined.contains(&format)
+                || registered.contains(format.as_str())
+                || VARIANTS_OF_SUPPORTED.contains(&format.as_str());
+            FormatSighting {
+                format,
+                file_count,
+                retriever_exists,
+            }
         })
         .collect();
     // Deterministic packet order regardless of directory-walk order.
@@ -582,22 +650,29 @@ mod tests {
     }
 
     #[test]
-    fn sighting_serializes_exactly_two_identity_keys() {
-        // The privacy audit: a sighting is the WHOLE record for an
-        // unsupported format. Adding a path/content-bearing field breaks this
+    fn sighting_serializes_only_identity_keys() {
+        // The privacy audit: a sighting is the WHOLE record for a format no
+        // retriever claimed. Adding a path/content-bearing field breaks this
         // test on purpose (same contract as ReportSurface).
-        let s = FormatSighting {
-            format: "terraform".into(),
-            file_count: 3,
-        };
+        //
+        // `retriever_exists` was added by po-av01j.136 and is deliberately
+        // allowed: it is a boolean derived from THIS BINARY's retriever
+        // registry, not from the scanned repo, so it cannot carry a path, a
+        // file name, or any content. Anything carrying repo-derived text still
+        // fails here.
+        let s = FormatSighting::declined("terraform", 3);
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
         let obj = v.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["file_count", "format"],
-            "a sighting must carry ONLY format identity + count"
+            vec!["file_count", "format", "retriever_exists"],
+            "a sighting must carry ONLY format identity, count, and whether we support it"
+        );
+        assert!(
+            obj["retriever_exists"].is_boolean(),
+            "the added field must stay a bare boolean: a string could carry repo text"
         );
     }
 
@@ -743,7 +818,8 @@ mod tests {
             got.sightings,
             vec![FormatSighting {
                 format: "circleci".into(),
-                file_count: 1
+                file_count: 1,
+                retriever_exists: false,
             }],
             "terraform is a supported format now, never a sighting"
         );
@@ -811,7 +887,8 @@ mod tests {
             got.sightings,
             vec![FormatSighting {
                 format: "kubernetes-templated".into(),
-                file_count: 1
+                file_count: 1,
+                retriever_exists: true,
             }]
         );
         assert!(got.packets.is_empty());
@@ -864,7 +941,8 @@ mod tests {
             got.sightings,
             vec![FormatSighting {
                 format: "argo-rollouts".into(),
-                file_count: 1
+                file_count: 1,
+                retriever_exists: false,
             }]
         );
     }
@@ -981,11 +1059,13 @@ mod tests {
             vec![
                 FormatSighting {
                     format: "alertmanager".into(),
-                    file_count: 1
+                    file_count: 1,
+                    retriever_exists: false,
                 },
                 FormatSighting {
                     format: "prometheus-rules-templated".into(),
-                    file_count: 1
+                    file_count: 1,
+                    retriever_exists: true,
                 },
             ]
         );

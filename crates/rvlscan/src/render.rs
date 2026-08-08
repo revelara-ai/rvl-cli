@@ -164,8 +164,10 @@ pub struct ConfigCoverage {
     pub abstain_other: usize,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
-    /// Unsupported-format sightings: (format identity, file count).
-    pub sightings: Vec<(String, usize)>,
+    /// Sightings: (format identity, file count, a retriever for the format
+    /// exists). The last field separates the authoring queue from files a
+    /// supported retriever simply had nothing to take (po-av01j.136).
+    pub sightings: Vec<(String, usize, bool)>,
 }
 
 impl ConfigCoverage {
@@ -342,16 +344,44 @@ pub fn render_ladder(
             );
             let _ = writeln!(o, "{}", paint(&uline, "2", color));
         }
-        if !cc.sightings.is_empty() {
-            // Identity-only telemetry: format id + count, never content.
-            let list: Vec<String> = cc
-                .sightings
-                .iter()
-                .map(|(f, n)| format!("{f} ({n})"))
-                .collect();
+        // Identity-only telemetry: format id + count, never content. Split by
+        // whether a retriever for the format exists, because one line saying
+        // "unsupported" for both was actively misleading (po-av01j.136 defect
+        // 2): it reported 109 Gatekeeper policies as unsupported Kubernetes in
+        // a run where the Kubernetes lane resolved 288 settings.
+        let render_list = |v: &[(String, usize, bool)]| -> String {
+            v.iter()
+                .map(|(f, n, _)| format!("{f} ({n})"))
+                .collect::<Vec<_>>()
+                .join(" \u{00b7} ")
+        };
+        let unsupported: Vec<_> = cc
+            .sightings
+            .iter()
+            .filter(|(_, _, has)| !has)
+            .cloned()
+            .collect();
+        let declined: Vec<_> = cc
+            .sightings
+            .iter()
+            .filter(|(_, _, has)| *has)
+            .cloned()
+            .collect();
+        if !unsupported.is_empty() {
+            // The authoring queue: nothing here reads these formats at all.
             let sline = format!(
                 "  unsupported config formats sighted: {}",
-                list.join(" \u{00b7} ")
+                render_list(&unsupported)
+            );
+            let _ = writeln!(o, "{}", paint(&sline, "2", color));
+        }
+        if !declined.is_empty() {
+            // Supported formats whose retriever declined these particular
+            // files — normally a resource carrying nothing any spec asks
+            // about. NOT a coverage gap, and it must not read as one.
+            let sline = format!(
+                "  supported formats, nothing to retrieve: {}",
+                render_list(&declined)
             );
             let _ = writeln!(o, "{}", paint(&sline, "2", color));
         }

@@ -614,7 +614,7 @@ pub(crate) fn retrieve(
     out.sightings = resolver
         .sightings
         .into_iter()
-        .map(|(format, file_count)| FormatSighting { format, file_count })
+        .map(|(format, file_count)| FormatSighting::declined(format, file_count))
         .collect();
     out
 }
