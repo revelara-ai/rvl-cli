@@ -267,14 +267,30 @@ const CORE_ADJACENT_GROUPS: &[&str] = &["apps", "batch", "autoscaling", "extensi
 /// tool nobody has seen is not added on speculation.
 const NON_KUBERNETES_API_GROUPS: &[(&str, &str)] = &[("skaffold", "skaffold")];
 
-/// The value of the first column-0 `apiVersion:` line, unquoted.
+/// The value of the first column-0 `apiVersion:` line, comment-stripped and
+/// unquoted.
+///
+/// The inline comment matters: real manifests carry them (a licence header on
+/// the apiVersion line is common in Google's Gatekeeper policy corpus, which is
+/// where this was found). Classification happens to survive an unstripped
+/// comment today, because only the group and the first two characters of the
+/// version are ever examined -- that is accidental, and it stops being true the
+/// moment anything compares the whole version string.
 fn api_version_value(head: &str) -> &str {
     head.lines()
         .find(|l| l.starts_with("apiVersion:"))
         .map(|l| {
-            l["apiVersion:".len()..]
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'')
+            let v = &l["apiVersion:".len()..];
+            // A YAML comment opens at a '#' preceded by whitespace (or at the
+            // start), so a '#' inside the value itself is left alone.
+            let v = match v
+                .char_indices()
+                .find(|&(i, c)| c == '#' && (i == 0 || v[..i].ends_with(char::is_whitespace)))
+            {
+                Some((i, _)) => &v[..i],
+                None => v,
+            };
+            v.trim().trim_matches(|c| c == '"' || c == '\'')
         })
         .unwrap_or("")
 }
@@ -583,6 +599,28 @@ mod tests {
             vec!["file_count", "format"],
             "a sighting must carry ONLY format identity + count"
         );
+    }
+
+    #[test]
+    fn api_version_value_strips_inline_comments_and_quotes() {
+        // Found on Google's Gatekeeper policy corpus, where the licence header
+        // sits on the apiVersion line itself.
+        assert_eq!(
+            api_version_value(
+                "apiVersion: constraints.gatekeeper.sh/v1alpha1 # Copyright 2019\nkind: X\n"
+            ),
+            "constraints.gatekeeper.sh/v1alpha1"
+        );
+        assert_eq!(
+            api_version_value("apiVersion: skaffold/v3 # a comment\nkind: Config\n"),
+            "skaffold/v3",
+            "an impostor must stay identifiable through a comment"
+        );
+        assert_eq!(api_version_value("apiVersion: \"v1\"\n"), "v1");
+        assert_eq!(api_version_value("apiVersion: 'apps/v1'\n"), "apps/v1");
+        assert_eq!(api_version_value("kind: Config\n"), "");
+        // A '#' with no leading whitespace is part of the value, not a comment.
+        assert_eq!(api_version_value("apiVersion: we#rd/v1\n"), "we#rd/v1");
     }
 
     #[test]
