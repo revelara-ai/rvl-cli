@@ -776,8 +776,25 @@ const SKIP_DIRS = new Set([
 
 // buildProgram creates a type-checked Program over `root`. If a tsconfig.json
 // is present it is honored (files + compilerOptions); otherwise every non-.d.ts
-// *.ts/*.tsx under root (skipping vendored/build dirs) is a root file with
+// source under root (skipping vendored/build dirs) is a root file with
 // conservative default options.
+//
+// JAVASCRIPT IS INCLUDED (po-av01j.137). It used to be excluded at two layers
+// at once -- discoverSources took only *.ts/*.tsx and allowJs was explicitly
+// false -- so identical code yielded 30 sites named .ts and 0 named .js, with
+// no abstention and exit 0. Express/Node backends without TypeScript were
+// simply invisible.
+//
+// Measured before enabling rather than assumed: on the fixture renamed to .js,
+// 30 sites with 27 of 30 client types RESOLVED (pg.Pool, express.Express,
+// bullmq.Queue, ioredis.Redis). Resolution survives because the client type
+// comes from the DEPENDENCY's type declarations, not from annotations in the
+// file, so untyped JS does not mean unresolved receivers.
+//
+// A tsconfig's own file list is UNIONED with discovered JS rather than
+// replaced: a project may legitimately exclude .js from its build while still
+// shipping .js that makes I/O calls, and this is a reliability scan, not a
+// compile.
 function buildProgram(root) {
   const tsconfigPath = path.join(root, 'tsconfig.json');
   if (fs.existsSync(tsconfigPath)) {
@@ -787,14 +804,21 @@ function buildProgram(root) {
       ts.sys,
       root,
     );
-    const options = Object.assign({}, parsed.options, { noEmit: true });
-    return ts.createProgram({ rootNames: parsed.fileNames, options });
+    const options = Object.assign({}, parsed.options, {
+      noEmit: true,
+      allowJs: true,
+    });
+    const known = new Set(parsed.fileNames);
+    for (const f of discoverSources(root)) {
+      if (!known.has(f)) known.add(f);
+    }
+    return ts.createProgram({ rootNames: Array.from(known), options });
   }
   const options = {
     target: ts.ScriptTarget.ES2020,
     module: ts.ModuleKind.CommonJS,
     moduleResolution: ts.ModuleResolutionKind.NodeJs,
-    allowJs: false,
+    allowJs: true,
     skipLibCheck: true,
     noEmit: true,
     strict: false,
@@ -803,8 +827,8 @@ function buildProgram(root) {
   return ts.createProgram({ rootNames, options });
 }
 
-// discoverSources walks root for *.ts/*.tsx (never *.d.ts), skipping vendored
-// and build dirs, returning absolute paths. Used only when there is no tsconfig.
+// discoverSources walks root for scannable sources (never *.d.ts), skipping
+// vendored and build dirs, returning absolute paths.
 function discoverSources(root) {
   const out = [];
   const stack = [root];
@@ -822,7 +846,9 @@ function discoverSources(root) {
         if (!SKIP_DIRS.has(e.name)) stack.push(full);
       } else if (e.isFile()) {
         if (e.name.endsWith('.d.ts')) continue;
-        if (e.name.endsWith('.ts') || e.name.endsWith('.tsx')) out.push(full);
+        // JavaScript included (po-av01j.137): .js is the majority of the Node
+        // ecosystem, and excluding it made those repos silently unscanned.
+        if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(e.name)) out.push(full);
       }
     }
   }

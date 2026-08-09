@@ -10,6 +10,8 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
 
 const HERE = __dirname;
 const TSINDEX = path.join(HERE, '..', 'tsindex.js');
@@ -533,4 +535,37 @@ test('awaitable client calls are still emitted', () => {
   for (const want of ['pg', 'axios', 'ioredis']) {
     assert.ok(pkgs.has(want), `real client package ${want} must still be retrieved`);
   }
+});
+
+// po-av01j.137: identical code yielded 30 sites named .ts and 0 named .js, with
+// no abstention and exit 0. Express/Node backends without TypeScript were
+// entirely invisible. Client types survive the rename because they come from
+// the DEPENDENCY's type declarations, not from annotations in the file.
+test('plain JavaScript is retrieved, with client types resolved', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-js-'));
+  fs.mkdirSync(path.join(dir, 'node_modules', 'pg'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'node_modules', 'pg', 'package.json'),
+    JSON.stringify({ name: 'pg', version: '8.11.3', types: 'index.d.ts' }),
+  );
+  fs.writeFileSync(
+    path.join(dir, 'node_modules', 'pg', 'index.d.ts'),
+    'export declare class Pool { query(text: string, values?: unknown[]): Promise<unknown>; }\n',
+  );
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: { pg: '^8.11.3' } }));
+  fs.writeFileSync(
+    path.join(dir, 'server.js'),
+    "import { Pool } from 'pg';\nconst p = new Pool({});\nexport async function go() { return await p.query('SELECT 1'); }\n",
+  );
+  const lines = run('--retrieve', '--root', dir, '--name', 'js')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const sites = lines.filter((r) => r.site_key);
+  assert.ok(sites.length >= 1, 'a .js file must produce sites: ' + JSON.stringify(lines));
+  assert.ok(
+    sites.some((s) => s.client_type === 'pg.Pool'),
+    'the client type must still resolve from the dependency types: ' + JSON.stringify(sites.map((s) => s.client_type)),
+  );
 });

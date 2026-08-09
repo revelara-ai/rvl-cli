@@ -775,7 +775,9 @@ fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut rs = root.join("Cargo.toml").is_file();
-    let mut ts = root.join("tsconfig.json").is_file();
+    // package.json counts as a marker too: a Node project without a tsconfig
+    // is the ordinary JavaScript case (po-av01j.137).
+    let mut ts = root.join("tsconfig.json").is_file() || root.join("package.json").is_file();
     let mut cs = has_csharp_marker(root);
     let mut java = root.join("pom.xml").is_file()
         || root.join("build.gradle").is_file()
@@ -851,7 +853,11 @@ fn walk_for_sources(
                     Some("go") => *go = true,
                     Some("py") => *py = true,
                     Some("rs") => *rs = true,
+                    // JavaScript detects the same lane as TypeScript
+                    // (po-av01j.137): tsindex reads both, and excluding .js here
+                    // meant a plain-JS backend was never even offered to it.
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("js" | "jsx" | "mjs" | "cjs") => *ts = true,
                     Some("cs" | "csproj" | "sln") => *cs = true,
                     Some("java") => *java = true,
                     Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
@@ -1264,6 +1270,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("py") => Some(Lang::Python),
         Some("rs") => Some(Lang::Rust),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Lang::TypeScript),
         Some("cs") => Some(Lang::CSharp),
         Some("java") => Some(Lang::Java),
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
@@ -3758,6 +3765,37 @@ mod tests {
     }
 
     #[test]
+    // po-av01j.137. Identical code yielded 30 sites named .ts and 0 named .js,
+    // with no abstention and exit 0, because detection took only .ts/.tsx.
+    // Express/Node backends without TypeScript were entirely invisible.
+    #[test]
+    fn plain_javascript_detects_the_typescript_lane() {
+        for name in ["server.js", "app.jsx", "mod.mjs", "legacy.cjs"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), "const x = 1;\n").unwrap();
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::TypeScript],
+                "{name} must reach the lane that can read it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_project_with_no_tsconfig_still_detects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{\"name\":\"x\"}\n").unwrap();
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    // A declaration file is types-only and still maps to nothing.
+    #[test]
+    fn declaration_files_are_still_not_scannable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("types.d.ts"), "export {};\n").unwrap();
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
     fn detect_typescript_only() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("app.ts"));
