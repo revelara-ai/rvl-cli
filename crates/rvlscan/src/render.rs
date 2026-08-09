@@ -251,6 +251,12 @@ pub struct ConfigCoverage {
     pub total: usize,
     /// No spec for the (format, key) — the factory's authoring lever.
     pub abstain_no_spec: usize,
+    /// The distinct `format key` identities behind `abstain_no_spec`. A count
+    /// alone says the lever exists but not where to pull it: these are keys a
+    /// retriever already emits and no spec judges, so each is a spec authorable
+    /// with no retriever work. Identities only, never values — a key is shape,
+    /// a value is content (po-av01j.133.4).
+    pub no_spec_keys: std::collections::BTreeSet<String>,
     /// The effective value lives outside the repo (org/project setting).
     pub abstain_outside_repo: usize,
     /// Any other undecided outcome (low-confidence spec, unknown pattern).
@@ -464,6 +470,30 @@ pub fn render_ladder(
                 }
                 let aline = format!("  config abstain \u{2014} {}", parts.join(" \u{00b7} "));
                 let _ = writeln!(o, "{}", paint(&aline, "2", color));
+            }
+            // Name the authoring lever instead of only counting it. Capped, but
+            // the remainder is stated: a silent truncation here would read as
+            // "that is the whole queue".
+            if !cc.no_spec_keys.is_empty() {
+                const MAX_SHOWN: usize = 12;
+                let shown: Vec<&str> = cc
+                    .no_spec_keys
+                    .iter()
+                    .take(MAX_SHOWN)
+                    .map(String::as_str)
+                    .collect();
+                let more = cc.no_spec_keys.len().saturating_sub(shown.len());
+                let tail = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                let kline = format!(
+                    "  unjudged keys \u{2014} {}{}",
+                    shown.join(" \u{00b7} "),
+                    tail
+                );
+                let _ = writeln!(o, "{}", paint(&kline, "2", color));
             }
         }
         if cc.unparseable_files > 0 {

@@ -358,6 +358,39 @@ fn hook_ladder_shows_counts_not_named_incidents() {
 // --- config lane coverage ---
 
 #[test]
+fn unjudged_keys_are_named_not_just_counted() {
+    // A count says the authoring lever exists; the names say where to pull it.
+    let cc = ConfigCoverage {
+        resolved: 1,
+        total: 3,
+        abstain_no_spec: 2,
+        no_spec_keys: ["github-actions workflow.concurrency".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+    assert!(
+        out.contains("unjudged keys") && out.contains("github-actions workflow.concurrency"),
+        "the key itself must appear, not only its count: {out}"
+    );
+}
+
+#[test]
+fn unjudged_key_list_states_what_it_dropped() {
+    // Capping is fine; capping silently would read as "that is the whole queue".
+    let cc = ConfigCoverage {
+        resolved: 0,
+        total: 40,
+        abstain_no_spec: 40,
+        no_spec_keys: (0..40).map(|i| format!("fmt key{i:02}")).collect(),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+    assert!(out.contains("+28 more"), "must state the remainder: {out}");
+}
+
+#[test]
 fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
     let cc = ConfigCoverage {
         resolved: 3,
@@ -366,6 +399,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         abstain_outside_repo: 2,
         abstain_other: 0,
         unparseable_files: 1,
+        no_spec_keys: Default::default(),
         sightings: vec![
             ("circleci".to_string(), 1, false),
             ("terraform".to_string(), 4, false),
