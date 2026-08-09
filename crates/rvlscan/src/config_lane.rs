@@ -222,19 +222,21 @@ mod tests {
     // because it genuinely needs the value `Present` never wanted.
     #[test]
     fn a_value_bearing_spec_still_abstains_on_an_out_of_repo_value() {
-        let mut sf = SpecFile::default();
-        sf.config_keys = vec![ConfigKeySpec {
-            format: "github-actions".into(),
-            key: "job.permissions".into(),
-            expect: ConfigExpect::Equals {
-                value: "contents: read".into(),
-            },
-            confidence: 0.9,
-            rationale: String::new(),
-            control: "RC-044".into(),
-            severity: "medium".into(),
-            fix: String::new(),
-        }];
+        let sf = SpecFile {
+            config_keys: vec![ConfigKeySpec {
+                format: "github-actions".into(),
+                key: "job.permissions".into(),
+                expect: ConfigExpect::Equals {
+                    value: "contents: read".into(),
+                },
+                confidence: 0.9,
+                rationale: String::new(),
+                control: "RC-044".into(),
+                severity: "medium".into(),
+                fix: String::new(),
+            }],
+            ..Default::default()
+        };
         let dir = repo_with_workflow("on: push\njobs:\n  a:\n    runs-on: x\n");
         let out = run(dir.path(), &SpecCache::from_file(sf), "snap");
         assert!(

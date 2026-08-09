@@ -4050,7 +4050,6 @@ mod tests {
         assert_eq!(lang_of_path(Path::new("svc/types.d.ts")), None);
     }
 
-    #[test]
     // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
     // independently of ARG_MAX. `--files` joins the whole changed set into one
     // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
@@ -4099,6 +4098,7 @@ mod tests {
         assert_eq!(chunk_files(&huge, MAX_FILES_ARG_BYTES).len(), 1);
     }
 
+    #[test]
     fn helper_argv_appends_files_for_changed_only() {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/goindex"),
