@@ -186,6 +186,62 @@ mod tests {
         );
     }
 
+    // THE INVARIANT rule_phrase EXISTS FOR, pinned. A class is grouped by the
+    // text before the first colon, so any VALUE appearing there fragments one
+    // reader-facing class into one class per distinct value. Introduced by
+    // po-av01j.129's numeric bounds ("workload.replicas = 1 is below the
+    // minimum of 2" has no colon at all) and caught by reading the ladder on a
+    // real repo, not by any test.
+    #[test]
+    fn differing_values_do_not_fragment_one_class() {
+        for (a, b) in [
+            (
+                "below the minimum of 2: workload.replicas = 1",
+                "below the minimum of 2: workload.replicas = 0",
+            ),
+            (
+                "not one of digest, tag: dockerfile.base_image_pin = latest",
+                "not one of digest, tag: dockerfile.base_image_pin = ",
+            ),
+            (
+                "does not match sha40: step.uses.ref = v4",
+                "does not match sha40: step.uses.ref = main",
+            ),
+            (
+                "not equal to false: job.continue-on-error = true",
+                "not equal to false: job.continue-on-error = yes",
+            ),
+        ] {
+            assert_eq!(
+                rule_phrase(a),
+                rule_phrase(b),
+                "two sites of the same rule must share a class"
+            );
+            assert!(
+                !rule_phrase(a).contains('='),
+                "a class phrase must carry no value: {:?}",
+                rule_phrase(a)
+            );
+        }
+    }
+
+    // ...and the phrase must still SAY something. "unexpected value" was fixed
+    // across sites and told the reader nothing; the expectation is equally
+    // fixed and is the useful half.
+    #[test]
+    fn a_class_phrase_names_the_expectation() {
+        for (reason, want) in [
+            ("below the minimum of 2: k = 1", "below the minimum of 2"),
+            (
+                "not one of digest, tag: k = latest",
+                "not one of digest, tag",
+            ),
+            ("does not match sha40: k = v4", "does not match sha40"),
+        ] {
+            assert_eq!(rule_phrase(reason), want);
+        }
+    }
+
     #[test]
     fn judged_severity_surfaces_and_coverage_counts_levers() {
         let dir = repo_with_workflow("on: push\njobs:\n  a:\n    runs-on: x\n");
