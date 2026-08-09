@@ -196,13 +196,52 @@ mod tests {
             .expect("a violating class");
         assert_eq!(f.disposition, "surface");
         assert_eq!(f.severity, "high");
-        // Coverage: timeout resolved (violates IS a conclusion); the other
-        // packets (permissions unresolvable, concurrency/continue-on-error
-        // unspecced) abstain by their levers.
+        // Coverage: timeout resolved (violates IS a conclusion), and since
+        // po-av01j.143 the permissions packet resolves too -- `Present` asks
+        // about authorship, so an unauthored key decides rather than abstaining
+        // on an out-of-repo default it never needed. The unspecced packets
+        // (concurrency, continue-on-error) still abstain by their lever.
         assert!(out.coverage.total >= 4, "coverage: {:?}", out.coverage);
-        assert!(out.coverage.resolved >= 1);
+        assert!(out.coverage.resolved >= 2, "coverage: {:?}", out.coverage);
         assert!(out.coverage.abstain_no_spec >= 2);
-        assert!(out.coverage.abstain_outside_repo >= 1);
+        let perms: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.class_rule == "github-actions.job.permissions")
+            .collect();
+        assert_eq!(
+            perms.len(),
+            1,
+            "an unauthored permissions block is a finding, not an abstention: {:?}",
+            out.findings
+        );
+    }
+
+    // The outside-repo lever still exists and must still be reachable: a
+    // VALUE-BEARING expectation on the same unresolvable packet cannot decide,
+    // because it genuinely needs the value `Present` never wanted.
+    #[test]
+    fn a_value_bearing_spec_still_abstains_on_an_out_of_repo_value() {
+        let mut sf = SpecFile::default();
+        sf.config_keys = vec![ConfigKeySpec {
+            format: "github-actions".into(),
+            key: "job.permissions".into(),
+            expect: ConfigExpect::Equals {
+                value: "contents: read".into(),
+            },
+            confidence: 0.9,
+            rationale: String::new(),
+            control: "RC-044".into(),
+            severity: "medium".into(),
+            fix: String::new(),
+        }];
+        let dir = repo_with_workflow("on: push\njobs:\n  a:\n    runs-on: x\n");
+        let out = run(dir.path(), &SpecCache::from_file(sf), "snap");
+        assert!(
+            out.coverage.abstain_outside_repo >= 1,
+            "coverage: {:?}",
+            out.coverage
+        );
     }
 
     #[test]

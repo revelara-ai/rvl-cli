@@ -893,6 +893,53 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
 /// `--files a,b,c` (repo-relative paths) so the helper emits packets ONLY for
 /// those files, the incremental reload path both goindex and pyindex support.
 /// Pure, so command construction is unit-testable without spawning a process.
+/// The largest `--files` payload one invocation may carry, in bytes.
+///
+/// Linux caps a SINGLE argv entry at MAX_ARG_STRLEN = 32 pages = 128 KiB,
+/// independently of ARG_MAX (2 MiB on a typical box). `--files` joins the whole
+/// changed set into one entry, so the binding limit is the per-argument one and
+/// ARG_MAX is a red herring: on apache/airflow the list is 7690 paths totalling
+/// ~1.46 MB, which fits ARG_MAX with room to spare and exceeds the real limit
+/// eleven times over. The spawn then fails before the helper runs, and because
+/// the incremental path is fail-open the scan reported a degraded result rather
+/// than a crash (po-av01j.141).
+///
+/// 96 KiB, not 128: the payload is one argument among several, and the kernel
+/// also counts the environment against ARG_MAX. The headroom costs one extra
+/// invocation on a very large batch and removes a cliff nobody would diagnose
+/// from the error text.
+const MAX_FILES_ARG_BYTES: usize = 96 * 1024;
+
+/// Split `files` into batches whose comma-joined length stays under
+/// [`MAX_FILES_ARG_BYTES`], so each batch survives exec.
+///
+/// A single path longer than the cap is still emitted, alone, rather than
+/// dropped: losing a file silently is the failure mode this whole epic keeps
+/// finding, and an over-long path fails loudly at exec with the path in the
+/// error instead.
+fn chunk_files(files: &[String], cap: usize) -> Vec<Vec<String>> {
+    if files.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for f in files {
+        // +1 for the comma that will join this entry to the previous one.
+        let add = f.len() + usize::from(!cur.is_empty());
+        if !cur.is_empty() && len + add > cap {
+            out.push(std::mem::take(&mut cur));
+            len = 0;
+        }
+        len += f.len() + usize::from(!cur.is_empty());
+        cur.push(f.clone());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String]) -> Vec<String> {
     let root = root.display().to_string();
     let helper_path = helper.path.display().to_string();
@@ -1022,21 +1069,39 @@ fn run_helper(
     name: &str,
     files: &[String],
 ) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
-    let argv = helper_argv(helper, root, name, files);
-    let (program, args) = argv.split_first().expect("argv always has a program");
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running retriever helper `{program}`"))?;
-    if !output.status.success() {
-        let kind = classify_helper_exit(output.status.code());
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Ok(Err((
-            kind,
-            helper_degrade_reason(kind, &output.status, &stderr),
-        )));
+    // BATCHED so the `--files` payload cannot exceed the per-argument exec
+    // limit (po-av01j.141). A whole-repo changed set on a large repository is
+    // megabytes of paths in one argv entry, and the spawn fails before the
+    // helper runs. Batching keeps the existing helper contract exactly as it
+    // is -- all seven helpers work unchanged -- and bounds peak memory for the
+    // merged stream as a side effect.
+    //
+    // An empty `files` means "the whole tree", which is a DIFFERENT request
+    // from "these zero files", so it must still produce exactly one invocation.
+    let batches = if files.is_empty() {
+        vec![Vec::new()]
+    } else {
+        chunk_files(files, MAX_FILES_ARG_BYTES)
+    };
+    let mut merged = String::new();
+    for batch in &batches {
+        let argv = helper_argv(helper, root, name, batch);
+        let (program, args) = argv.split_first().expect("argv always has a program");
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("running retriever helper `{program}`"))?;
+        if !output.status.success() {
+            let kind = classify_helper_exit(output.status.code());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(Err((
+                kind,
+                helper_degrade_reason(kind, &output.status, &stderr),
+            )));
+        }
+        merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
-    Ok(Ok(String::from_utf8_lossy(&output.stdout).into_owned()))
+    Ok(Ok(merged))
 }
 
 /// A one-line reason for a degradation, for the COVERAGE block.
@@ -3986,6 +4051,54 @@ mod tests {
     }
 
     #[test]
+    // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
+    // independently of ARG_MAX. `--files` joins the whole changed set into one
+    // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
+    // before pyindex ran -- and because the incremental path is fail-open, the
+    // scan reported a degraded result rather than an error anyone would chase.
+    #[test]
+    fn chunk_files_keeps_every_batch_under_the_exec_limit() {
+        // Realistic monorepo path lengths, well past the cap in total.
+        let files: Vec<String> = (0..8000)
+            .map(|i| format!("providers/amazon/tests/unit/aws/module_{i:05}/handler_impl.py"))
+            .collect();
+        let total: usize = files.iter().map(|f| f.len() + 1).sum();
+        assert!(
+            total > MAX_FILES_ARG_BYTES,
+            "the fixture must actually exceed the cap ({total} bytes)"
+        );
+
+        let batches = chunk_files(&files, MAX_FILES_ARG_BYTES);
+        assert!(batches.len() > 1, "an oversized list must be split");
+        for b in &batches {
+            let joined = b.join(",").len();
+            assert!(
+                joined <= MAX_FILES_ARG_BYTES,
+                "batch of {joined} bytes exceeds the cap"
+            );
+        }
+        // NOTHING may be lost or duplicated: a dropped file is a silent
+        // coverage hole, which is the failure this epic keeps finding.
+        let flat: Vec<&String> = batches.iter().flatten().collect();
+        assert_eq!(flat.len(), files.len(), "every file must survive batching");
+        assert!(
+            flat.iter().zip(files.iter()).all(|(a, b)| *a == b),
+            "order and content must be preserved"
+        );
+    }
+
+    #[test]
+    fn chunk_files_handles_the_small_and_empty_cases() {
+        assert!(chunk_files(&[], MAX_FILES_ARG_BYTES).is_empty());
+        let one = vec!["a.go".to_string()];
+        assert_eq!(chunk_files(&one, MAX_FILES_ARG_BYTES), vec![one.clone()]);
+        // A single path longer than the cap is emitted ALONE rather than
+        // dropped: it then fails loudly at exec with the path in the error,
+        // instead of vanishing from the scan.
+        let huge = vec!["x".repeat(MAX_FILES_ARG_BYTES + 10)];
+        assert_eq!(chunk_files(&huge, MAX_FILES_ARG_BYTES).len(), 1);
+    }
+
     fn helper_argv_appends_files_for_changed_only() {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/goindex"),
