@@ -1628,6 +1628,7 @@ fn run_scan(
             start,
             // No language was detected on this path, so nothing could degrade.
             &[],
+            None,
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict)?;
@@ -1660,6 +1661,9 @@ fn run_scan(
         color,
         start,
         &stream.degraded,
+        // Full retrieval: per-language degradation is already carried above,
+        // and there is no partial-pass note to add.
+        None,
     )
 }
 
@@ -1733,6 +1737,12 @@ fn render_scan_output(
     color: Option<&str>,
     start: std::time::Instant,
     degraded: &[LangDegradation],
+    // A whole-pass degradation from the incremental path (po-av01j.139): the
+    // retrieval covered only the reused portion. Threaded into COVERAGE rather
+    // than left on stderr, because when the lane comes back EMPTY the coverage
+    // line is the sentence that decides whether the reader believes there was
+    // nothing to scan or that nothing got scanned.
+    degraded_note: Option<String>,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -1742,6 +1752,7 @@ fn render_scan_output(
     let mut coverage = render::Coverage {
         resolved,
         total: sites.len(),
+        degraded_note,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -2449,6 +2460,7 @@ fn run_scan_incremental(
         color,
         start,
         &scan.lang_degraded,
+        scan.degraded_note.clone(),
     )
 }
 

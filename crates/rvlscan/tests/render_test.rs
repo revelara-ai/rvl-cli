@@ -104,6 +104,7 @@ fn cov() -> Coverage {
         abstain_judge: 0,
         abstain_other: 0,
         degraded: Vec::new(),
+        degraded_note: None,
     }
 }
 
@@ -150,6 +151,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_judge: 0,
         abstain_other: 0,
         degraded: Vec::new(),
+        degraded_note: None,
     };
     let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
@@ -201,6 +203,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -235,6 +238,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -260,6 +264,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -281,6 +286,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -301,6 +307,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -326,6 +333,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         None,
         "0.1s",
@@ -364,6 +372,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             abstain_judge: 0,
             abstain_other: 0,
             degraded: Vec::new(),
+            degraded_note: None,
         },
         Some(&cc),
         "0.1s",
@@ -395,6 +404,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 abstain_judge: 0,
                 abstain_other: 0,
                 degraded: Vec::new(),
+                degraded_note: None,
             },
             cfg,
             "0.1s",
@@ -565,5 +575,54 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
     assert!(
         out.contains("C#") && out.contains("retriever failed"),
         "a degraded language is the REASON G1 can be empty, so it must show: {out}"
+    );
+}
+
+// po-av01j.139, second half. Found on apache/airflow: the incremental pass
+// degraded (pyindex failed on a 7690-file Python repo) and the coverage line
+// still read "no API call sites in scope -- nothing to resolve". There WERE
+// call sites; the retriever never got to them. Printing the two alike is the
+// exact confusion this bead exists to remove, and the first fix reintroduced
+// it in the other direction.
+#[test]
+fn an_empty_lane_after_a_degraded_pass_says_incomplete_not_nothing_to_resolve() {
+    let cov = Coverage {
+        degraded_note: Some("retrieval failed (running retriever helper `python3`)".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("INCOMPLETE") && out.contains("python3"),
+        "an empty lane after a failed retrieval must say it never looked: {out}"
+    );
+    assert!(
+        !out.contains("nothing to resolve"),
+        "'nothing to resolve' is a false claim when retrieval failed: {out}"
+    );
+}
+
+// The truthful case must keep its truthful wording.
+#[test]
+fn an_empty_lane_with_no_degradation_still_reads_as_nothing_to_scan() {
+    let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+    assert!(out.contains("nothing to resolve"), "{out}");
+    assert!(!out.contains("INCOMPLETE"), "{out}");
+}
+
+// A PARTIAL pass must be flagged too: the percentage describes the reused
+// portion, not the repo, and a reader comparing it to a previous run would
+// otherwise read a retrieval failure as a coverage regression.
+#[test]
+fn a_partial_pass_flags_that_coverage_describes_less_than_the_repo() {
+    let cov = Coverage {
+        resolved: 10,
+        total: 12,
+        degraded_note: Some("retrieval failed (helper `python3`)".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("PARTIAL") && out.contains("10/12"),
+        "a partial pass reports its number AND that it is partial: {out}"
     );
 }
