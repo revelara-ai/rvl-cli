@@ -102,6 +102,16 @@ pub struct Coverage {
     pub abstain_judge: usize,
     /// Any other undecided outcome.
     pub abstain_other: usize,
+    /// A whole-pass degradation: the incremental path retrieved only part of
+    /// the tree because a helper failed, so `total` describes the reused
+    /// portion and NOT the repo (po-av01j.139). Distinct from `degraded`
+    /// below, which names individual languages during a full retrieval.
+    ///
+    /// Load-bearing when the lane is EMPTY: "no call sites in scope" and "the
+    /// retriever failed so we never looked" are opposite statements, and the
+    /// first one printed over the second is the exact confusion this bead
+    /// exists to remove.
+    pub degraded_note: Option<String>,
     /// Languages that contributed no packets at all (po-av01j.102). Distinct
     /// from the abstain buckets above, which count SITES the scanner reached
     /// and could not decide. These are languages it never got to look at, so
@@ -292,8 +302,18 @@ pub fn render_ladder(
     // whose commit touched no call site does not read a silent zero as either a
     // pass they did not earn or a failure they did not cause.
     if cov.total == 0 {
-        let line = "  no API call sites in scope \u{2014} nothing to resolve";
-        let _ = writeln!(o, "{}", paint(line, "2", color));
+        // "I found nothing" and "I could not look" must never print alike.
+        match &cov.degraded_note {
+            Some(note) => {
+                let line =
+                    format!("  call-site lane INCOMPLETE \u{2014} no sites were scanned: {note}");
+                let _ = writeln!(o, "{}", paint(&line, "33", color));
+            }
+            None => {
+                let line = "  no API call sites in scope \u{2014} nothing to resolve";
+                let _ = writeln!(o, "{}", paint(line, "2", color));
+            }
+        }
     } else {
         let total = cov.total.max(1);
         let pct = 100 * cov.resolved / total;
@@ -326,6 +346,12 @@ pub fn render_ladder(
     // lane can be empty, so it must be reported precisely when total == 0; and
     // the config and structure lanes have their own findings, which the old
     // abort discarded along with everything else.
+    if cov.total > 0 {
+        if let Some(note) = &cov.degraded_note {
+            let line = format!("  coverage is PARTIAL \u{2014} {note}");
+            let _ = writeln!(o, "{}", paint(&line, "33", color));
+        }
+    }
     o.push_str(&render_coverage_degradations(&cov, color));
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
