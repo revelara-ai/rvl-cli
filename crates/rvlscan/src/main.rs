@@ -474,6 +474,7 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                 // Matched against `.revelara.yaml` waivers; written by suppress.
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -510,6 +511,7 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
                 example_sites: f.evidence.clone(),
                 class_rule,
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -572,6 +574,7 @@ fn server_to_findings(
                 example_sites: f.evidence.clone(),
                 class_rule,
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -2613,7 +2616,24 @@ fn run_scan_incremental(
     structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
     // lane simply re-runs on every warm scan, so it can never be stale.
-    let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    let mut lane = config_lane::run(path, &specs, &snapshot_name(path));
+    if changed_only {
+        // po-av01j.140: SCOPE THE GATE, NOT THE REPORT. A config finding is
+        // usually a repo-wide FACT ("18 of 18 workflows declare permissions"),
+        // and the config lane's whole value is that it sees every file rather
+        // than a sample -- dropping the untouched ones would hide a
+        // misconfiguration until someone happened to edit the file carrying it.
+        // But failing a commit over a workflow the author never opened is the
+        // disproportionality --changed-only exists to remove. So they stay
+        // VISIBLE and become unable to block.
+        for f in &mut lane.findings {
+            let file = f.site.split_whitespace().next().unwrap_or("");
+            let file = file.rsplit_once(':').map_or(file, |(p, _)| p);
+            if !site_is_changed(file, &delta) {
+                f.gate_exempt = true;
+            }
+        }
+    }
     // Hook-mode agent adjudication (po-av01j.15): runs AFTER the deterministic
     // pipeline is fully assembled, under its own consent + budget, over the
     // delta-scoped undecided sites only. Every failure path fails open; the
@@ -4495,6 +4515,7 @@ mod tests {
             example_sites: vec!["src/a.ts:12".into()],
             class_rule: "kysely.SelectQueryBuilder.execute".into(),
             suppressed: false,
+            gate_exempt: false,
         }
     }
 

@@ -114,6 +114,7 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
                 example_sites: c.sites.into_iter().take(3).collect(),
                 class_rule: class_rule(&format, &key),
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect();

@@ -23,6 +23,7 @@ fn f(id_seed: &str, sev: &str, disp: &str, crit: u32) -> Finding {
         example_sites: vec!["a.go:1".into(), "b.go:2".into()],
         class_rule: "pkg.T.M".into(),
         suppressed: false,
+        gate_exempt: false,
     }
 }
 
@@ -717,4 +718,40 @@ fn a_failed_language_is_distinguishable_from_one_that_abstained() {
 fn no_languages_seen_prints_no_roll_call() {
     let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
     assert!(!out.contains("languages:"), "{out}");
+}
+
+// po-av01j.140. Under --changed-only a repo-wide config finding in a file the
+// change never touched stays VISIBLE -- the whole-tree view is what makes the
+// config lane worth having -- but must not fail a commit that did not introduce
+// it. Scope the gate, not the report.
+#[test]
+fn a_gate_exempt_finding_is_shown_but_can_never_block() {
+    let mut f = f("cfg1", "high", "surface", 5); // would otherwise be BLOCKING twice over
+    f.gate_exempt = true;
+    assert_eq!(classify(&f), Section::Advisory);
+    assert_eq!(blocking_count(&[f.clone()]), 0);
+
+    let out = render_ladder(&[f], Coverage::default(), None, "0.1s", false);
+    assert!(
+        out.contains(&finding_id("cfg1")),
+        "an exempt finding must still be reported: {out}"
+    );
+    assert!(out.contains("commit clean"), "{out}");
+}
+
+// The exemption must not resurrect something a waiver suppressed.
+#[test]
+fn gate_exempt_does_not_override_a_waiver() {
+    let mut f = f("cfg2", "high", "surface", 0);
+    f.gate_exempt = true;
+    f.suppressed = true;
+    assert_eq!(classify(&f), Section::Suppressed);
+}
+
+// And a normal finding is untouched: the exemption is opt-in per finding.
+#[test]
+fn a_normal_high_severity_finding_still_blocks() {
+    let f = f("norm", "high", "surface", 0);
+    assert_eq!(classify(&f), Section::Blocking);
+    assert_eq!(blocking_count(&[f]), 1);
 }

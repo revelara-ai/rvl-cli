@@ -603,6 +603,7 @@ pub fn gate_findings(
                 example_sites: Vec::new(),
                 class_rule,
                 suppressed: false,
+                gate_exempt: false,
             })
         })
         .collect()

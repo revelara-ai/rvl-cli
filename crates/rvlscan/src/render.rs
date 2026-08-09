@@ -76,6 +76,14 @@ pub struct Finding {
     /// Set when a `.revelara.yaml` waiver suppresses this finding. Folded into
     /// the Suppressed section like `low_value`, kept out of BLOCKING/ADVISORY.
     pub suppressed: bool,
+    /// VISIBLE BUT NEVER BLOCKING (po-av01j.140). Under `--changed-only`, a
+    /// repo-wide config finding in a file this change did not touch stays in
+    /// the report -- the whole-tree view is what makes the config lane worth
+    /// having -- but must not fail a commit that did not introduce it. That is
+    /// the proportionality `--changed-only` exists for, without discarding the
+    /// information.
+    #[serde(default)]
+    pub gate_exempt: bool,
 }
 
 /// Coverage summary for the coverage section.
@@ -277,6 +285,11 @@ pub fn finding_id(class_key: &str) -> String {
 /// `low_value` is suppressed; anything unjudged is advisory (surfaced, not
 /// blocking — an un-triaged finding must not block a commit).
 pub fn classify(f: &Finding) -> Section {
+    // Gate-exempt findings are shown but can never reach BLOCKING, so the
+    // printed verdict and the exit code stay in agreement (po-av01j.94).
+    if f.gate_exempt && !f.suppressed {
+        return Section::Advisory;
+    }
     if f.suppressed || f.disposition == "low_value" {
         return Section::Suppressed;
     }
