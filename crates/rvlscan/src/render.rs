@@ -285,32 +285,47 @@ pub fn render_ladder(
     }
 
     let _ = writeln!(o, "{}", paint("\u{25a0} COVERAGE", "32", color));
-    let total = cov.total.max(1);
-    let pct = 100 * cov.resolved / total;
-    let cline = format!(
-        "  {}/{} API surfaces resolved ({}%)",
-        cov.resolved, cov.total, pct
-    );
-    let _ = writeln!(o, "{}", paint(&cline, "2", color));
-    // Abstain breakdown, each bucket tied to the lever that closes it.
-    let ab = cov.abstain_total();
-    if ab > 0 {
-        let mut parts: Vec<String> = Vec::new();
-        if cov.abstain_no_spec > 0 {
-            parts.push(format!("{} no spec", cov.abstain_no_spec));
+    // No call sites in scope at all (po-av01j.139). "0/0 API surfaces resolved
+    // (0%)" is arithmetically fine and tells the reader nothing; under
+    // --changed-only this is the ordinary case and the useful statement is that
+    // the scan RAN and had nothing to look at. Said plainly so a developer
+    // whose commit touched no call site does not read a silent zero as either a
+    // pass they did not earn or a failure they did not cause.
+    if cov.total == 0 {
+        let line = "  no API call sites in scope \u{2014} nothing to resolve";
+        let _ = writeln!(o, "{}", paint(line, "2", color));
+    } else {
+        let total = cov.total.max(1);
+        let pct = 100 * cov.resolved / total;
+        let cline = format!(
+            "  {}/{} API surfaces resolved ({}%)",
+            cov.resolved, cov.total, pct
+        );
+        let _ = writeln!(o, "{}", paint(&cline, "2", color));
+        // Abstain breakdown, each bucket tied to the lever that closes it.
+        let ab = cov.abstain_total();
+        if ab > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            if cov.abstain_no_spec > 0 {
+                parts.push(format!("{} no spec", cov.abstain_no_spec));
+            }
+            if cov.abstain_bounds > 0 {
+                parts.push(format!("{} unresolved bounds", cov.abstain_bounds));
+            }
+            if cov.abstain_judge > 0 {
+                parts.push(format!("{} need per-site judge", cov.abstain_judge));
+            }
+            if cov.abstain_other > 0 {
+                parts.push(format!("{} other", cov.abstain_other));
+            }
+            let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
+            let _ = writeln!(o, "{}", paint(&aline, "2", color));
         }
-        if cov.abstain_bounds > 0 {
-            parts.push(format!("{} unresolved bounds", cov.abstain_bounds));
-        }
-        if cov.abstain_judge > 0 {
-            parts.push(format!("{} need per-site judge", cov.abstain_judge));
-        }
-        if cov.abstain_other > 0 {
-            parts.push(format!("{} other", cov.abstain_other));
-        }
-        let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
-        let _ = writeln!(o, "{}", paint(&aline, "2", color));
     }
+    // Outside the branch on purpose. A degraded language is the reason the G1
+    // lane can be empty, so it must be reported precisely when total == 0; and
+    // the config and structure lanes have their own findings, which the old
+    // abort discarded along with everything else.
     o.push_str(&render_coverage_degradations(&cov, color));
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
