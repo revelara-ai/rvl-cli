@@ -1062,6 +1062,12 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
 /// rewords a message.
 const HELPER_EXIT_ABSTAIN: i32 = 3;
 
+/// A helper says its PREREQUISITE is missing: the tool it drives is not
+/// installed (po-av01j.147). Distinct from both an abstention and a failure --
+/// nothing is broken and nothing was declined, the machine simply is not set up
+/// yet, and the fix is an install command rather than a bug report.
+const HELPER_EXIT_PREREQ_MISSING: i32 = 4;
+
 /// Why a language contributed no packets to the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DegradeKind {
@@ -1069,6 +1075,14 @@ enum DegradeKind {
     /// to analyse this tree (rustindex with no cargo workspace) and refuses to
     /// guess. Not an error, and must not be reported as one.
     Abstained,
+    /// The helper, or the toolchain it drives, is NOT INSTALLED
+    /// (po-av01j.147). Reported separately from a failure because the two ask
+    /// for opposite things from the reader: a failure is a defect to report, a
+    /// missing prerequisite is a command to run. Shipping the helper binary is
+    /// necessary and not sufficient -- rustindex ships and still needs a rustup
+    /// component -- so this is the ordinary state on a fresh machine, not an
+    /// edge case.
+    NotInstalled,
     /// The helper crashed, was missing, or exited non-zero for any other
     /// reason. Something is broken.
     Failed,
@@ -1090,6 +1104,7 @@ struct LangDegradation {
 fn classify_helper_exit(code: Option<i32>) -> DegradeKind {
     match code {
         Some(HELPER_EXIT_ABSTAIN) => DegradeKind::Abstained,
+        Some(HELPER_EXIT_PREREQ_MISSING) => DegradeKind::NotInstalled,
         _ => DegradeKind::Failed,
     }
 }
@@ -1109,9 +1124,9 @@ fn retrieval_verdict(
     detected: usize,
     degraded: &[LangDegradation],
     strict: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     if degraded.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let summary = degraded
         .iter()
@@ -1119,17 +1134,40 @@ fn retrieval_verdict(
         .collect::<Vec<_>>()
         .join("; ");
     if detected > 0 && degraded.len() >= detected {
-        anyhow::bail!(
-            "every detected language failed to retrieve, so nothing was scanned: {summary}. \
-             Reporting zero findings here would be a clean bill of health over an empty scan."
+        // TOTAL RETRIEVAL FAILURE IS A DEGRADATION, NOT AN ABORT
+        // (po-av01j.145). It used to bail, which discarded the lanes that need
+        // no retriever at all -- config, secrets and repo structure all walk
+        // the tree themselves. Measured with no helpers installed, the config
+        // lane alone resolves 217 of 320 settings and produces real findings,
+        // and all of it was thrown away because the CALL-SITE lane could not
+        // run.
+        //
+        // The original concern stands and is preserved: reporting zero findings
+        // here would be a clean bill of health over an empty scan. That is why
+        // the summary is returned rather than swallowed -- COVERAGE renders it
+        // as "call-site lane INCOMPLETE" (po-av01j.139) and the reader is told
+        // plainly which languages went unread.
+        //
+        // This is po-av01j.139 one level up: there an EMPTY call-site lane
+        // aborted and took the other lanes with it; here a FAILED one did the
+        // same. The lesson did not generalise because it was applied at one
+        // call site instead of as a principle.
+        anyhow::ensure!(
+            !strict,
+            "--strict: every detected language failed to retrieve, so nothing was scanned: \
+             {summary}. Reporting zero findings here would be a clean bill of health over an \
+             empty scan."
         );
+        return Ok(Some(format!(
+            "every detected language failed to retrieve, so no call site was scanned: {summary}"
+        )));
     }
     anyhow::ensure!(
         !strict,
         "--strict: retrieval degraded for {summary}. Re-run without --strict to scan the \
          remaining languages."
     );
-    Ok(())
+    Ok(None)
 }
 
 /// Run a resolved helper over `root` and return its stdout (the JSONL packet
@@ -1199,6 +1237,9 @@ fn helper_degrade_reason(
         .trim();
     match kind {
         DegradeKind::Abstained => last.to_string(),
+        // No exit status in the message: nothing crashed, and quoting a status
+        // code invites the reader to debug a tool that is simply absent.
+        DegradeKind::NotInstalled => last.to_string(),
         DegradeKind::Failed => format!("{status}: {last}"),
     }
 }
@@ -1308,6 +1349,10 @@ fn site_is_changed(file_path: &str, changed: &std::collections::BTreeSet<String>
 /// A resolved packet stream plus whatever it cost to get one.
 struct RetrievedStream {
     text: String,
+    /// Set when EVERY detected language failed, so the call-site lane is empty
+    /// for a reason the reader must be told (po-av01j.145). Rendered by the
+    /// COVERAGE block, never swallowed.
+    total_failure: Option<String>,
     /// Languages that contributed nothing, and why. Reported in COVERAGE; a
     /// skipped language is never silent.
     degraded: Vec<LangDegradation>,
@@ -1337,6 +1382,7 @@ fn resolve_packet_stream(
             .with_context(|| format!("reading --retrieved {}", p.display()))?;
         return Ok(RetrievedStream {
             text,
+            total_failure: None,
             degraded: Vec::new(),
             // A prebuilt stream says nothing about which helpers ran, so the
             // roll-call stays empty rather than inventing one.
@@ -1361,14 +1407,18 @@ fn resolve_packet_stream(
         let helper = match resolve_helper(lang) {
             Ok(h) => h,
             Err(e) => {
+                // The helper binary itself is absent. That is a missing
+                // prerequisite, not a malfunction (po-av01j.147), and today it
+                // is the NORMAL state: five of the seven helpers are not
+                // shipped at all (po-av01j.144).
                 degraded.push(LangDegradation {
                     lang,
-                    kind: DegradeKind::Failed,
+                    kind: DegradeKind::NotInstalled,
                     reason: format!("{e:#}"),
                 });
                 status.push(render::LangStatus {
                     lang: lang.to_string(),
-                    state: render::LangState::Failed,
+                    state: render::LangState::NotInstalled,
                     detail: format!("{e:#}"),
                 });
                 continue;
@@ -1395,6 +1445,7 @@ fn resolve_packet_stream(
                     lang: lang.to_string(),
                     state: match kind {
                         DegradeKind::Abstained => render::LangState::Abstained,
+                        DegradeKind::NotInstalled => render::LangState::NotInstalled,
                         DegradeKind::Failed => render::LangState::Failed,
                     },
                     detail: reason.clone(),
@@ -1410,9 +1461,10 @@ fn resolve_packet_stream(
             detail: format!("{count} files"),
         });
     }
-    retrieval_verdict(detected, &degraded, strict)?;
+    let total_failure = retrieval_verdict(detected, &degraded, strict)?;
     Ok(RetrievedStream {
         text: combined,
+        total_failure,
         status,
         degraded,
     })
@@ -1844,9 +1896,10 @@ fn run_scan(
         start,
         &stream.degraded,
         stream.status.clone(),
-        // Full retrieval: per-language degradation is already carried above,
-        // and there is no partial-pass note to add.
-        None,
+        // Total retrieval failure (po-av01j.145) renders as "call-site lane
+        // INCOMPLETE" rather than aborting, so the helper-independent lanes
+        // below still report.
+        stream.total_failure.clone(),
     )
 }
 
@@ -1947,6 +2000,7 @@ fn render_scan_output(
             .map(|d| render::DegradedLang {
                 lang: d.lang.to_string(),
                 abstained: d.kind == DegradeKind::Abstained,
+                not_installed: d.kind == DegradeKind::NotInstalled,
                 reason: d.reason.clone(),
             })
             .collect(),
@@ -3621,19 +3675,44 @@ mod tests {
     }
 
     #[test]
-    fn every_language_degrading_is_fatal_even_without_strict() {
-        // The false-pass guard. Degrading to ZERO languages is not degradation,
-        // it is a total failure rendered as "0 findings" — a clean report over
-        // nothing scanned, which is the one outcome that must never be quiet.
+    fn every_language_degrading_is_reported_but_no_longer_aborts() {
+        // The false-pass guard, RESHAPED by po-av01j.145. Degrading to zero
+        // languages must never be quiet -- a clean report over nothing scanned
+        // is the one outcome that must not happen -- but it must also not throw
+        // away the lanes that need no retriever at all. Measured with no
+        // helpers installed, the config lane alone resolves 217 of 320 settings
+        // and produces real findings; the old abort discarded every one.
+        //
+        // So it now returns the summary instead of an error, and COVERAGE
+        // renders it as "call-site lane INCOMPLETE".
         let d = vec![
             degraded(Lang::Rust, DegradeKind::Abstained),
             degraded(Lang::Go, DegradeKind::Failed),
         ];
-        let err = retrieval_verdict(2, &d, false).unwrap_err();
+        let note = retrieval_verdict(2, &d, false)
+            .expect("total failure degrades, it does not abort")
+            .expect("and it must produce a note, never silence");
         assert!(
-            err.to_string().contains("every detected language"),
-            "the message must say nothing was scanned, got: {err}"
+            note.contains("every detected language") && note.contains("Go"),
+            "the note must say nothing was scanned AND name the languages: {note}"
         );
+    }
+
+    #[test]
+    fn strict_still_makes_total_retrieval_failure_fatal() {
+        // --strict is exactly the mode that wants the abort, and it keeps it.
+        let d = vec![degraded(Lang::Go, DegradeKind::Failed)];
+        let err = retrieval_verdict(1, &d, true).unwrap_err();
+        assert!(err.to_string().contains("every detected language"), "{err}");
+    }
+
+    #[test]
+    fn a_healthy_scan_produces_no_note_at_all() {
+        assert!(retrieval_verdict(2, &[], false).unwrap().is_none());
+        // Partial degradation is not total failure: some languages scanned, so
+        // the call-site lane is real and carries no INCOMPLETE banner.
+        let d = vec![degraded(Lang::Go, DegradeKind::Failed)];
+        assert!(retrieval_verdict(3, &d, false).unwrap().is_none());
     }
 
     #[test]
@@ -3654,11 +3733,13 @@ mod tests {
                 render::DegradedLang {
                     lang: "Rust".into(),
                     abstained: true,
+                    not_installed: false,
                     reason: "no cargo workspace".into(),
                 },
                 render::DegradedLang {
                     lang: "Java".into(),
                     abstained: false,
+                    not_installed: false,
                     reason: "exit 2".into(),
                 },
             ],

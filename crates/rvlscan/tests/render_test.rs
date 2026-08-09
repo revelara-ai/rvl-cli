@@ -570,6 +570,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
         degraded: vec![DegradedLang {
             lang: "C#".into(),
             abstained: false,
+            not_installed: false,
             reason: "no csindex helper found".into(),
         }],
         ..Default::default()
@@ -754,4 +755,36 @@ fn a_normal_high_severity_finding_still_blocks() {
     let f = f("norm", "high", "surface", 0);
     assert_eq!(classify(&f), Section::Blocking);
     assert_eq!(blocking_count(&[f]), 1);
+}
+
+// po-av01j.147. A missing helper or toolchain is neither a failure nor an
+// abstention: nothing crashed and nothing was declined, the machine is simply
+// not set up. The two ask opposite things of the reader -- a failure is a
+// defect to report, a missing prerequisite is a command to run -- so they must
+// not render alike. Shipping the binary is necessary and NOT sufficient:
+// rustindex ships and still needs a rustup component.
+#[test]
+fn a_missing_helper_reads_as_not_installed_not_as_a_failure() {
+    let cov = Coverage {
+        lang_status: vec![
+            LangStatus {
+                lang: "Go".into(),
+                state: LangState::NotInstalled,
+                detail: "no goindex helper found".into(),
+            },
+            LangStatus {
+                lang: "Python".into(),
+                state: LangState::Failed,
+                detail: "crashed".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("Go helper not installed"), "{out}");
+    assert!(out.contains("Python FAILED"), "{out}");
+    assert!(
+        !out.contains("Go FAILED"),
+        "an absent tool must not read as a broken one: {out}"
+    );
 }

@@ -153,6 +153,13 @@ impl GroupAcc {
 /// unknown API surfaces. This is exactly what would ever be transmitted.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Report {
+    /// Sites whose client type never resolved, so no spec could ever be keyed
+    /// on them (po-av01j.146). Kept as a COUNT rather than dropped silently:
+    /// it is the signal that retrieval is failing to resolve receivers, and a
+    /// silent drop would hide it. Carries no identity, so the privacy contract
+    /// is unchanged.
+    #[serde(default)]
+    pub unresolved_sites: u32,
     pub scanner_version: String,
     pub surfaces: Vec<ReportSurface>,
 }
@@ -181,17 +188,40 @@ fn is_unknown(reason: &str) -> bool {
 ///
 /// Sorted deterministically: highest `site_count` first, ties broken by
 /// `client_type` then `method`, so the payload (and its audit) is reproducible.
+/// Is this client type UNMINTABLE -- an identity a spec could never be keyed on
+/// (po-av01j.146)?
+///
+/// Measured across five repositories, 15 surfaces and 270 sites carried an
+/// EMPTY client_type or the literal "invalid type": ".post", "invalid
+/// type.Get". These are retrieval artifacts rather than API surfaces. They
+/// cannot be minted -- there is nothing to key a spec on -- they inflate the
+/// queue, and a factory that consumed them would author a spec against an
+/// identity no scan can ever match.
+///
+/// Excluded from the payload and COUNTED instead, because a silent drop would
+/// be the same mistake this epic keeps finding: the number is the signal that
+/// retrieval is failing to resolve receivers.
+fn is_unmintable(client_type: &str) -> bool {
+    let t = client_type.trim();
+    t.is_empty() || t.starts_with("invalid type") || t.starts_with('<')
+}
+
 pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str) -> Report {
     // Accumulate per (client_type, method). BTreeMap keeps assembly
     // deterministic before the final sort.
     let mut groups: std::collections::BTreeMap<(String, String), GroupAcc> =
         std::collections::BTreeMap::new();
+    let mut unresolved_sites: u32 = 0;
     for (f, s) in findings.iter().zip(sites.iter()) {
         if !is_unknown(&f.reason) {
             continue;
         }
         // ONLY the public API identity and its language cross over. Nothing
         // else on the site is read here, so nothing else can leak.
+        if is_unmintable(&s.client_type) {
+            unresolved_sites += 1;
+            continue;
+        }
         let key = (s.client_type.clone(), s.method.clone());
         let acc = groups.entry(key).or_default();
         acc.site_count += 1;
@@ -218,6 +248,7 @@ pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str)
     Report {
         scanner_version: scanner_version.to_string(),
         surfaces,
+        unresolved_sites,
     }
 }
 
@@ -488,5 +519,38 @@ mod tests {
     #[test]
     fn empty_or_all_decided_scan_yields_no_surfaces() {
         assert!(build_report(&[], &[], "1.0.0").surfaces.is_empty());
+    }
+    // po-av01j.146. Measured across five repositories: 15 surfaces and 270
+    // sites carried an empty client_type or the literal "invalid type". They
+    // cannot be minted -- there is nothing to key a spec on -- and a factory
+    // that consumed them would author against an identity no scan can match.
+    #[test]
+    fn unmintable_identities_are_excluded_from_the_payload() {
+        for bad in ["", "   ", "invalid type", "<unknown>"] {
+            assert!(is_unmintable(bad), "{bad:?} must not reach the factory");
+        }
+        for good in ["net/http.Client", "pg.Pool", "tonic::client::grpc::Grpc<T>"] {
+            assert!(!is_unmintable(good), "{good:?} is a real surface");
+        }
+    }
+
+    // Counted, never silently dropped: the number IS the signal that retrieval
+    // is failing to resolve receivers, and hiding it would be the same mistake
+    // this epic keeps finding.
+    #[test]
+    fn excluded_sites_are_counted_rather_than_vanishing() {
+        let sites = vec![
+            unknown_site("", "post"),
+            unknown_site("invalid type", "Get"),
+            unknown_site("net/http.Client", "Do"),
+        ];
+        let findings: Vec<Finding> = sites
+            .iter()
+            .map(|_| finding("no spec for pkg.T.M"))
+            .collect();
+        let r = build_report(&sites, &findings, "test");
+        assert_eq!(r.surfaces.len(), 1, "only the real surface ships");
+        assert_eq!(r.surfaces[0].client_type, "net/http.Client");
+        assert_eq!(r.unresolved_sites, 2, "the rest are counted, not hidden");
     }
 }

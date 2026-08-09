@@ -145,6 +145,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             LangState::Abstained => format!("{} abstained", s.lang),
             LangState::Failed => format!("{} FAILED", s.lang),
             LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
+            LangState::NotInstalled => format!("{} helper not installed", s.lang),
         })
         .collect();
     let mut o = String::new();
@@ -173,6 +174,8 @@ pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
     for d in &cov.degraded {
         let line = if d.abstained {
             format!("  {}: abstained \u{2014} {}", d.lang, d.reason)
+        } else if d.not_installed {
+            format!("  {}: not installed \u{2014} {}", d.lang, d.reason)
         } else {
             format!("  {}: retriever failed \u{2014} {}", d.lang, d.reason)
         };
@@ -209,6 +212,10 @@ pub enum LangState {
     /// Sources are present and nothing here can read them. The third state,
     /// which used to be reported as nothing at all.
     Unsupported,
+    /// The helper, or the toolchain it drives, is not installed
+    /// (po-av01j.147). Asks the reader for an install command, not a bug
+    /// report, so it must not read like a failure.
+    NotInstalled,
 }
 
 /// One language that produced no packets, as rendered to the user.
@@ -219,6 +226,11 @@ pub struct DegradedLang {
     /// rather than folded into `reason` because the two must not read alike:
     /// an abstention is the tool working correctly, a failure is not.
     pub abstained: bool,
+    /// The helper or its toolchain is absent (po-av01j.147). A third flag
+    /// rather than a second meaning for `abstained`, because this line and the
+    /// per-language roll-call must AGREE -- saying "not installed" in one and
+    /// "retriever failed" in the other is worse than either alone.
+    pub not_installed: bool,
     pub reason: String,
 }
 
