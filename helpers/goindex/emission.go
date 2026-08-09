@@ -38,9 +38,30 @@ const siteKindEmission = "emission_point"
 // emissionFramework classifies a callee's PACKAGE into an emission category.
 // The framework list is the candidate extractor (like ioMethods for G1): it
 // decides what gets inventoried, never what a match means.
+// COVERAGE HERE IS A FALSE-POSITIVE SURFACE, not just missing inventory
+// (po-av01j.142). The recover_block swallow fact is "recovers and emits
+// NOTHING RECOGNIZED", so a logger this list does not know turns correct code
+// into a finding: consul logs every recovered panic through
+// hashicorp/go-hclog and was reported as swallowing them. The standard `log`
+// package was missing too, which is the most common logging call in Go.
+// Adding a framework can only ever REMOVE false swallows, never invent a
+// finding.
 func emissionFramework(pkgPath string) (string, bool) {
 	switch {
 	case pkgPath == "log/slog" || strings.HasPrefix(pkgPath, "log/slog/"):
+		return "log", true
+	// The standard library logger. Exact match: HasPrefix("log") would also
+	// swallow log/slog above and any other log/* subpackage.
+	case pkgPath == "log":
+		return "log", true
+	case strings.HasPrefix(pkgPath, "github.com/hashicorp/go-hclog"):
+		return "log", true
+	case strings.HasPrefix(pkgPath, "k8s.io/klog"):
+		return "log", true
+	case strings.HasPrefix(pkgPath, "github.com/go-kit/log"),
+		strings.HasPrefix(pkgPath, "github.com/go-kit/kit/log"):
+		return "log", true
+	case strings.HasPrefix(pkgPath, "github.com/golang/glog"):
 		return "log", true
 	case strings.HasPrefix(pkgPath, "go.uber.org/zap"):
 		return "log", true
@@ -63,6 +84,10 @@ var logEmitMethods = map[string]bool{
 	"Debug": true, "Info": true, "Warn": true, "Error": true,
 	"DPanic": true, "Panic": true, "Fatal": true, "Trace": true,
 	"Print": true, "Printf": true, "Println": true,
+	// The -f / -ln variants the standard library, klog and glog use.
+	"Debugf": true, "Infof": true, "Warnf": true, "Errorf": true,
+	"Fatalf": true, "Fatalln": true, "Panicf": true, "Panicln": true,
+	"Infoln": true, "Errorln": true, "Warning": true, "Warningf": true,
 	"Log": true, "LogAttrs": true,
 	"Msg": true, "Msgf": true, "Send": true,
 	"DebugContext": true, "InfoContext": true, "WarnContext": true,
@@ -159,11 +184,148 @@ func collectEmissions(pkgs []*packages.Package, src *srcIndex, root, snapshot st
 	return out
 }
 
+// namedResults returns the identifiers of a function type's named return
+// values. A function with unnamed results cannot propagate a recovered panic
+// by assignment, only by re-panicking.
+func namedResults(ft *ast.FuncType) map[string]bool {
+	out := map[string]bool{}
+	if ft == nil || ft.Results == nil {
+		return out
+	}
+	for _, f := range ft.Results.List {
+		for _, n := range f.Names {
+			if n.Name != "" && n.Name != "_" {
+				out[n.Name] = true
+			}
+		}
+	}
+	return out
+}
+
+// recoverPropagates reports whether a recovered panic LEAVES the function
+// rather than being discarded (po-av01j.142).
+//
+// WHY THIS EXISTS. The swallow fact used to be "calls recover() and logs
+// nothing", which flags the standard Go idiom for not panicking across an API
+// boundary:
+//
+//	func PatchStruct(...) (result K, e error) {
+//	    defer func() {
+//	        if err := recover(); err != nil {
+//	            e = fmt.Errorf("unexpected panic: %v", err)   // NOT a swallow
+//	        }
+//	    }()
+//
+// The caller receives the error. Nothing is hidden, and nothing needs a log
+// emission to make it visible. Measured on hashicorp/consul, every site the
+// old rule reported was this shape.
+//
+// The vocabulary always knew this for other languages -- catch_clause is "a
+// catch that neither emits NOR RE-THROWS", except_handler is "nor re-raises"
+// -- and Go's equivalent of re-throw is exactly assigning the named result or
+// re-panicking. Only the Go rule omitted it.
+//
+// SCOPED TO THE BLOCK THAT RECOVERS, not the whole function. A function whose
+// normal path assigns `err = doThing()` and whose deferred block discards the
+// panic IS a swallow, and looking at the whole body would wrongly clear it.
+func recoverPropagates(info *types.Info, fd *ast.FuncDecl) bool {
+	// True when `n` is a recover() call: the builtin, not a method named
+	// "recover" on some type.
+	isRecover := func(n ast.Node) bool {
+		c, ok := n.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		id, ok := c.Fun.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		b, ok := info.Uses[id].(*types.Builtin)
+		return ok && b.Name() == "recover"
+	}
+	// True when `n` re-raises, or hands the failure to a named result of the
+	// scope named by `named`.
+	escapes := func(n ast.Node, named map[string]bool) bool {
+		switch s := n.(type) {
+		case *ast.CallExpr:
+			id, ok := s.Fun.(*ast.Ident)
+			if !ok {
+				return false
+			}
+			b, isB := info.Uses[id].(*types.Builtin)
+			return isB && b.Name() == "panic"
+		case *ast.AssignStmt:
+			for _, lhs := range s.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && named[id.Name] {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// SHALLOW: stops at nested function literals, so each literal is judged in
+	// its own scope. A deep walk conflates a deferred block's recover() with an
+	// unrelated normal-path `err = ...` and clears a genuine swallow.
+	scopeHas := func(body ast.Node, named map[string]bool) (recovers, out bool) {
+		first := true
+		ast.Inspect(body, func(n ast.Node) bool {
+			if n == nil {
+				return false
+			}
+			if _, isLit := n.(*ast.FuncLit); isLit && !first {
+				return false // its own scope; handled by the recursion
+			}
+			first = false
+			if isRecover(n) {
+				recovers = true
+			}
+			if escapes(n, named) {
+				out = true
+			}
+			return true
+		})
+		return
+	}
+
+	// Each function scope judges the literals DIRECTLY inside it against its
+	// OWN named results. That is what makes the returned-closure shape work:
+	// in consul's ServerRateLimiterMiddleware the recovering block assigns
+	// `retErr`, a named result of the RETURNED closure, not of the outer
+	// function, so judging it against the outer scope finds nothing.
+	var walk func(body *ast.BlockStmt, named map[string]bool) bool
+	walk = func(body *ast.BlockStmt, named map[string]bool) bool {
+		if body == nil {
+			return false
+		}
+		prop := false
+		ast.Inspect(body, func(n ast.Node) bool {
+			fl, ok := n.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			if r, o := scopeHas(fl.Body, named); r && o {
+				prop = true
+			}
+			if walk(fl.Body, namedResults(fl.Type)) {
+				prop = true
+			}
+			return false
+		})
+		if r, o := scopeHas(body, named); r && o {
+			prop = true
+		}
+		return prop
+	}
+	return walk(fd.Body, namedResults(fd.Type))
+}
+
 // functionEmissions aggregates one function's emission calls, plus the
-// recover_block swallow fact: a function that calls recover() and emits
-// NOTHING recognized is an error path with no capture — the combined
-// mechanical fact RC-027's capture-vs-swallow question needs. A function
-// that recovers AND emits is instrumented, not a swallow.
+// recover_block swallow fact: a function that calls recover(), emits NOTHING
+// recognized, AND does not propagate the recovered panic is an error path with
+// no capture — the combined mechanical fact RC-027's capture-vs-swallow
+// question needs. A function that recovers AND emits is instrumented; one that
+// recovers and RETURNS the failure is propagating, which is not a swallow
+// either (po-av01j.142).
 func functionEmissions(
 	p *packages.Package,
 	info *types.Info,
@@ -233,7 +395,7 @@ func functionEmissions(
 		return true
 	})
 
-	if recoverCount > 0 && !sawEmission {
+	if recoverCount > 0 && !sawEmission && !recoverPropagates(info, fd) {
 		aggs["recover_block\x00error_capture"] = &emissionAgg{
 			file:       rel,
 			line:       recoverLine,
