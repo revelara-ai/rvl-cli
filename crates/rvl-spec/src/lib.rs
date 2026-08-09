@@ -320,6 +320,23 @@ pub enum ConfigExpect {
     /// The resolved value must match the NAMED pattern (e.g. "sha40" = a full
     /// 40-hex-char commit SHA, the action-pinning control).
     Pattern { name: String },
+    /// The resolved value, parsed as a number, must be >= `value`
+    /// (po-av01j.129).
+    ///
+    /// WHY THIS EXISTS RATHER THAN one_of. "replicas >= 2" was previously
+    /// unstatable: `equals("1")` is backwards, since an expectation flags what
+    /// does NOT match and would fire on every correctly-sized workload, and
+    /// `one_of(["2","3",...])` breaks at any count outside the list. Authoring
+    /// the class anyway produced the po-av01j.44 inversion, where a presence
+    /// check on a PodDisruptionBudget PASSED the exact configuration that pins
+    /// disruptionsAllowed at 0 and blocks node drain forever.
+    ///
+    /// A value that does not parse as a number ABSTAINS rather than failing:
+    /// an unresolved template or an unexpected unit is not evidence of a
+    /// violation.
+    AtLeast { value: f64 },
+    /// The resolved value, parsed as a number, must be <= `value`.
+    AtMost { value: f64 },
 }
 
 /// A spec about one config key in one config format — the G6 analog of

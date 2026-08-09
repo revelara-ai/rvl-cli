@@ -156,6 +156,38 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             ),
             Resolution::Unresolvable => unreachable!("handled above"),
         },
+        ConfigExpect::AtLeast { value: want } => match value.trim().parse::<f64>() {
+            Ok(got) if got >= *want => decided(
+                Verdict::Satisfies,
+                format!("{} = {value} meets the minimum of {want}", p.key),
+            ),
+            Ok(got) => decided(
+                Verdict::Violates,
+                format!("{} = {got} is below the minimum of {want}", p.key),
+            ),
+            // Not a number: an unresolved template or an unexpected unit is
+            // not evidence of a violation, so this abstains rather than
+            // failing. Guessing here is how a spec starts flagging correct
+            // configurations.
+            Err(_) => abstain(format!(
+                "{} = {value:?} is not numeric, so a numeric bound cannot be judged",
+                p.key
+            )),
+        },
+        ConfigExpect::AtMost { value: want } => match value.trim().parse::<f64>() {
+            Ok(got) if got <= *want => decided(
+                Verdict::Satisfies,
+                format!("{} = {value} is within the maximum of {want}", p.key),
+            ),
+            Ok(got) => decided(
+                Verdict::Violates,
+                format!("{} = {got} exceeds the maximum of {want}", p.key),
+            ),
+            Err(_) => abstain(format!(
+                "{} = {value:?} is not numeric, so a numeric bound cannot be judged",
+                p.key
+            )),
+        },
         ConfigExpect::Equals { value: want } => {
             if value == want {
                 decided(
@@ -365,6 +397,80 @@ mod tests {
     // An Unresolvable packet that DOES carry an authoring step keeps abstaining
     // even for `Present`: something in the repo set it, and what it resolves to
     // is genuinely unknown.
+    // po-av01j.129. "replicas >= 2" was unstatable: equals("1") is backwards
+    // because an expectation flags what does NOT match, and one_of enumerating
+    // counts breaks outside the list. Authoring the class anyway produced the
+    // po-av01j.44 inversion, where a PodDisruptionBudget presence check PASSED
+    // the configuration that pins disruptionsAllowed at 0 forever.
+    #[test]
+    fn at_least_decides_both_ways_on_a_numeric_value() {
+        let c = cache(
+            "workload.replicas",
+            ConfigExpect::AtLeast { value: 2.0 },
+            0.9,
+        );
+        let ok = evaluate(
+            &packet("workload.replicas", Some("3"), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(ok.verdict, Verdict::Satisfies, "{}", ok.reason);
+        let bad = evaluate(
+            &packet("workload.replicas", Some("1"), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(bad.verdict, Verdict::Violates, "{}", bad.reason);
+        // The boundary is inclusive: exactly the minimum satisfies.
+        let edge = evaluate(
+            &packet("workload.replicas", Some("2"), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(edge.verdict, Verdict::Satisfies, "{}", edge.reason);
+    }
+
+    #[test]
+    fn at_most_decides_both_ways() {
+        let c = cache(
+            "pod.termination-grace",
+            ConfigExpect::AtMost { value: 60.0 },
+            0.9,
+        );
+        assert_eq!(
+            evaluate(
+                &packet("pod.termination-grace", Some("30"), Resolution::AsAuthored),
+                &c
+            )
+            .verdict,
+            Verdict::Satisfies
+        );
+        assert_eq!(
+            evaluate(
+                &packet("pod.termination-grace", Some("120"), Resolution::AsAuthored),
+                &c
+            )
+            .verdict,
+            Verdict::Violates
+        );
+    }
+
+    // A NON-NUMERIC value abstains rather than failing. An unresolved Helm
+    // template or an unexpected unit is not evidence of a violation, and
+    // guessing is how a spec starts flagging correct configurations.
+    #[test]
+    fn a_non_numeric_value_abstains_rather_than_violating() {
+        let c = cache(
+            "workload.replicas",
+            ConfigExpect::AtLeast { value: 2.0 },
+            0.9,
+        );
+        for v in ["{{ .Values.replicas }}", "", "many"] {
+            let f = evaluate(
+                &packet("workload.replicas", Some(v), Resolution::AsAuthored),
+                &c,
+            );
+            assert_eq!(f.verdict, Verdict::Abstain, "{v:?} -> {}", f.reason);
+        }
+    }
+
     #[test]
     fn unresolvable_abstains_no_matter_what_the_spec_expects() {
         let c = cache("job.permissions", ConfigExpect::Present, 0.9);
