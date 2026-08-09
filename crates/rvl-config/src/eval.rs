@@ -163,7 +163,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             ),
             Ok(got) => decided(
                 Verdict::Violates,
-                format!("{} = {got} is below the minimum of {want}", p.key),
+                format!("below the minimum of {want}: {} = {got}", p.key),
             ),
             // Not a number: an unresolved template or an unexpected unit is
             // not evidence of a violation, so this abstains rather than
@@ -181,7 +181,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             ),
             Ok(got) => decided(
                 Verdict::Violates,
-                format!("{} = {got} exceeds the maximum of {want}", p.key),
+                format!("above the maximum of {want}: {} = {got}", p.key),
             ),
             Err(_) => abstain(format!(
                 "{} = {value:?} is not numeric, so a numeric bound cannot be judged",
@@ -197,7 +197,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             } else {
                 decided(
                     Verdict::Violates,
-                    format!("unexpected value: {} = {value}, expected {want}", p.key),
+                    format!("not equal to {want}: {} = {value}", p.key),
                 )
             }
         }
@@ -210,11 +210,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             } else {
                 decided(
                     Verdict::Violates,
-                    format!(
-                        "unexpected value: {} = {value}, expected one of {}",
-                        p.key,
-                        values.join(", ")
-                    ),
+                    format!("not one of {}: {} = {value}", values.join(", "), p.key),
                 )
             }
         }
