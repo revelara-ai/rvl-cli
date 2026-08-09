@@ -37,15 +37,42 @@ impl ConfigRetriever for GithubActions {
     /// repo root — one directory deep, so a vendored or fixture copy under
     /// some other tree never parses as this repo's CI.
     fn matches(&self, rel_path: &str) -> bool {
-        let Some(name) = rel_path.strip_prefix(".github/workflows/") else {
-            return false;
-        };
-        !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"))
+        if let Some(name) = rel_path.strip_prefix(".github/workflows/") {
+            return !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"));
+        }
+        // COMPOSITE ACTION DEFINITIONS (po-av01j round 11). An agent lens found
+        // two unpinned third-party actions in .github/actions/*/action.yaml that
+        // this retriever could not see at all: the workflows/ prefix excluded
+        // every composite action in existence, and those files pull the same
+        // third-party code into the same jobs with the same credentials.
+        //
+        // Matched by BASENAME, which is GitHub's own rule -- an action is
+        // defined by an action.yml at the root of its directory -- so it also
+        // covers a repository that IS an action and defines one at its root.
+        let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        base == "action.yml" || base == "action.yaml"
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         retrieve(rel_path, contents, snapshot_id)
     }
+}
+
+/// Split a `uses:` value into (action, ref), or None when it is not a
+/// third-party reference worth pinning.
+///
+/// Local actions are repo-pinned by construction and docker images are a
+/// different pinning story (digest), both out of family (1). No `@` at all
+/// means entirely unpinned: the ref fact is the empty string, an authored
+/// absence rather than a missing packet.
+fn split_uses(uses: &str) -> Option<(&str, String)> {
+    if uses.starts_with("./") || uses.starts_with("docker://") {
+        return None;
+    }
+    Some(match uses.rsplit_once('@') {
+        Some((a, r)) => (a, r.to_string()),
+        None => (uses, String::new()),
+    })
 }
 
 fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
@@ -58,9 +85,48 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         out.unparseable = 1;
         return out;
     };
+    // A composite action has no `jobs`; its steps live under `runs.steps`. It
+    // is the same supply-chain question in a different shape, so it gets the
+    // same key rather than a parallel one -- a spec should not have to be
+    // authored twice for `uses:` depending on which file it appears in.
+    if get(root, "jobs").is_none() {
+        if let Some(steps) = get(root, "runs")
+            .and_then(Value::as_mapping)
+            .and_then(|r| get(r, "steps"))
+            .and_then(Value::as_sequence)
+        {
+            for (idx, step) in steps.iter().enumerate() {
+                let Some(step) = step.as_mapping() else {
+                    continue;
+                };
+                let Some(uses) = get(step, "uses").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some((action, reference)) = split_uses(uses) else {
+                    continue;
+                };
+                out.packets.push(ConfigPacket {
+                    snapshot_id: snapshot_id.to_string(),
+                    format: "github-actions".to_string(),
+                    file_path: rel_path.to_string(),
+                    line: 0,
+                    unit: format!("step:runs/{idx}"),
+                    key: "step.uses.ref".to_string(),
+                    resolved_value: Some(reference),
+                    resolution: Resolution::AsAuthored,
+                    provenance: vec![ProvenanceStep::new(
+                        rel_path,
+                        &format!("runs.steps[{idx}].uses = {action}"),
+                        "explicit",
+                    )],
+                });
+            }
+            return out;
+        }
+    }
     let Some(jobs) = get(root, "jobs").and_then(Value::as_mapping) else {
-        // Parses as YAML but is not a workflow (no jobs): an unrecognized
-        // workflow file, counted so coverage says the lane saw and skipped it.
+        // Parses as YAML but is neither a workflow nor a composite action:
+        // counted so coverage says the lane saw and skipped it.
         out.unparseable = 1;
         return out;
     };
@@ -205,6 +271,33 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             )),
         }
 
+        // job.uses.ref: a job that CALLS A REUSABLE WORKFLOW has `uses:` at
+        // job level and no steps at all (po-av01j round 11). This was invisible
+        // -- the retriever only ever looked inside `steps` -- and it is the more
+        // dangerous of the two, because a reusable workflow executes with the
+        // CALLING repository's secrets. The instance found by the agent lens
+        // passes a Claude OAuth token and a GitHub App private key to a
+        // workflow pinned to a mutable tag.
+        //
+        // Its own key rather than step.uses.ref: the unit is a job, the
+        // provenance path is different, and a spec may reasonably judge a
+        // reusable workflow more strictly than a step action.
+        if let Some(uses) = get(job, "uses").and_then(Value::as_str) {
+            if let Some((called, reference)) = split_uses(uses) {
+                out.packets.push(packet(
+                    &unit,
+                    "job.uses.ref",
+                    Some(reference),
+                    Resolution::AsAuthored,
+                    vec![ProvenanceStep::new(
+                        rel_path,
+                        &format!("jobs.{job_id}.uses = {called}"),
+                        "explicit",
+                    )],
+                ));
+            }
+        }
+
         // step.uses.ref: the version reference of each external action.
         let steps = get(job, "steps").and_then(Value::as_sequence);
         for (idx, step) in steps.into_iter().flatten().enumerate() {
@@ -214,16 +307,8 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             let Some(uses) = get(step, "uses").and_then(Value::as_str) else {
                 continue;
             };
-            // Local actions are repo-pinned by construction; docker images
-            // are a different pinning story (digest), out of family (1).
-            if uses.starts_with("./") || uses.starts_with("docker://") {
+            let Some((action, reference)) = split_uses(uses) else {
                 continue;
-            }
-            let (action, reference) = match uses.rsplit_once('@') {
-                Some((a, r)) => (a, r.to_string()),
-                // No `@` at all: the action is entirely unpinned; the ref
-                // fact is the empty string, an authored absence.
-                None => (uses, String::new()),
             };
             out.packets.push(packet(
                 &format!("step:{job_id}/{idx}"),
@@ -260,6 +345,70 @@ mod tests {
             .iter()
             .find(|p| p.unit == unit && p.key == key)
             .unwrap_or_else(|| panic!("no packet {unit}:{key} in {:?}", got.packets))
+    }
+
+    // po-av01j round 11, found by the agent-lens diff. Both shapes below were
+    // invisible to this retriever, and both pull third-party code into the same
+    // jobs with the same credentials as a step action.
+    #[test]
+    fn composite_action_definitions_are_claimed_and_their_steps_pinned() {
+        let r = GithubActions;
+        assert!(r.matches(".github/actions/nightly-release/action.yaml"));
+        assert!(r.matches(".github/actions/foo/action.yml"));
+        // A repository that IS an action defines one at its root.
+        assert!(r.matches("action.yml"));
+        // Still not a workflow file in a subdirectory.
+        assert!(!r.matches(".github/workflows/nested/ci.yml"));
+        assert!(!r.matches("docs/action.md"));
+
+        let got = retrieve(
+            ".github/actions/nightly-release/action.yaml",
+            "name: nightly\nruns:\n  using: composite\n  steps:\n    - uses: docker/setup-buildx-action@v3\n    - uses: ./local\n    - run: echo hi\n",
+            "s",
+        );
+        assert_eq!(got.unparseable, 0, "a composite action is not unparseable");
+        let refs: Vec<_> = got
+            .packets
+            .iter()
+            .filter(|p| p.key == "step.uses.ref")
+            .collect();
+        assert_eq!(refs.len(), 1, "one third-party step: {:?}", got.packets);
+        assert_eq!(refs[0].resolved_value.as_deref(), Some("v3"));
+        assert_eq!(refs[0].unit, "step:runs/0");
+    }
+
+    // A reusable-workflow call is the MORE dangerous shape: it runs with the
+    // calling repository's secrets. It has `uses:` at job level and no steps.
+    #[test]
+    fn a_job_calling_a_reusable_workflow_emits_its_ref() {
+        let got = retrieve(
+            ".github/workflows/claude.yml",
+            "on: [push]\njobs:\n  claude:\n    uses: org/repo/.github/workflows/w.yml@v2\n    secrets: inherit\n",
+            "s",
+        );
+        let refs: Vec<_> = got
+            .packets
+            .iter()
+            .filter(|p| p.key == "job.uses.ref")
+            .collect();
+        assert_eq!(refs.len(), 1, "{:?}", got.packets);
+        assert_eq!(refs[0].resolved_value.as_deref(), Some("v2"));
+        assert_eq!(refs[0].unit, "job:claude");
+        // It must NOT be conflated with step.uses.ref: the unit is a job and a
+        // spec may reasonably judge it more strictly.
+        assert!(got.packets.iter().all(|p| p.key != "step.uses.ref"));
+    }
+
+    // An ordinary step-bearing job must be unaffected by the job-level branch.
+    #[test]
+    fn a_normal_job_still_emits_only_step_refs() {
+        let got = retrieve(
+            ".github/workflows/ci.yml",
+            "on: [push]\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n",
+            "s",
+        );
+        assert!(got.packets.iter().any(|p| p.key == "step.uses.ref"));
+        assert!(got.packets.iter().all(|p| p.key != "job.uses.ref"));
     }
 
     #[test]
