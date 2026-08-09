@@ -511,3 +511,59 @@ fn a_category_with_no_sightings_prints_no_line() {
         "{out}"
     );
 }
+
+// po-av01j.139. An empty G1 lane used to abort the whole scan with exit 1,
+// "the scan could not complete". In hook mode that is the ORDINARY case: a
+// commit whose changed files carry no retrievable call site. The scan ran
+// fine; it had nothing to look at, and it must say so rather than either
+// printing a meaningless 0/0 or failing the commit.
+#[test]
+fn an_empty_g1_lane_says_so_instead_of_rendering_a_meaningless_zero() {
+    let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+    assert!(
+        out.contains("no API call sites in scope"),
+        "an empty lane must state it ran and found nothing: {out}"
+    );
+    assert!(
+        !out.contains("0/0 API surfaces resolved"),
+        "a bare 0/0 tells the reader nothing: {out}"
+    );
+    assert!(
+        out.contains("commit clean"),
+        "nothing to scan is a CLEAN result, never a failure: {out}"
+    );
+}
+
+// The other lanes must survive an empty G1 lane. The old abort discarded their
+// findings along with everything else, which is how a config-only change lost
+// its config findings.
+#[test]
+fn config_and_degradation_still_render_when_there_are_no_call_sites() {
+    let cc = ConfigCoverage {
+        resolved: 516,
+        total: 871,
+        abstain_no_spec: 279,
+        ..Default::default()
+    };
+    let cov = Coverage {
+        degraded: vec![DegradedLang {
+            lang: "C#".into(),
+            abstained: false,
+            reason: "no csindex helper found".into(),
+        }],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, Some(&cc), "0.1s", false);
+    assert!(
+        out.contains("no API call sites in scope"),
+        "empty G1 lane still reported: {out}"
+    );
+    assert!(
+        out.contains("config: 516/871 settings resolved"),
+        "the config lane has its own findings and must still render: {out}"
+    );
+    assert!(
+        out.contains("C#") && out.contains("retriever failed"),
+        "a degraded language is the REASON G1 can be empty, so it must show: {out}"
+    );
+}

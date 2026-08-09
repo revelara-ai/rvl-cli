@@ -1334,10 +1334,26 @@ fn findings_from_sites(
         }
     };
 
-    anyhow::ensure!(
-        !sites.is_empty(),
-        "no parseable sites in the retrieved packet stream"
-    );
+    // AN EMPTY SITE SET IS NOT AN ERROR (po-av01j.139). This used to
+    // `ensure!(!sites.is_empty())`, which exits 1 -- "the scan could not
+    // complete" -- and it fires on the NORMAL case in hook mode: a commit whose
+    // changed files carry no retrievable call site. Measured on a real repo,
+    // that is a docs-only commit, a test-only commit, a config change, or any
+    // edit to a file without I/O calls, i.e. most commits. A pre-commit hook
+    // that errors on ordinary work gets uninstalled, and what is lost is not
+    // this run but every future one.
+    //
+    // Nothing is given up by proceeding. A genuine retrieval FAILURE is already
+    // caught upstream by `retrieval_verdict`, which runs before this point and
+    // reports per-language degradation (po-av01j.102); a malformed stream is
+    // already counted as unparseable lines. So by here, empty means "there was
+    // nothing to look at" -- a clean result, and the config and structure lanes
+    // still have their own findings to report, which the old abort discarded
+    // along with everything else.
+    //
+    // This is the epic's recurring confusion inverted: elsewhere absence was
+    // reported as success, here it was reported as failure. Both come from
+    // collapsing "I found nothing" and "I could not look" into one outcome.
     // G2 (po-av01j.3): server-entry records ride the same stream but are
     // judged by their own lane. Partition them out BEFORE propagation so the
     // G1 coverage numbers, the `--out` eval rows, and the shape-only report
