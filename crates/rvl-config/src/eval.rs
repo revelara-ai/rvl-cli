@@ -64,6 +64,20 @@ fn provenance_note(p: &ConfigPacket) -> String {
 }
 
 /// Apply the specs to one packet.
+/// True when NOTHING in the repo authors this key: no provenance step reports a
+/// value being supplied, only absences plus an out-of-repo setting.
+///
+/// This is what lets `Present` decide on an Unresolvable packet without
+/// guessing at the external value: the question is whether the repo authored
+/// anything, and the provenance chain already answers it. An Unresolvable
+/// packet that DOES carry an authoring step (a value set in-repo that still
+/// cannot be resolved) keeps abstaining.
+fn authored_nowhere(p: &ConfigPacket) -> bool {
+    !p.provenance
+        .iter()
+        .any(|s| matches!(s.role.as_str(), "explicit" | "inherited" | "default-block"))
+}
+
 pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
     let id = p.id();
     let abstain = |reason: String| ConfigFinding {
@@ -84,15 +98,6 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
             spec.confidence
         ));
     }
-    // An out-of-repo value is unknowable here regardless of what the spec
-    // expects: judged before the expectation so no variant can guess.
-    if p.resolution == Resolution::Unresolvable {
-        return abstain(format!(
-            "effective value is set outside the repo: {}",
-            provenance_note(p)
-        ));
-    }
-
     let decided = |verdict: Verdict, reason: String| ConfigFinding {
         packet_id: id.clone(),
         verdict,
@@ -101,6 +106,38 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
         severity: spec.severity.clone(),
         fix: spec.fix.clone(),
     };
+
+    // An out-of-repo VALUE is unknowable here, so the value-bearing variants
+    // abstain before the expectation is consulted and none of them can guess.
+    //
+    // `Present` IS THE EXCEPTION, and it is not a special case so much as the
+    // definition of the variant (po-av01j.143). It asks about AUTHORSHIP, not
+    // about the effective value: "an EXPLICIT setting must be present in the
+    // repo ... the control asks for an authored bound, and 'the platform picked
+    // one for you' is the finding". Not knowing the external default is
+    // therefore not an obstacle to deciding -- it IS the finding.
+    //
+    // Without this the ratified github-actions job.permissions spec was INERT.
+    // A workflow with no permissions block at any level resolves to
+    // Unresolvable (the GITHUB_TOKEN default is an org setting the retriever
+    // cannot see, which is honest), so the spec abstained on exactly the case
+    // it exists to catch and had never fired once in six rounds of dogfooding.
+    if p.resolution == Resolution::Unresolvable {
+        if matches!(spec.expect, ConfigExpect::Present) && authored_nowhere(p) {
+            return decided(
+                Verdict::Violates,
+                format!(
+                    "not authored anywhere in the repo; the effective value is an \
+                     out-of-repo default: {}",
+                    provenance_note(p)
+                ),
+            );
+        }
+        return abstain(format!(
+            "effective value is set outside the repo: {}",
+            provenance_note(p)
+        ));
+    }
     let value = p.resolved_value.as_deref().unwrap_or("");
 
     match &spec.expect {
@@ -270,6 +307,64 @@ mod tests {
         assert_eq!(f.verdict, Verdict::Satisfies);
     }
 
+    /// The REAL shape the GitHub Actions retriever emits when neither the job
+    /// nor the workflow authors `permissions`: every in-repo step reports an
+    /// absence, and the effective value lives in an org setting.
+    fn unauthored_unresolvable(key: &str) -> ConfigPacket {
+        let mut p = packet(key, None, Resolution::Unresolvable);
+        p.provenance = vec![
+            ProvenanceStep::new(
+                ".github/workflows/ci.yml",
+                "jobs.build.permissions",
+                "absent",
+            ),
+            ProvenanceStep::new(".github/workflows/ci.yml", "permissions", "absent"),
+            ProvenanceStep::new("", "GITHUB_TOKEN default permissions", "repo-setting"),
+        ];
+        p
+    }
+
+    // po-av01j.143. `Present` asks about AUTHORSHIP, so an out-of-repo default
+    // is not an obstacle to deciding -- it is the finding. Without this the
+    // ratified job.permissions spec was inert: it abstained on precisely the
+    // case it exists to catch and never fired once in six rounds.
+    #[test]
+    fn present_violates_when_the_key_is_authored_nowhere_in_the_repo() {
+        let c = cache("job.permissions", ConfigExpect::Present, 0.9);
+        let f = evaluate(&unauthored_unresolvable("job.permissions"), &c);
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(
+            f.reason.contains("not authored anywhere"),
+            "the reason must say WHY: {}",
+            f.reason
+        );
+    }
+
+    // The value-bearing variants genuinely need a value, so they must keep
+    // abstaining on the identical packet. This is the line between "I can
+    // decide without the value" and "I cannot".
+    #[test]
+    fn value_bearing_expectations_still_abstain_when_unresolvable() {
+        for expect in [
+            ConfigExpect::Equals {
+                value: "read".into(),
+            },
+            ConfigExpect::OneOf {
+                values: vec!["read".into()],
+            },
+            ConfigExpect::Pattern {
+                name: "sha40".into(),
+            },
+        ] {
+            let c = cache("job.permissions", expect, 0.9);
+            let f = evaluate(&unauthored_unresolvable("job.permissions"), &c);
+            assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        }
+    }
+
+    // An Unresolvable packet that DOES carry an authoring step keeps abstaining
+    // even for `Present`: something in the repo set it, and what it resolves to
+    // is genuinely unknown.
     #[test]
     fn unresolvable_abstains_no_matter_what_the_spec_expects() {
         let c = cache("job.permissions", ConfigExpect::Present, 0.9);
