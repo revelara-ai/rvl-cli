@@ -474,6 +474,7 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                 // Matched against `.revelara.yaml` waivers; written by suppress.
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -510,6 +511,7 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
                 example_sites: f.evidence.clone(),
                 class_rule,
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -572,6 +574,7 @@ fn server_to_findings(
                 example_sites: f.evidence.clone(),
                 class_rule,
                 suppressed: false,
+                gate_exempt: false,
             }
         })
         .collect()
@@ -704,11 +707,80 @@ fn has_csharp_marker(root: &Path) -> bool {
 /// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
 /// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
 /// helpers in a deterministic order.
+/// Source extensions rvlscan has NO retriever for, mapped to a display name.
+///
+/// The third state (po-av01j.128): a repository can carry a language nothing
+/// here can read, and before this it was reported as nothing at all --
+/// indistinguishable from a language that was scanned and came back clean. The
+/// list is short and holds only what is unambiguous; an extension shared with
+/// something else would turn a clean report into a false alarm.
+const UNSUPPORTED_SOURCE_EXTS: &[(&str, &str)] = &[
+    ("rb", "Ruby"),
+    ("php", "PHP"),
+    ("ex", "Elixir"),
+    ("exs", "Elixir"),
+    ("scala", "Scala"),
+    ("swift", "Swift"),
+    ("kt", "Kotlin"),
+    ("kts", "Kotlin"),
+    ("dart", "Dart"),
+    ("lua", "Lua"),
+    ("pl", "Perl"),
+    ("erl", "Erlang"),
+    ("hs", "Haskell"),
+    ("clj", "Clojure"),
+];
+
+/// Count files whose extension names a language with no retriever, so the scan
+/// can say "seen, and nothing here reads it" instead of staying silent.
+///
+/// Bounded exactly like `walk_for_sources`: same skip list, and it stops
+/// counting a language at a cap because the number only has to establish
+/// PRESENCE and prevalence, never precision.
+fn detect_unsupported(root: &Path) -> Vec<(String, usize)> {
+    const CAP: usize = 5000;
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some((_, disp)) = UNSUPPORTED_SOURCE_EXTS.iter().find(|(e, _)| *e == ext) {
+                    let c = counts.entry(*disp).or_insert(0);
+                    if *c < CAP {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
     let mut rs = root.join("Cargo.toml").is_file();
-    let mut ts = root.join("tsconfig.json").is_file();
+    // package.json counts as a marker too: a Node project without a tsconfig
+    // is the ordinary JavaScript case (po-av01j.137).
+    let mut ts = root.join("tsconfig.json").is_file() || root.join("package.json").is_file();
     let mut cs = has_csharp_marker(root);
     let mut java = root.join("pom.xml").is_file()
         || root.join("build.gradle").is_file()
@@ -784,7 +856,11 @@ fn walk_for_sources(
                     Some("go") => *go = true,
                     Some("py") => *py = true,
                     Some("rs") => *rs = true,
+                    // JavaScript detects the same lane as TypeScript
+                    // (po-av01j.137): tsindex reads both, and excluding .js here
+                    // meant a plain-JS backend was never even offered to it.
                     Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("js" | "jsx" | "mjs" | "cjs") => *ts = true,
                     Some("cs" | "csproj" | "sln") => *cs = true,
                     Some("java") => *java = true,
                     Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
@@ -893,6 +969,53 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
 /// `--files a,b,c` (repo-relative paths) so the helper emits packets ONLY for
 /// those files, the incremental reload path both goindex and pyindex support.
 /// Pure, so command construction is unit-testable without spawning a process.
+/// The largest `--files` payload one invocation may carry, in bytes.
+///
+/// Linux caps a SINGLE argv entry at MAX_ARG_STRLEN = 32 pages = 128 KiB,
+/// independently of ARG_MAX (2 MiB on a typical box). `--files` joins the whole
+/// changed set into one entry, so the binding limit is the per-argument one and
+/// ARG_MAX is a red herring: on apache/airflow the list is 7690 paths totalling
+/// ~1.46 MB, which fits ARG_MAX with room to spare and exceeds the real limit
+/// eleven times over. The spawn then fails before the helper runs, and because
+/// the incremental path is fail-open the scan reported a degraded result rather
+/// than a crash (po-av01j.141).
+///
+/// 96 KiB, not 128: the payload is one argument among several, and the kernel
+/// also counts the environment against ARG_MAX. The headroom costs one extra
+/// invocation on a very large batch and removes a cliff nobody would diagnose
+/// from the error text.
+const MAX_FILES_ARG_BYTES: usize = 96 * 1024;
+
+/// Split `files` into batches whose comma-joined length stays under
+/// [`MAX_FILES_ARG_BYTES`], so each batch survives exec.
+///
+/// A single path longer than the cap is still emitted, alone, rather than
+/// dropped: losing a file silently is the failure mode this whole epic keeps
+/// finding, and an over-long path fails loudly at exec with the path in the
+/// error instead.
+fn chunk_files(files: &[String], cap: usize) -> Vec<Vec<String>> {
+    if files.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for f in files {
+        // +1 for the comma that will join this entry to the previous one.
+        let add = f.len() + usize::from(!cur.is_empty());
+        if !cur.is_empty() && len + add > cap {
+            out.push(std::mem::take(&mut cur));
+            len = 0;
+        }
+        len += f.len() + usize::from(!cur.is_empty());
+        cur.push(f.clone());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String]) -> Vec<String> {
     let root = root.display().to_string();
     let helper_path = helper.path.display().to_string();
@@ -1022,21 +1145,39 @@ fn run_helper(
     name: &str,
     files: &[String],
 ) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
-    let argv = helper_argv(helper, root, name, files);
-    let (program, args) = argv.split_first().expect("argv always has a program");
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running retriever helper `{program}`"))?;
-    if !output.status.success() {
-        let kind = classify_helper_exit(output.status.code());
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Ok(Err((
-            kind,
-            helper_degrade_reason(kind, &output.status, &stderr),
-        )));
+    // BATCHED so the `--files` payload cannot exceed the per-argument exec
+    // limit (po-av01j.141). A whole-repo changed set on a large repository is
+    // megabytes of paths in one argv entry, and the spawn fails before the
+    // helper runs. Batching keeps the existing helper contract exactly as it
+    // is -- all seven helpers work unchanged -- and bounds peak memory for the
+    // merged stream as a side effect.
+    //
+    // An empty `files` means "the whole tree", which is a DIFFERENT request
+    // from "these zero files", so it must still produce exactly one invocation.
+    let batches = if files.is_empty() {
+        vec![Vec::new()]
+    } else {
+        chunk_files(files, MAX_FILES_ARG_BYTES)
+    };
+    let mut merged = String::new();
+    for batch in &batches {
+        let argv = helper_argv(helper, root, name, batch);
+        let (program, args) = argv.split_first().expect("argv always has a program");
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("running retriever helper `{program}`"))?;
+        if !output.status.success() {
+            let kind = classify_helper_exit(output.status.code());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(Err((
+                kind,
+                helper_degrade_reason(kind, &output.status, &stderr),
+            )));
+        }
+        merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
-    Ok(Ok(String::from_utf8_lossy(&output.stdout).into_owned()))
+    Ok(Ok(merged))
 }
 
 /// A one-line reason for a degradation, for the COVERAGE block.
@@ -1132,6 +1273,7 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("py") => Some(Lang::Python),
         Some("rs") => Some(Lang::Rust),
         Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Lang::TypeScript),
         Some("cs") => Some(Lang::CSharp),
         Some("java") => Some(Lang::Java),
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
@@ -1169,6 +1311,9 @@ struct RetrievedStream {
     /// Languages that contributed nothing, and why. Reported in COVERAGE; a
     /// skipped language is never silent.
     degraded: Vec<LangDegradation>,
+    /// EVERY language seen and what happened to it, including the ones that
+    /// ran cleanly and the ones nothing here can read (po-av01j.128 / .132).
+    status: Vec<render::LangStatus>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -1193,6 +1338,9 @@ fn resolve_packet_stream(
         return Ok(RetrievedStream {
             text,
             degraded: Vec::new(),
+            // A prebuilt stream says nothing about which helpers ran, so the
+            // roll-call stays empty rather than inventing one.
+            status: Vec::new(),
         });
     }
     let langs = detect_languages(path);
@@ -1205,6 +1353,7 @@ fn resolve_packet_stream(
     let detected = langs.len();
     let mut combined = String::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
+    let mut status: Vec<render::LangStatus> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -1217,22 +1366,54 @@ fn resolve_packet_stream(
                     kind: DegradeKind::Failed,
                     reason: format!("{e:#}"),
                 });
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::Failed,
+                    detail: format!("{e:#}"),
+                });
                 continue;
             }
         };
         match run_helper(&helper, path, &name, &[])? {
             Ok(out) => {
+                // A ZERO here is a real answer, not an absence: the helper ran
+                // and found nothing. Counting site packets rather than lines
+                // keeps repo_config/retrieval_stats records out of the number.
+                let sites = out.matches("\"site_key\"").count();
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::Scanned,
+                    detail: sites.to_string(),
+                });
                 if !combined.is_empty() && !combined.ends_with('\n') {
                     combined.push('\n');
                 }
                 combined.push_str(&out);
             }
-            Err((kind, reason)) => degraded.push(LangDegradation { lang, kind, reason }),
+            Err((kind, reason)) => {
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: match kind {
+                        DegradeKind::Abstained => render::LangState::Abstained,
+                        DegradeKind::Failed => render::LangState::Failed,
+                    },
+                    detail: reason.clone(),
+                });
+                degraded.push(LangDegradation { lang, kind, reason })
+            }
         }
+    }
+    for (name, count) in detect_unsupported(path) {
+        status.push(render::LangStatus {
+            lang: name,
+            state: render::LangState::Unsupported,
+            detail: format!("{count} files"),
+        });
     }
     retrieval_verdict(detected, &degraded, strict)?;
     Ok(RetrievedStream {
         text: combined,
+        status,
         degraded,
     })
 }
@@ -1628,6 +1809,7 @@ fn run_scan(
             start,
             // No language was detected on this path, so nothing could degrade.
             &[],
+            Vec::new(),
             None,
         );
     }
@@ -1661,6 +1843,7 @@ fn run_scan(
         color,
         start,
         &stream.degraded,
+        stream.status.clone(),
         // Full retrieval: per-language degradation is already carried above,
         // and there is no partial-pass note to add.
         None,
@@ -1737,6 +1920,8 @@ fn render_scan_output(
     color: Option<&str>,
     start: std::time::Instant,
     degraded: &[LangDegradation],
+    // Every language seen and what happened to it (po-av01j.128 / .132).
+    lang_status: Vec<render::LangStatus>,
     // A whole-pass degradation from the incremental path (po-av01j.139): the
     // retrieval covered only the reused portion. Threaded into COVERAGE rather
     // than left on stderr, because when the lane comes back EMPTY the coverage
@@ -1753,6 +1938,7 @@ fn render_scan_output(
         resolved,
         total: sites.len(),
         degraded_note,
+        lang_status,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -2430,7 +2616,24 @@ fn run_scan_incremental(
     structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
     // lane simply re-runs on every warm scan, so it can never be stale.
-    let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    let mut lane = config_lane::run(path, &specs, &snapshot_name(path));
+    if changed_only {
+        // po-av01j.140: SCOPE THE GATE, NOT THE REPORT. A config finding is
+        // usually a repo-wide FACT ("18 of 18 workflows declare permissions"),
+        // and the config lane's whole value is that it sees every file rather
+        // than a sample -- dropping the untouched ones would hide a
+        // misconfiguration until someone happened to edit the file carrying it.
+        // But failing a commit over a workflow the author never opened is the
+        // disproportionality --changed-only exists to remove. So they stay
+        // VISIBLE and become unable to block.
+        for f in &mut lane.findings {
+            let file = f.site.split_whitespace().next().unwrap_or("");
+            let file = file.rsplit_once(':').map_or(file, |(p, _)| p);
+            if !site_is_changed(file, &delta) {
+                f.gate_exempt = true;
+            }
+        }
+    }
     // Hook-mode agent adjudication (po-av01j.15): runs AFTER the deterministic
     // pipeline is fully assembled, under its own consent + budget, over the
     // delta-scoped undecided sites only. Every failure path fails open; the
@@ -2460,6 +2663,9 @@ fn run_scan_incremental(
         color,
         start,
         &scan.lang_degraded,
+        // The incremental path reuses an index rather than running every
+        // helper, so it has no roll-call to report.
+        Vec::new(),
         scan.degraded_note.clone(),
     )
 }
@@ -3578,6 +3784,37 @@ mod tests {
         assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::Python]);
     }
 
+    // po-av01j.137. Identical code yielded 30 sites named .ts and 0 named .js,
+    // with no abstention and exit 0, because detection took only .ts/.tsx.
+    // Express/Node backends without TypeScript were entirely invisible.
+    #[test]
+    fn plain_javascript_detects_the_typescript_lane() {
+        for name in ["server.js", "app.jsx", "mod.mjs", "legacy.cjs"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), "const x = 1;\n").unwrap();
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::TypeScript],
+                "{name} must reach the lane that can read it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_project_with_no_tsconfig_still_detects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{\"name\":\"x\"}\n").unwrap();
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    // A declaration file is types-only and still maps to nothing.
+    #[test]
+    fn declaration_files_are_still_not_scannable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("types.d.ts"), "export {};\n").unwrap();
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
     #[test]
     fn detect_typescript_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -3985,6 +4222,54 @@ mod tests {
         assert_eq!(lang_of_path(Path::new("svc/types.d.ts")), None);
     }
 
+    // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
+    // independently of ARG_MAX. `--files` joins the whole changed set into one
+    // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
+    // before pyindex ran -- and because the incremental path is fail-open, the
+    // scan reported a degraded result rather than an error anyone would chase.
+    #[test]
+    fn chunk_files_keeps_every_batch_under_the_exec_limit() {
+        // Realistic monorepo path lengths, well past the cap in total.
+        let files: Vec<String> = (0..8000)
+            .map(|i| format!("providers/amazon/tests/unit/aws/module_{i:05}/handler_impl.py"))
+            .collect();
+        let total: usize = files.iter().map(|f| f.len() + 1).sum();
+        assert!(
+            total > MAX_FILES_ARG_BYTES,
+            "the fixture must actually exceed the cap ({total} bytes)"
+        );
+
+        let batches = chunk_files(&files, MAX_FILES_ARG_BYTES);
+        assert!(batches.len() > 1, "an oversized list must be split");
+        for b in &batches {
+            let joined = b.join(",").len();
+            assert!(
+                joined <= MAX_FILES_ARG_BYTES,
+                "batch of {joined} bytes exceeds the cap"
+            );
+        }
+        // NOTHING may be lost or duplicated: a dropped file is a silent
+        // coverage hole, which is the failure this epic keeps finding.
+        let flat: Vec<&String> = batches.iter().flatten().collect();
+        assert_eq!(flat.len(), files.len(), "every file must survive batching");
+        assert!(
+            flat.iter().zip(files.iter()).all(|(a, b)| *a == b),
+            "order and content must be preserved"
+        );
+    }
+
+    #[test]
+    fn chunk_files_handles_the_small_and_empty_cases() {
+        assert!(chunk_files(&[], MAX_FILES_ARG_BYTES).is_empty());
+        let one = vec!["a.go".to_string()];
+        assert_eq!(chunk_files(&one, MAX_FILES_ARG_BYTES), vec![one.clone()]);
+        // A single path longer than the cap is emitted ALONE rather than
+        // dropped: it then fails loudly at exec with the path in the error,
+        // instead of vanishing from the scan.
+        let huge = vec!["x".repeat(MAX_FILES_ARG_BYTES + 10)];
+        assert_eq!(chunk_files(&huge, MAX_FILES_ARG_BYTES).len(), 1);
+    }
+
     #[test]
     fn helper_argv_appends_files_for_changed_only() {
         let helper = ResolvedHelper {
@@ -4230,6 +4515,7 @@ mod tests {
             example_sites: vec!["src/a.ts:12".into()],
             class_rule: "kysely.SelectQueryBuilder.execute".into(),
             suppressed: false,
+            gate_exempt: false,
         }
     }
 
