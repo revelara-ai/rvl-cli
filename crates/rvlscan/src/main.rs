@@ -3764,7 +3764,6 @@ mod tests {
         assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::Python]);
     }
 
-    #[test]
     // po-av01j.137. Identical code yielded 30 sites named .ts and 0 named .js,
     // with no abstention and exit 0, because detection took only .ts/.tsx.
     // Express/Node backends without TypeScript were entirely invisible.
@@ -3796,6 +3795,7 @@ mod tests {
         assert!(detect_languages(dir.path()).is_empty());
     }
 
+    #[test]
     fn detect_typescript_only() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("app.ts"));
