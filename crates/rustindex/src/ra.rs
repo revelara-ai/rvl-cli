@@ -61,10 +61,13 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
             );
             p
         }
-        None => find_on_path("rust-analyzer").context(
-            "no rust-analyzer found: set RVLSCAN_RUST_ANALYZER to the binary, or install the \
-             rustup component (`rustup component add rust-analyzer`)",
-        )?,
+        None => find_on_path("rust-analyzer").ok_or_else(|| {
+            anyhow::Error::new(MissingPrereq(
+                "no rust-analyzer found: set RVLSCAN_RUST_ANALYZER to the binary, or install \
+                 the rustup component (`rustup component add rust-analyzer`)"
+                    .to_string(),
+            ))
+        })?,
     };
 
     let out = Command::new(&path)
@@ -125,6 +128,23 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
 /// distinction survives the process boundary (po-av01j.102).
 #[derive(Debug)]
 pub struct Abstain(pub String);
+
+/// A PREREQUISITE is missing: the tool rustindex drives is not installed
+/// (po-av01j.147). Distinct from an abstention -- there is nothing wrong with
+/// the tree, the machine simply is not set up -- and distinct from a failure,
+/// because the fix is an install command rather than a bug report. Shipping
+/// rustindex is necessary and not sufficient: it needs rust-analyzer, a rustup
+/// component that is not installed by default.
+#[derive(Debug)]
+pub struct MissingPrereq(pub String);
+
+impl std::fmt::Display for MissingPrereq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for MissingPrereq {}
 
 impl std::fmt::Display for Abstain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

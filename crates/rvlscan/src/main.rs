@@ -1062,6 +1062,12 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
 /// rewords a message.
 const HELPER_EXIT_ABSTAIN: i32 = 3;
 
+/// A helper says its PREREQUISITE is missing: the tool it drives is not
+/// installed (po-av01j.147). Distinct from both an abstention and a failure --
+/// nothing is broken and nothing was declined, the machine simply is not set up
+/// yet, and the fix is an install command rather than a bug report.
+const HELPER_EXIT_PREREQ_MISSING: i32 = 4;
+
 /// Why a language contributed no packets to the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DegradeKind {
@@ -1069,6 +1075,14 @@ enum DegradeKind {
     /// to analyse this tree (rustindex with no cargo workspace) and refuses to
     /// guess. Not an error, and must not be reported as one.
     Abstained,
+    /// The helper, or the toolchain it drives, is NOT INSTALLED
+    /// (po-av01j.147). Reported separately from a failure because the two ask
+    /// for opposite things from the reader: a failure is a defect to report, a
+    /// missing prerequisite is a command to run. Shipping the helper binary is
+    /// necessary and not sufficient -- rustindex ships and still needs a rustup
+    /// component -- so this is the ordinary state on a fresh machine, not an
+    /// edge case.
+    NotInstalled,
     /// The helper crashed, was missing, or exited non-zero for any other
     /// reason. Something is broken.
     Failed,
@@ -1090,6 +1104,7 @@ struct LangDegradation {
 fn classify_helper_exit(code: Option<i32>) -> DegradeKind {
     match code {
         Some(HELPER_EXIT_ABSTAIN) => DegradeKind::Abstained,
+        Some(HELPER_EXIT_PREREQ_MISSING) => DegradeKind::NotInstalled,
         _ => DegradeKind::Failed,
     }
 }
@@ -1222,6 +1237,9 @@ fn helper_degrade_reason(
         .trim();
     match kind {
         DegradeKind::Abstained => last.to_string(),
+        // No exit status in the message: nothing crashed, and quoting a status
+        // code invites the reader to debug a tool that is simply absent.
+        DegradeKind::NotInstalled => last.to_string(),
         DegradeKind::Failed => format!("{status}: {last}"),
     }
 }
@@ -1389,14 +1407,18 @@ fn resolve_packet_stream(
         let helper = match resolve_helper(lang) {
             Ok(h) => h,
             Err(e) => {
+                // The helper binary itself is absent. That is a missing
+                // prerequisite, not a malfunction (po-av01j.147), and today it
+                // is the NORMAL state: five of the seven helpers are not
+                // shipped at all (po-av01j.144).
                 degraded.push(LangDegradation {
                     lang,
-                    kind: DegradeKind::Failed,
+                    kind: DegradeKind::NotInstalled,
                     reason: format!("{e:#}"),
                 });
                 status.push(render::LangStatus {
                     lang: lang.to_string(),
-                    state: render::LangState::Failed,
+                    state: render::LangState::NotInstalled,
                     detail: format!("{e:#}"),
                 });
                 continue;
@@ -1423,6 +1445,7 @@ fn resolve_packet_stream(
                     lang: lang.to_string(),
                     state: match kind {
                         DegradeKind::Abstained => render::LangState::Abstained,
+                        DegradeKind::NotInstalled => render::LangState::NotInstalled,
                         DegradeKind::Failed => render::LangState::Failed,
                     },
                     detail: reason.clone(),
@@ -1977,6 +2000,7 @@ fn render_scan_output(
             .map(|d| render::DegradedLang {
                 lang: d.lang.to_string(),
                 abstained: d.kind == DegradeKind::Abstained,
+                not_installed: d.kind == DegradeKind::NotInstalled,
                 reason: d.reason.clone(),
             })
             .collect(),
@@ -3709,11 +3733,13 @@ mod tests {
                 render::DegradedLang {
                     lang: "Rust".into(),
                     abstained: true,
+                    not_installed: false,
                     reason: "no cargo workspace".into(),
                 },
                 render::DegradedLang {
                     lang: "Java".into(),
                     abstained: false,
+                    not_installed: false,
                     reason: "exit 2".into(),
                 },
             ],

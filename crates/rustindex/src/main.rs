@@ -17,11 +17,18 @@ use anyhow::Context;
 /// 2 stays the generic failure code, so the two are never confused.
 const EXIT_ABSTAIN: i32 = 3;
 
+/// Must agree with `HELPER_EXIT_PREREQ_MISSING` in rvlscan (po-av01j.147): the
+/// toolchain this helper drives is not installed. rvlscan renders it as
+/// "helper not installed" with the install hint, rather than as a failure.
+const EXIT_PREREQ_MISSING: i32 = 4;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("rustindex: {e:#}");
         let code = if e.downcast_ref::<rustindex::ra::Abstain>().is_some() {
             EXIT_ABSTAIN
+        } else if e.downcast_ref::<rustindex::ra::MissingPrereq>().is_some() {
+            EXIT_PREREQ_MISSING
         } else {
             2
         };
