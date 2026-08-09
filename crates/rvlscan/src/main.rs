@@ -905,6 +905,22 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|cand| cand.is_file())
 }
 
+/// The deliberate escape hatch for a repo that knowingly cannot install a
+/// helper (po-av01j.148). Without one the rule is unusable on a mixed monorepo
+/// where one language's toolchain is genuinely unavailable, and an unusable
+/// rule gets disabled wholesale rather than scoped.
+///
+/// An ENV var rather than a silent default: the operator has to say it out
+/// loud, and it shows up in the command that ran.
+fn allow_missing_helpers() -> bool {
+    matches!(
+        std::env::var("RVLSCAN_ALLOW_MISSING_HELPERS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
@@ -1390,11 +1406,69 @@ fn resolve_packet_stream(
         });
     }
     let langs = detect_languages(path);
-    anyhow::ensure!(
-        !langs.is_empty(),
-        "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
-        path.display()
-    );
+    // NO DETECTED LANGUAGE IS NOT AN ERROR (po-av01j.148). A repository of pure
+    // infrastructure -- terraform, workflows, manifests and nothing else -- has
+    // no source for any retriever to read, so NO helper is needed and there is
+    // nothing to fail about. The config, secret and structure lanes read the
+    // tree directly and were measured producing real findings on exactly such
+    // trees.
+    //
+    // This is the same principle as po-av01j.145 at a third location: a lane's
+    // absence may not silence a lane that did not depend on it. Erroring here
+    // made a pure-IaC repo unscannable, which is a shape the product will meet
+    // constantly.
+    if langs.is_empty() {
+        return Ok(RetrievedStream {
+            text: String::new(),
+            total_failure: None,
+            status: detect_unsupported(path)
+                .into_iter()
+                .map(|(name, count)| render::LangStatus {
+                    lang: name,
+                    state: render::LangState::Unsupported,
+                    detail: format!("{count} files"),
+                })
+                .collect(),
+            degraded: Vec::new(),
+        });
+    }
+    // DISCOVERY PROBE (po-av01j.148). Resolve every detected language's helper
+    // BEFORE running any of them, so a missing retriever is a preflight
+    // statement naming ALL of them at once rather than a mid-scan surprise that
+    // reports the first and hides the rest. A developer on a polyglot repo
+    // should get one list and one install step, not N runs.
+    //
+    // The decision this implements: do not bundle the helpers, probe for them
+    // and error out when one is needed and absent. Carrying the helpers buys
+    // convenience and costs a permanent cross-compile and toolchain surface;
+    // the tool does not need to CARRY them, it needs to be honest about
+    // whether it found them.
+    let missing: Vec<(Lang, String)> = langs
+        .iter()
+        .filter_map(|&l| match resolve_helper(l) {
+            Ok(_) => None,
+            Err(e) => Some((l, format!("{e:#}"))),
+        })
+        .collect();
+    if !missing.is_empty() && !allow_missing_helpers() {
+        // A GATE THAT CANNOT READ A LANGUAGE THE REPO CONTAINS MUST NOT PASS.
+        // Reporting "commit clean" here would be a clean bill of health over a
+        // language nobody looked at -- the exact failure this epic has found
+        // repeatedly. Failing loudly with an install command is recoverable in
+        // seconds; a silent pass is never noticed at all.
+        let list = missing
+            .iter()
+            .map(|(l, why)| format!("  {l}: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "no retriever for {} of the {} language(s) in this repo, so it cannot be scanned \
+             honestly:\n{list}\n\nInstall the helper(s) above, or set \
+             RVLSCAN_ALLOW_MISSING_HELPERS=1 to scan the remaining lanes deliberately.",
+            missing.len(),
+            langs.len()
+        );
+    }
     let name = snapshot_name(path);
     let detected = langs.len();
     let mut combined = String::new();
@@ -4555,6 +4629,56 @@ mod tests {
         assert_eq!(
             classify_helper(Lang::Go, Path::new("/x/goindex")).kind,
             HelperKind::Executable
+        );
+    }
+
+    // po-av01j.148. Decided: do not bundle the helpers, probe for them and
+    // error out when one is NEEDED and absent. A gate that cannot read a
+    // language the repo contains must not report "commit clean" -- that is a
+    // clean bill of health over a language nobody looked at, the failure this
+    // epic has found repeatedly.
+    #[test]
+    fn the_escape_hatch_is_explicit_and_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
+        assert!(!allow_missing_helpers(), "silence must NOT permit a gap");
+        for v in ["1", "true"] {
+            std::env::set_var("RVLSCAN_ALLOW_MISSING_HELPERS", v);
+            assert!(allow_missing_helpers(), "{v} should opt in");
+        }
+        // Anything else is not consent: a typo must fail closed, not open.
+        for v in ["0", "false", "yes", ""] {
+            std::env::set_var("RVLSCAN_ALLOW_MISSING_HELPERS", v);
+            assert!(!allow_missing_helpers(), "{v:?} must not opt in");
+        }
+        std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
+    }
+
+    // A repository of pure infrastructure needs NO helper, so there is nothing
+    // to error about. This used to bail with "no supported source files",
+    // making a terraform- or workflows-only repo unscannable -- a shape the
+    // product meets constantly, and the same principle as po-av01j.145 at a
+    // third location.
+    #[test]
+    fn a_repo_with_no_source_still_scans_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("a.yml"),
+            "on: [push]\njobs:\n  b:\n    runs-on: x\n",
+        )
+        .unwrap();
+        assert!(
+            detect_languages(dir.path()).is_empty(),
+            "the fixture must genuinely have no source"
+        );
+        let stream = resolve_packet_stream(None, dir.path(), false)
+            .expect("no language is not an error: nothing was needed");
+        assert!(stream.text.is_empty());
+        assert!(
+            stream.total_failure.is_none(),
+            "nothing failed -- there was nothing to run"
         );
     }
 

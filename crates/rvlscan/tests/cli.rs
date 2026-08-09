@@ -250,7 +250,45 @@ fn scan_without_retrieved_runs_the_go_helper() {
 /// With no `--retrieved` and no source under the target, the scan fails closed
 /// with guidance toward the escape hatch.
 #[test]
-fn scan_without_retrieved_on_empty_dir_fails_with_guidance() {
+fn scan_errors_with_guidance_when_a_needed_retriever_is_absent() {
+    // po-av01j.148, the decided rule: do not bundle the helpers, probe for them
+    // and error out when one is NEEDED and absent. A gate that cannot read a
+    // language the repo contains must not pass -- reporting "commit clean"
+    // there is a clean bill of health over a language nobody looked at.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("gorepo");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("go.mod"), "module x\n\ngo 1.22\n").unwrap();
+    std::fs::write(target.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&target)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env_remove("RVLSCAN_GOINDEX")
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        !out.status.success(),
+        "a missing needed retriever must fail"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no retriever for") && stderr.contains("Go"),
+        "the error must name the language: {stderr}"
+    );
+    assert!(
+        stderr.contains("RVLSCAN_ALLOW_MISSING_HELPERS"),
+        "and it must name the deliberate escape hatch: {stderr}"
+    );
+}
+
+#[test]
+fn an_empty_dir_no_longer_fails_for_having_no_source() {
+    // Nothing is NEEDED here, so there is nothing to error about. A repository
+    // of pure infrastructure is the real case this unblocks; an empty directory
+    // is its degenerate form. Whatever else this run does, it must not fail
+    // because no language was detected.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("empty");
     std::fs::create_dir_all(&target).unwrap();
@@ -260,11 +298,10 @@ fn scan_without_retrieved_on_empty_dir_fails_with_guidance() {
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvlscan");
-    assert!(!out.status.success(), "no sources must fail the scan");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("no supported source files") && stderr.contains("--retrieved"),
-        "error must name the escape hatch: {stderr}"
+        !stderr.contains("no supported source files"),
+        "absence of source is not an error when no helper was needed: {stderr}"
     );
 }
 
