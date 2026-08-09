@@ -105,6 +105,7 @@ fn cov() -> Coverage {
         abstain_other: 0,
         degraded: Vec::new(),
         degraded_note: None,
+        lang_status: Vec::new(),
     }
 }
 
@@ -152,6 +153,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_other: 0,
         degraded: Vec::new(),
         degraded_note: None,
+        lang_status: Vec::new(),
     };
     let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
@@ -204,6 +206,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -239,6 +242,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -265,6 +269,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -287,6 +292,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -308,6 +314,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -334,6 +341,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         None,
         "0.1s",
@@ -373,6 +381,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             abstain_other: 0,
             degraded: Vec::new(),
             degraded_note: None,
+            lang_status: Vec::new(),
         },
         Some(&cc),
         "0.1s",
@@ -405,6 +414,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 abstain_other: 0,
                 degraded: Vec::new(),
                 degraded_note: None,
+                lang_status: Vec::new(),
             },
             cfg,
             "0.1s",
@@ -625,4 +635,86 @@ fn a_partial_pass_flags_that_coverage_describes_less_than_the_repo() {
         out.contains("PARTIAL") && out.contains("10/12"),
         "a partial pass reports its number AND that it is partial: {out}"
     );
+}
+
+// po-av01j.128 / po-av01j.132. Silence must never be ambiguous. Before this, a
+// language that ran and found nothing, one whose helper declined, and one
+// nothing here can read all produced the same output: none. On a Rust repo with
+// four C files, cindex parsed all four and correctly found no I/O, and the
+// report mentioned C nowhere.
+#[test]
+fn every_language_seen_is_named_including_the_ones_that_found_nothing() {
+    let cov = Coverage {
+        resolved: 100,
+        total: 200,
+        lang_status: vec![
+            LangStatus {
+                lang: "Rust".into(),
+                state: LangState::Scanned,
+                detail: "853".into(),
+            },
+            // The case that used to vanish: ran, looked, found nothing.
+            LangStatus {
+                lang: "C/C++".into(),
+                state: LangState::Scanned,
+                detail: "0".into(),
+            },
+            LangStatus {
+                lang: "TypeScript".into(),
+                state: LangState::Abstained,
+                detail: "no installed node_modules".into(),
+            },
+            LangStatus {
+                lang: "Ruby".into(),
+                state: LangState::Unsupported,
+                detail: "412 files".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("Rust 853 sites"), "{out}");
+    assert!(
+        out.contains("C/C++ 0 sites"),
+        "a clean zero must be VISIBLE, not silent: {out}"
+    );
+    assert!(out.contains("TypeScript abstained"), "{out}");
+    assert!(
+        out.contains("Ruby not supported (412 files)"),
+        "the third state must be reported: {out}"
+    );
+}
+
+#[test]
+fn a_failed_language_is_distinguishable_from_one_that_abstained() {
+    let cov = Coverage {
+        lang_status: vec![
+            LangStatus {
+                lang: "Python".into(),
+                state: LangState::Failed,
+                detail: "helper missing".into(),
+            },
+            LangStatus {
+                lang: "Go".into(),
+                state: LangState::Abstained,
+                detail: "no modules".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("Python FAILED"), "{out}");
+    assert!(out.contains("Go abstained"), "{out}");
+    assert!(
+        !out.contains("Go FAILED") && !out.contains("Python abstained"),
+        "an abstention is the tool working; a failure is not: {out}"
+    );
+}
+
+// Nothing seen means no line at all: an empty roll-call heading reads as a
+// finding of its own.
+#[test]
+fn no_languages_seen_prints_no_roll_call() {
+    let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+    assert!(!out.contains("languages:"), "{out}");
 }

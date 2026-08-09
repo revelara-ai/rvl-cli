@@ -117,6 +117,39 @@ pub struct Coverage {
     /// and could not decide. These are languages it never got to look at, so
     /// the resolved/total ratio says nothing about them.
     pub degraded: Vec<DegradedLang>,
+    /// Per-language outcome for every language SEEN, including the ones that
+    /// ran cleanly and the ones nothing can read (po-av01j.128 / .132).
+    pub lang_status: Vec<LangStatus>,
+}
+
+/// The one-line per-language roll-call. Rendered whenever anything was seen, so
+/// a lane that ran is visibly a lane that ran.
+pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
+    use std::fmt::Write as _;
+    if cov.lang_status.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = cov
+        .lang_status
+        .iter()
+        .map(|s| match s.state {
+            LangState::Scanned => format!("{} {} sites", s.lang, s.detail),
+            LangState::Abstained => format!("{} abstained", s.lang),
+            LangState::Failed => format!("{} FAILED", s.lang),
+            LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
+        })
+        .collect();
+    let mut o = String::new();
+    // Yellow when anything failed: a failure changes what the numbers above it
+    // mean, an abstention or an unsupported language does not.
+    let any_failed = cov.lang_status.iter().any(|s| s.state == LangState::Failed);
+    let line = format!("  languages: {}", parts.join(" \u{00b7} "));
+    let _ = writeln!(
+        o,
+        "{}",
+        paint(&line, if any_failed { "33" } else { "2" }, color)
+    );
+    o
 }
 
 /// The COVERAGE lines naming languages that contributed no packets
@@ -138,6 +171,36 @@ pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
         let _ = writeln!(o, "{}", paint(&line, "33", color));
     }
     o
+}
+
+/// What happened to one language in this scan, as rendered to the user.
+///
+/// The point is that SILENCE IS NEVER AMBIGUOUS (po-av01j.128 / po-av01j.132).
+/// Before this, a language that ran and found nothing, a language whose helper
+/// declined, and a language nothing here can read all produced the same output:
+/// none. On a Rust repo with four C files, cindex parsed all four, found no I/O
+/// correctly, and the report mentioned C nowhere -- a reader could not tell it
+/// had been looked at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LangStatus {
+    pub lang: String,
+    pub state: LangState,
+    /// Site count for Scanned; the reason for the others.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LangState {
+    /// The helper ran to completion. `detail` carries the packet count, which
+    /// may legitimately be zero.
+    Scanned,
+    /// The helper ran and declined, with a reason. Working as intended.
+    Abstained,
+    /// The helper could not run or errored. NOT working as intended.
+    Failed,
+    /// Sources are present and nothing here can read them. The third state,
+    /// which used to be reported as nothing at all.
+    Unsupported,
 }
 
 /// One language that produced no packets, as rendered to the user.
@@ -352,6 +415,7 @@ pub fn render_ladder(
             let _ = writeln!(o, "{}", paint(&line, "33", color));
         }
     }
+    o.push_str(&render_lang_status(&cov, color));
     o.push_str(&render_coverage_degradations(&cov, color));
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {

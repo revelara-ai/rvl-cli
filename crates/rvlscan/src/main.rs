@@ -704,6 +704,73 @@ fn has_csharp_marker(root: &Path) -> bool {
 /// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
 /// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
 /// helpers in a deterministic order.
+/// Source extensions rvlscan has NO retriever for, mapped to a display name.
+///
+/// The third state (po-av01j.128): a repository can carry a language nothing
+/// here can read, and before this it was reported as nothing at all --
+/// indistinguishable from a language that was scanned and came back clean. The
+/// list is short and holds only what is unambiguous; an extension shared with
+/// something else would turn a clean report into a false alarm.
+const UNSUPPORTED_SOURCE_EXTS: &[(&str, &str)] = &[
+    ("rb", "Ruby"),
+    ("php", "PHP"),
+    ("ex", "Elixir"),
+    ("exs", "Elixir"),
+    ("scala", "Scala"),
+    ("swift", "Swift"),
+    ("kt", "Kotlin"),
+    ("kts", "Kotlin"),
+    ("dart", "Dart"),
+    ("lua", "Lua"),
+    ("pl", "Perl"),
+    ("erl", "Erlang"),
+    ("hs", "Haskell"),
+    ("clj", "Clojure"),
+];
+
+/// Count files whose extension names a language with no retriever, so the scan
+/// can say "seen, and nothing here reads it" instead of staying silent.
+///
+/// Bounded exactly like `walk_for_sources`: same skip list, and it stops
+/// counting a language at a cap because the number only has to establish
+/// PRESENCE and prevalence, never precision.
+fn detect_unsupported(root: &Path) -> Vec<(String, usize)> {
+    const CAP: usize = 5000;
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some((_, disp)) = UNSUPPORTED_SOURCE_EXTS.iter().find(|(e, _)| *e == ext) {
+                    let c = counts.entry(*disp).or_insert(0);
+                    if *c < CAP {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
 fn detect_languages(root: &Path) -> Vec<Lang> {
     let mut go = root.join("go.mod").is_file();
     let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
@@ -1234,6 +1301,9 @@ struct RetrievedStream {
     /// Languages that contributed nothing, and why. Reported in COVERAGE; a
     /// skipped language is never silent.
     degraded: Vec<LangDegradation>,
+    /// EVERY language seen and what happened to it, including the ones that
+    /// ran cleanly and the ones nothing here can read (po-av01j.128 / .132).
+    status: Vec<render::LangStatus>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -1258,6 +1328,9 @@ fn resolve_packet_stream(
         return Ok(RetrievedStream {
             text,
             degraded: Vec::new(),
+            // A prebuilt stream says nothing about which helpers ran, so the
+            // roll-call stays empty rather than inventing one.
+            status: Vec::new(),
         });
     }
     let langs = detect_languages(path);
@@ -1270,6 +1343,7 @@ fn resolve_packet_stream(
     let detected = langs.len();
     let mut combined = String::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
+    let mut status: Vec<render::LangStatus> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -1282,22 +1356,54 @@ fn resolve_packet_stream(
                     kind: DegradeKind::Failed,
                     reason: format!("{e:#}"),
                 });
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::Failed,
+                    detail: format!("{e:#}"),
+                });
                 continue;
             }
         };
         match run_helper(&helper, path, &name, &[])? {
             Ok(out) => {
+                // A ZERO here is a real answer, not an absence: the helper ran
+                // and found nothing. Counting site packets rather than lines
+                // keeps repo_config/retrieval_stats records out of the number.
+                let sites = out.matches("\"site_key\"").count();
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::Scanned,
+                    detail: sites.to_string(),
+                });
                 if !combined.is_empty() && !combined.ends_with('\n') {
                     combined.push('\n');
                 }
                 combined.push_str(&out);
             }
-            Err((kind, reason)) => degraded.push(LangDegradation { lang, kind, reason }),
+            Err((kind, reason)) => {
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: match kind {
+                        DegradeKind::Abstained => render::LangState::Abstained,
+                        DegradeKind::Failed => render::LangState::Failed,
+                    },
+                    detail: reason.clone(),
+                });
+                degraded.push(LangDegradation { lang, kind, reason })
+            }
         }
+    }
+    for (name, count) in detect_unsupported(path) {
+        status.push(render::LangStatus {
+            lang: name,
+            state: render::LangState::Unsupported,
+            detail: format!("{count} files"),
+        });
     }
     retrieval_verdict(detected, &degraded, strict)?;
     Ok(RetrievedStream {
         text: combined,
+        status,
         degraded,
     })
 }
@@ -1693,6 +1799,7 @@ fn run_scan(
             start,
             // No language was detected on this path, so nothing could degrade.
             &[],
+            Vec::new(),
             None,
         );
     }
@@ -1726,6 +1833,7 @@ fn run_scan(
         color,
         start,
         &stream.degraded,
+        stream.status.clone(),
         // Full retrieval: per-language degradation is already carried above,
         // and there is no partial-pass note to add.
         None,
@@ -1802,6 +1910,8 @@ fn render_scan_output(
     color: Option<&str>,
     start: std::time::Instant,
     degraded: &[LangDegradation],
+    // Every language seen and what happened to it (po-av01j.128 / .132).
+    lang_status: Vec<render::LangStatus>,
     // A whole-pass degradation from the incremental path (po-av01j.139): the
     // retrieval covered only the reused portion. Threaded into COVERAGE rather
     // than left on stderr, because when the lane comes back EMPTY the coverage
@@ -1818,6 +1928,7 @@ fn render_scan_output(
         resolved,
         total: sites.len(),
         degraded_note,
+        lang_status,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -2525,6 +2636,9 @@ fn run_scan_incremental(
         color,
         start,
         &scan.lang_degraded,
+        // The incremental path reuses an index rather than running every
+        // helper, so it has no roll-call to report.
+        Vec::new(),
         scan.degraded_note.clone(),
     )
 }
