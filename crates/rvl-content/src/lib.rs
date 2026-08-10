@@ -53,6 +53,10 @@ struct Rule {
     /// Capture group holding the secret value (0 = whole match).
     secret_group: usize,
     entropy_min: Option<f64>,
+    /// A vocabulary the VALUE must match. Used by the weak-credential rule,
+    /// where shape and entropy both say "uninteresting" and the words say
+    /// otherwise.
+    value_must_match: Option<Regex>,
     /// The generic rule runs only where no specific rule matched the line:
     /// one secret is one finding, never one per overlapping rule.
     generic: bool,
@@ -75,6 +79,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"\b((?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})\b"),
                 secret_group: 1,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -84,6 +89,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r#"(?i)\baws[\w.\-]{0,30}["']?\s*(?::=|=>|=|:)\s*["']([A-Za-z0-9/+=]{40})["']"#),
                 secret_group: 1,
                 entropy_min: Some(3.0),
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -93,6 +99,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{82})\b"),
                 secret_group: 1,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -102,6 +109,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"\b(AIza[0-9A-Za-z_\-]{35})\b"),
                 secret_group: 1,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -111,6 +119,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"\b(xox[baprs]-[0-9A-Za-z\-]{10,250})\b"),
                 secret_group: 1,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -120,6 +129,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"\b((?:sk|rk)_live_[0-9A-Za-z]{20,99})\b"),
                 secret_group: 1,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -129,6 +139,7 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
                 secret_group: 0,
                 entropy_min: None,
+                value_must_match: None,
                 generic: false,
             },
             Rule {
@@ -138,6 +149,47 @@ fn ruleset() -> &'static [Rule] {
                 pattern: re(r#"(?i)\b(?:api[_\-]?key|apikey|secret|token|passwd|password|auth[_\-]?token|access[_\-]?token|client[_\-]?secret|private[_\-]?key)\b["']?\s*(?::=|=>|=|:)\s*["']([A-Za-z0-9+/_\-.=]{16,80})["']"#),
                 secret_group: 1,
                 entropy_min: Some(3.5),
+                value_must_match: None,
+                generic: true,
+            },
+            // WEAK AND SHIPPED BEATS STRONG AND COMMITTED. The generic rule
+            // above gates on HIGH entropy, which selects for randomly-generated
+            // values -- usually fixtures and examples -- and selects AGAINST
+            // human-chosen defaults, which are the ones that ship and get used.
+            //
+            // Found on mlflow, where the lane reported a test fixture and a
+            // docs config while missing `admin_password = password1234` in
+            // basic_auth.ini and the fallback key-encryption passphrase in
+            // crypto.py. Neither reached the entropy gate; both failed the
+            // PATTERN, for three separate reasons this rule fixes:
+            //   - a leading \b stopped the keyword matching inside snake_case
+            //     identifiers (admin_password, db_password), which is the
+            //     dominant naming convention in Python, Go, Ruby and config
+            //   - "passphrase" was absent from the vocabulary
+            //   - the value had to be QUOTED and >=16 chars, excluding both
+            //     .ini/.env/.properties style and short weak passwords
+            //
+            // Severity stays medium/advisory. A blocking severity needs a
+            // recorded human approval under the HITL policy, and this rule's
+            // discrimination has not been measured across the corpus yet.
+            Rule {
+                id: "weak_default_credential",
+                description: "weak or default credential assigned to a secret-named setting",
+                severity: "medium",
+                pattern: re(
+                    r#"(?i)[a-z0-9_.\-]*(?:passphrase|password|passwd|secret|api[_\-]?key|auth[_\-]?token|access[_\-]?token)\s*["']?\s*(?::=|=>|=|:)\s*["']?([A-Za-z0-9._\-]{4,80})["']?\s*$"#,
+                ),
+                secret_group: 1,
+                entropy_min: None,
+                // A dotted value is a CODE REFERENCE, not a literal:
+                // `password = request.authorization.password` reads a value, it
+                // does not set one, and the dotted form sailed through the
+                // character class on the first version of this rule. Requiring
+                // no interior dot also costs nothing, since real weak
+                // credentials do not contain them.
+                value_must_match: Some(re(
+                    r#"(?i)^(?:[a-z0-9_\-]*(?:pass(?:word|wd|phrase)|letmein|qwerty|welcome|changeit|admin|root|default|insecure|notsecure)[a-z0-9_\-]*|[a-z_\-]*[0-9]{4,}[a-z0-9_\-]*)$"#,
+                )),
                 generic: true,
             },
         ]
@@ -228,6 +280,20 @@ pub fn scan_bytes(rel_path: &str, content: &str) -> Vec<ContentFinding> {
                     let entropy = shannon_entropy(value);
                     if let Some(min) = rule.entropy_min {
                         if entropy < min {
+                            continue;
+                        }
+                    }
+                    if let Some(vocab) = &rule.value_must_match {
+                        if !vocab.is_match(value) {
+                            continue;
+                        }
+                        // `PASSWORD = "password"` names a config KEY, it does
+                        // not set a credential. A value identical to the
+                        // secret word itself is that shape, every time.
+                        if matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "password" | "passwd" | "passphrase" | "secret" | "token" | "apikey"
+                        ) {
                             continue;
                         }
                     }

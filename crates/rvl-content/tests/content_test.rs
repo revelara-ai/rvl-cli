@@ -267,3 +267,42 @@ fn scan_root_is_deterministic_and_repo_relative() {
         "sorted, repo-relative"
     );
 }
+
+// --- weak / default credentials (po-av01j.133.9) ---
+
+#[test]
+fn weak_shipped_credentials_are_found_despite_low_entropy() {
+    // Both lines are real mlflow source the lane previously missed. Neither
+    // reached the entropy gate: they failed the PATTERN, because a leading \b
+    // blocked snake_case identifiers, "passphrase" was not in the vocabulary,
+    // and values had to be quoted and >=16 chars.
+    for line in [
+        "admin_password = password1234",
+        "DEFAULT_KEK_PASSPHRASE = \"mlflow-default-kek-passphrase-for-development-only\"",
+    ] {
+        let f = scan_bytes("conf/app.ini", line);
+        assert!(
+            f.iter().any(|x| x.rule_id == "weak_default_credential"),
+            "weak shipped credential must fire: {line}"
+        );
+    }
+}
+
+#[test]
+fn code_references_and_key_names_are_not_credentials() {
+    // `password = request.authorization.password` READS a value; the dotted
+    // form passed the value character class on the first version of this rule.
+    // `PASSWORD = "password"` names a config key rather than setting a secret.
+    for line in [
+        "password = request.authorization.password",
+        "PASSWORD = \"password\"",
+        "api_key = os.environ[\"API_KEY\"]",
+        "password_hash = \"a3f9d2b8c1e47f60a9b2c3d4e5f60718\"",
+    ] {
+        let f = scan_bytes("app/config.py", line);
+        assert!(
+            !f.iter().any(|x| x.rule_id == "weak_default_credential"),
+            "must not flag: {line}"
+        );
+    }
+}

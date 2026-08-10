@@ -300,6 +300,8 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         ".nycrc.json",
         ".nycrc.yml",
     ];
+    // Unambiguous tool names only: these are matched as substrings of lowercased
+    // build/CI text, so a short or generic token would manufacture a Satisfies.
     const COVERAGE_TOKENS: &[&str] = &[
         "-cover",
         "--cov",
@@ -309,6 +311,11 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         "go tool cover",
         "covermode",
         "codecov",
+        "coveralls",
+        "jacoco",
+        "simplecov",
+        "coverlet",
+        "opencover",
         "collectcoverage",
         "coveragethreshold",
     ];
@@ -319,6 +326,14 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         || rp == "azure-pipelines.yml"
         || name == "Jenkinsfile";
     let is_makefile = name == "Makefile" || name == "makefile" || name == "GNUmakefile";
+    // CI routinely delegates the real invocation to a script or task runner
+    // (`run: ./scripts/cov.sh`), leaving the only coverage token in the repo
+    // inside a file the walk never reads. That is how a repo with coverage,
+    // a coverage workflow, and a Coveralls upload gets told it has none.
+    let is_build_script = name.ends_with(".sh")
+        || name.eq_ignore_ascii_case("justfile")
+        || name == "Taskfile.yml"
+        || name == "Taskfile.yaml";
     if COVERAGE_NAMES.contains(&name) {
         acc.coverage.insert(rp.clone());
     } else if name.starts_with("jest.config.") || name.starts_with("vitest.config.") {
@@ -333,7 +348,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         if read_capped(path).contains("[coverage:") {
             acc.coverage.insert(rp.clone());
         }
-    } else if is_ci_file || is_makefile {
+    } else if is_ci_file || is_makefile || is_build_script {
         let text = read_capped(path).to_ascii_lowercase();
         if COVERAGE_TOKENS.iter().any(|t| text.contains(t)) {
             acc.coverage.insert(rp.clone());

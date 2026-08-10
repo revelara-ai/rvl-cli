@@ -300,9 +300,13 @@ fn eval_coverage(facts: &RepoStructure) -> StructureFinding {
             vec![],
         );
     }
+    // State the search, not a universal negative. The recognizer reads coverage
+    // config files, CI workflows, Makefiles and build scripts; a claim broader
+    // than that is one the evidence cannot carry.
     mk(
         Verdict::Violates,
-        "no coverage configuration or CI coverage invocation found".into(),
+        "no coverage tooling found in coverage config, CI workflows, Makefiles or build scripts"
+            .into(),
         vec![],
     )
 }

@@ -64,6 +64,9 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
             coverage.resolved += 1;
         } else if f.reason.starts_with("no config spec") {
             coverage.abstain_no_spec += 1;
+            coverage
+                .no_spec_keys
+                .insert(format!("{} {}", p.format, p.key));
         } else if f.reason.contains("outside the repo") {
             coverage.abstain_outside_repo += 1;
         } else {

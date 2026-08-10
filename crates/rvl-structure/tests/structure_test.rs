@@ -239,6 +239,55 @@ fn rc057_pyproject_tool_coverage_satisfies() {
     );
 }
 
+#[test]
+fn rc057_coverage_delegated_to_a_shell_script_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    // The nats-server shape: the workflow delegates, so the only coverage token
+    // in the whole repo lives in the script it calls.
+    write(
+        dir.path(),
+        ".github/workflows/cov.yaml",
+        "jobs:\n  cov:\n    steps:\n      - run: ./scripts/cov.sh upload\n",
+    );
+    write(
+        dir.path(),
+        "scripts/cov.sh",
+        "#!/bin/bash\ngo test -covermode=atomic -coverprofile=./cov/x.out ./...\n",
+    );
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-057");
+    assert_eq!(f.verdict, Verdict::Satisfies, "reason: {}", f.reason);
+}
+
+#[test]
+fn rc057_coveralls_uploader_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    write(
+        dir.path(),
+        ".github/workflows/cov.yaml",
+        "jobs:\n  cov:\n    steps:\n      - uses: coverallsapp/github-action@v2\n",
+    );
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-057");
+    assert_eq!(f.verdict, Verdict::Satisfies, "reason: {}", f.reason);
+}
+
+#[test]
+fn rc057_absence_claim_names_the_search_that_backs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-057");
+    assert_eq!(f.verdict, Verdict::Violates);
+    assert!(
+        f.reason.contains("build scripts"),
+        "a negative may claim only what was actually searched: {}",
+        f.reason
+    );
+}
+
 // --- RC-058: integration/e2e test presence (live catalog: Integration and Smoke Tests) ---
 
 #[test]
