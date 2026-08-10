@@ -98,6 +98,7 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
 /// it, so one fully-resolved value serves.
 fn cov() -> Coverage {
     Coverage {
+        retrievers: vec![],
         resolved: 1,
         total: 1,
         abstain_no_spec: 0,
@@ -147,6 +148,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         f("hidden", "low", "low_value", 0),
     ];
     let cov = Coverage {
+        retrievers: vec![],
         resolved: 58,
         total: 59,
         abstain_no_spec: 1,
@@ -201,6 +203,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
     let out = render_ladder(
         &findings,
         Coverage {
+            retrievers: vec![],
             resolved: 5,
             total: 5,
             abstain_no_spec: 0,
@@ -238,6 +241,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
     let out = render_ladder(
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
+            retrievers: vec![],
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
@@ -266,6 +270,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
     let out = render_ladder(
         &findings,
         Coverage {
+            retrievers: vec![],
             resolved: 10,
             total: 10,
             abstain_no_spec: 0,
@@ -290,6 +295,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let out = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            retrievers: vec![],
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
@@ -313,6 +319,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let colored = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            retrievers: vec![],
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
@@ -341,6 +348,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     let out = render_ladder(
         &[f("b", "high", "surface", 2)],
         Coverage {
+            retrievers: vec![],
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
@@ -416,6 +424,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
     let out = render_ladder(
         &[],
         Coverage {
+            retrievers: vec![],
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
@@ -450,6 +459,7 @@ fn empty_config_coverage_renders_nothing_extra() {
         render_ladder(
             &[],
             Coverage {
+                retrievers: vec![],
                 resolved: 1,
                 total: 1,
                 abstain_no_spec: 0,
@@ -611,6 +621,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
         ..Default::default()
     };
     let cov = Coverage {
+        retrievers: vec![],
         degraded: vec![DegradedLang {
             lang: "C#".into(),
             abstained: false,
@@ -643,6 +654,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
 #[test]
 fn an_empty_lane_after_a_degraded_pass_says_incomplete_not_nothing_to_resolve() {
     let cov = Coverage {
+        retrievers: vec![],
         degraded_note: Some("retrieval failed (running retriever helper `python3`)".into()),
         ..Default::default()
     };
@@ -671,6 +683,7 @@ fn an_empty_lane_with_no_degradation_still_reads_as_nothing_to_scan() {
 #[test]
 fn a_partial_pass_flags_that_coverage_describes_less_than_the_repo() {
     let cov = Coverage {
+        retrievers: vec![],
         resolved: 10,
         total: 12,
         degraded_note: Some("retrieval failed (helper `python3`)".into()),
@@ -691,6 +704,7 @@ fn a_partial_pass_flags_that_coverage_describes_less_than_the_repo() {
 #[test]
 fn every_language_seen_is_named_including_the_ones_that_found_nothing() {
     let cov = Coverage {
+        retrievers: vec![],
         resolved: 100,
         total: 200,
         lang_status: vec![
@@ -734,6 +748,7 @@ fn every_language_seen_is_named_including_the_ones_that_found_nothing() {
 #[test]
 fn a_failed_language_is_distinguishable_from_one_that_abstained() {
     let cov = Coverage {
+        retrievers: vec![],
         lang_status: vec![
             LangStatus {
                 lang: "Python".into(),
@@ -810,6 +825,7 @@ fn a_normal_high_severity_finding_still_blocks() {
 #[test]
 fn a_missing_helper_reads_as_not_installed_not_as_a_failure() {
     let cov = Coverage {
+        retrievers: vec![],
         lang_status: vec![
             LangStatus {
                 lang: "Go".into(),

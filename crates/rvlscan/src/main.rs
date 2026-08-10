@@ -669,6 +669,10 @@ enum HelperKind {
 struct ResolvedHelper {
     path: PathBuf,
     kind: HelperKind,
+    /// Where resolution found it: "env:<VAR>", "bundled", or "PATH". Printed
+    /// with the coverage block (po-vd7ii): a stale helper shadowing via PATH
+    /// is invisible in every other line of output.
+    source: String,
 }
 
 /// Directory names never worth descending into during language detection.
@@ -878,7 +882,7 @@ fn walk_for_sources(
 /// `.js`, a Java helper is a `java` source-file script when it ends in
 /// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
 /// otherwise an executable on PATH.
-fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
+fn classify_helper(lang: Lang, path: &Path, source: &str) -> ResolvedHelper {
     let ext = path.extension().and_then(|e| e.to_str());
     let kind = match lang {
         Lang::Go | Lang::Rust | Lang::CCpp => HelperKind::Executable,
@@ -894,6 +898,7 @@ fn classify_helper(lang: Lang, path: &Path) -> ResolvedHelper {
     ResolvedHelper {
         path: path.to_path_buf(),
         kind,
+        source: source.to_string(),
     }
 }
 
@@ -937,7 +942,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             lang.env_override(),
             p.display()
         );
-        return Ok(classify_helper(lang, &p));
+        return Ok(classify_helper(lang, &p, &format!("env:{}", lang.env_override())));
     }
     let base = lang.helper_base();
     // The scripted-helper filename to also look for, for a language whose helper
@@ -954,23 +959,23 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         if let Some(dir) = exe.parent() {
             let cand = dir.join(base);
             if cand.is_file() {
-                return Ok(classify_helper(lang, &cand));
+                return Ok(classify_helper(lang, &cand, "bundled"));
             }
             if let Some(script) = &script_name {
                 let cand_script = dir.join(script);
                 if cand_script.is_file() {
-                    return Ok(classify_helper(lang, &cand_script));
+                    return Ok(classify_helper(lang, &cand_script, "bundled"));
                 }
             }
         }
     }
     // (3) on PATH.
     if let Some(found) = find_on_path(base) {
-        return Ok(classify_helper(lang, &found));
+        return Ok(classify_helper(lang, &found, "PATH"));
     }
     if let Some(script) = &script_name {
         if let Some(found) = find_on_path(script) {
-            return Ok(classify_helper(lang, &found));
+            return Ok(classify_helper(lang, &found, "PATH"));
         }
     }
     anyhow::bail!(
@@ -1455,6 +1460,8 @@ struct RetrievedStream {
     /// EVERY language seen and what happened to it, including the ones that
     /// ran cleanly and the ones nothing here can read (po-av01j.128 / .132).
     status: Vec<render::LangStatus>,
+    /// Which helper file ran per language and how it was found (po-vd7ii).
+    retrievers: Vec<render::RetrieverInfo>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -1486,6 +1493,7 @@ fn resolve_packet_stream(
             // A prebuilt stream says nothing about which helpers ran, so the
             // roll-call stays empty rather than inventing one.
             status: Vec::new(),
+            retrievers: Vec::new(),
         });
     }
     let langs = detect_languages(path);
@@ -1505,6 +1513,7 @@ fn resolve_packet_stream(
             text: String::new(),
             generated_skipped: 0,
             total_failure: None,
+            retrievers: Vec::new(),
             status: detect_unsupported(path)
                 .into_iter()
                 .map(|(name, count)| render::LangStatus {
@@ -1559,6 +1568,7 @@ fn resolve_packet_stream(
     let mut generated_skipped = 0usize;
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
+    let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -1583,6 +1593,11 @@ fn resolve_packet_stream(
                 continue;
             }
         };
+        retrievers.push(render::RetrieverInfo {
+            lang: lang.to_string(),
+            path: helper.path.display().to_string(),
+            source: helper.source.clone(),
+        });
         match run_helper(&helper, path, &name, &[])? {
             Ok(out) => {
                 // Drop machine-generated files BEFORE counting. Filtering after
@@ -1633,6 +1648,7 @@ fn resolve_packet_stream(
         total_failure,
         status,
         degraded,
+        retrievers,
     })
 }
 
@@ -2028,6 +2044,7 @@ fn run_scan(
             // No language was detected on this path, so nothing could degrade.
             &[],
             Vec::new(),
+            Vec::new(),
             None,
             0,
         );
@@ -2063,6 +2080,7 @@ fn run_scan(
         start,
         &stream.degraded,
         stream.status.clone(),
+        stream.retrievers.clone(),
         // Total retrieval failure (po-av01j.145) renders as "call-site lane
         // INCOMPLETE" rather than aborting, so the helper-independent lanes
         // below still report.
@@ -2143,6 +2161,8 @@ fn render_scan_output(
     degraded: &[LangDegradation],
     // Every language seen and what happened to it (po-av01j.128 / .132).
     lang_status: Vec<render::LangStatus>,
+    // Which helper file ran per language and how it was found (po-vd7ii).
+    retrievers: Vec<render::RetrieverInfo>,
     // A whole-pass degradation from the incremental path (po-av01j.139): the
     // retrieval covered only the reused portion. Threaded into COVERAGE rather
     // than left on stderr, because when the lane comes back EMPTY the coverage
@@ -2163,6 +2183,7 @@ fn render_scan_output(
         generated_skipped,
         degraded_note,
         lang_status,
+        retrievers,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -2890,6 +2911,7 @@ fn run_scan_incremental(
         &scan.lang_degraded,
         // The incremental path reuses an index rather than running every
         // helper, so it has no roll-call to report.
+        Vec::new(),
         Vec::new(),
         scan.degraded_note.clone(),
         // The incremental path reuses indexed packets, which were already
@@ -3896,6 +3918,36 @@ mod tests {
     }
 
     #[test]
+    fn resolved_helper_provenance_is_named_in_the_coverage_block() {
+        // A stale helper shadowing via PATH is invisible without this: the
+        // 2026-08-10 dogfoods ran a six-day-old pyindex/tsindex fleet from
+        // ~/.local/bin for a full day, silently missing the LLM-SDK surface
+        // and reporting a type-degraded TS lane as normal sites (po-vd7ii).
+        // The scan must SAY which helper file ran and where it came from.
+        let cov = render::Coverage {
+            resolved: 10,
+            total: 12,
+            retrievers: vec![
+                render::RetrieverInfo {
+                    lang: "Python".into(),
+                    path: "/home/u/.local/bin/pyindex.py".into(),
+                    source: "PATH".into(),
+                },
+                render::RetrieverInfo {
+                    lang: "Go".into(),
+                    path: "/opt/rvlscan/goindex".into(),
+                    source: "bundled".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render::render_lang_status(&cov, false);
+        assert!(out.contains("retrievers:"), "got: {out}");
+        assert!(out.contains("/home/u/.local/bin/pyindex.py (PATH)"), "got: {out}");
+        assert!(out.contains("/opt/rvlscan/goindex (bundled)"), "got: {out}");
+    }
+
+    #[test]
     fn degraded_languages_are_named_in_the_coverage_block() {
         // Silence would trade a loud crash for a quiet false pass. The user has
         // to be able to see that a language was skipped, and which kind of
@@ -4198,7 +4250,7 @@ mod tests {
     #[test]
     fn rust_helper_is_an_executable_and_rs_maps_to_rust() {
         assert_eq!(
-            classify_helper(Lang::Rust, Path::new("/x/rustindex")).kind,
+            classify_helper(Lang::Rust, Path::new("/x/rustindex"), "test").kind,
             HelperKind::Executable
         );
         assert_eq!(Lang::Rust.helper_base(), "rustindex");
@@ -4275,6 +4327,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/goindex"),
             kind: HelperKind::Executable,
+            source: "test".into(),
         };
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
@@ -4295,6 +4348,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/pyindex.py"),
             kind: HelperKind::PyScript,
+            source: "test".into(),
         };
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
@@ -4316,6 +4370,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/tsindex.js"),
             kind: HelperKind::NodeScript,
+            source: "test".into(),
         };
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
@@ -4337,6 +4392,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/csindex.dll"),
             kind: HelperKind::DotnetAssembly,
+            source: "test".into(),
         };
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
@@ -4356,13 +4412,13 @@ mod tests {
     #[test]
     fn c_cpp_helper_is_a_direct_executable() {
         assert_eq!(
-            classify_helper(Lang::CCpp, Path::new("/x/cindex")).kind,
+            classify_helper(Lang::CCpp, Path::new("/x/cindex"), "test").kind,
             HelperKind::Executable
         );
         assert_eq!(Lang::CCpp.helper_base(), "cindex");
         assert_eq!(Lang::CCpp.env_override(), "RVLSCAN_CINDEX");
         let argv = helper_argv(
-            &classify_helper(Lang::CCpp, Path::new("/opt/cindex")),
+            &classify_helper(Lang::CCpp, Path::new("/opt/cindex"), "test"),
             Path::new("/repo"),
             "repo",
             &[],
@@ -4383,11 +4439,11 @@ mod tests {
     #[test]
     fn classify_csharp_dll_is_an_assembly_but_bin_is_executable() {
         assert_eq!(
-            classify_helper(Lang::CSharp, Path::new("/x/csindex.dll")).kind,
+            classify_helper(Lang::CSharp, Path::new("/x/csindex.dll"), "test").kind,
             HelperKind::DotnetAssembly
         );
         assert_eq!(
-            classify_helper(Lang::CSharp, Path::new("/x/csindex")).kind,
+            classify_helper(Lang::CSharp, Path::new("/x/csindex"), "test").kind,
             HelperKind::Executable
         );
     }
@@ -4419,6 +4475,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/javaindex.java"),
             kind: HelperKind::JavaSource,
+            source: "test".into(),
         };
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
         assert_eq!(
@@ -4438,11 +4495,11 @@ mod tests {
     #[test]
     fn classify_java_source_is_a_script_but_bin_is_executable() {
         assert_eq!(
-            classify_helper(Lang::Java, Path::new("/x/javaindex.java")).kind,
+            classify_helper(Lang::Java, Path::new("/x/javaindex.java"), "test").kind,
             HelperKind::JavaSource
         );
         assert_eq!(
-            classify_helper(Lang::Java, Path::new("/x/javaindex")).kind,
+            classify_helper(Lang::Java, Path::new("/x/javaindex"), "test").kind,
             HelperKind::Executable
         );
     }
@@ -4455,11 +4512,11 @@ mod tests {
     #[test]
     fn classify_typescript_js_is_a_script_but_bin_is_executable() {
         assert_eq!(
-            classify_helper(Lang::TypeScript, Path::new("/x/tsindex.js")).kind,
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex.js"), "test").kind,
             HelperKind::NodeScript
         );
         assert_eq!(
-            classify_helper(Lang::TypeScript, Path::new("/x/tsindex")).kind,
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex"), "test").kind,
             HelperKind::Executable
         );
     }
@@ -4530,6 +4587,7 @@ mod tests {
         let helper = ResolvedHelper {
             path: PathBuf::from("/opt/goindex"),
             kind: HelperKind::Executable,
+            source: "test".into(),
         };
         let changed = vec!["svc/db.go".to_string(), "svc/http.go".to_string()];
         let argv = helper_argv(&helper, Path::new("/repo"), "repo", &changed);
@@ -4719,15 +4777,15 @@ mod tests {
     #[test]
     fn classify_python_py_is_a_script_but_bin_is_executable() {
         assert_eq!(
-            classify_helper(Lang::Python, Path::new("/x/pyindex.py")).kind,
+            classify_helper(Lang::Python, Path::new("/x/pyindex.py"), "test").kind,
             HelperKind::PyScript
         );
         assert_eq!(
-            classify_helper(Lang::Python, Path::new("/x/pyindex")).kind,
+            classify_helper(Lang::Python, Path::new("/x/pyindex"), "test").kind,
             HelperKind::Executable
         );
         assert_eq!(
-            classify_helper(Lang::Go, Path::new("/x/goindex")).kind,
+            classify_helper(Lang::Go, Path::new("/x/goindex"), "test").kind,
             HelperKind::Executable
         );
     }

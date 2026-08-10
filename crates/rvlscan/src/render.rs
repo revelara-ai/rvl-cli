@@ -133,6 +133,8 @@ pub struct Coverage {
     /// Per-language outcome for every language SEEN, including the ones that
     /// ran cleanly and the ones nothing can read (po-av01j.128 / .132).
     pub lang_status: Vec<LangStatus>,
+    /// Which helper file ran per language, and how it was found (po-vd7ii).
+    pub retrievers: Vec<RetrieverInfo>,
 }
 
 /// The one-line per-language roll-call. Rendered whenever anything was seen, so
@@ -163,6 +165,19 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         "{}",
         paint(&line, if any_failed { "33" } else { "2" }, color)
     );
+    // Name the helper FILE that ran and where resolution found it. A stale
+    // helper shadowing via PATH is invisible in every other line of output —
+    // the numbers above simply describe an older scanner than the one the
+    // user thinks they ran (po-vd7ii).
+    if !cov.retrievers.is_empty() {
+        let parts: Vec<String> = cov
+            .retrievers
+            .iter()
+            .map(|r| format!("{} {} ({})", r.lang, r.path, r.source))
+            .collect();
+        let line = format!("  retrievers: {}", parts.join(" \u{00b7} "));
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
     if cov.generated_skipped > 0 {
         let g = format!(
             "  {} machine-generated file{} excluded (banner-declared; not editable, not counted)",
@@ -211,6 +226,18 @@ pub struct LangStatus {
     pub state: LangState,
     /// Site count for Scanned; the reason for the others.
     pub detail: String,
+}
+
+/// Which helper file actually ran for a language, and where resolution found
+/// it (env override, bundled next to the binary, or PATH). Printed with the
+/// coverage block because its absence is undiagnosable any other way: a stale
+/// helper shadowing via PATH ran the 2026-08-10 dogfoods on a six-day-old
+/// fleet with nothing in the output to show it (po-vd7ii).
+#[derive(Debug, Clone)]
+pub struct RetrieverInfo {
+    pub lang: String,
+    pub path: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
