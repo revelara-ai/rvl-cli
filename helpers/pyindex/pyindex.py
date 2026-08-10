@@ -97,6 +97,12 @@ STRONG_IO_METHODS = frozenset({
 WEAK_IO_METHODS = frozenset({
     # ambiguous with builtin containers -- require a resolved receiver
     "get", "send", "connect", "call", "run", "query", "invoke", "read", "write",
+    # LLM SDK verbs (po-av01j.133.8). All ambiguous in isolation ("create" is
+    # every ORM and factory), so they ride the weak set: only a receiver that
+    # RESOLVED to a constructed client emits. openai/anthropic
+    # (...completions.create / messages.create), google.genai
+    # (generate_content), bedrock (invoke_model / converse).
+    "create", "stream", "generate_content", "invoke_model", "converse",
 })
 
 
@@ -448,7 +454,24 @@ class FileIndex:
             dotted = expr_to_str(recv)
             if dotted in self.self_attr_types:
                 return self.self_attr_types[dotted], True
+            # A chain hanging off a constructed self attr:
+            # `self.client.chat.completions` resolves via `self.client`,
+            # appending the rest of the path to the constructed type.
+            if dotted.startswith("self."):
+                head = ".".join(dotted.split(".")[:2])  # "self.<attr>"
+                if head in self.self_attr_types:
+                    return self.self_attr_types[head] + dotted[len(head):], True
             root = _root_name(recv)
+            # A chain hanging off a constructed LOCAL: `client.chat.completions`
+            # where `client = OpenAI(...)`. This is the shape every modern LLM
+            # SDK call takes (openai, anthropic, boto3, google.genai), and it
+            # was invisible (po-av01j.133.8): the root is a variable, not an
+            # import, so the imports lookup below never matched and ambiguous
+            # methods like `create` were then dropped for being unresolved.
+            # Same precedence as the bare-Name branch above: a local
+            # assignment shadows an imported name.
+            if root is not None and root in self.var_types:
+                return self.var_types[root] + dotted[len(root):], True
             if root is not None and root in self.imports:
                 return self.imports[root] + dotted[len(root):], True
             return "", False
@@ -461,6 +484,15 @@ class FileIndex:
             out = self.ctor_by_var[recv.id]
         elif recv_str in self.ctor_by_selfattr:
             out = self.ctor_by_selfattr[recv_str]
+        elif (isinstance(recv, ast.Attribute)
+              and _root_name(recv) in self.ctor_by_var):
+            # Chained receiver on a constructed local (`client.chat.completions`):
+            # the construction is where these SDKs put timeout/max_retries, so
+            # it must travel with the chained call site too.
+            out = self.ctor_by_var[_root_name(recv)]
+        elif (recv_str.startswith("self.")
+              and ".".join(recv_str.split(".")[:2]) in self.ctor_by_selfattr):
+            out = self.ctor_by_selfattr[".".join(recv_str.split(".")[:2])]
         elif client_type and client_type in self.ctor_by_type:
             out = self.ctor_by_type[client_type]
         return out[:MAX_CTORS_EMITTED]

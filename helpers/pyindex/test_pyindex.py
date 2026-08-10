@@ -105,6 +105,45 @@ class TestRetrievedPackets(unittest.TestCase):
             any("requests.Session()" in s for s in ctor_sources),
             "construction of the session client must be retrievable")
 
+    def test_chained_attribute_on_constructed_local_resolves(self):
+        # po-av01j.133.8: `client = OpenAI(...)` then
+        # `client.chat.completions.create(...)`. The receiver's ROOT is a
+        # local variable whose type comes from a constructor assignment; the
+        # chain must resolve by appending the attribute path to the
+        # constructed type. Before the fix this call emitted NO site at all
+        # ("create" is ambiguous, so an unresolved receiver is dropped), which
+        # made the entire modern LLM SDK surface invisible.
+        records = _retrieve_records()
+        sites = [
+            r for r in records
+            if r["client_type"] == "openai.OpenAI.chat.completions"
+            and r["func"] == "create"
+            and r["provenance"]["client_type_resolved"] is True
+        ]
+        self.assertTrue(
+            sites, "expected resolved openai.OpenAI.chat.completions.create sites")
+        # Both spellings of the shape: the local variable and the self attr.
+        symbols = {r["symbol"] for r in sites}
+        self.assertIn("ask", symbols)
+
+    def test_chained_local_receiver_carries_its_construction(self):
+        # The construction (which is where timeout/max_retries live for these
+        # SDKs) must be retrievable from the chained call site, exactly as it
+        # already is for a bare `session.get`.
+        records = _retrieve_records()
+        sites = [
+            r for r in records
+            if r["client_type"] == "openai.OpenAI.chat.completions"
+            and r["func"] == "create"
+        ]
+        self.assertTrue(sites)
+        ctor_sources = [
+            c["source"] for r in sites for c in r.get("client_construction", [])
+        ]
+        self.assertTrue(
+            any("OpenAI(" in s for s in ctor_sources),
+            "construction of the chained client must be retrievable")
+
     def test_noise_calls_are_not_emitted(self):
         # items.append(...) and os.path.join(...) must never be sites
         records = _retrieve_records()
