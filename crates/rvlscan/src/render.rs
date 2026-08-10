@@ -99,6 +99,11 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// Distinct machine-generated files whose packets were dropped before
+    /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
+    /// without saying so reads as having scanned them, and it moves every
+    /// number above it.
+    pub generated_skipped: usize,
     pub resolved: usize,
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
@@ -158,6 +163,14 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         "{}",
         paint(&line, if any_failed { "33" } else { "2" }, color)
     );
+    if cov.generated_skipped > 0 {
+        let g = format!(
+            "  {} machine-generated file{} excluded (banner-declared; not editable, not counted)",
+            cov.generated_skipped,
+            if cov.generated_skipped == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&g, "2", color));
+    }
     o
 }
 
