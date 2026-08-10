@@ -159,6 +159,21 @@ test('two calls on one line with different client types get distinct keys', () =
   );
 });
 
+test('a chained LLM SDK call on a constructed client resolves and emits', () => {
+  // po-av01j.133.8: `const client = new OpenAI()` then
+  // `client.chat.completions.create(...)`. The checker resolves the chained
+  // receiver; the site was invisible because "create" was in neither method
+  // allowlist. It rides the weak set, so only a RESOLVED receiver emits it.
+  const records = retrieveRecords();
+  const sites = records.filter(
+    (r) =>
+      r.func === 'create' &&
+      r.client_type.startsWith('openai.') &&
+      r.provenance.client_type_resolved === true,
+  );
+  assert.ok(sites.length >= 1, 'expected a resolved openai chained create site');
+});
+
 test('an unresolved receiver still emits a STRONG verb at low confidence', () => {
   const records = retrieveRecords();
   const raw = records.filter(
