@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 regex = { workspace = true }
+ignore = "0.4"
 rvl-core = { path = "../rvl-core" }
 serde = { workspace = true }
 

@@ -871,6 +871,64 @@ fn walk_for_sources(
     }
 }
 
+/// Source extensions for a language, for the incidental-language check.
+/// Marker files (.csproj, pom.xml) are NOT here — only actual source.
+fn language_source_exts(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Go => &["go"],
+        Lang::Python => &["py"],
+        Lang::Rust => &["rs"],
+        Lang::TypeScript => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+        Lang::CSharp => &["cs"],
+        Lang::Java => &["java"],
+        Lang::CCpp => &["c", "cc", "cpp", "cxx", "h", "hpp"],
+    }
+}
+
+/// True when a language appears in the repo ONLY as non-production material —
+/// every source file classifies non-runtime (testdata/fixtures/examples via
+/// rvl-core::scope_of), or there is no real source at all (a lone marker like
+/// a stray .csproj). Such a language must not hard-fail the whole scan for a
+/// missing helper (po-hjte8): polaris carries one C# file, a skilleval TEST
+/// FIXTURE, and it should not brick a scan of the real Go/TS/Python code. A
+/// language with even one production-scope file is NOT incidental — a helper
+/// we cannot run for real code must still fail loudly (po-av01j.145).
+fn language_is_incidental(root: &Path, lang: Lang) -> bool {
+    let exts = language_source_exts(lang);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+            } else if ft.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| exts.contains(&e))
+            {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rvl_core::scope_of(&rel) == rvl_core::ScopeClass::Runtime {
+                    return false; // a real production file — not incidental
+                }
+            }
+        }
+    }
+    // No production source found: marker-only, or all non-production.
+    true
+}
+
 /// Classify a resolved helper path into how it must be invoked. Go, Rust, and
 /// C/C++ helpers are always executables (rustindex and cindex are workspace
 /// binaries built next to rvlscan); a Python helper is a `python3` script when
@@ -1534,22 +1592,31 @@ fn resolve_packet_stream(
             Err(e) => Some((l, format!("{e:#}"))),
         })
         .collect();
-    if !missing.is_empty() && !allow_missing_helpers() {
+    // A missing helper for a language present ONLY as non-production material
+    // (one testdata fixture) must not abort the whole scan (po-hjte8). It still
+    // degrades to "not installed" in the loop below and is reported in
+    // COVERAGE; only a language with real production sources hard-fails, which
+    // preserves po-av01j.145 (no silent pass over a language nobody looked at).
+    let blocking_missing: Vec<&(Lang, String)> = missing
+        .iter()
+        .filter(|(l, _)| !language_is_incidental(path, *l))
+        .collect();
+    if !blocking_missing.is_empty() && !allow_missing_helpers() {
         // A GATE THAT CANNOT READ A LANGUAGE THE REPO CONTAINS MUST NOT PASS.
         // Reporting "commit clean" here would be a clean bill of health over a
         // language nobody looked at -- the exact failure this epic has found
         // repeatedly. Failing loudly with an install command is recoverable in
         // seconds; a silent pass is never noticed at all.
-        let list = missing
+        let list = blocking_missing
             .iter()
             .map(|(l, why)| format!("  {l}: {why}"))
             .collect::<Vec<_>>()
             .join("\n");
         anyhow::bail!(
-            "no retriever for {} of the {} language(s) in this repo, so it cannot be scanned \
-             honestly:\n{list}\n\nInstall the helper(s) above, or set \
+            "no retriever for {} of the {} language(s) in this repo with production sources, so it \
+             cannot be scanned honestly:\n{list}\n\nInstall the helper(s) above, or set \
              RVLSCAN_ALLOW_MISSING_HELPERS=1 to scan the remaining lanes deliberately.",
-            missing.len(),
+            blocking_missing.len(),
             langs.len()
         );
     }
@@ -3753,6 +3820,28 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_language_present_only_as_testdata_is_incidental() {
+        // po-hjte8: polaris carries one C# file, a skilleval fixture under
+        // testdata/, and it must not hard-fail the scan. A C# file in a
+        // production path is NOT incidental.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scripts/skilleval/testdata/matrix/csharp-pro")).unwrap();
+        std::fs::write(
+            root.join("scripts/skilleval/testdata/matrix/csharp-pro/csharp_pro.cs"),
+            "class C {}\n",
+        ).unwrap();
+        assert!(language_is_incidental(root, Lang::CSharp), "a lone testdata .cs is incidental");
+
+        std::fs::create_dir_all(root.join("src/api")).unwrap();
+        std::fs::write(root.join("src/api/Handler.cs"), "class H {}\n").unwrap();
+        assert!(
+            !language_is_incidental(root, Lang::CSharp),
+            "a production-path .cs makes the language non-incidental"
+        );
+    }
 
     // Serializes tests that mutate process-global env so they don't race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
