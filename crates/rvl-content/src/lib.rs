@@ -396,35 +396,51 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// (file, line, rule) so output is deterministic.
 pub fn scan_root(root: &Path) -> Vec<ContentFinding> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    // Honor .gitignore (po-lqbh2): a full-tree secret scan was blocking commits
+    // on gitignored .env / debug material, which git never commits — a false
+    // gate that reads as a scary leak on the first run. The `ignore` walker
+    // applies .gitignore / .git/info/exclude / parent ignores and treats a
+    // nested .git as its own repo boundary. Two deliberate settings:
+    //   - hidden(false): the gitignore filter must NOT double as a hidden-file
+    //     filter, or a secret in .github/workflows (not ignored) would be
+    //     missed — that was a real OpenMetadata finding.
+    //   - git_global(false): the user's global gitignore is machine-specific
+    //     and would make a scan's output depend on who ran it.
+    // SKIP_DIRS stays as a belt-and-suspenders filter for trees that do not
+    // gitignore node_modules/target/vendor.
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if !scannable(path) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            let path = entry.path();
-            if ft.is_dir() {
-                let name = entry.file_name();
-                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
-                    stack.push(path);
-                }
-            } else if ft.is_file() && scannable(&path) {
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                if looks_binary(&bytes) {
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.extend(scan_bytes(&rel, &text));
-            }
+        if looks_binary(&bytes) {
+            continue;
         }
+        let text = String::from_utf8_lossy(&bytes);
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.extend(scan_bytes(&rel, &text));
     }
     out.sort_by(|a, b| {
         (a.file.as_str(), a.line, a.rule_id.as_str()).cmp(&(
@@ -454,4 +470,82 @@ pub fn to_sites(findings: &[ContentFinding], snapshot_id: &str) -> Vec<Site> {
             ..Default::default()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod gitignore_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn scan_root_skips_gitignored_files() {
+        // po-lqbh2: a full-tree scan was blocking on .env / debug secrets that
+        // git deliberately ignores. scan_root must honor .gitignore so a
+        // gitignored secret is not a false gate, while a TRACKED secret still
+        // fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join(".git")).unwrap(); // marks a repo so ignores apply
+        fs::write(root.join(".gitignore"), ".env\ndebug/\n").unwrap();
+
+        // A gitignored secrets file — must be SKIPPED.
+        fs::write(
+            root.join(".env"),
+            "GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("debug")).unwrap();
+        fs::write(
+            root.join("debug/notes.txt"),
+            "sk_live_0123456789abcdefghij\n",
+        )
+        .unwrap();
+
+        // A tracked config with a secret — must STILL fire.
+        fs::write(
+            root.join("config.yaml"),
+            "github_token: ghp_zyxwvutsrqponmlkjihgfedcba9876543210\n",
+        )
+        .unwrap();
+
+        let findings = scan_root(root);
+        let files: Vec<&str> = findings.iter().map(|f| f.file.as_str()).collect();
+        assert!(
+            files.iter().any(|f| f.contains("config.yaml")),
+            "tracked secret must fire: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains(".env")),
+            ".env is gitignored, must be skipped: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("debug/")),
+            "debug/ is gitignored, must be skipped: {files:?}"
+        );
+    }
+
+    #[test]
+    fn scan_root_still_scans_non_ignored_dotdirs() {
+        // .github is a dotdir but not ignored; secrets there (the OpenMetadata
+        // case) must still be found — the gitignore filter must not double as a
+        // hidden-file filter.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "env:\n  TOKEN: ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
+        )
+        .unwrap();
+        let findings = scan_root(root);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.file.contains(".github/workflows/ci.yml")),
+            "a secret in a non-ignored dotdir must still fire: {:?}",
+            findings.iter().map(|f| &f.file).collect::<Vec<_>>()
+        );
+    }
 }
