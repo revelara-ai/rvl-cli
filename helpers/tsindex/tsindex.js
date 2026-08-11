@@ -1445,6 +1445,21 @@ function parseArgs(argv) {
 //
 // A package.json with no dependencies and no devDependencies needs no install,
 // so it is not reported. Skips node_modules itself and the usual vendored trees.
+// True when `dir` or any ancestor up to (and including) `root` has an
+// installed node_modules — the resolvability the TypeScript module resolver
+// actually uses, which is also how hoisted monorepos are laid out.
+function hasNodeModulesUpTo(dir, root) {
+  let cur = path.resolve(dir);
+  const stop = path.resolve(root);
+  for (;;) {
+    if (fs.existsSync(path.join(cur, 'node_modules'))) return true;
+    if (cur === stop) return false;
+    const parent = path.dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
+}
+
 function missingDependencyTrees(root) {
   const skip = new Set(['node_modules', '.git', 'dist', 'build', 'out', 'target', 'vendor']);
   const missing = [];
@@ -1468,7 +1483,14 @@ function missingDependencyTrees(root) {
         // An unreadable package.json is not evidence of anything; leave it.
         declares = false;
       }
-      if (declares && !fs.existsSync(path.join(dir, 'node_modules'))) {
+      // Hoisting-aware: yarn/pnpm workspaces install a workspace's deps into
+      // an ANCESTOR's node_modules (usually the repo root), and a local dir
+      // exists only for version conflicts. Demanding node_modules per
+      // declaring workspace refused medusa (98 hoisted workspaces) and Ghost
+      // (.nxcache artifacts) immediately after both had installed cleanly.
+      // Unresolvable means: neither this dir nor any ancestor up to the
+      // scanned root has node_modules.
+      if (declares && !hasNodeModulesUpTo(dir, root)) {
         missing.push(path.relative(root, dir) || '.');
       }
     }

@@ -159,6 +159,47 @@ test('two calls on one line with different client types get distinct keys', () =
   );
 });
 
+test('a hoisted monorepo does not trip the missing-node_modules abstain', () => {
+  // yarn/pnpm workspaces HOIST: a workspace's dependencies land in the ROOT
+  // node_modules, and a per-workspace dir exists only for version conflicts.
+  // The guard demanding node_modules in every declaring workspace refused
+  // medusa (98 hoisted workspaces) and Ghost (.nxcache artifacts) right after
+  // both had installed successfully. Resolvability is: this dir OR any
+  // ancestor up to the root has node_modules.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-hoist-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'node_modules'));
+    fs.mkdirSync(path.join(tmp, 'packages', 'app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'packages', 'app', 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { axios: '^1.0.0' } }),
+    );
+    const out = run('--retrieve', '--root', tmp);
+    // The run must complete (no sites is fine); before the fix it exited 3.
+    assert.ok(typeof out === 'string');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a repo with no node_modules anywhere still abstains', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-bare-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'packages', 'app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'packages', 'app', 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { axios: '^1.0.0' } }),
+    );
+    assert.throws(
+      () => run('--retrieve', '--root', tmp),
+      (e) => e.status === 3,
+      'expected the abstain exit code',
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('a chained LLM SDK call on a constructed client resolves and emits', () => {
   // po-av01j.133.8: `const client = new OpenAI()` then
   // `client.chat.completions.create(...)`. The checker resolves the chained

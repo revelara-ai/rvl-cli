@@ -303,20 +303,30 @@ class JavaIndex {
         JavaIndex ix = new JavaIndex(rootPath, snapshot);
         List<Map<String, Object>> records = ix.run(only);
 
+        // Stream one packet per line rather than accumulating the whole run in
+        // a single String: apache/camel's stream exceeded 2 GiB and the final
+        // String.getBytes overflowed int (NegativeArraySizeException), killing
+        // the run at the last step with every packet already built. A buffered
+        // writer bounds memory to one packet regardless of repo size.
+        java.io.BufferedWriter w = new java.io.BufferedWriter(
+                new java.io.OutputStreamWriter(System.out, StandardCharsets.UTF_8), 1 << 20);
         StringBuilder sb = new StringBuilder();
         for (Map<String, Object> rec : records) {
             rec.put("packet_schema", PACKET_SCHEMA);
             rec.put("site_key", siteKey(rec));
+            sb.setLength(0);
             writeJson(sb, rec);
             sb.append('\n');
+            w.write(sb.toString());
         }
         // One repo-scoped record per run, after the site packets. rvl_core's
         // parse_stream keys on kind:"repo_config" to route it away from
         // sites. Emitted even when empty, like tsindex.
+        sb.setLength(0);
         writeJson(sb, ix.repoConfigRecord());
         sb.append('\n');
-        System.out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-        System.out.flush();
+        w.write(sb.toString());
+        w.flush();
         System.err.println(snapshot + ": " + records.size() + " retrieved sites, "
                 + ix.repoConfig.size() + " config constructions");
     }
