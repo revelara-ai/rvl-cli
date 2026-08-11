@@ -889,7 +889,7 @@ fn language_source_exts(lang: Lang) -> &'static [&'static str] {
 /// every source file classifies non-runtime (testdata/fixtures/examples via
 /// rvl-core::scope_of), or there is no real source at all (a lone marker like
 /// a stray .csproj). Such a language must not hard-fail the whole scan for a
-/// missing helper (po-hjte8): polaris carries one C# file, a skilleval TEST
+/// missing helper (po-hjte8): a real backend repo carries one C# file, a skilleval TEST
 /// FIXTURE, and it should not brick a scan of the real Go/TS/Python code. A
 /// language with even one production-scope file is NOT incidental — a helper
 /// we cannot run for real code must still fail loudly (po-av01j.145).
@@ -3823,7 +3823,7 @@ mod tests {
 
     #[test]
     fn a_language_present_only_as_testdata_is_incidental() {
-        // po-hjte8: polaris carries one C# file, a skilleval fixture under
+        // po-hjte8: a real backend repo carries one C# file, a skilleval fixture under
         // testdata/, and it must not hard-fail the scan. A C# file in a
         // production path is NOT incidental.
         let tmp = tempfile::tempdir().unwrap();
