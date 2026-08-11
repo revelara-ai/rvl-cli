@@ -141,30 +141,35 @@ pub struct Coverage {
 /// a lane that ran is visibly a lane that ran.
 pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
     use std::fmt::Write as _;
-    if cov.lang_status.is_empty() {
+    if cov.lang_status.is_empty() && cov.retrievers.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = cov
-        .lang_status
-        .iter()
-        .map(|s| match s.state {
-            LangState::Scanned => format!("{} {} sites", s.lang, s.detail),
-            LangState::Abstained => format!("{} abstained", s.lang),
-            LangState::Failed => format!("{} FAILED", s.lang),
-            LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
-            LangState::NotInstalled => format!("{} helper not installed", s.lang),
-        })
-        .collect();
     let mut o = String::new();
-    // Yellow when anything failed: a failure changes what the numbers above it
-    // mean, an abstention or an unsupported language does not.
-    let any_failed = cov.lang_status.iter().any(|s| s.state == LangState::Failed);
-    let line = format!("  languages: {}", parts.join(" \u{00b7} "));
-    let _ = writeln!(
-        o,
-        "{}",
-        paint(&line, if any_failed { "33" } else { "2" }, color)
-    );
+    // The languages roll-call renders only when a language was seen; the
+    // retrievers line below is independent, so a retriever list is never
+    // dropped just because lang_status happens to be empty.
+    if !cov.lang_status.is_empty() {
+        let parts: Vec<String> = cov
+            .lang_status
+            .iter()
+            .map(|s| match s.state {
+                LangState::Scanned => format!("{} {} sites", s.lang, s.detail),
+                LangState::Abstained => format!("{} abstained", s.lang),
+                LangState::Failed => format!("{} FAILED", s.lang),
+                LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
+                LangState::NotInstalled => format!("{} helper not installed", s.lang),
+            })
+            .collect();
+        // Yellow when anything failed: a failure changes what the numbers above
+        // it mean, an abstention or an unsupported language does not.
+        let any_failed = cov.lang_status.iter().any(|s| s.state == LangState::Failed);
+        let line = format!("  languages: {}", parts.join(" \u{00b7} "));
+        let _ = writeln!(
+            o,
+            "{}",
+            paint(&line, if any_failed { "33" } else { "2" }, color)
+        );
+    }
     // Name the helper FILE that ran and where resolution found it. A stale
     // helper shadowing via PATH is invisible in every other line of output —
     // the numbers above simply describe an older scanner than the one the
