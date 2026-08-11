@@ -754,14 +754,22 @@ mod humanize_tests {
 
     #[test]
     fn bound_reasons_read_as_english_and_name_the_missing_thing() {
-        let s = humanize_bound_reason("subprocess", "run", "no bound anywhere and the search was complete");
+        let s = humanize_bound_reason(
+            "subprocess",
+            "run",
+            "no bound anywhere and the search was complete",
+        );
         assert!(s.contains("subprocess.run"), "{s}");
         assert!(s.contains("no timeout or deadline"), "{s}");
         assert!(s.contains("hang indefinitely"), "{s}");
         // The raw engine phrase must not survive to the user.
         assert!(!s.contains("the search was complete"), "{s}");
 
-        let p = humanize_bound_reason("pgxpool.Pool", "Query", "only phase bounds: connect_timeout=5s");
+        let p = humanize_bound_reason(
+            "pgxpool.Pool",
+            "Query",
+            "only phase bounds: connect_timeout=5s",
+        );
         assert!(p.contains("connection phase"), "{p}");
         assert!(p.contains("connect_timeout=5s"), "{p}");
         assert!(p.contains("response read is still unbounded"), "{p}");

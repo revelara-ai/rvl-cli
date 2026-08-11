@@ -570,7 +570,11 @@ mod tests {
             "pkg/testsupport/fake.go",
             "src/testing/harness.py",
         ] {
-            assert_eq!(scope_of(p), ScopeClass::TestSupport, "{p} must be non-production");
+            assert_eq!(
+                scope_of(p),
+                ScopeClass::TestSupport,
+                "{p} must be non-production"
+            );
         }
         // Production paths stay runtime — blocking must still reach a real leak.
         // "latest" contains "test" but not "/test"/"test_"/"testutils", so the
@@ -579,7 +583,10 @@ mod tests {
         // noted, not fixed in this change.)
         assert_eq!(scope_of("internal/api/handler.go"), ScopeClass::Runtime);
         assert_eq!(scope_of("src/server/auth.py"), ScopeClass::Runtime);
-        assert_eq!(scope_of("src/latestrelease/handler.go"), ScopeClass::Runtime);
+        assert_eq!(
+            scope_of("src/latestrelease/handler.go"),
+            ScopeClass::Runtime
+        );
     }
 
     #[test]
