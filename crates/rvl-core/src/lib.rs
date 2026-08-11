@@ -432,6 +432,16 @@ pub fn scope_of(path: &str) -> ScopeClass {
         || p.ends_with("_test.go")
         || p.contains("test_")
         || p.ends_with("conftest.py")
+        // Test-support packages that carry "test" mid-token, so the "/test"
+        // and "test_" guards above miss them (po-x1bla sibling, found when a
+        // judgment promoted `_openmetadata_testutils/…` to BLOCKING). Distinct
+        // enough not to collide with "latest"/"greatest"/"attestation".
+        || p.contains("testutils")
+        || p.contains("test-utils")
+        || p.contains("testsupport")
+        || p.contains("test_support")
+        || p.contains("/testing/")
+        || p.starts_with("testing/")
         // Non-production support material, same severity class as test trees
         // (po-x1bla): example/sample configs, fixtures, testdata and docs ship
         // deliberate dummy credentials, so a secret finding in one is advisory,
@@ -555,12 +565,21 @@ mod tests {
             "docs/impersonation-design.md",
             "internal/fixtures/keys.pem",
             "src/testdata/creds.json",
+            // Mid-token "test" packages the /test and test_ guards miss.
+            "ingestion/src/_openmetadata_testutils/kafka/load_csv_data.py",
+            "pkg/testsupport/fake.go",
+            "src/testing/harness.py",
         ] {
             assert_eq!(scope_of(p), ScopeClass::TestSupport, "{p} must be non-production");
         }
         // Production paths stay runtime — blocking must still reach a real leak.
+        // "latest" contains "test" but not "/test"/"test_"/"testutils", so the
+        // widening must NOT catch it. (A pre-existing narrower imprecision, out
+        // of scope here: "greatest_handler" contains "test_" and so demotes —
+        // noted, not fixed in this change.)
         assert_eq!(scope_of("internal/api/handler.go"), ScopeClass::Runtime);
         assert_eq!(scope_of("src/server/auth.py"), ScopeClass::Runtime);
+        assert_eq!(scope_of("src/latestrelease/handler.go"), ScopeClass::Runtime);
     }
 
     #[test]
