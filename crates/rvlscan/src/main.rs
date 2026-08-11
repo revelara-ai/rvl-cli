@@ -942,7 +942,11 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             lang.env_override(),
             p.display()
         );
-        return Ok(classify_helper(lang, &p, &format!("env:{}", lang.env_override())));
+        return Ok(classify_helper(
+            lang,
+            &p,
+            &format!("env:{}", lang.env_override()),
+        ));
     }
     let base = lang.helper_base();
     // The scripted-helper filename to also look for, for a language whose helper
@@ -3943,7 +3947,10 @@ mod tests {
         };
         let out = render::render_lang_status(&cov, false);
         assert!(out.contains("retrievers:"), "got: {out}");
-        assert!(out.contains("/home/u/.local/bin/pyindex.py (PATH)"), "got: {out}");
+        assert!(
+            out.contains("/home/u/.local/bin/pyindex.py (PATH)"),
+            "got: {out}"
+        );
         assert!(out.contains("/opt/rvlscan/goindex (bundled)"), "got: {out}");
     }
 
