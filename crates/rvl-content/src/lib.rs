@@ -218,10 +218,13 @@ fn allowlisted(value: &str, line: &str) -> bool {
         || (value.starts_with('<') && value.ends_with('>'))
 }
 
-/// Inline allow pragma. `gitleaks:allow` is honored too so a repo migrating
-/// from gitleaks keeps its suppressions.
+/// Inline allow pragma. `rvl:allow` is the canonical form, chosen ahead of the
+/// rvl-cli cutover (the tool is renaming rvlscan -> rvl); it lives in users'
+/// source, so accepting it now means fewer files to migrate later. The older
+/// `rvlscan:allow` stays honored so existing suppressions keep working, and
+/// `gitleaks:allow` so a repo migrating from gitleaks keeps its suppressions.
 fn inline_allow(line: &str) -> bool {
-    line.contains("rvlscan:allow") || line.contains("gitleaks:allow")
+    line.contains("rvl:allow") || line.contains("rvlscan:allow") || line.contains("gitleaks:allow")
 }
 
 /// Shannon entropy of `s` in bits per character.
@@ -470,6 +473,28 @@ pub fn to_sites(findings: &[ContentFinding], snapshot_id: &str) -> Vec<Site> {
             ..Default::default()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod allow_token_tests {
+    use super::*;
+
+    #[test]
+    fn all_three_allow_tokens_suppress_a_secret_on_the_line() {
+        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        for token in ["rvl:allow", "rvlscan:allow", "gitleaks:allow"] {
+            let line = format!("token: {key}  # {token} accepted, not a real secret");
+            assert!(
+                scan_bytes("config.yaml", &line).is_empty(),
+                "`{token}` on the line must suppress the finding"
+            );
+        }
+        // Without a marker, the same line still fires.
+        assert!(
+            !scan_bytes("config.yaml", &format!("token: {key}\n")).is_empty(),
+            "an unmarked secret must still fire"
+        );
+    }
 }
 
 #[cfg(test)]
