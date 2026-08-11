@@ -432,6 +432,22 @@ pub fn scope_of(path: &str) -> ScopeClass {
         || p.ends_with("_test.go")
         || p.contains("test_")
         || p.ends_with("conftest.py")
+        // Non-production support material, same severity class as test trees
+        // (po-x1bla): example/sample configs, fixtures, testdata and docs ship
+        // deliberate dummy credentials, so a secret finding in one is advisory,
+        // never a blocking gate. Matched broadly — `examples/`, `sample_*`,
+        // `/samples/`, `fixtures/`, `testdata/`, `docs/` — because the false
+        // positive that motivated this was `examples/sample_configs/…`.
+        || p.contains("/examples/")
+        || p.starts_with("examples/")
+        || p.contains("/sample")
+        || p.starts_with("sample")
+        || p.contains("/fixtures/")
+        || p.starts_with("fixtures/")
+        || p.contains("/testdata/")
+        || p.starts_with("testdata/")
+        || p.contains("/docs/")
+        || p.starts_with("docs/")
     {
         ScopeClass::TestSupport
     } else if p.starts_with("scripts/")
@@ -523,6 +539,29 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_production_material_is_not_runtime_scoped() {
+        // po-x1bla: a secret in examples/sample_configs fired HIGH + BLOCKING
+        // on OpenMetadata while the identical class in tests/ was demoted to
+        // medium — the classifier knew test trees but not example/sample/doc/
+        // fixture material, which is equally non-production. All of it routes
+        // to TestSupport so the content lane's test_support->medium demotion
+        // reaches it too, and blocking stays reserved for production paths.
+        for p in [
+            "ingestion/examples/sample_configs/drives/sample_drive_data.yaml",
+            "pkg/samples/config.yaml",
+            "app/sample_drive_data.yaml",
+            "docs/impersonation-design.md",
+            "internal/fixtures/keys.pem",
+            "src/testdata/creds.json",
+        ] {
+            assert_eq!(scope_of(p), ScopeClass::TestSupport, "{p} must be non-production");
+        }
+        // Production paths stay runtime — blocking must still reach a real leak.
+        assert_eq!(scope_of("internal/api/handler.go"), ScopeClass::Runtime);
+        assert_eq!(scope_of("src/server/auth.py"), ScopeClass::Runtime);
+    }
 
     #[test]
     fn not_applicable_is_not_a_decided_label() {

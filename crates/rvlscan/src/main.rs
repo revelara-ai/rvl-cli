@@ -461,7 +461,7 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                     .first()
                     .cloned()
                     .unwrap_or_else(|| format!("{} sites", it.site_count)),
-                description: format!("{}.{} \u{2014} {}", short, ck.method, ck.reason),
+                description: render::humanize_bound_reason(short, &ck.method, &ck.reason),
                 disposition: it.disposition.clone(),
                 severity: it.severity.clone(),
                 incident_count: 0,

@@ -618,12 +618,19 @@ fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
     // A judged finding shows its severity; an unjudged one ranks by exposure
     // (blast radius) and says plainly the severity is unrated -- honest about
     // what the scanner knows vs. what a human review still owes it.
+    // Both branches lead with "severity:" so a judged and an unjudged finding
+    // read as the same kind of row (po-lht6p). An unjudged reliability finding
+    // is ADVISORY BY POLICY (un-triaged never blocks), so it is labelled that
+    // way — "not yet graded (advisory)" — rather than as "unrated", which read
+    // as a defect. The real fix for the frequency of ungraded rows is authoring
+    // advisory judgments for the minted classes in the signed cache; this only
+    // stops the ungraded state from looking like a bug.
     let meta = if f.severity.is_empty() {
         let plural = if f.site_count == 1 { "" } else { "s" };
         format!(
-            "exposure: {} \u{00b7} {} site{plural} \u{00b7} severity unrated{ev}",
+            "severity: not yet graded (advisory) \u{00b7} {} site{plural} \u{00b7} exposure {}{ev}",
+            f.site_count,
             exposure_tier(f.site_count),
-            f.site_count
         )
     } else {
         let mut m = format!("severity: {}{ev}", f.severity);
@@ -702,4 +709,65 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
         }
     }
     o
+}
+
+/// Turn a propagation reason into a sentence a human can act on, keyed on the
+/// call class and the raw reason (po-68mlb). The propagation layer's reason
+/// strings are a load-bearing CONTRACT — coverage bucketing string-matches
+/// "no spec" / "truncated" / "depends" on the finding's own `reason` field —
+/// so this rewrite happens ONLY at display assembly and never mutates that
+/// field. The reliability specs for these client classes all bound a call in
+/// TIME (a timeout, deadline, or context), so the missing thing is named as
+/// such rather than as an abstract "bound".
+pub fn humanize_bound_reason(class: &str, method: &str, reason: &str) -> String {
+    let call = format!("{class}.{method}");
+    if reason == "no bound anywhere and the search was complete" {
+        format!(
+            "{call} has no timeout or deadline — not at the call, not on a client or session it is built from, \
+             and not anywhere up the call chain; it can hang indefinitely"
+        )
+    } else if reason == "no bound found and the search was truncated" {
+        format!(
+            "{call}: no timeout found, but the search hit its depth budget before the chain was exhausted — \
+             raise retrieval depth to decide it"
+        )
+    } else if let Some(detail) = reason.strip_prefix("only phase bounds: ") {
+        format!(
+            "{call} bounds only the connection phase ({detail}); the response read is still unbounded and can hang"
+        )
+    } else if reason == "the timeout argument's value did not resolve, and this API has values that mean no bound" {
+        format!(
+            "{call} passes a timeout whose value could not be resolved, and some values of it (None, 0) mean no bound — \
+             confirm the value at the call site"
+        )
+    } else {
+        // Unknown reason shape: fall back to the class plus the raw reason,
+        // so a new propagation reason degrades to today's output, never to a
+        // blank line.
+        format!("{call} — {reason}")
+    }
+}
+
+#[cfg(test)]
+mod humanize_tests {
+    use super::*;
+
+    #[test]
+    fn bound_reasons_read_as_english_and_name_the_missing_thing() {
+        let s = humanize_bound_reason("subprocess", "run", "no bound anywhere and the search was complete");
+        assert!(s.contains("subprocess.run"), "{s}");
+        assert!(s.contains("no timeout or deadline"), "{s}");
+        assert!(s.contains("hang indefinitely"), "{s}");
+        // The raw engine phrase must not survive to the user.
+        assert!(!s.contains("the search was complete"), "{s}");
+
+        let p = humanize_bound_reason("pgxpool.Pool", "Query", "only phase bounds: connect_timeout=5s");
+        assert!(p.contains("connection phase"), "{p}");
+        assert!(p.contains("connect_timeout=5s"), "{p}");
+        assert!(p.contains("response read is still unbounded"), "{p}");
+
+        // Unknown reasons degrade to class + raw reason, never a blank.
+        let u = humanize_bound_reason("x.Y", "z", "some novel reason");
+        assert_eq!(u, "x.Y.z — some novel reason");
+    }
 }
