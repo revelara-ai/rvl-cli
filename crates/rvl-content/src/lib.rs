@@ -489,18 +489,39 @@ mod gitignore_tests {
         fs::write(root.join(".gitignore"), ".env\ndebug/\n").unwrap();
 
         // A gitignored secrets file — must be SKIPPED.
-        fs::write(root.join(".env"), "GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz\n").unwrap();
+        fs::write(
+            root.join(".env"),
+            "GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz\n",
+        )
+        .unwrap();
         fs::create_dir(root.join("debug")).unwrap();
-        fs::write(root.join("debug/notes.txt"), "sk_live_0123456789abcdefghij\n").unwrap();
+        fs::write(
+            root.join("debug/notes.txt"),
+            "sk_live_0123456789abcdefghij\n",
+        )
+        .unwrap();
 
         // A tracked config with a secret — must STILL fire.
-        fs::write(root.join("config.yaml"), "github_token: ghp_zyxwvutsrqponmlkjihgfedcba9876543210\n").unwrap();
+        fs::write(
+            root.join("config.yaml"),
+            "github_token: ghp_zyxwvutsrqponmlkjihgfedcba9876543210\n",
+        )
+        .unwrap();
 
         let findings = scan_root(root);
         let files: Vec<&str> = findings.iter().map(|f| f.file.as_str()).collect();
-        assert!(files.iter().any(|f| f.contains("config.yaml")), "tracked secret must fire: {files:?}");
-        assert!(!files.iter().any(|f| f.contains(".env")), ".env is gitignored, must be skipped: {files:?}");
-        assert!(!files.iter().any(|f| f.contains("debug/")), "debug/ is gitignored, must be skipped: {files:?}");
+        assert!(
+            files.iter().any(|f| f.contains("config.yaml")),
+            "tracked secret must fire: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains(".env")),
+            ".env is gitignored, must be skipped: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("debug/")),
+            "debug/ is gitignored, must be skipped: {files:?}"
+        );
     }
 
     #[test]
@@ -516,10 +537,13 @@ mod gitignore_tests {
         fs::write(
             root.join(".github/workflows/ci.yml"),
             "env:\n  TOKEN: ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
-        ).unwrap();
+        )
+        .unwrap();
         let findings = scan_root(root);
         assert!(
-            findings.iter().any(|f| f.file.contains(".github/workflows/ci.yml")),
+            findings
+                .iter()
+                .any(|f| f.file.contains(".github/workflows/ci.yml")),
             "a secret in a non-ignored dotdir must still fire: {:?}",
             findings.iter().map(|f| &f.file).collect::<Vec<_>>()
         );

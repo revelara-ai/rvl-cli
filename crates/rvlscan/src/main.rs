@@ -3832,8 +3832,12 @@ mod tests {
         std::fs::write(
             root.join("scripts/skilleval/testdata/matrix/csharp-pro/csharp_pro.cs"),
             "class C {}\n",
-        ).unwrap();
-        assert!(language_is_incidental(root, Lang::CSharp), "a lone testdata .cs is incidental");
+        )
+        .unwrap();
+        assert!(
+            language_is_incidental(root, Lang::CSharp),
+            "a lone testdata .cs is incidental"
+        );
 
         std::fs::create_dir_all(root.join("src/api")).unwrap();
         std::fs::write(root.join("src/api/Handler.cs"), "class H {}\n").unwrap();
