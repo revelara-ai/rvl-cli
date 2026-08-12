@@ -494,65 +494,71 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         }
     }
 
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    // Honor .gitignore (po-90lwe): the config lane was walking the whole tree
+    // and reporting findings from a gitignored nested worktree in a backend repo's
+    // pre-commit output. The `ignore` walker applies .gitignore /
+    // .git/info/exclude / parent ignores and treats a nested .git as its own
+    // boundary. hidden(false) keeps .github and other non-ignored dotdirs in
+    // scope; git_global(false) keeps output independent of whose machine ran
+    // it. SKIP_DIRS stays as a belt-and-suspenders filter (vendor/.terraform
+    // are not always gitignored). Mirrors rvl-content::scan_root (po-lqbh2).
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
+        }
+        let path = entry.path();
+        let rel = repo_relative(root, path);
+        if let Some(idx) = retrievers.iter().position(|r| r.matches(&rel)) {
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                out.unparseable_files += 1;
+                continue;
+            };
+            claimed[idx].push((rel, contents));
+            continue;
+        }
+        // Path shapes need no read; bare YAML gets a bounded head read
+        // for content-identified formats and sighting (content is read
+        // locally and dropped either way).
+        let needs_head = rel.ends_with(".yml") || rel.ends_with(".yaml");
+        let head = if needs_head {
+            read_head(path, 4096)
+        } else {
+            String::new()
         };
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            let path = entry.path();
-            if ft.is_dir() {
-                let name = entry.file_name();
-                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if !ft.is_file() {
-                continue;
-            }
-            let rel = repo_relative(root, &path);
-            if let Some(idx) = retrievers.iter().position(|r| r.matches(&rel)) {
-                let Ok(contents) = std::fs::read_to_string(&path) else {
+        // Content-identified formats (no canonical path) get a bounded
+        // head consult before the file degrades to a sighting.
+        if needs_head {
+            if let Some(r) = retrievers.iter().find(|r| r.matches_head(&rel, &head)) {
+                let Ok(contents) = std::fs::read_to_string(path) else {
                     out.unparseable_files += 1;
                     continue;
                 };
-                claimed[idx].push((rel, contents));
+                absorb(
+                    &mut out,
+                    &mut sightings,
+                    &mut declined,
+                    r.retrieve_with_root(root, &rel, &contents, snapshot_id),
+                );
                 continue;
             }
-            // Path shapes need no read; bare YAML gets a bounded head read
-            // for content-identified formats and sighting (content is read
-            // locally and dropped either way).
-            let needs_head = rel.ends_with(".yml") || rel.ends_with(".yaml");
-            let head = if needs_head {
-                read_head(&path, 4096)
-            } else {
-                String::new()
-            };
-            // Content-identified formats (no canonical path) get a bounded
-            // head consult before the file degrades to a sighting.
-            if needs_head {
-                if let Some(r) = retrievers.iter().find(|r| r.matches_head(&rel, &head)) {
-                    let Ok(contents) = std::fs::read_to_string(&path) else {
-                        out.unparseable_files += 1;
-                        continue;
-                    };
-                    absorb(
-                        &mut out,
-                        &mut sightings,
-                        &mut declined,
-                        r.retrieve_with_root(root, &rel, &contents, snapshot_id),
-                    );
-                    continue;
-                }
-            }
-            // No retriever claimed this file. Whether that means the format is
-            // unsupported or merely that this file carries nothing to retrieve
-            // is decided once, below, where the registry is in scope.
-            if let Some(fmt) = sight_format(&rel, &head) {
-                *sightings.entry(fmt.to_string()).or_insert(0) += 1;
-            }
+        }
+        // No retriever claimed this file. Whether that means the format is
+        // unsupported or merely that this file carries nothing to retrieve
+        // is decided once, below, where the registry is in scope.
+        if let Some(fmt) = sight_format(&rel, &head) {
+            *sightings.entry(fmt.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -793,6 +799,41 @@ mod tests {
         assert_eq!(sight_format("Pipfile", ""), Some("pipfile"));
         assert_eq!(sight_format("mix.exs", ""), Some("mix"));
         assert_eq!(sight_format("build.sbt", ""), Some("sbt"));
+    }
+
+    #[test]
+    fn retrieve_repo_skips_gitignored_config_files() {
+        // po-90lwe: the config lane walked the whole tree and reported findings
+        // from a gitignored nested worktree (.claude/worktrees/…) in a backend repo's
+        // pre-commit hook output. It must honor .gitignore like the content
+        // lane (po-lqbh2), while still scanning non-ignored dotdirs (.github).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), ".claude/\nlocal.tf\n").unwrap();
+        // Tracked config — must be retrieved.
+        std::fs::write(root.join("main.tf"), "resource \"x\" \"y\" {}\n").unwrap();
+        // Gitignored config — must be SKIPPED.
+        std::fs::write(root.join("local.tf"), "resource \"secret\" \"z\" {}\n").unwrap();
+        std::fs::create_dir_all(root.join(".claude/worktrees/w")).unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/w/infra.tf"),
+            "resource \"nested\" \"q\" {}\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets.iter().any(|p| p.unit == "resource:x.y"),
+            "tracked main.tf must be retrieved: {:?}",
+            got.packets
+        );
+        assert!(
+            got.packets
+                .iter()
+                .all(|p| !p.file_path.contains(".claude/") && p.file_path != "local.tf"),
+            "gitignored config must not be retrieved: {:?}",
+            got.packets
+        );
     }
 
     #[test]
