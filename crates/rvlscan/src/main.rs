@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod out_doc;
 mod render;
 mod report;
 mod shared_config;
@@ -542,17 +543,6 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// One finding row. Mirrors the rvl-eval `run` emitter so the eval harness
-/// can score a scan output without a conversion step.
-#[derive(serde::Serialize)]
-struct FindingOut {
-    site_id: String,
-    snapshot_id: String,
-    verdict: String,
-    reason: String,
-    class: String,
 }
 
 /// Map triaged items to renderable findings. Incident-linkage fields
@@ -2435,6 +2425,29 @@ fn render_scan_output(
     // verbatim, from any directory, without re-running this scan's inputs.
     save_last_scan(state_path, path, &ladder_findings);
 
+    // The gate verdict, computed ONCE from the same `classify` the footer
+    // uses, then shared by the printed ladder, the --out document's `exit`
+    // field, and the process exit code, so no pair of them can ever disagree
+    // (po-av01j.94's invariant, extended to the document).
+    let blocked = render::blocking_count(&ladder_findings) > 0;
+
+    // Build the structured scan document (rvlscan-scan/v1) BEFORE the ladder
+    // render consumes `coverage`. Deterministic-engine truth only; the agent
+    // block rides as an opaque, provenance-tagged string.
+    let doc = out.map(|_| {
+        out_doc::build(
+            &ladder_findings,
+            &coverage,
+            config.map(|lane| &lane.coverage),
+            findings,
+            sites,
+            hook_agent
+                .map(|a| a.block.as_str())
+                .filter(|b| !b.is_empty()),
+            blocked,
+        )
+    });
+
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
         "{}",
@@ -2454,26 +2467,15 @@ fn render_scan_output(
         }
     }
 
-    if let Some(p) = out {
-        let rows: Vec<FindingOut> = findings
-            .iter()
-            .zip(sites.iter())
-            .map(|(f, s)| FindingOut {
-                site_id: f.site_id.clone(),
-                snapshot_id: s.snapshot_id.clone(),
-                verdict: f.verdict.as_str().to_string(),
-                reason: f.reason.clone(),
-                class: rvl_triage::class_key_string(s),
-            })
-            .collect();
-        std::fs::write(p, serde_json::to_string_pretty(&rows)?)?;
+    if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
+        std::fs::write(p, serde_json::to_string_pretty(doc)?)?;
         println!("\nwrote {}", p.display());
     }
     // The gate. Both scan paths (packet stream and incremental) funnel through
     // here, so this is the single place the blocking verdict becomes a process
     // status — derived from the same `classify` the footer used, never a second
     // opinion. See EXIT_BLOCKED for the full contract.
-    if render::blocking_count(&ladder_findings) > 0 {
+    if blocked {
         return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
