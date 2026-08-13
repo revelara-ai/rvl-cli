@@ -3225,6 +3225,51 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
     assert!(body.contains(r#""idempotency_key":""#), "{body}");
 }
 
+/// `--dry-run` validates and normalizes without submitting (po-4g59y):
+/// machine-readable JSON summary on stdout, human framing on stderr, no
+/// HTTP request at all. The API URL points at an unroutable port to prove
+/// nothing is sent.
+#[test]
+fn scan_submission_dry_run_prints_summary_and_never_posts() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--dry-run"])
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        // Unroutable: a request attempt would error, so success proves
+        // the dry run never touched the network.
+        .env("RVL_API_URL", "http://127.0.0.1:9")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "dry run failed: {stdout}\n{stderr}");
+
+    assert!(
+        stderr.contains("Dry run - would submit to http://127.0.0.1:9"),
+        "{stderr}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be the JSON summary");
+    assert_eq!(summary["dry_run"], serde_json::Value::Bool(true));
+    assert_eq!(summary["service"], "checkout-api");
+    assert_eq!(summary["findings"], 2);
+    assert_eq!(summary["scan_type"], "full");
+    // po-gli2z counts ride the summary so CI can assert no STPA loss.
+    assert_eq!(summary["findings_with_stpa"], 1);
+    assert_eq!(summary["findings_coerced"], 2);
+    assert_eq!(summary["findings_with_dropped"], 0);
+    // No --target flag given: the key is absent, mirroring rvl-cli.
+    assert!(summary.get("target").is_none(), "{stdout}");
+}
+
 /// `--cleanup-on-success` removes the scan-parts directory after a 2xx.
 #[test]
 fn scan_submission_cleanup_on_success_removes_parts() {

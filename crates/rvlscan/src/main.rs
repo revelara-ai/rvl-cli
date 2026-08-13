@@ -134,6 +134,10 @@ enum Cmd {
         /// submit.
         #[arg(long)]
         cleanup_on_success: bool,
+        /// Submission mode: validate, normalize, and print the submit
+        /// summary (JSON on stdout) without submitting.
+        #[arg(long)]
+        dry_run: bool,
         /// Submission mode: HTTP submission timeout (e.g. 90, 90s, 2m;
         /// default 60s or RVL_SCAN_TIMEOUT).
         #[arg(long)]
@@ -3631,10 +3635,11 @@ fn run() -> anyhow::Result<ExitCode> {
             file,
             scan_dir,
             cleanup_on_success,
+            dry_run,
             timeout,
             format,
             ..
-        } if stdin || file.is_some() || scan_dir.is_some() || service.is_some() => {
+        } if stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run => {
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
@@ -3643,6 +3648,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     file,
                     scan_dir,
                     cleanup_on_success,
+                    dry_run,
                     timeout,
                     format,
                 },

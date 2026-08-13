@@ -1098,6 +1098,9 @@ pub struct SubmitArgs {
     pub file: Option<PathBuf>,
     pub scan_dir: Option<PathBuf>,
     pub cleanup_on_success: bool,
+    /// Validate, normalize, and print the submit summary without
+    /// submitting (po-4g59y contract: JSON on stdout, framing on stderr).
+    pub dry_run: bool,
     pub timeout: Option<String>,
     pub format: Option<String>,
 }
@@ -1247,6 +1250,50 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         OutputFormat::Json => "ci".to_string(),
         OutputFormat::Text => "auto".to_string(),
     };
+
+    // Dry run (po-4g59y): machine-readable summary on stdout so the scan
+    // skill and CI can parse it, human framing on stderr, no submit.
+    // serde_json's default Map is sorted, matching Go's map-key encoding,
+    // so the two CLIs emit byte-comparable summaries.
+    if args.dry_run {
+        eprintln!("Dry run - would submit to {}:", client.api_url);
+        let mut summary = serde_json::Map::new();
+        summary.insert("dry_run".into(), Value::Bool(true));
+        summary.insert("api_url".into(), Value::String(client.api_url.clone()));
+        summary.insert("service".into(), Value::String(req.service.clone()));
+        summary.insert("mode".into(), Value::String(req.scan_mode.clone()));
+        summary.insert("scan_type".into(), Value::String(req.scan_type.clone()));
+        summary.insert(
+            "findings".into(),
+            Value::from(req.findings.as_ref().map(Vec::len).unwrap_or(0)),
+        );
+        // po-gli2z: normalization counts so CI can assert no STPA loss.
+        summary.insert(
+            "findings_with_stpa".into(),
+            Value::from(norm_report.with_stpa),
+        );
+        summary.insert(
+            "findings_coerced".into(),
+            Value::from(norm_report.coerced_findings),
+        );
+        summary.insert(
+            "findings_with_dropped".into(),
+            Value::from(norm_report.dropped_findings),
+        );
+        summary.insert(
+            "dropped_fields".into(),
+            Value::from(norm_report.dropped_fields),
+        );
+        if args.target.is_some() {
+            summary.insert("target".into(), Value::String(target.display().to_string()));
+        }
+        match serde_json::to_string_pretty(&Value::Object(summary)) {
+            Ok(s) => println!("{s}"),
+            Err(e) => return fail(Failure::runtime(format!("Error encoding summary: {e}"))),
+        }
+        print_stpa_loss_banner(&norm_report);
+        return ExitCode::SUCCESS;
+    }
 
     // Warn (don't block) when findings have no component and no
     // linked_services: they land at the bare project label and split
