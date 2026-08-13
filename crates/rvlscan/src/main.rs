@@ -48,6 +48,13 @@ enum Cmd {
     ///
     /// Exit codes: 0 = clean, 3 = BLOCKING findings remain (the gate fires),
     /// 1 = the scan could not complete, 2 = usage error.
+    ///
+    /// SUBMISSION MODE (rvl-cli parity, po-av01j.153): when `--scan-dir`,
+    /// `--file`, `--stdin`, or `--service` is present, this command instead
+    /// submits risk findings to the Revelara risk register — same flags and
+    /// wire contract as `rvl scan --service <name> --scan-dir <dir>`, so
+    /// plugin skill content works against this binary verbatim. The
+    /// deterministic scan above is untouched when none of those flags appear.
     Scan {
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
@@ -106,6 +113,36 @@ enum Cmd {
         /// BLOCKING row — see EXIT_BLOCKED.
         #[arg(long)]
         hook: Option<String>,
+        /// Submission mode: service name the findings belong to (selects
+        /// submission when combined with --scan-dir/--file/--stdin).
+        #[arg(long, short = 's')]
+        service: Option<String>,
+        /// Submission mode: project directory the scan describes (default:
+        /// cwd); git_commit/git_branch metadata come from here.
+        #[arg(long, short = 't')]
+        target: Option<PathBuf>,
+        /// Submission mode: read findings JSON from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Submission mode: read findings from a file.
+        #[arg(long, short = 'f')]
+        file: Option<PathBuf>,
+        /// Submission mode: merge all *.json part files from a directory.
+        #[arg(long)]
+        scan_dir: Option<PathBuf>,
+        /// Submission mode: remove --scan-dir contents after a successful
+        /// submit.
+        #[arg(long)]
+        cleanup_on_success: bool,
+        /// Submission mode: HTTP submission timeout (e.g. 90, 90s, 2m;
+        /// default 60s or RVL_SCAN_TIMEOUT).
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Submission mode: output format (text|json). json mirrors
+        /// rvl-cli's CI contract: response JSON on stdout, exit 1 when
+        /// critical/high findings were reported.
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method`, the language it
@@ -3582,6 +3619,36 @@ fn run() -> anyhow::Result<ExitCode> {
     // config/exit-code contract inside rvl-data (rvl-cli parity) and never
     // touch the spec cache, so they dispatch before the store opens.
     let cmd = match cmd {
+        // Scan SUBMISSION mode (po-av01j.153): `--scan-dir`/`--file`/
+        // `--stdin` (or a lone `--service`, which rvl-cli answers with its
+        // "must specify an input" error) routes to the ported rvl-cli
+        // submit surface. Dispatches before the store opens: submission
+        // needs API credentials, never the spec cache.
+        Cmd::Scan {
+            service,
+            target,
+            stdin,
+            file,
+            scan_dir,
+            cleanup_on_success,
+            timeout,
+            format,
+            ..
+        } if stdin || file.is_some() || scan_dir.is_some() || service.is_some() => {
+            return Ok(rvl_data::scan_submit::run(
+                rvl_data::scan_submit::SubmitArgs {
+                    service,
+                    target,
+                    stdin,
+                    file,
+                    scan_dir,
+                    cleanup_on_success,
+                    timeout,
+                    format,
+                },
+                env!("CARGO_PKG_VERSION"),
+            ));
+        }
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
@@ -3608,6 +3675,7 @@ fn run() -> anyhow::Result<ExitCode> {
             changed_only,
             agent,
             hook,
+            ..
         } => {
             if agent {
                 agent_alias_notice();
@@ -5149,6 +5217,98 @@ mod tests {
         match cli.cmd {
             Some(Cmd::Scan { agent, path, .. }) => {
                 assert!(agent);
+                assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn scan_submission_flags_parse_like_rvl_cli() {
+        // The submission surface (po-av01j.153): flag names match rvl-cli
+        // exactly so existing skill content invoking
+        // `rvl scan --service X --target Y --scan-dir DIR` works verbatim.
+        let cli = Cli::try_parse_from([
+            "rvlscan",
+            "scan",
+            "--service",
+            "checkout-api",
+            "--target",
+            "/tmp/proj",
+            "--scan-dir",
+            ".revelara/scan-parts",
+            "--cleanup-on-success",
+            "--timeout",
+            "90s",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                service,
+                target,
+                scan_dir,
+                cleanup_on_success,
+                timeout,
+                format,
+                stdin,
+                file,
+                ..
+            }) => {
+                assert_eq!(service.as_deref(), Some("checkout-api"));
+                assert_eq!(target, Some(PathBuf::from("/tmp/proj")));
+                assert_eq!(scan_dir, Some(PathBuf::from(".revelara/scan-parts")));
+                assert!(cleanup_on_success);
+                assert_eq!(timeout.as_deref(), Some("90s"));
+                assert_eq!(format.as_deref(), Some("json"));
+                assert!(!stdin);
+                assert!(file.is_none());
+            }
+            _ => panic!("expected scan"),
+        }
+
+        // Short-flag spellings (-s/-t/-f) and --stdin.
+        let cli = Cli::try_parse_from([
+            "rvlscan",
+            "scan",
+            "-s",
+            "svc",
+            "-t",
+            ".",
+            "-f",
+            "findings.json",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { service, file, .. }) => {
+                assert_eq!(service.as_deref(), Some("svc"));
+                assert_eq!(file, Some(PathBuf::from("findings.json")));
+            }
+            _ => panic!("expected scan"),
+        }
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "--service", "svc", "--stdin"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { stdin, .. }) => assert!(stdin),
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn plain_scan_parses_without_submission_flags() {
+        // The deterministic scan surface is untouched: no submission flag,
+        // no submission routing inputs set.
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                service,
+                scan_dir,
+                file,
+                stdin,
+                path,
+                ..
+            }) => {
+                assert!(service.is_none() && scan_dir.is_none() && file.is_none() && !stdin);
                 assert_eq!(path, Some(PathBuf::from("some/path")));
             }
             _ => panic!("expected scan"),

@@ -24,6 +24,8 @@ pub mod evidence;
 pub mod gojson;
 pub mod knowledge;
 pub mod risk;
+pub mod scan_normalize;
+pub mod scan_submit;
 
 use std::process::ExitCode;
 
