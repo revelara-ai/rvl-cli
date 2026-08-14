@@ -270,7 +270,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, foresight, enrich)
+    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, relationships, graph, foresight, enrich, health)
     Knowledge {
         #[command(subcommand)]
         cmd: rvl_data::knowledge::KnowledgeCmd,
@@ -5565,6 +5565,26 @@ mod tests {
                 "--control=RC-018",
                 "--technology=go",
             ],
+            // The rvl-cli knowledge usage examples, verbatim.
+            vec![
+                "rvlscan",
+                "knowledge",
+                "relationships",
+                "fact",
+                "fact_abc12",
+                "--format=json",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "graph",
+                "fact",
+                "fact_abc12",
+                "--depth=2",
+                "--min-strength=0.3",
+                "--type=causes,mitigates",
+            ],
+            vec!["rvlscan", "knowledge", "health"],
             vec![
                 "rvlscan",
                 "evidence",
@@ -5600,6 +5620,9 @@ mod tests {
             vec!["rvlscan", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
             vec!["rvlscan", "knowledge", "enrich", "--bogus"],
             vec!["rvlscan", "knowledge", "foresight", "--min-strength=abc"], // not a number
+            vec!["rvlscan", "knowledge", "relationships", "fact"],           // missing entity id
+            vec!["rvlscan", "knowledge", "graph", "fact", "f1", "--depth=0"], // depth must be >= 1
+            vec!["rvlscan", "knowledge", "health", "--bogus"],
         ] {
             let joined = argv.join(" ");
             assert!(

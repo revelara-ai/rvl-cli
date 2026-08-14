@@ -1,8 +1,8 @@
 //! Slice (c): `knowledge` read commands ported from rvl-cli
 //! `internal/commands/knowledge.go`: `search`, `facts`, `procedures`,
 //! `patterns`, plus (po-av01j.160) `graph-search`, `foresight`, and
-//! `enrich`. The remaining subcommands (graph, relationships, health) are
-//! follow-up work — see the beads filed on the parent epic.
+//! `enrich`, plus (po-av01j.161) `relationships`, `graph`, and `health` —
+//! the full read surface is now ported.
 //!
 //! JSON parity: search/facts/patterns print the server body verbatim, as
 //! does `foresight --format=json`; `procedures --control=RC-XXX
@@ -12,7 +12,7 @@
 
 use crate::client::Client;
 use crate::display;
-use crate::gojson::{compact, pretty, query_encode, query_escape, G};
+use crate::gojson::{compact, path_escape, pretty, query_encode, query_escape, G};
 use crate::{CmdResult, Failure, BIN};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -104,6 +104,32 @@ pub enum KnowledgeCmd {
         #[arg(long)]
         format: Option<String>,
     },
+    /// List relationships for a knowledge entity
+    Relationships {
+        /// Entity type: fact, procedure, pattern, service, technology, control
+        entity_type: String,
+        /// Entity ID (e.g. fact_abc12)
+        entity_id: String,
+        /// Output format: table (default) or json
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Traverse the knowledge graph from an entity
+    Graph {
+        /// Entity type: fact, procedure, pattern, service, technology, control
+        entity_type: String,
+        /// Entity ID (e.g. fact_abc12)
+        entity_id: String,
+        /// Traversal depth (default 3)
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+        depth: u32,
+        /// Minimum edge strength (default 0.3); passed to the server verbatim
+        #[arg(long, default_value = "0.3")]
+        min_strength: String,
+        /// Comma-separated relation types to follow (e.g. causes,mitigates)
+        #[arg(long = "type")]
+        relation_type: Option<String>,
+    },
     /// Graph-expanded semantic search (search + graph neighbors)
     GraphSearch {
         /// Search query (words are joined with spaces)
@@ -161,6 +187,8 @@ pub enum KnowledgeCmd {
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
+    /// Show knowledge base health statistics
+    Health,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -376,6 +404,65 @@ struct ForesightResponse {
     metadata: ForesightMetadata,
 }
 
+/// A relationship from the knowledge API (rvl-cli's
+/// KnowledgeRelationship; only the fields the table render reads).
+#[derive(Debug, Default, Deserialize)]
+struct Relationship {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    relation_type: String,
+    #[serde(default)]
+    source_type: String,
+    #[serde(default)]
+    source_label: String,
+    #[serde(default)]
+    target_type: String,
+    #[serde(default)]
+    target_label: String,
+    #[serde(default)]
+    strength: f64,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    observation_count: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelationshipsResponse {
+    #[serde(default)]
+    relationships: Vec<Relationship>,
+    #[serde(default)]
+    total: i64,
+}
+
+/// A node from graph traversal (rvl-cli's KnowledgeTraversalResult).
+#[derive(Debug, Default, Deserialize)]
+struct TraversalNode {
+    #[serde(default)]
+    entity_type: String,
+    #[serde(default)]
+    entity_id: String,
+    #[serde(default)]
+    entity_label: String,
+    #[serde(default)]
+    relation_type: String,
+    #[serde(default)]
+    strength: f64,
+    #[serde(default)]
+    depth: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TraversalResponse {
+    #[serde(default)]
+    results: Vec<TraversalNode>,
+    #[serde(default)]
+    total: i64,
+}
+
 /// Knowledge base health stats (rvl-cli's KnowledgeHealth).
 #[derive(Debug, Default, Deserialize)]
 struct Health {
@@ -483,6 +570,31 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     format.as_deref(),
                 )
             }
+            KnowledgeCmd::Relationships {
+                entity_type,
+                entity_id,
+                format,
+            } => {
+                let (_, client) = crate::client::load_and_resolve()?;
+                relationships_output(&client, &entity_type, &entity_id, format.as_deref())
+            }
+            KnowledgeCmd::Graph {
+                entity_type,
+                entity_id,
+                depth,
+                min_strength,
+                relation_type,
+            } => {
+                let (_, client) = crate::client::load_and_resolve()?;
+                graph_output(
+                    &client,
+                    &entity_type,
+                    &entity_id,
+                    depth,
+                    &min_strength,
+                    relation_type.as_deref(),
+                )
+            }
             KnowledgeCmd::GraphSearch {
                 query,
                 limit,
@@ -535,6 +647,10 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     query.as_deref(),
                     limit,
                 )
+            }
+            KnowledgeCmd::Health => {
+                let (_, client) = crate::client::load_and_resolve()?;
+                health_output(&client)
             }
         }
     })();
@@ -991,6 +1107,184 @@ fn render_graph_search(resp: &GraphSearchResponse, query: &str) -> String {
     out
 }
 
+pub fn relationships_output(
+    client: &Client,
+    entity_type: &str,
+    entity_id: &str,
+    format: Option<&str>,
+) -> CmdResult {
+    // po-4xrz5 (carried from rvl-cli): URL-encode the path segments so
+    // entity ids with /, ?, # don't smuggle.
+    let url = format!(
+        "{}/api/knowledge/entities/{}/{}/relationships",
+        client.api_url,
+        path_escape(entity_type),
+        path_escape(entity_id)
+    );
+    let resp = client
+        .request("GET", &url, None)
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+
+    // rvl-cli only compares --format against "json"; any other value
+    // falls through to the table render, unvalidated. Mirror that quirk.
+    if format == Some("json") {
+        return Ok(format!("{}\n", String::from_utf8_lossy(&resp)));
+    }
+
+    let parsed: RelationshipsResponse = serde_json::from_slice(&resp)
+        .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
+    Ok(render_relationships(&parsed, entity_type, entity_id))
+}
+
+fn render_relationships(
+    resp: &RelationshipsResponse,
+    entity_type: &str,
+    entity_id: &str,
+) -> String {
+    let mut out = String::new();
+    if resp.total == 0 {
+        let _ = writeln!(out, "No relationships found for {entity_type} {entity_id}");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "Relationships for {entity_type} {entity_id} ({} total):\n",
+        resp.total
+    );
+    for rel in &resp.relationships {
+        let dir_icon = if rel.direction == "bidirectional" {
+            " <-> "
+        } else {
+            " -> "
+        };
+        let _ = write!(
+            out,
+            "  {} [{}]{dir_icon}{} [{}] (strength: {:.0}%",
+            rel.source_label,
+            rel.source_type,
+            rel.target_label,
+            rel.target_type,
+            rel.strength * 100.0
+        );
+        if rel.observation_count > 1 {
+            let _ = write!(out, ", seen {}x", rel.observation_count);
+        }
+        out.push_str(")\n");
+        let _ = writeln!(out, "    Relation: {}  ID: {}", rel.relation_type, rel.id);
+        if let Some(ev) = rel.evidence.first() {
+            let _ = writeln!(out, "    Evidence: {ev}");
+        }
+    }
+    out
+}
+
+pub fn graph_output(
+    client: &Client,
+    entity_type: &str,
+    entity_id: &str,
+    depth: u32,
+    min_strength: &str,
+    relation_type: Option<&str>,
+) -> CmdResult {
+    // rvl-cli builds this URL with fmt.Sprintf and — unlike relationships
+    // (po-4xrz5) — does NOT path-escape the entity segments or the
+    // min_strength/relation_type values. Mirror that byte-for-byte.
+    let mut url = format!(
+        "{}/api/knowledge/entities/{entity_type}/{entity_id}/graph?max_depth={depth}&min_strength={min_strength}",
+        client.api_url
+    );
+    if let Some(rt) = relation_type {
+        if !rt.is_empty() {
+            let _ = write!(url, "&relation_type={rt}");
+        }
+    }
+    let resp = client
+        .request("GET", &url, None)
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+    let parsed: TraversalResponse = serde_json::from_slice(&resp)
+        .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
+    Ok(render_graph(&parsed, entity_type, entity_id))
+}
+
+fn render_graph(resp: &TraversalResponse, entity_type: &str, entity_id: &str) -> String {
+    let mut out = String::new();
+    if resp.total == 0 {
+        let _ = writeln!(
+            out,
+            "No connected nodes found from {entity_type} {entity_id}"
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "Graph traversal from {entity_type} {entity_id} ({} nodes):\n",
+        resp.total
+    );
+
+    // Group by depth for readability, exactly like the Go render: a
+    // "Depth N:" header per level from 1 to the max observed depth.
+    let max_depth = resp.results.iter().map(|n| n.depth).max().unwrap_or(0);
+    for d in 1..=max_depth {
+        let _ = writeln!(out, "  Depth {d}:");
+        for n in resp.results.iter().filter(|n| n.depth == d) {
+            let indent = "  ".repeat(d.max(0) as usize);
+            let _ = writeln!(
+                out,
+                "  {indent}-[{}]-> {} [{}] (strength: {:.0}%)",
+                n.relation_type,
+                n.entity_label,
+                n.entity_type,
+                n.strength * 100.0
+            );
+            let _ = writeln!(out, "  {indent}         ID: {}", n.entity_id);
+        }
+    }
+    out
+}
+
+pub fn health_output(client: &Client) -> CmdResult {
+    let url = format!("{}/api/knowledge/health", client.api_url);
+    let resp = client
+        .request("GET", &url, None)
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+    let parsed: Health = serde_json::from_slice(&resp)
+        .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
+    Ok(render_health(&parsed))
+}
+
+fn render_health(health: &Health) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Knowledge Base Health\n");
+    write_health_lines(&mut out, health);
+    out
+}
+
+/// The health stat lines; rvl-cli renders them identically in both the
+/// `health` command and the `enrich` Knowledge Health section.
+fn write_health_lines(out: &mut String, health: &Health) {
+    let total = health.total_facts + health.total_procedures + health.total_patterns;
+    let _ = writeln!(out, "  Total Items:       {total}");
+    let _ = writeln!(out, "    Facts:           {}", health.total_facts);
+    let _ = writeln!(out, "    Procedures:      {}", health.total_procedures);
+    let _ = writeln!(out, "    Patterns:        {}", health.total_patterns);
+    let _ = writeln!(
+        out,
+        "  Validated:         {:.0}%",
+        health.validated_percentage
+    );
+    let _ = writeln!(
+        out,
+        "  Avg Confidence:    {:.0}%",
+        health.avg_confidence * 100.0
+    );
+    if health.stale_count > 0 {
+        let _ = writeln!(out, "  Stale:             {}", health.stale_count);
+    }
+    if health.contradiction_count > 0 {
+        let _ = writeln!(out, "  Contradictions:    {}", health.contradiction_count);
+    }
+}
+
 /// The POST /api/knowledge/foresight body: Go's `map[string]interface{}`
 /// marshal (sorted keys: depth, entity_id, entity_type,
 /// include_mitigations, min_strength, relation_types; relation_types only
@@ -1350,28 +1644,8 @@ fn render_enrich(
     }
 
     // --- Health ---
-    let total = health.total_facts + health.total_procedures + health.total_patterns;
     let _ = writeln!(out, "\n=== Knowledge Health ===\n");
-    let _ = writeln!(out, "  Total Items:       {total}");
-    let _ = writeln!(out, "    Facts:           {}", health.total_facts);
-    let _ = writeln!(out, "    Procedures:      {}", health.total_procedures);
-    let _ = writeln!(out, "    Patterns:        {}", health.total_patterns);
-    let _ = writeln!(
-        out,
-        "  Validated:         {:.0}%",
-        health.validated_percentage
-    );
-    let _ = writeln!(
-        out,
-        "  Avg Confidence:    {:.0}%",
-        health.avg_confidence * 100.0
-    );
-    if health.stale_count > 0 {
-        let _ = writeln!(out, "  Stale:             {}", health.stale_count);
-    }
-    if health.contradiction_count > 0 {
-        let _ = writeln!(out, "  Contradictions:    {}", health.contradiction_count);
-    }
+    write_health_lines(&mut out, health);
     out
 }
 
@@ -1691,5 +1965,114 @@ mod tests {
         // Optional sections stay hidden without --technology/--query.
         assert!(!out.contains("=== Facts for"), "{out}");
         assert!(!out.contains("=== Search Results"), "{out}");
+    }
+
+    // --- relationships ---
+
+    #[test]
+    fn relationships_render_directions_observations_and_evidence() {
+        let resp: RelationshipsResponse = serde_json::from_str(
+            r#"{"relationships":[
+                {"id":"rel_1","relation_type":"causes","source_type":"fact","source_id":"fact_a1","source_label":"Redis timeout","target_type":"pattern","target_id":"pat_b2","target_label":"Retry storm","strength":0.8,"direction":"outbound","evidence":["INC-1234","INC-9"],"observation_count":3},
+                {"id":"rel_2","relation_type":"correlates_with","source_type":"pattern","source_id":"pat_b2","source_label":"Retry storm","target_type":"service","target_id":"svc_c3","target_label":"checkout-api","strength":0.45,"direction":"bidirectional","observation_count":1}
+            ],"total":2}"#,
+        )
+        .unwrap();
+        let out = render_relationships(&resp, "fact", "fact_a1");
+        // Exact Go format string: `"  %s [%s]%s%s [%s] (strength: %s"` with
+        // dirIcon " -> " / " <-> ", then optional ", seen Nx" and ")".
+        let want = concat!(
+            "Relationships for fact fact_a1 (2 total):\n",
+            "\n",
+            "  Redis timeout [fact] -> Retry storm [pattern] (strength: 80%, seen 3x)\n",
+            "    Relation: causes  ID: rel_1\n",
+            "    Evidence: INC-1234\n",
+            "  Retry storm [pattern] <-> checkout-api [service] (strength: 45%)\n",
+            "    Relation: correlates_with  ID: rel_2\n",
+        );
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn relationships_render_empty_total() {
+        let resp = RelationshipsResponse::default();
+        assert_eq!(
+            render_relationships(&resp, "fact", "fact_abc12"),
+            "No relationships found for fact fact_abc12\n"
+        );
+    }
+
+    // --- graph ---
+
+    #[test]
+    fn graph_render_groups_by_depth_with_go_indentation() {
+        let resp: TraversalResponse = serde_json::from_str(
+            r#"{"results":[
+                {"entity_type":"pattern","entity_id":"pat_b2","entity_label":"Retry storm","relation_type":"causes","strength":0.8,"depth":1},
+                {"entity_type":"service","entity_id":"svc_c3","entity_label":"checkout-api","relation_type":"impacts","strength":0.6,"depth":2},
+                {"entity_type":"control","entity_id":"ctl_d4","entity_label":"RC-018 Timeouts","relation_type":"mitigates","strength":0.9,"depth":1}
+            ],"total":3}"#,
+        )
+        .unwrap();
+        let out = render_graph(&resp, "fact", "fact_a1");
+        // Indent per node is "  " + "  "*depth, exactly Go's
+        // `"  %s-[%s]-> ..."` with strings.Repeat("  ", depth).
+        let want = concat!(
+            "Graph traversal from fact fact_a1 (3 nodes):\n",
+            "\n",
+            "  Depth 1:\n",
+            "    -[causes]-> Retry storm [pattern] (strength: 80%)\n",
+            "             ID: pat_b2\n",
+            "    -[mitigates]-> RC-018 Timeouts [control] (strength: 90%)\n",
+            "             ID: ctl_d4\n",
+            "  Depth 2:\n",
+            "      -[impacts]-> checkout-api [service] (strength: 60%)\n",
+            "               ID: svc_c3\n",
+        );
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn graph_render_empty_total() {
+        let resp = TraversalResponse::default();
+        assert_eq!(
+            render_graph(&resp, "fact", "fact_abc12"),
+            "No connected nodes found from fact fact_abc12\n"
+        );
+    }
+
+    // --- health ---
+
+    #[test]
+    fn health_render_matches_go_layout() {
+        let health: Health = serde_json::from_str(
+            r#"{"total_facts":10,"total_procedures":5,"total_patterns":3,"validated_percentage":80,"avg_confidence":0.75,"stale_count":2,"contradiction_count":1}"#,
+        )
+        .unwrap();
+        let want = concat!(
+            "Knowledge Base Health\n",
+            "\n",
+            "  Total Items:       18\n",
+            "    Facts:           10\n",
+            "    Procedures:      5\n",
+            "    Patterns:        3\n",
+            "  Validated:         80%\n",
+            "  Avg Confidence:    75%\n",
+            "  Stale:             2\n",
+            "  Contradictions:    1\n",
+        );
+        assert_eq!(render_health(&health), want);
+    }
+
+    #[test]
+    fn health_render_hides_zero_stale_and_contradictions() {
+        let health: Health = serde_json::from_str(
+            r#"{"total_facts":1,"total_procedures":0,"total_patterns":0,"validated_percentage":100,"avg_confidence":1}"#,
+        )
+        .unwrap();
+        let out = render_health(&health);
+        assert!(!out.contains("Stale:"), "{out}");
+        assert!(!out.contains("Contradictions:"), "{out}");
+        assert!(out.contains("  Total Items:       1\n"), "{out}");
     }
 }
