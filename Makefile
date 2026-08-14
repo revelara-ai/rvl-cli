@@ -4,11 +4,20 @@
 # pyindex, tsindex, javaindex, rustindex) at runtime in this order: an env
 # override (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_TSINDEX /
 # RVLSCAN_JAVAINDEX / RVLSCAN_RUSTINDEX), then a helper sitting NEXT TO the
-# rvlscan binary, then PATH. The `helpers` target populates that adjacent slot
-# so a locally built `rvlscan scan` needs no env var — the same layout a
-# release archive ships. rustindex is a workspace crate, so a plain `cargo
-# build` already lands it next to rvlscan; it needs rust-analyzer at runtime
-# (`rustup component add rust-analyzer`).
+# rvlscan binary, then the copy the binary CARRIES and extracts to
+# ~/.revelara/helpers/<version>/, then PATH.
+#
+# Since po-aml3h the scripted helpers (pyindex.py, tsindex.js, javaindex.java)
+# are embedded in the binary, so `make helpers` is no longer needed to scan
+# those languages — it is now for DEVELOPING them: the adjacent copy outranks
+# the embedded one, so an edit to helpers/pyindex/pyindex.py takes effect
+# without a rebuild of rvlscan. (A rebuild re-embeds it either way.)
+#
+# `helpers` still matters for goindex, which is a Go binary this Makefile is
+# the only local way to produce. rustindex and cindex are workspace crates, so
+# a plain `cargo build` already lands them next to rvlscan; rustindex needs
+# rust-analyzer at runtime (`rustup component add rust-analyzer`) and cindex
+# needs a system libclang.
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).

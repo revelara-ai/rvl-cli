@@ -1124,6 +1124,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "hex",
  "libc",
  "rvl-cache",
  "rvl-config",
@@ -1140,6 +1141,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
 ]
 

@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod doctor;
+mod embedded_helpers;
 mod hook;
 mod init;
 mod out_doc;
@@ -70,8 +72,10 @@ enum Cmd {
         /// Loudly announced; never silent.
         #[arg(long)]
         specs_file: Option<PathBuf>,
-        /// Class judgments (JSON array) for triage; unjudged classes still
-        /// surface, they are never dropped.
+        /// DEV ONLY: override the signed cache's judgments with a JSON array.
+        /// The ratified corpus ships inside the cache, so no flag is needed;
+        /// this is loudly announced when used. Unjudged classes still surface,
+        /// they are never dropped.
         #[arg(long)]
         judgments: Option<PathBuf>,
         /// Write findings JSON here.
@@ -274,6 +278,30 @@ enum Cmd {
         /// Accept all auto-detected defaults non-interactively
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+    /// Diagnose (and with `--fix`, repair) this machine's ability to scan
+    /// THIS repository: the retriever for every language actually present,
+    /// which slot it resolved from and whether its runtime exists, plus
+    /// credentials, spec cache and git-hook wiring.
+    ///
+    /// Repo-aware by design: it reports only on languages this tree contains,
+    /// so a Go shop is never told about .NET.
+    ///
+    /// Exit codes: 0 = everything this repo needs is in place, 1 = a gap
+    /// remains, 2 = usage error.
+    Doctor {
+        /// Repo/dir to diagnose (default: current directory).
+        path: Option<PathBuf>,
+        /// Attempt the safe, idempotent repairs: extract the embedded
+        /// helpers, install the PINNED typescript into the helper dir, build
+        /// csindex when a .NET SDK and the project source are both already
+        /// present, refresh the spec cache when credentials are configured.
+        /// Anything needing a package manager or sudo is printed, never run.
+        #[arg(long)]
+        fix: bool,
+        /// Output format (text|json).
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Install or check the git-hook scan gate: `hook install` writes a
     /// pre-commit/pre-push shim invoking the native deterministic scan;
@@ -757,9 +785,24 @@ fn server_to_findings(
 // Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
 // it is omitted, rvlscan discovers and runs the language retriever helper over
 // the target itself and feeds the packets into the same pipeline. Helper
-// PACKAGING for release (bundling goindex/pyindex with the shipped binary) is
-// intentionally out of scope: discovery falls back to env override, a helper
-// adjacent to the rvlscan binary, then PATH.
+// PACKAGING (po-aml3h). A fresh `brew install rvlscan` used to deliver the
+// binary and NONE of the seven helpers, so the first scan of any real repo
+// hard-failed. Each helper now ships by the cheapest route its nature allows:
+//
+//   pyindex.py / tsindex.js / javaindex.java   embedded in this binary and
+//       extracted to ~/.revelara/helpers/<version>/ on first use. They are
+//       platform-independent text, so one build carries them everywhere.
+//   cindex / rustindex                          workspace bins, packed into
+//       the same release archive as rvlscan (dist `binaries` in Cargo.toml).
+//   goindex                                     built per target by release CI
+//       and packed into the archive alongside the binary.
+//   csindex                                     NOT carried: it needs ~9 MB of
+//       Roslyn assemblies. Built by the user into ~/.revelara/helpers/csindex,
+//       which resolution searches, so the build IS the install.
+//
+// Discovery order: env override, adjacent to the rvlscan binary (or the
+// packaged share dir next to it), the extracted copy, the canonical helper
+// dir, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
 /// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
@@ -1156,12 +1199,93 @@ fn allow_missing_helpers() -> bool {
     )
 }
 
+/// The script this binary CARRIES for `lang`, when it carries one (po-aml3h).
+/// The native helpers ride the release archive instead; C# rides neither.
+fn embedded_for(lang: Lang) -> Option<&'static embedded_helpers::Embedded> {
+    match lang {
+        Lang::Python => Some(&embedded_helpers::PYINDEX),
+        Lang::TypeScript => Some(&embedded_helpers::TSINDEX),
+        Lang::Java => Some(&embedded_helpers::JAVAINDEX),
+        Lang::Go | Lang::Rust | Lang::CSharp | Lang::CCpp => None,
+    }
+}
+
+/// Directories a PACKAGED helper may sit in, given the running binary. The
+/// first is the release archive's own layout (everything unpacked side by
+/// side); the second is where Homebrew files an archive's non-binary members,
+/// `<prefix>/share/rvlscan`, since `bin.install` only relocates executables and
+/// leaves the rest in pkgshare. Without the second entry a `brew install` would
+/// carry goindex in the bottle and still not find it.
+fn packaged_helper_dirs(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![exe_dir.to_path_buf()];
+    if let Some(prefix) = exe_dir.parent() {
+        dirs.push(prefix.join("share").join("rvlscan"));
+    }
+    dirs
+}
+
+/// What a reader should DO when `lang` has no retriever: the specific install,
+/// and the one command that performs it. Generic advice ("install the helper")
+/// is what this bead exists to delete.
+///
+/// Every command here writes into a location `resolve_helper` already searches,
+/// so nothing in this text asks for a follow-up step. A hint that ends in "now
+/// export VAR=<the path you just typed>" is a hint that stopped one move short.
+fn missing_helper_hint(lang: Lang) -> String {
+    let env = lang.env_override();
+    match lang {
+        // Built per target by release CI and packed next to the binary, so its
+        // absence means a source build or a hand-assembled install.
+        Lang::Go => String::from(
+            "goindex ships next to the rvlscan binary; if you built from source run `make helpers`, \
+             or build it once with `go build -C helpers/goindex -o ~/.revelara/helpers/goindex .` \
+             (needs Go 1.21+), where rvlscan finds it with no further setup",
+        ),
+        Lang::Rust | Lang::CCpp => format!(
+            "{base} ships next to the rvlscan binary in the release archive; if you built from \
+             source run `cargo build --release -p {base}` and copy it to \
+             ~/.revelara/helpers/{base}, where rvlscan finds it with no further setup",
+            base = lang.helper_base(),
+        ),
+        // The one helper deliberately NOT carried: the .NET assembly itself is
+        // ~39 KB but drags ~9 MB of Microsoft.CodeAnalysis (Roslyn) with it,
+        // which is more than the rest of the release archive combined. The
+        // -o directory is the per-helper canonical dir, so the build IS the
+        // install: `install_dirs` looks inside it for csindex.dll.
+        Lang::CSharp => String::from(
+            "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
+             then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
+             `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
+             — rvlscan finds it there with no further setup",
+        ),
+        // Embedded — reaching this arm means extraction itself failed.
+        Lang::Python | Lang::TypeScript | Lang::Java => format!(
+            "{base} is carried inside the rvlscan binary but could not be written out; set \
+             {dir} to a writable directory, or set {env} to a {base} you installed yourself",
+            base = lang.helper_base(),
+            dir = embedded_helpers::HELPER_DIR_ENV,
+        ),
+    }
+}
+
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
-///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX`),
-///   2. a helper next to the current exe,
-///   3. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / ...),
+///   2. a helper packaged with the binary (adjacent, or in its pkgshare dir),
+///   3. the copy extracted from THIS binary (pyindex/tsindex/javaindex),
+///   4. a helper the user built into the canonical helper dir,
+///   5. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///
+/// Packaged beats embedded so a deliberately installed helper — the Makefile's
+/// `make helpers`, a release archive's goindex — still wins over the carried
+/// copy. Embedded beats the canonical dir so a hand-dropped copy of a script
+/// we carry cannot go stale unnoticed (extraction repairs its own file; it
+/// would never repair one found ahead of it). Both beat PATH, so a fresh
+/// machine needs no PATH surgery and an unrelated `pyindex` cannot quietly
+/// answer for ours. Every step records WHERE it found the file and the
+/// "retrievers:" roll-call prints it: a shadowing helper is undiagnosable from
+/// any other line of output.
 fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     // (1) explicit env override wins.
     if let Some(p) = std::env::var_os(lang.env_override()) {
@@ -1188,22 +1312,51 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         Lang::Java => Some(format!("{base}.java")),
         Lang::Go | Lang::Rust | Lang::CCpp => None,
     };
-    // (2) adjacent to the rvlscan binary.
+    // (2) packaged with the binary: adjacent, or in the pkgshare dir a
+    // package manager files the archive's non-binary members into.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join(base);
-            if cand.is_file() {
-                return Ok(classify_helper(lang, &cand, "bundled"));
-            }
-            if let Some(script) = &script_name {
-                let cand_script = dir.join(script);
-                if cand_script.is_file() {
-                    return Ok(classify_helper(lang, &cand_script, "bundled"));
+        if let Some(exe_dir) = exe.parent() {
+            for dir in packaged_helper_dirs(exe_dir) {
+                let cand = dir.join(base);
+                if cand.is_file() {
+                    return Ok(classify_helper(lang, &cand, "bundled"));
+                }
+                if let Some(script) = &script_name {
+                    let cand_script = dir.join(script);
+                    if cand_script.is_file() {
+                        return Ok(classify_helper(lang, &cand_script, "bundled"));
+                    }
                 }
             }
         }
     }
-    // (3) on PATH.
+    // (3) the copy carried inside this binary, written out on first use.
+    // Best-effort: an unwritable HOME degrades to the PATH lookup below rather
+    // than failing a scan that a helper on PATH could have served.
+    let mut extract_failure: Option<String> = None;
+    if let Some(embedded) = embedded_for(lang) {
+        match embedded_helpers::ensure(embedded) {
+            Ok(path) => return Ok(classify_helper(lang, &path, "embedded")),
+            Err(e) => extract_failure = Some(format!("{e:#}")),
+        }
+    }
+    // (4) a helper the user built themselves, in the canonical helper dir.
+    // This is the other half of the install hints below: a message that names
+    // a location and then also demands an env var pointing at that same
+    // location has not actually removed a step.
+    for dir in embedded_helpers::install_dirs(base) {
+        let cand = dir.join(base);
+        if cand.is_file() {
+            return Ok(classify_helper(lang, &cand, "installed"));
+        }
+        if let Some(script) = &script_name {
+            let cand_script = dir.join(script);
+            if cand_script.is_file() {
+                return Ok(classify_helper(lang, &cand_script, "installed"));
+            }
+        }
+    }
+    // (5) on PATH.
     if let Some(found) = find_on_path(base) {
         return Ok(classify_helper(lang, &found, "PATH"));
     }
@@ -1212,10 +1365,17 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             return Ok(classify_helper(lang, &found, "PATH"));
         }
     }
+    // Name the extraction failure when there was one: "no helper found" would
+    // send the reader hunting for an install that this binary already carries.
+    if let Some(why) = extract_failure {
+        anyhow::bail!(
+            "no {base} helper for detected {lang} sources ({why}): {hint}",
+            hint = missing_helper_hint(lang),
+        );
+    }
     anyhow::bail!(
-        "no {base} helper found for detected {lang} sources: set {env} to the helper path, \
-         place {base} next to the rvlscan binary, or put it on PATH",
-        env = lang.env_override(),
+        "no {base} helper found for detected {lang} sources: {hint}",
+        hint = missing_helper_hint(lang),
     )
 }
 
@@ -1456,10 +1616,34 @@ fn run_helper(
     for batch in &batches {
         let argv = helper_argv(helper, root, name, batch);
         let (program, args) = argv.split_first().expect("argv always has a program");
-        let output = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("running retriever helper `{program}`"))?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if helper.kind == HelperKind::NodeScript {
+            cmd.env("NODE_PATH", node_path_for(root));
+        }
+        let output = match cmd.output() {
+            Ok(o) => o,
+            // The INTERPRETER is missing, not the helper: `dotnet`, `java`,
+            // `node` or `python3` is absent even though the helper file itself
+            // resolved. That is the same "not set up yet" state a helper's own
+            // exit 4 reports, and it must degrade this one language rather than
+            // abort the scan — a polyglot repo whose C# toolchain is absent
+            // still has four other languages worth reading.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Err((
+                    DegradeKind::NotInstalled,
+                    format!(
+                        "`{program}` is not installed, so {} cannot run",
+                        helper.path.display()
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("running retriever helper `{program}`"))
+                );
+            }
+        };
         if !output.status.success() {
             let kind = classify_helper_exit(output.status.code());
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1471,6 +1655,31 @@ fn run_helper(
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
     Ok(Ok(merged))
+}
+
+/// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
+///
+/// tsindex drives the real TypeScript compiler API, so it needs the
+/// `typescript` package at runtime. Node resolves `require` by walking up from
+/// the SCRIPT's directory, and once the script is extracted to
+/// `~/.revelara/helpers/<version>/` that walk never reaches the repository
+/// being scanned — even though almost every TypeScript repo already has
+/// `typescript` in its own `node_modules`. Pointing NODE_PATH at the scanned
+/// tree makes the common case need no install at all, and uses the project's
+/// OWN compiler version, which is the more faithful answer anyway.
+///
+/// An existing NODE_PATH is preserved and takes precedence: an operator who
+/// set it meant it.
+fn node_path_for(root: &Path) -> std::ffi::OsString {
+    let repo_modules = root.join("node_modules");
+    match std::env::var_os("NODE_PATH") {
+        Some(existing) if !existing.is_empty() => {
+            let mut parts: Vec<PathBuf> = std::env::split_paths(&existing).collect();
+            parts.push(repo_modules);
+            std::env::join_paths(parts).unwrap_or(existing)
+        }
+        _ => repo_modules.into_os_string(),
+    }
 }
 
 /// A one-line reason for a degradation, for the COVERAGE block.
@@ -1765,11 +1974,11 @@ fn resolve_packet_stream(
     // reports the first and hides the rest. A developer on a polyglot repo
     // should get one list and one install step, not N runs.
     //
-    // The decision this implements: do not bundle the helpers, probe for them
-    // and error out when one is needed and absent. Carrying the helpers buys
-    // convenience and costs a permanent cross-compile and toolchain surface;
-    // the tool does not need to CARRY them, it needs to be honest about
-    // whether it found them.
+    // The probe ALSO extracts: `resolve_helper` materializes an embedded
+    // script the first time it is asked for one (po-aml3h), so the preflight
+    // both answers "can this repo be scanned" and does the setup that makes
+    // the answer yes. Extraction is hash-checked and memoized, so running the
+    // probe and then the loop costs one write, not two.
     let missing: Vec<(Lang, String)> = langs
         .iter()
         .filter_map(|&l| match resolve_helper(l) {
@@ -1940,6 +2149,74 @@ fn resolve_findings(
     )
 }
 
+/// Decide which judgments grade this scan: the ones inside the signed cache,
+/// or a dev-override file (po-av01j.106 / po-axk44).
+///
+/// THE DEFAULT IS THE CACHE. Judgments used to come only from `--judgments`,
+/// which meant the out-of-the-box scan had nothing to grade findings with:
+/// every class landed on `unjudged`, unjudged renders advisory, and the
+/// deterministic gate could not fire however serious the finding. The corpus
+/// now ships inside the same signed bytes as the specs, so a user who runs
+/// `rvlscan scan .` gets graded, control-mapped, blocking-eligible findings
+/// with no flag at all.
+///
+/// `--judgments` survives as a DEV OVERRIDE and is announced on stderr every
+/// time it is used, the same contract `--specs-file` has: a grading layer that
+/// did not come out of the signed artifact must never apply silently, because
+/// a judgment is the one input that can wedge a commit.
+///
+/// A cache judgments section that will not parse is a WARNING, not an error.
+/// Failing the scan would let one bad publish stop every commit in the fleet;
+/// degrading to advisory keeps scans running and keeps every finding visible,
+/// which is the floor the triage layer already guarantees. It is loud on
+/// stderr so the degradation is seen rather than inferred.
+fn resolve_judgments(
+    cache_judgments: Option<&serde_json::Value>,
+    override_file: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<Vec<rvl_triage::ClassJudgment>> {
+    if let Some(p) = override_file {
+        let from_cache = cache_judgments
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| a.len());
+        eprintln!(
+            "WARNING: grading with UNVERIFIED judgments from {} (--judgments is a dev override; \
+             production scans use the judgments inside the signed cache){}",
+            p.display(),
+            if from_cache > 0 {
+                format!(", REPLACING the {from_cache} judgment(s) the cache carries")
+            } else {
+                String::new()
+            }
+        );
+        return Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?);
+    }
+    let Some(raw) = cache_judgments else {
+        // An older artifact, or a deployment that publishes no corpus. Silent
+        // on stderr and reported in the verbose census below: absence is a
+        // valid state, not a fault.
+        if verbose {
+            println!("judgments 0 (cache carries none; every finding is advisory)");
+        }
+        return Ok(Vec::new());
+    };
+    match serde_json::from_value::<Vec<rvl_triage::ClassJudgment>>(raw.clone()) {
+        Ok(js) => {
+            if verbose {
+                println!("judgments {} (from the signed cache)", js.len());
+            }
+            Ok(js)
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: the signed cache's judgments section did not parse ({e}); \
+                 every finding will be advisory. Run `rvlscan sync` for a newer artifact."
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// The pipeline shared by the packet-stream path and the incremental path:
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
@@ -1960,7 +2237,11 @@ fn findings_from_sites(
     policy_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
-    let specs_text = match specs_file {
+    // The signed artifact carries BOTH halves of the answer: the specs that
+    // decide whether a call is bounded, and the judgments that decide what an
+    // unbounded one means (po-av01j.106). They are loaded together because they
+    // arrive together, inside one signature.
+    let (specs_text, cache_judgments) = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
             // spec cache must never load quietly.
@@ -1969,7 +2250,9 @@ fn findings_from_sites(
                  production scans use the signed cache)",
                 p.display()
             );
-            std::fs::read_to_string(p)?
+            // No envelope was opened, so there are no cache judgments to carry.
+            // A dev spec file plus `--judgments` is the full offline pairing.
+            (std::fs::read_to_string(p)?, None)
         }
         None => {
             let loaded = store.load(keyset, &rvl_cache::today_utc())?;
@@ -1988,7 +2271,10 @@ fn findings_from_sites(
                     loaded.envelope.content_version, loaded.envelope.schema, loaded.source
                 );
             }
-            serde_json::to_string(&loaded.envelope.specs)?
+            (
+                serde_json::to_string(&loaded.envelope.specs)?,
+                loaded.envelope.judgments,
+            )
         }
     };
 
@@ -2082,10 +2368,7 @@ fn findings_from_sites(
 
     // Triage: collapse violations into reader-facing classes. Unjudged classes
     // still surface; they are never dropped.
-    let judgments: Vec<rvl_triage::ClassJudgment> = match judgments {
-        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
-        None => Vec::new(),
-    };
+    let judgments = resolve_judgments(cache_judgments.as_ref(), judgments, verbose)?;
     // Key each verdict on the site's UNIQUE site_key (not the finding's
     // file:line site_id, which collides on chained calls), so triage rematches
     // it to the right call and labels the finding correctly (po-3t3oj.35).
@@ -4024,6 +4307,97 @@ fn run_plugin_agents(
     }
 }
 
+/// Does this `scan` invocation select SUBMISSION mode?
+///
+/// The single definition of the rule, so the dispatch guard and the
+/// stray-flag check below cannot drift apart: the day one grows a sixth
+/// selector and the other does not, a flag becomes silently ignored again,
+/// which is exactly the bug po-av01j.168 exists to close.
+fn selects_submission(
+    stdin: bool,
+    file: Option<&Path>,
+    scan_dir: Option<&Path>,
+    service: Option<&str>,
+    dry_run: bool,
+) -> bool {
+    stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run
+}
+
+/// The flags that select submission mode, as prose for the usage error. A
+/// reader who typed `--team` needs the RULE, not just the refusal.
+const SUBMISSION_SELECTORS: &str = "--stdin, --file, --scan-dir, --service, or --dry-run";
+
+/// Submission-only flags the caller EXPLICITLY typed on a deterministic scan
+/// (po-av01j.168).
+///
+/// Before this, `rvl scan --team=backend-team` ran an ordinary local scan and
+/// dropped the team on the floor: no error, no warning, nothing submitted. A
+/// silent no-op is the worst failure shape available here, because the user
+/// believes the flag took effect — and `--format=json` made it worse than
+/// cosmetic, since a script asking for JSON silently received the human
+/// ladder.
+///
+/// Every flag below is `Option`/`bool` with NO clap default, so `Some(_)` /
+/// `true` proves the user typed it. Nothing here can be tripped by a default
+/// value, which is the property that lets this be a hard error rather than a
+/// warning.
+fn stray_submission_flags(
+    team: Option<&str>,
+    target: Option<&Path>,
+    cleanup_on_success: bool,
+    timeout: Option<&str>,
+    format: Option<&str>,
+) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if team.is_some() {
+        out.push("--team");
+    }
+    if target.is_some() {
+        out.push("--target");
+    }
+    if cleanup_on_success {
+        out.push("--cleanup-on-success");
+    }
+    if timeout.is_some() {
+        out.push("--timeout");
+    }
+    if format.is_some() {
+        out.push("--format");
+    }
+    out
+}
+
+/// The usage error for [`stray_submission_flags`]: names every offending flag
+/// and what it requires, then shows the invocation that would honor it.
+fn stray_submission_flag_error(flags: &[&str]) -> String {
+    let (subject, verb) = if flags.len() == 1 {
+        (format!("{} is a submission-mode flag", flags[0]), "has")
+    } else {
+        (
+            format!("{} are submission-mode flags", flags.join(", ")),
+            "have",
+        )
+    };
+    format!(
+        "{subject} and {verb} no effect on a deterministic scan, so it would have been \
+         silently dropped. Submission mode is selected by {SUBMISSION_SELECTORS} — e.g. \
+         `{BIN} scan --service <name> --scan-dir <dir>{example}`. For a local scan, drop \
+         the flag.",
+        BIN = rvl_data::BIN,
+        example = flags
+            .iter()
+            .map(|f| format!(
+                " {f}{}",
+                if *f == "--cleanup-on-success" {
+                    ""
+                } else {
+                    " <value>"
+                }
+            ))
+            .collect::<String>(),
+    )
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -4053,7 +4427,14 @@ fn run() -> anyhow::Result<ExitCode> {
             timeout,
             format,
             ..
-        } if stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run => {
+        } if selects_submission(
+            stdin,
+            file.as_deref(),
+            scan_dir.as_deref(),
+            service.as_deref(),
+            dry_run,
+        ) =>
+        {
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
@@ -4069,6 +4450,43 @@ fn run() -> anyhow::Result<ExitCode> {
                 },
                 env!("CARGO_PKG_VERSION"),
             ));
+        }
+        // Deterministic scan carrying a SUBMISSION-ONLY flag (po-av01j.168).
+        // Reaching this arm means the guard above already decided this is not
+        // a submission, so every flag `stray_submission_flags` finds is one
+        // the rest of this command would ignore. Refusing costs the user one
+        // corrected command; accepting costs them a scan they believe was
+        // submitted, or a script that asked for JSON and parsed a ladder.
+        //
+        // Placed BEFORE the store opens on purpose: a mistyped flag is a
+        // usage error whether or not this machine has a verifiable spec
+        // cache, and it must not be masked by exit 1 from the cache load.
+        Cmd::Scan {
+            ref team,
+            ref target,
+            cleanup_on_success,
+            ref timeout,
+            ref format,
+            ..
+        } if !stray_submission_flags(
+            team.as_deref(),
+            target.as_deref(),
+            cleanup_on_success,
+            timeout.as_deref(),
+            format.as_deref(),
+        )
+        .is_empty() =>
+        {
+            let stray = stray_submission_flags(
+                team.as_deref(),
+                target.as_deref(),
+                cleanup_on_success,
+                timeout.as_deref(),
+                format.as_deref(),
+            );
+            let f = rvl_data::Failure::usage(stray_submission_flag_error(&stray));
+            eprintln!("error: {}", f.msg);
+            return Ok(ExitCode::from(f.code));
         }
         // Onboarding surface (po-av01j.163): init needs the skills machinery
         // for its plugin step but never the spec cache; hook is pure file
@@ -4099,6 +4517,13 @@ fn run() -> anyhow::Result<ExitCode> {
             ));
         }
         Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
+        // Environment diagnosis (po-av01j.169). Dispatches before the store
+        // opens because a MISSING spec cache is one of the things it reports:
+        // opening the store here would turn that report into exit 1 from the
+        // cache loader, which is the failure the command exists to explain.
+        Cmd::Doctor { path, fix, format } => {
+            return Ok(doctor::run(doctor::DoctorArgs { path, fix, format }))
+        }
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
@@ -4354,6 +4779,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // returned before the store opened, above.
         Cmd::Init { .. }
         | Cmd::Hook { .. }
+        | Cmd::Doctor { .. }
         | Cmd::Login
         | Cmd::Logout
         | Cmd::Status
@@ -4401,7 +4827,126 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+
+    // --- judgments ship in the signed cache (po-av01j.106 / po-axk44) ---
+
+    /// The judgments section exactly as the factory publishes it: one ratified
+    /// blocking promotion for an unbounded `requests.get` on a production path.
+    fn cache_judgments_json() -> serde_json::Value {
+        serde_json::json!([{
+            "api": "requests.get",
+            "scope": "runtime",
+            "verdict": "surface",
+            "severity": "high",
+            "fix": "Pass timeout=(connect, read); requests defaults to NO timeout. RC-019.",
+            "control": "RC-019"
+        }])
+    }
+
+    /// One violating site, triaged and rendered exactly the way a scan does it,
+    /// so the returned findings are the ones the gate counts.
+    fn ladder_for(judgments: &[rvl_triage::ClassJudgment]) -> Vec<render::Finding> {
+        let sites = vec![rvl_core::Site {
+            file_path: "svc/http.py".into(),
+            line_number: 12,
+            client_type: "requests".into(),
+            method: "get".into(),
+            ..Default::default()
+        }];
+        let verdicts = vec![(
+            sites[0].site_key(),
+            rvl_core::Verdict::Violates,
+            "no bound anywhere".to_string(),
+        )];
+        triage_to_findings(&rvl_triage::triage(&sites, &verdicts, judgments))
+    }
+
+    #[test]
+    fn judgments_load_from_the_signed_cache_with_no_flag() {
+        // The bead's core defect: judgments were readable ONLY from
+        // --judgments, so a plain `rvlscan scan .` had nothing to grade with.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        assert_eq!(js.len(), 1, "the cache's corpus must load with no flag");
+        assert_eq!(js[0].api, "requests.get");
+        assert_eq!(js[0].scope, "runtime");
+        assert_eq!(js[0].severity, "high");
+        assert_eq!(js[0].control, "RC-019");
+    }
+
+    #[test]
+    fn cache_judgments_produce_a_blocking_finding() {
+        // The whole point. `blocking_count > 0` is verbatim the `blocked`
+        // predicate that becomes EXIT_BLOCKED (3) in run_scan; cli.rs asserts
+        // the process status itself.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        let findings = ladder_for(&js);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, "high");
+        assert_eq!(findings[0].control, "RC-019");
+        assert!(
+            render::blocking_count(&findings) > 0,
+            "a ratified high-severity judgment must produce a BLOCKING row: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_judgments_stays_advisory() {
+        // NEW BINARY / OLD CACHE, and any deployment that publishes no corpus:
+        // the finding still surfaces, it is simply ungraded. Advisory is the
+        // floor; nothing is ever dropped.
+        for source in [None, Some(serde_json::json!([]))] {
+            let js = resolve_judgments(source.as_ref(), None, false).unwrap();
+            assert!(js.is_empty());
+            let findings = ladder_for(&js);
+            assert_eq!(findings.len(), 1, "the finding must still surface");
+            assert!(
+                findings[0].severity.is_empty(),
+                "an unjudged class has no severity"
+            );
+            assert_eq!(
+                render::blocking_count(&findings),
+                0,
+                "unjudged must never block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judgments_flag_overrides_the_cache() {
+        // --judgments survives as a dev override only. When both are present
+        // the file wins outright: a half-merge would grade some classes from an
+        // unverified source and some from a signed one, with no way to tell
+        // which did what.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dev_judgments.json");
+        std::fs::write(
+            &p,
+            r#"[{"api":"requests.get","scope":"runtime","verdict":"surface","severity":"low","fix":"dev","control":"RC-000"}]"#,
+        )
+        .unwrap();
+
+        let js =
+            resolve_judgments(Some(&cache_judgments_json()), Some(p.as_path()), false).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(
+            js[0].severity, "low",
+            "the override must win over the cache"
+        );
+        assert_eq!(js[0].control, "RC-000");
+        // ...and the override demotes the class off the gate, which is exactly
+        // why it has to be announced.
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
+
+    #[test]
+    fn a_malformed_cache_judgments_section_degrades_to_advisory() {
+        // One bad publish must not stop every commit in the fleet. Degrade
+        // loudly (stderr) rather than failing the scan.
+        let bad = serde_json::json!([{"scope": "runtime", "verdict": "surface"}]);
+        let js = resolve_judgments(Some(&bad), None, false).unwrap();
+        assert!(js.is_empty(), "a malformed corpus grades nothing");
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
 
     #[test]
     fn a_language_present_only_as_testdata_is_incidental() {
@@ -4430,7 +4975,10 @@ mod tests {
     }
 
     // Serializes tests that mutate process-global env so they don't race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared with `embedded_helpers`' own tests: both move HOME and
+    // RVLSCAN_HELPER_DIR, and a second mutex over the same process-wide state
+    // is not a lock at all (see `embedded_helpers::env_lock`).
+    use crate::embedded_helpers::env_lock;
 
     // --- Changed-only scoping (po-av01j.127) ---
 
@@ -5453,7 +6001,7 @@ mod tests {
     // epic has found repeatedly.
     #[test]
     fn the_escape_hatch_is_explicit_and_opt_in() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
         assert!(!allow_missing_helpers(), "silence must NOT permit a gap");
         for v in ["1", "true"] {
@@ -5498,7 +6046,7 @@ mod tests {
 
     #[test]
     fn resolve_helper_env_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("my-goindex");
         touch(&fake);
@@ -5512,11 +6060,168 @@ mod tests {
 
     #[test]
     fn resolve_helper_env_override_missing_file_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::set_var("RVLSCAN_GOINDEX", "/definitely/not/here/goindex");
         let resolved = resolve_helper(Lang::Go);
         std::env::remove_var("RVLSCAN_GOINDEX");
         assert!(resolved.is_err(), "a missing override path must error");
+    }
+
+    #[test]
+    fn embedded_scripts_cover_exactly_the_platform_independent_helpers() {
+        // The split is the whole packaging decision (po-aml3h): text is
+        // carried, native code is shipped in the archive, and Roslyn is
+        // neither. A helper silently changing sides here is a helper that
+        // stops arriving on a fresh install.
+        for lang in [Lang::Python, Lang::TypeScript, Lang::Java] {
+            assert!(
+                embedded_for(lang).is_some(),
+                "{lang} is a scripted retriever and must be carried in the binary"
+            );
+        }
+        for lang in [Lang::Go, Lang::Rust, Lang::CCpp, Lang::CSharp] {
+            assert!(
+                embedded_for(lang).is_none(),
+                "{lang}'s helper is native and must ship in the archive, not be embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_lookup_covers_the_homebrew_pkgshare_dir() {
+        // Homebrew's generated formula `bin.install`s the archive's EXECUTABLES
+        // and files everything else under <prefix>/share/<app>. goindex rides
+        // the archive as a non-cargo file, so without this dir a brew install
+        // would carry it and never find it.
+        let dirs = packaged_helper_dirs(Path::new("/opt/homebrew/Cellar/rvlscan/1.0/bin"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvlscan/1.0/bin")));
+        assert!(dirs.contains(&PathBuf::from(
+            "/opt/homebrew/Cellar/rvlscan/1.0/share/rvlscan"
+        )));
+    }
+
+    #[test]
+    fn missing_helper_hints_name_a_command_to_run() {
+        // "Install the helper" is the message this bead exists to delete: a
+        // reader who hits a missing retriever must get the specific install.
+        for lang in [
+            Lang::Go,
+            Lang::Python,
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::CSharp,
+            Lang::Java,
+            Lang::CCpp,
+        ] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                hint.contains('`') || hint.contains(lang.env_override()),
+                "{lang}'s hint must name a command or the override var: {hint}"
+            );
+        }
+        let cs = missing_helper_hint(Lang::CSharp);
+        assert!(
+            cs.contains("dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex"),
+            "csindex is the one helper we deliberately do not ship, so its hint must be the \
+             most specific of all: {cs}"
+        );
+    }
+
+    #[test]
+    fn no_install_hint_asks_for_a_follow_up_env_var() {
+        // The inconsistency this guards against: naming a canonical location
+        // AND requiring an override that points at that same location. Every
+        // command in a hint must write somewhere resolution already searches,
+        // so the install is the whole fix.
+        for lang in [Lang::Go, Lang::Rust, Lang::CSharp, Lang::CCpp] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                !hint.contains(lang.env_override()),
+                "{lang}'s hint names a canonical path, so it must not also demand \
+                 {}: {hint}",
+                lang.env_override()
+            );
+            assert!(
+                hint.contains("~/.revelara/helpers/"),
+                "{lang}'s hint must install into a directory resolution searches: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canonical_helper_dirs_accept_both_build_output_shapes() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let dirs = embedded_helpers::install_dirs("csindex");
+        std::env::remove_var("HOME");
+        let helpers = dir.path().join(".revelara").join("helpers");
+        assert!(
+            dirs.contains(&helpers.join("csindex")),
+            "`dotnet build -o DIR` writes a directory of assemblies: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&helpers),
+            "`go build -o FILE` writes one file into the flat root: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_in_the_canonical_dir_is_found_and_the_env_override_still_wins() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let canonical = dir.path().join(".revelara").join("helpers").join("csindex");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let dll = canonical.join("csindex.dll");
+        touch(&dll);
+
+        let found = resolve_helper(Lang::CSharp).expect("the canonical dir must be searched");
+        assert_eq!(found.path, dll);
+        assert_eq!(found.kind, HelperKind::DotnetAssembly);
+        assert_eq!(
+            found.source, "installed",
+            "the roll-call must say the user installed this one, not that we shipped it"
+        );
+
+        // An explicit override still outranks it: an operator debugging a
+        // patched retriever must not be silently served the canonical copy.
+        let other = dir.path().join("patched-csindex.dll");
+        touch(&other);
+        std::env::set_var("RVLSCAN_CSINDEX", &other);
+        let overridden = resolve_helper(Lang::CSharp);
+        std::env::remove_var("RVLSCAN_CSINDEX");
+        std::env::remove_var("HOME");
+        let overridden = overridden.expect("env override must resolve");
+        assert_eq!(overridden.path, other);
+        assert_eq!(overridden.source, "env:RVLSCAN_CSINDEX");
+    }
+
+    #[test]
+    fn node_path_points_at_the_scanned_repo_and_keeps_any_existing_entries() {
+        let _guard = env_lock();
+        std::env::remove_var("NODE_PATH");
+        let root = Path::new("/work/api");
+        assert_eq!(
+            node_path_for(root),
+            std::ffi::OsString::from("/work/api/node_modules"),
+            "a node helper must be able to load the SCANNED project's typescript"
+        );
+
+        std::env::set_var("NODE_PATH", "/opt/mods");
+        let combined = node_path_for(root);
+        std::env::remove_var("NODE_PATH");
+        let parts: Vec<PathBuf> = std::env::split_paths(&combined).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/opt/mods"),
+                PathBuf::from("/work/api/node_modules")
+            ],
+            "an operator's own NODE_PATH is preserved, and searched first"
+        );
     }
 
     fn ladder_finding(id: &str) -> render::Finding {
@@ -5863,6 +6568,112 @@ mod tests {
             }
             _ => panic!("expected scan"),
         }
+    }
+
+    #[test]
+    fn submission_only_flags_are_stray_on_a_deterministic_scan() {
+        // po-av01j.168: every one of these was accepted and silently dropped.
+        assert_eq!(
+            stray_submission_flags(Some("backend-team"), None, false, None, None),
+            vec!["--team"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, false, None, Some("json")),
+            vec!["--format"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, false, Some("90s"), None),
+            vec!["--timeout"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, true, None, None),
+            vec!["--cleanup-on-success"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, Some(Path::new("/tmp/p")), false, None, None),
+            vec!["--target"]
+        );
+        // Every flag at once still names every flag: a reader who typed two
+        // must not have to run twice to learn about the second.
+        assert_eq!(
+            stray_submission_flags(
+                Some("t"),
+                Some(Path::new("/tmp/p")),
+                true,
+                Some("90s"),
+                Some("json")
+            ),
+            vec![
+                "--team",
+                "--target",
+                "--cleanup-on-success",
+                "--timeout",
+                "--format"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unflagged_deterministic_scan_has_nothing_stray() {
+        // The defaults must never trip the check — that is the property that
+        // makes this a hard error rather than a warning. Clap gives these
+        // flags no default value, so absent is `None`/`false`.
+        assert!(stray_submission_flags(None, None, false, None, None).is_empty());
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                team,
+                target,
+                cleanup_on_success,
+                timeout,
+                format,
+                ..
+            }) => assert!(stray_submission_flags(
+                team.as_deref(),
+                target.as_deref(),
+                cleanup_on_success,
+                timeout.as_deref(),
+                format.as_deref(),
+            )
+            .is_empty()),
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn stray_flag_error_names_the_flag_and_what_it_requires() {
+        let msg = stray_submission_flag_error(&["--team"]);
+        assert!(msg.contains("--team"), "must name the flag: {msg}");
+        assert!(
+            msg.contains("--scan-dir") && msg.contains("--service"),
+            "must name what selects submission mode: {msg}"
+        );
+        let msg = stray_submission_flag_error(&["--team", "--format"]);
+        assert!(msg.contains("--team") && msg.contains("--format"), "{msg}");
+    }
+
+    #[test]
+    fn submission_selectors_are_exactly_the_documented_five() {
+        // The dispatch guard and the stray-flag check read the same rule from
+        // this function; if a sixth selector is added, it is added here.
+        assert!(selects_submission(true, None, None, None, false));
+        assert!(selects_submission(
+            false,
+            Some(Path::new("f.json")),
+            None,
+            None,
+            false
+        ));
+        assert!(selects_submission(
+            false,
+            None,
+            Some(Path::new("parts")),
+            None,
+            false
+        ));
+        assert!(selects_submission(false, None, None, Some("svc"), false));
+        assert!(selects_submission(false, None, None, None, true));
+        assert!(!selects_submission(false, None, None, None, false));
     }
 
     #[test]

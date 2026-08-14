@@ -26,6 +26,11 @@ rvl-emission = { path = "../rvl-emission" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# Content-addressing for the embedded scripted retrievers (po-aml3h): the
+# extracted copy is rewritten when its hash differs from the embedded text, so
+# a truncated or hand-edited helper heals instead of silently scanning wrong.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -37,3 +42,22 @@ serde_json = { workspace = true }
 # "index is busy" path is exercised deterministically instead of by racing
 # two processes (po-l3jo5).
 rvl-index = { path = "../rvl-index" }
+
+# RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
+# this each of cindex/rustindex was its own dist "app" — its own archive, its
+# own Homebrew formula — so `brew install rvlscan` delivered the scanner and
+# none of the retrievers, and the first scan of a polyglot repo hard-failed.
+#
+# `binaries` packs the workspace's native helpers into the SAME archive as
+# rvlscan, which is where resolution looks first (adjacent to the binary), and
+# Homebrew's generated formula `bin.install`s all three together.
+#
+# `include` carries goindex, which cargo cannot build: release CI cross-builds
+# it per target into `dist-extras/` before `dist build` runs. It is not a cargo
+# bin target, so Homebrew files it under `<prefix>/share/rvlscan` rather than
+# in `bin` — `packaged_helper_dirs` in main.rs looks there for exactly that
+# reason. csindex is deliberately absent: ~9 MB of Roslyn is more than the rest
+# of the archive combined.
+[package.metadata.dist]
+binaries = { "*" = ["rvlscan", "cindex", "rustindex"] }
+include = ["dist-extras/goindex"]

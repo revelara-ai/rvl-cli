@@ -212,7 +212,7 @@ fn write_hook_shim(hooks_dir: &Path, hook: &str, force: bool) -> anyhow::Result<
     Ok(())
 }
 
-fn git_toplevel(dir: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn git_toplevel(dir: &Path) -> anyhow::Result<PathBuf> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -228,15 +228,20 @@ fn git_toplevel(dir: &Path) -> anyhow::Result<PathBuf> {
 // --- doctor ---
 
 /// A doctor check outcome (rvl-cli `checkStatus`).
+///
+/// `pub(crate)` so `rvlscan doctor` can FOLD IN these checks rather than
+/// growing a second implementation of them (po-av01j.169): the hook state a
+/// user needs is the same state whether they asked `hook doctor` or `doctor`,
+/// and two copies would disagree the first time one of them was edited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Status {
+pub(crate) enum Status {
     Pass,
     Warn,
     Fail,
 }
 
 impl Status {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
             Status::Warn => "WARN",
@@ -245,10 +250,10 @@ impl Status {
     }
 }
 
-struct Check {
-    status: Status,
-    label: String,
-    detail: String,
+pub(crate) struct Check {
+    pub(crate) status: Status,
+    pub(crate) label: String,
+    pub(crate) detail: String,
 }
 
 impl Check {
@@ -290,7 +295,7 @@ fn run_doctor() -> ExitCode {
 /// The read-only preflight, mirroring rvl-cli's `doctorChecks` output
 /// structure. Takes `path_env` explicitly so tests can drive it without
 /// touching the real environment.
-fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
+pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // The binary the installed hooks invoke (`rvl`, the post-rename name).

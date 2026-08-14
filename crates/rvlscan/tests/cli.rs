@@ -3982,3 +3982,260 @@ fn completion_generates_a_script_for_each_shell() {
         );
     }
 }
+
+// --- submission-only flags on the deterministic path (po-av01j.168) ---
+
+/// Every one of these used to be accepted and silently dropped: the scan ran
+/// normally, the flag went nowhere, and the user believed it had taken
+/// effect. `--format=json` was the worst of them — a script asked for JSON
+/// and parsed the human ladder.
+#[test]
+fn deterministic_scan_rejects_each_submission_only_flag() {
+    for (flag, value) in [
+        ("--team", Some("backend-team")),
+        ("--format", Some("json")),
+        ("--timeout", Some("90s")),
+        ("--cleanup-on-success", None),
+        ("--target", Some(".")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = bin();
+        cmd.arg("scan").arg(dir.path()).arg(flag);
+        if let Some(v) = value {
+            cmd.arg(v);
+        }
+        let out = cmd
+            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("HOME", dir.path())
+            .output()
+            .expect("failed to run rvlscan");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`scan {flag}` must be a usage error (exit 2), got {:?}: {stderr}",
+            out.status.code()
+        );
+        assert!(
+            stderr.contains(flag),
+            "the error must NAME the flag that was refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("--scan-dir") || stderr.contains("--service"),
+            "the error must say what the flag requires: {stderr}"
+        );
+    }
+}
+
+/// The rejection is a USAGE error, so it must fire before the spec cache is
+/// even consulted: a mistyped flag is wrong whether or not this machine has a
+/// verifiable cache, and exit 1 ("the scanner broke") would hide it.
+#[test]
+fn the_stray_flag_error_precedes_the_spec_cache_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["scan"])
+        .arg(dir.path())
+        .args(["--team", "backend-team"])
+        // An empty cache dir: a plain scan here exits 1 with "no verifiable
+        // spec cache". The usage error must win.
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path())
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// A deterministic scan with NO submission flag is byte-for-byte what it was:
+/// the check only ever looks at flags the user explicitly typed.
+#[test]
+fn a_plain_deterministic_scan_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "a flagless scan must still reach a verdict, got {:?}",
+        out.status.code()
+    );
+}
+
+/// Submission mode is untouched: the same flags that were refused above are
+/// honored the moment an input selects submission.
+#[test]
+fn submission_mode_still_accepts_the_same_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let findings = dir.path().join("findings.json");
+    std::fs::write(&findings, r#"{"findings":[]}"#).unwrap();
+    let out = bin()
+        .args([
+            "scan",
+            "--service",
+            "checkout-api",
+            "--team",
+            "backend-team",
+        ])
+        .arg("--file")
+        .arg(&findings)
+        .args(["--dry-run", "--format", "json", "--timeout", "90s"])
+        .env("HOME", dir.path())
+        .env("RVL_API_KEY", "test-key")
+        .env("RVL_API_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "submission mode must not be refused: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"dry_run\"") && stdout.contains("checkout-api"),
+        "the dry-run summary must describe the submission: {stdout} {stderr}"
+    );
+}
+// --- judgments and the gate (po-av01j.106) ---
+
+/// A production-path `requests.get` with no timeout: one violating site, the
+/// class the ratified corpus promotes to blocking.
+///
+/// The scan root is built under a NAME WE CHOOSE rather than a raw tempdir,
+/// because scope is derived from the file path (`rvl_core::scope_of`) and a
+/// random temp name containing "test" would silently reclassify the site as
+/// test-support and demote it. The judgments match `scope: runtime` exactly.
+fn write_runtime_python_fixture(
+    tag: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("rvlscan-judgments-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let http_py = src.join("http.py");
+    std::fs::write(
+        &http_py,
+        "import requests\n\n\ndef fetch(url):\n    return requests.get(url)\n",
+    )
+    .unwrap();
+
+    let packets = root.join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        format!(
+            "{{\"snapshot_id\":\"fixture\",\"file_path\":{f:?},\"line_number\":5,\"func\":\"get\",\"client_type\":\"requests\",\"snippet\":\"return requests.get(url)\",\"lang\":\"python\"}}\n",
+            f = http_py.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let specs = root.join("specs.json");
+    std::fs::write(
+        &specs,
+        r#"{"apis":[{"type":"requests","method":"get","site_count":1,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests defaults to no timeout"}],"configs":[]}"#,
+    )
+    .unwrap();
+    (root, packets, specs)
+}
+
+/// The ratified corpus, verbatim from rvlscan-eval registry/judgments/.
+const RELIABILITY_SEED: &str = r#"[{"api":"requests.get","scope":"runtime","verdict":"surface","severity":"high","fix":"Pass timeout=(connect, read); requests defaults to NO timeout. RC-019.","control":"RC-019"}]"#;
+
+/// WITH judgments the same scan BLOCKS and exits 3. This is the outcome the
+/// bead measured as impossible: 1549 sites, 1281 resolved, 33 findings, zero
+/// blocking, exit 0 — not because nothing was found, but because nothing could
+/// grade what was found.
+#[test]
+fn judged_findings_block_the_commit_and_exit_3() {
+    let (root, packets, specs) = write_runtime_python_fixture("blocking");
+    let judgments = root.join("judgments.json");
+    std::fs::write(&judgments, RELIABILITY_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--judgments")
+        .arg(&judgments)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a ratified high-severity judgment must wedge the commit:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("BLOCKING"), "no BLOCKING section: {stdout}");
+    assert!(
+        stdout.contains("RC-019"),
+        "the finding must be born control-mapped: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WITHOUT judgments the identical scan finds the identical site, surfaces it,
+/// and exits 0. The finding is never dropped — it is simply ungraded, and
+/// ungraded is advisory. This is what every scan did before the corpus shipped,
+/// and it is what an OLD cache (no judgments section) still does.
+#[test]
+fn unjudged_findings_stay_advisory_and_exit_0() {
+    let (root, packets, specs) = write_runtime_python_fixture("advisory");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unjudged class must not block:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("not yet graded"),
+        "the finding must still surface, honestly labelled: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The dev override announces itself every time, exactly as `--specs-file`
+/// does. A grading layer that did not come out of the signed artifact must
+/// never apply silently: it is the one input that can wedge a commit.
+#[test]
+fn the_judgments_override_is_loudly_announced() {
+    let (root, packets, specs) = write_runtime_python_fixture("announce");
+    let judgments = root.join("judgments.json");
+    std::fs::write(&judgments, RELIABILITY_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--judgments")
+        .arg(&judgments)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.to_uppercase().contains("UNVERIFIED") && stderr.contains("--judgments"),
+        "the judgments override must announce itself: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

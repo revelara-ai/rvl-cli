@@ -15,3 +15,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+# Not its own release app: rustindex rides the rvlscan archive (po-aml3h).
+[package.metadata.dist]
+dist = false

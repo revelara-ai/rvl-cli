@@ -30,9 +30,53 @@
 
 'use strict';
 
-const ts = require('typescript');
 const fs = require('fs');
 const path = require('path');
+
+// The `typescript` package is this helper's PREREQUISITE, not part of it: the
+// script is embedded in the rvlscan binary and extracted to
+// ~/.revelara/helpers/<version>/, and the compiler is 9 MB that would have to
+// be carried for every target (po-aml3h). rvlscan points NODE_PATH at the
+// scanned repository, so a project with its own `node_modules` needs nothing;
+// anything else gets ONE command rather than a raw module-resolution stack.
+//
+// Exit 4 is rvlscan's HELPER_EXIT_PREREQ_MISSING: "not set up yet", which
+// degrades this language and scans the rest of the repo, as distinct from
+// "broken" (which asks the reader to file a bug).
+// The version is PINNED, and the pin is load-bearing: npm's `typescript` now
+// resolves to the 7.x native port, whose JS surface has no `ts.sys` and no
+// `createProgram`. Suggesting a bare `npm install typescript` would hand the
+// reader a package that fails differently.
+const TS_REQUIREMENT = '^5.9.3';
+
+function missingTypeScript(detail) {
+  process.stderr.write(
+    'tsindex: ' + detail + '\n' +
+    '  (searched from ' + __dirname + ', NODE_PATH=' + (process.env.NODE_PATH || '') + ')\n' +
+    'tsindex: install a compatible compiler with: npm install --no-audit --no-fund --prefix ' +
+    __dirname + ' "typescript@' + TS_REQUIREMENT + '"\n'
+  );
+  process.exit(4);
+}
+
+let ts;
+try {
+  ts = require('typescript');
+} catch (e) {
+  missingTypeScript('the `typescript` package is not installed where node can find it');
+}
+// Checked by CAPABILITY rather than by version string: rvlscan points NODE_PATH
+// at the repository being scanned, so the compiler that answers here is
+// whatever that project depends on, and "does it expose the API we drive"
+// survives a version scheme changing under us. Without this the 7.x port
+// crashes mid-run with a raw module stack, which reads as a broken scanner
+// rather than a machine that needs one command.
+if (!ts || typeof ts.createProgram !== 'function' || !ts.sys) {
+  missingTypeScript(
+    'the `typescript` package found (version ' + ((ts && ts.version) || 'unknown') +
+    ') does not expose the compiler API this helper drives'
+  );
+}
 
 // PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
 // helper churn behind this number: a consumer that does not know a version
