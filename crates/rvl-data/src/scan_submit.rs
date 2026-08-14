@@ -10,15 +10,18 @@
 
 use crate::client::Client;
 use crate::gojson::{compact, compact_raw, pretty, G};
+use crate::scan_cached_output::{note_cached_scan, print_scan_findings, scan_submit_headline};
 use crate::scan_normalize::{
     normalization_summary, normalize_findings, print_normalization_issues, print_stpa_loss_banner,
     FindingNormReport,
 };
+use crate::scan_team::{apply_team_assignments, slugify_team_preview, warn_unknown_teams};
 use crate::{Failure, BIN};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,6 +50,19 @@ pub struct ScanRequest {
     pub business_criticality: Option<f64>,
     pub service_tolerance: Option<ServiceToleranceConfig>,
     pub idempotency_key: String,
+
+    /// In-repo team ownership (po-77b6w.1, org-ownership spec Decision 1).
+    /// Wire contract shared with the server's `ScanRequest`: `team` is the
+    /// repo-level owning team from `.revelara.yaml` `team:` or the `--team`
+    /// override; `team_source` is `"override"` when `--team` was used (the
+    /// server defaults to `"scan"` when omitted); `component_teams` maps
+    /// component name -> team for per-component `team:` declarations. The
+    /// server slugifies and creates teams on first sight; bindings are
+    /// latest-submission-wins. A `BTreeMap` reproduces Go's sorted map-key
+    /// marshal order.
+    pub team: String,
+    pub team_source: String,
+    pub component_teams: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -160,6 +176,13 @@ pub struct ScanResponse {
     pub warnings: Vec<String>,
     pub timestamp: String,
     pub effective_tolerance: Option<EffectiveTolerance>,
+
+    /// True when the server replayed a previously-processed response because
+    /// this submission's `idempotency_key` matched a recent scan. Nothing in
+    /// `findings` was created or updated by this run, so the output must not
+    /// re-announce those risks as `[NEW]`. Servers that predate the field omit
+    /// it; `false` is the pre-existing behavior (po-72d5d).
+    pub cached: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -548,6 +571,21 @@ fn request_g(req: &ScanRequest, include_key: bool) -> G {
         f.push((
             "idempotency_key".to_string(),
             G::Str(req.idempotency_key.clone()),
+        ));
+    }
+    // po-77b6w.1 team ownership: struct order puts these last, and all three
+    // stay off the wire when empty so older servers see no change.
+    push_str_opt(&mut f, "team", &req.team);
+    push_str_opt(&mut f, "team_source", &req.team_source);
+    if !req.component_teams.is_empty() {
+        f.push((
+            "component_teams".to_string(),
+            G::Obj(
+                req.component_teams
+                    .iter()
+                    .map(|(k, v)| (k.clone(), G::Str(v.clone())))
+                    .collect(),
+            ),
         ));
     }
     G::Obj(f)
@@ -1027,6 +1065,11 @@ fn response_g(r: &ScanResponse) -> G {
         }
         f.push(("effective_tolerance".to_string(), G::Obj(tf)));
     }
+    // omitempty, so a fresh scan's JSON is byte-identical to before
+    // (po-72d5d).
+    if r.cached {
+        f.push(("cached".to_string(), G::Bool(true)));
+    }
     G::Obj(f)
 }
 
@@ -1093,6 +1136,9 @@ fn populate_git_metadata(meta: &mut ScanMetadata, target: &Path) {
 /// The submission-mode arguments carried over from the `scan` subcommand.
 pub struct SubmitArgs {
     pub service: Option<String>,
+    /// Owning team for the WHOLE submission, overriding every `.revelara.yaml`
+    /// `team:` value (po-77b6w.1).
+    pub team: Option<String>,
     pub target: Option<PathBuf>,
     pub stdin: bool,
     pub file: Option<PathBuf>,
@@ -1127,6 +1173,15 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
             )))
         }
     };
+
+    // po-77b6w.1: validate the override early; a value that slugifies to
+    // nothing usable would be silently dropped server-side.
+    let team_flag = args.team.clone().unwrap_or_default();
+    if !team_flag.is_empty() && slugify_team_preview(&team_flag).is_empty() {
+        return fail(Failure::usage(format!(
+            "Error: --team {team_flag:?} is not a usable team name (slugifies to nothing)"
+        )));
+    }
 
     // Target directory: default cwd, must exist and be a directory.
     let target = match &args.target {
@@ -1251,6 +1306,12 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         OutputFormat::Text => "auto".to_string(),
     };
 
+    // po-77b6w.1: carry team ownership on the submission. --team overrides the
+    // whole submission; otherwise `.revelara.yaml` `team:` (repo default) and
+    // per-component `team:` entries apply.
+    let project_cfg = crate::project_config::load_project_config_from(&target);
+    apply_team_assignments(&mut req, project_cfg.as_ref(), &team_flag);
+
     // Dry run (po-4g59y): machine-readable summary on stdout so the scan
     // skill and CI can parse it, human framing on stderr, no submit.
     // serde_json's default Map is sorted, matching Go's map-key encoding,
@@ -1287,6 +1348,9 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         if args.target.is_some() {
             summary.insert("target".into(), Value::String(target.display().to_string()));
         }
+        if !req.team.is_empty() {
+            summary.insert("team".into(), Value::String(req.team.clone()));
+        }
         match serde_json::to_string_pretty(&Value::Object(summary)) {
             Ok(s) => println!("{s}"),
             Err(e) => return fail(Failure::runtime(format!("Error encoding summary: {e}"))),
@@ -1307,6 +1371,17 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
                 req.service
             );
         }
+    }
+
+    // po-77b6w.1: pre-submit did-you-mean against the org's known team slugs.
+    // Loud, never blocking: a fetch failure skips the check and an unknown
+    // team still submits (create-on-first-sight).
+    if !req.team.is_empty() || !req.component_teams.is_empty() {
+        warn_unknown_teams(
+            &mut std::io::stderr(),
+            crate::client::fetch_team_slugs(&client).as_deref(),
+            &req,
+        );
     }
 
     let timeout = resolve_scan_timeout(args.timeout.as_deref());
@@ -1366,6 +1441,9 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
             "Findings submitted: {}",
             normalization_summary(&norm_report)
         );
+        // stdout stays machine-readable (the `cached` field simply rides
+        // along in the marshalled body); the human-facing note goes to stderr.
+        note_cached_scan(&mut std::io::stderr(), &response);
         print_stpa_loss_banner(&norm_report);
         println!("{}", pretty(&response_g(&response)));
         if response.summary.critical > 0 || response.summary.high > 0 {
@@ -1381,7 +1459,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
 /// The human-readable success block, mirroring rvl-cli's standard output
 /// path (plus the effective-tolerance line the response now carries).
 fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url: &str) {
-    println!("Scan submitted successfully");
+    println!("{}", scan_submit_headline(response.cached));
     println!("  Scan ID: {}", response.scan_id);
     println!("  Service: {}", response.service);
     println!(
@@ -1431,28 +1509,9 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
     }
     println!();
 
-    if let Some(findings) = &response.findings {
-        if !findings.is_empty() {
-            println!("Findings:");
-            for f in findings {
-                let status = match f.status.as_str() {
-                    "created" => "NEW",
-                    "updated" => "UPD",
-                    _ => "---",
-                };
-                println!(
-                    "  [{status}] {}: {} (score: {}, {})",
-                    f.risk_code, f.title, f.score, f.priority
-                );
-                // Per-finding server warnings: a server-side partial accept
-                // of a finding's fields must be visible.
-                for w in &f.warnings {
-                    eprintln!("        warning [{}]: {w}", f.risk_code);
-                }
-            }
-            println!();
-        }
-    }
+    // Risk rows on stdout, per-finding server warnings on stderr: a
+    // server-side partial accept of a finding's fields must be visible.
+    print_scan_findings(&mut std::io::stdout(), &mut std::io::stderr(), response);
 
     if !response.warnings.is_empty() {
         eprintln!("Warnings:");
@@ -1545,6 +1604,46 @@ mod tests {
             body,
             r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{"git_commit":"abc123","scanner_id":"rvlscan/0.1.0"},"business_criticality":0.9,"service_tolerance":{"tolerance_target":25,"strict_enforcement":true},"idempotency_key":"k"}"#
         );
+    }
+
+    /// The team wire contract shared with the server's `ScanRequest`: field
+    /// names `team`, `team_source`, `component_teams`, marshalled last (Go
+    /// struct order) with sorted component keys, and all three omitted when
+    /// empty so older servers see no change (po-77b6w.1).
+    #[test]
+    fn team_fields_ride_last_and_stay_off_the_wire_when_empty() {
+        let mut req = base_request();
+        req.idempotency_key = "k".into();
+        req.team = "checkout".into();
+        req.team_source = "override".into();
+        req.component_teams
+            .insert("worker".into(), "payments".into());
+        req.component_teams.insert("api".into(), "checkout".into());
+        let body = request_body(&req, true);
+        assert!(
+            body.ends_with(
+                r#""idempotency_key":"k","team":"checkout","team_source":"override","component_teams":{"api":"checkout","worker":"payments"}}"#
+            ),
+            "{body}"
+        );
+
+        let plain = request_body(&base_request(), false);
+        for key in ["team", "team_source", "component_teams"] {
+            assert!(
+                !plain.contains(&format!("\"{key}\"")),
+                "{key} must be omitted when empty: {plain}"
+            );
+        }
+    }
+
+    /// Team ownership is part of the deduplicated payload: re-submitting the
+    /// same findings under a different team is a different scan.
+    #[test]
+    fn idempotency_key_changes_with_team() {
+        let a = base_request();
+        let mut b = base_request();
+        b.team = "checkout".into();
+        assert_ne!(derive_idempotency_key(&a), derive_idempotency_key(&b));
     }
 
     #[test]

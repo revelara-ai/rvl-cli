@@ -6,7 +6,7 @@
 use crate::client::Client;
 use crate::control;
 use crate::display;
-use crate::gojson::{compact, G};
+use crate::gojson::{compact, query_encode, G};
 use crate::{CmdResult, Failure, BIN};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -33,6 +33,13 @@ pub enum EvidenceCmd {
         /// Git commit hash (auto-detected if not provided)
         #[arg(long)]
         git_hash: Option<String>,
+        /// Team slug the evidence is scoped to (who exercises the practice)
+        #[arg(long)]
+        team: Option<String>,
+        /// Service name the evidence covers; combinable with --team (AND).
+        /// Without --team/--service the evidence lands org-wide (global)
+        #[arg(long)]
+        service: Option<String>,
         /// Output raw JSON response
         #[arg(long)]
         format: Option<String>,
@@ -48,6 +55,15 @@ pub enum EvidenceCmd {
         /// Filter by status (not_configured, configured, sample, verified)
         #[arg(long)]
         status: Option<String>,
+        /// Filter to evidence scoped to this team
+        #[arg(long)]
+        team: Option<String>,
+        /// Filter to evidence covering this service
+        #[arg(long)]
+        service: Option<String>,
+        /// Filter by scope state (team, service, global, unknown)
+        #[arg(long = "scope-state")]
+        scope_state: Option<String>,
         /// Max records (default: 20)
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
@@ -79,6 +95,46 @@ pub struct EvidenceItem {
     pub git_hash: Option<String>,
     #[serde(default)]
     pub status: String,
+    /// Evidence scope (team | service | global | unknown). An EMPTY string
+    /// means an older server that predates scoping — rendered as nothing,
+    /// which is deliberately distinct from `unknown` (a grandfathered row
+    /// the server knows about but cannot attribute).
+    #[serde(default)]
+    pub scope_state: String,
+    #[serde(default)]
+    pub team_slug: Option<String>,
+    #[serde(default)]
+    pub service_name: Option<String>,
+}
+
+/// Whether `s` is a known evidence scope state (mirrors the server's
+/// `EvidenceScopeState` enum).
+pub fn valid_scope_state(s: &str) -> bool {
+    matches!(s, "team" | "service" | "global" | "unknown")
+}
+
+/// Renders an evidence record's scope for text output. Global scope (the
+/// default) and pre-scoping servers (empty `scope_state`) render nothing;
+/// grandfathered `unknown` rows are flagged for re-scoping.
+pub fn evidence_scope_label(e: &EvidenceItem) -> String {
+    match e.scope_state.as_str() {
+        "unknown" => "unknown scope (needs re-scoping)".to_string(),
+        "team" | "service" => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = e.team_slug.as_deref() {
+                if !t.is_empty() {
+                    parts.push(format!("team={t}"));
+                }
+            }
+            if let Some(s) = e.service_name.as_deref() {
+                if !s.is_empty() {
+                    parts.push(format!("service={s}"));
+                }
+            }
+            parts.join(" ")
+        }
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -99,6 +155,8 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 url,
                 description,
                 git_hash,
+                team,
+                service,
                 format,
             } => {
                 validate_format(&format)?;
@@ -119,6 +177,8 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                     url.as_deref().unwrap_or(""),
                     description.as_deref().unwrap_or(""),
                     &git_hash,
+                    team.as_deref().unwrap_or(""),
+                    service.as_deref().unwrap_or(""),
                     format.as_deref(),
                 )
             }
@@ -126,17 +186,24 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 control,
                 evidence_type,
                 status,
+                team,
+                service,
+                scope_state,
                 limit,
                 format,
             } => {
                 validate_format(&format)?;
                 validate_status(&status)?;
+                validate_scope_state(&scope_state)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(
                     &client,
                     control.as_deref(),
                     evidence_type.as_deref(),
                     status.as_deref(),
+                    team.as_deref(),
+                    service.as_deref(),
+                    scope_state.as_deref(),
                     limit,
                     format.as_deref(),
                 )
@@ -179,6 +246,17 @@ fn validate_status(status: &Option<String>) -> Result<(), Failure> {
     }
 }
 
+/// `--scope-state` is validated client-side against the server enum.
+fn validate_scope_state(scope_state: &Option<String>) -> Result<(), Failure> {
+    match scope_state.as_deref() {
+        None => Ok(()),
+        Some(s) if valid_scope_state(s) => Ok(()),
+        Some(s) => Err(Failure::usage(format!(
+            "Error: invalid --scope-state value \"{s}\"; must be one of: team, service, global, unknown"
+        ))),
+    }
+}
+
 fn check_not_risk_code(code: &str) -> Result<(), Failure> {
     if code.starts_with("R-") && !code.starts_with("RC-") {
         return Err(Failure::usage(format!(
@@ -203,6 +281,12 @@ fn detect_git_hash() -> Option<String> {
 
 /// The POST /api/v1/evidence body: byte-identical to Go's sorted-key
 /// `map[string]string` marshal (git_hash only when present).
+///
+/// `team`/`service` are only sent when set, so unscoped submissions keep
+/// working against older servers that predate scoping. They are combinable
+/// (AND): team = who exercises the practice, service = what it covers;
+/// neither means org-wide (global) evidence.
+#[allow(clippy::too_many_arguments)]
 pub fn submit_body(
     control_id: &str,
     evidence_type: &str,
@@ -210,6 +294,8 @@ pub fn submit_body(
     url: &str,
     description: &str,
     git_hash: &str,
+    team: &str,
+    service: &str,
 ) -> String {
     let mut fields = vec![
         ("control_id".to_string(), G::Str(control_id.into())),
@@ -219,6 +305,12 @@ pub fn submit_body(
         fields.push(("git_hash".to_string(), G::Str(git_hash.into())));
     }
     fields.push(("name".to_string(), G::Str(name.into())));
+    if !service.is_empty() {
+        fields.push(("service".to_string(), G::Str(service.into())));
+    }
+    if !team.is_empty() {
+        fields.push(("team".to_string(), G::Str(team.into())));
+    }
     fields.push(("type".to_string(), G::Str(evidence_type.into())));
     fields.push(("url_or_identifier".to_string(), G::Str(url.into())));
     // Fields are constructed pre-sorted (Go map marshal sorts keys).
@@ -234,6 +326,8 @@ pub fn submit_output(
     url: &str,
     description: &str,
     git_hash: &str,
+    team: &str,
+    service: &str,
     format: Option<&str>,
 ) -> CmdResult {
     let control = control::fetch_control_by_code(client, control_code)?;
@@ -250,8 +344,19 @@ pub fn submit_output(
         );
     }
 
-    let body = submit_body(&control.id, evidence_type, name, url, description, git_hash);
+    let body = submit_body(
+        &control.id,
+        evidence_type,
+        name,
+        url,
+        description,
+        git_hash,
+        team,
+        service,
+    );
     let api_url = format!("{}/api/v1/evidence", client.api_url);
+    // An unknown --team/--service is a 400 whose message lists the org's
+    // known slugs/services; it passes through verbatim.
     let resp = client
         .request("POST", &api_url, Some(body.as_bytes()))
         .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
@@ -270,6 +375,12 @@ pub fn submit_output(
     let _ = writeln!(out, "  Type:    {}", evidence.evidence_type);
     let _ = writeln!(out, "  Name:    {}", evidence.name);
     let _ = writeln!(out, "  Status:  {}", evidence.status);
+    let scope = evidence_scope_label(&evidence);
+    if !scope.is_empty() {
+        let _ = writeln!(out, "  Scope:   {scope}");
+    } else if evidence.scope_state == "global" {
+        let _ = writeln!(out, "  Scope:   org-wide (global)");
+    }
     if !url.is_empty() {
         let _ = writeln!(out, "  URL:     {url}");
     }
@@ -281,29 +392,38 @@ pub fn submit_output(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn list_output(
     client: &Client,
     control: Option<&str>,
     evidence_type: Option<&str>,
     status: Option<&str>,
+    team: Option<&str>,
+    service: Option<&str>,
+    scope_state: Option<&str>,
     limit: u32,
     format: Option<&str>,
 ) -> CmdResult {
-    // rvl-cli builds this query by string concatenation in a fixed order
-    // (limit, type, status, control_id) rather than url.Values; mirror it.
-    let mut url = format!("{}/api/v1/evidence?limit={limit}", client.api_url);
-    if let Some(t) = evidence_type {
-        url.push_str(&format!("&type={t}"));
-    }
-    if let Some(s) = status {
-        url.push_str(&format!("&status={s}"));
-    }
-    if let Some(code) = control {
-        let control_id = control::find_control_id_by_code(client, code)
-            .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
-        url.push_str(&format!("&control_id={control_id}"));
-    }
+    let control_id = match control {
+        Some(code) => Some(
+            control::find_control_id_by_code(client, code)
+                .map_err(|e| Failure::runtime(format!("Error: {e}")))?,
+        ),
+        None => None,
+    };
+    let url = list_url(
+        &client.api_url,
+        limit,
+        evidence_type,
+        status,
+        control_id.as_deref(),
+        team,
+        service,
+        scope_state,
+    );
 
+    // An unknown --team/--service is a 400 whose message lists the org's
+    // known slugs/services; it passes through verbatim.
     let resp = client
         .request("GET", &url, None)
         .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
@@ -339,11 +459,46 @@ pub fn list_output(
             e.evidence_type,
             e.name
         );
+        let scope = evidence_scope_label(e);
+        if !scope.is_empty() {
+            let _ = writeln!(out, "    Scope: {scope}");
+        }
         if !e.url_or_identifier.is_empty() {
             let _ = writeln!(out, "    URL: {}", e.url_or_identifier);
         }
     }
     Ok(out)
+}
+
+/// The GET /api/v1/evidence query. `url.Values`-encoded (sorted keys,
+/// escaped values) so service names with spaces — or a stray `&`/`%` —
+/// cannot smuggle extra params.
+#[allow(clippy::too_many_arguments)]
+pub fn list_url(
+    base: &str,
+    limit: u32,
+    evidence_type: Option<&str>,
+    status: Option<&str>,
+    control_id: Option<&str>,
+    team: Option<&str>,
+    service: Option<&str>,
+    scope_state: Option<&str>,
+) -> String {
+    let mut pairs = vec![("limit", limit.to_string())];
+    let mut push = |key: &'static str, val: Option<&str>| {
+        if let Some(v) = val {
+            if !v.is_empty() {
+                pairs.push((key, v.to_string()));
+            }
+        }
+    };
+    push("type", evidence_type);
+    push("status", status);
+    push("control_id", control_id);
+    push("team", team);
+    push("service", service);
+    push("scope_state", scope_state);
+    format!("{base}/api/v1/evidence?{}", query_encode(&pairs))
 }
 
 pub fn verify_output(client: &Client, id: &str, format: Option<&str>) -> CmdResult {
@@ -381,14 +536,143 @@ mod tests {
                 "CB impl",
                 "https://x",
                 "desc & more",
-                "abc123"
+                "abc123",
+                "",
+                ""
             ),
             r#"{"control_id":"uuid-1","description":"desc \u0026 more","git_hash":"abc123","name":"CB impl","type":"code","url_or_identifier":"https://x"}"#
         );
         assert_eq!(
-            submit_body("uuid-1", "code", "n", "", "", ""),
+            submit_body("uuid-1", "code", "n", "", "", "", "", ""),
             r#"{"control_id":"uuid-1","description":"","name":"n","type":"code","url_or_identifier":""}"#
         );
+    }
+
+    #[test]
+    fn submit_body_carries_scope_flags() {
+        // team/service are combinable (AND) and sort between name and type.
+        assert_eq!(
+            submit_body(
+                "cid",
+                "code",
+                "n",
+                "u",
+                "d",
+                "abc123",
+                "platform",
+                "shared-postgres"
+            ),
+            r#"{"control_id":"cid","description":"d","git_hash":"abc123","name":"n","service":"shared-postgres","team":"platform","type":"code","url_or_identifier":"u"}"#
+        );
+        // Team only.
+        let body = submit_body("cid", "code", "n", "u", "d", "abc123", "payments", "");
+        assert!(body.contains(r#""team":"payments""#), "{body}");
+        assert!(!body.contains(r#""service""#), "{body}");
+        // Service only.
+        let body = submit_body("cid", "code", "n", "u", "d", "abc123", "", "checkout-api");
+        assert!(body.contains(r#""service":"checkout-api""#), "{body}");
+        assert!(!body.contains(r#""team""#), "{body}");
+        // Neither: no scope keys at all (org-wide/global).
+        let body = submit_body("cid", "code", "n", "u", "d", "abc123", "", "");
+        assert!(!body.contains("team"), "{body}");
+        assert!(!body.contains("service"), "{body}");
+        // Base fields always survive.
+        assert!(body.contains(r#""control_id":"cid""#), "{body}");
+        assert!(body.contains(r#""git_hash":"abc123""#), "{body}");
+    }
+
+    #[test]
+    fn list_url_encodes_scope_filters() {
+        let url = list_url(
+            "https://api.example.com",
+            20,
+            Some("code"),
+            Some("verified"),
+            Some("cid-1"),
+            Some("payments"),
+            Some("checkout api"),
+            Some("team"),
+        );
+        for want in [
+            "limit=20",
+            "type=code",
+            "status=verified",
+            "control_id=cid-1",
+            "team=payments",
+            "service=checkout+api",
+            "scope_state=team",
+        ] {
+            assert!(url.contains(want), "url {url} missing {want}");
+        }
+    }
+
+    #[test]
+    fn list_url_omits_empty_scope_filters() {
+        let url = list_url(
+            "https://api.example.com",
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(url, "https://api.example.com/api/v1/evidence?limit=20");
+        for absent in ["team=", "service=", "scope_state="] {
+            assert!(!url.contains(absent), "url {url} must not contain {absent}");
+        }
+    }
+
+    #[test]
+    fn scope_state_enum_matches_the_server() {
+        for ok in ["team", "service", "global", "unknown"] {
+            assert!(valid_scope_state(ok), "{ok} should be valid");
+        }
+        for bad in ["", "org", "TEAM", "all"] {
+            assert!(!valid_scope_state(bad), "{bad} should be invalid");
+        }
+        let f = validate_scope_state(&Some("org".into())).unwrap_err();
+        assert_eq!(f.code, 2);
+        assert_eq!(
+            f.msg,
+            "Error: invalid --scope-state value \"org\"; must be one of: team, service, global, unknown"
+        );
+        assert!(validate_scope_state(&None).is_ok());
+        assert!(validate_scope_state(&Some("unknown".into())).is_ok());
+    }
+
+    #[test]
+    fn scope_label_distinguishes_empty_from_unknown() {
+        let item = |state: &str, team: Option<&str>, svc: Option<&str>| EvidenceItem {
+            scope_state: state.to_string(),
+            team_slug: team.map(str::to_string),
+            service_name: svc.map(str::to_string),
+            ..Default::default()
+        };
+        // Pre-scoping server (empty scope_state): renders nothing.
+        assert_eq!(evidence_scope_label(&EvidenceItem::default()), "");
+        // Global is silent too, but for a different reason.
+        assert_eq!(evidence_scope_label(&item("global", None, None)), "");
+        // Grandfathered rows the server knows it cannot attribute.
+        assert_eq!(
+            evidence_scope_label(&item("unknown", None, None)),
+            "unknown scope (needs re-scoping)"
+        );
+        assert_eq!(
+            evidence_scope_label(&item("team", Some("payments"), None)),
+            "team=payments"
+        );
+        assert_eq!(
+            evidence_scope_label(&item("service", None, Some("checkout-api"))),
+            "service=checkout-api"
+        );
+        assert_eq!(
+            evidence_scope_label(&item("team", Some("payments"), Some("checkout-api"))),
+            "team=payments service=checkout-api"
+        );
+        // Empty strings inside the pointers contribute nothing.
+        assert_eq!(evidence_scope_label(&item("team", Some(""), Some(""))), "");
     }
 
     #[test]

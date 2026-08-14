@@ -1,6 +1,9 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod hook;
+mod init;
+mod out_doc;
 mod render;
 mod report;
 mod shared_config;
@@ -117,6 +120,11 @@ enum Cmd {
         /// submission when combined with --scan-dir/--file/--stdin).
         #[arg(long, short = 's')]
         service: Option<String>,
+        /// Submission mode: owning team for the whole submission. Overrides
+        /// every `.revelara.yaml` `team:` value (repo-level and per-component)
+        /// and creates the team on first sight.
+        #[arg(long)]
+        team: Option<String>,
         /// Submission mode: project directory the scan describes (default:
         /// cwd); git_commit/git_branch metadata come from here.
         #[arg(long, short = 't')]
@@ -250,6 +258,30 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PluginCmd,
     },
+    /// Initialize Revelara for this repository: write .revelara.yaml with
+    /// the project name and detected components, install the plugin skills,
+    /// and check credentials (rvl-cli `rvl init` parity, po-av01j.163).
+    Init {
+        /// Set project name (default: from git remote or directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Skip installing the Revelara plugin for coding agents
+        #[arg(long, alias = "skip-skills")]
+        skip_plugin: bool,
+        /// Overwrite existing config without prompting
+        #[arg(long)]
+        force: bool,
+        /// Accept all auto-detected defaults non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Install or check the git-hook scan gate: `hook install` writes a
+    /// pre-commit/pre-push shim invoking the native deterministic scan;
+    /// `hook doctor` preflights it (rvl-cli `rvl hook` parity).
+    Hook {
+        #[command(subcommand)]
+        cmd: hook::HookCmd,
+    },
     // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
     // contract (same subcommands/flags, byte-identical --format=json);
     // implementations live in crates/rvl-data with golden-parity suites. ---
@@ -269,7 +301,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, foresight, enrich)
+    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, relationships, graph, foresight, enrich, health)
     Knowledge {
         #[command(subcommand)]
         cmd: rvl_data::knowledge::KnowledgeCmd,
@@ -294,6 +326,39 @@ enum Cmd {
         #[command(flatten)]
         args: rvl_data::feedback::FeedbackArgs,
     },
+    /// View and edit CLI configuration (~/.revelara/config.yaml)
+    Config {
+        #[command(subcommand)]
+        cmd: rvl_data::config::ConfigCmd,
+    },
+    /// Generate shell completion scripts (bash, zsh, fish).
+    /// Bash/zsh: eval "$(rvlscan completion bash)" in your rc file.
+    /// Fish: rvlscan completion fish > ~/.config/fish/completions/rvlscan.fish
+    Completion {
+        /// Shell to generate a completion script for.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+/// The shells `rvl completion` supports (rvl-cli parity: bash, zsh, fish).
+/// A deliberate subset of `clap_complete::Shell` so `--help` and error
+/// messages advertise exactly what rvl-cli does.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(s: CompletionShell) -> Self {
+        match s {
+            CompletionShell::Bash => clap_complete::Shell::Bash,
+            CompletionShell::Zsh => clap_complete::Shell::Zsh,
+            CompletionShell::Fish => clap_complete::Shell::Fish,
+        }
+    }
 }
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
@@ -542,17 +607,6 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// One finding row. Mirrors the rvl-eval `run` emitter so the eval harness
-/// can score a scan output without a conversion step.
-#[derive(serde::Serialize)]
-struct FindingOut {
-    site_id: String,
-    snapshot_id: String,
-    verdict: String,
-    reason: String,
-    class: String,
 }
 
 /// Map triaged items to renderable findings. Incident-linkage fields
@@ -2435,6 +2489,29 @@ fn render_scan_output(
     // verbatim, from any directory, without re-running this scan's inputs.
     save_last_scan(state_path, path, &ladder_findings);
 
+    // The gate verdict, computed ONCE from the same `classify` the footer
+    // uses, then shared by the printed ladder, the --out document's `exit`
+    // field, and the process exit code, so no pair of them can ever disagree
+    // (po-av01j.94's invariant, extended to the document).
+    let blocked = render::blocking_count(&ladder_findings) > 0;
+
+    // Build the structured scan document (rvl-scan/v1) BEFORE the ladder
+    // render consumes `coverage`. Deterministic-engine truth only; the agent
+    // block rides as an opaque, provenance-tagged string.
+    let doc = out.map(|_| {
+        out_doc::build(
+            &ladder_findings,
+            &coverage,
+            config.map(|lane| &lane.coverage),
+            findings,
+            sites,
+            hook_agent
+                .map(|a| a.block.as_str())
+                .filter(|b| !b.is_empty()),
+            blocked,
+        )
+    });
+
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
     print!(
         "{}",
@@ -2454,26 +2531,15 @@ fn render_scan_output(
         }
     }
 
-    if let Some(p) = out {
-        let rows: Vec<FindingOut> = findings
-            .iter()
-            .zip(sites.iter())
-            .map(|(f, s)| FindingOut {
-                site_id: f.site_id.clone(),
-                snapshot_id: s.snapshot_id.clone(),
-                verdict: f.verdict.as_str().to_string(),
-                reason: f.reason.clone(),
-                class: rvl_triage::class_key_string(s),
-            })
-            .collect();
-        std::fs::write(p, serde_json::to_string_pretty(&rows)?)?;
+    if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
+        std::fs::write(p, serde_json::to_string_pretty(doc)?)?;
         println!("\nwrote {}", p.display());
     }
     // The gate. Both scan paths (packet stream and incremental) funnel through
     // here, so this is the single place the blocking verdict becomes a process
     // status — derived from the same `classify` the footer used, never a second
     // opinion. See EXIT_BLOCKED for the full contract.
-    if render::blocking_count(&ladder_findings) > 0 {
+    if blocked {
         return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
@@ -3531,12 +3597,24 @@ fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: 
 /// including v1 rvl-cli-recorded installs, which the update ADOPTS by
 /// performing a normal v2 install — falling back to detection). Mirrors
 /// `rvl plugin install/update`.
+/// Map a `run_skills_install` failure count to the command exit code.
+fn skills_exit(failed: usize) -> ExitCode {
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Returns `(installed, failed)` counts so callers (the `skills`/`plugin`
+/// arms, and `init`'s delegated plugin step) can distinguish "everything
+/// installed", "some harness failed", and "nothing to do".
 fn run_skills_install(
     env: &rvl_skills::flow::Env,
     harness: Option<String>,
     no_register: bool,
     update: bool,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<(usize, usize)> {
     let supported = || rvl_skills::harness::supported_names().join(", ");
     let targets: Vec<String> = match harness {
         Some(name) => {
@@ -3575,12 +3653,13 @@ fn run_skills_install(
                     supported()
                 );
                 println!("Install one, or name it explicitly: rvlscan skills install <harness>");
-                return Ok(ExitCode::SUCCESS);
+                return Ok((0, 0));
             }
             names
         }
     };
 
+    let mut installed = 0usize;
     let mut failed = 0usize;
     for name in &targets {
         // by_name is total over `targets` by construction; skip defensively.
@@ -3588,18 +3667,17 @@ fn run_skills_install(
             continue;
         };
         match rvl_skills::flow::install_one(env, h.as_ref()) {
-            Ok(report) => render_install_report(&report, no_register),
+            Ok(report) => {
+                render_install_report(&report, no_register);
+                installed += 1;
+            }
             Err(e) => {
                 eprintln!("{name}: {e}");
                 failed += 1;
             }
         }
     }
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok((installed, failed))
 }
 
 /// Render the drift report, mirroring `rvl plugin list`'s UX.
@@ -3732,14 +3810,16 @@ fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, false)
+            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            Ok(skills_exit(failed))
         }
         SkillsCmd::Update {
             harness,
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, true)
+            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            Ok(skills_exit(failed))
         }
         SkillsCmd::Status => {
             render_skills_status(&rvl_skills::flow::status(&env));
@@ -3761,14 +3841,16 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, false)
+            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            Ok(skills_exit(failed))
         }
         PluginCmd::Update {
             harness,
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, true)
+            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            Ok(skills_exit(failed))
         }
         PluginCmd::List => {
             render_skills_status(&rvl_skills::flow::status(&env));
@@ -3961,6 +4043,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // needs API credentials, never the spec cache.
         Cmd::Scan {
             service,
+            team,
             target,
             stdin,
             file,
@@ -3974,6 +4057,7 @@ fn run() -> anyhow::Result<ExitCode> {
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
+                    team,
                     target,
                     stdin,
                     file,
@@ -3986,6 +4070,35 @@ fn run() -> anyhow::Result<ExitCode> {
                 env!("CARGO_PKG_VERSION"),
             ));
         }
+        // Onboarding surface (po-av01j.163): init needs the skills machinery
+        // for its plugin step but never the spec cache; hook is pure file
+        // operations on .git/hooks. Both dispatch before the store opens.
+        Cmd::Init {
+            project,
+            skip_plugin,
+            force,
+            yes,
+        } => {
+            let cfg = Config::from_env();
+            return Ok(init::run(
+                init::InitArgs {
+                    project,
+                    skip_plugin,
+                    force,
+                    yes,
+                },
+                || {
+                    let ctx = SkillsCtx::resolve(&cfg)?;
+                    ctx.require_key()?;
+                    let (installed, _failed) = run_skills_install(&ctx.env(), None, false, false)?;
+                    // rvl-cli marks the plugin installed when ANY editor
+                    // ended up with skills; per-harness failures were
+                    // already reported by the machinery.
+                    Ok(installed > 0)
+                },
+            ));
+        }
+        Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
@@ -4007,6 +4120,18 @@ fn run() -> anyhow::Result<ExitCode> {
                 "bug",
                 env!("CARGO_PKG_VERSION"),
             ))
+        }
+        Cmd::Config { cmd } => return Ok(rvl_data::config::run(cmd)),
+        Cmd::Completion { shell } => {
+            use clap::CommandFactory as _;
+            let mut command = Cli::command();
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut command,
+                "rvlscan",
+                &mut std::io::stdout(),
+            );
+            return Ok(ExitCode::SUCCESS);
         }
         other => other,
     };
@@ -4224,10 +4349,12 @@ fn run() -> anyhow::Result<ExitCode> {
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
         Cmd::Plugin { cmd } => run_plugin(&cfg, cmd),
-        // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
-        // Incident/Evidence/Feedback/Bugreport) returned before the store
-        // opened, above.
-        Cmd::Login
+        // Data and onboarding commands (Init/Hook/Login/Logout/Status/
+        // Risk/Control/Knowledge/Incident/Evidence/Feedback/Bugreport)
+        // returned before the store opened, above.
+        Cmd::Init { .. }
+        | Cmd::Hook { .. }
+        | Cmd::Login
         | Cmd::Logout
         | Cmd::Status
         | Cmd::Risk { .. }
@@ -4236,7 +4363,9 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Incident { .. }
         | Cmd::Evidence { .. }
         | Cmd::Feedback { .. }
-        | Cmd::Bugreport { .. } => {
+        | Cmd::Bugreport { .. }
+        | Cmd::Config { .. }
+        | Cmd::Completion { .. } => {
             unreachable!("data commands dispatch before the store opens")
         }
     }
@@ -5563,6 +5692,26 @@ mod tests {
                 "--control=RC-018",
                 "--technology=go",
             ],
+            // The rvl-cli knowledge usage examples, verbatim.
+            vec![
+                "rvlscan",
+                "knowledge",
+                "relationships",
+                "fact",
+                "fact_abc12",
+                "--format=json",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "graph",
+                "fact",
+                "fact_abc12",
+                "--depth=2",
+                "--min-strength=0.3",
+                "--type=causes,mitigates",
+            ],
+            vec!["rvlscan", "knowledge", "health"],
             vec![
                 "rvlscan",
                 "evidence",
@@ -5598,6 +5747,9 @@ mod tests {
             vec!["rvlscan", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
             vec!["rvlscan", "knowledge", "enrich", "--bogus"],
             vec!["rvlscan", "knowledge", "foresight", "--min-strength=abc"], // not a number
+            vec!["rvlscan", "knowledge", "relationships", "fact"],           // missing entity id
+            vec!["rvlscan", "knowledge", "graph", "fact", "f1", "--depth=0"], // depth must be >= 1
+            vec!["rvlscan", "knowledge", "health", "--bogus"],
         ] {
             let joined = argv.join(" ");
             assert!(
