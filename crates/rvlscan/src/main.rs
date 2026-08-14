@@ -2431,7 +2431,7 @@ fn render_scan_output(
     // (po-av01j.94's invariant, extended to the document).
     let blocked = render::blocking_count(&ladder_findings) > 0;
 
-    // Build the structured scan document (rvlscan-scan/v1) BEFORE the ladder
+    // Build the structured scan document (rvl-scan/v1) BEFORE the ladder
     // render consumes `coverage`. Deterministic-engine truth only; the agent
     // block rides as an opaque, provenance-tagged string.
     let doc = out.map(|_| {

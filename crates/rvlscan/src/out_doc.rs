@@ -1,4 +1,4 @@
-//! The `--out` structured scan document, schema `rvlscan-scan/v1`.
+//! The `--out` structured scan document, schema `rvl-scan/v1`.
 //!
 //! PROTOTYPE (design vetting): replaces the per-site eval rows with a full
 //! machine contract mirroring what the human ladder and COVERAGE block say:
@@ -225,7 +225,7 @@ pub fn build(
     }
 
     OutDoc {
-        schema: "rvlscan-scan/v1",
+        schema: "rvl-scan/v1",
         exit: if blocked { 3 } else { 0 },
         findings,
         coverage: OutCoverage {

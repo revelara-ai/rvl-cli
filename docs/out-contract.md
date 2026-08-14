@@ -38,7 +38,7 @@ orchestrator. The orchestrator uses it to:
 
 ```json
 {
-  "schema": "rvlscan-scan/v1",
+  "schema": "rvl-scan/v1",
   "exit": 0,
   "findings": [
     {
