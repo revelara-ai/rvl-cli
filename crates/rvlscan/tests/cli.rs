@@ -3982,3 +3982,123 @@ fn completion_generates_a_script_for_each_shell() {
         );
     }
 }
+
+// --- submission-only flags on the deterministic path (po-av01j.168) ---
+
+/// Every one of these used to be accepted and silently dropped: the scan ran
+/// normally, the flag went nowhere, and the user believed it had taken
+/// effect. `--format=json` was the worst of them — a script asked for JSON
+/// and parsed the human ladder.
+#[test]
+fn deterministic_scan_rejects_each_submission_only_flag() {
+    for (flag, value) in [
+        ("--team", Some("backend-team")),
+        ("--format", Some("json")),
+        ("--timeout", Some("90s")),
+        ("--cleanup-on-success", None),
+        ("--target", Some(".")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = bin();
+        cmd.arg("scan").arg(dir.path()).arg(flag);
+        if let Some(v) = value {
+            cmd.arg(v);
+        }
+        let out = cmd
+            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("HOME", dir.path())
+            .output()
+            .expect("failed to run rvlscan");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`scan {flag}` must be a usage error (exit 2), got {:?}: {stderr}",
+            out.status.code()
+        );
+        assert!(
+            stderr.contains(flag),
+            "the error must NAME the flag that was refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("--scan-dir") || stderr.contains("--service"),
+            "the error must say what the flag requires: {stderr}"
+        );
+    }
+}
+
+/// The rejection is a USAGE error, so it must fire before the spec cache is
+/// even consulted: a mistyped flag is wrong whether or not this machine has a
+/// verifiable cache, and exit 1 ("the scanner broke") would hide it.
+#[test]
+fn the_stray_flag_error_precedes_the_spec_cache_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["scan"])
+        .arg(dir.path())
+        .args(["--team", "backend-team"])
+        // An empty cache dir: a plain scan here exits 1 with "no verifiable
+        // spec cache". The usage error must win.
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path())
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// A deterministic scan with NO submission flag is byte-for-byte what it was:
+/// the check only ever looks at flags the user explicitly typed.
+#[test]
+fn a_plain_deterministic_scan_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "a flagless scan must still reach a verdict, got {:?}",
+        out.status.code()
+    );
+}
+
+/// Submission mode is untouched: the same flags that were refused above are
+/// honored the moment an input selects submission.
+#[test]
+fn submission_mode_still_accepts_the_same_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let findings = dir.path().join("findings.json");
+    std::fs::write(&findings, r#"{"findings":[]}"#).unwrap();
+    let out = bin()
+        .args([
+            "scan",
+            "--service",
+            "checkout-api",
+            "--team",
+            "backend-team",
+        ])
+        .arg("--file")
+        .arg(&findings)
+        .args(["--dry-run", "--format", "json", "--timeout", "90s"])
+        .env("HOME", dir.path())
+        .env("RVL_API_KEY", "test-key")
+        .env("RVL_API_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "submission mode must not be refused: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"dry_run\"") && stdout.contains("checkout-api"),
+        "the dry-run summary must describe the submission: {stdout} {stderr}"
+    );
+}

@@ -116,7 +116,30 @@ fn scan(bin: &Path, repo: &Path, home: &Path, cache: &Path, out: &Path) -> std::
     ] {
         cmd.env_remove(var);
     }
-    cmd.output().expect("failed to run rvlscan")
+    run_retrying_etxtbsy(&mut cmd)
+}
+
+/// Spawn `cmd`, retrying briefly on `ETXTBSY` ("Text file busy").
+///
+/// Not flake papering: this is a known Linux fork/exec race and it belongs to
+/// the harness, not to the scanner. These tests COPY the binary and then
+/// execute the copy; while `fs::copy` holds a write descriptor on the
+/// destination, any fork elsewhere in this multi-threaded test process
+/// inherits that descriptor, and the kernel refuses to exec a file that is
+/// open for writing until the last such descriptor closes. It surfaced only
+/// under a full `cargo test` — several test binaries spawning at once widen
+/// the window — which is exactly the run the commit gate uses.
+fn run_retrying_etxtbsy(cmd: &mut Command) -> std::process::Output {
+    for _ in 0..50 {
+        match cmd.output() {
+            Ok(o) => return o,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("failed to run rvlscan: {e:?}"),
+        }
+    }
+    panic!("rvlscan stayed ETXTBSY for a second; the copied binary never became executable")
 }
 
 /// THE ACCEPTANCE TEST. A lone binary, an empty HOME, a polyglot repo, and no

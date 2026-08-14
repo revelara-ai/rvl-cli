@@ -110,6 +110,27 @@ pub fn install_dirs(base: &str) -> Vec<PathBuf> {
     dirs
 }
 
+/// Serializes EVERY test in this binary that mutates process-global env
+/// (`HOME`, `RVLSCAN_HELPER_DIR`, the per-language overrides).
+///
+/// One lock for the whole crate on purpose. This module and `main.rs` both
+/// move `HOME` and `RVLSCAN_HELPER_DIR`, and two separate mutexes guarding the
+/// same process-wide state guard nothing: `ensure_writes_then_repairs_a_
+/// corrupted_copy` failed four runs in five with "HOME is unset" because a
+/// `main.rs` test held the OTHER lock and had just cleared both variables.
+/// The lock lives here rather than in `main.rs` because this is the module
+/// whose contract the env actually is.
+///
+/// Poison is absorbed (`into_inner`): a panicking test must fail on its own
+/// assertion, not cascade into every later test as a poisoned-lock unwrap.
+#[cfg(test)]
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     let mut h = sha2::Sha256::new();
     h.update(bytes);
@@ -168,15 +189,6 @@ pub fn ensure(helper: &Embedded) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the tests that move HOME/`RVLSCAN_HELPER_DIR`: env is
-    /// process-wide and cargo runs unit tests on threads.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn cache_root_is_versioned_under_home() {

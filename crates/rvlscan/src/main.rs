@@ -4206,6 +4206,97 @@ fn run_plugin_agents(
     }
 }
 
+/// Does this `scan` invocation select SUBMISSION mode?
+///
+/// The single definition of the rule, so the dispatch guard and the
+/// stray-flag check below cannot drift apart: the day one grows a sixth
+/// selector and the other does not, a flag becomes silently ignored again,
+/// which is exactly the bug po-av01j.168 exists to close.
+fn selects_submission(
+    stdin: bool,
+    file: Option<&Path>,
+    scan_dir: Option<&Path>,
+    service: Option<&str>,
+    dry_run: bool,
+) -> bool {
+    stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run
+}
+
+/// The flags that select submission mode, as prose for the usage error. A
+/// reader who typed `--team` needs the RULE, not just the refusal.
+const SUBMISSION_SELECTORS: &str = "--stdin, --file, --scan-dir, --service, or --dry-run";
+
+/// Submission-only flags the caller EXPLICITLY typed on a deterministic scan
+/// (po-av01j.168).
+///
+/// Before this, `rvl scan --team=backend-team` ran an ordinary local scan and
+/// dropped the team on the floor: no error, no warning, nothing submitted. A
+/// silent no-op is the worst failure shape available here, because the user
+/// believes the flag took effect — and `--format=json` made it worse than
+/// cosmetic, since a script asking for JSON silently received the human
+/// ladder.
+///
+/// Every flag below is `Option`/`bool` with NO clap default, so `Some(_)` /
+/// `true` proves the user typed it. Nothing here can be tripped by a default
+/// value, which is the property that lets this be a hard error rather than a
+/// warning.
+fn stray_submission_flags(
+    team: Option<&str>,
+    target: Option<&Path>,
+    cleanup_on_success: bool,
+    timeout: Option<&str>,
+    format: Option<&str>,
+) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if team.is_some() {
+        out.push("--team");
+    }
+    if target.is_some() {
+        out.push("--target");
+    }
+    if cleanup_on_success {
+        out.push("--cleanup-on-success");
+    }
+    if timeout.is_some() {
+        out.push("--timeout");
+    }
+    if format.is_some() {
+        out.push("--format");
+    }
+    out
+}
+
+/// The usage error for [`stray_submission_flags`]: names every offending flag
+/// and what it requires, then shows the invocation that would honor it.
+fn stray_submission_flag_error(flags: &[&str]) -> String {
+    let (subject, verb) = if flags.len() == 1 {
+        (format!("{} is a submission-mode flag", flags[0]), "has")
+    } else {
+        (
+            format!("{} are submission-mode flags", flags.join(", ")),
+            "have",
+        )
+    };
+    format!(
+        "{subject} and {verb} no effect on a deterministic scan, so it would have been \
+         silently dropped. Submission mode is selected by {SUBMISSION_SELECTORS} — e.g. \
+         `{BIN} scan --service <name> --scan-dir <dir>{example}`. For a local scan, drop \
+         the flag.",
+        BIN = rvl_data::BIN,
+        example = flags
+            .iter()
+            .map(|f| format!(
+                " {f}{}",
+                if *f == "--cleanup-on-success" {
+                    ""
+                } else {
+                    " <value>"
+                }
+            ))
+            .collect::<String>(),
+    )
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
@@ -4235,7 +4326,14 @@ fn run() -> anyhow::Result<ExitCode> {
             timeout,
             format,
             ..
-        } if stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run => {
+        } if selects_submission(
+            stdin,
+            file.as_deref(),
+            scan_dir.as_deref(),
+            service.as_deref(),
+            dry_run,
+        ) =>
+        {
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
@@ -4251,6 +4349,43 @@ fn run() -> anyhow::Result<ExitCode> {
                 },
                 env!("CARGO_PKG_VERSION"),
             ));
+        }
+        // Deterministic scan carrying a SUBMISSION-ONLY flag (po-av01j.168).
+        // Reaching this arm means the guard above already decided this is not
+        // a submission, so every flag `stray_submission_flags` finds is one
+        // the rest of this command would ignore. Refusing costs the user one
+        // corrected command; accepting costs them a scan they believe was
+        // submitted, or a script that asked for JSON and parsed a ladder.
+        //
+        // Placed BEFORE the store opens on purpose: a mistyped flag is a
+        // usage error whether or not this machine has a verifiable spec
+        // cache, and it must not be masked by exit 1 from the cache load.
+        Cmd::Scan {
+            ref team,
+            ref target,
+            cleanup_on_success,
+            ref timeout,
+            ref format,
+            ..
+        } if !stray_submission_flags(
+            team.as_deref(),
+            target.as_deref(),
+            cleanup_on_success,
+            timeout.as_deref(),
+            format.as_deref(),
+        )
+        .is_empty() =>
+        {
+            let stray = stray_submission_flags(
+                team.as_deref(),
+                target.as_deref(),
+                cleanup_on_success,
+                timeout.as_deref(),
+                format.as_deref(),
+            );
+            let f = rvl_data::Failure::usage(stray_submission_flag_error(&stray));
+            eprintln!("error: {}", f.msg);
+            return Ok(ExitCode::from(f.code));
         }
         // Onboarding surface (po-av01j.163): init needs the skills machinery
         // for its plugin step but never the spec cache; hook is pure file
@@ -4583,7 +4718,6 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[test]
     fn a_language_present_only_as_testdata_is_incidental() {
@@ -4612,7 +4746,10 @@ mod tests {
     }
 
     // Serializes tests that mutate process-global env so they don't race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared with `embedded_helpers`' own tests: both move HOME and
+    // RVLSCAN_HELPER_DIR, and a second mutex over the same process-wide state
+    // is not a lock at all (see `embedded_helpers::env_lock`).
+    use crate::embedded_helpers::env_lock;
 
     // --- Changed-only scoping (po-av01j.127) ---
 
@@ -5635,7 +5772,7 @@ mod tests {
     // epic has found repeatedly.
     #[test]
     fn the_escape_hatch_is_explicit_and_opt_in() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
         assert!(!allow_missing_helpers(), "silence must NOT permit a gap");
         for v in ["1", "true"] {
@@ -5680,7 +5817,7 @@ mod tests {
 
     #[test]
     fn resolve_helper_env_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("my-goindex");
         touch(&fake);
@@ -5694,7 +5831,7 @@ mod tests {
 
     #[test]
     fn resolve_helper_env_override_missing_file_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::set_var("RVLSCAN_GOINDEX", "/definitely/not/here/goindex");
         let resolved = resolve_helper(Lang::Go);
         std::env::remove_var("RVLSCAN_GOINDEX");
@@ -5784,7 +5921,7 @@ mod tests {
 
     #[test]
     fn the_canonical_helper_dirs_accept_both_build_output_shapes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
         std::env::set_var("HOME", dir.path());
@@ -5803,7 +5940,7 @@ mod tests {
 
     #[test]
     fn a_helper_in_the_canonical_dir_is_found_and_the_env_override_still_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
         std::env::set_var("HOME", dir.path());
@@ -5835,7 +5972,7 @@ mod tests {
 
     #[test]
     fn node_path_points_at_the_scanned_repo_and_keeps_any_existing_entries() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::remove_var("NODE_PATH");
         let root = Path::new("/work/api");
         assert_eq!(
@@ -6202,6 +6339,112 @@ mod tests {
             }
             _ => panic!("expected scan"),
         }
+    }
+
+    #[test]
+    fn submission_only_flags_are_stray_on_a_deterministic_scan() {
+        // po-av01j.168: every one of these was accepted and silently dropped.
+        assert_eq!(
+            stray_submission_flags(Some("backend-team"), None, false, None, None),
+            vec!["--team"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, false, None, Some("json")),
+            vec!["--format"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, false, Some("90s"), None),
+            vec!["--timeout"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, None, true, None, None),
+            vec!["--cleanup-on-success"]
+        );
+        assert_eq!(
+            stray_submission_flags(None, Some(Path::new("/tmp/p")), false, None, None),
+            vec!["--target"]
+        );
+        // Every flag at once still names every flag: a reader who typed two
+        // must not have to run twice to learn about the second.
+        assert_eq!(
+            stray_submission_flags(
+                Some("t"),
+                Some(Path::new("/tmp/p")),
+                true,
+                Some("90s"),
+                Some("json")
+            ),
+            vec![
+                "--team",
+                "--target",
+                "--cleanup-on-success",
+                "--timeout",
+                "--format"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unflagged_deterministic_scan_has_nothing_stray() {
+        // The defaults must never trip the check — that is the property that
+        // makes this a hard error rather than a warning. Clap gives these
+        // flags no default value, so absent is `None`/`false`.
+        assert!(stray_submission_flags(None, None, false, None, None).is_empty());
+        let cli = Cli::try_parse_from(["rvlscan", "scan", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                team,
+                target,
+                cleanup_on_success,
+                timeout,
+                format,
+                ..
+            }) => assert!(stray_submission_flags(
+                team.as_deref(),
+                target.as_deref(),
+                cleanup_on_success,
+                timeout.as_deref(),
+                format.as_deref(),
+            )
+            .is_empty()),
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn stray_flag_error_names_the_flag_and_what_it_requires() {
+        let msg = stray_submission_flag_error(&["--team"]);
+        assert!(msg.contains("--team"), "must name the flag: {msg}");
+        assert!(
+            msg.contains("--scan-dir") && msg.contains("--service"),
+            "must name what selects submission mode: {msg}"
+        );
+        let msg = stray_submission_flag_error(&["--team", "--format"]);
+        assert!(msg.contains("--team") && msg.contains("--format"), "{msg}");
+    }
+
+    #[test]
+    fn submission_selectors_are_exactly_the_documented_five() {
+        // The dispatch guard and the stray-flag check read the same rule from
+        // this function; if a sixth selector is added, it is added here.
+        assert!(selects_submission(true, None, None, None, false));
+        assert!(selects_submission(
+            false,
+            Some(Path::new("f.json")),
+            None,
+            None,
+            false
+        ));
+        assert!(selects_submission(
+            false,
+            None,
+            Some(Path::new("parts")),
+            None,
+            false
+        ));
+        assert!(selects_submission(false, None, None, Some("svc"), false));
+        assert!(selects_submission(false, None, None, None, true));
+        assert!(!selects_submission(false, None, None, None, false));
     }
 
     #[test]
