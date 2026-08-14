@@ -3122,6 +3122,23 @@ const SUBMIT_RESPONSE: &str = r#"{
                           "strict_enforcement": false}
 }"#;
 
+/// The same body the server replays when an identical submission lands inside
+/// the idempotency-key dedup window (po-av01j.165).
+const CACHED_SUBMIT_RESPONSE: &str = r#"{
+  "scan_id": "scan-cli-1",
+  "service": "checkout-api",
+  "summary": {"total": 2, "created": 2, "updated": 0, "unchanged": 0,
+              "critical": 0, "high": 0, "medium": 2, "low": 0},
+  "findings": [
+    {"risk_id": "u1", "risk_code": "R-101", "title": "Missing timeout",
+     "status": "created", "score": 61, "priority": "medium"},
+    {"risk_id": "u2", "risk_code": "R-102", "title": "No circuit breaker",
+     "status": "created", "score": 55, "priority": "medium"}
+  ],
+  "timestamp": "2026-08-13T00:00:00Z",
+  "cached": true
+}"#;
+
 fn write_scan_parts(dir: &std::path::Path) -> std::path::PathBuf {
     let parts = dir.join("scan-parts");
     std::fs::create_dir_all(&parts).unwrap();
@@ -3183,6 +3200,10 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
         stdout.contains("[NEW] R-102: No circuit breaker"),
         "{stdout}"
     );
+    // A fresh scan says nothing about the cache (po-av01j.165): the server
+    // omits `cached` and the render is byte-for-byte what it always was.
+    assert!(!stdout.contains("cached"), "{stdout}");
+    assert!(!stderr.contains("cached scan replay"), "{stderr}");
     assert!(
         stdout.contains("Effective tolerance: target=25, headroom=20%, strict=false"),
         "{stdout}"
@@ -3223,6 +3244,60 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
     );
     assert!(body.contains(r#""scanner_id":"rvlscan/"#), "{body}");
     assert!(body.contains(r#""idempotency_key":""#), "{body}");
+}
+
+/// The server deduplicates submissions by `idempotency_key` and replays the
+/// first submission's stored response with `cached: true`. Nothing was created
+/// or updated by the command that just ran, so the render must not reprint
+/// `[NEW]` (po-av01j.165).
+#[test]
+fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, CACHED_SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--target"])
+        .arg(dir.path())
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "submit failed: {stdout}\n{stderr}");
+
+    assert!(
+        stdout.contains(
+            "Scan replayed from server cache (cached: no new processing; risks below are the previous result)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Scan submitted successfully"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Findings (cached: from the earlier scan, nothing was created or updated by this run):"
+        ),
+        "{stdout}"
+    );
+    // A reader (or a grep) hunting for "[NEW]" must find none on a replay.
+    assert!(!stdout.contains("[NEW]"), "{stdout}");
+    assert!(
+        stdout.contains("[was NEW] R-101: Missing timeout"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[was NEW] R-102: No circuit breaker"),
+        "{stdout}"
+    );
+    // The rest of the block is untouched.
+    assert!(stdout.contains("Scan ID: scan-cli-1"), "{stdout}");
 }
 
 /// `--dry-run` validates and normalizes without submitting (po-4g59y):

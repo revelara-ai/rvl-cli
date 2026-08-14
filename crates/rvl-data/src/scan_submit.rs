@@ -10,6 +10,7 @@
 
 use crate::client::Client;
 use crate::gojson::{compact, compact_raw, pretty, G};
+use crate::scan_cached_output::{note_cached_scan, print_scan_findings, scan_submit_headline};
 use crate::scan_normalize::{
     normalization_summary, normalize_findings, print_normalization_issues, print_stpa_loss_banner,
     FindingNormReport,
@@ -160,6 +161,13 @@ pub struct ScanResponse {
     pub warnings: Vec<String>,
     pub timestamp: String,
     pub effective_tolerance: Option<EffectiveTolerance>,
+
+    /// True when the server replayed a previously-processed response because
+    /// this submission's `idempotency_key` matched a recent scan. Nothing in
+    /// `findings` was created or updated by this run, so the output must not
+    /// re-announce those risks as `[NEW]`. Servers that predate the field omit
+    /// it; `false` is the pre-existing behavior (po-72d5d).
+    pub cached: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1027,6 +1035,11 @@ fn response_g(r: &ScanResponse) -> G {
         }
         f.push(("effective_tolerance".to_string(), G::Obj(tf)));
     }
+    // omitempty, so a fresh scan's JSON is byte-identical to before
+    // (po-72d5d).
+    if r.cached {
+        f.push(("cached".to_string(), G::Bool(true)));
+    }
     G::Obj(f)
 }
 
@@ -1366,6 +1379,9 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
             "Findings submitted: {}",
             normalization_summary(&norm_report)
         );
+        // stdout stays machine-readable (the `cached` field simply rides
+        // along in the marshalled body); the human-facing note goes to stderr.
+        note_cached_scan(&mut std::io::stderr(), &response);
         print_stpa_loss_banner(&norm_report);
         println!("{}", pretty(&response_g(&response)));
         if response.summary.critical > 0 || response.summary.high > 0 {
@@ -1381,7 +1397,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
 /// The human-readable success block, mirroring rvl-cli's standard output
 /// path (plus the effective-tolerance line the response now carries).
 fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url: &str) {
-    println!("Scan submitted successfully");
+    println!("{}", scan_submit_headline(response.cached));
     println!("  Scan ID: {}", response.scan_id);
     println!("  Service: {}", response.service);
     println!(
@@ -1431,28 +1447,9 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
     }
     println!();
 
-    if let Some(findings) = &response.findings {
-        if !findings.is_empty() {
-            println!("Findings:");
-            for f in findings {
-                let status = match f.status.as_str() {
-                    "created" => "NEW",
-                    "updated" => "UPD",
-                    _ => "---",
-                };
-                println!(
-                    "  [{status}] {}: {} (score: {}, {})",
-                    f.risk_code, f.title, f.score, f.priority
-                );
-                // Per-finding server warnings: a server-side partial accept
-                // of a finding's fields must be visible.
-                for w in &f.warnings {
-                    eprintln!("        warning [{}]: {w}", f.risk_code);
-                }
-            }
-            println!();
-        }
-    }
+    // Risk rows on stdout, per-finding server warnings on stderr: a
+    // server-side partial accept of a finding's fields must be visible.
+    print_scan_findings(&mut std::io::stdout(), &mut std::io::stderr(), response);
 
     if !response.warnings.is_empty() {
         eprintln!("Warnings:");
