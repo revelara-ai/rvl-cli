@@ -282,6 +282,14 @@ pub struct CachedStatus {
     pub fetched_at: String,
 }
 
+/// One install recorded only by rvl-cli's v1 metadata (not yet adopted
+/// into rvlscan's own store).
+pub struct V1InstallStatus {
+    pub harness: String,
+    pub version: String,
+    pub location: String,
+}
+
 /// Installed-vs-served report, mirroring `rvl plugin list`'s UX.
 pub struct StatusReport {
     /// The version the server currently serves; None when unreachable or
@@ -289,6 +297,9 @@ pub struct StatusReport {
     pub served_version: Option<String>,
     pub server_note: Option<String>,
     pub harnesses: Vec<HarnessStatus>,
+    /// Installs known only from rvl-cli's v1 records (read-only fallback);
+    /// harnesses rvlscan's own store already tracks are excluded.
+    pub v1_installs: Vec<V1InstallStatus>,
     pub cached: Vec<CachedStatus>,
 }
 
@@ -304,9 +315,20 @@ pub fn status(env: &Env) -> StatusReport {
         }
     };
 
-    let harnesses = env
-        .store
-        .read_installed()
+    let installed = env.store.read_installed();
+    // v1 rvl-cli records are the day-one continuity view: show them until
+    // an adoption (any v2 install/update) shadows them.
+    let v1_installs = crate::v1::read_v1_installs(env.home)
+        .into_iter()
+        .filter(|p| !installed.contains_key(&p.editor))
+        .map(|p| V1InstallStatus {
+            harness: p.editor,
+            version: p.version,
+            location: p.location,
+        })
+        .collect();
+
+    let harnesses = installed
         .into_iter()
         .map(|(name, info)| {
             let update_available = served_version
@@ -342,6 +364,7 @@ pub fn status(env: &Env) -> StatusReport {
         served_version,
         server_note,
         harnesses,
+        v1_installs,
         cached,
     }
 }
@@ -689,6 +712,38 @@ mod tests {
         env.offline = true;
         let err = editors(&env).unwrap_err();
         assert!(err.to_string().contains("offline"), "got: {err}");
+    }
+
+    #[test]
+    fn status_surfaces_v1_records_until_adoption_shadows_them() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        std::fs::create_dir_all(fx.home.path().join(".revelara")).unwrap();
+        std::fs::write(
+            fx.home.path().join(".revelara/plugins.json"),
+            r#"[{"editor":"claude","version":"0.9.0",
+                 "installed":"2026-08-01T10:00:00Z","location":"/v1/loc"},
+                {"editor":"codex","version":"0.9.0",
+                 "installed":"2026-08-01T10:00:00Z","location":"/v1/codex"}]"#,
+        )
+        .unwrap();
+
+        let dead = MockFetcher::down("timeout");
+        let report = status(&fx.env(&store, &dead));
+        assert_eq!(report.v1_installs.len(), 2, "both v1 records surface");
+        assert_eq!(report.v1_installs[0].harness, "claude");
+        assert_eq!(report.v1_installs[0].version, "0.9.0");
+
+        // Adopting claude (a v2 install) shadows its v1 record; codex stays.
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        install_one(&env, by_name("claude").unwrap().as_ref()).unwrap();
+        let report = status(&env);
+        assert_eq!(report.v1_installs.len(), 1);
+        assert_eq!(report.v1_installs[0].harness, "codex");
+        assert_eq!(report.harnesses.len(), 1);
+        assert_eq!(report.harnesses[0].harness, "claude");
     }
 
     #[test]

@@ -3527,8 +3527,10 @@ fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: 
 }
 
 /// Install or update the named harness, or every relevant one when omitted
-/// (install: detected harnesses; update: previously installed harnesses,
-/// falling back to detection). Mirrors `rvl plugin install/update`.
+/// (install: detected harnesses; update: previously installed harnesses —
+/// including v1 rvl-cli-recorded installs, which the update ADOPTS by
+/// performing a normal v2 install — falling back to detection). Mirrors
+/// `rvl plugin install/update`.
 fn run_skills_install(
     env: &rvl_skills::flow::Env,
     harness: Option<String>,
@@ -3551,6 +3553,19 @@ fn run_skills_install(
             } else {
                 Vec::new()
             };
+            if update {
+                // Adopt v1 rvl-cli installs: an update targets them too, and
+                // the resulting v2 install records them in rvlscan's store so
+                // every later operation uses v2 records.
+                for p in rvl_skills::v1::read_v1_installs(env.home) {
+                    if rvl_skills::harness::by_name(&p.editor).is_some()
+                        && !names.contains(&p.editor)
+                    {
+                        println!("adopting {} (installed by rvl-cli)", p.editor);
+                        names.push(p.editor);
+                    }
+                }
+            }
             if names.is_empty() {
                 names = rvl_skills::harness::detect_installed(env.home);
             }
@@ -3596,7 +3611,11 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
     }
 
     if report.harnesses.is_empty() {
-        println!("\nNo skills installed. Run 'rvlscan skills install'.");
+        // v1-only installs still count as installed: the section below
+        // renders them instead of a misleading "nothing installed".
+        if report.v1_installs.is_empty() {
+            println!("\nNo skills installed. Run 'rvlscan skills install'.");
+        }
     } else {
         println!("\nInstalled:");
         let mut drift = false;
@@ -3617,6 +3636,14 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
         if drift {
             println!("\nRun 'rvlscan skills update' to upgrade.");
         }
+    }
+
+    if !report.v1_installs.is_empty() {
+        println!("\nInstalled by rvl-cli (v1 records):");
+        for p in &report.v1_installs {
+            println!("  {:<10} {:<10} {}", p.harness, p.version, p.location);
+        }
+        println!("Run 'rvlscan plugin update' to adopt these into rvlscan.");
     }
 
     if !report.cached.is_empty() {
@@ -3870,16 +3897,26 @@ fn run_plugin_agents(
         Some("table") | Some("text") | Some("") | None => json,
         Some(other) => anyhow::bail!("invalid --format {other:?} (valid: table, json)"),
     };
+    // rvlscan's own record wins; a v1 rvl-cli record is the fallback so an
+    // upgraded user's lens listing keeps working on day one.
     let agents = rvl_skills::agents::installed_agents_dir(env.store, env.home, editor)
-        .and_then(|dir| rvl_skills::agents::list_agents(&dir));
+        .and_then(|(dir, source)| Ok((rvl_skills::agents::list_agents(&dir)?, source)));
     match agents {
-        Ok(agents) => {
+        Ok((agents, source)) => {
             if as_json {
+                // The contract is IDENTICAL regardless of which record
+                // resolved the directory.
                 println!(
                     "{}",
                     serde_json::to_string(&rvl_skills::agents::AgentsOutput { agents })?
                 );
             } else {
+                if source == rvl_skills::agents::RecordSource::V1 {
+                    eprintln!(
+                        "note: {editor} skills were installed by rvl-cli; run \
+                         'rvlscan plugin update {editor}' to adopt them into rvlscan"
+                    );
+                }
                 for a in agents {
                     if a.description.is_empty() {
                         println!("{}", a.id);

@@ -14,4 +14,5 @@ pub mod flow;
 pub mod harness;
 pub mod semver;
 pub mod store;
+pub mod v1;
 pub mod verify;

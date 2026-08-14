@@ -27,30 +27,51 @@ pub struct AgentsOutput {
     pub agents: Vec<AgentEntry>,
 }
 
+/// Which install record anchored an agents-directory resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordSource {
+    /// rvlscan's own store (installed.json in the skills cache).
+    V2,
+    /// rvl-cli's v1 metadata (~/.revelara/plugins.json), read-only fallback.
+    V1,
+}
+
 /// Resolve the directory holding installed agent files for `editor`,
 /// anchored on the install record (rvl-cli `installedAgentsDir` parity):
-/// Claude Code keeps agents under its recorded marketplace location; the
-/// other harnesses use their fixed agents directory under `home`.
+/// Claude Code keeps agents under its recorded install location; the other
+/// harnesses use their fixed agents directory under `home`. rvlscan's own
+/// store wins; when it has no record, the v1 rvl-cli record is the
+/// fallback so upgraded users keep their lens listing on day one.
 pub fn installed_agents_dir(
     store: &SkillsStore,
     home: &Path,
     editor: &str,
-) -> anyhow::Result<PathBuf> {
-    let installed = store.read_installed();
-    if let Some(info) = installed.get(editor) {
-        if editor == "claude" {
-            return Ok(PathBuf::from(&info.location).join("agents"));
-        }
-        let Some(h) = crate::harness::by_name(editor) else {
-            anyhow::bail!(
-                "unsupported harness: {editor} (supported: {})",
-                crate::harness::supported_names().join(", ")
-            );
+) -> anyhow::Result<(PathBuf, RecordSource)> {
+    // Claude anchors on the record's location; everything else resolves to
+    // a fixed home-relative agents dir regardless of which record proved
+    // the install exists.
+    let resolve =
+        |location: &str, source: RecordSource| -> anyhow::Result<(PathBuf, RecordSource)> {
+            if editor == "claude" {
+                return Ok((PathBuf::from(location).join("agents"), source));
+            }
+            let Some(h) = crate::harness::by_name(editor) else {
+                anyhow::bail!(
+                    "unsupported harness: {editor} (supported: {})",
+                    crate::harness::supported_names().join(", ")
+                );
+            };
+            let Some(dir) = h.agents_dir() else {
+                anyhow::bail!("harness {editor:?} does not expose a separate agents directory");
+            };
+            Ok((home.join(dir), source))
         };
-        let Some(dir) = h.agents_dir() else {
-            anyhow::bail!("harness {editor:?} does not expose a separate agents directory");
-        };
-        return Ok(home.join(dir));
+
+    if let Some(info) = store.read_installed().get(editor) {
+        return resolve(&info.location, RecordSource::V2);
+    }
+    if let Some(p) = crate::v1::v1_install(home, editor) {
+        return resolve(&p.location, RecordSource::V1);
     }
     anyhow::bail!(
         "no Revelara skills installed for harness {editor:?} (run: rvlscan plugin install {editor})"
@@ -164,8 +185,9 @@ mod tests {
         std::fs::create_dir_all(agents_dir.join("sub.md")).unwrap(); // dir, skipped
 
         let store = store_with(&dir.path().join("cache"), "claude", &location);
-        let resolved = installed_agents_dir(&store, &home, "claude").unwrap();
+        let (resolved, source) = installed_agents_dir(&store, &home, "claude").unwrap();
         assert_eq!(resolved, agents_dir);
+        assert_eq!(source, RecordSource::V2);
 
         let agents = list_agents(&resolved).unwrap();
         assert_eq!(
@@ -191,7 +213,61 @@ mod tests {
         let store = store_with(&dir.path().join("cache"), "gemini", &home.join(".gemini"));
         assert_eq!(
             installed_agents_dir(&store, &home, "gemini").unwrap(),
-            home.join(".gemini/agents")
+            (home.join(".gemini/agents"), RecordSource::V2)
+        );
+    }
+
+    fn write_v1_records(home: &Path, records: &str) {
+        std::fs::create_dir_all(home.join(".revelara")).unwrap();
+        std::fs::write(home.join(".revelara/plugins.json"), records).unwrap();
+    }
+
+    #[test]
+    fn v1_record_is_the_fallback_when_the_v2_store_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let v1_location = home.join(".claude/plugins/cache/revelara-api/revelara/0.9.0");
+        write_v1_records(
+            &home,
+            &format!(
+                r#"[{{"editor":"claude","version":"0.9.0",
+                     "installed":"2026-08-01T10:00:00Z","location":{loc}}},
+                    {{"editor":"gemini","version":"0.9.0",
+                     "installed":"2026-08-01T10:00:00Z","location":""}}]"#,
+                loc = serde_json::json!(v1_location.to_str().unwrap())
+            ),
+        );
+
+        let store = SkillsStore::open(&dir.path().join("cache")).unwrap();
+        assert_eq!(
+            installed_agents_dir(&store, &home, "claude").unwrap(),
+            (v1_location.join("agents"), RecordSource::V1),
+            "claude anchors on the v1 record's location"
+        );
+        assert_eq!(
+            installed_agents_dir(&store, &home, "gemini").unwrap(),
+            (home.join(".gemini/agents"), RecordSource::V1),
+            "tier-2 resolves to the fixed home-relative agents dir"
+        );
+        // A harness with no record in EITHER store still errors.
+        assert!(installed_agents_dir(&store, &home, "cursor").is_err());
+    }
+
+    #[test]
+    fn v2_record_wins_over_a_v1_record_for_the_same_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let v2_location = home.join(".revelara/marketplace/plugins/revelara");
+        write_v1_records(
+            &home,
+            r#"[{"editor":"claude","version":"0.9.0",
+                 "installed":"2026-08-01T10:00:00Z","location":"/stale/v1/path"}]"#,
+        );
+        let store = store_with(&dir.path().join("cache"), "claude", &v2_location);
+        assert_eq!(
+            installed_agents_dir(&store, &home, "claude").unwrap(),
+            (v2_location.join("agents"), RecordSource::V2),
+            "the adopted v2 record must shadow the stale v1 location"
         );
     }
 

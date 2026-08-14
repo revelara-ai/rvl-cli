@@ -3518,3 +3518,127 @@ fn plugin_remove_yes_is_idempotent_for_claude() {
         "unregistration commands must be printed, not run: {stdout}"
     );
 }
+
+/// Day-one continuity after the rename: with NO rvlscan-store record but a
+/// v1 rvl-cli install recorded in ~/.revelara/plugins.json, `plugin agents
+/// --json` must list the installed agents via the v1 fallback, with the
+/// contract shape unchanged.
+#[test]
+fn plugin_agents_json_falls_back_to_v1_rvl_cli_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    // rvl-cli's claude install location (version-dependent plugin cache
+    // path), with agents under <location>/agents.
+    let location = home.join(".claude/plugins/cache/revelara-api/revelara/0.9.0");
+    let agents_dir = location.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("rvl-observability-pro.md"),
+        "---\ndescription: Observability lens\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents_dir.join("rvl-resilience-pro.md"),
+        "---\ndescription: Resilience lens\n---\n",
+    )
+    .unwrap();
+
+    // The v1 metadata file exactly as rvl-cli SavePluginInfo writes it: a
+    // JSON ARRAY of {editor, version, installed, location}.
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    let v1 = serde_json::json!([{
+        "editor": "claude",
+        "version": "0.9.0",
+        "installed": "2026-08-01T10:00:00Z",
+        "location": location.to_str().unwrap(),
+    }]);
+    std::fs::write(home.join(".revelara/plugins.json"), v1.to_string()).unwrap();
+
+    let out = bin()
+        .args(["plugin", "agents", "--json"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "agents --json failed: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout must be JSON");
+    let agents = v["agents"].as_array().expect("agents must be an array");
+    assert_eq!(agents.len(), 2, "v1 fallback must list them: {stdout}");
+    assert_eq!(agents[0]["id"], "rvl-observability-pro");
+    assert_eq!(agents[0]["description"], "Observability lens");
+    assert_eq!(agents[1]["id"], "rvl-resilience-pro");
+}
+
+/// `plugin list` must not claim nothing is installed on a machine where
+/// rvl-cli recorded the install: v1 records surface, marked as such.
+#[test]
+fn plugin_list_surfaces_v1_installs_marked_as_rvl_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    std::fs::write(
+        home.join(".revelara/plugins.json"),
+        r#"[{"editor":"claude","version":"0.9.0",
+             "installed":"2026-08-01T10:00:00Z","location":"/v1/loc"}]"#,
+    )
+    .unwrap();
+
+    let out = bin()
+        .args(["plugin", "list"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVLSCAN_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("No skills installed"),
+        "a v1 install is still an install: {stdout}"
+    );
+    assert!(stdout.contains("Installed by rvl-cli"), "got: {stdout}");
+    assert!(stdout.contains("claude"), "got: {stdout}");
+    assert!(
+        stdout.contains("adopt"),
+        "must point at the adoption path: {stdout}"
+    );
+}
+
+/// `plugin update` ADOPTS v1-recorded installs: the harness is targeted
+/// even though rvlscan's own store is empty. (Offline here, so the install
+/// itself fails without a cache — the assertion is about targeting.)
+#[test]
+fn plugin_update_targets_v1_recorded_installs_for_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    std::fs::write(
+        home.join(".revelara/plugins.json"),
+        r#"[{"editor":"claude","version":"0.9.0",
+             "installed":"2026-08-01T10:00:00Z","location":"/v1/loc"}]"#,
+    )
+    .unwrap();
+
+    let out = bin()
+        .args(["plugin", "update"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVLSCAN_OFFLINE", "1")
+        .env("PATH", "")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.contains("adopting claude"),
+        "the v1 install must be targeted: {stdout}\n{stderr}"
+    );
+    // Without the harness detection fallback kicking in, the run must NOT
+    // report "no harness detected" — it found the v1 record.
+    assert!(
+        !stdout.contains("No supported coding-agent harness detected"),
+        "got: {stdout}"
+    );
+}
