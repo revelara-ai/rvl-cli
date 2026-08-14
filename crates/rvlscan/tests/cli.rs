@@ -3139,6 +3139,23 @@ const SUBMIT_RESPONSE: &str = r#"{
                           "strict_enforcement": false}
 }"#;
 
+/// The same body the server replays when an identical submission lands inside
+/// the idempotency-key dedup window (po-av01j.165).
+const CACHED_SUBMIT_RESPONSE: &str = r#"{
+  "scan_id": "scan-cli-1",
+  "service": "checkout-api",
+  "summary": {"total": 2, "created": 2, "updated": 0, "unchanged": 0,
+              "critical": 0, "high": 0, "medium": 2, "low": 0},
+  "findings": [
+    {"risk_id": "u1", "risk_code": "R-101", "title": "Missing timeout",
+     "status": "created", "score": 61, "priority": "medium"},
+    {"risk_id": "u2", "risk_code": "R-102", "title": "No circuit breaker",
+     "status": "created", "score": 55, "priority": "medium"}
+  ],
+  "timestamp": "2026-08-13T00:00:00Z",
+  "cached": true
+}"#;
+
 fn write_scan_parts(dir: &std::path::Path) -> std::path::PathBuf {
     let parts = dir.join("scan-parts");
     std::fs::create_dir_all(&parts).unwrap();
@@ -3200,6 +3217,10 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
         stdout.contains("[NEW] R-102: No circuit breaker"),
         "{stdout}"
     );
+    // A fresh scan says nothing about the cache (po-av01j.165): the server
+    // omits `cached` and the render is byte-for-byte what it always was.
+    assert!(!stdout.contains("cached"), "{stdout}");
+    assert!(!stderr.contains("cached scan replay"), "{stderr}");
     assert!(
         stdout.contains("Effective tolerance: target=25, headroom=20%, strict=false"),
         "{stdout}"
@@ -3240,6 +3261,180 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
     );
     assert!(body.contains(r#""scanner_id":"rvlscan/"#), "{body}");
     assert!(body.contains(r#""idempotency_key":""#), "{body}");
+}
+
+/// The server deduplicates submissions by `idempotency_key` and replays the
+/// first submission's stored response with `cached: true`. Nothing was created
+/// or updated by the command that just ran, so the render must not reprint
+/// `[NEW]` (po-av01j.165).
+#[test]
+fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, CACHED_SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--target"])
+        .arg(dir.path())
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "submit failed: {stdout}\n{stderr}");
+
+    assert!(
+        stdout.contains(
+            "Scan replayed from server cache (cached: no new processing; risks below are the previous result)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Scan submitted successfully"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Findings (cached: from the earlier scan, nothing was created or updated by this run):"
+        ),
+        "{stdout}"
+    );
+    // A reader (or a grep) hunting for "[NEW]" must find none on a replay.
+    assert!(!stdout.contains("[NEW]"), "{stdout}");
+    assert!(
+        stdout.contains("[was NEW] R-101: Missing timeout"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[was NEW] R-102: No circuit breaker"),
+        "{stdout}"
+    );
+    // The rest of the block is untouched.
+    assert!(stdout.contains("Scan ID: scan-cli-1"), "{stdout}");
+}
+
+/// Team ownership declared in `.revelara.yaml` rides the submission, and
+/// `--team` overrides the whole thing (repo default AND component teams)
+/// [po-av01j.166].
+#[test]
+fn scan_submission_carries_team_ownership_and_honors_the_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "project: checkout-api\nteam: checkout\ncomponents:\n  - name: worker\n    path: cmd/worker\n    team: payments\n",
+    )
+    .unwrap();
+    // Each run first asks the server for its known team slugs (best-effort,
+    // never blocking), then POSTs the scan.
+    const KNOWN_SLUGS: &str = r#"{"slugs":["checkout","payments"]}"#;
+    let server = submit_mock::MockServer::start(vec![
+        (200, KNOWN_SLUGS),
+        (200, SUBMIT_RESPONSE),
+        (200, KNOWN_SLUGS),
+        (200, SUBMIT_RESPONSE),
+    ]);
+
+    let run = |extra: &[&str]| -> String {
+        let mut cmd = bin();
+        cmd.args(["scan", "--service", "checkout-api", "--target"])
+            .arg(dir.path())
+            .arg("--scan-dir")
+            .arg(&parts)
+            .args(extra)
+            .env("RVL_API_KEY", "pk_cli_test")
+            .env("RVL_API_URL", &server.base_url)
+            .env("HOME", &home)
+            .env_remove("RVL_ORG_NAME");
+        let out = cmd.output().expect("failed to run rvlscan");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "submit failed: {stderr}");
+        stderr
+    };
+
+    // Both declared teams are known: the did-you-mean stays silent.
+    let stderr = run(&[]);
+    assert!(!stderr.contains("is not a known team"), "{stderr}");
+    // "platform" is not in the org's slug list: warn, never block.
+    let stderr = run(&["--team", "platform"]);
+    assert!(stderr.contains(r#"team "platform""#), "{stderr}");
+    assert!(stderr.contains("is not a known team"), "{stderr}");
+    assert!(
+        stderr.contains("Proceeding creates a new team."),
+        "{stderr}"
+    );
+
+    let reqs = server.recorded();
+    let slug_lookups: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.path == "/api/v1/teams/slugs")
+        .collect();
+    assert_eq!(slug_lookups.len(), 2, "one lookup per run");
+    assert_eq!(slug_lookups[0].method, "GET");
+    let posts: Vec<_> = reqs.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(posts.len(), 2);
+
+    // .revelara.yaml: repo-level team plus the per-component override. No
+    // team_source, so the server records the default ("scan").
+    let from_file = String::from_utf8(posts[0].body.clone()).unwrap();
+    assert!(from_file.contains(r#""team":"checkout""#), "{from_file}");
+    assert!(
+        from_file.contains(r#""component_teams":{"worker":"payments"}"#),
+        "{from_file}"
+    );
+    assert!(!from_file.contains(r#""team_source""#), "{from_file}");
+
+    // --team replaces the whole submission and drops the component teams.
+    let overridden = String::from_utf8(posts[1].body.clone()).unwrap();
+    assert!(overridden.contains(r#""team":"platform""#), "{overridden}");
+    assert!(
+        overridden.contains(r#""team_source":"override""#),
+        "{overridden}"
+    );
+    assert!(!overridden.contains(r#""component_teams""#), "{overridden}");
+}
+
+/// A `--team` value that slugifies to nothing is a usage error: the server
+/// would silently drop it (po-av01j.166).
+#[test]
+fn scan_submission_rejects_an_unusable_team_slug() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args([
+            "scan",
+            "--service",
+            "checkout-api",
+            "--team",
+            "/",
+            "--target",
+        ])
+        .arg(dir.path())
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        // Unroutable: a submit attempt would error, so the usage exit proves
+        // the check fires before any network call.
+        .env("RVL_API_URL", "http://127.0.0.1:9")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("is not a usable team name (slugifies to nothing)"),
+        "{stderr}"
+    );
 }
 
 /// `--dry-run` validates and normalizes without submitting (po-4g59y):

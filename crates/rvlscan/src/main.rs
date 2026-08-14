@@ -118,6 +118,11 @@ enum Cmd {
         /// submission when combined with --scan-dir/--file/--stdin).
         #[arg(long, short = 's')]
         service: Option<String>,
+        /// Submission mode: owning team for the whole submission. Overrides
+        /// every `.revelara.yaml` `team:` value (repo-level and per-component)
+        /// and creates the team on first sight.
+        #[arg(long)]
+        team: Option<String>,
         /// Submission mode: project directory the scan describes (default:
         /// cwd); git_commit/git_branch metadata come from here.
         #[arg(long, short = 't')]
@@ -3996,6 +4001,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // needs API credentials, never the spec cache.
         Cmd::Scan {
             service,
+            team,
             target,
             stdin,
             file,
@@ -4009,6 +4015,7 @@ fn run() -> anyhow::Result<ExitCode> {
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
+                    team,
                     target,
                     stdin,
                     file,

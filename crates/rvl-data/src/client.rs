@@ -181,6 +181,34 @@ pub fn validate_credentials(client: &Client) -> Result<(), String> {
     }
 }
 
+/// The org's known team slugs from `GET /api/v1/teams/slugs` (po-77b6w.1),
+/// consumed by the pre-submit did-you-mean. Best-effort by design: `None` on
+/// any failure (unreachable server, old server without the endpoint, auth
+/// problem) so callers skip the check instead of blocking a submission —
+/// agents must be able to run headless. `None` means "unknown", `Some(vec![])`
+/// means "the org has no teams yet".
+pub fn fetch_team_slugs(client: &Client) -> Option<Vec<String>> {
+    if client.api_key.is_empty() || client.api_url.is_empty() {
+        return None;
+    }
+    let url = format!("{}/api/v1/teams/slugs", client.api_url);
+    let mut req = ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {}", client.api_key));
+    if let Some(org) = &client.org_id {
+        req = req.set("X-Organization-ID", org);
+    }
+    let body = read_body(req.call().ok()?).ok()?;
+
+    #[derive(Deserialize)]
+    struct SlugsResponse {
+        #[serde(default)]
+        slugs: Option<Vec<String>>,
+    }
+    let parsed: SlugsResponse = serde_json::from_slice(&body).ok()?;
+    Some(parsed.slugs.unwrap_or_default())
+}
+
 /// Load config and resolve the org, mirroring `api.LoadAndResolveConfig`:
 /// every failure is a printed message + exit 1.
 pub fn load_and_resolve() -> Result<(DataConfig, Client), Failure> {

@@ -25,9 +25,12 @@ pub mod feedback;
 pub mod gojson;
 pub mod incident;
 pub mod knowledge;
+pub mod project_config;
 pub mod risk;
+pub mod scan_cached_output;
 pub mod scan_normalize;
 pub mod scan_submit;
+pub mod scan_team;
 
 use std::process::ExitCode;
 
