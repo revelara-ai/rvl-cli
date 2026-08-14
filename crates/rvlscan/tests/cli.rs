@@ -3374,3 +3374,147 @@ fn plain_scan_stays_deterministic_and_never_submits() {
         "no submission on the deterministic path: {stdout}"
     );
 }
+
+// --- plugin command surface over the skills machinery (po-av01j.162) ---
+
+/// The `plugin agents --json` OUTPUT CONTRACT: the scan skill parses this
+/// as the source of truth for available lenses, so the shape is exactly
+/// {"agents":[{"id":"...","description":"..."}]} — read from the INSTALLED
+/// agent files under the recorded Claude install location (rvl-cli parity),
+/// never from the network.
+#[test]
+fn plugin_agents_json_contract_reads_installed_claude_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let location = home.join(".revelara/marketplace/plugins/revelara");
+    let agents_dir = location.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("rvl-rust-pro.md"),
+        "---\nname: rvl-rust-pro\ndescription: \"Rust reliability lens\"\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents_dir.join("rvl-golang-pro.md"),
+        "---\ndescription: Go reliability lens\n---\n",
+    )
+    .unwrap();
+    std::fs::write(agents_dir.join("notes.txt"), "not an agent").unwrap();
+
+    // The install record anchoring the lookup, as `plugin install` writes it.
+    let cache = dir.path().join("skills-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let installed = serde_json::json!({
+        "claude": {
+            "version": "0.2.0",
+            "location": location.to_str().unwrap(),
+            "installed_at": "2026-08-13",
+        }
+    });
+    std::fs::write(cache.join("installed.json"), installed.to_string()).unwrap();
+
+    let out = bin()
+        .args(["plugin", "agents", "--json"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", &cache)
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "agents --json failed: {stderr}");
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout must be JSON");
+    let agents = v["agents"].as_array().expect("agents must be an array");
+    assert_eq!(agents.len(), 2, "only .md files count: {stdout}");
+    for a in agents {
+        let obj = a.as_object().unwrap();
+        // serde_json::Value sorts keys, so assert the key SET here and the
+        // wire-level field order on the raw stdout below.
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["description", "id"],
+            "entry shape is exactly id+description: {stdout}"
+        );
+    }
+    assert!(
+        stdout.trim().starts_with(r#"{"agents":[{"id":""#),
+        "wire order is id then description: {stdout}"
+    );
+    assert_eq!(agents[0]["id"], "rvl-golang-pro", "sorted by id");
+    assert_eq!(agents[0]["description"], "Go reliability lens");
+    assert_eq!(agents[1]["id"], "rvl-rust-pro");
+    assert_eq!(
+        agents[1]["description"], "Rust reliability lens",
+        "one quote layer stripped"
+    );
+}
+
+/// With nothing installed, JSON mode still emits the empty contract shape
+/// on stdout (warning on stderr, exit 0) so the scan skill's parser never
+/// sees non-JSON.
+#[test]
+fn plugin_agents_json_emits_empty_contract_when_nothing_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["plugin", "agents", "--json"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success(), "empty JSON listing must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.trim(), r#"{"agents":[]}"#, "got: {stdout}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no Revelara skills installed"),
+        "got: {stderr}"
+    );
+}
+
+/// `plugin editors` never hard-fails without a server: offline it degrades
+/// to the built-in harness list.
+#[test]
+fn plugin_editors_degrades_to_builtin_list_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["plugin", "editors"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVLSCAN_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("built-in"), "got: {stdout}");
+    assert!(stdout.contains("claude"), "got: {stdout}");
+    assert!(stdout.contains("plugin install"), "got: {stdout}");
+}
+
+/// `plugin remove --yes` is idempotent for Claude with nothing installed
+/// and never runs `claude` when it is not on PATH (PATH is cleared here so
+/// the test can never touch a real Claude Code installation).
+#[test]
+fn plugin_remove_yes_is_idempotent_for_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["plugin", "remove", "claude", "--yes"])
+        .env("HOME", &home)
+        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("PATH", "")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "remove failed: {stdout}\n{stderr}");
+    assert!(stdout.contains("removed claude"), "got: {stdout}");
+    assert!(
+        stdout.contains("not found on PATH"),
+        "unregistration commands must be printed, not run: {stdout}"
+    );
+}

@@ -127,6 +127,20 @@ impl SkillsStore {
         )?;
         Ok(())
     }
+
+    /// Forget one harness's install record (read-modify-write; a harness
+    /// that was never recorded is a no-op, keeping removal idempotent).
+    pub fn remove_installed(&self, harness: &str) -> anyhow::Result<()> {
+        let mut map = self.read_installed();
+        if map.remove(harness).is_none() {
+            return Ok(());
+        }
+        write_atomic(
+            &self.root.join(INSTALLED),
+            &serde_json::to_vec_pretty(&map)?,
+        )?;
+        Ok(())
+    }
 }
 
 /// Write via same-directory temp file + rename, so a crash never leaves a
@@ -212,5 +226,10 @@ mod tests {
         let map = store.read_installed();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("claude"), Some(&info));
+
+        // remove_installed forgets the record; removing again is a no-op.
+        store.remove_installed("claude").unwrap();
+        assert!(store.read_installed().is_empty());
+        store.remove_installed("claude").unwrap();
     }
 }

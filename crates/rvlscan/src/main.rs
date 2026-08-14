@@ -242,6 +242,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+    /// rvl-cli parity surface over the same skills machinery: manage the
+    /// Revelara plugin content per coding-agent harness (install, update,
+    /// list, remove, editors, agents). `plugin agents --json` is the
+    /// machine-readable lens listing the scan skill consumes.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
     // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
     // contract (same subcommands/flags, byte-identical --format=json);
     // implementations live in crates/rvl-data with golden-parity suites. ---
@@ -325,6 +333,60 @@ enum SkillsCmd {
     },
     /// Show installed, cached, and served skill versions (drift report).
     Status,
+}
+
+/// `rvlscan plugin`: the rvl-cli `rvl plugin` parity surface. Install and
+/// update DELEGATE to the skills machinery (same download/verify/cache
+/// engine as `rvlscan skills`); list/remove/editors/agents are machinery
+/// capabilities exposed under the names rvl-cli users know.
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install the plugin content for a harness. With no name, installs
+    /// into every detected harness (same engine as `rvlscan skills install`).
+    Install {
+        /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
+        harness: Option<String>,
+        /// Stage files but do not run the harness's plugin registration
+        /// commands (Claude Code); they are printed for manual use instead.
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Update installed plugin content to the served version (install and
+    /// update are the same operation, mirroring `rvl plugin update`).
+    Update {
+        /// Harness name; defaults to everything previously installed.
+        harness: Option<String>,
+        /// Stage files but do not run registration commands (Claude Code).
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// List installed plugin content with versions and update availability.
+    List,
+    /// Remove installed plugin content for a harness. Deletes exactly the
+    /// files the install placed (never the editor's own configuration).
+    Remove {
+        /// Harness name to remove.
+        harness: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// List the supported editor targets served by the Revelara API
+    /// (GET /api/v1/plugin/editors), with a built-in fallback offline.
+    Editors,
+    /// List installed agent lenses. `--json` output is the contract the
+    /// scan skill parses: {"agents":[{"id":"...","description":"..."}]}.
+    Agents {
+        /// Harness whose installed agents to list.
+        #[arg(long, default_value = "claude")]
+        editor: String,
+        /// Alias for --format=json (rvl-cli back-compat).
+        #[arg(long)]
+        json: bool,
+        /// Output format: table (default) or json.
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3568,60 +3630,277 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
     }
 }
 
-/// `rvlscan skills`: resolve env/config once, then dispatch. Uses the same
-/// base URL/org key resolution as `sync` (rvlscan env > rvl-cli env >
-/// shared config file) and the spec cache's offline kill switch.
-fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
-    let skills_cache_dir = std::env::var_os("RVLSCAN_SKILLS_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
-    let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
-    let fetcher = rvl_skills::fetch::HttpFetcher {
-        base_url: cfg.base_url.clone(),
-        org_key: cfg.org_key.clone(),
-    };
-    let env = rvl_skills::flow::Env {
-        store: &store,
-        fetcher: &fetcher,
-        home: &home,
-        offline: cfg.offline,
-        allow_unsigned: std::env::var("RVLSCAN_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
-        allow_missing_checksum: std::env::var("RVLSCAN_ALLOW_MISSING_CHECKSUM")
-            .ok()
-            .as_deref()
-            == Some("1"),
-    };
-    let require_key = || {
+/// Everything the `skills` and `plugin` surfaces need, resolved once: home,
+/// the skills cache store, the HTTP fetcher, and the policy env switches.
+/// Uses the same base URL/org key resolution as `sync` (rvlscan env >
+/// rvl-cli env > shared config file) and the spec cache's offline kill
+/// switch.
+struct SkillsCtx {
+    home: PathBuf,
+    store: rvl_skills::store::SkillsStore,
+    fetcher: rvl_skills::fetch::HttpFetcher,
+    offline: bool,
+    has_key: bool,
+    allow_unsigned: bool,
+    allow_missing_checksum: bool,
+}
+
+impl SkillsCtx {
+    fn resolve(cfg: &Config) -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
+        let skills_cache_dir = std::env::var_os("RVLSCAN_SKILLS_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
+        let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
+        let fetcher = rvl_skills::fetch::HttpFetcher {
+            base_url: cfg.base_url.clone(),
+            org_key: cfg.org_key.clone(),
+        };
+        Ok(Self {
+            home,
+            store,
+            fetcher,
+            offline: cfg.offline,
+            has_key: !cfg.org_key.is_empty(),
+            allow_unsigned: std::env::var("RVLSCAN_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
+            allow_missing_checksum: std::env::var("RVLSCAN_ALLOW_MISSING_CHECKSUM")
+                .ok()
+                .as_deref()
+                == Some("1"),
+        })
+    }
+
+    fn env(&self) -> rvl_skills::flow::Env<'_> {
+        rvl_skills::flow::Env {
+            store: &self.store,
+            fetcher: &self.fetcher,
+            home: &self.home,
+            offline: self.offline,
+            allow_unsigned: self.allow_unsigned,
+            allow_missing_checksum: self.allow_missing_checksum,
+        }
+    }
+
+    fn require_key(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            cfg.offline || !cfg.org_key.is_empty(),
+            self.offline || self.has_key,
             "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
              `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1 \
              to install from the local cache)"
         );
         Ok(())
-    };
+    }
+}
+
+/// `rvlscan skills`: resolve env/config once, then dispatch.
+fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
+    let ctx = SkillsCtx::resolve(cfg)?;
+    let env = ctx.env();
     match cmd {
         SkillsCmd::Install {
             harness,
             no_register,
         } => {
-            require_key()?;
+            ctx.require_key()?;
             run_skills_install(&env, harness, no_register, false)
         }
         SkillsCmd::Update {
             harness,
             no_register,
         } => {
-            require_key()?;
+            ctx.require_key()?;
             run_skills_install(&env, harness, no_register, true)
         }
         SkillsCmd::Status => {
             render_skills_status(&rvl_skills::flow::status(&env));
             Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `rvlscan plugin`: the rvl-cli parity command surface over the same
+/// machinery. Install/update delegate to [`run_skills_install`]; list
+/// renders the same drift report `skills status` uses; remove, editors, and
+/// agents call the corresponding machinery capabilities.
+fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
+    let ctx = SkillsCtx::resolve(cfg)?;
+    let env = ctx.env();
+    match cmd {
+        PluginCmd::Install {
+            harness,
+            no_register,
+        } => {
+            ctx.require_key()?;
+            run_skills_install(&env, harness, no_register, false)
+        }
+        PluginCmd::Update {
+            harness,
+            no_register,
+        } => {
+            ctx.require_key()?;
+            run_skills_install(&env, harness, no_register, true)
+        }
+        PluginCmd::List => {
+            render_skills_status(&rvl_skills::flow::status(&env));
+            Ok(ExitCode::SUCCESS)
+        }
+        PluginCmd::Remove { harness, yes } => run_plugin_remove(&env, &harness, yes),
+        PluginCmd::Editors => {
+            run_plugin_editors(&env);
+            Ok(ExitCode::SUCCESS)
+        }
+        PluginCmd::Agents {
+            editor,
+            json,
+            format,
+        } => run_plugin_agents(&env, &editor, json, format.as_deref()),
+    }
+}
+
+/// One-line y/N confirmation on stdin (mirrors `rvl plugin remove`).
+fn confirm(prompt: &str) -> bool {
+    use std::io::Write as _;
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `plugin remove <harness>`: confirm, remove via the machinery, then run
+/// any unregistration commands best-effort.
+fn run_plugin_remove(
+    env: &rvl_skills::flow::Env,
+    harness: &str,
+    yes: bool,
+) -> anyhow::Result<ExitCode> {
+    let Some(h) = rvl_skills::harness::by_name(harness) else {
+        anyhow::bail!(
+            "unsupported harness: {harness} (supported: {})",
+            rvl_skills::harness::supported_names().join(", ")
+        );
+    };
+    if !yes && !confirm(&format!("Remove Revelara skills for {harness}?")) {
+        println!("Cancelled.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let report = rvl_skills::flow::remove_one(env, h.as_ref())?;
+    match report.receipt.files_removed {
+        Some(n) => println!(
+            "removed {harness}: {n} file(s) under {}",
+            report.receipt.location.display()
+        ),
+        None => println!("removed {harness}: {}", report.receipt.location.display()),
+    }
+    if let Some(reg) = &report.receipt.register {
+        if binary_on_path(reg.binary) {
+            run_removal_registration(reg);
+        } else {
+            println!(
+                "'{}' not found on PATH; to unregister once it is:",
+                reg.binary
+            );
+            print_registration_commands(reg);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run post-removal unregistration commands. ALL steps are best-effort: a
+/// plugin that was never registered must not fail its removal.
+fn run_removal_registration(reg: &rvl_skills::harness::Registration) {
+    for argv in &reg.commands {
+        let ok = std::process::Command::new(reg.binary)
+            .args(argv)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "note: '{} {}' failed (already unregistered?)",
+                reg.binary,
+                argv.join(" ")
+            );
+        }
+    }
+}
+
+/// `plugin editors`: the server-side editor list, degrading to the built-in
+/// harness registry when the Revelara API is unreachable or offline.
+fn run_plugin_editors(env: &rvl_skills::flow::Env) {
+    match rvl_skills::flow::editors(env) {
+        Ok(editors) => {
+            println!("Supported editors (served by the Revelara API):");
+            for e in editors {
+                println!("  {:<14} {} (tier {})", e.name, e.display_name, e.tier);
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: {err}; showing the built-in harness list");
+            println!("Supported harnesses (built-in):");
+            for h in rvl_skills::harness::registry() {
+                println!("  {:<14} {}", h.name(), h.display_name());
+            }
+        }
+    }
+    println!("\nInstall:  rvlscan plugin install <name>");
+}
+
+/// `plugin agents`: list installed lenses from disk (never the network).
+/// The `--json` OUTPUT CONTRACT — {"agents":[{"id":"...","description":
+/// "..."}]} — is what the scan skill parses as the source of truth for
+/// available lenses, so on any resolution error JSON mode still emits the
+/// empty contract shape (warning on stderr) and exits 0; the parser must
+/// never see non-JSON on stdout.
+fn run_plugin_agents(
+    env: &rvl_skills::flow::Env,
+    editor: &str,
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let as_json = match format {
+        Some("json") => true,
+        // --json stays honored alongside an explicit table format,
+        // mirroring rvl-cli's alias semantics.
+        Some("table") | Some("text") | Some("") | None => json,
+        Some(other) => anyhow::bail!("invalid --format {other:?} (valid: table, json)"),
+    };
+    let agents = rvl_skills::agents::installed_agents_dir(env.store, env.home, editor)
+        .and_then(|dir| rvl_skills::agents::list_agents(&dir));
+    match agents {
+        Ok(agents) => {
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&rvl_skills::agents::AgentsOutput { agents })?
+                );
+            } else {
+                for a in agents {
+                    if a.description.is_empty() {
+                        println!("{}", a.id);
+                    } else {
+                        println!("{}\t{}", a.id, a.description);
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) if as_json => {
+            println!(
+                "{}",
+                serde_json::to_string(&rvl_skills::agents::AgentsOutput { agents: Vec::new() })?
+            );
+            eprintln!("warning: {e}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -3907,6 +4186,7 @@ fn run() -> anyhow::Result<ExitCode> {
             }
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
+        Cmd::Plugin { cmd } => run_plugin(&cfg, cmd),
         // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
         // Incident/Evidence/Feedback/Bugreport) returned before the store
         // opened, above.

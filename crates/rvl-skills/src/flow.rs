@@ -227,6 +227,45 @@ pub fn install_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<InstallRe
     })
 }
 
+/// A completed removal for one harness.
+#[derive(Debug)]
+pub struct RemoveReport {
+    pub harness: String,
+    pub receipt: crate::harness::RemoveReceipt,
+}
+
+/// Remove one harness's installed skills, mirroring `rvl plugin remove`.
+/// The installed-file inventory comes from the cached tarball (the cache
+/// records exactly what was installed); the harness decides how to apply
+/// it. The install record is forgotten afterwards.
+pub fn remove_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<RemoveReport> {
+    // A corrupt cache slot must not block removal: treat it as absent and
+    // let the harness decide whether it can proceed without an inventory.
+    let files = env
+        .store
+        .load(harness.editor_param())
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| crate::verify::extract_tarball(&bytes))
+        .transpose()?;
+    let receipt = harness.remove(env.home, files.as_ref())?;
+    env.store.remove_installed(harness.name())?;
+    Ok(RemoveReport {
+        harness: harness.name().to_string(),
+        receipt,
+    })
+}
+
+/// The editor targets served by `GET /api/v1/plugin/editors`. Network-only
+/// by nature (the server owns the list), so the offline kill switch gates it.
+pub fn editors(env: &Env) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
+    anyhow::ensure!(
+        !env.offline,
+        "offline (RVLSCAN_OFFLINE=1): the editors listing is served by the Revelara API"
+    );
+    env.fetcher.fetch_editors()
+}
+
 /// Drift status for one installed harness.
 pub struct HarnessStatus {
     pub harness: String,
@@ -363,6 +402,15 @@ mod tests {
                 version,
                 checksum,
             })
+        }
+        fn fetch_editors(&self) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
+            // Up when the version endpoint is up, mirroring the server.
+            self.version.clone().map_err(|e| anyhow::anyhow!(e))?;
+            Ok(vec![crate::fetch::EditorInfo {
+                name: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                tier: 1,
+            }])
         }
     }
 
@@ -564,6 +612,83 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("without signature verification")));
+    }
+
+    #[test]
+    fn remove_deletes_installed_files_and_forgets_the_record() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("codex").unwrap();
+        install_one(&env, h.as_ref()).unwrap();
+        assert!(fx
+            .home
+            .path()
+            .join(".agents/skills/rvl-scan/SKILL.md")
+            .exists());
+
+        let report = remove_one(&env, h.as_ref()).unwrap();
+        assert_eq!(report.harness, "codex");
+        // The signed fixture ships the skill file plus the integrity
+        // manifest; both were installed, both get removed.
+        assert_eq!(report.receipt.files_removed, Some(2));
+        assert!(!fx
+            .home
+            .path()
+            .join(".agents/skills/rvl-scan/SKILL.md")
+            .exists());
+        assert!(!fx.home.path().join(".agents/skills/rvl-scan").exists());
+        assert!(store.read_installed().is_empty(), "record forgotten");
+        // The cache slot survives: removal must not brick a later install.
+        assert_eq!(store.cached_version("codex").as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn remove_without_cache_fails_actionably_for_dir_harness() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let dead = MockFetcher::down("no network");
+        let env = fx.env(&store, &dead);
+        let err = remove_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("cached plugin tarball"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_claude_works_without_cache_and_returns_unregistration() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("claude").unwrap();
+        install_one(&env, h.as_ref()).unwrap();
+
+        let report = remove_one(&env, h.as_ref()).unwrap();
+        assert!(!fx.home.path().join(".revelara/marketplace").exists());
+        assert!(report.receipt.register.is_some());
+        assert!(store.read_installed().is_empty());
+    }
+
+    #[test]
+    fn editors_is_offline_gated_and_passes_the_served_list_through() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+
+        let list = editors(&fx.env(&store, &fetcher)).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "claude");
+
+        let mut env = fx.env(&store, &fetcher);
+        env.offline = true;
+        let err = editors(&env).unwrap_err();
+        assert!(err.to_string().contains("offline"), "got: {err}");
     }
 
     #[test]
