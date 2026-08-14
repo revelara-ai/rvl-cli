@@ -36,6 +36,12 @@ pub enum G {
     /// Arbitrary JSON round-tripped through Go's `map[string]any` /
     /// `interface{}`: object keys sorted, every number a float64.
     Dyn(Value),
+    /// Pre-rendered JSON spliced verbatim, the way Go marshals a
+    /// `json.RawMessage`: key order and number literals preserved. Callers
+    /// pass output of [`compact_raw`] so the splice matches Go's compact +
+    /// HTML-escape pass. Compact emission only (the ported paths that carry
+    /// raw JSON never pretty-print it).
+    Raw(String),
 }
 
 /// `json.MarshalIndent(v, "", "  ")` equivalent.
@@ -69,7 +75,51 @@ fn write_g(out: &mut String, g: &G, depth: usize, indent: bool) {
         G::Arr(items) => write_arr(out, items, depth, indent),
         G::Obj(fields) => write_obj(out, fields, depth, indent),
         G::Dyn(v) => write_dyn(out, v, depth, indent),
+        G::Raw(s) => out.push_str(s),
     }
+}
+
+/// Go's marshal of a `json.RawMessage`: `json.Compact` with HTML escaping.
+/// Whitespace outside strings is dropped; key order and number literals are
+/// preserved byte-for-byte; `<` `>` `&` and U+2028/U+2029 inside strings are
+/// escaped; existing escape sequences pass through untouched. The input must
+/// be valid JSON (the ported callers only feed it JSON that already parsed).
+pub fn compact_raw(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            match c {
+                '\\' => {
+                    out.push('\\');
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '"' => {
+                    out.push('"');
+                    in_string = false;
+                }
+                '<' => out.push_str("\\u003c"),
+                '>' => out.push_str("\\u003e"),
+                '&' => out.push_str("\\u0026"),
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                c => out.push(c),
+            }
+        } else {
+            match c {
+                ' ' | '\t' | '\n' | '\r' => {}
+                '"' => {
+                    out.push('"');
+                    in_string = true;
+                }
+                c => out.push(c),
+            }
+        }
+    }
+    out
 }
 
 fn write_arr(out: &mut String, items: &[G], depth: usize, indent: bool) {
@@ -381,6 +431,25 @@ mod tests {
         assert_eq!(pretty(&G::Arr(vec![])), "[]");
         assert_eq!(pretty(&G::Obj(vec![])), "{}");
         assert_eq!(compact(&G::Null), "null");
+    }
+
+    #[test]
+    fn compact_raw_preserves_order_and_escapes_like_go() {
+        // Key order and number literals survive; whitespace goes; HTML
+        // escaping matches Go's json.Compact-with-escape of a RawMessage.
+        assert_eq!(
+            compact_raw("[ {\"z\": 1, \"a\": 2.50} ]"),
+            r#"[{"z":1,"a":2.50}]"#
+        );
+        assert_eq!(
+            compact_raw("{\"k\": \"a<b> & c\"}"),
+            "{\"k\":\"a\\u003cb\\u003e \\u0026 c\"}"
+        );
+        // Existing escapes (including an escaped quote) pass through; spaces
+        // inside strings are kept.
+        assert_eq!(compact_raw("{\"k\": \"x \\\" y\"}"), r#"{"k":"x \" y"}"#);
+        let g = G::Raw(compact_raw("{\"z\":1,\"a\":2}"));
+        assert_eq!(compact(&g), r#"{"z":1,"a":2}"#);
     }
 
     #[test]

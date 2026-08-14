@@ -3003,3 +3003,374 @@ fn a_generated_banner_is_matched_by_evidence_not_by_path() {
         "a hand-written file under proto/ must not be excluded: {text}"
     );
 }
+
+// --- scan submission mode (po-av01j.153, rvl-cli parity) ---
+
+mod submit_mock {
+    //! Just enough HTTP/1.1 for ureq: serves scripted responses in order and
+    //! records every request, so the CLI-level submission tests are hermetic.
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    pub struct Recorded {
+        pub method: String,
+        pub path: String,
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    impl Recorded {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    pub struct MockServer {
+        pub base_url: String,
+        requests: Arc<Mutex<Vec<Recorded>>>,
+    }
+
+    impl MockServer {
+        pub fn start(responses: Vec<(u16, &'static str)>) -> MockServer {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+            let reqs = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                let mut script = responses.into_iter();
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let next = script.next().unwrap_or((500, "exhausted"));
+                    let _ = handle(stream, next, &reqs);
+                }
+            });
+            MockServer { base_url, requests }
+        }
+
+        pub fn recorded(&self) -> Vec<Recorded> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn handle(
+        stream: std::net::TcpStream,
+        (status, resp_body): (u16, &str),
+        reqs: &Arc<Mutex<Vec<Recorded>>>,
+    ) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let path = parts.next().unwrap_or_default().to_string();
+        let mut headers = Vec::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim_end().to_string();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                if k.eq_ignore_ascii_case("content-length") {
+                    content_length = v.parse().unwrap_or(0);
+                }
+                headers.push((k, v));
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        reqs.lock().unwrap().push(Recorded {
+            method,
+            path,
+            headers,
+            body,
+        });
+        let mut out = stream;
+        write!(
+            out,
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            resp_body.len()
+        )?;
+        out.write_all(resp_body.as_bytes())?;
+        Ok(())
+    }
+}
+
+const SUBMIT_RESPONSE: &str = r#"{
+  "scan_id": "scan-cli-1",
+  "service": "checkout-api",
+  "summary": {"total": 2, "created": 2, "updated": 0, "unchanged": 0,
+              "critical": 0, "high": 0, "medium": 2, "low": 0},
+  "findings": [
+    {"risk_id": "u1", "risk_code": "R-101", "title": "Missing timeout",
+     "status": "created", "score": 61, "priority": "medium"},
+    {"risk_id": "u2", "risk_code": "R-102", "title": "No circuit breaker",
+     "status": "created", "score": 55, "priority": "medium"}
+  ],
+  "timestamp": "2026-08-13T00:00:00Z",
+  "effective_tolerance": {"tolerance_target": 25, "tolerance_headroom_pct": 20,
+                          "strict_enforcement": false}
+}"#;
+
+fn write_scan_parts(dir: &std::path::Path) -> std::path::PathBuf {
+    let parts = dir.join("scan-parts");
+    std::fs::create_dir_all(&parts).unwrap();
+    std::fs::write(
+        parts.join("01-stack.json"),
+        r#"{"stack":{"languages":["go"]},"repo_url":"https://example.com/repo"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        parts.join("02-findings.json"),
+        r#"{"findings":[{"title":"Missing timeout","category":"resilience","likelihood":"high","impact":"high","risk_score":61,"uca_type":"Not Provided"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        parts.join("03-findings.json"),
+        r#"{"findings":[{"title":"No circuit breaker","category":"resilience","likelihood":"medium","impact":"high","risk_score":"55"}]}"#,
+    )
+    .unwrap();
+    parts
+}
+
+/// The drop-in skill invocation `rvl scan --service X --target Y
+/// --scan-dir DIR` works against this binary verbatim: parts merge in
+/// alphabetical order, findings normalize (enum casing, numeric-as-string
+/// risk_score), the wire body matches the rvl-cli contract, and the
+/// success render names the created risk codes.
+#[test]
+fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--target"])
+        .arg(dir.path())
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "submit failed: {stdout}\n{stderr}");
+
+    // Success render: summary counts, created risk codes, tolerance line.
+    assert!(stdout.contains("Scan submitted successfully"), "{stdout}");
+    assert!(stdout.contains("Scan ID: scan-cli-1"), "{stdout}");
+    assert!(
+        stdout.contains("Total: 2 (Created: 2, Updated: 0, Unchanged: 0)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[NEW] R-101: Missing timeout"), "{stdout}");
+    assert!(
+        stdout.contains("[NEW] R-102: No circuit breaker"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Effective tolerance: target=25, headroom=20%, strict=false"),
+        "{stdout}"
+    );
+    // Merge + normalization narration on stderr.
+    assert!(stderr.contains("Merged: 01-stack.json"), "{stderr}");
+    assert!(stderr.contains("Merged: 02-findings.json"), "{stderr}");
+    assert!(stderr.contains("[coerced]"), "{stderr}");
+    assert!(
+        stderr.contains("Scan parts kept at"),
+        "no --cleanup-on-success keeps the parts: {stderr}"
+    );
+
+    // The wire body: one POST carrying the merged, normalized request.
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/api/v1/risks/scan");
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_cli_test"));
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(
+        body.starts_with(r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto""#),
+        "{body}"
+    );
+    assert!(body.contains(r#""title":"Missing timeout""#), "{body}");
+    assert!(body.contains(r#""title":"No circuit breaker""#), "{body}");
+    assert!(
+        body.contains(r#""uca_type":"not_provided""#),
+        "enum casing normalized on the wire: {body}"
+    );
+    assert!(
+        body.contains(r#""risk_score":55"#),
+        "numeric-as-string risk_score coerced: {body}"
+    );
+    assert!(
+        body.contains(r#""repo_url":"https://example.com/repo""#),
+        "{body}"
+    );
+    assert!(body.contains(r#""scanner_id":"rvlscan/"#), "{body}");
+    assert!(body.contains(r#""idempotency_key":""#), "{body}");
+}
+
+/// `--dry-run` validates and normalizes without submitting (po-4g59y):
+/// machine-readable JSON summary on stdout, human framing on stderr, no
+/// HTTP request at all. The API URL points at an unroutable port to prove
+/// nothing is sent.
+#[test]
+fn scan_submission_dry_run_prints_summary_and_never_posts() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--dry-run"])
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        // Unroutable: a request attempt would error, so success proves
+        // the dry run never touched the network.
+        .env("RVL_API_URL", "http://127.0.0.1:9")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "dry run failed: {stdout}\n{stderr}");
+
+    assert!(
+        stderr.contains("Dry run - would submit to http://127.0.0.1:9"),
+        "{stderr}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be the JSON summary");
+    assert_eq!(summary["dry_run"], serde_json::Value::Bool(true));
+    assert_eq!(summary["service"], "checkout-api");
+    assert_eq!(summary["findings"], 2);
+    assert_eq!(summary["scan_type"], "full");
+    // po-gli2z counts ride the summary so CI can assert no STPA loss.
+    assert_eq!(summary["findings_with_stpa"], 1);
+    assert_eq!(summary["findings_coerced"], 2);
+    assert_eq!(summary["findings_with_dropped"], 0);
+    // No --target flag given: the key is absent, mirroring rvl-cli.
+    assert!(summary.get("target").is_none(), "{stdout}");
+}
+
+/// `--cleanup-on-success` removes the scan-parts directory after a 2xx.
+#[test]
+fn scan_submission_cleanup_on_success_removes_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--cleanup-on-success"])
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success());
+    assert!(!parts.exists(), "scan parts must be removed after a 2xx");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("Removed scan parts at"), "{stderr}");
+}
+
+/// A failed submit preserves the parts and prints the re-run hint.
+#[test]
+fn scan_submission_failure_preserves_parts_with_rerun_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(
+        400,
+        r#"{"code":"validation_failed","message":"bad request"}"#,
+    )]);
+
+    let out = bin()
+        .args(["scan", "--service", "checkout-api", "--cleanup-on-success"])
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(out.status.code(), Some(1), "submit failure exits 1");
+    assert!(parts.exists(), "scan parts survive a failed submit");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("Scan parts preserved at"), "{stderr}");
+    assert!(
+        stderr.contains("server error (400 validation_failed)"),
+        "{stderr}"
+    );
+}
+
+/// `--service` with no input source gets rvl-cli's error, and never runs
+/// the deterministic scan.
+#[test]
+fn scan_service_without_input_source_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = bin()
+        .args(["scan", "--service", "svc"])
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("Must specify --stdin, --file, or --scan-dir"),
+        "{stderr}"
+    );
+}
+
+/// Plain `rvlscan scan <path>` (no submission flag) still runs the
+/// deterministic scanner: no network, no submit output, same verdict
+/// surface as before this feature landed.
+#[test]
+fn plain_scan_stays_deterministic_and_never_submits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "deterministic scan must still reach a verdict"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("Scan submitted"),
+        "no submission on the deterministic path: {stdout}"
+    );
+}
