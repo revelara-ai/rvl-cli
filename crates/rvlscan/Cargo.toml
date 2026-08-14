@@ -10,6 +10,7 @@ homepage.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 rvl-cache = { path = "../rvl-cache" }
 rvl-config = { path = "../rvl-config" }
 rvl-content = { path = "../rvl-content" }

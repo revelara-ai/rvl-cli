@@ -295,6 +295,39 @@ enum Cmd {
         #[command(flatten)]
         args: rvl_data::feedback::FeedbackArgs,
     },
+    /// View and edit CLI configuration (~/.revelara/config.yaml)
+    Config {
+        #[command(subcommand)]
+        cmd: rvl_data::config::ConfigCmd,
+    },
+    /// Generate shell completion scripts (bash, zsh, fish).
+    /// Bash/zsh: eval "$(rvlscan completion bash)" in your rc file.
+    /// Fish: rvlscan completion fish > ~/.config/fish/completions/rvlscan.fish
+    Completion {
+        /// Shell to generate a completion script for.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+/// The shells `rvl completion` supports (rvl-cli parity: bash, zsh, fish).
+/// A deliberate subset of `clap_complete::Shell` so `--help` and error
+/// messages advertise exactly what rvl-cli does.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(s: CompletionShell) -> Self {
+        match s {
+            CompletionShell::Bash => clap_complete::Shell::Bash,
+            CompletionShell::Zsh => clap_complete::Shell::Zsh,
+            CompletionShell::Fish => clap_complete::Shell::Fish,
+        }
+    }
 }
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
@@ -4010,6 +4043,18 @@ fn run() -> anyhow::Result<ExitCode> {
                 env!("CARGO_PKG_VERSION"),
             ))
         }
+        Cmd::Config { cmd } => return Ok(rvl_data::config::run(cmd)),
+        Cmd::Completion { shell } => {
+            use clap::CommandFactory as _;
+            let mut command = Cli::command();
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut command,
+                "rvlscan",
+                &mut std::io::stdout(),
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         other => other,
     };
     let cfg = Config::from_env();
@@ -4238,7 +4283,9 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Incident { .. }
         | Cmd::Evidence { .. }
         | Cmd::Feedback { .. }
-        | Cmd::Bugreport { .. } => {
+        | Cmd::Bugreport { .. }
+        | Cmd::Config { .. }
+        | Cmd::Completion { .. } => {
             unreachable!("data commands dispatch before the store opens")
         }
     }
