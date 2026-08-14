@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod embedded_helpers;
 mod hook;
 mod init;
 mod out_doc;
@@ -757,9 +758,22 @@ fn server_to_findings(
 // Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
 // it is omitted, rvlscan discovers and runs the language retriever helper over
 // the target itself and feeds the packets into the same pipeline. Helper
-// PACKAGING for release (bundling goindex/pyindex with the shipped binary) is
-// intentionally out of scope: discovery falls back to env override, a helper
-// adjacent to the rvlscan binary, then PATH.
+// PACKAGING (po-aml3h). A fresh `brew install rvlscan` used to deliver the
+// binary and NONE of the seven helpers, so the first scan of any real repo
+// hard-failed. Each helper now ships by the cheapest route its nature allows:
+//
+//   pyindex.py / tsindex.js / javaindex.java   embedded in this binary and
+//       extracted to ~/.revelara/helpers/<version>/ on first use. They are
+//       platform-independent text, so one build carries them everywhere.
+//   cindex / rustindex                          workspace bins, packed into
+//       the same release archive as rvlscan (dist `binaries` in Cargo.toml).
+//   goindex                                     built per target by release CI
+//       and packed into the archive alongside the binary.
+//   csindex                                     NOT carried: it needs ~9 MB of
+//       Roslyn assemblies. Env override / PATH only, with a one-command hint.
+//
+// Discovery order: env override, adjacent to the rvlscan binary (or the
+// packaged share dir next to it), the extracted copy, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
 /// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
@@ -1156,12 +1170,82 @@ fn allow_missing_helpers() -> bool {
     )
 }
 
+/// The script this binary CARRIES for `lang`, when it carries one (po-aml3h).
+/// The native helpers ride the release archive instead; C# rides neither.
+fn embedded_for(lang: Lang) -> Option<&'static embedded_helpers::Embedded> {
+    match lang {
+        Lang::Python => Some(&embedded_helpers::PYINDEX),
+        Lang::TypeScript => Some(&embedded_helpers::TSINDEX),
+        Lang::Java => Some(&embedded_helpers::JAVAINDEX),
+        Lang::Go | Lang::Rust | Lang::CSharp | Lang::CCpp => None,
+    }
+}
+
+/// Directories a PACKAGED helper may sit in, given the running binary. The
+/// first is the release archive's own layout (everything unpacked side by
+/// side); the second is where Homebrew files an archive's non-binary members,
+/// `<prefix>/share/rvlscan`, since `bin.install` only relocates executables and
+/// leaves the rest in pkgshare. Without the second entry a `brew install` would
+/// carry goindex in the bottle and still not find it.
+fn packaged_helper_dirs(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![exe_dir.to_path_buf()];
+    if let Some(prefix) = exe_dir.parent() {
+        dirs.push(prefix.join("share").join("rvlscan"));
+    }
+    dirs
+}
+
+/// What a reader should DO when `lang` has no retriever: the specific install,
+/// and the one command that performs it. Generic advice ("install the helper")
+/// is what this bead exists to delete.
+fn missing_helper_hint(lang: Lang) -> String {
+    let env = lang.env_override();
+    match lang {
+        // Built per target by release CI and packed next to the binary, so its
+        // absence means a source build or a hand-assembled install.
+        Lang::Go => format!(
+            "goindex ships next to the rvlscan binary; if you built from source run `make helpers`, \
+             or build it directly with `go build -C helpers/goindex -o <dir holding rvlscan> .` \
+             (needs Go 1.21+), or set {env} to an existing goindex"
+        ),
+        Lang::Rust | Lang::CCpp => format!(
+            "{base} ships next to the rvlscan binary in the release archive; if you built from \
+             source run `cargo build --release -p {base}` and put it there, or set {env}",
+            base = lang.helper_base(),
+        ),
+        // The one helper deliberately NOT carried: the .NET assembly itself is
+        // ~39 KB but drags ~9 MB of Microsoft.CodeAnalysis (Roslyn) with it,
+        // which is more than the rest of the release archive combined.
+        Lang::CSharp => format!(
+            "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
+             then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
+             `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
+             and set {env}=~/.revelara/helpers/csindex/csindex.dll"
+        ),
+        // Embedded — reaching this arm means extraction itself failed.
+        Lang::Python | Lang::TypeScript | Lang::Java => format!(
+            "{base} is carried inside the rvlscan binary but could not be written out; set \
+             {dir} to a writable directory, or set {env} to a {base} you installed yourself",
+            base = lang.helper_base(),
+            dir = embedded_helpers::HELPER_DIR_ENV,
+        ),
+    }
+}
+
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
-///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX`),
-///   2. a helper next to the current exe,
-///   3. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / ...),
+///   2. a helper packaged with the binary (adjacent, or in its pkgshare dir),
+///   3. the copy extracted from THIS binary (pyindex/tsindex/javaindex),
+///   4. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///
+/// Packaged beats embedded so a deliberately installed helper — the Makefile's
+/// `make helpers`, a release archive's goindex — still wins over the carried
+/// copy; embedded beats PATH so a fresh machine needs no PATH surgery, and so
+/// an unrelated `pyindex` on PATH cannot quietly answer for ours. Every step
+/// records WHERE it found the file, and the "retrievers:" roll-call prints it:
+/// a shadowing helper is undiagnosable from any other line of output.
 fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     // (1) explicit env override wins.
     if let Some(p) = std::env::var_os(lang.env_override()) {
@@ -1188,22 +1272,35 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         Lang::Java => Some(format!("{base}.java")),
         Lang::Go | Lang::Rust | Lang::CCpp => None,
     };
-    // (2) adjacent to the rvlscan binary.
+    // (2) packaged with the binary: adjacent, or in the pkgshare dir a
+    // package manager files the archive's non-binary members into.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join(base);
-            if cand.is_file() {
-                return Ok(classify_helper(lang, &cand, "bundled"));
-            }
-            if let Some(script) = &script_name {
-                let cand_script = dir.join(script);
-                if cand_script.is_file() {
-                    return Ok(classify_helper(lang, &cand_script, "bundled"));
+        if let Some(exe_dir) = exe.parent() {
+            for dir in packaged_helper_dirs(exe_dir) {
+                let cand = dir.join(base);
+                if cand.is_file() {
+                    return Ok(classify_helper(lang, &cand, "bundled"));
+                }
+                if let Some(script) = &script_name {
+                    let cand_script = dir.join(script);
+                    if cand_script.is_file() {
+                        return Ok(classify_helper(lang, &cand_script, "bundled"));
+                    }
                 }
             }
         }
     }
-    // (3) on PATH.
+    // (3) the copy carried inside this binary, written out on first use.
+    // Best-effort: an unwritable HOME degrades to the PATH lookup below rather
+    // than failing a scan that a helper on PATH could have served.
+    let mut extract_failure: Option<String> = None;
+    if let Some(embedded) = embedded_for(lang) {
+        match embedded_helpers::ensure(embedded) {
+            Ok(path) => return Ok(classify_helper(lang, &path, "embedded")),
+            Err(e) => extract_failure = Some(format!("{e:#}")),
+        }
+    }
+    // (4) on PATH.
     if let Some(found) = find_on_path(base) {
         return Ok(classify_helper(lang, &found, "PATH"));
     }
@@ -1212,10 +1309,17 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             return Ok(classify_helper(lang, &found, "PATH"));
         }
     }
+    // Name the extraction failure when there was one: "no helper found" would
+    // send the reader hunting for an install that this binary already carries.
+    if let Some(why) = extract_failure {
+        anyhow::bail!(
+            "no {base} helper for detected {lang} sources ({why}): {hint}",
+            hint = missing_helper_hint(lang),
+        );
+    }
     anyhow::bail!(
-        "no {base} helper found for detected {lang} sources: set {env} to the helper path, \
-         place {base} next to the rvlscan binary, or put it on PATH",
-        env = lang.env_override(),
+        "no {base} helper found for detected {lang} sources: {hint}",
+        hint = missing_helper_hint(lang),
     )
 }
 
@@ -1456,8 +1560,12 @@ fn run_helper(
     for batch in &batches {
         let argv = helper_argv(helper, root, name, batch);
         let (program, args) = argv.split_first().expect("argv always has a program");
-        let output = std::process::Command::new(program)
-            .args(args)
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if helper.kind == HelperKind::NodeScript {
+            cmd.env("NODE_PATH", node_path_for(root));
+        }
+        let output = cmd
             .output()
             .with_context(|| format!("running retriever helper `{program}`"))?;
         if !output.status.success() {
@@ -1471,6 +1579,31 @@ fn run_helper(
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
     Ok(Ok(merged))
+}
+
+/// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
+///
+/// tsindex drives the real TypeScript compiler API, so it needs the
+/// `typescript` package at runtime. Node resolves `require` by walking up from
+/// the SCRIPT's directory, and once the script is extracted to
+/// `~/.revelara/helpers/<version>/` that walk never reaches the repository
+/// being scanned — even though almost every TypeScript repo already has
+/// `typescript` in its own `node_modules`. Pointing NODE_PATH at the scanned
+/// tree makes the common case need no install at all, and uses the project's
+/// OWN compiler version, which is the more faithful answer anyway.
+///
+/// An existing NODE_PATH is preserved and takes precedence: an operator who
+/// set it meant it.
+fn node_path_for(root: &Path) -> std::ffi::OsString {
+    let repo_modules = root.join("node_modules");
+    match std::env::var_os("NODE_PATH") {
+        Some(existing) if !existing.is_empty() => {
+            let mut parts: Vec<PathBuf> = std::env::split_paths(&existing).collect();
+            parts.push(repo_modules);
+            std::env::join_paths(parts).unwrap_or(existing)
+        }
+        _ => repo_modules.into_os_string(),
+    }
 }
 
 /// A one-line reason for a degradation, for the COVERAGE block.
@@ -1765,11 +1898,11 @@ fn resolve_packet_stream(
     // reports the first and hides the rest. A developer on a polyglot repo
     // should get one list and one install step, not N runs.
     //
-    // The decision this implements: do not bundle the helpers, probe for them
-    // and error out when one is needed and absent. Carrying the helpers buys
-    // convenience and costs a permanent cross-compile and toolchain surface;
-    // the tool does not need to CARRY them, it needs to be honest about
-    // whether it found them.
+    // The probe ALSO extracts: `resolve_helper` materializes an embedded
+    // script the first time it is asked for one (po-aml3h), so the preflight
+    // both answers "can this repo be scanned" and does the setup that makes
+    // the answer yes. Extraction is hash-checked and memoized, so running the
+    // probe and then the loop costs one write, not two.
     let missing: Vec<(Lang, String)> = langs
         .iter()
         .filter_map(|&l| match resolve_helper(l) {
@@ -5517,6 +5650,91 @@ mod tests {
         let resolved = resolve_helper(Lang::Go);
         std::env::remove_var("RVLSCAN_GOINDEX");
         assert!(resolved.is_err(), "a missing override path must error");
+    }
+
+    #[test]
+    fn embedded_scripts_cover_exactly_the_platform_independent_helpers() {
+        // The split is the whole packaging decision (po-aml3h): text is
+        // carried, native code is shipped in the archive, and Roslyn is
+        // neither. A helper silently changing sides here is a helper that
+        // stops arriving on a fresh install.
+        for lang in [Lang::Python, Lang::TypeScript, Lang::Java] {
+            assert!(
+                embedded_for(lang).is_some(),
+                "{lang} is a scripted retriever and must be carried in the binary"
+            );
+        }
+        for lang in [Lang::Go, Lang::Rust, Lang::CCpp, Lang::CSharp] {
+            assert!(
+                embedded_for(lang).is_none(),
+                "{lang}'s helper is native and must ship in the archive, not be embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_lookup_covers_the_homebrew_pkgshare_dir() {
+        // Homebrew's generated formula `bin.install`s the archive's EXECUTABLES
+        // and files everything else under <prefix>/share/<app>. goindex rides
+        // the archive as a non-cargo file, so without this dir a brew install
+        // would carry it and never find it.
+        let dirs = packaged_helper_dirs(Path::new("/opt/homebrew/Cellar/rvlscan/1.0/bin"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvlscan/1.0/bin")));
+        assert!(dirs.contains(&PathBuf::from(
+            "/opt/homebrew/Cellar/rvlscan/1.0/share/rvlscan"
+        )));
+    }
+
+    #[test]
+    fn missing_helper_hints_name_a_command_to_run() {
+        // "Install the helper" is the message this bead exists to delete: a
+        // reader who hits a missing retriever must get the specific install.
+        for lang in [
+            Lang::Go,
+            Lang::Python,
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::CSharp,
+            Lang::Java,
+            Lang::CCpp,
+        ] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                hint.contains('`') || hint.contains(lang.env_override()),
+                "{lang}'s hint must name a command or the override var: {hint}"
+            );
+        }
+        let cs = missing_helper_hint(Lang::CSharp);
+        assert!(
+            cs.contains("dotnet build helpers/csindex") && cs.contains("RVLSCAN_CSINDEX"),
+            "csindex is the one helper we deliberately do not ship, so its hint must be the \
+             most specific of all: {cs}"
+        );
+    }
+
+    #[test]
+    fn node_path_points_at_the_scanned_repo_and_keeps_any_existing_entries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("NODE_PATH");
+        let root = Path::new("/work/api");
+        assert_eq!(
+            node_path_for(root),
+            std::ffi::OsString::from("/work/api/node_modules"),
+            "a node helper must be able to load the SCANNED project's typescript"
+        );
+
+        std::env::set_var("NODE_PATH", "/opt/mods");
+        let combined = node_path_for(root);
+        std::env::remove_var("NODE_PATH");
+        let parts: Vec<PathBuf> = std::env::split_paths(&combined).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/opt/mods"),
+                PathBuf::from("/work/api/node_modules")
+            ],
+            "an operator's own NODE_PATH is preserved, and searched first"
+        );
     }
 
     fn ladder_finding(id: &str) -> render::Finding {

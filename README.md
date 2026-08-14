@@ -35,10 +35,48 @@ concatenate their packets.
 
 Helpers are discovered in this order:
 
-1. an env override — `RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` (path to the helper
-   binary, or, for Python, the `pyindex.py` script);
-2. a helper next to the `rvlscan` binary;
-3. a helper on `PATH` (`goindex`; for Python, `pyindex` or `pyindex.py`).
+1. an env override — `RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / … (path to the
+   helper binary, or, for Python, the `pyindex.py` script);
+2. a helper packaged with the binary — next to `rvlscan`, or in the
+   `share/rvlscan` directory a package manager files an archive's non-binary
+   members into;
+3. the copy `rvlscan` **carries inside itself** and writes out on first use
+   (`pyindex.py`, `tsindex.js`, `javaindex.java` — see below);
+4. a helper on `PATH` (`goindex`; for Python, `pyindex` or `pyindex.py`).
+
+The scan's `retrievers:` line names the resolved path and which of those four
+slots answered, so a stale helper shadowing a fresh one is visible.
+
+### What arrives with an install, and what does not
+
+`brew install revelara-ai/tap/rvlscan` gives you a working scan for six of the
+seven languages with no further setup:
+
+| Retriever | How it arrives | Runtime prerequisite |
+| --- | --- | --- |
+| `pyindex.py` | embedded in the binary | `python3` |
+| `tsindex.js` | embedded in the binary | `node` + a TypeScript 5.x compiler¹ |
+| `javaindex.java` | embedded in the binary | a JDK 11+ (JEP 330 source mode) |
+| `cindex` | in the release archive | a system `libclang` |
+| `rustindex` | in the release archive | `rust-analyzer` |
+| `goindex` | in the release archive | the `go` tool |
+| `csindex` | **not shipped** — it drags ~9 MB of Roslyn | a .NET 8 SDK² |
+
+¹ rvlscan points `NODE_PATH` at the repository being scanned, so a project with
+`typescript` in its own `node_modules` needs nothing. Otherwise tsindex prints
+the one command to run (`npm install --prefix ~/.revelara/helpers/<version>
+"typescript@^5.9.3"`) and that language degrades rather than failing the scan.
+The pin matters: npm's `typescript` now resolves to the 7.x native port, whose
+JS API this helper cannot drive.
+
+² Build it once from a clone:
+`dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex`, then
+set `RVLSCAN_CSINDEX=~/.revelara/helpers/csindex/csindex.dll`.
+
+The embedded scripts are written to `~/.revelara/helpers/<rvlscan version>/` on
+first use, and rewritten whenever their contents no longer hash to the embedded
+text — so an edited or truncated copy heals instead of silently scanning wrong.
+`RVLSCAN_HELPER_DIR` relocates that directory.
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape
 hatch:
@@ -146,10 +184,11 @@ make test lint      # cargo test; clippy -D warnings
 make dev            # build + install helpers next to the binary
 ```
 
-`make dev` (or `make helpers`) builds `goindex` and copies `pyindex.py` into
-`target/<profile>/` next to the `rvlscan` binary, so a locally built
-`rvlscan scan <path>` resolves its retriever via the adjacent-to-binary
-discovery path with **no env var** — the same layout a release archive ships.
+A locally built `rvlscan scan <path>` already resolves the scripted retrievers
+from the copies embedded in the binary, so `make helpers` is only needed for
+`goindex` (which cargo cannot build) and when **developing** a scripted helper:
+it copies `pyindex.py` / `javaindex.java` next to the binary, and the adjacent
+slot outranks the embedded one, so an edit takes effect without re-embedding.
 On a gvm box with a mismatched `GOROOT`, override the Go invocation:
 `make helpers GO='env -u GOROOT go'`. Raw `cargo` still works for anything the
 Makefile does not wrap.
@@ -162,22 +201,31 @@ archives and publishes the Homebrew formula to `revelara-ai/homebrew-tap`.
 
 ### Shipping the retriever helpers
 
-For a released `rvlscan` to scan with zero configuration, each release archive
-must place the retriever helpers **next to the `rvlscan` binary** (the
-adjacent-to-binary discovery slot). Two helpers, two shapes:
+Each helper reaches a released `rvlscan` by the cheapest route its nature
+allows, so a fresh install scans with no setup:
 
-- **`pyindex.py`** is platform-independent (stdlib Python). It is added to
-  every archive verbatim; scanning Python requires `python3` on the user's
-  `PATH` at runtime.
-- **`goindex`** is a compiled Go binary and must be cross-compiled **per
-  target triple** (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, …) and
-  injected into the matching archive. cargo-dist does not build non-Rust
-  artifacts itself, so this is a release-CI build step (`GOOS`/`GOARCH` matrix
-  matching `dist-workspace.toml` `targets`) that emits `goindex` into each
-  archive's binary directory. **This CI wiring is not yet in place** — until
-  it is, released users fall back to `RVLSCAN_GOINDEX` / a `goindex` on `PATH`.
-  It must be validated against a real release (do not merge speculative release
-  changes; CI credits are limited).
+- **`pyindex.py` / `tsindex.js` / `javaindex.java`** are platform-independent
+  text. They are `include_str!`d into the binary
+  (`crates/rvlscan/src/embedded_helpers.rs`) and written to
+  `~/.revelara/helpers/<version>/` on first use — one build carries them for
+  every target, and there is nothing to package.
+- **`cindex` / `rustindex`** are workspace binaries. `[package.metadata.dist]
+  binaries` in `crates/rvlscan/Cargo.toml` packs them into the **same** archive
+  as `rvlscan` (each was previously its own dist app, its own archive, and its
+  own Homebrew formula), and the generated formula `bin.install`s all three.
+- **`goindex`** is a compiled Go binary that cargo cannot build. Release CI
+  cross-compiles it per target triple into `crates/rvlscan/dist-extras/`
+  (`.github/workflows/build-setup.yml`, spliced into dist's build job via
+  `github-build-setup`), and `[package.metadata.dist] include` packs it. It is
+  not a cargo bin target, so Homebrew files it under `<prefix>/share/rvlscan`
+  rather than in `bin` — which is why resolution checks that directory too.
+  **This CI path has not yet run against a real release**: validate it on the
+  next tag (`dist build` fails loudly if `dist-extras/goindex` is missing, so
+  it cannot ship silently broken).
+- **`csindex`** is deliberately not shipped: the assembly is ~39 KB but pulls
+  ~9 MB of `Microsoft.CodeAnalysis` behind it, more than the rest of the
+  archive combined. Env override / `PATH` only, with a one-command install hint
+  when a C# repo is scanned without it.
 
 The spec-cache version is independent of the binary version and is not coupled
 to this repo's release CI.

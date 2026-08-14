@@ -127,6 +127,36 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Install Go (for the goindex retriever)"
+        uses: "actions/setup-go@v6"
+        with:
+          "cache": false
+          "go-version-file": "helpers/goindex/go.mod"
+      - name: "Cross-build goindex for this target"
+        run: |
+          set -euo pipefail
+          targets=(${{ join(matrix.targets, ' ') }})
+          # `include` names ONE static path, so a job building two targets would
+          # silently ship the second one's binary for both. Fail instead.
+          if [ "${#targets[@]}" -ne 1 ]; then
+            echo "goindex packaging assumes one target per job, got: ${targets[*]}" >&2
+            exit 1
+          fi
+          case "${targets[0]}" in
+            x86_64-apple-darwin)     export GOOS=darwin GOARCH=amd64 ;;
+            aarch64-apple-darwin)    export GOOS=darwin GOARCH=arm64 ;;
+            x86_64-unknown-linux-*)  export GOOS=linux  GOARCH=amd64 ;;
+            aarch64-unknown-linux-*) export GOOS=linux  GOARCH=arm64 ;;
+            *) echo "no GOOS/GOARCH mapping for ${targets[0]}" >&2; exit 1 ;;
+          esac
+          # CGO off so the helper is static and cross-builds without a C toolchain;
+          # goindex drives the `go` tool at runtime, not libc-linked analysis.
+          out="$GITHUB_WORKSPACE/crates/rvlscan/dist-extras/goindex"
+          mkdir -p "$(dirname "$out")"
+          CGO_ENABLED=0 go build -C helpers/goindex -trimpath -o "$out" .
+          chmod +x "$out"
+          file "$out" || true
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
