@@ -685,3 +685,57 @@ fn auth_error_message_matches_rvl_cli_401_contract() {
         f.msg
     );
 }
+
+// --- incident search ---
+
+#[test]
+fn incident_search_encodes_query_and_renders_both_formats() {
+    let raw = r#"{"results":[{"short_name":"INC-1234","title":"Redis failover storm","severity":"sev1","incident_date":"2026-01-02T00:00:00Z","mttr_minutes":42,"source_url":"https://example.com/pm","relevance_score":0.87}],"total":1}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/v1/incidents/search?limit=5&q=payment+timeout",
+        200,
+        raw,
+    )]);
+
+    // JSON mode is a raw body passthrough (exactly what the plugin's
+    // scan.md Step 3C invocation consumes).
+    let out =
+        rvl_data::incident::search_output(&server.client(), "payment timeout", 5, Some("json"))
+            .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+
+    // Table mode: header line + parsed rows.
+    let out =
+        rvl_data::incident::search_output(&server.client(), "payment timeout", 5, None).unwrap();
+    assert!(
+        out.starts_with("Found 1 result(s) for \"payment timeout\":\n\n"),
+        "{out}"
+    );
+    assert!(out.contains("INC-1234"), "{out}");
+    assert!(out.contains("0.87"), "{out}");
+    assert!(out.contains("sev1"), "{out}");
+    assert!(out.contains("https://example.com/pm"), "{out}");
+
+    // The request path is Go url.Values.Encode parity: sorted keys,
+    // space escaped as '+', with auth headers on every call.
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 2);
+    for r in &reqs {
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.path, "/api/v1/incidents/search?limit=5&q=payment+timeout");
+        assert_eq!(r.header("Authorization"), Some("Bearer pk_test_key"));
+        assert_eq!(r.header("X-Organization-ID"), Some("org-uuid-1"));
+    }
+}
+
+#[test]
+fn incident_search_server_error_message_matches_rvl_cli() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/incidents/search?limit=10&q=kafka",
+        500,
+        r#"{"error":"internal","message":"boom"}"#,
+    )]);
+    let f = rvl_data::incident::search_output(&server.client(), "kafka", 10, None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(f.msg, "Error: server error (500): internal: boom");
+}

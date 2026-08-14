@@ -23,6 +23,7 @@ pub mod display;
 pub mod evidence;
 pub mod feedback;
 pub mod gojson;
+pub mod incident;
 pub mod knowledge;
 pub mod risk;
 pub mod scan_normalize;
