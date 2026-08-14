@@ -945,3 +945,178 @@ fn knowledge_enrich_total_fetch_failure_is_a_runtime_error() {
     assert!(lines[1].starts_with("Error: procedures:"), "{}", f.msg);
     assert!(lines[2].starts_with("Error: health:"), "{}", f.msg);
 }
+
+// --- slice (e): knowledge relationships / graph / health (po-av01j.161) ---
+
+#[test]
+fn knowledge_relationships_path_escapes_entities_and_renders_table() {
+    let raw = r#"{"relationships":[{"id":"rel_1","relation_type":"causes","source_type":"fact","source_id":"fact a/b","source_label":"Redis timeout","target_type":"pattern","target_id":"pat_b2","target_label":"Retry storm","strength":0.8,"direction":"outbound","evidence":["INC-1234"],"observation_count":3}],"total":1}"#;
+    let server = MockServer::start(vec![(
+        // Go url.PathEscape parity (po-4xrz5): space -> %20, slash -> %2F.
+        "GET /api/knowledge/entities/fact/fact%20a%2Fb/relationships",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::knowledge::relationships_output(&server.client(), "fact", "fact a/b", None)
+        .unwrap();
+    assert!(
+        out.starts_with("Relationships for fact fact a/b (1 total):\n\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Redis timeout [fact] -> Retry storm [pattern] (strength: 80%, seen 3x)"),
+        "{out}"
+    );
+    assert!(out.contains("    Relation: causes  ID: rel_1"), "{out}");
+    assert!(out.contains("    Evidence: INC-1234"), "{out}");
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(
+        reqs[0].path,
+        "/api/knowledge/entities/fact/fact%20a%2Fb/relationships"
+    );
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+    assert_eq!(reqs[0].header("X-Organization-ID"), Some("org-uuid-1"));
+}
+
+#[test]
+fn knowledge_relationships_json_is_raw_passthrough() {
+    // Key order in the server body is deliberately non-alphabetical: the
+    // passthrough must not re-encode.
+    let raw = r#"{"total":0,"relationships":[]}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/entities/fact/fact_abc12/relationships",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::knowledge::relationships_output(
+        &server.client(),
+        "fact",
+        "fact_abc12",
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+}
+
+#[test]
+fn knowledge_relationships_server_error_is_a_runtime_error() {
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/entities/fact/fact_abc12/relationships",
+        500,
+        r#"{"error":"internal","message":"boom"}"#,
+    )]);
+    let f = rvl_data::knowledge::relationships_output(&server.client(), "fact", "fact_abc12", None)
+        .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(f.msg, "Error: server error (500): internal: boom");
+}
+
+#[test]
+fn knowledge_graph_builds_go_shaped_url_and_renders_depths() {
+    let raw = r#"{"results":[{"entity_type":"pattern","entity_id":"pat_b2","entity_label":"Retry storm","relation_type":"causes","strength":0.8,"depth":1},{"entity_type":"service","entity_id":"svc_c3","entity_label":"checkout-api","relation_type":"impacts","strength":0.6,"depth":2}],"total":2}"#;
+    let server = MockServer::start(vec![(
+        // rvl-cli's fmt.Sprintf URL: entity segments and query values ride
+        // unescaped (unlike relationships), commas included.
+        "GET /api/knowledge/entities/fact/fact_abc12/graph?max_depth=2&min_strength=0.5&relation_type=causes,mitigates",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::knowledge::graph_output(
+        &server.client(),
+        "fact",
+        "fact_abc12",
+        2,
+        "0.5",
+        Some("causes,mitigates"),
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("Graph traversal from fact fact_abc12 (2 nodes):\n\n"),
+        "{out}"
+    );
+    assert!(out.contains("  Depth 1:\n"), "{out}");
+    assert!(
+        out.contains("    -[causes]-> Retry storm [pattern] (strength: 80%)"),
+        "{out}"
+    );
+    assert!(out.contains("  Depth 2:\n"), "{out}");
+    assert!(
+        out.contains("      -[impacts]-> checkout-api [service] (strength: 60%)"),
+        "{out}"
+    );
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(
+        reqs[0].path,
+        "/api/knowledge/entities/fact/fact_abc12/graph?max_depth=2&min_strength=0.5&relation_type=causes,mitigates"
+    );
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+}
+
+#[test]
+fn knowledge_graph_omits_relation_type_when_not_given() {
+    let raw = r#"{"results":[],"total":0}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/entities/fact/fact_abc12/graph?max_depth=3&min_strength=0.3",
+        200,
+        raw,
+    )]);
+    let out =
+        rvl_data::knowledge::graph_output(&server.client(), "fact", "fact_abc12", 3, "0.3", None)
+            .unwrap();
+    assert_eq!(out, "No connected nodes found from fact fact_abc12\n");
+    assert_eq!(
+        server.recorded()[0].path,
+        "/api/knowledge/entities/fact/fact_abc12/graph?max_depth=3&min_strength=0.3"
+    );
+}
+
+#[test]
+fn knowledge_graph_server_error_is_a_runtime_error() {
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/entities/fact/fact_abc12/graph?max_depth=3&min_strength=0.3",
+        500,
+        r#"{"error":"internal","message":"graph down"}"#,
+    )]);
+    let f =
+        rvl_data::knowledge::graph_output(&server.client(), "fact", "fact_abc12", 3, "0.3", None)
+            .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(f.msg, "Error: server error (500): internal: graph down");
+}
+
+#[test]
+fn knowledge_health_fetches_and_renders_stats() {
+    let server = MockServer::start(vec![(
+        "GET /api/knowledge/health",
+        200,
+        r#"{"total_facts":10,"total_procedures":5,"total_patterns":3,"validated_percentage":80,"avg_confidence":0.75,"stale_count":2}"#,
+    )]);
+    let out = rvl_data::knowledge::health_output(&server.client()).unwrap();
+    assert!(out.starts_with("Knowledge Base Health\n\n"), "{out}");
+    assert!(out.contains("  Total Items:       18\n"), "{out}");
+    assert!(out.contains("  Validated:         80%\n"), "{out}");
+    assert!(out.contains("  Avg Confidence:    75%\n"), "{out}");
+    assert!(out.contains("  Stale:             2\n"), "{out}");
+    assert!(!out.contains("Contradictions:"), "{out}");
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/api/knowledge/health");
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+    assert_eq!(reqs[0].header("X-Organization-ID"), Some("org-uuid-1"));
+}
+
+#[test]
+fn knowledge_health_auth_error_matches_rvl_cli() {
+    let server = MockServer::start(vec![("GET /api/knowledge/health", 401, "{}")]);
+    let f = rvl_data::knowledge::health_output(&server.client()).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(f.msg.contains("authentication failed (401)"), "{}", f.msg);
+}
