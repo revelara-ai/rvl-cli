@@ -3982,3 +3982,141 @@ fn completion_generates_a_script_for_each_shell() {
         );
     }
 }
+
+// --- judgments and the gate (po-av01j.106) ---
+
+/// A production-path `requests.get` with no timeout: one violating site, the
+/// class the ratified corpus promotes to blocking.
+///
+/// The scan root is built under a NAME WE CHOOSE rather than a raw tempdir,
+/// because scope is derived from the file path (`rvl_core::scope_of`) and a
+/// random temp name containing "test" would silently reclassify the site as
+/// test-support and demote it. The judgments match `scope: runtime` exactly.
+fn write_runtime_python_fixture(
+    tag: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("rvlscan-judgments-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let http_py = src.join("http.py");
+    std::fs::write(
+        &http_py,
+        "import requests\n\n\ndef fetch(url):\n    return requests.get(url)\n",
+    )
+    .unwrap();
+
+    let packets = root.join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        format!(
+            "{{\"snapshot_id\":\"fixture\",\"file_path\":{f:?},\"line_number\":5,\"func\":\"get\",\"client_type\":\"requests\",\"snippet\":\"return requests.get(url)\",\"lang\":\"python\"}}\n",
+            f = http_py.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let specs = root.join("specs.json");
+    std::fs::write(
+        &specs,
+        r#"{"apis":[{"type":"requests","method":"get","site_count":1,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests defaults to no timeout"}],"configs":[]}"#,
+    )
+    .unwrap();
+    (root, packets, specs)
+}
+
+/// The ratified corpus, verbatim from rvlscan-eval registry/judgments/.
+const RELIABILITY_SEED: &str = r#"[{"api":"requests.get","scope":"runtime","verdict":"surface","severity":"high","fix":"Pass timeout=(connect, read); requests defaults to NO timeout. RC-019.","control":"RC-019"}]"#;
+
+/// WITH judgments the same scan BLOCKS and exits 3. This is the outcome the
+/// bead measured as impossible: 1549 sites, 1281 resolved, 33 findings, zero
+/// blocking, exit 0 — not because nothing was found, but because nothing could
+/// grade what was found.
+#[test]
+fn judged_findings_block_the_commit_and_exit_3() {
+    let (root, packets, specs) = write_runtime_python_fixture("blocking");
+    let judgments = root.join("judgments.json");
+    std::fs::write(&judgments, RELIABILITY_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--judgments")
+        .arg(&judgments)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a ratified high-severity judgment must wedge the commit:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("BLOCKING"), "no BLOCKING section: {stdout}");
+    assert!(
+        stdout.contains("RC-019"),
+        "the finding must be born control-mapped: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WITHOUT judgments the identical scan finds the identical site, surfaces it,
+/// and exits 0. The finding is never dropped — it is simply ungraded, and
+/// ungraded is advisory. This is what every scan did before the corpus shipped,
+/// and it is what an OLD cache (no judgments section) still does.
+#[test]
+fn unjudged_findings_stay_advisory_and_exit_0() {
+    let (root, packets, specs) = write_runtime_python_fixture("advisory");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unjudged class must not block:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("not yet graded"),
+        "the finding must still surface, honestly labelled: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The dev override announces itself every time, exactly as `--specs-file`
+/// does. A grading layer that did not come out of the signed artifact must
+/// never apply silently: it is the one input that can wedge a commit.
+#[test]
+fn the_judgments_override_is_loudly_announced() {
+    let (root, packets, specs) = write_runtime_python_fixture("announce");
+    let judgments = root.join("judgments.json");
+    std::fs::write(&judgments, RELIABILITY_SEED).unwrap();
+
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--judgments")
+        .arg(&judgments)
+        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.to_uppercase().contains("UNVERIFIED") && stderr.contains("--judgments"),
+        "the judgments override must announce itself: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
