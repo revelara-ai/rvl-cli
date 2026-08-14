@@ -8,9 +8,11 @@
 //! harness. It never launches agents and never uploads anything: the fetch
 //! surface is GET-only by construction (see [`fetch::Fetcher`]).
 
+pub mod agents;
 pub mod fetch;
 pub mod flow;
 pub mod harness;
 pub mod semver;
 pub mod store;
+pub mod v1;
 pub mod verify;

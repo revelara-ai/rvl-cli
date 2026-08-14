@@ -227,6 +227,45 @@ pub fn install_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<InstallRe
     })
 }
 
+/// A completed removal for one harness.
+#[derive(Debug)]
+pub struct RemoveReport {
+    pub harness: String,
+    pub receipt: crate::harness::RemoveReceipt,
+}
+
+/// Remove one harness's installed skills, mirroring `rvl plugin remove`.
+/// The installed-file inventory comes from the cached tarball (the cache
+/// records exactly what was installed); the harness decides how to apply
+/// it. The install record is forgotten afterwards.
+pub fn remove_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<RemoveReport> {
+    // A corrupt cache slot must not block removal: treat it as absent and
+    // let the harness decide whether it can proceed without an inventory.
+    let files = env
+        .store
+        .load(harness.editor_param())
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| crate::verify::extract_tarball(&bytes))
+        .transpose()?;
+    let receipt = harness.remove(env.home, files.as_ref())?;
+    env.store.remove_installed(harness.name())?;
+    Ok(RemoveReport {
+        harness: harness.name().to_string(),
+        receipt,
+    })
+}
+
+/// The editor targets served by `GET /api/v1/plugin/editors`. Network-only
+/// by nature (the server owns the list), so the offline kill switch gates it.
+pub fn editors(env: &Env) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
+    anyhow::ensure!(
+        !env.offline,
+        "offline (RVLSCAN_OFFLINE=1): the editors listing is served by the Revelara API"
+    );
+    env.fetcher.fetch_editors()
+}
+
 /// Drift status for one installed harness.
 pub struct HarnessStatus {
     pub harness: String,
@@ -243,6 +282,14 @@ pub struct CachedStatus {
     pub fetched_at: String,
 }
 
+/// One install recorded only by rvl-cli's v1 metadata (not yet adopted
+/// into rvlscan's own store).
+pub struct V1InstallStatus {
+    pub harness: String,
+    pub version: String,
+    pub location: String,
+}
+
 /// Installed-vs-served report, mirroring `rvl plugin list`'s UX.
 pub struct StatusReport {
     /// The version the server currently serves; None when unreachable or
@@ -250,6 +297,9 @@ pub struct StatusReport {
     pub served_version: Option<String>,
     pub server_note: Option<String>,
     pub harnesses: Vec<HarnessStatus>,
+    /// Installs known only from rvl-cli's v1 records (read-only fallback);
+    /// harnesses rvlscan's own store already tracks are excluded.
+    pub v1_installs: Vec<V1InstallStatus>,
     pub cached: Vec<CachedStatus>,
 }
 
@@ -265,9 +315,20 @@ pub fn status(env: &Env) -> StatusReport {
         }
     };
 
-    let harnesses = env
-        .store
-        .read_installed()
+    let installed = env.store.read_installed();
+    // v1 rvl-cli records are the day-one continuity view: show them until
+    // an adoption (any v2 install/update) shadows them.
+    let v1_installs = crate::v1::read_v1_installs(env.home)
+        .into_iter()
+        .filter(|p| !installed.contains_key(&p.editor))
+        .map(|p| V1InstallStatus {
+            harness: p.editor,
+            version: p.version,
+            location: p.location,
+        })
+        .collect();
+
+    let harnesses = installed
         .into_iter()
         .map(|(name, info)| {
             let update_available = served_version
@@ -303,6 +364,7 @@ pub fn status(env: &Env) -> StatusReport {
         served_version,
         server_note,
         harnesses,
+        v1_installs,
         cached,
     }
 }
@@ -363,6 +425,15 @@ mod tests {
                 version,
                 checksum,
             })
+        }
+        fn fetch_editors(&self) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
+            // Up when the version endpoint is up, mirroring the server.
+            self.version.clone().map_err(|e| anyhow::anyhow!(e))?;
+            Ok(vec![crate::fetch::EditorInfo {
+                name: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                tier: 1,
+            }])
         }
     }
 
@@ -564,6 +635,115 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("without signature verification")));
+    }
+
+    #[test]
+    fn remove_deletes_installed_files_and_forgets_the_record() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("codex").unwrap();
+        install_one(&env, h.as_ref()).unwrap();
+        assert!(fx
+            .home
+            .path()
+            .join(".agents/skills/rvl-scan/SKILL.md")
+            .exists());
+
+        let report = remove_one(&env, h.as_ref()).unwrap();
+        assert_eq!(report.harness, "codex");
+        // The signed fixture ships the skill file plus the integrity
+        // manifest; both were installed, both get removed.
+        assert_eq!(report.receipt.files_removed, Some(2));
+        assert!(!fx
+            .home
+            .path()
+            .join(".agents/skills/rvl-scan/SKILL.md")
+            .exists());
+        assert!(!fx.home.path().join(".agents/skills/rvl-scan").exists());
+        assert!(store.read_installed().is_empty(), "record forgotten");
+        // The cache slot survives: removal must not brick a later install.
+        assert_eq!(store.cached_version("codex").as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn remove_without_cache_fails_actionably_for_dir_harness() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let dead = MockFetcher::down("no network");
+        let env = fx.env(&store, &dead);
+        let err = remove_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("cached plugin tarball"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_claude_works_without_cache_and_returns_unregistration() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("claude").unwrap();
+        install_one(&env, h.as_ref()).unwrap();
+
+        let report = remove_one(&env, h.as_ref()).unwrap();
+        assert!(!fx.home.path().join(".revelara/marketplace").exists());
+        assert!(report.receipt.register.is_some());
+        assert!(store.read_installed().is_empty());
+    }
+
+    #[test]
+    fn editors_is_offline_gated_and_passes_the_served_list_through() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+
+        let list = editors(&fx.env(&store, &fetcher)).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "claude");
+
+        let mut env = fx.env(&store, &fetcher);
+        env.offline = true;
+        let err = editors(&env).unwrap_err();
+        assert!(err.to_string().contains("offline"), "got: {err}");
+    }
+
+    #[test]
+    fn status_surfaces_v1_records_until_adoption_shadows_them() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        std::fs::create_dir_all(fx.home.path().join(".revelara")).unwrap();
+        std::fs::write(
+            fx.home.path().join(".revelara/plugins.json"),
+            r#"[{"editor":"claude","version":"0.9.0",
+                 "installed":"2026-08-01T10:00:00Z","location":"/v1/loc"},
+                {"editor":"codex","version":"0.9.0",
+                 "installed":"2026-08-01T10:00:00Z","location":"/v1/codex"}]"#,
+        )
+        .unwrap();
+
+        let dead = MockFetcher::down("timeout");
+        let report = status(&fx.env(&store, &dead));
+        assert_eq!(report.v1_installs.len(), 2, "both v1 records surface");
+        assert_eq!(report.v1_installs[0].harness, "claude");
+        assert_eq!(report.v1_installs[0].version, "0.9.0");
+
+        // Adopting claude (a v2 install) shadows its v1 record; codex stays.
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        install_one(&env, by_name("claude").unwrap().as_ref()).unwrap();
+        let report = status(&env);
+        assert_eq!(report.v1_installs.len(), 1);
+        assert_eq!(report.v1_installs[0].harness, "codex");
+        assert_eq!(report.harnesses.len(), 1);
+        assert_eq!(report.harnesses[0].harness, "claude");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! - `GET /api/v1/plugin/download?editor=..`  -> tar.gz + X-Plugin-SemVer +
 //!   X-Checksum headers (auth)
 //! - `GET /api/v1/plugin/signing-key`         -> {algorithm, public_key}
+//! - `GET /api/v1/plugin/editors`             -> [{name, displayName, tier}]
 
 use crate::semver::semver_base;
 use serde::Deserialize;
@@ -32,6 +33,28 @@ pub trait Fetcher {
     fn fetch_signing_key(&self) -> anyhow::Result<[u8; 32]>;
     /// The plugin tarball in `editor` layout.
     fn fetch_tarball(&self, editor: &str) -> anyhow::Result<TarballDownload>;
+    /// The supported editor targets (`GET /api/v1/plugin/editors`).
+    fn fetch_editors(&self) -> anyhow::Result<Vec<EditorInfo>>;
+}
+
+/// One supported editor target, as served by `GET /api/v1/plugin/editors`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditorInfo {
+    /// Stable identifier, also the `?editor=` query parameter.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "displayName")]
+    pub display_name: String,
+    /// Tier ordinal the server uses to gate editor availability.
+    #[serde(default)]
+    pub tier: i64,
+}
+
+/// Parse the `GET /api/v1/plugin/editors` response (a bare JSON array).
+pub fn parse_editors_response(body: &[u8]) -> anyhow::Result<Vec<EditorInfo>> {
+    let editors: Vec<EditorInfo> = serde_json::from_slice(body)?;
+    anyhow::ensure!(!editors.is_empty(), "editors response listed no editors");
+    Ok(editors)
 }
 
 #[derive(Deserialize)]
@@ -132,6 +155,14 @@ impl Fetcher for HttpFetcher {
             checksum,
         })
     }
+
+    fn fetch_editors(&self) -> anyhow::Result<Vec<EditorInfo>> {
+        // Public endpoint; no auth header needed (the list is not secret).
+        let resp = ureq::get(&self.url("/api/v1/plugin/editors")).call()?;
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)?;
+        parse_editors_response(&body)
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +177,20 @@ mod tests {
         let v = parse_version_response(br#"{"version":"0.2.0+abc"}"#).unwrap();
         assert_eq!(v, "0.2.0");
         assert!(parse_version_response(br#"{}"#).is_err());
+    }
+
+    #[test]
+    fn editors_response_parses_wire_field_names() {
+        let body = br#"[{"name":"claude","displayName":"Claude Code","tier":1},
+                        {"name":"codex","displayName":"OpenAI Codex","tier":2}]"#;
+        let editors = parse_editors_response(body).unwrap();
+        assert_eq!(editors.len(), 2);
+        assert_eq!(editors[0].name, "claude");
+        assert_eq!(editors[0].display_name, "Claude Code");
+        assert_eq!(editors[0].tier, 1);
+        // Empty and malformed bodies are rejected.
+        assert!(parse_editors_response(b"[]").is_err());
+        assert!(parse_editors_response(b"not json").is_err());
     }
 
     #[test]
