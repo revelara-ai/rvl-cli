@@ -266,6 +266,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::knowledge::KnowledgeCmd,
     },
+    /// Search indexed incident postmortems
+    Incident {
+        #[command(subcommand)]
+        cmd: rvl_data::incident::IncidentCmd,
+    },
     /// Manage control evidence (submit, list, verify)
     Evidence {
         #[command(subcommand)]
@@ -3671,6 +3676,7 @@ fn run() -> anyhow::Result<ExitCode> {
         Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
         Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
         Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
+        Cmd::Incident { cmd } => return Ok(rvl_data::incident::run(cmd)),
         Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
         Cmd::Feedback { args } => {
             return Ok(rvl_data::feedback::run(
@@ -3902,14 +3908,15 @@ fn run() -> anyhow::Result<ExitCode> {
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
         // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
-        // Evidence/Feedback/Bugreport) returned before the store opened,
-        // above.
+        // Incident/Evidence/Feedback/Bugreport) returned before the store
+        // opened, above.
         Cmd::Login
         | Cmd::Logout
         | Cmd::Status
         | Cmd::Risk { .. }
         | Cmd::Control { .. }
         | Cmd::Knowledge { .. }
+        | Cmd::Incident { .. }
         | Cmd::Evidence { .. }
         | Cmd::Feedback { .. }
         | Cmd::Bugreport { .. } => {
