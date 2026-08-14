@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod hook;
+mod init;
 mod out_doc;
 mod render;
 mod report;
@@ -255,6 +257,30 @@ enum Cmd {
     Plugin {
         #[command(subcommand)]
         cmd: PluginCmd,
+    },
+    /// Initialize Revelara for this repository: write .revelara.yaml with
+    /// the project name and detected components, install the plugin skills,
+    /// and check credentials (rvl-cli `rvl init` parity, po-av01j.163).
+    Init {
+        /// Set project name (default: from git remote or directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Skip installing the Revelara plugin for coding agents
+        #[arg(long, alias = "skip-skills")]
+        skip_plugin: bool,
+        /// Overwrite existing config without prompting
+        #[arg(long)]
+        force: bool,
+        /// Accept all auto-detected defaults non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Install or check the git-hook scan gate: `hook install` writes a
+    /// pre-commit/pre-push shim invoking the native deterministic scan;
+    /// `hook doctor` preflights it (rvl-cli `rvl hook` parity).
+    Hook {
+        #[command(subcommand)]
+        cmd: hook::HookCmd,
     },
     // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
     // contract (same subcommands/flags, byte-identical --format=json);
@@ -3571,12 +3597,24 @@ fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: 
 /// including v1 rvl-cli-recorded installs, which the update ADOPTS by
 /// performing a normal v2 install — falling back to detection). Mirrors
 /// `rvl plugin install/update`.
+/// Map a `run_skills_install` failure count to the command exit code.
+fn skills_exit(failed: usize) -> ExitCode {
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Returns `(installed, failed)` counts so callers (the `skills`/`plugin`
+/// arms, and `init`'s delegated plugin step) can distinguish "everything
+/// installed", "some harness failed", and "nothing to do".
 fn run_skills_install(
     env: &rvl_skills::flow::Env,
     harness: Option<String>,
     no_register: bool,
     update: bool,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<(usize, usize)> {
     let supported = || rvl_skills::harness::supported_names().join(", ");
     let targets: Vec<String> = match harness {
         Some(name) => {
@@ -3615,12 +3653,13 @@ fn run_skills_install(
                     supported()
                 );
                 println!("Install one, or name it explicitly: rvlscan skills install <harness>");
-                return Ok(ExitCode::SUCCESS);
+                return Ok((0, 0));
             }
             names
         }
     };
 
+    let mut installed = 0usize;
     let mut failed = 0usize;
     for name in &targets {
         // by_name is total over `targets` by construction; skip defensively.
@@ -3628,18 +3667,17 @@ fn run_skills_install(
             continue;
         };
         match rvl_skills::flow::install_one(env, h.as_ref()) {
-            Ok(report) => render_install_report(&report, no_register),
+            Ok(report) => {
+                render_install_report(&report, no_register);
+                installed += 1;
+            }
             Err(e) => {
                 eprintln!("{name}: {e}");
                 failed += 1;
             }
         }
     }
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok((installed, failed))
 }
 
 /// Render the drift report, mirroring `rvl plugin list`'s UX.
@@ -3772,14 +3810,16 @@ fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, false)
+            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            Ok(skills_exit(failed))
         }
         SkillsCmd::Update {
             harness,
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, true)
+            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            Ok(skills_exit(failed))
         }
         SkillsCmd::Status => {
             render_skills_status(&rvl_skills::flow::status(&env));
@@ -3801,14 +3841,16 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, false)
+            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            Ok(skills_exit(failed))
         }
         PluginCmd::Update {
             harness,
             no_register,
         } => {
             ctx.require_key()?;
-            run_skills_install(&env, harness, no_register, true)
+            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            Ok(skills_exit(failed))
         }
         PluginCmd::List => {
             render_skills_status(&rvl_skills::flow::status(&env));
@@ -4028,6 +4070,35 @@ fn run() -> anyhow::Result<ExitCode> {
                 env!("CARGO_PKG_VERSION"),
             ));
         }
+        // Onboarding surface (po-av01j.163): init needs the skills machinery
+        // for its plugin step but never the spec cache; hook is pure file
+        // operations on .git/hooks. Both dispatch before the store opens.
+        Cmd::Init {
+            project,
+            skip_plugin,
+            force,
+            yes,
+        } => {
+            let cfg = Config::from_env();
+            return Ok(init::run(
+                init::InitArgs {
+                    project,
+                    skip_plugin,
+                    force,
+                    yes,
+                },
+                || {
+                    let ctx = SkillsCtx::resolve(&cfg)?;
+                    ctx.require_key()?;
+                    let (installed, _failed) = run_skills_install(&ctx.env(), None, false, false)?;
+                    // rvl-cli marks the plugin installed when ANY editor
+                    // ended up with skills; per-harness failures were
+                    // already reported by the machinery.
+                    Ok(installed > 0)
+                },
+            ));
+        }
+        Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
@@ -4278,10 +4349,12 @@ fn run() -> anyhow::Result<ExitCode> {
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
         Cmd::Plugin { cmd } => run_plugin(&cfg, cmd),
-        // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
-        // Incident/Evidence/Feedback/Bugreport) returned before the store
-        // opened, above.
-        Cmd::Login
+        // Data and onboarding commands (Init/Hook/Login/Logout/Status/
+        // Risk/Control/Knowledge/Incident/Evidence/Feedback/Bugreport)
+        // returned before the store opened, above.
+        Cmd::Init { .. }
+        | Cmd::Hook { .. }
+        | Cmd::Login
         | Cmd::Logout
         | Cmd::Status
         | Cmd::Risk { .. }
