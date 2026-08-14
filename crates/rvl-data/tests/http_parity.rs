@@ -585,6 +585,93 @@ fn knowledge_facts_builds_sorted_query_and_passes_json_through() {
     assert_eq!(out, format!("{raw}\n"));
 }
 
+// --- slice (d): feedback / bugreport (po-av01j.158) ---
+
+fn sample_submission(category: &str) -> rvl_data::feedback::Submission {
+    rvl_data::feedback::Submission {
+        message: "the scan did not submit data".into(),
+        category: category.into(),
+        cli_version: "1.2.3".into(),
+        diagnostics: Some(rvl_data::feedback::Diagnostics {
+            cli_version: "1.2.3".into(),
+            os: "linux".into(),
+            arch: "amd64".into(),
+            api_host: "api.revelara.ai".into(),
+            ..rvl_data::feedback::Diagnostics::default()
+        }),
+    }
+}
+
+#[test]
+fn feedback_submit_posts_go_shaped_body_and_renders_report_id() {
+    let server = MockServer::start(vec![("POST /api/v1/feedback", 200, r#"{"id":"fb-123"}"#)]);
+    let sub = sample_submission("bug");
+    let body = rvl_data::feedback::submission_json(&sub);
+    let out = rvl_data::feedback::submit_output(&server.client(), &body, "bug", "text").unwrap();
+    assert_eq!(
+        out,
+        "Thanks! Your bug report was sent to Revelara.\nReport id: fb-123\n"
+    );
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/api/v1/feedback");
+    assert_eq!(reqs[0].header("Content-Type"), Some("application/json"));
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+    // Byte-parity with Go's feedbackSubmission struct marshal.
+    assert_eq!(
+        String::from_utf8(reqs[0].body.clone()).unwrap(),
+        r#"{"message":"the scan did not submit data","category":"bug","cli_version":"1.2.3","diagnostics":{"cli_version":"1.2.3","os":"linux","arch":"amd64","api_host":"api.revelara.ai"}}"#
+    );
+}
+
+#[test]
+fn feedback_submit_json_mode_matches_go_marshalindent() {
+    let server = MockServer::start(vec![("POST /api/v1/feedback", 200, r#"{"id":"fb-9"}"#)]);
+    let sub = sample_submission("feedback");
+    let body = rvl_data::feedback::submission_json(&sub);
+    let out =
+        rvl_data::feedback::submit_output(&server.client(), &body, "feedback", "json").unwrap();
+    // Go: MarshalIndent(map[string]string{...}, "", "  ") — sorted keys.
+    assert_eq!(
+        out,
+        "{\n  \"category\": \"feedback\",\n  \"id\": \"fb-9\",\n  \"status\": \"submitted\"\n}\n"
+    );
+}
+
+#[test]
+fn feedback_submit_unexpected_response_is_a_runtime_error() {
+    // 200 without an id (and non-JSON bodies) both fail loudly.
+    let server = MockServer::start(vec![("POST /api/v1/feedback", 200, r#"{"ok":true}"#)]);
+    let sub = sample_submission("feedback");
+    let body = rvl_data::feedback::submission_json(&sub);
+    let f =
+        rvl_data::feedback::submit_output(&server.client(), &body, "feedback", "text").unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(
+        f.msg,
+        "Error: unexpected response from server: {\"ok\":true}"
+    );
+}
+
+#[test]
+fn feedback_submit_server_error_names_the_category_noun() {
+    let server = MockServer::start(vec![(
+        "POST /api/v1/feedback",
+        500,
+        r#"{"error":"db","message":"down"}"#,
+    )]);
+    let sub = sample_submission("bug");
+    let body = rvl_data::feedback::submission_json(&sub);
+    let f = rvl_data::feedback::submit_output(&server.client(), &body, "bug", "text").unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(
+        f.msg,
+        "Error submitting bug report: server error (500): db: down"
+    );
+}
+
 #[test]
 fn auth_error_message_matches_rvl_cli_401_contract() {
     let server = MockServer::start(vec![("GET /api/v1/risks?limit=1000", 401, "{}")]);

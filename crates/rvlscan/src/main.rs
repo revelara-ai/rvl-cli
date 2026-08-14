@@ -271,6 +271,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::evidence::EvidenceCmd,
     },
+    /// Send feedback to the Revelara team
+    Feedback {
+        #[command(flatten)]
+        args: rvl_data::feedback::FeedbackArgs,
+    },
+    /// Send a bug report to the Revelara team
+    Bugreport {
+        #[command(flatten)]
+        args: rvl_data::feedback::FeedbackArgs,
+    },
 }
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
@@ -3662,6 +3672,20 @@ fn run() -> anyhow::Result<ExitCode> {
         Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
         Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
         Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
+        Cmd::Feedback { args } => {
+            return Ok(rvl_data::feedback::run(
+                args,
+                "feedback",
+                env!("CARGO_PKG_VERSION"),
+            ))
+        }
+        Cmd::Bugreport { args } => {
+            return Ok(rvl_data::feedback::run(
+                args,
+                "bug",
+                env!("CARGO_PKG_VERSION"),
+            ))
+        }
         other => other,
     };
     let cfg = Config::from_env();
@@ -3878,14 +3902,19 @@ fn run() -> anyhow::Result<ExitCode> {
         },
         Cmd::Skills { cmd } => run_skills(&cfg, cmd),
         // Data commands (Login/Logout/Status/Risk/Control/Knowledge/
-        // Evidence) returned before the store opened, above.
+        // Evidence/Feedback/Bugreport) returned before the store opened,
+        // above.
         Cmd::Login
         | Cmd::Logout
         | Cmd::Status
         | Cmd::Risk { .. }
         | Cmd::Control { .. }
         | Cmd::Knowledge { .. }
-        | Cmd::Evidence { .. } => unreachable!("data commands dispatch before the store opens"),
+        | Cmd::Evidence { .. }
+        | Cmd::Feedback { .. }
+        | Cmd::Bugreport { .. } => {
+            unreachable!("data commands dispatch before the store opens")
+        }
     }
 }
 
