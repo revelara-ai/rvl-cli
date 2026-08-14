@@ -3642,3 +3642,131 @@ fn plugin_update_targets_v1_recorded_installs_for_adoption() {
         "got: {stdout}"
     );
 }
+
+// --- rvl-cli parity: `config show` / `config set` + `completion`
+// (po-av01j.164) ---
+
+/// A command with a tempdir HOME and every credential env override
+/// removed, so config commands see ONLY the file under test.
+fn config_bin(home: &std::path::Path) -> Command {
+    let mut cmd = bin();
+    cmd.env("HOME", home)
+        .env_remove("RVL_API_KEY")
+        .env_remove("RVL_API_URL")
+        .env_remove("RVL_ORG_NAME")
+        .env_remove("RVLSCAN_ORG_KEY")
+        .env_remove("RVLSCAN_API_BASE");
+    cmd
+}
+
+#[test]
+fn config_show_masks_the_api_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    std::fs::write(
+        home.join(".revelara/config.yaml"),
+        "api_url: https://api.revelara.ai\napi_key: pk_live_abcdef123456\norg_name: acme\n",
+    )
+    .unwrap();
+
+    let out = config_bin(home)
+        .args(["config", "show"])
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        "api_url: https://api.revelara.ai\napi_key: pk_l...3456\norg_name: acme\n"
+    );
+    assert!(
+        !stdout.contains("pk_live_abcdef123456"),
+        "full key must never print: {stdout}"
+    );
+}
+
+#[test]
+fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    let cfg_path = home.join(".revelara/config.yaml");
+    std::fs::write(
+        &cfg_path,
+        "api_url: https://api.revelara.ai\napi_key: pk_live_abcdef123456\nfuture_key: keep-me\n",
+    )
+    .unwrap();
+
+    let out = config_bin(home)
+        .args(["config", "set", "org_name", "my-org"])
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "config set failed: {stdout}\n{stderr}"
+    );
+    assert_eq!(stdout, "Set org_name = my-org\n");
+
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        text.contains("org_name: my-org\n"),
+        "value not persisted: {text}"
+    );
+    assert!(
+        text.contains("future_key: keep-me\n"),
+        "unknown key clobbered on rewrite: {text}"
+    );
+    assert!(
+        text.contains("api_key: pk_live_abcdef123456\n"),
+        "sibling key lost on rewrite: {text}"
+    );
+
+    // Round-trip: show reads back the value just set.
+    let out = config_bin(home)
+        .args(["config", "show"])
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("org_name: my-org\n"), "{stdout}");
+    assert!(stdout.contains("api_key: pk_l...3456\n"), "{stdout}");
+}
+
+#[test]
+fn config_set_invalid_key_errors_with_rvl_cli_wording() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = config_bin(dir.path())
+        .args(["config", "set", "bogus", "v"])
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("Unknown config key: bogus"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Valid keys: api_url, api_key, org_name"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn completion_generates_a_script_for_each_shell() {
+    for shell in ["bash", "zsh", "fish"] {
+        let out = bin()
+            .args(["completion", shell])
+            .output()
+            .expect("failed to run rvlscan");
+        assert!(out.status.success(), "completion {shell} exited non-zero");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(!stdout.is_empty(), "completion {shell} produced no output");
+        assert!(
+            stdout.contains("rvlscan"),
+            "completion {shell} does not mention the binary name"
+        );
+    }
+}
