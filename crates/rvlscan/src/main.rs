@@ -261,7 +261,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Query the organizational knowledge base (search, facts, procedures, patterns)
+    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, foresight, enrich)
     Knowledge {
         #[command(subcommand)]
         cmd: rvl_data::knowledge::KnowledgeCmd,
@@ -5211,6 +5211,41 @@ mod tests {
                 "--type=failure_mode",
                 "--min-occurrences=3",
             ],
+            // The plugin scan.md Step 3C invocations, verbatim.
+            vec![
+                "rvlscan",
+                "knowledge",
+                "graph-search",
+                "timeout failures",
+                "--depth=2",
+                "--types=causes,depends_on",
+                "--limit=5",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "foresight",
+                "--entity-type=technology",
+                "--entity-id=redis",
+                "--depth=3",
+                "--include-mitigations",
+                "--format=json",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "enrich",
+                "--query=timeout failure",
+                "--limit=10",
+            ],
+            vec![
+                "rvlscan",
+                "knowledge",
+                "enrich",
+                "--vertical=fault-tolerance",
+                "--control=RC-018",
+                "--technology=go",
+            ],
             vec![
                 "rvlscan",
                 "evidence",
@@ -5242,6 +5277,10 @@ mod tests {
             vec!["rvlscan", "risk", "stale", "--anything"],
             vec!["rvlscan", "control", "show"], // missing required code
             vec!["rvlscan", "knowledge", "search"], // missing required query
+            vec!["rvlscan", "knowledge", "graph-search"], // missing required query
+            vec!["rvlscan", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
+            vec!["rvlscan", "knowledge", "enrich", "--bogus"],
+            vec!["rvlscan", "knowledge", "foresight", "--min-strength=abc"], // not a number
         ] {
             let joined = argv.join(" ");
             assert!(

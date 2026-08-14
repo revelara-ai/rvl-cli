@@ -739,3 +739,209 @@ fn incident_search_server_error_message_matches_rvl_cli() {
     assert_eq!(f.code, 1);
     assert_eq!(f.msg, "Error: server error (500): internal: boom");
 }
+
+// --- slice (d): knowledge graph-search / foresight / enrich ---
+
+#[test]
+fn knowledge_graph_search_posts_go_shaped_body_and_renders_badges() {
+    let raw = r#"{"results":[{"type":"fact","id":"fact_a1","title":"Redis timeouts cascade","vertical":"fault-tolerance","similarity":0.91,"discovery_method":"semantic"}],"total":1,"graph_expanded":true}"#;
+    let server = MockServer::start(vec![("POST /api/knowledge/graph-search", 200, raw)]);
+    let out = rvl_data::knowledge::graph_search_output(
+        &server.client(),
+        "timeout failures",
+        5,
+        2,
+        Some("causes,depends_on"),
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("Found 1 results for \"timeout failures\" (graph-expanded):"),
+        "{out}"
+    );
+    assert!(
+        out.contains("fact_a1      [FACT] [SEM] Redis timeouts cascade"),
+        "{out}"
+    );
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/api/knowledge/graph-search");
+    // Go's sorted-key map marshal, byte-identical.
+    assert_eq!(
+        String::from_utf8(reqs[0].body.clone()).unwrap(),
+        r#"{"expand_depth":2,"expand_types":["causes","depends_on"],"graph_expand":true,"limit":5,"query":"timeout failures"}"#
+    );
+    assert_eq!(reqs[0].header("Authorization"), Some("Bearer pk_test_key"));
+}
+
+#[test]
+fn knowledge_graph_search_server_error_is_a_runtime_error() {
+    let server = MockServer::start(vec![(
+        "POST /api/knowledge/graph-search",
+        500,
+        r#"{"error":"internal","message":"graph down"}"#,
+    )]);
+    let f =
+        rvl_data::knowledge::graph_search_output(&server.client(), "q", 20, 1, None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(f.msg, "Error: server error (500): internal: graph down");
+}
+
+#[test]
+fn knowledge_foresight_posts_body_and_json_mode_is_raw_passthrough() {
+    // Key order in the server body is deliberately non-alphabetical: the
+    // passthrough must not re-encode.
+    let raw = r#"{"metadata":{"traversal_depth":3,"edges_examined":42,"query_time_ms":12.5},"impact_paths":[]}"#;
+    let server = MockServer::start(vec![("POST /api/knowledge/foresight", 200, raw)]);
+    let out = rvl_data::knowledge::foresight_output(
+        &server.client(),
+        "technology",
+        "redis",
+        3,
+        0.3,
+        true,
+        None,
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(out, format!("{raw}\n"));
+
+    let reqs = server.recorded();
+    assert_eq!(reqs[0].path, "/api/knowledge/foresight");
+    assert_eq!(
+        String::from_utf8(reqs[0].body.clone()).unwrap(),
+        r#"{"depth":3,"entity_id":"redis","entity_type":"technology","include_mitigations":true,"min_strength":0.3}"#
+    );
+}
+
+#[test]
+fn knowledge_foresight_table_renders_impact_chain() {
+    let raw = r#"{"impact_paths":[{"chain":[{"entity_type":"pattern","entity_id":"p1","label":"Retry storm","relation_type":"causes","strength":0.8,"depth":1}],"total_strength":0.8}],"metadata":{"traversal_depth":3,"edges_examined":7,"query_time_ms":50}}"#;
+    let server = MockServer::start(vec![("POST /api/knowledge/foresight", 200, raw)]);
+    let out = rvl_data::knowledge::foresight_output(
+        &server.client(),
+        "service",
+        "checkout-api",
+        3,
+        0.3,
+        false,
+        Some("causes,depends_on"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("Foresight: service checkout-api (depth 3, 7 edges examined, 50ms)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  -[causes]-> Retry storm [pattern] (strength: 80%)"),
+        "{out}"
+    );
+    let body = String::from_utf8(server.recorded()[0].body.clone()).unwrap();
+    assert!(
+        body.ends_with(r#""relation_types":["causes","depends_on"]}"#),
+        "{body}"
+    );
+}
+
+#[test]
+fn knowledge_foresight_auth_error_matches_rvl_cli() {
+    let server = MockServer::start(vec![("POST /api/knowledge/foresight", 401, "{}")]);
+    let f = rvl_data::knowledge::foresight_output(
+        &server.client(),
+        "service",
+        "api",
+        3,
+        0.3,
+        false,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(f.msg.contains("authentication failed (401)"), "{}", f.msg);
+}
+
+#[test]
+fn knowledge_enrich_fetches_all_sections_with_go_shaped_urls() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/knowledge/patterns?limit=10&vertical=fault-tolerance",
+            200,
+            r#"{"patterns":[{"id":"pat_1","title":"Retry storm","pattern_type":"failure_mode","occurrence_count":2}],"total":1}"#,
+        ),
+        (
+            "GET /api/knowledge/procedures?limit=10&vertical=fault-tolerance&q=RC-018",
+            200,
+            r#"{"procedures":[{"id":"proc_1","title":"Set timeouts","procedure_type":"runbook","related_controls":["RC-018"]}],"total":1}"#,
+        ),
+        (
+            "GET /api/knowledge/health",
+            200,
+            r#"{"total_facts":10,"total_procedures":5,"total_patterns":3,"validated_percentage":80,"avg_confidence":0.75}"#,
+        ),
+        (
+            "GET /api/knowledge/facts?limit=10&technology=go&vertical=fault-tolerance",
+            200,
+            r#"{"facts":[{"id":"fact_1","content":"c","vertical":"fault-tolerance","confidence":0.8,"validation_status":"auto_extracted"}],"total":1}"#,
+        ),
+        (
+            "POST /api/knowledge/search",
+            200,
+            r#"{"results":[{"type":"fact","id":"fact_2","title":"Timeout budget","similarity":0.88,"vertical":"fault-tolerance"}],"total":1}"#,
+        ),
+    ]);
+    let out = rvl_data::knowledge::enrich_output(
+        &server.client(),
+        "fault-tolerance",
+        Some("RC-018"),
+        Some("go"),
+        Some("timeout failure"),
+        10,
+    )
+    .unwrap();
+    assert!(out.starts_with("=== Patterns (1) ==="), "{out}");
+    assert!(out.contains("=== Procedures (1) ==="), "{out}");
+    assert!(out.contains("proc_1 [runbook] Set timeouts"), "{out}");
+    assert!(out.contains("=== Facts for go (1) ==="), "{out}");
+    assert!(
+        out.contains("=== Search Results for \"timeout failure\" (1) ==="),
+        "{out}"
+    );
+    assert!(out.contains("Total Items:       18"), "{out}");
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 5);
+    // The search fetch posts Go's sorted-key {limit, query} body.
+    let search_req = reqs
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("search POST recorded");
+    assert_eq!(
+        String::from_utf8(search_req.body.clone()).unwrap(),
+        r#"{"limit":10,"query":"timeout failure"}"#
+    );
+}
+
+#[test]
+fn knowledge_enrich_total_fetch_failure_is_a_runtime_error() {
+    // Everything 404s: all three attempted fetches fail, so enrich must
+    // exit 1 with one Error line per fetch (po-cj4s7 parity).
+    let server = MockServer::start(vec![]);
+    let f = rvl_data::knowledge::enrich_output(
+        &server.client(),
+        "fault-tolerance",
+        None,
+        None,
+        None,
+        10,
+    )
+    .unwrap_err();
+    assert_eq!(f.code, 1);
+    let lines: Vec<&str> = f.msg.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", f.msg);
+    assert!(lines[0].starts_with("Error: patterns:"), "{}", f.msg);
+    assert!(lines[1].starts_with("Error: procedures:"), "{}", f.msg);
+    assert!(lines[2].starts_with("Error: health:"), "{}", f.msg);
+}
