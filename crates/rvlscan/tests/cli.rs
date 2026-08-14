@@ -146,7 +146,9 @@ fn scan_with_specs_file_emits_findings_and_coverage() {
     // findings written and well-formed
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().expect("findings must be a JSON array");
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be a JSON array");
     assert_eq!(rows.len(), 2);
     for r in rows {
         assert!(r.get("site_id").is_some() && r.get("verdict").is_some());
@@ -566,7 +568,7 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
-        rows.as_array().unwrap().len(),
+        rows["sites"].as_array().unwrap().len(),
         2,
         "server-entry records must not become eval rows: {rows}"
     );
@@ -1344,7 +1346,7 @@ fn declared_bound_converts_finding_to_satisfies_with_provenance() {
 
     // Without the declaration: no bound evidence anywhere -> a finding.
     let without = scan(false);
-    let verdict = without[0]["verdict"]
+    let verdict = without["sites"][0]["verdict"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -1356,8 +1358,14 @@ fn declared_bound_converts_finding_to_satisfies_with_provenance() {
     // With the declaration: satisfied, and the reason carries the policy
     // provenance so the finding is auditable back to .revelara.yaml.
     let with = scan(true);
-    let verdict = with[0]["verdict"].as_str().unwrap_or_default().to_string();
-    let reason = with[0]["reason"].as_str().unwrap_or_default().to_string();
+    let verdict = with["sites"][0]["verdict"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let reason = with["sites"][0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert_eq!(
         verdict, "satisfies",
         "declared whole-call bound must satisfy: {with}"
@@ -1412,7 +1420,7 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
-        v[0]["verdict"].as_str().unwrap_or_default(),
+        v["sites"][0]["verdict"].as_str().unwrap_or_default(),
         "violates",
         "an expired declaration and another type's declaration must both be inert: {v}"
     );
@@ -1468,7 +1476,10 @@ fn scan_fixture_findings(
     );
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    rows.as_array().expect("findings must be an array").clone()
+    rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone()
 }
 
 /// (verdict, reason) of every finding whose site_id contains `path_frag`.
@@ -1605,7 +1616,7 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
     // --out rows are the G1 eval contract: one row, the call site.
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().unwrap();
+    let rows = rows["sites"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
 }
 
@@ -1686,7 +1697,7 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = verdicts_for(rows.as_array().unwrap(), "svc.py");
+    let rows = verdicts_for(rows["sites"].as_array().unwrap(), "svc.py");
     assert!(
         rows.iter()
             .any(|(v, r)| v == "satisfies" && r.contains("timeout=5")),
@@ -1867,7 +1878,10 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
     );
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().expect("findings must be an array").clone();
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone();
     let main_c = verdicts_for(&rows, "src/main.c");
 
     // Every planted blocking identity with no visible bound violates: two
@@ -2077,7 +2091,10 @@ fn scan_decides_java_sites_end_to_end() {
     );
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().expect("findings must be an array").clone();
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone();
 
     let jobs = verdicts_for(&rows, "Jobs.java");
     assert!(
@@ -2719,7 +2736,7 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
 
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().unwrap().clone();
+    let rows = rows["sites"].as_array().unwrap().clone();
     let g1 = verdicts_for(&rows, "Svc.cs");
     assert!(
         g1.iter().any(
@@ -2822,7 +2839,7 @@ fn scan_decides_csharp_sites_end_to_end() {
     );
     let rows: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    let rows = rows.as_array().unwrap().clone();
+    let rows = rows["sites"].as_array().unwrap().clone();
     let g1 = verdicts_for(&rows, "Svc.cs");
     assert!(
         g1.iter().any(
