@@ -4,7 +4,7 @@
 
 use crate::client::Client;
 use crate::display;
-use crate::gojson::{path_escape, query_encode};
+use crate::gojson::{compact, compact_raw, path_escape, query_encode, G};
 use crate::{CmdResult, Failure, BIN};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -27,6 +27,12 @@ pub enum ControlCmd {
     Show {
         /// Control code (RC-XXX)
         code: String,
+        /// Show the scope-status breakdown filtered to this team
+        #[arg(long)]
+        team: Option<String>,
+        /// Show the scope-status breakdown filtered to this service
+        #[arg(long)]
+        service: Option<String>,
         /// Output format: table (default) or json
         #[arg(long)]
         format: Option<String>,
@@ -72,6 +78,39 @@ pub struct ControlLinkedRisk {
     pub risk_code: String,
 }
 
+/// Mirrors the Revelara API's `ControlScopeStatusResponse`: the per-team
+/// breakdown plus the WORST-OF org rollup. `unknown_evidence` counts
+/// grandfathered rows flagged for re-scoping; they are never credited to
+/// any scope.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ControlScopeStatus {
+    #[serde(default)]
+    pub control_code: String,
+    #[serde(default)]
+    pub org_status: String,
+    #[serde(default)]
+    pub teams: Vec<ControlTeamScopeStatus>,
+    #[serde(default)]
+    pub unknown_evidence: i64,
+}
+
+/// One team's row in the scope-status breakdown.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ControlTeamScopeStatus {
+    #[serde(default)]
+    pub team_slug: String,
+    #[serde(default)]
+    pub team_name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub direct_evidence: i64,
+    #[serde(default)]
+    pub inherited_evidence: i64,
+    #[serde(default)]
+    pub global_evidence: i64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ListControlsResponse {
     #[serde(default)]
@@ -92,11 +131,22 @@ pub fn run(cmd: ControlCmd) -> std::process::ExitCode {
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(&client, category.as_deref(), limit, format.as_deref())
             }
-            ControlCmd::Show { code, format } => {
+            ControlCmd::Show {
+                code,
+                team,
+                service,
+                format,
+            } => {
                 validate_format(&format)?;
                 check_not_risk_code(&code)?;
                 let (_, client) = crate::client::load_and_resolve()?;
-                show_output(&client, &code, format.as_deref())
+                show_output(
+                    &client,
+                    &code,
+                    team.as_deref(),
+                    service.as_deref(),
+                    format.as_deref(),
+                )
             }
         }
     })();
@@ -185,7 +235,110 @@ pub fn list_output(
     Ok(out)
 }
 
-pub fn show_output(client: &Client, code: &str, format: Option<&str>) -> CmdResult {
+/// GET /api/v1/controls/by-code/{code}/scope-status with optional
+/// team/service filters. Returns the parsed response plus the raw body
+/// (for `--format=json` passthrough). An unknown team/service is a 400
+/// whose message lists the org's known slugs/services — the client
+/// surfaces that message verbatim, so callers must not swallow the error.
+pub fn fetch_control_scope_status(
+    client: &Client,
+    code: &str,
+    team: Option<&str>,
+    service: Option<&str>,
+) -> Result<(ControlScopeStatus, Vec<u8>), Failure> {
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    if let Some(t) = team {
+        if !t.is_empty() {
+            pairs.push(("team", t.to_string()));
+        }
+    }
+    if let Some(s) = service {
+        if !s.is_empty() {
+            pairs.push(("service", s.to_string()));
+        }
+    }
+    let mut url = format!(
+        "{}/api/v1/controls/by-code/{}/scope-status",
+        client.api_url,
+        path_escape(code)
+    );
+    if !pairs.is_empty() {
+        url.push('?');
+        url.push_str(&query_encode(&pairs));
+    }
+    let body = client
+        .request("GET", &url, None)
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+    let st: ControlScopeStatus = serde_json::from_slice(&body)
+        .map_err(|e| Failure::runtime(format!("Error: parse scope-status response: {e}")))?;
+    Ok((st, body))
+}
+
+/// The per-team scope breakdown plus the worst-of org rollup.
+pub fn render_control_scope_status(st: &ControlScopeStatus) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Scope Status (per team):");
+    if st.teams.is_empty() {
+        let _ = writeln!(
+            out,
+            "  (no teams in scope - the org has no teams yet, or the filter matched none)"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  {:<20} {:<10} {:>7} {:>10} {:>7}",
+            "TEAM", "STATUS", "DIRECT", "INHERITED", "GLOBAL"
+        );
+        for t in &st.teams {
+            let _ = writeln!(
+                out,
+                "  {:<20} {:<10} {:>7} {:>10} {:>7}",
+                t.team_slug, t.status, t.direct_evidence, t.inherited_evidence, t.global_evidence
+            );
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Org status (worst-of): {}", st.org_status);
+    if st.unknown_evidence > 0 {
+        let _ = writeln!(
+            out,
+            "Note: {} evidence record(s) have unknown scope (grandfathered; re-scope them - they are never credited to any team).",
+            st.unknown_evidence
+        );
+    }
+    out
+}
+
+/// The one-line org scope summary shown on a plain `control show` when the
+/// control has scoped (non-global) evidence, or "" when everything is
+/// org-wide and there is nothing scoped to surface.
+pub fn org_scope_summary_line(st: Option<&ControlScopeStatus>) -> String {
+    let Some(st) = st else {
+        return String::new();
+    };
+    let scoped = st.unknown_evidence > 0
+        || st
+            .teams
+            .iter()
+            .any(|t| t.direct_evidence > 0 || t.inherited_evidence > 0);
+    if !scoped {
+        return String::new();
+    }
+    format!(
+        "Org scope status: {} (worst-of across {} teams; {} unknown-scope records; see --team/--service)",
+        st.org_status,
+        st.teams.len(),
+        st.unknown_evidence
+    )
+}
+
+pub fn show_output(
+    client: &Client,
+    code: &str,
+    team: Option<&str>,
+    service: Option<&str>,
+    format: Option<&str>,
+) -> CmdResult {
     let url = format!(
         "{}/api/v1/controls/by-code/{}",
         client.api_url,
@@ -195,7 +348,32 @@ pub fn show_output(client: &Client, code: &str, format: Option<&str>) -> CmdResu
         .request("GET", &url, None)
         .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
 
+    // With scope flags the scope-status fetch is part of what the user
+    // asked for, so its errors (including the 400 that lists known team
+    // slugs / services) are fatal and surfaced verbatim.
+    let wants_scope = team.is_some_and(|t| !t.is_empty()) || service.is_some_and(|s| !s.is_empty());
+    let scope = if wants_scope {
+        Some(fetch_control_scope_status(client, code, team, service)?)
+    } else {
+        None
+    };
+
     if format == Some("json") {
+        if let Some((_, raw)) = &scope {
+            // Combined envelope so jq pipelines get both bodies in one
+            // document: {"control": <control>, "scope_status": <breakdown>}.
+            let combined = compact(&G::Obj(vec![
+                (
+                    "control".to_string(),
+                    G::Raw(compact_raw(&String::from_utf8_lossy(&body))),
+                ),
+                (
+                    "scope_status".to_string(),
+                    G::Raw(compact_raw(&String::from_utf8_lossy(raw))),
+                ),
+            ]));
+            return Ok(format!("{combined}\n"));
+        }
         return Ok(format!("{}\n", String::from_utf8_lossy(&body)));
     }
 
@@ -238,6 +416,24 @@ pub fn show_output(client: &Client, code: &str, format: Option<&str>) -> CmdResu
             .map(|r| r.risk_code.as_str())
             .collect();
         let _ = writeln!(out, "\nRelated Risks: {}", codes.join(", "));
+    }
+
+    // Scope-aware status. With --team/--service, render the full per-team
+    // breakdown (already fetched above, errors fatal). Without flags, a
+    // best-effort unfiltered fetch adds a one-line org scope summary when
+    // the control has scoped evidence; older servers without the endpoint
+    // degrade silently to the classic output.
+    if let Some((st, _)) = &scope {
+        let _ = writeln!(out);
+        out.push_str(&render_control_scope_status(st));
+        return Ok(out);
+    }
+    if let Ok((st, _)) = fetch_control_scope_status(client, code, None, None) {
+        let line = org_scope_summary_line(Some(&st));
+        if !line.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "{line}");
+        }
     }
     Ok(out)
 }
@@ -305,5 +501,103 @@ mod tests {
         );
         assert!(validate_format(&Some("json".into())).is_ok());
         assert!(validate_format(&None).is_ok());
+    }
+
+    fn scope_status_fixture() -> ControlScopeStatus {
+        ControlScopeStatus {
+            control_code: "RC-018".into(),
+            // Worst-of: one team is evidenced, one is absent -> absent.
+            org_status: "absent".into(),
+            teams: vec![
+                ControlTeamScopeStatus {
+                    team_slug: "payments".into(),
+                    team_name: "Payments".into(),
+                    status: "evidenced".into(),
+                    direct_evidence: 2,
+                    inherited_evidence: 1,
+                    global_evidence: 0,
+                },
+                ControlTeamScopeStatus {
+                    team_slug: "platform".into(),
+                    team_name: "Platform".into(),
+                    status: "absent".into(),
+                    ..Default::default()
+                },
+            ],
+            unknown_evidence: 3,
+        }
+    }
+
+    #[test]
+    fn scope_status_render_has_teams_counts_and_worst_of() {
+        let out = render_control_scope_status(&scope_status_fixture());
+        for want in [
+            "payments",
+            "platform",
+            "evidenced",
+            "absent",
+            "Org status (worst-of): absent",
+            "3 evidence record(s) have unknown scope",
+        ] {
+            assert!(out.contains(want), "render missing {want} in:\n{out}");
+        }
+        // Direct/inherited/global counts for the evidenced team.
+        assert!(
+            out.contains("payments             evidenced        2          1       0"),
+            "counts row wrong in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn scope_status_render_with_no_teams() {
+        let out = render_control_scope_status(&ControlScopeStatus {
+            control_code: "RC-018".into(),
+            org_status: "evidenced".into(),
+            ..Default::default()
+        });
+        assert!(out.contains("no teams"), "{out}");
+        assert!(out.contains("Org status (worst-of): evidenced"), "{out}");
+        // No unknown-scope note when the count is zero.
+        assert!(!out.contains("unknown scope"), "{out}");
+    }
+
+    #[test]
+    fn org_scope_summary_line_only_when_something_is_scoped() {
+        assert_eq!(
+            org_scope_summary_line(Some(&scope_status_fixture())),
+            "Org scope status: absent (worst-of across 2 teams; 3 unknown-scope records; see --team/--service)"
+        );
+        // Only global evidence: nothing scoped, so no line.
+        assert_eq!(
+            org_scope_summary_line(Some(&ControlScopeStatus {
+                org_status: "evidenced".into(),
+                teams: vec![ControlTeamScopeStatus {
+                    team_slug: "payments".into(),
+                    status: "evidenced".into(),
+                    global_evidence: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            ""
+        );
+        // No teams, no unknown records.
+        assert_eq!(
+            org_scope_summary_line(Some(&ControlScopeStatus {
+                org_status: "evidenced".into(),
+                ..Default::default()
+            })),
+            ""
+        );
+        // Unknown-scope records alone are enough to surface the line.
+        assert_eq!(
+            org_scope_summary_line(Some(&ControlScopeStatus {
+                org_status: "evidenced".into(),
+                unknown_evidence: 1,
+                ..Default::default()
+            })),
+            "Org scope status: evidenced (worst-of across 0 teams; 1 unknown-scope records; see --team/--service)"
+        );
+        assert_eq!(org_scope_summary_line(None), "");
     }
 }

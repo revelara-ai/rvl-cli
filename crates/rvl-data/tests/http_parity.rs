@@ -261,6 +261,8 @@ fn evidence_submit_resolves_control_then_posts_go_shaped_body() {
         "https://github.com/x",
         "desc",
         "abc123def",
+        "",
+        "",
         None,
     )
     .unwrap();
@@ -299,6 +301,8 @@ fn evidence_submit_json_mode_prints_server_body_verbatim() {
         "",
         "",
         "",
+        "",
+        "",
         Some("json"),
     )
     .unwrap();
@@ -313,6 +317,8 @@ fn evidence_submit_unknown_control_is_a_runtime_error() {
         "RC-999",
         "code",
         "n",
+        "",
+        "",
         "",
         "",
         "",
@@ -496,7 +502,8 @@ fn control_list_and_show_json_are_raw_passthrough() {
     ]);
     let out = rvl_data::control::list_output(&server.client(), None, 200, Some("json")).unwrap();
     assert_eq!(out, format!("{list_raw}\n"));
-    let out = rvl_data::control::show_output(&server.client(), "RC-018", Some("json")).unwrap();
+    let out = rvl_data::control::show_output(&server.client(), "RC-018", None, None, Some("json"))
+        .unwrap();
     assert_eq!(out, format!("{show_raw}\n"));
 }
 
@@ -944,4 +951,374 @@ fn knowledge_enrich_total_fetch_failure_is_a_runtime_error() {
     assert!(lines[0].starts_with("Error: patterns:"), "{}", f.msg);
     assert!(lines[1].starts_with("Error: procedures:"), "{}", f.msg);
     assert!(lines[2].starts_with("Error: health:"), "{}", f.msg);
+}
+
+// --- slice (b/c) po-av01j.167: evidence + control scoping ---
+
+#[test]
+fn evidence_submit_sends_team_and_service_and_renders_scope() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-uuid-1","control_code":"RC-018","name":"Timeouts"}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","type":"code","name":"CB impl","status":"configured","scope_state":"team","team_slug":"platform","service_name":"shared-postgres"}"#,
+        ),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-018",
+        "code",
+        "CB impl",
+        "",
+        "",
+        "abc123",
+        "platform",
+        "shared-postgres",
+        None,
+    )
+    .unwrap();
+    assert!(
+        out.contains("  Scope:   team=platform service=shared-postgres"),
+        "{out}"
+    );
+
+    let reqs = server.recorded();
+    let body = String::from_utf8(reqs[1].body.clone()).unwrap();
+    assert_eq!(
+        body,
+        r#"{"control_id":"ctl-uuid-1","description":"","git_hash":"abc123","name":"CB impl","service":"shared-postgres","team":"platform","type":"code","url_or_identifier":""}"#
+    );
+}
+
+#[test]
+fn evidence_submit_team_only_omits_service_from_the_wire() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-1","name":"Timeouts"}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","type":"code","name":"n","status":"configured","scope_state":"team","team_slug":"payments"}"#,
+        ),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-018",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        "payments",
+        "",
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("  Scope:   team=payments"), "{out}");
+
+    let body = String::from_utf8(server.recorded()[1].body.clone()).unwrap();
+    assert!(body.contains(r#""team":"payments""#), "{body}");
+    assert!(!body.contains("service"), "{body}");
+}
+
+#[test]
+fn evidence_submit_service_only_scope_renders() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-1","name":"Timeouts"}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","type":"code","name":"n","status":"configured","scope_state":"service","service_name":"checkout-api"}"#,
+        ),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-018",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        "",
+        "checkout-api",
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("  Scope:   service=checkout-api"), "{out}");
+
+    let body = String::from_utf8(server.recorded()[1].body.clone()).unwrap();
+    assert!(body.contains(r#""service":"checkout-api""#), "{body}");
+    assert!(!body.contains("team"), "{body}");
+}
+
+#[test]
+fn evidence_submit_global_says_org_wide_but_pre_scoping_server_says_nothing() {
+    // Server that knows about scoping and reports global.
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-1","name":"Timeouts"}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","type":"code","name":"n","status":"configured","scope_state":"global"}"#,
+        ),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &server.client(),
+        "RC-018",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        "",
+        "",
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("  Scope:   org-wide (global)"), "{out}");
+
+    // Older server that predates scoping: no scope_state at all, so no
+    // Scope line whatsoever (empty is NOT "unknown").
+    let old = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"ctl-1","name":"Timeouts"}"#,
+        ),
+        (
+            "POST /api/v1/evidence",
+            200,
+            r#"{"id":"ev-1","type":"code","name":"n","status":"configured"}"#,
+        ),
+    ]);
+    let out = rvl_data::evidence::submit_output(
+        &old.client(),
+        "RC-018",
+        "code",
+        "n",
+        "",
+        "",
+        "",
+        "",
+        "",
+        None,
+    )
+    .unwrap();
+    assert!(
+        !out.contains("Scope:"),
+        "pre-scoping server must be silent: {out}"
+    );
+}
+
+#[test]
+fn evidence_list_scope_filters_are_url_values_encoded() {
+    let raw = r#"{"evidence":[{"id":"ev-abcdef1234","type":"code","name":"CB impl","status":"verified","scope_state":"team","team_slug":"payments"}],"total":1}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/v1/evidence?limit=20&scope_state=team&service=checkout+api&team=payments",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::evidence::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        Some("payments"),
+        Some("checkout api"),
+        Some("team"),
+        20,
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("Found 1 evidence records:"), "{out}");
+    assert!(out.contains("    Scope: team=payments"), "{out}");
+}
+
+#[test]
+fn evidence_list_flags_unknown_scope_and_stays_silent_on_global_and_old_servers() {
+    let raw = r#"{"evidence":[
+        {"id":"ev-1","type":"code","name":"grandfathered","status":"configured","scope_state":"unknown"},
+        {"id":"ev-2","type":"code","name":"org wide","status":"configured","scope_state":"global"},
+        {"id":"ev-3","type":"code","name":"pre scoping","status":"configured"}
+    ],"total":3}"#;
+    let server = MockServer::start(vec![("GET /api/v1/evidence?limit=20", 200, raw)]);
+    let out = rvl_data::evidence::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        20,
+        None,
+    )
+    .unwrap();
+    assert!(
+        out.contains("    Scope: unknown scope (needs re-scoping)"),
+        "{out}"
+    );
+    // Exactly one Scope line: global and pre-scoping rows render nothing.
+    assert_eq!(out.matches("    Scope:").count(), 1, "{out}");
+}
+
+#[test]
+fn control_show_team_scope_breakdown_renders_worst_of() {
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts","category":"fault_tolerance","type":"preventive","weight":9}"#;
+    let scope_raw = r#"{"control_code":"RC-018","org_status":"absent","teams":[{"team_slug":"payments","team_name":"Payments","status":"evidenced","direct_evidence":2,"inherited_evidence":1,"global_evidence":0},{"team_slug":"platform","team_name":"Platform","status":"absent","direct_evidence":0,"inherited_evidence":0,"global_evidence":0}],"unknown_evidence":3}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status?team=payments",
+            200,
+            scope_raw,
+        ),
+    ]);
+    let out =
+        rvl_data::control::show_output(&server.client(), "RC-018", Some("payments"), None, None)
+            .unwrap();
+    assert!(out.contains("Control: RC-018 - Timeouts"), "{out}");
+    assert!(out.contains("Scope Status (per team):"), "{out}");
+    assert!(out.contains("payments"), "{out}");
+    // Worst-of: payments is evidenced but platform is absent -> absent.
+    assert!(out.contains("Org status (worst-of): absent"), "{out}");
+    assert!(
+        out.contains("Note: 3 evidence record(s) have unknown scope"),
+        "{out}"
+    );
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(
+        reqs[1].path,
+        "/api/v1/controls/by-code/RC-018/scope-status?team=payments"
+    );
+}
+
+#[test]
+fn control_show_service_scope_breakdown_encodes_the_filter() {
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
+    let scope_raw =
+        r#"{"control_code":"RC-018","org_status":"evidenced","teams":[],"unknown_evidence":0}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status?service=checkout+api",
+            200,
+            scope_raw,
+        ),
+    ]);
+    let out = rvl_data::control::show_output(
+        &server.client(),
+        "RC-018",
+        None,
+        Some("checkout api"),
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("(no teams in scope"), "{out}");
+    assert!(out.contains("Org status (worst-of): evidenced"), "{out}");
+}
+
+#[test]
+fn control_show_scope_json_is_a_combined_envelope() {
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
+    let scope_raw =
+        r#"{"control_code":"RC-018","org_status":"absent","teams":[],"unknown_evidence":1}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status?team=payments",
+            200,
+            scope_raw,
+        ),
+    ]);
+    let out = rvl_data::control::show_output(
+        &server.client(),
+        "RC-018",
+        Some("payments"),
+        None,
+        Some("json"),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        format!("{{\"control\":{show_raw},\"scope_status\":{scope_raw}}}\n")
+    );
+}
+
+#[test]
+fn control_show_without_flags_appends_best_effort_org_summary() {
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
+    let scope_raw = r#"{"control_code":"RC-018","org_status":"absent","teams":[{"team_slug":"payments","status":"evidenced","direct_evidence":2,"inherited_evidence":0,"global_evidence":0}],"unknown_evidence":3}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status",
+            200,
+            scope_raw,
+        ),
+    ]);
+    let out = rvl_data::control::show_output(&server.client(), "RC-018", None, None, None).unwrap();
+    assert!(
+        out.contains("Org scope status: absent (worst-of across 1 teams; 3 unknown-scope records; see --team/--service)"),
+        "{out}"
+    );
+    // The full per-team table belongs to the --team/--service path only.
+    assert!(!out.contains("Scope Status (per team):"), "{out}");
+}
+
+#[test]
+fn control_show_degrades_silently_when_scope_status_is_missing() {
+    // A server that predates the scope-status endpoint: 404 on the extra
+    // best-effort fetch must not disturb the classic output.
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
+    let server = MockServer::start(vec![("GET /api/v1/controls/by-code/RC-018", 200, show_raw)]);
+    let out = rvl_data::control::show_output(&server.client(), "RC-018", None, None, None).unwrap();
+    assert!(out.contains("Control: RC-018 - Timeouts"), "{out}");
+    assert!(!out.contains("Org scope status"), "{out}");
+    assert!(!out.contains("Scope Status"), "{out}");
+}
+
+#[test]
+fn control_show_scope_status_surfaces_the_server_hint_verbatim() {
+    // An unknown --team is a 400 whose message lists the known slugs; with
+    // scope flags that error is fatal and must pass through.
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/controls/by-code/RC-018",
+            200,
+            r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#,
+        ),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status?team=paymnets",
+            400,
+            r#"{"error":"bad_request","message":"unknown team \"paymnets\"; known team slugs: payments, platform"}"#,
+        ),
+    ]);
+    let f =
+        rvl_data::control::show_output(&server.client(), "RC-018", Some("paymnets"), None, None)
+            .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg.contains("known team slugs: payments, platform"),
+        "server hint swallowed: {}",
+        f.msg
+    );
 }
