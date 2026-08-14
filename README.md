@@ -42,10 +42,18 @@ Helpers are discovered in this order:
    members into;
 3. the copy `rvlscan` **carries inside itself** and writes out on first use
    (`pyindex.py`, `tsindex.js`, `javaindex.java` — see below);
-4. a helper on `PATH` (`goindex`; for Python, `pyindex` or `pyindex.py`).
+4. a helper you built into the canonical helper directory —
+   `~/.revelara/helpers/<name>` (a file) or `~/.revelara/helpers/<name>/`
+   (a directory, for builds like `dotnet -o` that emit several files);
+5. a helper on `PATH` (`goindex`; for Python, `pyindex` or `pyindex.py`).
 
-The scan's `retrievers:` line names the resolved path and which of those four
-slots answered, so a stale helper shadowing a fresh one is visible.
+The scan's `retrievers:` line names the resolved path and which of those five
+slots answered (`env:VAR` / `bundled` / `embedded` / `installed` / `PATH`), so a
+stale helper shadowing a fresh one is visible.
+
+Slot 4 is why no install instruction in this tool ends with "now export
+`RVLSCAN_…`": every command it suggests writes somewhere resolution already
+looks, so building the helper *is* installing it.
 
 ### What arrives with an install, and what does not
 
@@ -69,9 +77,9 @@ the one command to run (`npm install --prefix ~/.revelara/helpers/<version>
 The pin matters: npm's `typescript` now resolves to the 7.x native port, whose
 JS API this helper cannot drive.
 
-² Build it once from a clone:
-`dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex`, then
-set `RVLSCAN_CSINDEX=~/.revelara/helpers/csindex/csindex.dll`.
+² Build it once from a clone, and that is the whole install — the output
+directory is a location rvlscan searches:
+`dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex`.
 
 The embedded scripts are written to `~/.revelara/helpers/<rvlscan version>/` on
 first use, and rewritten whenever their contents no longer hash to the embedded
@@ -224,8 +232,11 @@ allows, so a fresh install scans with no setup:
   it cannot ship silently broken).
 - **`csindex`** is deliberately not shipped: the assembly is ~39 KB but pulls
   ~9 MB of `Microsoft.CodeAnalysis` behind it, more than the rest of the
-  archive combined. Env override / `PATH` only, with a one-command install hint
-  when a C# repo is scanned without it.
+  archive combined. Scanning a C# repo without it fails closed with the one
+  `dotnet build` command that installs it into `~/.revelara/helpers/csindex`,
+  where resolution finds it — no environment variable at any point. A future
+  `rvlscan-csindex` Homebrew formula should install into that same directory so
+  the two routes compose.
 
 The spec-cache version is independent of the binary version and is not coupled
 to this repo's release CI.

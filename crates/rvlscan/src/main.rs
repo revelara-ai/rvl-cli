@@ -770,10 +770,12 @@ fn server_to_findings(
 //   goindex                                     built per target by release CI
 //       and packed into the archive alongside the binary.
 //   csindex                                     NOT carried: it needs ~9 MB of
-//       Roslyn assemblies. Env override / PATH only, with a one-command hint.
+//       Roslyn assemblies. Built by the user into ~/.revelara/helpers/csindex,
+//       which resolution searches, so the build IS the install.
 //
 // Discovery order: env override, adjacent to the rvlscan binary (or the
-// packaged share dir next to it), the extracted copy, then PATH.
+// packaged share dir next to it), the extracted copy, the canonical helper
+// dir, then PATH.
 
 /// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
 /// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
@@ -1198,29 +1200,36 @@ fn packaged_helper_dirs(exe_dir: &Path) -> Vec<PathBuf> {
 /// What a reader should DO when `lang` has no retriever: the specific install,
 /// and the one command that performs it. Generic advice ("install the helper")
 /// is what this bead exists to delete.
+///
+/// Every command here writes into a location `resolve_helper` already searches,
+/// so nothing in this text asks for a follow-up step. A hint that ends in "now
+/// export VAR=<the path you just typed>" is a hint that stopped one move short.
 fn missing_helper_hint(lang: Lang) -> String {
     let env = lang.env_override();
     match lang {
         // Built per target by release CI and packed next to the binary, so its
         // absence means a source build or a hand-assembled install.
-        Lang::Go => format!(
+        Lang::Go => String::from(
             "goindex ships next to the rvlscan binary; if you built from source run `make helpers`, \
-             or build it directly with `go build -C helpers/goindex -o <dir holding rvlscan> .` \
-             (needs Go 1.21+), or set {env} to an existing goindex"
+             or build it once with `go build -C helpers/goindex -o ~/.revelara/helpers/goindex .` \
+             (needs Go 1.21+), where rvlscan finds it with no further setup",
         ),
         Lang::Rust | Lang::CCpp => format!(
             "{base} ships next to the rvlscan binary in the release archive; if you built from \
-             source run `cargo build --release -p {base}` and put it there, or set {env}",
+             source run `cargo build --release -p {base}` and copy it to \
+             ~/.revelara/helpers/{base}, where rvlscan finds it with no further setup",
             base = lang.helper_base(),
         ),
         // The one helper deliberately NOT carried: the .NET assembly itself is
         // ~39 KB but drags ~9 MB of Microsoft.CodeAnalysis (Roslyn) with it,
-        // which is more than the rest of the release archive combined.
-        Lang::CSharp => format!(
+        // which is more than the rest of the release archive combined. The
+        // -o directory is the per-helper canonical dir, so the build IS the
+        // install: `install_dirs` looks inside it for csindex.dll.
+        Lang::CSharp => String::from(
             "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
              then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
              `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
-             and set {env}=~/.revelara/helpers/csindex/csindex.dll"
+             — rvlscan finds it there with no further setup",
         ),
         // Embedded — reaching this arm means extraction itself failed.
         Lang::Python | Lang::TypeScript | Lang::Java => format!(
@@ -1238,14 +1247,18 @@ fn missing_helper_hint(lang: Lang) -> String {
 ///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / ...),
 ///   2. a helper packaged with the binary (adjacent, or in its pkgshare dir),
 ///   3. the copy extracted from THIS binary (pyindex/tsindex/javaindex),
-///   4. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///   4. a helper the user built into the canonical helper dir,
+///   5. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
 ///
 /// Packaged beats embedded so a deliberately installed helper — the Makefile's
 /// `make helpers`, a release archive's goindex — still wins over the carried
-/// copy; embedded beats PATH so a fresh machine needs no PATH surgery, and so
-/// an unrelated `pyindex` on PATH cannot quietly answer for ours. Every step
-/// records WHERE it found the file, and the "retrievers:" roll-call prints it:
-/// a shadowing helper is undiagnosable from any other line of output.
+/// copy. Embedded beats the canonical dir so a hand-dropped copy of a script
+/// we carry cannot go stale unnoticed (extraction repairs its own file; it
+/// would never repair one found ahead of it). Both beat PATH, so a fresh
+/// machine needs no PATH surgery and an unrelated `pyindex` cannot quietly
+/// answer for ours. Every step records WHERE it found the file and the
+/// "retrievers:" roll-call prints it: a shadowing helper is undiagnosable from
+/// any other line of output.
 fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
     // (1) explicit env override wins.
     if let Some(p) = std::env::var_os(lang.env_override()) {
@@ -1300,7 +1313,23 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
             Err(e) => extract_failure = Some(format!("{e:#}")),
         }
     }
-    // (4) on PATH.
+    // (4) a helper the user built themselves, in the canonical helper dir.
+    // This is the other half of the install hints below: a message that names
+    // a location and then also demands an env var pointing at that same
+    // location has not actually removed a step.
+    for dir in embedded_helpers::install_dirs(base) {
+        let cand = dir.join(base);
+        if cand.is_file() {
+            return Ok(classify_helper(lang, &cand, "installed"));
+        }
+        if let Some(script) = &script_name {
+            let cand_script = dir.join(script);
+            if cand_script.is_file() {
+                return Ok(classify_helper(lang, &cand_script, "installed"));
+            }
+        }
+    }
+    // (5) on PATH.
     if let Some(found) = find_on_path(base) {
         return Ok(classify_helper(lang, &found, "PATH"));
     }
@@ -1565,9 +1594,29 @@ fn run_helper(
         if helper.kind == HelperKind::NodeScript {
             cmd.env("NODE_PATH", node_path_for(root));
         }
-        let output = cmd
-            .output()
-            .with_context(|| format!("running retriever helper `{program}`"))?;
+        let output = match cmd.output() {
+            Ok(o) => o,
+            // The INTERPRETER is missing, not the helper: `dotnet`, `java`,
+            // `node` or `python3` is absent even though the helper file itself
+            // resolved. That is the same "not set up yet" state a helper's own
+            // exit 4 reports, and it must degrade this one language rather than
+            // abort the scan — a polyglot repo whose C# toolchain is absent
+            // still has four other languages worth reading.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Err((
+                    DegradeKind::NotInstalled,
+                    format!(
+                        "`{program}` is not installed, so {} cannot run",
+                        helper.path.display()
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("running retriever helper `{program}`"))
+                );
+            }
+        };
         if !output.status.success() {
             let kind = classify_helper_exit(output.status.code());
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -5706,10 +5755,82 @@ mod tests {
         }
         let cs = missing_helper_hint(Lang::CSharp);
         assert!(
-            cs.contains("dotnet build helpers/csindex") && cs.contains("RVLSCAN_CSINDEX"),
+            cs.contains("dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex"),
             "csindex is the one helper we deliberately do not ship, so its hint must be the \
              most specific of all: {cs}"
         );
+    }
+
+    #[test]
+    fn no_install_hint_asks_for_a_follow_up_env_var() {
+        // The inconsistency this guards against: naming a canonical location
+        // AND requiring an override that points at that same location. Every
+        // command in a hint must write somewhere resolution already searches,
+        // so the install is the whole fix.
+        for lang in [Lang::Go, Lang::Rust, Lang::CSharp, Lang::CCpp] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                !hint.contains(lang.env_override()),
+                "{lang}'s hint names a canonical path, so it must not also demand \
+                 {}: {hint}",
+                lang.env_override()
+            );
+            assert!(
+                hint.contains("~/.revelara/helpers/"),
+                "{lang}'s hint must install into a directory resolution searches: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canonical_helper_dirs_accept_both_build_output_shapes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let dirs = embedded_helpers::install_dirs("csindex");
+        std::env::remove_var("HOME");
+        let helpers = dir.path().join(".revelara").join("helpers");
+        assert!(
+            dirs.contains(&helpers.join("csindex")),
+            "`dotnet build -o DIR` writes a directory of assemblies: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&helpers),
+            "`go build -o FILE` writes one file into the flat root: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_in_the_canonical_dir_is_found_and_the_env_override_still_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let canonical = dir.path().join(".revelara").join("helpers").join("csindex");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let dll = canonical.join("csindex.dll");
+        touch(&dll);
+
+        let found = resolve_helper(Lang::CSharp).expect("the canonical dir must be searched");
+        assert_eq!(found.path, dll);
+        assert_eq!(found.kind, HelperKind::DotnetAssembly);
+        assert_eq!(
+            found.source, "installed",
+            "the roll-call must say the user installed this one, not that we shipped it"
+        );
+
+        // An explicit override still outranks it: an operator debugging a
+        // patched retriever must not be silently served the canonical copy.
+        let other = dir.path().join("patched-csindex.dll");
+        touch(&other);
+        std::env::set_var("RVLSCAN_CSINDEX", &other);
+        let overridden = resolve_helper(Lang::CSharp);
+        std::env::remove_var("RVLSCAN_CSINDEX");
+        std::env::remove_var("HOME");
+        let overridden = overridden.expect("env override must resolve");
+        assert_eq!(overridden.path, other);
+        assert_eq!(overridden.source, "env:RVLSCAN_CSINDEX");
     }
 
     #[test]

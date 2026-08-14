@@ -220,6 +220,107 @@ fn a_corrupted_extracted_script_is_rewritten_on_the_next_scan() {
     );
 }
 
+/// Adds C# to a fixture repo. Split out because C# is the one language whose
+/// retriever is deliberately NOT shipped, so most tests want a repo without it.
+fn add_csharp(repo: &Path) {
+    std::fs::write(
+        repo.join("Svc.csproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>\
+         <TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("Svc.cs"),
+        "public class Svc { public static void Main() { System.Console.WriteLine(1); } }\n",
+    )
+    .unwrap();
+}
+
+/// csindex is the one retriever rvlscan does not carry, so its install hint
+/// names a canonical build location — and a location we name is a location the
+/// binary must search. Found there with NO env var, and reported as the user's
+/// own install rather than as something we shipped.
+///
+/// This is the gap the real target repo exposed: Google's Online Boutique is
+/// five languages including C#, and it hard-failed after the embedded scripts
+/// landed because the only route to csindex was an env var the hint itself
+/// told you to set to a path it had just chosen for you.
+#[test]
+fn csindex_is_discovered_at_the_canonical_helper_dir_with_no_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let canonical = home.join(".revelara").join("helpers").join("csindex");
+    std::fs::create_dir_all(&canonical).unwrap();
+    let dll = canonical.join("csindex.dll");
+    // Stands in for a real `dotnet build -o ~/.revelara/helpers/csindex`: this
+    // test is about RESOLUTION, and driving Roslyn would need a .NET SDK on
+    // every machine that runs the suite.
+    std::fs::write(&dll, "not a real assembly\n").unwrap();
+
+    let bin = lone_binary(&dir.path().join("bin"));
+    let repo = polyglot_fixture(dir.path());
+    add_csharp(&repo);
+    let out = scan(
+        &bin,
+        &repo,
+        &home,
+        &dir.path().join("cache"),
+        &dir.path().join("findings.json"),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !stderr.contains("cannot be scanned honestly"),
+        "an installed csindex must satisfy the preflight probe:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("C# {} (installed)", dll.display())),
+        "the roll-call must name the canonical path and credit the user's install:\n{stdout}"
+    );
+    // The stand-in cannot actually retrieve, and that is fine: C# degrades and
+    // the other four languages are still scanned. What must NOT happen is the
+    // scan dying because one language's toolchain is unusable.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(EXIT_BLOCKED)),
+        "an unusable helper degrades its language, it does not sink the scan: {:?}\n{stderr}",
+        out.status.code()
+    );
+}
+
+/// Without that install, a C# repo still fails CLOSED — a gate that cannot read
+/// a language the repo contains must not report "clean" — and the failure says
+/// exactly what to run, with no follow-up environment step.
+#[test]
+fn a_missing_csindex_fails_closed_with_a_single_actionable_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = lone_binary(&dir.path().join("bin"));
+    let repo = polyglot_fixture(dir.path());
+    add_csharp(&repo);
+    let out = scan(
+        &bin,
+        &repo,
+        &home,
+        &dir.path().join("cache"),
+        &dir.path().join("findings.json"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("cannot be scanned honestly"),
+        "a language with no retriever must not pass silently:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex"),
+        "the failure must carry the one command that fixes it:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("RVLSCAN_CSINDEX="),
+        "the command writes where rvlscan looks, so no env var may be demanded:\n{stderr}"
+    );
+}
+
 /// A helper deliberately installed NEXT TO the binary still wins over the
 /// embedded copy: `make helpers`, a release archive's goindex, and an operator
 /// debugging a patched retriever all depend on that precedence, and the

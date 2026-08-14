@@ -79,6 +79,37 @@ pub fn cache_root() -> Option<PathBuf> {
     )
 }
 
+/// Where a user's OWN build of a helper this binary does not carry is looked
+/// for, in order (po-aml3h follow-up).
+///
+/// Naming a canonical location and then still demanding an env var pointing at
+/// it is two steps where one will do: if we tell someone to build csindex into
+/// `~/.revelara/helpers/csindex`, the binary has to look there. Three shapes
+/// are accepted because the build tools disagree about what an output path is:
+/// `dotnet build -o DIR` produces a directory of assemblies, while
+/// `go build -o FILE` produces one file.
+///
+///   1. the extraction root (`RVLSCAN_HELPER_DIR`, else the versioned dir), so
+///      a relocated helper dir holds hand-built helpers too;
+///   2. `~/.revelara/helpers/<base>/`, the per-helper subdirectory a
+///      directory-producing build writes into;
+///   3. `~/.revelara/helpers/`, flat, for a single-file build output.
+pub fn install_dirs(base: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(root) = cache_root() {
+        dirs.push(root);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            let helpers = Path::new(&home).join(".revelara").join("helpers");
+            dirs.push(helpers.join(base));
+            dirs.push(helpers);
+        }
+    }
+    dirs.dedup();
+    dirs
+}
+
 fn sha256(bytes: &[u8]) -> String {
     let mut h = sha2::Sha256::new();
     h.update(bytes);
