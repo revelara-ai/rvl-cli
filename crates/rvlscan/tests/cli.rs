@@ -3300,6 +3300,126 @@ fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
     assert!(stdout.contains("Scan ID: scan-cli-1"), "{stdout}");
 }
 
+/// Team ownership declared in `.revelara.yaml` rides the submission, and
+/// `--team` overrides the whole thing (repo default AND component teams)
+/// [po-av01j.166].
+#[test]
+fn scan_submission_carries_team_ownership_and_honors_the_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "project: checkout-api\nteam: checkout\ncomponents:\n  - name: worker\n    path: cmd/worker\n    team: payments\n",
+    )
+    .unwrap();
+    // Each run first asks the server for its known team slugs (best-effort,
+    // never blocking), then POSTs the scan.
+    const KNOWN_SLUGS: &str = r#"{"slugs":["checkout","payments"]}"#;
+    let server = submit_mock::MockServer::start(vec![
+        (200, KNOWN_SLUGS),
+        (200, SUBMIT_RESPONSE),
+        (200, KNOWN_SLUGS),
+        (200, SUBMIT_RESPONSE),
+    ]);
+
+    let run = |extra: &[&str]| -> String {
+        let mut cmd = bin();
+        cmd.args(["scan", "--service", "checkout-api", "--target"])
+            .arg(dir.path())
+            .arg("--scan-dir")
+            .arg(&parts)
+            .args(extra)
+            .env("RVL_API_KEY", "pk_cli_test")
+            .env("RVL_API_URL", &server.base_url)
+            .env("HOME", &home)
+            .env_remove("RVL_ORG_NAME");
+        let out = cmd.output().expect("failed to run rvlscan");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "submit failed: {stderr}");
+        stderr
+    };
+
+    // Both declared teams are known: the did-you-mean stays silent.
+    let stderr = run(&[]);
+    assert!(!stderr.contains("is not a known team"), "{stderr}");
+    // "platform" is not in the org's slug list: warn, never block.
+    let stderr = run(&["--team", "platform"]);
+    assert!(stderr.contains(r#"team "platform""#), "{stderr}");
+    assert!(stderr.contains("is not a known team"), "{stderr}");
+    assert!(
+        stderr.contains("Proceeding creates a new team."),
+        "{stderr}"
+    );
+
+    let reqs = server.recorded();
+    let slug_lookups: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.path == "/api/v1/teams/slugs")
+        .collect();
+    assert_eq!(slug_lookups.len(), 2, "one lookup per run");
+    assert_eq!(slug_lookups[0].method, "GET");
+    let posts: Vec<_> = reqs.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(posts.len(), 2);
+
+    // .revelara.yaml: repo-level team plus the per-component override. No
+    // team_source, so the server records the default ("scan").
+    let from_file = String::from_utf8(posts[0].body.clone()).unwrap();
+    assert!(from_file.contains(r#""team":"checkout""#), "{from_file}");
+    assert!(
+        from_file.contains(r#""component_teams":{"worker":"payments"}"#),
+        "{from_file}"
+    );
+    assert!(!from_file.contains(r#""team_source""#), "{from_file}");
+
+    // --team replaces the whole submission and drops the component teams.
+    let overridden = String::from_utf8(posts[1].body.clone()).unwrap();
+    assert!(overridden.contains(r#""team":"platform""#), "{overridden}");
+    assert!(
+        overridden.contains(r#""team_source":"override""#),
+        "{overridden}"
+    );
+    assert!(!overridden.contains(r#""component_teams""#), "{overridden}");
+}
+
+/// A `--team` value that slugifies to nothing is a usage error: the server
+/// would silently drop it (po-av01j.166).
+#[test]
+fn scan_submission_rejects_an_unusable_team_slug() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = write_scan_parts(dir.path());
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args([
+            "scan",
+            "--service",
+            "checkout-api",
+            "--team",
+            "/",
+            "--target",
+        ])
+        .arg(dir.path())
+        .arg("--scan-dir")
+        .arg(&parts)
+        .env("RVL_API_KEY", "pk_cli_test")
+        // Unroutable: a submit attempt would error, so the usage exit proves
+        // the check fires before any network call.
+        .env("RVL_API_URL", "http://127.0.0.1:9")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("is not a usable team name (slugifies to nothing)"),
+        "{stderr}"
+    );
+}
+
 /// `--dry-run` validates and normalizes without submitting (po-4g59y):
 /// machine-readable JSON summary on stdout, human framing on stderr, no
 /// HTTP request at all. The API URL points at an unroutable port to prove
