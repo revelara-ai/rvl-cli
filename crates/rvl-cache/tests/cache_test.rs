@@ -342,3 +342,123 @@ fn rejected_dir_is_pruned() {
         "rejected/ grew unbounded: {n} files"
     );
 }
+
+// --- judgments inside the signed envelope (po-av01j.106) ---
+
+/// An envelope carrying the ratified judgments corpus beside the specs.
+fn envelope_with_judgments(content_version: &str, severity: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "content_version": content_version,
+        "specs": {"apis": [], "configs": []},
+        "judgments": [{
+            "api": "requests.get",
+            "scope": "runtime",
+            "verdict": "surface",
+            "severity": severity,
+            "fix": "Pass timeout=(connect, read). RC-019.",
+            "control": "RC-019"
+        }]
+    }))
+    .unwrap()
+}
+
+/// The corpus survives the real install + verify + load round trip. Before
+/// po-av01j.106 there was nowhere in the envelope for it to ride, so a scan had
+/// nothing to grade findings with and every one came out advisory.
+#[test]
+fn judgments_ride_inside_the_verified_envelope() {
+    let k = keys();
+    let (_d, s) = store();
+    let bytes = envelope_with_judgments("2026-08-13.jj", "high");
+    assert!(matches!(
+        s.install(&bytes, &sign_b64(&k, &bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+
+    let loaded = s.load(&k.keyset, "2026-08-13").unwrap();
+    let js = loaded
+        .envelope
+        .judgments
+        .expect("judgments must survive the load path");
+    let js = js.as_array().expect("judgments is a JSON array");
+    assert_eq!(js.len(), 1);
+    assert_eq!(js[0]["api"], "requests.get");
+    assert_eq!(js[0]["scope"], "runtime");
+    // The field that decides whether a commit is wedged.
+    assert_eq!(js[0]["severity"], "high");
+    assert_eq!(js[0]["control"], "RC-019");
+}
+
+/// The signature covers the judgments because it covers the whole artifact.
+/// Demoting the ratified severity — the one edit that would silently turn a
+/// blocking gate back into an advisory one — must fail verification, be
+/// quarantined, and leave the previous good corpus serving.
+#[test]
+fn tampering_with_a_judgment_fails_verification() {
+    let k = keys();
+    let (_d, s) = store();
+    let good = envelope_with_judgments("2026-08-13.jj", "high");
+    let sig = sign_b64(&k, &good);
+    s.install(&good, &sig, &k.keyset);
+
+    // Same signature, judgments demoted to advisory.
+    let tampered = envelope_with_judgments("2026-08-13.jj", "low");
+    assert_ne!(good, tampered, "test bug: the tamper changed nothing");
+    assert!(
+        k.keyset.verify_detached(&tampered, Some(&sig)).is_err(),
+        "a demoted judgment verified: judgments are outside the signature"
+    );
+    assert!(matches!(
+        s.install(&tampered, &sig, &k.keyset),
+        SyncOutcome::Rejected { .. }
+    ));
+    // The store still serves the untampered corpus.
+    let loaded = s.load(&k.keyset, "2026-08-13").unwrap();
+    assert_eq!(
+        loaded.envelope.judgments.unwrap().as_array().unwrap()[0]["severity"],
+        "high"
+    );
+}
+
+/// NEW BINARY / OLD CACHE. Every artifact in the field predates the judgments
+/// section; each must load unchanged and grade nothing, which is advisory —
+/// the floor, never an error.
+#[test]
+fn an_artifact_without_judgments_still_loads() {
+    let k = keys();
+    let (_d, s) = store();
+    let bytes = envelope_bytes(1, "2026-08-13.1");
+    s.install(&bytes, &sign_b64(&k, &bytes), &k.keyset);
+
+    let loaded = s.load(&k.keyset, "2026-08-13").unwrap();
+    assert!(
+        loaded.envelope.judgments.is_none(),
+        "an absent judgments section must be None, not an error"
+    );
+}
+
+/// OLD BINARY / NEW CACHE, simulated the only way a running binary can see it:
+/// an envelope carrying a section this build does not model. Unknown fields are
+/// ignored rather than rejected, which is why the factory could add `judgments`
+/// without bumping the schema — a bump would have made every deployed binary
+/// decline the artifact and pin itself to its last-good cache.
+#[test]
+fn an_unknown_envelope_section_is_ignored_not_rejected() {
+    let k = keys();
+    let (_d, s) = store();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "content_version": "2026-08-13.future",
+        "specs": {"apis": [], "configs": []},
+        "judgments": [],
+        "some_future_lane": [{"whatever": true}]
+    }))
+    .unwrap();
+    assert!(matches!(
+        s.install(&bytes, &sign_b64(&k, &bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+    let loaded = s.load(&k.keyset, "2026-08-13").unwrap();
+    assert_eq!(loaded.envelope.content_version, "2026-08-13.future");
+}

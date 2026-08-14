@@ -72,8 +72,10 @@ enum Cmd {
         /// Loudly announced; never silent.
         #[arg(long)]
         specs_file: Option<PathBuf>,
-        /// Class judgments (JSON array) for triage; unjudged classes still
-        /// surface, they are never dropped.
+        /// DEV ONLY: override the signed cache's judgments with a JSON array.
+        /// The ratified corpus ships inside the cache, so no flag is needed;
+        /// this is loudly announced when used. Unjudged classes still surface,
+        /// they are never dropped.
         #[arg(long)]
         judgments: Option<PathBuf>,
         /// Write findings JSON here.
@@ -2147,6 +2149,74 @@ fn resolve_findings(
     )
 }
 
+/// Decide which judgments grade this scan: the ones inside the signed cache,
+/// or a dev-override file (po-av01j.106 / po-axk44).
+///
+/// THE DEFAULT IS THE CACHE. Judgments used to come only from `--judgments`,
+/// which meant the out-of-the-box scan had nothing to grade findings with:
+/// every class landed on `unjudged`, unjudged renders advisory, and the
+/// deterministic gate could not fire however serious the finding. The corpus
+/// now ships inside the same signed bytes as the specs, so a user who runs
+/// `rvlscan scan .` gets graded, control-mapped, blocking-eligible findings
+/// with no flag at all.
+///
+/// `--judgments` survives as a DEV OVERRIDE and is announced on stderr every
+/// time it is used, the same contract `--specs-file` has: a grading layer that
+/// did not come out of the signed artifact must never apply silently, because
+/// a judgment is the one input that can wedge a commit.
+///
+/// A cache judgments section that will not parse is a WARNING, not an error.
+/// Failing the scan would let one bad publish stop every commit in the fleet;
+/// degrading to advisory keeps scans running and keeps every finding visible,
+/// which is the floor the triage layer already guarantees. It is loud on
+/// stderr so the degradation is seen rather than inferred.
+fn resolve_judgments(
+    cache_judgments: Option<&serde_json::Value>,
+    override_file: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<Vec<rvl_triage::ClassJudgment>> {
+    if let Some(p) = override_file {
+        let from_cache = cache_judgments
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| a.len());
+        eprintln!(
+            "WARNING: grading with UNVERIFIED judgments from {} (--judgments is a dev override; \
+             production scans use the judgments inside the signed cache){}",
+            p.display(),
+            if from_cache > 0 {
+                format!(", REPLACING the {from_cache} judgment(s) the cache carries")
+            } else {
+                String::new()
+            }
+        );
+        return Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?);
+    }
+    let Some(raw) = cache_judgments else {
+        // An older artifact, or a deployment that publishes no corpus. Silent
+        // on stderr and reported in the verbose census below: absence is a
+        // valid state, not a fault.
+        if verbose {
+            println!("judgments 0 (cache carries none; every finding is advisory)");
+        }
+        return Ok(Vec::new());
+    };
+    match serde_json::from_value::<Vec<rvl_triage::ClassJudgment>>(raw.clone()) {
+        Ok(js) => {
+            if verbose {
+                println!("judgments {} (from the signed cache)", js.len());
+            }
+            Ok(js)
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: the signed cache's judgments section did not parse ({e}); \
+                 every finding will be advisory. Run `rvlscan sync` for a newer artifact."
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// The pipeline shared by the packet-stream path and the incremental path:
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
@@ -2167,7 +2237,11 @@ fn findings_from_sites(
     policy_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
-    let specs_text = match specs_file {
+    // The signed artifact carries BOTH halves of the answer: the specs that
+    // decide whether a call is bounded, and the judgments that decide what an
+    // unbounded one means (po-av01j.106). They are loaded together because they
+    // arrive together, inside one signature.
+    let (specs_text, cache_judgments) = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
             // spec cache must never load quietly.
@@ -2176,7 +2250,9 @@ fn findings_from_sites(
                  production scans use the signed cache)",
                 p.display()
             );
-            std::fs::read_to_string(p)?
+            // No envelope was opened, so there are no cache judgments to carry.
+            // A dev spec file plus `--judgments` is the full offline pairing.
+            (std::fs::read_to_string(p)?, None)
         }
         None => {
             let loaded = store.load(keyset, &rvl_cache::today_utc())?;
@@ -2195,7 +2271,10 @@ fn findings_from_sites(
                     loaded.envelope.content_version, loaded.envelope.schema, loaded.source
                 );
             }
-            serde_json::to_string(&loaded.envelope.specs)?
+            (
+                serde_json::to_string(&loaded.envelope.specs)?,
+                loaded.envelope.judgments,
+            )
         }
     };
 
@@ -2289,10 +2368,7 @@ fn findings_from_sites(
 
     // Triage: collapse violations into reader-facing classes. Unjudged classes
     // still surface; they are never dropped.
-    let judgments: Vec<rvl_triage::ClassJudgment> = match judgments {
-        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
-        None => Vec::new(),
-    };
+    let judgments = resolve_judgments(cache_judgments.as_ref(), judgments, verbose)?;
     // Key each verdict on the site's UNIQUE site_key (not the finding's
     // file:line site_id, which collides on chained calls), so triage rematches
     // it to the right call and labels the finding correctly (po-3t3oj.35).
@@ -4751,6 +4827,126 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- judgments ship in the signed cache (po-av01j.106 / po-axk44) ---
+
+    /// The judgments section exactly as the factory publishes it: one ratified
+    /// blocking promotion for an unbounded `requests.get` on a production path.
+    fn cache_judgments_json() -> serde_json::Value {
+        serde_json::json!([{
+            "api": "requests.get",
+            "scope": "runtime",
+            "verdict": "surface",
+            "severity": "high",
+            "fix": "Pass timeout=(connect, read); requests defaults to NO timeout. RC-019.",
+            "control": "RC-019"
+        }])
+    }
+
+    /// One violating site, triaged and rendered exactly the way a scan does it,
+    /// so the returned findings are the ones the gate counts.
+    fn ladder_for(judgments: &[rvl_triage::ClassJudgment]) -> Vec<render::Finding> {
+        let sites = vec![rvl_core::Site {
+            file_path: "svc/http.py".into(),
+            line_number: 12,
+            client_type: "requests".into(),
+            method: "get".into(),
+            ..Default::default()
+        }];
+        let verdicts = vec![(
+            sites[0].site_key(),
+            rvl_core::Verdict::Violates,
+            "no bound anywhere".to_string(),
+        )];
+        triage_to_findings(&rvl_triage::triage(&sites, &verdicts, judgments))
+    }
+
+    #[test]
+    fn judgments_load_from_the_signed_cache_with_no_flag() {
+        // The bead's core defect: judgments were readable ONLY from
+        // --judgments, so a plain `rvlscan scan .` had nothing to grade with.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        assert_eq!(js.len(), 1, "the cache's corpus must load with no flag");
+        assert_eq!(js[0].api, "requests.get");
+        assert_eq!(js[0].scope, "runtime");
+        assert_eq!(js[0].severity, "high");
+        assert_eq!(js[0].control, "RC-019");
+    }
+
+    #[test]
+    fn cache_judgments_produce_a_blocking_finding() {
+        // The whole point. `blocking_count > 0` is verbatim the `blocked`
+        // predicate that becomes EXIT_BLOCKED (3) in run_scan; cli.rs asserts
+        // the process status itself.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        let findings = ladder_for(&js);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, "high");
+        assert_eq!(findings[0].control, "RC-019");
+        assert!(
+            render::blocking_count(&findings) > 0,
+            "a ratified high-severity judgment must produce a BLOCKING row: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_judgments_stays_advisory() {
+        // NEW BINARY / OLD CACHE, and any deployment that publishes no corpus:
+        // the finding still surfaces, it is simply ungraded. Advisory is the
+        // floor; nothing is ever dropped.
+        for source in [None, Some(serde_json::json!([]))] {
+            let js = resolve_judgments(source.as_ref(), None, false).unwrap();
+            assert!(js.is_empty());
+            let findings = ladder_for(&js);
+            assert_eq!(findings.len(), 1, "the finding must still surface");
+            assert!(
+                findings[0].severity.is_empty(),
+                "an unjudged class has no severity"
+            );
+            assert_eq!(
+                render::blocking_count(&findings),
+                0,
+                "unjudged must never block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judgments_flag_overrides_the_cache() {
+        // --judgments survives as a dev override only. When both are present
+        // the file wins outright: a half-merge would grade some classes from an
+        // unverified source and some from a signed one, with no way to tell
+        // which did what.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dev_judgments.json");
+        std::fs::write(
+            &p,
+            r#"[{"api":"requests.get","scope":"runtime","verdict":"surface","severity":"low","fix":"dev","control":"RC-000"}]"#,
+        )
+        .unwrap();
+
+        let js =
+            resolve_judgments(Some(&cache_judgments_json()), Some(p.as_path()), false).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(
+            js[0].severity, "low",
+            "the override must win over the cache"
+        );
+        assert_eq!(js[0].control, "RC-000");
+        // ...and the override demotes the class off the gate, which is exactly
+        // why it has to be announced.
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
+
+    #[test]
+    fn a_malformed_cache_judgments_section_degrades_to_advisory() {
+        // One bad publish must not stop every commit in the fleet. Degrade
+        // loudly (stderr) rather than failing the scan.
+        let bad = serde_json::json!([{"scope": "runtime", "verdict": "surface"}]);
+        let js = resolve_judgments(Some(&bad), None, false).unwrap();
+        assert!(js.is_empty(), "a malformed corpus grades nothing");
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
 
     #[test]
     fn a_language_present_only_as_testdata_is_incidental() {

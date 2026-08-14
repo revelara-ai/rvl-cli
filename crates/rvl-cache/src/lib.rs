@@ -36,6 +36,13 @@ const SIG: &str = "specs.json.sig";
 ///
 /// Only obtain one via [`CacheStore::load`]/[`CacheStore::install`] — reading
 /// the cache files directly would sidestep signature verification.
+///
+/// UNKNOWN FIELDS ARE IGNORED, deliberately, and there is no
+/// `deny_unknown_fields` here. That is the forward-compatibility contract: the
+/// factory may add a purely additive envelope section without bumping
+/// [`SUPPORTED_SCHEMA`], and a binary too old to know the section keeps
+/// working on the same artifact instead of pinning itself to its last-good
+/// cache. `judgments` below is the first section to use it.
 #[derive(Debug, Deserialize)]
 pub struct Envelope {
     pub schema: u32,
@@ -44,6 +51,25 @@ pub struct Envelope {
     /// The spec payload the scan engine consumes (engine port wires this up;
     /// opaque JSON here so this crate never depends on spec internals).
     pub specs: serde_json::Value,
+    /// The ratified judgments corpus: what a resolved, violating finding MEANS
+    /// — its severity, its control, its fix (po-av01j.106).
+    ///
+    /// A spec answers only "is this call bounded". Grading is a separate layer,
+    /// and until the factory published it here the scanner could read it only
+    /// from an optional `--judgments` file, so an out-of-the-box scan had
+    /// nothing to grade findings with and every class surfaced as advisory —
+    /// the gate could not fire no matter what the scan found.
+    ///
+    /// Opaque JSON for the same reason `specs` is: this crate distributes and
+    /// verifies artifacts, it does not know what a judgment is. Triage owns
+    /// that type.
+    ///
+    /// `#[serde(default)]`, so an artifact published before this section
+    /// existed — every cache in the field today — loads unchanged and grades
+    /// nothing, exactly as it does now. Absence is a valid state, never an
+    /// error: no judgments means advisory, and advisory is the floor.
+    #[serde(default)]
+    pub judgments: Option<serde_json::Value>,
 }
 
 /// Pinned verifying keys (additive rotation: new keys append, old keys stay
