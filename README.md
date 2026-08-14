@@ -55,6 +55,34 @@ Slot 4 is why no install instruction in this tool ends with "now export
 `RVLSCAN_…`": every command it suggests writes somewhere resolution already
 looks, so building the helper *is* installing it.
 
+### First run: `rvlscan doctor`
+
+Before the first scan on a new machine, ask what is missing:
+
+```sh
+rvlscan doctor [PATH]        # PATH defaults to the current directory
+rvlscan doctor --fix         # close what can be closed safely
+```
+
+`doctor` is REPO-AWARE: it reports only on the languages this tree actually
+contains, using the same detection the scan uses, so a Go shop is never told
+about .NET. Per lane it names which retriever resolved, **from which slot**
+(`env:` / `bundled` / `embedded` / `installed` / `PATH`) and whether the
+runtime it drives is installed — a stale helper shadowing the shipped one via
+`PATH` is visible here and nowhere else. It also reports credentials, spec
+cache freshness, and git-hook wiring (folding in `rvlscan hook doctor`).
+
+`--fix` performs only safe, idempotent, local repairs, announcing each one
+before it runs: extract the embedded helpers, `npm install` the **pinned**
+`typescript` into the helper dir, build `csindex` when a .NET SDK and the
+project source are both already present, and refresh the spec cache when
+credentials are already configured. Anything needing a system package manager
+or `sudo` is printed, never run, and `RVLSCAN_OFFLINE=1` stops it reaching the
+network. Re-running `--fix` on a healthy machine does nothing.
+
+Exit codes: `0` everything this repo needs is in place, `1` a gap remains, `2`
+usage error. `--format=json` emits the same checks for scripts.
+
 ### What arrives with an install, and what does not
 
 `brew install revelara-ai/tap/rvlscan` gives you a working scan for six of the

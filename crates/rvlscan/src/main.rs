@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod doctor;
 mod embedded_helpers;
 mod hook;
 mod init;
@@ -275,6 +276,30 @@ enum Cmd {
         /// Accept all auto-detected defaults non-interactively
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+    /// Diagnose (and with `--fix`, repair) this machine's ability to scan
+    /// THIS repository: the retriever for every language actually present,
+    /// which slot it resolved from and whether its runtime exists, plus
+    /// credentials, spec cache and git-hook wiring.
+    ///
+    /// Repo-aware by design: it reports only on languages this tree contains,
+    /// so a Go shop is never told about .NET.
+    ///
+    /// Exit codes: 0 = everything this repo needs is in place, 1 = a gap
+    /// remains, 2 = usage error.
+    Doctor {
+        /// Repo/dir to diagnose (default: current directory).
+        path: Option<PathBuf>,
+        /// Attempt the safe, idempotent repairs: extract the embedded
+        /// helpers, install the PINNED typescript into the helper dir, build
+        /// csindex when a .NET SDK and the project source are both already
+        /// present, refresh the spec cache when credentials are configured.
+        /// Anything needing a package manager or sudo is printed, never run.
+        #[arg(long)]
+        fix: bool,
+        /// Output format (text|json).
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Install or check the git-hook scan gate: `hook install` writes a
     /// pre-commit/pre-push shim invoking the native deterministic scan;
@@ -4416,6 +4441,13 @@ fn run() -> anyhow::Result<ExitCode> {
             ));
         }
         Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
+        // Environment diagnosis (po-av01j.169). Dispatches before the store
+        // opens because a MISSING spec cache is one of the things it reports:
+        // opening the store here would turn that report into exit 1 from the
+        // cache loader, which is the failure the command exists to explain.
+        Cmd::Doctor { path, fix, format } => {
+            return Ok(doctor::run(doctor::DoctorArgs { path, fix, format }))
+        }
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
@@ -4671,6 +4703,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // returned before the store opened, above.
         Cmd::Init { .. }
         | Cmd::Hook { .. }
+        | Cmd::Doctor { .. }
         | Cmd::Login
         | Cmd::Logout
         | Cmd::Status
