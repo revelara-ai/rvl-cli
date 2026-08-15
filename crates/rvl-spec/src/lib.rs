@@ -51,6 +51,41 @@ pub enum Mechanism {
     None,
 }
 
+/// What the LIBRARY itself does when the caller passes no explicit bound
+/// (po-av01j.175).
+///
+/// This is the one fact the engine can never derive from the user's code, and
+/// without it the scanner was asserting it anyway: every completed search with
+/// no bound printed "it can hang indefinitely", which is true of `requests`
+/// (whose timeout defaults to `None`) and FALSE of every SDK that ships a
+/// default — openai 3.1.0 and anthropic 0.122.0 both carry
+/// `DEFAULT_TIMEOUT = Timeout(connect=5.0, read=600, write=600, pool=600)`.
+///
+/// Three states, deliberately distinct, because "we do not know" and "there is
+/// no default" are different claims and only one of them licenses the strong
+/// sentence:
+///   - [`DefaultBound::Unknown`] — nobody established it. Say only what the
+///     search verified about the user's code.
+///   - [`DefaultBound::None`] — the library applies no default. The strong
+///     claim is now EVIDENCED and may be made.
+///   - [`DefaultBound::Seconds`] — the library applies its own default, which
+///     is a finding of its own shape: a 600s fallback in a request path
+///     exhausts workers long before it returns.
+///
+/// Absent from a cache means `Unknown`, so every spec authored before this
+/// field existed keeps the honest wording rather than silently inheriting a
+/// claim about a library nobody checked.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DefaultBound {
+    #[default]
+    Unknown,
+    None,
+    Seconds {
+        seconds: f64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSpec {
     #[serde(rename = "type")]
@@ -92,6 +127,18 @@ pub struct ApiSpec {
     /// [`ConfigExpect::Equals`].
     #[serde(default)]
     pub unbounded_sentinels: Vec<String>,
+    /// What this API does with NO explicit bound from the caller
+    /// (po-av01j.175). Serde-defaulted to [`DefaultBound::Unknown`]: every
+    /// cache predating the field parses unchanged, and a cache carrying the
+    /// field loads in a pre-.175 binary with the field ignored — additive in
+    /// both directions, so the envelope schema version does not move.
+    ///
+    /// It is DISPLAY knowledge, not verdict knowledge. Propagation still
+    /// resolves a call with no bound in user code exactly as it did; what
+    /// changes is that the sentence describing it can no longer claim a
+    /// library behaviour nobody verified.
+    #[serde(default)]
+    pub default_bound: DefaultBound,
 }
 
 impl ApiSpec {
@@ -709,6 +756,7 @@ mod tests {
             site_count: 1,
             site_kinds: vec![],
             unbounded_sentinels: vec![],
+            default_bound: DefaultBound::Unknown,
         }
     }
 
@@ -945,6 +993,106 @@ mod tests {
                 "an undeclared spec must match nothing, including {v:?}"
             );
         }
+    }
+
+    // --- default bounds: the library's own fallback (po-av01j.175) ---
+
+    #[test]
+    fn a_cache_without_the_default_bound_field_reads_as_unknown() {
+        // Compatibility, direction one: every cache in production predates the
+        // field. It must parse, and the resulting spec must claim NOTHING
+        // about the library -- Unknown is what makes the renderer stop at the
+        // half the search actually verified.
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":0.9}],"configs":[]}"#,
+        )
+        .expect("a cache without the field must still parse");
+        let spec = cache.api(&("requests".into(), "get".into())).unwrap();
+        assert_eq!(spec.default_bound, DefaultBound::Unknown);
+    }
+
+    #[test]
+    fn the_three_default_bound_states_are_distinguishable_on_the_wire() {
+        let cache = SpecCache::load(
+            r#"{"apis":[
+                 {"type":"requests","method":"get","blocking":"yes","confidence":0.9,
+                  "default_bound":{"kind":"none"}},
+                 {"type":"openai.OpenAI","method":"create","blocking":"yes","confidence":0.9,
+                  "default_bound":{"kind":"seconds","seconds":600.0}},
+                 {"type":"mystery","method":"call","blocking":"yes","confidence":0.9}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cache
+                .api(&("requests".into(), "get".into()))
+                .unwrap()
+                .default_bound,
+            DefaultBound::None,
+            "requests really does default to None; the spec must be able to say so"
+        );
+        assert_eq!(
+            cache
+                .api(&("openai.OpenAI".into(), "create".into()))
+                .unwrap()
+                .default_bound,
+            DefaultBound::Seconds { seconds: 600.0 },
+            "openai 3.1.0 ships DEFAULT_TIMEOUT read=600"
+        );
+        assert_eq!(
+            cache
+                .api(&("mystery".into(), "call".into()))
+                .unwrap()
+                .default_bound,
+            DefaultBound::Unknown
+        );
+    }
+
+    #[test]
+    fn a_cache_carrying_default_bounds_still_loads_where_the_field_is_unknown() {
+        // Compatibility, direction two: a NEW cache read by an OLD binary.
+        // Serde skips unknown fields, so the section is inert rather than a
+        // parse failure -- which is why the envelope schema version does not
+        // move for this change. Simulated by parsing a spec that also carries
+        // a field this binary has never heard of.
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes","confidence":0.9,
+                 "default_bound":{"kind":"none"},"some_future_field":{"a":1}}],
+               "configs":[],"some_future_section":[{"x":1}]}"#,
+        )
+        .expect("unknown fields and sections must be ignored, not rejected");
+        let spec = cache.api(&("requests".into(), "get".into())).unwrap();
+        assert_eq!(spec.default_bound, DefaultBound::None);
+    }
+
+    #[test]
+    fn merge_carries_the_winning_specs_default_bound() {
+        // The default bound rides the api entry, so the existing merge policy
+        // decides it: a stale spec must not leave its (possibly wrong) library
+        // claim behind on the winner.
+        let mk = |confidence: f64, db: DefaultBound| SpecFile {
+            apis: vec![ApiSpec {
+                default_bound: db,
+                ..api(Blocking::Yes, confidence)
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, DefaultBound::None));
+        base.merge(SpecCache::from_file(mk(
+            0.95,
+            DefaultBound::Seconds { seconds: 600.0 },
+        )));
+        assert_eq!(
+            base.api(&("t".into(), "Do".into())).unwrap().default_bound,
+            DefaultBound::Seconds { seconds: 600.0 }
+        );
+        base.merge(SpecCache::from_file(mk(0.5, DefaultBound::Unknown)));
+        assert_eq!(
+            base.api(&("t".into(), "Do".into())).unwrap().default_bound,
+            DefaultBound::Seconds { seconds: 600.0 },
+            "a lower-confidence spec never displaces the winner's default bound"
+        );
     }
 
     #[test]

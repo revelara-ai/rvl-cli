@@ -9,6 +9,7 @@
 //!   - explain: one finding as an evidence block with the snippet, named
 //!     incident citations, control, and fix. Invoked via `rvlscan explain`.
 
+use rvl_spec::DefaultBound;
 use std::fmt::Write as _;
 
 /// When to emit ANSI color. Auto honors NO_COLOR and a non-tty stdout.
@@ -743,6 +744,28 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
     o
 }
 
+/// Render a default-bound duration the way a human writes it: `600s`, `1.5s`,
+/// `5m` when the seconds divide evenly into whole minutes. Kept in the display
+/// layer because it is a wording decision, not spec data — the spec carries a
+/// number.
+fn humanize_seconds(seconds: f64) -> String {
+    if seconds >= 60.0 && (seconds % 60.0).abs() < f64::EPSILON {
+        let m = seconds / 60.0;
+        return format!("{}s ({}m)", trim_float(seconds), trim_float(m));
+    }
+    format!("{}s", trim_float(seconds))
+}
+
+/// `600.0` -> `600`, `1.5` -> `1.5`. A trailing `.0` in a sentence reads like
+/// a machine wrote it.
+fn trim_float(v: f64) -> String {
+    if v.fract().abs() < f64::EPSILON {
+        format!("{}", v.trunc() as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
 /// Turn a propagation reason into a sentence a human can act on, keyed on the
 /// call class and the raw reason (po-68mlb). The propagation layer's reason
 /// strings are a load-bearing CONTRACT — coverage bucketing string-matches
@@ -751,13 +774,50 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
 /// field. The reliability specs for these client classes all bound a call in
 /// TIME (a timeout, deadline, or context), so the missing thing is named as
 /// such rather than as an abstract "bound".
-pub fn humanize_bound_reason(class: &str, method: &str, reason: &str) -> String {
+///
+/// The sentence must never assert more than the evidence supports
+/// (po-av01j.175). The search establishes facts about the USER'S CODE; what
+/// the library does with no explicit bound is a fact about the LIBRARY, and
+/// the only place that fact can live is the spec. So `default_bound` is an
+/// input here and the wording is a FUNCTION of it rather than a fixed string:
+/// unknown says only what was verified, [`DefaultBound::None`] licenses the
+/// strong "can hang indefinitely" claim, and [`DefaultBound::Seconds`] names
+/// the fallback the call actually relies on.
+pub fn humanize_bound_reason(
+    class: &str,
+    method: &str,
+    reason: &str,
+    default_bound: DefaultBound,
+) -> String {
     let call = format!("{class}.{method}");
     if reason == "no bound anywhere and the search was complete" {
-        format!(
+        // What the SEARCH established, and nothing beyond it: there is no
+        // explicit bound in this repository. Whether the call can then run
+        // forever is a fact about the LIBRARY, and only the spec knows it.
+        let verified = format!(
             "{call} has no timeout or deadline — not at the call, not on a client or session it is built from, \
-             and not anywhere up the call chain; it can hang indefinitely"
-        )
+             and not anywhere up the call chain"
+        );
+        match default_bound {
+            // Nobody established what the library does with no explicit
+            // bound, so the sentence stops at the verified half.
+            DefaultBound::Unknown => {
+                format!("{verified}; nothing in this repository bounds how long it can run")
+            }
+            // The spec says the library ships no default. NOW the strong
+            // claim is evidence-backed.
+            DefaultBound::None => {
+                format!("{verified}, and {class} applies no default of its own; it can hang indefinitely")
+            }
+            // The library does bound it, which is still worth surfacing: a
+            // multi-minute SDK default in a request path holds the worker for
+            // that long before it ever returns.
+            DefaultBound::Seconds { seconds } => format!(
+                "{verified}, so it falls back to the {class} default of {}, \
+                 which is usually far too long for a request path",
+                humanize_seconds(seconds)
+            ),
+        }
     } else if reason == "no bound found and the search was truncated" {
         format!(
             "{call}: no timeout found, but the search hit its depth budget before the chain was exhausted — \
@@ -784,16 +844,13 @@ pub fn humanize_bound_reason(class: &str, method: &str, reason: &str) -> String 
 mod humanize_tests {
     use super::*;
 
+    const COMPLETE: &str = "no bound anywhere and the search was complete";
+
     #[test]
     fn bound_reasons_read_as_english_and_name_the_missing_thing() {
-        let s = humanize_bound_reason(
-            "subprocess",
-            "run",
-            "no bound anywhere and the search was complete",
-        );
+        let s = humanize_bound_reason("subprocess", "run", COMPLETE, DefaultBound::Unknown);
         assert!(s.contains("subprocess.run"), "{s}");
         assert!(s.contains("no timeout or deadline"), "{s}");
-        assert!(s.contains("hang indefinitely"), "{s}");
         // The raw engine phrase must not survive to the user.
         assert!(!s.contains("the search was complete"), "{s}");
 
@@ -801,13 +858,73 @@ mod humanize_tests {
             "pgxpool.Pool",
             "Query",
             "only phase bounds: connect_timeout=5s",
+            DefaultBound::Unknown,
         );
         assert!(p.contains("connection phase"), "{p}");
         assert!(p.contains("connect_timeout=5s"), "{p}");
         assert!(p.contains("response read is still unbounded"), "{p}");
 
         // Unknown reasons degrade to class + raw reason, never a blank.
-        let u = humanize_bound_reason("x.Y", "z", "some novel reason");
+        let u = humanize_bound_reason("x.Y", "z", "some novel reason", DefaultBound::Unknown);
         assert_eq!(u, "x.Y.z — some novel reason");
+    }
+
+    /// The bug (po-av01j.175): the tool asserted a LIBRARY fact it never
+    /// checked. With no default-bound data the sentence must stop at what the
+    /// search verified about the user's code.
+    #[test]
+    fn an_unknown_default_never_claims_the_library_hangs() {
+        let s = humanize_bound_reason("openai.OpenAI", "create", COMPLETE, DefaultBound::Unknown);
+        assert!(
+            !s.contains("hang indefinitely"),
+            "a claim about the library with no evidence for it: {s}"
+        );
+        assert_eq!(
+            s,
+            "openai.OpenAI.create has no timeout or deadline — not at the call, not on a client \
+             or session it is built from, and not anywhere up the call chain; nothing in this \
+             repository bounds how long it can run"
+        );
+    }
+
+    /// `requests` really does default to `None`. Once the spec SAYS so, the
+    /// strong claim is evidenced and must come back.
+    #[test]
+    fn a_spec_declaring_no_default_earns_the_strong_claim() {
+        let s = humanize_bound_reason("requests", "get", COMPLETE, DefaultBound::None);
+        assert_eq!(
+            s,
+            "requests.get has no timeout or deadline — not at the call, not on a client or \
+             session it is built from, and not anywhere up the call chain, and requests applies \
+             no default of its own; it can hang indefinitely"
+        );
+    }
+
+    /// openai 3.1.0 / anthropic 0.122.0 ship a 600s read timeout. The call is
+    /// bounded, and the honest finding is the one about the fallback's length.
+    #[test]
+    fn a_declared_default_names_the_fallback_the_call_relies_on() {
+        let s = humanize_bound_reason(
+            "openai.OpenAI",
+            "create",
+            COMPLETE,
+            DefaultBound::Seconds { seconds: 600.0 },
+        );
+        assert_eq!(
+            s,
+            "openai.OpenAI.create has no timeout or deadline — not at the call, not on a client \
+             or session it is built from, and not anywhere up the call chain, so it falls back \
+             to the openai.OpenAI default of 600s (10m), which is usually far too long for a \
+             request path"
+        );
+        assert!(!s.contains("hang indefinitely"), "{s}");
+    }
+
+    #[test]
+    fn sub_minute_and_fractional_defaults_read_naturally() {
+        assert_eq!(humanize_seconds(5.0), "5s");
+        assert_eq!(humanize_seconds(1.5), "1.5s");
+        assert_eq!(humanize_seconds(600.0), "600s (10m)");
+        assert_eq!(humanize_seconds(90.0), "90s");
     }
 }

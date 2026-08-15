@@ -534,7 +534,7 @@ pub fn propagate_all(
 mod tests {
     use super::*;
     use rvl_core::{Provenance, RootFact, Snippet};
-    use rvl_spec::{ApiSpec, Blocking, ConfigSpec, Scope, ScopeSpec, SpecFile};
+    use rvl_spec::{ApiSpec, Blocking, ConfigSpec, DefaultBound, Scope, ScopeSpec, SpecFile};
     use std::collections::HashMap;
 
     fn cache(bounded_by: Vec<Mechanism>, configs: Vec<ConfigSpec>) -> SpecCache {
@@ -561,6 +561,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec![],
                 unbounded_sentinels,
+                default_bound: DefaultBound::Unknown,
             }],
             configs,
             scopes: vec![],
@@ -596,6 +597,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec!["background_job".into()],
                 unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
             }],
             configs: vec![],
             scopes: vec![],
@@ -711,6 +713,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec!["background_job".into()],
                 unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
             }],
             configs: vec![],
             scopes: vec![],
@@ -825,6 +828,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec![],
                 unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
             }],
             configs: vec![],
             scopes: vec![],
@@ -1196,6 +1200,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec![],
                 unbounded_sentinels: vec!["None".into()],
+                default_bound: DefaultBound::Unknown,
             }],
             configs: vec![],
             scopes: vec![],
@@ -1402,6 +1407,7 @@ mod tests {
                 site_count: 1,
                 site_kinds: vec![],
                 unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
             }],
             configs: vec![],
             config_keys: vec![],
