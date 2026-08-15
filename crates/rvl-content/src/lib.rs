@@ -57,6 +57,16 @@ struct Rule {
     /// where shape and entropy both say "uninteresting" and the words say
     /// otherwise.
     value_must_match: Option<Regex>,
+    /// Drop values whose SHAPE is a NAME rather than a generated credential
+    /// (see [`name_shaped`]). Set on the entropy-gated generic rule, whose
+    /// character-distribution score cannot tell an identifier from a token.
+    reject_name_shaped: bool,
+    /// The value must be a quoted string LITERAL when the file is written in
+    /// a language that always quotes them (see [`quoted_literal`] and
+    /// [`requires_quoted_literal`]). Set on the weak-credential rule, whose
+    /// unquoted branch exists for .ini/.env config and must not swallow a
+    /// bare identifier on the right-hand side of an assignment.
+    require_string_literal: bool,
     /// The generic rule runs only where no specific rule matched the line:
     /// one secret is one finding, never one per overlapping rule.
     generic: bool,
@@ -80,6 +90,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -90,6 +102,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: Some(3.0),
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -100,6 +114,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -110,6 +126,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -120,6 +138,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -130,6 +150,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -140,6 +162,8 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 0,
                 entropy_min: None,
                 value_must_match: None,
+                reject_name_shaped: false,
+                require_string_literal: false,
                 generic: false,
             },
             Rule {
@@ -150,6 +174,12 @@ fn ruleset() -> &'static [Rule] {
                 secret_group: 1,
                 entropy_min: Some(3.5),
                 value_must_match: None,
+                // Entropy is a character-distribution score, and IDENTIFIERS
+                // score well on it: `AUDIO_STT_AZURE_API_KEY` is 3.6 bits/char.
+                // Found on open-webui, where config key-name mapping tables
+                // produced 20 sites that are every one of them a name.
+                reject_name_shaped: true,
+                require_string_literal: false,
                 generic: true,
             },
             // WEAK AND SHIPPED BEATS STRONG AND COMMITTED. The generic rule
@@ -190,6 +220,16 @@ fn ruleset() -> &'static [Rule] {
                 value_must_match: Some(re(
                     r#"(?i)^(?:[a-z0-9_\-]*(?:pass(?:word|wd|phrase)|letmein|qwerty|welcome|changeit|admin|root|default|insecure|notsecure)[a-z0-9_\-]*|[a-z_\-]*[0-9]{4,}[a-z0-9_\-]*)$"#,
                 )),
+                reject_name_shaped: false,
+                // The unquoted branch of the pattern above exists for
+                // .ini/.env/.properties, where an unquoted value IS the
+                // literal. In a language that always quotes its strings, an
+                // unquoted right-hand side is an EXPRESSION:
+                // `auth_row.password = new_password` sets a column from a
+                // parameter and contains no literal at all, yet it satisfied
+                // both the pattern and the `*password*` vocabulary. Six
+                // open-webui sites, in Python and TypeScript, were that shape.
+                require_string_literal: true,
                 generic: true,
             },
         ]
@@ -216,6 +256,87 @@ fn allowlisted(value: &str, line: &str) -> bool {
     value.contains("${")
         || (value.starts_with("{{") && value.ends_with("}}"))
         || (value.starts_with('<') && value.ends_with('>'))
+}
+
+/// Values whose SHAPE is a NAME — an identifier, a config path, a phrase —
+/// rather than a generated credential. Shannon entropy scores character
+/// distribution, so it cannot make this distinction on its own: the env var
+/// name `AUDIO_STT_AZURE_API_KEY` scores 3.62 bits/char, over the generic
+/// rule's 3.5 gate.
+///
+/// Three shapes, each of which requires a SEPARATOR, so a single opaque run of
+/// characters — what base64, hex and every provider token actually look like —
+/// is never excluded by any of them:
+///
+///   1. SCREAMING_SNAKE_CASE with at least one underscore. An env var name.
+///      (`{'audio.stt.azure.api_key': 'AUDIO_STT_AZURE_API_KEY'}` — the dict
+///      KEY makes the site read as secret-named, the VALUE is a name.)
+///   2. A dotted path of lowercase identifier segments. A config path.
+///      (`{'API_KEY': 'audio.tts.api_key'}` — the same mapping table, read in
+///      the other direction.)
+///   3. Two or more purely ALPHABETIC tokens joined by `.`/`_`/`-`, with no
+///      digit anywhere. A name or a natural-language phrase: `current-password`
+///      in an HTML autocomplete attribute, `Anwendungs-DN-Passwort` in an i18n
+///      translation file.
+///
+/// The narrowing is bounded by the separator requirement and, for (3), by the
+/// absence of any digit: a generated credential is one opaque token, or it
+/// carries mixed case WITH digits. The residual miss is a word-list passphrase
+/// used as an api key (`api_key = "zebra-mango-tulip-quartz"`); a passphrase
+/// naming itself as one (`...-passphrase-...`) is still caught by the
+/// weak-credential rule's vocabulary, which does not use this check.
+fn name_shaped(value: &str) -> bool {
+    use std::sync::OnceLock;
+    static SHAPES: OnceLock<Vec<Regex>> = OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| {
+        [
+            // 1. SCREAMING_SNAKE_CASE (>= 1 underscore).
+            r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$",
+            // 2. dotted lowercase config path (>= 1 dot).
+            r"^[a-z][a-z0-9]*(?:[_\-][a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:[_\-][a-z0-9]+)*)+$",
+            // 3. alphabetic word sequence, no digits (>= 2 tokens).
+            r"^[A-Za-z]+(?:[._\-][A-Za-z]+)+$",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).expect("static name-shape regex"))
+        .collect()
+    });
+    shapes.iter().any(|re| re.is_match(value))
+}
+
+/// Extensions whose language ALWAYS quotes its string literals. In these files
+/// an unquoted right-hand side is an expression — a variable, an attribute, a
+/// call — and can never be a hardcoded credential.
+///
+/// Config and plain-text formats are deliberately ABSENT (.env, .ini, .cfg,
+/// .conf, .properties, .yaml, .toml, shell, Dockerfile, Makefile, and every
+/// unknown extension): an unquoted value there IS the literal, and that is
+/// exactly where shipped weak defaults live — mlflow's `admin_password =
+/// password1234` in basic_auth.ini is the case this rule was built for.
+const QUOTED_LITERAL_LANGS: &[&str] = &[
+    "rs", "py", "pyi", "go", "java", "kt", "kts", "scala", "groovy", "js", "jsx", "mjs", "cjs",
+    "ts", "tsx", "svelte", "vue", "rb", "php", "cs", "swift", "dart", "c", "h", "cc", "cpp", "cxx",
+    "hpp", "hh", "m", "mm", "ex", "exs", "erl", "lua", "pl", "pm",
+];
+
+/// Whether an unquoted value in this file can be a literal at all.
+fn requires_quoted_literal(rel_path: &str) -> bool {
+    Path::new(rel_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| QUOTED_LITERAL_LANGS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Whether the matched value is delimited by quotes on this line, i.e. it is a
+/// string literal rather than a bare token the rule's optional-quote branch
+/// picked up.
+fn quoted_literal(line: &str, span: std::ops::Range<usize>) -> bool {
+    let before = line[..span.start].chars().next_back();
+    let after = line[span.end..].chars().next();
+    matches!(
+        (before, after),
+        (Some('"'), Some('"')) | (Some('\''), Some('\''))
+    )
 }
 
 /// Inline allow pragma. `rvl:allow` is the canonical form, chosen ahead of the
@@ -273,11 +394,22 @@ pub fn scan_bytes(rel_path: &str, content: &str) -> Vec<ContentFinding> {
                     continue;
                 }
                 for caps in rule.pattern.captures_iter(line) {
-                    let value = caps
-                        .get(rule.secret_group)
-                        .map(|m| m.as_str())
-                        .unwrap_or_default();
+                    let Some(m) = caps.get(rule.secret_group) else {
+                        continue;
+                    };
+                    let value = m.as_str();
                     if allowlisted(value, line) {
+                        continue;
+                    }
+                    // A name is not a credential, and an expression is not a
+                    // literal: both checks read the VALUE's shape only.
+                    if rule.reject_name_shaped && name_shaped(value) {
+                        continue;
+                    }
+                    if rule.require_string_literal
+                        && !quoted_literal(line, m.range())
+                        && requires_quoted_literal(rel_path)
+                    {
                         continue;
                     }
                     let entropy = shannon_entropy(value);
