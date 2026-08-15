@@ -116,6 +116,19 @@ pub struct Coverage {
     pub abstain_judge: usize,
     /// Any other undecided outcome.
     pub abstain_other: usize,
+    /// Sites the specs resolved as BLOCKING BY DESIGN (po-av01j.180): a
+    /// server main loop, an event loop, a blocking queue wait, a stream
+    /// write. Counted inside `resolved` — the scanner reached a conclusion
+    /// about them, and the conclusion is "waiting is the contract".
+    ///
+    /// They produce no finding, because there is no deadline to add. But the
+    /// count and the identities are printed HERE rather than dropped: a class
+    /// the reader saw yesterday and does not see today must be accounted for,
+    /// or suppression is indistinguishable from a scanner that stopped
+    /// looking.
+    pub by_design: usize,
+    /// The distinct `<class> (<role>)` labels behind `by_design`, sorted.
+    pub by_design_classes: Vec<String>,
     /// A whole-pass degradation: the incremental path retrieved only part of
     /// the tree because a helper failed, so `total` describes the reused
     /// portion and NOT the repo (po-av01j.139). Distinct from `degraded`
@@ -481,6 +494,34 @@ pub fn render_ladder(
             let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
             let _ = writeln!(o, "{}", paint(&aline, "2", color));
         }
+        // Blocking by design (po-av01j.180). These sites resolved, and they
+        // produce no finding because no deadline belongs on them — so this
+        // line is where their count stays visible. Naming the classes is the
+        // point: it is what lets a reader who disagrees with the call see it
+        // and say so, rather than wonder why uvicorn.run stopped appearing.
+        if cov.by_design > 0 {
+            const MAX_SHOWN: usize = 8;
+            let shown: Vec<&str> = cov
+                .by_design_classes
+                .iter()
+                .take(MAX_SHOWN)
+                .map(String::as_str)
+                .collect();
+            let more = cov.by_design_classes.len().saturating_sub(shown.len());
+            let tail = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            let bline = format!(
+                "  {} site{} block by design \u{2014} {}{} \u{2014} waiting is the contract, so no deadline is expected",
+                cov.by_design,
+                if cov.by_design == 1 { "" } else { "s" },
+                shown.join(" \u{00b7} "),
+                tail
+            );
+            let _ = writeln!(o, "{}", paint(&bline, "2", color));
+        }
     }
     // Outside the branch on purpose. A degraded language is the reason the G1
     // lane can be empty, so it must be reported precisely when total == 0; and
@@ -837,6 +878,78 @@ pub fn humanize_bound_reason(
         // so a new propagation reason degrades to today's output, never to a
         // blank line.
         format!("{call} — {reason}")
+    }
+}
+
+#[cfg(test)]
+mod by_design_coverage_tests {
+    use super::*;
+
+    fn cov(by_design: usize, classes: &[&str]) -> Coverage {
+        Coverage {
+            resolved: 10,
+            total: 10,
+            by_design,
+            by_design_classes: classes.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// po-av01j.180: a suppressed class must still be ACCOUNTED FOR. The
+    /// coverage line is where the count and the identities live, so a reader
+    /// who disagrees with the by-design call can see it and say so.
+    #[test]
+    fn the_coverage_line_names_the_suppressed_classes() {
+        let out = render_ladder(
+            &[],
+            cov(
+                4,
+                &[
+                    "sys.stdout.write (stream write)",
+                    "uvicorn.run (server main loop)",
+                ],
+            ),
+            None,
+            "0.1s",
+            false,
+        );
+        assert!(out.contains("4 sites block by design"), "{out}");
+        assert!(out.contains("uvicorn.run (server main loop)"), "{out}");
+        assert!(out.contains("sys.stdout.write (stream write)"), "{out}");
+        assert!(out.contains("no deadline is expected"), "{out}");
+    }
+
+    #[test]
+    fn one_site_reads_as_one_site() {
+        let out = render_ladder(
+            &[],
+            cov(1, &["uvicorn.run (server main loop)"]),
+            None,
+            "0.1s",
+            false,
+        );
+        assert!(out.contains("1 site block"), "{out}");
+        assert!(!out.contains("1 sites"), "{out}");
+    }
+
+    /// Every cache in the fleet predates the field, so the ordinary report
+    /// must be untouched: no line, no blank, nothing.
+    #[test]
+    fn nothing_by_design_prints_nothing() {
+        let out = render_ladder(&[], cov(0, &[]), None, "0.1s", false);
+        assert!(!out.contains("by design"), "{out}");
+    }
+
+    /// A long list is capped, and the remainder is STATED — a silent
+    /// truncation would read as "that is all of them".
+    #[test]
+    fn a_long_list_is_capped_and_says_so() {
+        let many: Vec<String> = (0..12)
+            .map(|i| format!("c{i}.call (stream write)"))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let out = render_ladder(&[], cov(30, &refs), None, "0.1s", false);
+        assert!(out.contains("(+4 more)"), "{out}");
     }
 }
 

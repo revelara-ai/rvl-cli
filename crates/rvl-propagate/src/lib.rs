@@ -534,7 +534,9 @@ pub fn propagate_all(
 mod tests {
     use super::*;
     use rvl_core::{Provenance, RootFact, Snippet};
-    use rvl_spec::{ApiSpec, Blocking, ConfigSpec, DefaultBound, Scope, ScopeSpec, SpecFile};
+    use rvl_spec::{
+        ApiSpec, Blocking, BlockingIntent, ConfigSpec, DefaultBound, Scope, ScopeSpec, SpecFile,
+    };
     use std::collections::HashMap;
 
     fn cache(bounded_by: Vec<Mechanism>, configs: Vec<ConfigSpec>) -> SpecCache {
@@ -562,6 +564,7 @@ mod tests {
                 site_kinds: vec![],
                 unbounded_sentinels,
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs,
             scopes: vec![],
@@ -598,6 +601,7 @@ mod tests {
                 site_kinds: vec!["background_job".into()],
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs: vec![],
             scopes: vec![],
@@ -616,6 +620,129 @@ mod tests {
             site_kind: "background_job".into(),
             ..Default::default()
         }
+    }
+
+    // --- blocking by design (po-av01j.180) ---
+
+    /// A cache whose one spec is the class under test, with the intent the
+    /// caller names. Built from the real corpus rows so the parity below is
+    /// between the exact shapes that ship: `uvicorn.run` and `requests.post`
+    /// differ in this field and NOTHING else.
+    fn intent_cache(type_name: &str, method: &str, intent: BlockingIntent) -> SpecCache {
+        SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: type_name.into(),
+                method: method.into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::None],
+                confidence: 1.0,
+                rationale: String::new(),
+                site_count: 4,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: intent,
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+        })
+    }
+
+    fn intent_site(type_name: &str, method: &str) -> Site {
+        Site {
+            file_path: "backend/app/__init__.py".into(),
+            line_number: 81,
+            method: method.into(),
+            client_type: type_name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_by_design_site_resolves_instead_of_violating() {
+        // uvicorn.run blocks until the process is killed. With no intent it is
+        // a violation asking for a deadline; with the intent declared it is a
+        // resolved not-applicable, and the reason names the class and the role
+        // so the coverage line can print them.
+        let f = propagate(
+            &intent_site("uvicorn", "run"),
+            &intent_cache(
+                "uvicorn",
+                "run",
+                BlockingIntent::ByDesign {
+                    role: rvl_spec::DesignRole::ServerMainLoop,
+                },
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable);
+        assert!(f.verdict.is_resolved(), "resolved, not abstained");
+        assert_eq!(
+            rvl_spec::by_design_label(&f.reason),
+            Some("uvicorn.run (server main loop)")
+        );
+    }
+
+    /// The same site with the same spec MINUS the intent — the state every
+    /// cache in the fleet is in today — must still violate. This is the pair
+    /// that proves the suppression is the field and not something else.
+    #[test]
+    fn the_same_class_without_the_intent_still_violates() {
+        let f = propagate(
+            &intent_site("uvicorn", "run"),
+            &intent_cache("uvicorn", "run", BlockingIntent::Incidental),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates);
+        assert_eq!(f.reason, "no bound anywhere and the search was complete");
+    }
+
+    /// requests/subprocess are genuine defects and must be untouched. Asserted
+    /// on the FULL finding — verdict and reason byte-for-byte — because the
+    /// reason string is what the ladder renders and what coverage buckets.
+    #[test]
+    fn the_genuine_defects_are_byte_identical_with_the_field_present() {
+        for (t, m) in [("requests", "post"), ("subprocess", "run")] {
+            let f = propagate(
+                &intent_site(t, m),
+                &intent_cache(t, m, BlockingIntent::Incidental),
+                &ServedBound::None,
+                &HashMap::new(),
+            );
+            assert_eq!(f.verdict, Verdict::Violates, "{t}.{m}");
+            assert_eq!(
+                f.reason, "no bound anywhere and the search was complete",
+                "{t}.{m}"
+            );
+            assert_eq!(rvl_spec::by_design_label(&f.reason), None, "{t}.{m}");
+        }
+    }
+
+    #[test]
+    fn a_by_design_class_that_does_carry_a_bound_is_still_not_a_finding() {
+        // A stream write inside a bounded context resolves either way; the
+        // point is only that neither path produces a violation.
+        let mut s = intent_site("sys.stdout", "write");
+        s.enclosing_function_body =
+            "async with asyncio.timeout(5):\n    sys.stdout.write(x)".into();
+        let f = propagate(
+            &s,
+            &intent_cache(
+                "sys.stdout",
+                "write",
+                BlockingIntent::ByDesign {
+                    role: rvl_spec::DesignRole::StreamWrite,
+                },
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_ne!(f.verdict, Verdict::Violates);
     }
 
     #[test]
@@ -714,6 +841,7 @@ mod tests {
                 site_kinds: vec!["background_job".into()],
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs: vec![],
             scopes: vec![],
@@ -829,6 +957,7 @@ mod tests {
                 site_kinds: vec![],
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs: vec![],
             scopes: vec![],
@@ -1201,6 +1330,7 @@ mod tests {
                 site_kinds: vec![],
                 unbounded_sentinels: vec!["None".into()],
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs: vec![],
             scopes: vec![],
@@ -1408,6 +1538,7 @@ mod tests {
                 site_kinds: vec![],
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
             }],
             configs: vec![],
             config_keys: vec![],

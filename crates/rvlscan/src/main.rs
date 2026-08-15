@@ -2704,6 +2704,34 @@ fn load_last_scan(state: &std::path::Path) -> Option<LastScan> {
     serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()
 }
 
+/// Sites the specs resolved as BLOCKING BY DESIGN, and the distinct
+/// `<class> (<role>)` labels behind them (po-av01j.180).
+///
+/// These are already inside `resolved` (a not-applicable is a conclusion) and
+/// they produce no finding, because there is no deadline to add to a server's
+/// main loop. Without this they would leave the report in silence, and a class
+/// that vanishes without explanation is indistinguishable from a scanner that
+/// stopped looking — so the count and the identities are printed in COVERAGE.
+///
+/// The reason string is the propagation layer's output CONTRACT. `rvl_spec`
+/// owns both ends of this one — the format in `spec_gate`, the reader in
+/// `by_design_label` — so the two cannot drift apart here.
+fn by_design_coverage(findings: &[rvl_propagate::Finding]) -> (usize, Vec<String>) {
+    let mut count = 0;
+    let mut classes: Vec<String> = Vec::new();
+    for f in findings {
+        let Some(label) = rvl_spec::by_design_label(&f.reason) else {
+            continue;
+        };
+        count += 1;
+        if !classes.iter().any(|c| c == label) {
+            classes.push(label.to_string());
+        }
+    }
+    classes.sort();
+    (count, classes)
+}
+
 /// Render the ladder + optional `--out` JSON for a completed scan. Shared by
 /// the packet-stream path and the incremental path so both report identically.
 #[allow(clippy::too_many_arguments)]
@@ -2764,6 +2792,7 @@ fn render_scan_output(
             .collect(),
         ..Default::default()
     };
+    (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
@@ -5043,6 +5072,169 @@ mod tests {
         );
         assert!(d.contains("far too long for a request path"), "{d}");
         assert!(!d.contains("hang indefinitely"), "{d}");
+    }
+
+    // --- blocking by design, end to end (po-av01j.180) ---
+
+    /// The three published corpus rows the bug report names, verbatim, plus
+    /// the two genuine defects that must be untouched. The intents are spliced
+    /// in so the before/after pair differs in EXACTLY one field per row and
+    /// nothing else.
+    fn corpus(with_intent: bool) -> String {
+        let field = |role: &str| {
+            if with_intent {
+                format!(r#","blocking_intent":{{"kind":"by_design","role":"{role}"}}"#)
+            } else {
+                String::new()
+            }
+        };
+        format!(
+            r#"{{"apis":[
+                 {{"type":"uvicorn","method":"run","blocking":"yes","bounded_by":["none"],
+                   "confidence":1.0{server}}},
+                 {{"type":"sys.stdout","method":"write","blocking":"yes","bounded_by":["none"],
+                   "confidence":0.9{stream}}},
+                 {{"type":"sys.stderr","method":"write","blocking":"yes","bounded_by":["none"],
+                   "confidence":0.967{stream}}},
+                 {{"type":"requests","method":"post","blocking":"yes","bounded_by":["call_arg"],
+                   "confidence":1.0,"unbounded_sentinels":["None"],
+                   "default_bound":{{"kind":"none"}}}},
+                 {{"type":"subprocess","method":"run","blocking":"yes","bounded_by":["call_arg"],
+                   "confidence":1.0,"unbounded_sentinels":["None"],
+                   "default_bound":{{"kind":"none"}}}}
+               ],"configs":[]}}"#,
+            server = field("server_main_loop"),
+            stream = field("stream_write"),
+        )
+    }
+
+    /// Run the real pipeline — propagate, triage, ladder rows — over one site
+    /// per class, and return (finding descriptions, by-design coverage).
+    fn scan_classes(specs_json: &str) -> (Vec<String>, (usize, Vec<String>)) {
+        let specs = rvl_spec::SpecCache::load(specs_json).expect("corpus must parse");
+        let sites: Vec<rvl_core::Site> = [
+            ("uvicorn", "run"),
+            ("sys.stdout", "write"),
+            ("sys.stderr", "write"),
+            ("requests", "post"),
+            ("subprocess", "run"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (t, m))| rvl_core::Site {
+            file_path: "backend/app/main.py".into(),
+            line_number: i as u32 + 1,
+            client_type: (*t).into(),
+            method: (*m).into(),
+            ..Default::default()
+        })
+        .collect();
+        let findings = rvl_propagate::propagate_all(
+            &sites,
+            &specs,
+            &rvl_spec::ServedBound::None,
+            &std::collections::HashMap::new(),
+        );
+        let verdicts: Vec<_> = sites
+            .iter()
+            .zip(findings.iter())
+            .map(|(s, f)| (s.site_key(), f.verdict, f.reason.clone()))
+            .collect();
+        let items = rvl_triage::triage(&sites, &verdicts, &[]);
+        let rows: Vec<String> = triage_to_findings(&items, Some(&specs))
+            .into_iter()
+            .map(|f| f.description)
+            .collect();
+        (rows, by_design_coverage(&findings))
+    }
+
+    #[test]
+    fn by_design_classes_leave_the_ladder_and_the_defects_stay_byte_identical() {
+        let (before, before_cov) = scan_classes(&corpus(false));
+        let (after, _) = scan_classes(&corpus(true));
+
+        // BEFORE: the reported bug. All five classes ask for a timeout, and
+        // three of them are asking for something meaningless.
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().any(|d| d.starts_with("uvicorn.run")),
+            "{before:#?}"
+        );
+        assert!(before.iter().any(|d| d.starts_with("sys.stdout.write")));
+        assert!(before.iter().any(|d| d.starts_with("sys.stderr.write")));
+        assert_eq!(before_cov.0, 0, "nothing is by-design without the field");
+
+        // AFTER: the three by-design classes produce no remediation row.
+        assert_eq!(after.len(), 2, "{after:#?}");
+        for gone in ["uvicorn.run", "sys.stdout.write", "sys.stderr.write"] {
+            assert!(
+                !after.iter().any(|d| d.starts_with(gone)),
+                "{gone} must not ask for a deadline: {after:#?}"
+            );
+        }
+
+        // REGRESSION PROOF: the genuine defects are byte-identical, sentence
+        // for sentence, before and after.
+        let defect = |rows: &[String], class: &str| -> String {
+            rows.iter()
+                .find(|d| d.starts_with(class))
+                .unwrap_or_else(|| panic!("{class} must still be reported: {rows:#?}"))
+                .clone()
+        };
+        for class in ["requests.post", "subprocess.run"] {
+            assert_eq!(defect(&before, class), defect(&after, class), "{class}");
+            assert!(
+                defect(&after, class).contains("it can hang indefinitely"),
+                "the genuine defect keeps its full force"
+            );
+        }
+    }
+
+    #[test]
+    fn the_suppressed_classes_are_counted_and_named_in_coverage() {
+        // Suppression without accounting is indistinguishable from a scanner
+        // that stopped looking, so the count and the identities must survive
+        // into COVERAGE.
+        let (_, (count, classes)) = scan_classes(&corpus(true));
+        assert_eq!(count, 3);
+        assert_eq!(
+            classes,
+            vec![
+                "sys.stderr.write (stream write)",
+                "sys.stdout.write (stream write)",
+                "uvicorn.run (server main loop)",
+            ]
+        );
+        let cov = render::Coverage {
+            resolved: 5,
+            total: 5,
+            by_design: count,
+            by_design_classes: classes,
+            ..Default::default()
+        };
+        let out = render::render_ladder(&[], cov, None, "0.1s", false);
+        assert!(out.contains("3 sites block by design"), "{out}");
+        assert!(out.contains("uvicorn.run (server main loop)"), "{out}");
+        assert!(
+            out.contains("waiting is the contract"),
+            "the line must say why there is no finding: {out}"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_the_intent_field_renders_no_by_design_line() {
+        // Compatibility: today's fleet caches carry nothing, so the coverage
+        // block must look exactly as it does now.
+        let (_, (count, classes)) = scan_classes(&corpus(false));
+        assert_eq!(count, 0);
+        assert!(classes.is_empty());
+        let cov = render::Coverage {
+            resolved: 5,
+            total: 5,
+            ..Default::default()
+        };
+        let out = render::render_ladder(&[], cov, None, "0.1s", false);
+        assert!(!out.contains("by design"), "{out}");
     }
 
     #[test]
