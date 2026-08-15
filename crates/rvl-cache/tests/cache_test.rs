@@ -462,3 +462,75 @@ fn an_unknown_envelope_section_is_ignored_not_rejected() {
     let loaded = s.load(&k.keyset, "2026-08-13").unwrap();
     assert_eq!(loaded.envelope.content_version, "2026-08-13.future");
 }
+
+/// po-av01j.176: a conditional GET that the server answers 304 must resolve to
+/// NotModified, never to a signature failure.
+///
+/// The regression this pins is subtle and was live for as long as sync existed.
+/// `HttpFetcher::fetch` handled 304 in an `Err(ureq::Error::Status(304, _))`
+/// arm, but ureq reserves `Error::Status` for 4xx/5xx and hands a 304 back as
+/// `Ok`. So the arm never fired: the response fell through to the success path,
+/// an EMPTY body was read, the detached signature was fetched separately as a
+/// real 200, and verification of zero bytes against a valid signature failed.
+/// Users saw "signature does not verify against any pinned key" — a tampering
+/// message — for a correct, healthy cache hit. It stayed hidden because syncs
+/// normally follow a version change, which takes the 200 path.
+///
+/// A live loopback server rather than a fake Fetcher on purpose: the bug lived
+/// in the ureq status handling itself, so a hand-rolled Fetcher stub would have
+/// reproduced nothing and passed against the broken code.
+#[test]
+fn a_304_is_up_to_date_not_a_signature_failure() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let mut conditional = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("if-none-match:") {
+                    conditional = true;
+                }
+            }
+            // Mirror the real handler: a conditional hit is 304 with NO body,
+            // and it never touches storage.
+            let response = if conditional {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\nContent-Length: 0\r\n\r\n"
+                    .to_string()
+            } else {
+                let body = "{\"schema\":1}";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let fetcher = HttpFetcher {
+        base_url: base,
+        org_key: "pk_test".into(),
+    };
+    match fetcher.fetch(Some("abc")) {
+        Ok(Fetched::NotModified) => {}
+        Ok(Fetched::New { bytes, .. }) => panic!(
+            "a 304 was treated as a fresh artifact carrying {} byte(s); the empty \
+             body then fails signature verification",
+            bytes.len()
+        ),
+        Err(e) => panic!("a 304 must not be an error: {e}"),
+    }
+}

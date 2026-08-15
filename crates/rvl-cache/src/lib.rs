@@ -496,6 +496,14 @@ impl Fetcher for HttpFetcher {
             req = req.set("If-None-Match", &format!("\"{h}\""));
         }
         let resp = match req.call() {
+            // 304 arrives as Ok, NOT as Err: ureq reserves `Error::Status` for
+            // 4xx/5xx. Checking the status here rather than in an Err arm is
+            // the whole fix (po-av01j.176) — the Err arm below never fired, so
+            // every conditional hit fell through, read an EMPTY body, and then
+            // failed signature verification against it. That surfaced to users
+            // as "signature does not verify against any pinned key": a
+            // tampering message for a healthy cache hit.
+            Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
             Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
             Err(e) => return Err(e.into()),
