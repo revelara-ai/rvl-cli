@@ -648,7 +648,10 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
 /// (counts, control) are not yet populated — they arrive from the corpus/
 /// judgment layer — so they default to empty and the ladder degrades to
 /// severity + coverage until that data flows.
-fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding> {
+fn triage_to_findings(
+    items: &[rvl_triage::TriagedItem],
+    specs: Option<&rvl_spec::SpecCache>,
+) -> Vec<render::Finding> {
     items
         .iter()
         .map(|it| {
@@ -668,7 +671,20 @@ fn triage_to_findings(items: &[rvl_triage::TriagedItem]) -> Vec<render::Finding>
                     .first()
                     .cloned()
                     .unwrap_or_else(|| format!("{} sites", it.site_count)),
-                description: render::humanize_bound_reason(short, &ck.method, &ck.reason),
+                // What the LIBRARY does with no explicit bound is spec
+                // knowledge, so the sentence is derived from the spec rather
+                // than asserted (po-av01j.175). No spec, or a spec that never
+                // declared it, leaves it Unknown and the wording stops at what
+                // the search actually verified.
+                description: render::humanize_bound_reason(
+                    short,
+                    &ck.method,
+                    &ck.reason,
+                    specs
+                        .and_then(|c| c.api(&(ck.client_type.clone(), ck.method.clone())))
+                        .map(|s| s.default_bound)
+                        .unwrap_or_default(),
+                ),
                 disposition: it.disposition.clone(),
                 severity: it.severity.clone(),
                 incident_count: 0,
@@ -2576,6 +2592,9 @@ fn run_scan(
             &[],
             &citems,
             &[],
+            // No spec cache is resolved on this path, so every class renders
+            // the unknown-default wording -- which is the honest one.
+            None,
             &structure,
             None,
             None,
@@ -2613,6 +2632,7 @@ fn run_scan(
         &findings,
         &items,
         &sites,
+        Some(&specs),
         &structure,
         Some(&lane),
         None,
@@ -2693,6 +2713,11 @@ fn render_scan_output(
     findings: &[rvl_propagate::Finding],
     items: &[rvl_triage::TriagedItem],
     sites: &[rvl_core::Site],
+    // The specs the propagation ran against. Carried this far because the
+    // ladder's sentence for an unbounded call depends on what the LIBRARY does
+    // with no explicit bound, and only the spec knows that (po-av01j.175).
+    // `None` on the content-only path, where no spec cache is resolved at all.
+    specs: Option<&rvl_spec::SpecCache>,
     structure: &[render::Finding],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
@@ -2750,7 +2775,7 @@ fn render_scan_output(
             coverage.abstain_other += 1;
         }
     }
-    let mut ladder_findings = triage_to_findings(items);
+    let mut ladder_findings = triage_to_findings(items, specs);
     // Repo-structure lane findings join the ladder (always Advisory) and the
     // persisted last-scan state, so explain/suppress resolve their ids too.
     ladder_findings.extend(structure.iter().cloned());
@@ -3515,6 +3540,7 @@ fn run_scan_incremental(
         &findings,
         &items,
         &sites,
+        Some(&specs),
         &structure,
         Some(&lane),
         hook_agent.as_ref(),
@@ -3591,7 +3617,7 @@ fn run_explain(
     if retrieved.is_none() {
         items.extend(content_items(path));
     }
-    let mut ladder_findings = triage_to_findings(&items);
+    let mut ladder_findings = triage_to_findings(&items, Some(&specs));
     ladder_findings.extend(resolve_structure_findings(retrieved, &stream.text, path));
     ladder_findings.extend(server_to_findings(&server));
     // Config-lane ids resolve here too: the fresh scan mirrors what the
@@ -3655,7 +3681,7 @@ fn run_suppress(
                 if retrieved.is_none() {
                     items.extend(content_items(scan_path));
                 }
-                let mut ladder_findings = triage_to_findings(&items);
+                let mut ladder_findings = triage_to_findings(&items, Some(&specs));
                 ladder_findings.extend(resolve_structure_findings(
                     retrieved,
                     &stream.text,
@@ -4934,7 +4960,89 @@ mod tests {
             rvl_core::Verdict::Violates,
             "no bound anywhere".to_string(),
         )];
-        triage_to_findings(&rvl_triage::triage(&sites, &verdicts, judgments))
+        triage_to_findings(&rvl_triage::triage(&sites, &verdicts, judgments), None)
+    }
+
+    // --- the ladder's sentence follows the spec's default bound (.175) ---
+
+    /// The class the scan actually triages for one unbounded site of
+    /// `<client_type>.<method>`, rendered through the same path a scan uses.
+    fn description_for(
+        client_type: &str,
+        method: &str,
+        specs: Option<&rvl_spec::SpecCache>,
+    ) -> String {
+        let sites = vec![rvl_core::Site {
+            file_path: "svc/http.py".into(),
+            line_number: 12,
+            client_type: client_type.into(),
+            method: method.into(),
+            ..Default::default()
+        }];
+        let verdicts = vec![(
+            sites[0].site_key(),
+            rvl_core::Verdict::Violates,
+            "no bound anywhere and the search was complete".to_string(),
+        )];
+        let items = rvl_triage::triage(&sites, &verdicts, &[]);
+        let findings = triage_to_findings(&items, specs);
+        assert_eq!(findings.len(), 1);
+        findings[0].description.clone()
+    }
+
+    #[test]
+    fn a_class_with_no_default_bound_data_never_claims_the_library_hangs() {
+        // po-av01j.175: the false claim. Both the no-cache path and a cache
+        // whose spec predates the field must stop at the verified half.
+        let no_cache = description_for("openai.OpenAI", "create", None);
+        assert!(
+            !no_cache.contains("hang indefinitely"),
+            "unevidenced library claim: {no_cache}"
+        );
+
+        let pre_175 = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"openai.OpenAI","method":"create","blocking":"yes",
+                 "confidence":0.9}],"configs":[]}"#,
+        )
+        .unwrap();
+        let old = description_for("openai.OpenAI", "create", Some(&pre_175));
+        assert!(
+            !old.contains("hang indefinitely"),
+            "a cache without the field must behave exactly like no data: {old}"
+        );
+        assert_eq!(no_cache, old, "existing caches keep the honest wording");
+        assert!(old.contains("nothing in this repository bounds how long it can run"));
+    }
+
+    #[test]
+    fn a_spec_declaring_no_default_still_produces_the_strong_claim() {
+        // `requests` genuinely has no default. Once the spec SAYS so, the
+        // serious finding must read exactly as seriously as it used to.
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes",
+                 "confidence":0.9,"default_bound":{"kind":"none"}}],"configs":[]}"#,
+        )
+        .unwrap();
+        let d = description_for("requests", "get", Some(&specs));
+        assert!(d.contains("applies no default of its own"), "{d}");
+        assert!(d.contains("it can hang indefinitely"), "{d}");
+    }
+
+    #[test]
+    fn a_spec_declaring_a_default_names_the_sdk_fallback() {
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"openai.OpenAI","method":"create","blocking":"yes",
+                 "confidence":0.9,"default_bound":{"kind":"seconds","seconds":600.0}}],
+               "configs":[]}"#,
+        )
+        .unwrap();
+        let d = description_for("openai.OpenAI", "create", Some(&specs));
+        assert!(
+            d.contains("falls back to the openai.OpenAI default of 600s"),
+            "{d}"
+        );
+        assert!(d.contains("far too long for a request path"), "{d}");
+        assert!(!d.contains("hang indefinitely"), "{d}");
     }
 
     #[test]
