@@ -219,7 +219,7 @@ pub fn build(
                 site: format!("{}:{}", s.file_path, s.line_number),
                 class,
                 lever: lever_of(&f.reason),
-                scope: rvl_core::scope_of(&s.file_path).as_str(),
+                scope: s.scope().as_str(),
             });
         }
     }

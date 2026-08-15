@@ -14,7 +14,7 @@
 //! are one problem with 245 instances; surfacing them individually IS the spam,
 //! no matter how each is judged.
 
-use rvl_core::{scope_of, Site, Verdict};
+use rvl_core::{Site, Verdict};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -60,7 +60,7 @@ pub fn class_of(site: &Site, reason: &str) -> ClassKey {
             .unwrap_or(reason)
             .trim()
             .to_string(),
-        scope: scope_of(&site.file_path).as_str().into(),
+        scope: site.scope().as_str().into(),
     }
 }
 

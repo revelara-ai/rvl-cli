@@ -288,6 +288,153 @@ fn weak_shipped_credentials_are_found_despite_low_entropy() {
     }
 }
 
+// --- names are not credentials; expressions are not literals (po-av01j.172) --
+//
+// All six lines below are verbatim open-webui source that the lane reported as
+// secret findings. Every one of them is a NAME or an EXPRESSION.
+
+#[test]
+fn identifier_shaped_values_are_not_high_entropy_secrets() {
+    for (file, line) in [
+        // A config key-name mapping table: the dict KEY contains `api_key`, so
+        // the site reads as secret-named; the VALUE is an env var NAME that
+        // scores 3.62 bits/char, over the generic rule's 3.5 gate.
+        (
+            "migrations/versions/3ff2c63645b8_reshape.py",
+            "    'audio.stt.azure.api_key': 'AUDIO_STT_AZURE_API_KEY',",
+        ),
+        (
+            "migrations/versions/3ff2c63645b8_reshape.py",
+            "    'oauth.oidc.client_secret': 'oauth.client_secret',",
+        ),
+        // The same table read the other way: the VALUE is a dotted config path.
+        ("routers/audio.py", "    'API_KEY': 'audio.tts.api_key',"),
+        (
+            "routers/audio.py",
+            "    'OPENAI_API_KEY': 'audio.tts.openai.api_key',",
+        ),
+        // A natural-language phrase in an i18n translation file.
+        (
+            "src/lib/i18n/locales/de-DE/translation.json",
+            "\t\"Application DN Password\": \"Anwendungs-DN-Passwort\",",
+        ),
+        // An HTML autocomplete attribute, not an assignment of anything.
+        (
+            "src/routes/auth/+page.svelte",
+            "autocomplete={mode === 'signup' ? 'new-password' : 'current-password'}",
+        ),
+    ] {
+        let f = scan_bytes(file, line);
+        assert!(
+            f.is_empty(),
+            "identifier/phrase must not flag: {line} -> {f:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_identifier_right_hand_side_is_never_a_weak_default() {
+    // No literal appears anywhere on these lines: the right-hand side is a
+    // parameter (Python) and a variable (TypeScript). A weak default needs
+    // something actually written down to be weak.
+    for (file, line) in [
+        (
+            "backend/open_webui/models/auths.py",
+            "            auth_row.password = new_password",
+        ),
+        (
+            "src/lib/apis/auths/index.ts",
+            "\t\t\tnew_password: newPassword",
+        ),
+        ("app/models.py", "        self.password = hashed"),
+        ("cfg.go", "\tcfg.Password = envPassword"),
+    ] {
+        let f = scan_bytes(file, line);
+        assert!(
+            !f.iter().any(|x| x.rule_id == "weak_default_credential"),
+            "non-literal assignment must not flag: {line} -> {f:?}"
+        );
+    }
+}
+
+#[test]
+fn quoted_weak_defaults_in_code_still_fire() {
+    // The narrowing above is about LITERALS, not about code files: the same
+    // files with a quoted value are real hardcoded credentials (both lines are
+    // verbatim open-webui source) and must still fire.
+    for (file, line) in [
+        (
+            "backend/open_webui/retrieval/vector/dbs/oracle23ai.py",
+            "ORACLE_DB_PASSWORD = \"Welcome123456\"",
+        ),
+        (
+            "backend/open_webui/routers/auths.py",
+            "        admin_password = 'admin'",
+        ),
+        ("src/config.ts", "const dbPassword = 'changeit'"),
+    ] {
+        let f = scan_bytes(file, line);
+        assert!(
+            f.iter().any(|x| x.rule_id == "weak_default_credential"),
+            "quoted weak credential must still fire: {line} -> {f:?}"
+        );
+    }
+    // And an UNQUOTED value in a config format, where unquoted IS the literal.
+    let ini = scan_bytes("conf/basic_auth.ini", "admin_password = password1234");
+    assert!(
+        ini.iter().any(|x| x.rule_id == "weak_default_credential"),
+        "unquoted .ini literal must still fire: {ini:?}"
+    );
+}
+
+#[test]
+fn real_credential_shapes_survive_the_name_shape_narrowing() {
+    // The narrowing must not touch the detection path. Each value below is a
+    // credential SHAPE — provider-prefixed, base64, hex — none of which is a
+    // separator-joined identifier.
+    let cases: [(&str, &str, &str); 6] = [
+        ("api_key = \"@\"", &gcp_key(), "gcp_api_key"),
+        (
+            "aws_secret_access_key = \"@\"",
+            &aws_secret(),
+            "aws_secret_access_key",
+        ),
+        (
+            "client_secret = \"@\"",
+            &generic_secret(),
+            "generic_api_key",
+        ),
+        // 32 hex chars: high entropy, no separators.
+        (
+            "token = \"@\"",
+            "a3f9d2b8c1e47f60a9b2c3d4e5f60718",
+            "generic_api_key",
+        ),
+        // URL-safe base64 blob with underscores AND dashes, mixed case + digits:
+        // separators are present but the tokens are not alphabetic words.
+        (
+            "private_key = \"@\"",
+            "kR9_pQ2-vX7mZ4nT6yB1cE8fH3jL0aGw",
+            "generic_api_key",
+        ),
+        // All-caps with underscores would be name-shaped -- unless it is hex,
+        // which carries digits and no word tokens.
+        (
+            "apikey = \"@\"",
+            "9F3A2B7C4D1E6F80A5B9C2D3E4F60718",
+            "generic_api_key",
+        ),
+    ];
+    for (tmpl, value, want) in cases {
+        let line = tmpl.replace('@', value);
+        let f = scan_bytes("app/config.py", &line);
+        assert!(
+            f.iter().any(|x| x.rule_id == want),
+            "real credential must still fire as {want}: {line} -> {f:?}"
+        );
+    }
+}
+
 #[test]
 fn code_references_and_key_names_are_not_credentials() {
     // `password = request.authorization.password` READS a value; the dotted
