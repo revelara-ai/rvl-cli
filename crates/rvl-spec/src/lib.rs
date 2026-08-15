@@ -86,6 +86,142 @@ pub enum DefaultBound {
     },
 }
 
+/// WHY a call blocks: because bounding it was forgotten, or because waiting
+/// IS the job (po-av01j.180).
+///
+/// `blocking = yes` plus `bounded_by = [none]` conflates two situations a
+/// reader needs kept apart, and the corpus proves it: `requests.post` (an
+/// actionable defect — I/O that should carry a timeout and does not) and
+/// `uvicorn.run` (the server main loop, which blocks until the process is
+/// killed, by design) carried the SAME two fields and so rendered the same
+/// complaint. On the open-webui demo the by-design classes produced 4 of ~14
+/// advisory rows, each asking for a deadline that would be meaningless.
+///
+/// The model answered accurately every time; the vocabulary had no way to
+/// record the difference. This is that vocabulary.
+///
+/// TWO STATES, NOT THREE — deliberately unlike [`DefaultBound`], where
+/// "unknown" and "none" license DIFFERENT sentences and so both had to exist.
+/// Here "nobody asked" and "asked, and it is not by design" license the same
+/// output: surface the finding exactly as today. A third state would be a
+/// distinction the renderer could not honor, and every state that is not
+/// `ByDesign` must fail safe to surfacing anyway — because a wrong by-design
+/// marker HIDES a real defect, which is strictly worse than the noise it
+/// removes. So the default is the safe one and the payload rides the one
+/// variant that changes behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockingIntent {
+    /// The call is MEANT to block indefinitely. There is no deadline to add,
+    /// so there is no remediation to ask for.
+    ///
+    /// `role` is serde-defaulted so a `{"kind":"by_design"}` with no role
+    /// degrades to [`DesignRole::Unrecognized`] — which suppresses nothing —
+    /// instead of failing `SpecCache::load` for the whole artifact. The
+    /// publish guard rejects that shape at authoring time; this is what
+    /// happens if one reaches a binary anyway.
+    ByDesign {
+        #[serde(default)]
+        role: DesignRole,
+    },
+    /// Blocking is a means to an end here: the call waits because it is doing
+    /// I/O, and a bound belongs on it. The ordinary case, the serde default,
+    /// and what an absent field means — so every cache authored before this
+    /// existed behaves EXACTLY as it does today.
+    ///
+    /// `#[serde(other)]` as well as `#[default]`: a future `kind` this binary
+    /// has never heard of lands here rather than failing `SpecCache::load` for
+    /// the whole artifact, and lands on the side that still reports the
+    /// finding. Forward compatibility that fails safe in the same direction.
+    /// (Serde requires the catch-all to be the LAST variant, which is why the
+    /// default is written second.)
+    #[default]
+    #[serde(other)]
+    Incidental,
+}
+
+/// The closed vocabulary of reasons a call legitimately blocks forever.
+///
+/// Closed on purpose. An open string would let the authoring model invent a
+/// category and let anything be marked by-design, and the publish guard could
+/// not validate it. Extending this list is a deliberate code change with the
+/// same review as any other spec semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignRole {
+    /// A server's own main loop: `uvicorn.run`, `app.run`, `srv.Serve`. It
+    /// returns when the process is shut down and not before.
+    ServerMainLoop,
+    /// An event/scheduler loop run to completion: `loop.run_forever`.
+    EventLoop,
+    /// A blocking take from a queue or channel, where waiting for the next
+    /// item IS the contract.
+    BlockingQueue,
+    /// A write to a process stream (`sys.stdout.write`, `sys.stderr.write`).
+    /// It can technically block on a full pipe; a timeout is not the remedy
+    /// and a finding on every log line is noise, not signal.
+    StreamWrite,
+    /// A role this binary does not recognize — only reachable by reading a
+    /// NEWER corpus than the binary. Treated as not-by-design everywhere, so
+    /// an unknown role reports the finding exactly as today: an old binary may
+    /// print noise, but it may never hide a defect. The publish guard rejects
+    /// this spelling at authoring time, so it cannot be chosen deliberately.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// The DEFAULT role is the unrecognized one, which is the only defensible
+/// choice: a role that was never stated must not be filled in with a guess
+/// that suppresses a finding. Every unstated, unreadable or future value lands
+/// on "report it as before".
+impl Default for DesignRole {
+    fn default() -> Self {
+        DesignRole::Unrecognized
+    }
+}
+
+/// Marker that opens the propagation reason for a by-design site. The
+/// propagation layer's reason strings are a consumed CONTRACT (coverage
+/// bucketing string-matches them), so the format is defined here, next to the
+/// [`by_design_label`] that reads it back, rather than spelled twice.
+pub const BY_DESIGN_PREFIX: &str = "blocks by design: ";
+
+/// Separates the class label from the explanation inside a by-design reason.
+const BY_DESIGN_SEP: &str = " \u{2014} ";
+
+impl DesignRole {
+    /// How the role reads in a sentence.
+    pub fn label(self) -> &'static str {
+        match self {
+            DesignRole::ServerMainLoop => "server main loop",
+            DesignRole::EventLoop => "event loop",
+            DesignRole::BlockingQueue => "blocking queue wait",
+            DesignRole::StreamWrite => "stream write",
+            DesignRole::Unrecognized => "unrecognized",
+        }
+    }
+}
+
+impl BlockingIntent {
+    /// The role when this spec declares the call blocks by design, and the
+    /// binary recognizes the role. `Unrecognized` answers `None` — the whole
+    /// point of the fallback variant is that it must not suppress anything.
+    pub fn by_design_role(self) -> Option<DesignRole> {
+        match self {
+            BlockingIntent::ByDesign { role } if role != DesignRole::Unrecognized => Some(role),
+            _ => None,
+        }
+    }
+}
+
+/// The `<class> (<role>)` label out of a by-design reason, or None if the
+/// reason is not one. The inverse of the format `spec_gate` writes, kept
+/// beside it so the two cannot drift.
+pub fn by_design_label(reason: &str) -> Option<&str> {
+    let rest = reason.strip_prefix(BY_DESIGN_PREFIX)?;
+    Some(rest.split(BY_DESIGN_SEP).next().unwrap_or(rest))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSpec {
     #[serde(rename = "type")]
@@ -139,6 +275,22 @@ pub struct ApiSpec {
     /// library behaviour nobody verified.
     #[serde(default)]
     pub default_bound: DefaultBound,
+    /// Whether blocking here is the POINT of the call (po-av01j.180).
+    /// Serde-defaulted to [`BlockingIntent::Incidental`]: every cache
+    /// predating the field parses unchanged and keeps reporting exactly what
+    /// it reports today, and a cache carrying the field loads in a pre-.180
+    /// binary with the field ignored — additive in both directions, so the
+    /// envelope schema version does not move.
+    ///
+    /// Unlike [`ApiSpec::default_bound`] this IS verdict knowledge: a
+    /// by-design call is not-applicable to the deadline control, the same way
+    /// a non-blocking call is, because there is no bound to add. The
+    /// suppression is one-directional by construction — only an explicit,
+    /// recognized `ByDesign` removes a row, so the failure mode of every
+    /// missing, malformed or future value is the noise this field exists to
+    /// remove, never a hidden defect.
+    #[serde(default)]
+    pub blocking_intent: BlockingIntent,
 }
 
 impl ApiSpec {
@@ -736,7 +888,29 @@ pub fn spec_gate(spec: Option<&ApiSpec>) -> Option<(Verdict, String)> {
             Verdict::Abstain,
             format!("spec confidence {:.2} below {MIN_CONFIDENCE}", s.confidence),
         )),
-        Blocking::Yes => None,
+        // The call blocks, and blocking is the POINT of it (po-av01j.180).
+        // Resolved as NotApplicable for the same reason `Blocking::No` is:
+        // there is no bound to look for, so searching for one and then
+        // reporting its absence describes nothing the reader can act on.
+        // `uvicorn.run` returns when the process is killed; a deadline on it
+        // is not a fix, it is a shorter outage.
+        //
+        // Placed AFTER the confidence floor deliberately: a spec too shaky to
+        // decide that the call blocks is too shaky to decide why it blocks,
+        // and abstaining routes it to an author instead of silently removing
+        // it from the report.
+        Blocking::Yes => s.blocking_intent.by_design_role().map(|role| {
+            (
+                Verdict::NotApplicable,
+                format!(
+                    "{BY_DESIGN_PREFIX}{}.{} ({}){BY_DESIGN_SEP}waiting is the contract here, \
+                     so no deadline is expected",
+                    s.type_name,
+                    s.method,
+                    role.label(),
+                ),
+            )
+        }),
     }
 }
 
@@ -757,6 +931,7 @@ mod tests {
             site_kinds: vec![],
             unbounded_sentinels: vec![],
             default_bound: DefaultBound::Unknown,
+            blocking_intent: BlockingIntent::Incidental,
         }
     }
 
@@ -1093,6 +1268,236 @@ mod tests {
             DefaultBound::Seconds { seconds: 600.0 },
             "a lower-confidence spec never displaces the winner's default bound"
         );
+    }
+
+    // --- blocking intent: waiting as the contract (po-av01j.180) ---
+
+    /// Compatibility, direction one. Every cache in the fleet predates this
+    /// field; each must parse and behave EXACTLY as it does today, which for
+    /// this field means "surface the finding".
+    #[test]
+    fn a_cache_without_blocking_intent_reads_as_incidental() {
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"uvicorn","method":"run","blocking":"yes",
+                 "bounded_by":["none"],"confidence":1.0}],"configs":[]}"#,
+        )
+        .expect("a cache without the field must still parse");
+        let spec = cache.api(&("uvicorn".into(), "run".into())).unwrap();
+        assert_eq!(spec.blocking_intent, BlockingIntent::Incidental);
+        assert_eq!(
+            spec.blocking_intent.by_design_role(),
+            None,
+            "absence must never suppress"
+        );
+        assert_eq!(
+            spec_gate(Some(spec)),
+            None,
+            "and the site is still decided from evidence, exactly as before"
+        );
+    }
+
+    /// Compatibility, direction two: a NEW cache in an OLD binary. Serde skips
+    /// unknown fields, so the section is inert rather than a parse failure —
+    /// which is why the envelope schema version does not move.
+    #[test]
+    fn an_unknown_field_alongside_blocking_intent_is_ignored_not_rejected() {
+        let cache = SpecCache::load(
+            r#"{"apis":[{"type":"uvicorn","method":"run","blocking":"yes","confidence":1.0,
+                 "blocking_intent":{"kind":"by_design","role":"server_main_loop"},
+                 "some_future_field":{"a":1}}],
+               "configs":[],"some_future_section":[{"x":1}]}"#,
+        )
+        .expect("unknown fields and sections must be ignored, not rejected");
+        assert_eq!(
+            cache
+                .api(&("uvicorn".into(), "run".into()))
+                .unwrap()
+                .blocking_intent,
+            BlockingIntent::ByDesign {
+                role: DesignRole::ServerMainLoop
+            }
+        );
+    }
+
+    #[test]
+    fn the_declared_roles_parse_and_read_as_english() {
+        let cache = SpecCache::load(
+            r#"{"apis":[
+                 {"type":"uvicorn","method":"run","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"by_design","role":"server_main_loop"}},
+                 {"type":"asyncio.AbstractEventLoop","method":"run_forever","blocking":"yes",
+                  "confidence":1.0,"blocking_intent":{"kind":"by_design","role":"event_loop"}},
+                 {"type":"queue.Queue","method":"get","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"by_design","role":"blocking_queue"}},
+                 {"type":"sys.stdout","method":"write","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"by_design","role":"stream_write"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        for (t, m, role, label) in [
+            (
+                "uvicorn",
+                "run",
+                DesignRole::ServerMainLoop,
+                "server main loop",
+            ),
+            (
+                "asyncio.AbstractEventLoop",
+                "run_forever",
+                DesignRole::EventLoop,
+                "event loop",
+            ),
+            (
+                "queue.Queue",
+                "get",
+                DesignRole::BlockingQueue,
+                "blocking queue wait",
+            ),
+            (
+                "sys.stdout",
+                "write",
+                DesignRole::StreamWrite,
+                "stream write",
+            ),
+        ] {
+            let spec = cache.api(&(t.into(), m.into())).unwrap();
+            assert_eq!(spec.blocking_intent.by_design_role(), Some(role), "{t}.{m}");
+            assert_eq!(role.label(), label);
+        }
+    }
+
+    /// THE FIX. A by-design call resolves as not-applicable to the deadline
+    /// control, the same way a non-blocking call does — so it never becomes a
+    /// violation and never asks for a timeout that would be meaningless.
+    #[test]
+    fn a_by_design_spec_resolves_as_not_applicable_rather_than_violating() {
+        let mut s = api(Blocking::Yes, 1.0);
+        s.type_name = "uvicorn".into();
+        s.method = "run".into();
+        s.blocking_intent = BlockingIntent::ByDesign {
+            role: DesignRole::ServerMainLoop,
+        };
+        let (v, why) = spec_gate(Some(&s)).expect("a by-design spec decides on its own");
+        assert_eq!(v, Verdict::NotApplicable);
+        assert!(v.is_resolved(), "and it is a CONCLUSION, not an abstention");
+        assert!(why.starts_with(BY_DESIGN_PREFIX), "{why}");
+        assert_eq!(
+            by_design_label(&why),
+            Some("uvicorn.run (server main loop)")
+        );
+        assert!(why.contains("waiting is the contract"), "{why}");
+    }
+
+    /// The regression that matters most: the genuine defects must be
+    /// untouched. `requests` and `subprocess` carry no intent in the corpus,
+    /// so they must still fall through to the evidence search.
+    #[test]
+    fn the_genuine_defect_classes_still_reach_the_evidence_search() {
+        let cache = SpecCache::load(
+            r#"{"apis":[
+                 {"type":"requests","method":"post","blocking":"yes","bounded_by":["call_arg"],
+                  "confidence":1.0,"default_bound":{"kind":"none"}},
+                 {"type":"subprocess","method":"run","blocking":"yes","bounded_by":["call_arg"],
+                  "confidence":1.0,"default_bound":{"kind":"none"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        for (t, m) in [("requests", "post"), ("subprocess", "run")] {
+            let spec = cache.api(&(t.into(), m.into())).unwrap();
+            assert_eq!(spec.blocking_intent, BlockingIntent::Incidental);
+            assert_eq!(
+                spec_gate(Some(spec)),
+                None,
+                "{t}.{m} must still be decided from the evidence in the user's code"
+            );
+        }
+    }
+
+    /// Forward compatibility, and it fails in the SAFE direction. A newer
+    /// corpus can carry a kind or a role this binary has never heard of; both
+    /// must load, and both must leave the finding standing. An old binary may
+    /// print noise; it may never hide a defect.
+    #[test]
+    fn an_unreadable_intent_never_suppresses_and_never_fails_the_artifact() {
+        let cache = SpecCache::load(
+            r#"{"apis":[
+                 {"type":"a","method":"x","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"some_future_kind"}},
+                 {"type":"b","method":"x","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"by_design","role":"some_future_role"}},
+                 {"type":"c","method":"x","blocking":"yes","confidence":1.0,
+                  "blocking_intent":{"kind":"by_design"}}
+               ],"configs":[]}"#,
+        )
+        .expect("a future value must not take down the whole artifact");
+        for t in ["a", "b", "c"] {
+            let spec = cache.api(&(t.into(), "x".into())).unwrap();
+            assert_eq!(
+                spec.blocking_intent.by_design_role(),
+                None,
+                "{t}: an intent this binary cannot read must not suppress anything"
+            );
+            assert_eq!(spec_gate(Some(spec)), None, "{t}");
+        }
+    }
+
+    /// A spec too shaky to decide that the call blocks is too shaky to decide
+    /// WHY it blocks: it abstains and routes to an author, rather than
+    /// silently removing the class from the report.
+    #[test]
+    fn a_low_confidence_by_design_spec_abstains_rather_than_suppressing() {
+        let mut s = api(Blocking::Yes, 0.4);
+        s.blocking_intent = BlockingIntent::ByDesign {
+            role: DesignRole::ServerMainLoop,
+        };
+        let (v, why) = spec_gate(Some(&s)).unwrap();
+        assert_eq!(v, Verdict::Abstain);
+        assert_eq!(by_design_label(&why), None);
+    }
+
+    #[test]
+    fn merge_carries_the_winning_specs_blocking_intent() {
+        let mk = |confidence: f64, bi: BlockingIntent| SpecFile {
+            apis: vec![ApiSpec {
+                blocking_intent: bi,
+                ..api(Blocking::Yes, confidence)
+            }],
+            ..Default::default()
+        };
+        let by_design = BlockingIntent::ByDesign {
+            role: DesignRole::ServerMainLoop,
+        };
+        let mut base = SpecCache::from_file(mk(0.7, BlockingIntent::Incidental));
+        base.merge(SpecCache::from_file(mk(0.95, by_design)));
+        assert_eq!(
+            base.api(&("t".into(), "Do".into()))
+                .unwrap()
+                .blocking_intent,
+            by_design
+        );
+        base.merge(SpecCache::from_file(mk(0.5, BlockingIntent::Incidental)));
+        assert_eq!(
+            base.api(&("t".into(), "Do".into()))
+                .unwrap()
+                .blocking_intent,
+            by_design,
+            "a lower-confidence spec never displaces the winner's intent"
+        );
+    }
+
+    /// The reason string is a consumed contract (coverage bucketing reads it),
+    /// so the parser and the formatter are tested against each other.
+    #[test]
+    fn by_design_label_reads_back_only_a_by_design_reason() {
+        assert_eq!(
+            by_design_label("blocks by design: sys.stdout.write (stream write) \u{2014} waiting is the contract here, so no deadline is expected"),
+            Some("sys.stdout.write (stream write)")
+        );
+        assert_eq!(
+            by_design_label("no bound anywhere and the search was complete"),
+            None
+        );
+        assert_eq!(by_design_label("spec: run does not block"), None);
     }
 
     #[test]
