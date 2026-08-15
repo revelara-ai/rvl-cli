@@ -4415,3 +4415,388 @@ fn a_referenced_root_script_still_blocks() {
     );
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
+// --- the changed set comes from GIT, not from the packet index (po-sg7jb) ---
+
+/// A real git repo carrying a pre-existing BLOCKING finding (a hardcoded AWS
+/// key in a committed file) that the author is not touching. The content lane
+/// runs in-process on every warm scan, so this fixture blocks without needing
+/// a language helper, a spec cache or a judgment corpus — the gate contract is
+/// what is under test, not the detector.
+fn git_repo_with_pre_existing_blocking_finding(dir: &std::path::Path) -> std::path::PathBuf {
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"svc\"\n").unwrap();
+    std::fs::write(
+        root.join("legacy.py"),
+        "import requests\n\nAWS_KEY = \"AKIAZZ3RVLQ7SG7JBX2Q\"\n\n\ndef fetch(url):\n    \
+         return requests.get(url)\n",
+    )
+    .unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "seed"]);
+    root
+}
+
+fn stage(root: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A hook scan of that repo with `--changed-only` unset DOES block: proof the
+/// fixture's pre-existing finding is real, so the scoped runs below are
+/// passing because of the scope and not because there was nothing to find.
+#[test]
+fn the_fixtures_pre_existing_finding_really_blocks_an_unscoped_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args(["--incremental", "--specs-file"])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "fixture must carry a blocking finding: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE REGRESSION THAT MATTERS MOST (po-sg7jb): a COLD packet index plus one
+/// trivial staged file must gate on that file alone. Before this fix the
+/// changed set came from `plan_reload`, which on a cold index has no stored
+/// hash to compare against and therefore called every file changed — so the
+/// FIRST commit after installing the hook was blocked by the repository's
+/// entire pre-existing debt, at the exact moment the author decides whether
+/// to keep the hook.
+#[test]
+fn cold_index_gates_on_the_staged_file_only_not_the_whole_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("test.file"), "").unwrap();
+    stage(&root, &["add", "test.file"]);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    // No RVLSCAN_INDEX_DIR content anywhere: this is a first-ever hook run.
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a cold index must not gate on findings the author did not \
+         introduce:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("legacy.py"),
+        "an untouched file must not appear in a change-scoped ladder: {stdout}"
+    );
+    assert!(
+        stderr.contains("staged paths"),
+        "the scan must state that its scope came from git: {stderr}"
+    );
+}
+
+/// DETERMINISM ACROSS RUNS. The same command over identical code must reach
+/// the same verdict whether or not a previous run warmed the index. Before the
+/// fix run 1 blocked (cold index = everything changed) and run 2 passed
+/// (warm index = nothing changed) — the gate was a function of cache state.
+#[test]
+fn the_gate_verdict_is_identical_cold_and_warm() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("test.file"), "").unwrap();
+    stage(&root, &["add", "test.file"]);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let mut codes = Vec::new();
+    for _ in 0..2 {
+        let out = bin()
+            .arg("scan")
+            .arg(&root)
+            .args([
+                "--incremental",
+                "--changed-only",
+                "--hook",
+                "pre-commit",
+                "--specs-file",
+            ])
+            .arg(&specs)
+            // The SAME index dir both times: run 1 warms it, run 2 reuses it.
+            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+            .env("HOME", dir.path().join("home"))
+            .output()
+            .expect("failed to run rvlscan");
+        codes.push(out.status.code());
+    }
+    assert_eq!(
+        codes[0], codes[1],
+        "cold and warm runs over identical code must agree"
+    );
+    assert_eq!(codes[0], Some(0), "and both must be clean");
+}
+
+/// STAGED, NOT WORKING TREE. The offending file is present and dirty in the
+/// working tree but NOT staged, so it is not being committed and cannot block.
+#[test]
+fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    // Author stages a clean new file; the secret-bearing file is merely dirty.
+    std::fs::write(root.join("clean.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "clean.py"]);
+    std::fs::write(
+        root.join("legacy.py"),
+        "import requests\n\nAWS_KEY = \"AKIAZZ3RVLQ7SG7JBX2Q\"\n# unstaged edit\n",
+    )
+    .unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unstaged change is not part of the commit:\n{stdout}\n{stderr}"
+    );
+}
+
+/// PARTIAL STAGING, and the limit of this fix stated out loud. The staged hunk
+/// puts the file in scope; the retrievers still read WORKING-TREE bytes, so the
+/// unstaged hunk is judged too. That is a known gap — what the scan must never
+/// do is carry it silently, so it names the partially staged files.
+#[test]
+fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    // Further edit, deliberately NOT staged.
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("half.py") && stderr.contains("unstaged edits"),
+        "a partially staged file must be named, not silently judged on \
+         working-tree bytes: {stderr}"
+    );
+}
+
+/// PRE-PUSH picks up the commits in the pushed range, so a finding introduced
+/// by an unpushed commit blocks even though the working tree is clean — the
+/// case a staged-paths-only gate would report as "nothing changed".
+#[test]
+fn pre_push_gates_on_the_pushed_range_not_the_working_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    let remote = dir.path().join("remote.git");
+    stage(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+    stage(
+        &root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    stage(&root, &["push", "-q", "-u", "origin", "main"]);
+    // A committed-but-unpushed secret: clean working tree, dirty range.
+    std::fs::write(
+        root.join("new_leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "-A"]);
+    stage(&root, &["commit", "-qm", "leak"]);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-push",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("branch upstream"),
+        "pre-push must scope to the pushed range: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a secret in an unpushed commit must block the push:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("legacy.py"),
+        "and the already-pushed file must stay out of scope: {stdout}"
+    );
+}
+
+/// NOT A GIT REPO: refuse, loudly. Falling back to a whole-repo gate is the
+/// exact defect this fix removes, and silently reporting "nothing changed"
+/// would be a gate that passes everything. Exit 1 ("the scanner could not do
+/// what you asked"), never 0 and never EXIT_BLOCKED.
+#[test]
+fn changed_only_outside_a_git_repo_refuses_instead_of_gating_on_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"svc\"\n").unwrap();
+    std::fs::write(
+        root.join("legacy.py"),
+        "AWS_KEY = \"AKIAZZ3RVLQ7SG7JBX2Q\"\n",
+    )
+    .unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args(["--incremental", "--changed-only", "--specs-file"])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unanswerable scope must fail, not fall open or fall silent: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not determine the changed set from git"),
+        "and it must say why: {stderr}"
+    );
+}
+
+/// Without `--changed-only`, a scan outside a git work tree is unaffected: it
+/// was never claiming to be scoped, so it reports the whole repo as before.
+#[test]
+fn a_full_scan_outside_a_git_repo_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"svc\"\n").unwrap();
+    std::fs::write(
+        root.join("legacy.py"),
+        "AWS_KEY = \"AKIAZZ3RVLQ7SG7JBX2Q\"\n",
+    )
+    .unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args(["--incremental", "--specs-file"])
+        .arg(&specs)
+        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvlscan");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "unscoped scans must be unaffected by the git requirement: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

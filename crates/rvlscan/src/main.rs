@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 mod agent;
+mod changed;
 mod config_lane;
 mod devscope;
 mod doctor;
@@ -95,9 +96,14 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
         /// Report and gate ONLY on findings in the files this change touched
-        /// (po-av01j.127). Requires `--incremental`, which is where the changed
-        /// set comes from. Without it, `--incremental` is an index-reuse
-        /// optimization only: it re-retrieves just the changed files but still
+        /// (po-av01j.127). The changed set comes from GIT, never from the
+        /// packet index (po-sg7jb): staged paths under `--hook pre-commit`,
+        /// the pushed range under `--hook pre-push`, otherwise the working
+        /// tree against HEAD. Outside a git work tree the scan REFUSES rather
+        /// than widening to the whole repository. Requires `--incremental`,
+        /// which is the only path that implements the scoping. Without it,
+        /// `--incremental` is an index-reuse
+        /// optimization only: it re-retrieves just the stale files but still
         /// reports the WHOLE repo, so a one-file docs commit surfaces the same
         /// rows as a nine-file code commit. That is the right shape for a
         /// manual audit and the wrong one for a commit hook, where findings you
@@ -3053,11 +3059,16 @@ struct IncrementalScan {
     reused_files: usize,
     retrieved_files: usize,
     degraded_note: Option<String>,
-    /// Repo-relative paths of the files this pass considered CHANGED — the
-    /// delta the hook-mode agent adjudication lane is scoped to (po-av01j.15).
-    /// On a degraded pass the changed files were not retrieved, so they carry
-    /// no sites and the delta batch is naturally empty.
-    changed_files: Vec<String>,
+    /// Repo-relative paths this pass RE-PARSED because their content hash
+    /// differed from the index — a retrieval fact, nothing more.
+    ///
+    /// DELIBERATELY NOT THE GATE'S CHANGED SET (po-sg7jb). It used to be, and
+    /// that made `--changed-only` a function of cache state: a cold index has
+    /// nothing to compare against, so every file landed here and the gate
+    /// widened to the whole repository. The changed set now comes from git
+    /// (`changed::resolve`); this field survives only as the advisory fallback
+    /// for a scan that is not in a git work tree and did not ask to be scoped.
+    reparsed_files: Vec<String>,
     /// Languages whose helper abstained or failed during this pass
     /// (po-av01j.102). Distinct from `degraded_note`, which is about the wall
     /// budget: this is about a language contributing nothing at all.
@@ -3077,7 +3088,7 @@ where
     F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
 {
     let plan = index.plan_reload(candidates);
-    let changed_files: Vec<String> = plan
+    let reparsed_files: Vec<String> = plan
         .changed
         .iter()
         .map(|f| repo_relative(root, f))
@@ -3130,7 +3141,7 @@ where
         reused_files,
         retrieved_files,
         degraded_note: rr.degraded_note,
-        changed_files,
+        reparsed_files,
         // Filled in by the caller that owns the retriever handle; this function
         // is retriever-agnostic so a fake can drive it in tests.
         lang_degraded: Vec::new(),
@@ -3342,23 +3353,78 @@ fn run_scan_incremental(
     hook: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+
+    // THE CHANGED SET IS A GIT QUESTION (po-sg7jb). Resolved BEFORE the scan
+    // so an unanswerable one costs nothing, and never from the packet index:
+    // that index is a RETRIEVAL cache, and deriving "what changed" from it
+    // made a cold cache mean "everything changed" -- the whole repo's
+    // pre-existing findings gating the first commit after hook install.
+    let mode = changed::Mode::from_hook(hook);
+    let resolved = changed::resolve(path, mode);
+    if changed_only {
+        if let Err(e) = &resolved {
+            // REFUSE, do not widen. Falling back to a full-repo gate here
+            // would recreate the exact defect this fix removes, and a gate
+            // that lies about its scope is worse than no gate
+            // (cf. the --changed-only/--incremental guard in `run`).
+            anyhow::bail!(
+                "--changed-only: could not determine the changed set from git ({e:#}).\n  \
+                 Refusing rather than gating on the whole repository: --changed-only exists \
+                 so a commit is never failed over findings its author did not introduce.\n  \
+                 Re-run without --changed-only for a full advisory scan."
+            );
+        }
+    }
+
     let scan = incremental_scan_pass(index_dir, path, strict)?;
 
     // One-line reuse summary to stderr; the ladder itself goes to stdout.
+    // "re-parsed" is the honest word: it counts what the INDEX had to reload,
+    // which is independent of what the change touched.
     eprintln!(
-        "incremental: reused {} files from index, retrieved {} changed",
+        "incremental: reused {} files from index, re-parsed {} stale",
         scan.reused_files, scan.retrieved_files
     );
     if let Some(note) = &scan.degraded_note {
         eprintln!("incremental: degraded (fail-open): {note}");
     }
 
+    // The delta the gate and the agent lane are scoped to. Git when we have
+    // it; the index's re-parse list only as an advisory fallback outside a git
+    // work tree, which `changed_only` has already refused above.
+    let changed_files = match &resolved {
+        Ok(cs) => {
+            eprintln!("changed set: {} file(s) from {}", cs.files.len(), cs.source);
+            if !cs.dirty.is_empty() {
+                // KNOWN GAP, STATED OUT LOUD: the changed PATHS come from the
+                // git index, but the retrievers read working-tree bytes, so a
+                // partially staged file is judged in its working-tree form.
+                eprintln!(
+                    "note: {} staged file(s) also have unstaged edits ({}); \
+                     rvlscan reads working-tree content, so those hunks are \
+                     included in the judgment even though they are not being \
+                     committed",
+                    cs.dirty.len(),
+                    cs.dirty.join(", ")
+                );
+            }
+            cs.files.clone()
+        }
+        Err(e) => {
+            eprintln!(
+                "note: changed set unavailable from git ({e:#}); \
+                 falling back to the index's re-parse list for advisory scoping only"
+            );
+            scan.reparsed_files.clone()
+        }
+    };
+
     // SCOPE TO THE CHANGE, at the SITE level and before triage
     // (po-av01j.127). Filtering the rendered ladder instead would leave
     // class site_counts describing the whole repo and, worse, leave the exit
     // code derived from unscoped findings -- the printed verdict and the
     // process status diverging is exactly po-av01j.94.
-    let delta = changed_set(&scan.changed_files);
+    let delta = changed_set(&changed_files);
     let scan_sites = if changed_only {
         scan.sites
             .into_iter()
@@ -3435,7 +3501,7 @@ fn run_scan_incremental(
         agent::run_hook_adjudication(
             h,
             path,
-            &scan.changed_files,
+            &changed_files,
             &findings,
             &sites,
             &agent::telemetry_path_from_state(state_path),
@@ -4592,15 +4658,16 @@ fn run() -> anyhow::Result<ExitCode> {
                 agent_alias_notice();
             }
             let path = path.unwrap_or_else(|| PathBuf::from("."));
-            // --changed-only has no changed set to scope to without the
-            // incremental pass. Refuse rather than silently scanning the whole
-            // repo while the caller believes it is scoped -- a gate that lies
-            // about its scope is worse than no gate (po-av01j.127).
+            // Only the incremental path implements change scoping. Refuse
+            // rather than silently scanning the whole repo while the caller
+            // believes it is scoped -- a gate that lies about its scope is
+            // worse than no gate (po-av01j.127). (The changed set itself comes
+            // from git, not from the incremental pass -- po-sg7jb.)
             anyhow::ensure!(
                 !changed_only || (incremental && retrieved.is_none()),
                 "--changed-only requires --incremental (and is incompatible with --retrieved): \
-                 the changed-file set comes from the incremental pass, so there is nothing to \
-                 scope to without it"
+                 change scoping is implemented on the incremental path only, so there is \
+                 nothing to scope to without it"
             );
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
