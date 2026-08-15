@@ -10,7 +10,7 @@ decides nothing about reliability, it only says what the code is.
 
 Install once with `npm install` (its only dependency is `typescript`). rvl
 invokes it as `node tsindex.js …`, the same way it runs `pyindex.py` under
-`python3`; helper discovery is env override (`RVLSCAN_TSINDEX`) → a helper next
+`python3`; helper discovery is env override (`RVL_TSINDEX`) → a helper next
 to the rvl binary → `PATH`.
 
 ## What it emits

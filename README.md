@@ -36,7 +36,7 @@ concatenate their packets.
 
 Helpers are discovered in this order:
 
-1. an env override — `RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / … (path to the
+1. an env override — `RVL_GOINDEX` / `RVL_PYINDEX` / … (path to the
    helper binary, or, for Python, the `pyindex.py` script);
 2. a helper packaged with the binary — next to `rvl`, or in the
    `share/rvl` directory a package manager files an archive's non-binary
@@ -53,7 +53,7 @@ slots answered (`env:VAR` / `bundled` / `embedded` / `installed` / `PATH`), so a
 stale helper shadowing a fresh one is visible.
 
 Slot 4 is why no install instruction in this tool ends with "now export
-`RVLSCAN_…`": every command it suggests writes somewhere resolution already
+`RVL_…`": every command it suggests writes somewhere resolution already
 looks, so building the helper *is* installing it.
 
 ### First run: `rvl doctor`
@@ -78,7 +78,7 @@ before it runs: extract the embedded helpers, `npm install` the **pinned**
 `typescript` into the helper dir, build `csindex` when a .NET SDK and the
 project source are both already present, and refresh the spec cache when
 credentials are already configured. Anything needing a system package manager
-or `sudo` is printed, never run, and `RVLSCAN_OFFLINE=1` stops it reaching the
+or `sudo` is printed, never run, and `RVL_OFFLINE=1` stops it reaching the
 network. Re-running `--fix` on a healthy machine does nothing.
 
 Exit codes: `0` everything this repo needs is in place, `1` a gap remains, `2`
@@ -113,7 +113,7 @@ directory is a location rvl searches:
 The embedded scripts are written to `~/.revelara/helpers/<rvl version>/` on
 first use, and rewritten whenever their contents no longer hash to the embedded
 text — so an edited or truncated copy heals instead of silently scanning wrong.
-`RVLSCAN_HELPER_DIR` relocates that directory.
+`RVL_HELPER_DIR` relocates that directory.
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape
 hatch:
@@ -172,7 +172,7 @@ rvl skills status             # installed vs served versions (drift)
 Content is served by the Revelara plugin system (the same content
 `rvl plugin install` ships), verified (transport checksum + signed integrity
 manifest), and cached under `~/.revelara/cache/skills` so installs keep
-working offline (`RVLSCAN_OFFLINE=1` or network failure fall back to the
+working offline (`RVL_OFFLINE=1` or network failure fall back to the
 verified cached copy). This surface only downloads; it never uploads
 anything.
 

@@ -2,8 +2,8 @@
 #
 # The scanner binary discovers its language retriever helpers (goindex,
 # pyindex, tsindex, javaindex, rustindex) at runtime in this order: an env
-# override (RVLSCAN_GOINDEX / RVLSCAN_PYINDEX / RVLSCAN_TSINDEX /
-# RVLSCAN_JAVAINDEX / RVLSCAN_RUSTINDEX), then a helper sitting NEXT TO the
+# override (RVL_GOINDEX / RVL_PYINDEX / RVL_TSINDEX / RVL_JAVAINDEX /
+# RVL_RUSTINDEX), then a helper sitting NEXT TO the
 # rvl binary, then the copy the binary CARRIES and extracts to
 # ~/.revelara/helpers/<version>/, then PATH.
 #
@@ -97,7 +97,7 @@ helpers: build
 ## helpers-csindex: build the C# retriever (needs a .NET 8 SDK + NuGet for Roslyn)
 helpers-csindex:
 	dotnet build helpers/csindex -c Release -o $(BIN_DIR)/csindex-build
-	@echo "csindex built; C# scanning works via RVLSCAN_CSINDEX=$(abspath $(BIN_DIR))/csindex-build/csindex.dll"
+	@echo "csindex built; C# scanning works via RVL_CSINDEX=$(abspath $(BIN_DIR))/csindex-build/csindex.dll"
 
 ## dev: build the binary and its helpers for local zero-env `rvl scan`
 dev: helpers

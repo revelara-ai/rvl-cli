@@ -60,7 +60,7 @@ Build requires a .NET 8 SDK and NuGet access for the Roslyn package:
 dotnet build -c Release
 ```
 
-rvl discovers the helper via `RVLSCAN_CSINDEX` (pointing at either a
+rvl discovers the helper via `RVL_CSINDEX` (pointing at either a
 published `csindex` executable or a framework-dependent `csindex.dll`, which
 runs under `dotnet`), a `csindex`/`csindex.dll` adjacent to the rvl
 binary, or `PATH`.

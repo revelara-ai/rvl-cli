@@ -148,7 +148,7 @@ pub struct CacheStore {
 /// Outcome of a sync attempt. Sync never fails a scan.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SyncOutcome {
-    /// RVLSCAN_OFFLINE=1: no fetch attempted.
+    /// RVL_OFFLINE=1: no fetch attempted.
     Offline,
     /// Hash-conditional GET returned not-modified.
     UpToDate,

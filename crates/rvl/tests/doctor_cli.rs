@@ -50,21 +50,20 @@ fn doctor(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> std::process::
         .arg(repo)
         .args(args)
         .env("HOME", home)
-        .env("RVLSCAN_CACHE_DIR", home.join("cache"))
-        .env("RVLSCAN_OFFLINE", "1");
+        .env("RVL_CACHE_DIR", home.join("cache"))
+        .env("RVL_OFFLINE", "1");
     for var in [
-        "RVLSCAN_GOINDEX",
-        "RVLSCAN_PYINDEX",
-        "RVLSCAN_RUSTINDEX",
-        "RVLSCAN_TSINDEX",
-        "RVLSCAN_CSINDEX",
-        "RVLSCAN_JAVAINDEX",
-        "RVLSCAN_CINDEX",
-        "RVLSCAN_HELPER_DIR",
+        "RVL_GOINDEX",
+        "RVL_PYINDEX",
+        "RVL_RUSTINDEX",
+        "RVL_TSINDEX",
+        "RVL_CSINDEX",
+        "RVL_JAVAINDEX",
+        "RVL_CINDEX",
+        "RVL_HELPER_DIR",
         "RVL_API_KEY",
         "RVL_API_URL",
-        "RVLSCAN_ORG_KEY",
-        "RVLSCAN_SRC",
+        "RVL_SRC",
     ] {
         cmd.env_remove(var);
     }
@@ -131,13 +130,13 @@ fn a_bare_machine_is_told_every_gap_with_a_command() {
     }
     // csindex is the deliberate manual step, and its gap must carry the one
     // command that closes it — landing in the dir resolution already searches,
-    // never "and now export RVLSCAN_CSINDEX".
+    // never "and now export RVL_CSINDEX".
     assert!(
         stdout.contains("csindex") && stdout.contains("dotnet"),
         "the C# gap must name the dotnet build: {stdout}"
     );
     assert!(
-        !stdout.contains("RVLSCAN_CSINDEX"),
+        !stdout.contains("RVL_CSINDEX"),
         "a hint that names a canonical path must not also demand an env var: {stdout}"
     );
     // No spec cache is a gap, not a silent zero.
@@ -258,8 +257,8 @@ fn a_missing_runtime_degrades_only_its_own_lane() {
         .arg(&repo)
         .env("HOME", &home)
         .env("PATH", &empty)
-        .env("RVLSCAN_CACHE_DIR", home.join("cache"))
-        .env("RVLSCAN_OFFLINE", "1");
+        .env("RVL_CACHE_DIR", home.join("cache"))
+        .env("RVL_OFFLINE", "1");
     let stdout = String::from_utf8(run(&mut cmd).stdout).unwrap();
 
     let go_row = stdout
@@ -349,7 +348,7 @@ fn fix_prints_rather_than_runs_what_it_may_not_do() {
     let out = doctor(&bin, &repo, &home, &["--fix"]);
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("RVLSCAN_OFFLINE=1"),
+        stderr.contains("RVL_OFFLINE=1"),
         "the refusal must say why: {stderr}"
     );
     // The pinned install is printed verbatim, pin included: a bare

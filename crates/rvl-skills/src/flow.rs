@@ -22,12 +22,12 @@ pub struct Env<'a> {
     pub store: &'a SkillsStore,
     pub fetcher: &'a dyn Fetcher,
     pub home: &'a Path,
-    /// RVLSCAN_OFFLINE=1: no fetch attempted, cache-only.
+    /// RVL_OFFLINE=1: no fetch attempted, cache-only.
     pub offline: bool,
-    /// RVLSCAN_ALLOW_UNSIGNED=1: accept content without a verifiable
+    /// RVL_ALLOW_UNSIGNED=1: accept content without a verifiable
     /// integrity manifest (self-hosted servers without signing).
     pub allow_unsigned: bool,
-    /// RVLSCAN_ALLOW_MISSING_CHECKSUM=1: accept a download without the
+    /// RVL_ALLOW_MISSING_CHECKSUM=1: accept a download without the
     /// X-Checksum transport header.
     pub allow_missing_checksum: bool,
 }
@@ -83,7 +83,7 @@ fn check_cached_signature(
             Ok(())
         }
         None => anyhow::bail!(
-            "cached skills for {editor} carry no signing key; set RVLSCAN_ALLOW_UNSIGNED=1 \
+            "cached skills for {editor} carry no signing key; set RVL_ALLOW_UNSIGNED=1 \
              to install them anyway, or re-run online against a signing-enabled server"
         ),
     }
@@ -124,7 +124,7 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
             warnings.push("server did not send X-Checksum (allowed by env)".to_string());
         }
         None => anyhow::bail!(
-            "server did not send X-Checksum header; set RVLSCAN_ALLOW_MISSING_CHECKSUM=1 \
+            "server did not send X-Checksum header; set RVL_ALLOW_MISSING_CHECKSUM=1 \
              to install anyway"
         ),
     }
@@ -139,12 +139,12 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
         }
         Err(e) if env.allow_unsigned => {
             warnings.push(format!(
-                "installing without signature verification (RVLSCAN_ALLOW_UNSIGNED=1): {e}"
+                "installing without signature verification (RVL_ALLOW_UNSIGNED=1): {e}"
             ));
         }
         Err(e) => anyhow::bail!(
             "could not fetch signing key for integrity verification: {e}; \
-             set RVLSCAN_ALLOW_UNSIGNED=1 to install unsigned content"
+             set RVL_ALLOW_UNSIGNED=1 to install unsigned content"
         ),
     }
 
@@ -173,8 +173,8 @@ fn acquire(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
     if env.offline {
         return acquire_from_cache(env, editor)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "offline (RVLSCAN_OFFLINE=1) and no cached skills for {editor}; \
-                 unset RVLSCAN_OFFLINE and re-run once online to seed the cache"
+                "offline (RVL_OFFLINE=1) and no cached skills for {editor}; \
+                 unset RVL_OFFLINE and re-run once online to seed the cache"
             )
         });
     }
@@ -262,7 +262,7 @@ pub fn remove_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<RemoveRepo
 pub fn editors(env: &Env) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
     anyhow::ensure!(
         !env.offline,
-        "offline (RVLSCAN_OFFLINE=1): the editors listing is served by the Revelara API"
+        "offline (RVL_OFFLINE=1): the editors listing is served by the Revelara API"
     );
     env.fetcher.fetch_editors()
 }
@@ -308,7 +308,7 @@ pub struct StatusReport {
 /// installed/cached information plus a note.
 pub fn status(env: &Env) -> StatusReport {
     let (served_version, server_note) = if env.offline {
-        (None, Some("offline (RVLSCAN_OFFLINE=1)".to_string()))
+        (None, Some("offline (RVL_OFFLINE=1)".to_string()))
     } else {
         match env.fetcher.fetch_version() {
             Ok(v) => (Some(v), None),
@@ -624,10 +624,7 @@ mod tests {
 
         let env = fx.env(&store, &fetcher);
         let err = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
-        assert!(
-            err.to_string().contains("RVLSCAN_ALLOW_UNSIGNED"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("RVL_ALLOW_UNSIGNED"), "got: {err}");
 
         let mut env = fx.env(&store, &fetcher);
         env.allow_unsigned = true;

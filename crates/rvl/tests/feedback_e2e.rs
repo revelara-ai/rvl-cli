@@ -99,8 +99,6 @@ fn bin(server: &MockServer, home: &std::path::Path) -> Command {
     cmd.env("HOME", home)
         .env("RVL_API_KEY", "pk_e2e_key")
         .env("RVL_API_URL", &server.base_url)
-        .env_remove("RVLSCAN_ORG_KEY")
-        .env_remove("RVLSCAN_API_BASE")
         .env_remove("RVL_ORG_NAME")
         .current_dir(home);
     cmd

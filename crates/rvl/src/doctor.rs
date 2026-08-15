@@ -478,13 +478,13 @@ fn apply_fixes(root: &Path) {
     let langs = detect_languages(root);
     let cfg = Config::from_env();
     let mut acted = false;
-    // RVLSCAN_OFFLINE is the binary's kill switch for reaching the network,
+    // RVL_OFFLINE is the binary's kill switch for reaching the network,
     // and it binds here too: an npm install and a spec-cache sync are both
     // fetches. An operator who set it meant it, so those two repairs are
     // PRINTED instead. Extraction and the csindex build are purely local and
     // still run.
     if cfg.offline {
-        eprintln!("doctor --fix: RVLSCAN_OFFLINE=1, so no repair will reach the network");
+        eprintln!("doctor --fix: RVL_OFFLINE=1, so no repair will reach the network");
     }
 
     // (1) Materialize the scripted retrievers this binary carries. `ensure` is
@@ -630,7 +630,7 @@ fn csindex_install_dir() -> PathBuf {
 /// `brew install` case, where the honest answer is to print the clone command.
 fn csindex_project_dir() -> Option<PathBuf> {
     let mut starts: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("RVLSCAN_SRC") {
+    if let Some(dir) = std::env::var_os("RVL_SRC") {
         starts.push(PathBuf::from(dir));
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -802,10 +802,10 @@ mod tests {
     fn the_csindex_build_lands_where_resolution_already_looks() {
         // The whole point of po-aml3h's fourth slot: the build IS the install,
         // so the command must target the canonical dir and never end in "now
-        // export RVLSCAN_CSINDEX=...".
+        // export RVL_CSINDEX=...".
         let cmd = csindex_build_command(Path::new("/src/helpers/csindex"));
         assert!(cmd.contains(".revelara/helpers/csindex"), "{cmd}");
-        assert!(!cmd.contains("RVLSCAN_CSINDEX"), "{cmd}");
+        assert!(!cmd.contains("RVL_CSINDEX"), "{cmd}");
     }
 
     #[test]

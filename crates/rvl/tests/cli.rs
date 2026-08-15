@@ -41,7 +41,7 @@ fn cache_status_reports_empty_store() {
     let dir = tempfile::tempdir().unwrap();
     let out = bin()
         .args(["cache", "status"])
-        .env("RVLSCAN_CACHE_DIR", dir.path())
+        .env("RVL_CACHE_DIR", dir.path())
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -57,8 +57,8 @@ fn sync_respects_offline_kill_switch() {
     let dir = tempfile::tempdir().unwrap();
     let out = bin()
         .arg("sync")
-        .env("RVLSCAN_CACHE_DIR", dir.path())
-        .env("RVLSCAN_OFFLINE", "1")
+        .env("RVL_CACHE_DIR", dir.path())
+        .env("RVL_OFFLINE", "1")
         .output()
         .expect("failed to run rvl");
     assert!(out.status.success(), "offline sync is a successful no-op");
@@ -74,7 +74,7 @@ fn cache_import_refuses_missing_signature() {
     let out = bin()
         .args(["cache", "import"])
         .arg(&art)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -117,7 +117,7 @@ fn scan_with_specs_file_emits_findings_and_coverage() {
         .arg(&specs)
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -162,7 +162,7 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
     let out = bin()
         .args(["scan", "--retrieved"])
         .arg(&packets)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("empty-cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -227,8 +227,8 @@ fn scan_without_retrieved_runs_the_go_helper() {
         .arg(&fixture)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -265,8 +265,8 @@ fn scan_errors_with_guidance_when_a_needed_retriever_is_absent() {
     let out = bin()
         .arg("scan")
         .arg(&target)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env_remove("RVLSCAN_GOINDEX")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env_remove("RVL_GOINDEX")
         .env("PATH", "/nonexistent")
         .output()
         .expect("failed to run rvl");
@@ -280,7 +280,7 @@ fn scan_errors_with_guidance_when_a_needed_retriever_is_absent() {
         "the error must name the language: {stderr}"
     );
     assert!(
-        stderr.contains("RVLSCAN_ALLOW_MISSING_HELPERS"),
+        stderr.contains("RVL_ALLOW_MISSING_HELPERS"),
         "and it must name the deliberate escape hatch: {stderr}"
     );
 }
@@ -297,7 +297,7 @@ fn an_empty_dir_no_longer_fails_for_having_no_source() {
     let out = bin()
         .arg("scan")
         .arg(&target)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -325,7 +325,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     let out = bin()
         .arg("scan")
         .arg(&repo)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -364,7 +364,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     let out2 = bin()
         .arg("scan")
         .arg(&repo)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout2 = String::from_utf8(out2.stdout).unwrap();
@@ -415,7 +415,7 @@ fn blocking_scan_exits_with_the_blocked_code_not_zero() {
     let out = bin()
         .arg("scan")
         .arg(&repo)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -458,7 +458,7 @@ fn advisory_only_scan_exits_zero() {
         .arg(&packets_path)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -536,7 +536,7 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
         .arg(&specs)
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -604,7 +604,7 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
         .arg(&packets_path)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -622,8 +622,8 @@ fn index_status_reports_empty_then_populated() {
     let dir = tempfile::tempdir().unwrap();
     let out = bin()
         .args(["index", "status"])
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .output()
         .expect("run rvl");
     assert!(
@@ -641,8 +641,8 @@ fn index_init_indexes_packets_from_a_stream() {
     let out = bin()
         .args(["index", "init", "--retrieved"])
         .arg(&packets)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .output()
         .expect("run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -656,8 +656,8 @@ fn index_init_indexes_packets_from_a_stream() {
     // status now reflects the indexed files
     let out = bin()
         .args(["index", "status"])
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .output()
         .expect("run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -682,7 +682,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -757,9 +757,9 @@ fn index_reindex_live_mode_runs_the_go_helper() {
     let out = bin()
         .args(["index", "reindex"])
         .arg(&fixture)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -777,8 +777,8 @@ fn index_reindex_live_mode_runs_the_go_helper() {
     // background warm actually landed packets.
     let status = bin()
         .args(["index", "status"])
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let status_out = String::from_utf8(status.stdout).unwrap();
@@ -792,9 +792,9 @@ fn index_reindex_live_mode_runs_the_go_helper() {
     let again = bin()
         .args(["index", "reindex"])
         .arg(&fixture)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let again_out = String::from_utf8(again.stdout).unwrap();
@@ -819,9 +819,9 @@ fn index_reindex_detach_returns_immediately_and_child_indexes() {
     let out = bin()
         .args(["index", "reindex", "--detach"])
         .arg(&fixture)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let parent_elapsed = started.elapsed();
@@ -855,8 +855,8 @@ fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, se
     loop {
         let status = bin()
             .args(["index", "status"])
-            .env("RVLSCAN_INDEX_DIR", index_dir)
-            .env("RVLSCAN_CACHE_DIR", cache_dir)
+            .env("RVL_INDEX_DIR", index_dir)
+            .env("RVL_CACHE_DIR", cache_dir)
             .output()
             .expect("failed to run rvl");
         if status.status.success() {
@@ -912,9 +912,9 @@ fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
     let out = bin()
         .args(["index", "reindex", "--detach"])
         .arg(&fixture)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_INDEX_DIR", &index_dir)
-        .env("RVLSCAN_CACHE_DIR", &cache_dir)
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_INDEX_DIR", &index_dir)
+        .env("RVL_CACHE_DIR", &cache_dir)
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -983,7 +983,7 @@ fn scan_runs_the_config_lane_and_reports_config_coverage() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1035,7 +1035,7 @@ fn config_findings_are_waivable_by_format_key_rule() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1087,7 +1087,7 @@ fn scan_runs_the_dep_manifests_family_with_seed_specs() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .env("RVL_CACHE_DIR", root.join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1171,7 +1171,7 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1258,7 +1258,7 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1333,7 +1333,7 @@ fn declared_bound_converts_finding_to_satisfies_with_provenance() {
             .arg(&specs)
             .arg("--out")
             .arg(&out_path)
-            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
             .output()
             .expect("failed to run rvl");
         assert!(
@@ -1409,7 +1409,7 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
         .arg(&specs)
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -1463,7 +1463,7 @@ fn scan_fixture_findings(
         .arg(background_jobs_specs())
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.join("cache"));
+        .env("RVL_CACHE_DIR", dir.join("cache"));
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -1507,7 +1507,7 @@ fn scan_decides_go_background_job_sites_end_to_end() {
     let rows = scan_fixture_findings(
         dir.path(),
         &helper_fixture("goindex"),
-        &[("RVLSCAN_GOINDEX", goindex_bin.as_os_str())],
+        &[("RVL_GOINDEX", goindex_bin.as_os_str())],
     );
     let jobs = verdicts_for(&rows, "jobs.go");
     assert!(
@@ -1588,7 +1588,7 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
         .arg(&specs)
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1683,10 +1683,10 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
         .arg("--out")
         .arg(&out_path)
         .env(
-            "RVLSCAN_PYINDEX",
+            "RVL_PYINDEX",
             helpers_dir().join("pyindex").join("pyindex.py"),
         )
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -1738,7 +1738,7 @@ fn scan_decides_python_background_job_sites_end_to_end() {
     let rows = scan_fixture_findings(
         dir.path(),
         &helper_fixture("pyindex"),
-        &[("RVLSCAN_PYINDEX", pyindex.as_os_str())],
+        &[("RVL_PYINDEX", pyindex.as_os_str())],
     );
     let jobs = verdicts_for(&rows, "jobs.py");
     assert!(
@@ -1784,7 +1784,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
     let rows = scan_fixture_findings(
         dir.path(),
         &helper_fixture("tsindex"),
-        &[("RVLSCAN_TSINDEX", tsindex_js.as_os_str())],
+        &[("RVL_TSINDEX", tsindex_js.as_os_str())],
     );
     let jobs = verdicts_for(&rows, "jobs.ts");
     assert!(
@@ -1834,7 +1834,7 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
 }
 
 /// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
-/// compile_commands.json, helper via RVLSCAN_CINDEX), the seed specs judge
+/// compile_commands.json, helper via RVL_CINDEX), the seed specs judge
 /// the C identities, and the judgments map the surfaced classes to RC-019 /
 /// RC-022 on the ladder. The macro-wrapped perform site flows through the
 /// pipeline like any other — the v2 macro flag is packet evidence, never a
@@ -1863,8 +1863,8 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         .arg(fixtures.join("c_seed_judgments.json"))
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CINDEX", &cindex)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1931,8 +1931,8 @@ fn live_go_scan_surfaces_g4_emission_findings() {
         .arg(goindex_fixture())
         .arg("--specs-file")
         .arg(g4_seed_specs())
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1967,8 +1967,8 @@ fn live_py_scan_surfaces_g4_emission_findings() {
         .arg(&fixture)
         .arg("--specs-file")
         .arg(g4_seed_specs())
-        .env("RVLSCAN_PYINDEX", &pyindex)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_PYINDEX", &pyindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2012,8 +2012,8 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
         .arg(tsdir.join("testdata").join("fixture"))
         .arg("--specs-file")
         .arg(g4_seed_specs())
-        .env("RVLSCAN_TSINDEX", tsdir.join("tsindex.js"))
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_TSINDEX", tsdir.join("tsindex.js"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2079,8 +2079,8 @@ fn scan_decides_java_sites_end_to_end() {
         .arg(java_seed_specs())
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_JAVAINDEX", &javaindex)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -2135,8 +2135,8 @@ fn live_java_scan_surfaces_g4_emission_findings() {
         .arg(helper_fixture("javaindex"))
         .arg("--specs-file")
         .arg(java_seed_specs())
-        .env("RVLSCAN_JAVAINDEX", &javaindex)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2219,8 +2219,8 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .arg(&fixture)
         .arg("--specs-file")
         .arg(rust_seed_specs())
-        .env("RVLSCAN_RUSTINDEX", &rustindex)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_RUSTINDEX", &rustindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2263,7 +2263,7 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
         .arg(&packets_path)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2306,7 +2306,7 @@ fn copy_fixture_to(dst: &std::path::Path) {
 }
 
 /// End-to-end hook lane: with EVERY consent layer on and a stub agent
-/// (RVLSCAN_AGENT_CMD), an incremental hook scan makes ONE batched invocation
+/// (RVL_AGENT_CMD), an incremental hook scan makes ONE batched invocation
 /// over the delta's undecided sites, renders the provenance-tagged AGENT
 /// block, and records identity-only telemetry locally. The stub replies `[]`
 /// (a valid, empty verdict set), so every site stays undecided and the
@@ -2353,10 +2353,10 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
         .arg(&repo)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
-        .env("RVLSCAN_AGENT_CMD", &stub)
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_AGENT_CMD", &stub)
         .env("HOME", &home)
         .output()
         .expect("failed to run rvl");
@@ -2410,9 +2410,9 @@ fn hook_scan_without_consent_stays_deterministic_only() {
         .arg(&repo)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_GOINDEX", &goindex_bin)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", &home)
         .output()
         .expect("failed to run rvl");
@@ -2486,7 +2486,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2594,7 +2594,7 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2724,7 +2724,7 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
         .arg(csharp_seed_specs())
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2827,8 +2827,8 @@ fn scan_decides_csharp_sites_end_to_end() {
         .arg(csharp_seed_specs())
         .arg("--out")
         .arg(&out_path)
-        .env("RVLSCAN_CSINDEX", &csindex_dll)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CSINDEX", &csindex_dll)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2906,7 +2906,7 @@ fn report_payload_names_each_surface_language_and_never_carries_source() {
         .arg("--specs-file")
         .arg(&specs)
         .arg("--json")
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2973,7 +2973,7 @@ fn generated_files_are_excluded_and_the_exclusion_is_reported() {
     repo_with_a_generated_file(dir.path());
     let out = bin()
         .args(["scan", dir.path().to_str().unwrap()])
-        .env("RVLSCAN_ALLOW_MISSING_HELPERS", "1")
+        .env("RVL_ALLOW_MISSING_HELPERS", "1")
         .output()
         .expect("failed to run rvl");
     if !scan_reached_a_verdict(&out) {
@@ -3008,7 +3008,7 @@ fn a_generated_banner_is_matched_by_evidence_not_by_path() {
     );
     let out = bin()
         .args(["scan", dir.path().to_str().unwrap()])
-        .env("RVLSCAN_ALLOW_MISSING_HELPERS", "1")
+        .env("RVL_ALLOW_MISSING_HELPERS", "1")
         .output()
         .expect("failed to run rvl");
     if !scan_reached_a_verdict(&out) {
@@ -3573,7 +3573,7 @@ fn plain_scan_stays_deterministic_and_never_submits() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -3628,7 +3628,7 @@ fn plugin_agents_json_contract_reads_installed_claude_agents() {
     let out = bin()
         .args(["plugin", "agents", "--json"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", &cache)
+        .env("RVL_SKILLS_CACHE_DIR", &cache)
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -3672,7 +3672,7 @@ fn plugin_agents_json_emits_empty_contract_when_nothing_installed() {
     let out = bin()
         .args(["plugin", "agents", "--json"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .output()
         .expect("failed to run rvl");
     assert!(out.status.success(), "empty JSON listing must exit 0");
@@ -3695,8 +3695,8 @@ fn plugin_editors_degrades_to_builtin_list_offline() {
     let out = bin()
         .args(["plugin", "editors"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
-        .env("RVLSCAN_OFFLINE", "1")
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_OFFLINE", "1")
         .output()
         .expect("failed to run rvl");
     assert!(out.status.success());
@@ -3717,7 +3717,7 @@ fn plugin_remove_yes_is_idempotent_for_claude() {
     let out = bin()
         .args(["plugin", "remove", "claude", "--yes"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .env("PATH", "")
         .output()
         .expect("failed to run rvl");
@@ -3769,7 +3769,7 @@ fn plugin_agents_json_falls_back_to_v1_rvl_cli_records() {
     let out = bin()
         .args(["plugin", "agents", "--json"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -3800,8 +3800,8 @@ fn plugin_list_surfaces_v1_installs_marked_as_rvl_cli() {
     let out = bin()
         .args(["plugin", "list"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
-        .env("RVLSCAN_OFFLINE", "1")
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_OFFLINE", "1")
         .output()
         .expect("failed to run rvl");
     assert!(out.status.success());
@@ -3836,8 +3836,8 @@ fn plugin_update_targets_v1_recorded_installs_for_adoption() {
     let out = bin()
         .args(["plugin", "update"])
         .env("HOME", &home)
-        .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
-        .env("RVLSCAN_OFFLINE", "1")
+        .env("RVL_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
+        .env("RVL_OFFLINE", "1")
         .env("PATH", "")
         .output()
         .expect("failed to run rvl");
@@ -3865,9 +3865,7 @@ fn config_bin(home: &std::path::Path) -> Command {
     cmd.env("HOME", home)
         .env_remove("RVL_API_KEY")
         .env_remove("RVL_API_URL")
-        .env_remove("RVL_ORG_NAME")
-        .env_remove("RVLSCAN_ORG_KEY")
-        .env_remove("RVLSCAN_API_BASE");
+        .env_remove("RVL_ORG_NAME");
     cmd
 }
 
@@ -4005,7 +4003,7 @@ fn deterministic_scan_rejects_each_submission_only_flag() {
             cmd.arg(v);
         }
         let out = cmd
-            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
             .env("HOME", dir.path())
             .output()
             .expect("failed to run rvl");
@@ -4039,7 +4037,7 @@ fn the_stray_flag_error_precedes_the_spec_cache_check() {
         .args(["--team", "backend-team"])
         // An empty cache dir: a plain scan here exits 1 with "no verifiable
         // spec cache". The usage error must win.
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .env("HOME", dir.path())
         .output()
         .expect("failed to run rvl");
@@ -4057,7 +4055,7 @@ fn a_plain_deterministic_scan_is_unchanged() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
         .output()
         .expect("failed to run rvl");
     assert!(
@@ -4164,7 +4162,7 @@ fn judged_findings_block_the_commit_and_exit_3() {
         .arg(&specs)
         .arg("--judgments")
         .arg(&judgments)
-        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .env("RVL_CACHE_DIR", root.join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -4195,7 +4193,7 @@ fn unjudged_findings_stay_advisory_and_exit_0() {
         .arg(&packets)
         .arg("--specs-file")
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .env("RVL_CACHE_DIR", root.join("cache"))
         .output()
         .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -4229,7 +4227,7 @@ fn the_judgments_override_is_loudly_announced() {
         .arg(&specs)
         .arg("--judgments")
         .arg(&judgments)
-        .env("RVLSCAN_CACHE_DIR", root.join("cache"))
+        .env("RVL_CACHE_DIR", root.join("cache"))
         .output()
         .expect("failed to run rvl");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -4338,7 +4336,7 @@ fn scan_fixture(
         .arg(specs)
         .arg("--judgments")
         .arg(root.parent().unwrap().join("judgments.json"))
-        .env("RVLSCAN_CACHE_DIR", root.parent().unwrap().join("cache"))
+        .env("RVL_CACHE_DIR", root.parent().unwrap().join("cache"))
         .output()
         .expect("failed to run rvl");
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -4483,8 +4481,8 @@ fn the_fixtures_pre_existing_finding_really_blocks_an_unscoped_scan() {
         .arg(&root)
         .args(["--incremental", "--specs-file"])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4513,7 +4511,7 @@ fn cold_index_gates_on_the_staged_file_only_not_the_whole_repo() {
     let specs = dir.path().join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
 
-    // No RVLSCAN_INDEX_DIR content anywhere: this is a first-ever hook run.
+    // No RVL_INDEX_DIR content anywhere: this is a first-ever hook run.
     let out = bin()
         .arg("scan")
         .arg(&root)
@@ -4525,8 +4523,8 @@ fn cold_index_gates_on_the_staged_file_only_not_the_whole_repo() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4575,8 +4573,8 @@ fn the_gate_verdict_is_identical_cold_and_warm() {
             ])
             .arg(&specs)
             // The SAME index dir both times: run 1 warms it, run 2 reuses it.
-            .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-            .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
             .env("HOME", dir.path().join("home"))
             .output()
             .expect("failed to run rvl");
@@ -4617,8 +4615,8 @@ fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4657,8 +4655,8 @@ fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4706,8 +4704,8 @@ fn pre_push_gates_on_the_pushed_range_not_the_working_tree() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4751,8 +4749,8 @@ fn changed_only_outside_a_git_repo_refuses_instead_of_gating_on_everything() {
         .arg(&root)
         .args(["--incremental", "--changed-only", "--specs-file"])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");
@@ -4789,8 +4787,8 @@ fn a_full_scan_outside_a_git_repo_still_works() {
         .arg(&root)
         .args(["--incremental", "--specs-file"])
         .arg(&specs)
-        .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
-        .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
         .expect("failed to run rvl");

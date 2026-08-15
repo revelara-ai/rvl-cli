@@ -17,7 +17,7 @@ through `ToolProvider.getSystemJavaCompiler()` — `JavacTask.parse()` +
 `.java` source file run in **JEP 330 source-file mode** (`java
 javaindex.java …`): in-memory compile, no build step, no dependency jars, the
 same scripted-helper shape as `pyindex.py` under `python3` and `tsindex.js`
-under `node`. Discovery is env override (`RVLSCAN_JAVAINDEX`) → a
+under `node`. Discovery is env override (`RVL_JAVAINDEX`) → a
 `javaindex.java` next to the rvl binary → `PATH`.
 
 Rejected alternatives: Eclipse JDT (a dependency jar and a build system in

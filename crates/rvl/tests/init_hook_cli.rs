@@ -26,11 +26,9 @@ fn init_cmd(dir: &Path) -> Command {
     let mut c = bin();
     c.current_dir(dir)
         .env("HOME", dir)
-        .env("RVLSCAN_OFFLINE", "1")
+        .env("RVL_OFFLINE", "1")
         .env_remove("RVL_API_KEY")
-        .env_remove("RVLSCAN_ORG_KEY")
         .env_remove("RVL_API_URL")
-        .env_remove("RVLSCAN_API_BASE")
         .env_remove("RVL_ORG_NAME");
     c
 }

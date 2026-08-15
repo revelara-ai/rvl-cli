@@ -100,19 +100,19 @@ fn scan(bin: &Path, repo: &Path, home: &Path, cache: &Path, out: &Path) -> std::
         .arg("--out")
         .arg(out)
         .env("HOME", home)
-        .env("RVLSCAN_CACHE_DIR", cache);
+        .env("RVL_CACHE_DIR", cache);
     // Nothing pre-arranged: no override may reach in and satisfy a language
     // the embedded copy is supposed to satisfy.
     for var in [
-        "RVLSCAN_GOINDEX",
-        "RVLSCAN_PYINDEX",
-        "RVLSCAN_RUSTINDEX",
-        "RVLSCAN_TSINDEX",
-        "RVLSCAN_CSINDEX",
-        "RVLSCAN_JAVAINDEX",
-        "RVLSCAN_CINDEX",
-        "RVLSCAN_HELPER_DIR",
-        "RVLSCAN_ALLOW_MISSING_HELPERS",
+        "RVL_GOINDEX",
+        "RVL_PYINDEX",
+        "RVL_RUSTINDEX",
+        "RVL_TSINDEX",
+        "RVL_CSINDEX",
+        "RVL_JAVAINDEX",
+        "RVL_CINDEX",
+        "RVL_HELPER_DIR",
+        "RVL_ALLOW_MISSING_HELPERS",
     ] {
         cmd.env_remove(var);
     }
@@ -339,7 +339,7 @@ fn a_missing_csindex_fails_closed_with_a_single_actionable_command() {
         "the failure must carry the one command that fixes it:\n{stderr}"
     );
     assert!(
-        !stderr.contains("RVLSCAN_CSINDEX="),
+        !stderr.contains("RVL_CSINDEX="),
         "the command writes where rvl looks, so no env var may be demanded:\n{stderr}"
     );
 }

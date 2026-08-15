@@ -10,7 +10,7 @@
 //!   overrides, filters, or re-ranks engine findings.
 //! * Approved-agent transport: the hatch shells out to a coding agent the user
 //!   already runs on this codebase (Claude Code, Copilot, or a custom command
-//!   via `RVLSCAN_AGENT_CMD`). rvl introduces zero new data flows,
+//!   via `RVL_AGENT_CMD`). rvl introduces zero new data flows,
 //!   endpoints, or key handling; the prompt goes to the USER'S OWN agent.
 //! * ONE batched headless invocation per hook run, capped at
 //!   [`MAX_BATCH_SITES`] sites.
@@ -21,7 +21,7 @@
 //!   repo `scanner.use_agent: allow` AND per-hook
 //!   `scanner.agent_hooks.<hook>.enabled: true`, overridden by the org
 //!   force-deny kill switch (`~/.revelara/org-policy.yaml`) and the
-//!   `RVLSCAN_NO_AGENT=1` env hard-off.
+//!   `RVL_NO_AGENT=1` env hard-off.
 //! * Asymmetric verdicts: `satisfies` CLEARS a site (shown in the agent
 //!   block); `violates` becomes an agent-tagged WARNING in the agent block.
 //!   Blocking stays deterministic-only unless the repo sets
@@ -236,7 +236,7 @@ pub enum Consent {
 }
 
 /// Resolve consent for `hook`. Precedence (strongest first): the
-/// `RVLSCAN_NO_AGENT=1` env hard-off, the org force-deny kill switch, the
+/// `RVL_NO_AGENT=1` env hard-off, the org force-deny kill switch, the
 /// repo's committed `use_agent: allow`, the per-hook opt-in. All default OFF.
 pub fn consent(
     hook: Hook,
@@ -246,7 +246,7 @@ pub fn consent(
 ) -> Consent {
     if env_no_agent {
         return Consent::Disabled {
-            reason: "RVLSCAN_NO_AGENT=1 (env hard-off)",
+            reason: "RVL_NO_AGENT=1 (env hard-off)",
         };
     }
     if org_force_deny {
@@ -316,7 +316,7 @@ impl Adapter for CliAdapter {
     }
 }
 
-/// Resolve the adapter to invoke. `env_cmd` (`RVLSCAN_AGENT_CMD`) is the
+/// Resolve the adapter to invoke. `env_cmd` (`RVL_AGENT_CMD`) is the
 /// explicit-command seam for custom/local-model agents and tests; otherwise
 /// the user's selection picks an installed agent by name, and "auto"/absent
 /// tries Claude Code then Copilot on PATH. None = no approved agent found;
@@ -840,7 +840,7 @@ pub fn run_hook_adjudication(
         return None;
     };
     let repo = RepoAgentConfig::load(repo_root);
-    let env_no_agent = std::env::var("RVLSCAN_NO_AGENT").ok().as_deref() == Some("1");
+    let env_no_agent = std::env::var("RVL_NO_AGENT").ok().as_deref() == Some("1");
     let budget = match consent(hook, &repo, load_org_force_deny(), env_no_agent) {
         Consent::Enabled { budget } => budget,
         // Consent is OFF by default; a disabled lane stays quiet so hooks
@@ -852,11 +852,11 @@ pub fn run_hook_adjudication(
         // Median case: nothing undecided in the delta, no invocation at all.
         return None;
     }
-    let env_cmd = std::env::var("RVLSCAN_AGENT_CMD").ok();
+    let env_cmd = std::env::var("RVL_AGENT_CMD").ok();
     let Some(adapter) = resolve_adapter(&user_agent_selection(), env_cmd.as_deref()) else {
         eprintln!(
             "note: agent adjudication is enabled for {} but no approved agent was found \
-             (claude/copilot on PATH, `agent:` in ~/.revelara/config.yaml, or RVLSCAN_AGENT_CMD)",
+             (claude/copilot on PATH, `agent:` in ~/.revelara/config.yaml, or RVL_AGENT_CMD)",
             hook.as_str()
         );
         return None;
@@ -918,7 +918,7 @@ mod tests {
         let got = consent(Hook::PreCommit, &all_on_repo(), false, true);
         match got {
             Consent::Disabled { reason } => {
-                assert!(reason.contains("RVLSCAN_NO_AGENT"), "reason: {reason}")
+                assert!(reason.contains("RVL_NO_AGENT"), "reason: {reason}")
             }
             other => panic!("env hard-off must win: {other:?}"),
         }

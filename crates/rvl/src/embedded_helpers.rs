@@ -57,7 +57,7 @@ pub static JAVAINDEX: Embedded = Embedded {
 
 /// Overrides where the embedded helpers are materialized. Exists for tests and
 /// for a machine whose HOME is not writable; ordinary use never sets it.
-pub const HELPER_DIR_ENV: &str = "RVLSCAN_HELPER_DIR";
+pub const HELPER_DIR_ENV: &str = "RVL_HELPER_DIR";
 
 /// The versioned directory the embedded helpers are written to, or `None` when
 /// there is nowhere to write them (no HOME and no override).
@@ -89,7 +89,7 @@ pub fn cache_root() -> Option<PathBuf> {
 /// `dotnet build -o DIR` produces a directory of assemblies, while
 /// `go build -o FILE` produces one file.
 ///
-///   1. the extraction root (`RVLSCAN_HELPER_DIR`, else the versioned dir), so
+///   1. the extraction root (`RVL_HELPER_DIR`, else the versioned dir), so
 ///      a relocated helper dir holds hand-built helpers too;
 ///   2. `~/.revelara/helpers/<base>/`, the per-helper subdirectory a
 ///      directory-producing build writes into;
@@ -111,10 +111,10 @@ pub fn install_dirs(base: &str) -> Vec<PathBuf> {
 }
 
 /// Serializes EVERY test in this binary that mutates process-global env
-/// (`HOME`, `RVLSCAN_HELPER_DIR`, the per-language overrides).
+/// (`HOME`, `RVL_HELPER_DIR`, the per-language overrides).
 ///
 /// One lock for the whole crate on purpose. This module and `main.rs` both
-/// move `HOME` and `RVLSCAN_HELPER_DIR`, and two separate mutexes guarding the
+/// move `HOME` and `RVL_HELPER_DIR`, and two separate mutexes guarding the
 /// same process-wide state guard nothing: `ensure_writes_then_repairs_a_
 /// corrupted_copy` failed four runs in five with "HOME is unset" because a
 /// `main.rs` test held the OTHER lock and had just cleared both variables.

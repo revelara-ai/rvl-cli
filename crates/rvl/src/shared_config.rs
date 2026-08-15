@@ -69,7 +69,7 @@ pub fn load_shared_config() -> SharedConfig {
 /// Return the first `Some(non-empty)` value from `vals`, else `None`.
 ///
 /// An empty string is treated as ABSENT: an exported-but-empty
-/// `RVLSCAN_ORG_KEY=""` must not shadow a real value from a lower-precedence
+/// `RVL_API_KEY=""` must not shadow a real value from a lower-precedence
 /// source. Pure and filesystem-free so precedence layering is unit-testable.
 pub fn first_nonempty(vals: &[Option<String>]) -> Option<String> {
     vals.iter().flatten().find(|s| !s.is_empty()).cloned()
@@ -80,37 +80,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_nonempty_env_specific_wins() {
-        // env-specific beats env-shared beats file beats default.
+    fn first_nonempty_env_wins() {
+        // env beats file beats default — the ONE env name per value the
+        // binary reads (`RVL_API_KEY` / `RVL_API_URL`).
         let got = first_nonempty(&[
-            Some("specific".into()),
-            Some("shared".into()),
+            Some("env".into()),
             Some("file".into()),
             Some("default".into()),
         ]);
-        assert_eq!(got.as_deref(), Some("specific"));
-    }
-
-    #[test]
-    fn first_nonempty_env_shared_beats_file() {
-        let got = first_nonempty(&[
-            None,
-            Some("shared".into()),
-            Some("file".into()),
-            Some("default".into()),
-        ]);
-        assert_eq!(got.as_deref(), Some("shared"));
+        assert_eq!(got.as_deref(), Some("env"));
     }
 
     #[test]
     fn first_nonempty_file_beats_default() {
-        let got = first_nonempty(&[None, None, Some("file".into()), Some("default".into())]);
+        let got = first_nonempty(&[None, Some("file".into()), Some("default".into())]);
         assert_eq!(got.as_deref(), Some("file"));
     }
 
     #[test]
     fn first_nonempty_falls_through_to_default() {
-        let got = first_nonempty(&[None, None, None, Some("default".into())]);
+        let got = first_nonempty(&[None, None, Some("default".into())]);
         assert_eq!(got.as_deref(), Some("default"));
     }
 
@@ -118,7 +107,6 @@ mod tests {
     fn first_nonempty_empty_string_is_absent() {
         // An exported-but-empty env var must NOT shadow a real file value.
         let got = first_nonempty(&[
-            Some(String::new()), // RVLSCAN_ORG_KEY=""
             Some(String::new()), // RVL_API_KEY=""
             Some("filekey".into()),
             None,

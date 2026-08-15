@@ -242,7 +242,7 @@ enum Cmd {
         judgments: Option<PathBuf>,
     },
     /// Refresh the spec cache from the Revelara API (async-safe, never
-    /// blocks a scan; RVLSCAN_OFFLINE=1 disables all fetches).
+    /// blocks a scan; RVL_OFFLINE=1 disables all fetches).
     Sync,
     /// Spec-cache maintenance.
     Cache {
@@ -555,7 +555,7 @@ const DEFAULT_API_URL: &str = "https://api.revelara.ai";
 
 impl Config {
     fn from_env() -> Self {
-        let cache_dir = std::env::var_os("RVLSCAN_CACHE_DIR")
+        let cache_dir = std::env::var_os("RVL_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 let home = std::env::var_os("HOME")
@@ -563,7 +563,7 @@ impl Config {
                     .unwrap_or_default();
                 home.join(".revelara").join("cache").join("specs")
             });
-        let index_dir = std::env::var_os("RVLSCAN_INDEX_DIR")
+        let index_dir = std::env::var_os("RVL_INDEX_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 let home = std::env::var_os("HOME")
@@ -576,12 +576,13 @@ impl Config {
         let shared = shared_config::load_shared_config();
 
         // Precedence (highest first), for BOTH values:
-        //   base_url: RVLSCAN_API_BASE  > RVL_API_URL > file api_url > default
-        //   org_key:  RVLSCAN_ORG_KEY   > RVL_API_KEY > file api_key > (empty)
+        //   base_url: RVL_API_URL > file api_url > default
+        //   org_key:  RVL_API_KEY > file api_key > (empty)
+        // There is ONE env name per value: the scan surface and the data
+        // surface read the same variable the sibling rvl-cli already uses.
         // Empty strings are skipped so an exported-but-empty env var never
         // shadows a real value from a lower-precedence source.
         let base_url = shared_config::first_nonempty(&[
-            std::env::var("RVLSCAN_API_BASE").ok(),
             std::env::var("RVL_API_URL").ok(),
             shared.api_url.clone(),
             Some(DEFAULT_API_URL.to_string()),
@@ -589,7 +590,6 @@ impl Config {
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
         let org_key = shared_config::first_nonempty(&[
-            std::env::var("RVLSCAN_ORG_KEY").ok(),
             std::env::var("RVL_API_KEY").ok(),
             shared.api_key.clone(),
         ])
@@ -598,7 +598,7 @@ impl Config {
         Self {
             cache_dir,
             index_dir,
-            offline: offline_from_env(std::env::var("RVLSCAN_OFFLINE").ok().as_deref()),
+            offline: offline_from_env(std::env::var("RVL_OFFLINE").ok().as_deref()),
             base_url,
             org_key,
         }
@@ -612,7 +612,7 @@ impl Config {
 fn report(outcome: &SyncOutcome) -> ExitCode {
     match outcome {
         SyncOutcome::Offline => {
-            println!("offline (RVLSCAN_OFFLINE=1): no fetch attempted");
+            println!("offline (RVL_OFFLINE=1): no fetch attempted");
             ExitCode::SUCCESS
         }
         SyncOutcome::UpToDate => {
@@ -862,13 +862,13 @@ impl Lang {
     /// The env var that overrides helper discovery for this language.
     fn env_override(self) -> &'static str {
         match self {
-            Lang::Go => "RVLSCAN_GOINDEX",
-            Lang::Python => "RVLSCAN_PYINDEX",
-            Lang::Rust => "RVLSCAN_RUSTINDEX",
-            Lang::TypeScript => "RVLSCAN_TSINDEX",
-            Lang::CSharp => "RVLSCAN_CSINDEX",
-            Lang::Java => "RVLSCAN_JAVAINDEX",
-            Lang::CCpp => "RVLSCAN_CINDEX",
+            Lang::Go => "RVL_GOINDEX",
+            Lang::Python => "RVL_PYINDEX",
+            Lang::Rust => "RVL_RUSTINDEX",
+            Lang::TypeScript => "RVL_TSINDEX",
+            Lang::CSharp => "RVL_CSINDEX",
+            Lang::Java => "RVL_JAVAINDEX",
+            Lang::CCpp => "RVL_CINDEX",
         }
     }
 }
@@ -1216,9 +1216,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// loud, and it shows up in the command that ran.
 fn allow_missing_helpers() -> bool {
     matches!(
-        std::env::var("RVLSCAN_ALLOW_MISSING_HELPERS")
-            .ok()
-            .as_deref(),
+        std::env::var("RVL_ALLOW_MISSING_HELPERS").ok().as_deref(),
         Some("1") | Some("true")
     )
 }
@@ -1295,7 +1293,7 @@ fn missing_helper_hint(lang: Lang) -> String {
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
-///   1. env override (`RVLSCAN_GOINDEX` / `RVLSCAN_PYINDEX` / ...),
+///   1. env override (`RVL_GOINDEX` / `RVL_PYINDEX` / ...),
 ///   2. a helper packaged with the binary (adjacent, or in its pkgshare dir),
 ///   3. the copy extracted from THIS binary (pyindex/tsindex/javaindex),
 ///   4. a helper the user built into the canonical helper dir,
@@ -2033,7 +2031,7 @@ fn resolve_packet_stream(
         anyhow::bail!(
             "no retriever for {} of the {} language(s) in this repo with production sources, so it \
              cannot be scanned honestly:\n{list}\n\nInstall the helper(s) above, or set \
-             RVLSCAN_ALLOW_MISSING_HELPERS=1 to scan the remaining lanes deliberately.",
+             RVL_ALLOW_MISSING_HELPERS=1 to scan the remaining lanes deliberately.",
             blocking_missing.len(),
             langs.len()
         );
@@ -2665,7 +2663,7 @@ struct LastScan {
 }
 
 /// The last-scan state file: a sibling of the spec-cache dir, so it lives
-/// under the same RVLSCAN_CACHE_DIR umbrella and never touches the scanned
+/// under the same RVL_CACHE_DIR umbrella and never touches the scanned
 /// repo.
 fn last_scan_path(cache_dir: &std::path::Path) -> PathBuf {
     cache_dir
@@ -4170,7 +4168,7 @@ impl SkillsCtx {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
-        let skills_cache_dir = std::env::var_os("RVLSCAN_SKILLS_CACHE_DIR")
+        let skills_cache_dir = std::env::var_os("RVL_SKILLS_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
         let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
@@ -4184,10 +4182,8 @@ impl SkillsCtx {
             fetcher,
             offline: cfg.offline,
             has_key: !cfg.org_key.is_empty(),
-            allow_unsigned: std::env::var("RVLSCAN_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
-            allow_missing_checksum: std::env::var("RVLSCAN_ALLOW_MISSING_CHECKSUM")
-                .ok()
-                .as_deref()
+            allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
+            allow_missing_checksum: std::env::var("RVL_ALLOW_MISSING_CHECKSUM").ok().as_deref()
                 == Some("1"),
         })
     }
@@ -4206,8 +4202,8 @@ impl SkillsCtx {
     fn require_key(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.offline || self.has_key,
-            "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
-             `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1 \
+            "no API key found: set RVL_API_KEY, or add \
+             `api_key` to ~/.revelara/config.yaml (or set RVL_OFFLINE=1 \
              to install from the local cache)"
         );
         Ok(())
@@ -4825,8 +4821,8 @@ fn run() -> anyhow::Result<ExitCode> {
         Cmd::Sync => {
             if !cfg.offline && cfg.org_key.is_empty() {
                 anyhow::bail!(
-                    "no API key found: set RVLSCAN_ORG_KEY or RVL_API_KEY, or add \
-                     `api_key` to ~/.revelara/config.yaml (or set RVLSCAN_OFFLINE=1)"
+                    "no API key found: set RVL_API_KEY, or add \
+                     `api_key` to ~/.revelara/config.yaml (or set RVL_OFFLINE=1)"
                 );
             }
             let fetcher = HttpFetcher {
@@ -5353,7 +5349,7 @@ mod tests {
 
     // Serializes tests that mutate process-global env so they don't race.
     // Shared with `embedded_helpers`' own tests: both move HOME and
-    // RVLSCAN_HELPER_DIR, and a second mutex over the same process-wide state
+    // RVL_HELPER_DIR, and a second mutex over the same process-wide state
     // is not a lock at all (see `embedded_helpers::env_lock`).
     use crate::embedded_helpers::env_lock;
 
@@ -5835,7 +5831,7 @@ mod tests {
             HelperKind::Executable
         );
         assert_eq!(Lang::Rust.helper_base(), "rustindex");
-        assert_eq!(Lang::Rust.env_override(), "RVLSCAN_RUSTINDEX");
+        assert_eq!(Lang::Rust.env_override(), "RVL_RUSTINDEX");
         assert_eq!(lang_of_path(Path::new("src/lib.rs")), Some(Lang::Rust));
     }
 
@@ -5997,7 +5993,7 @@ mod tests {
             HelperKind::Executable
         );
         assert_eq!(Lang::CCpp.helper_base(), "cindex");
-        assert_eq!(Lang::CCpp.env_override(), "RVLSCAN_CINDEX");
+        assert_eq!(Lang::CCpp.env_override(), "RVL_CINDEX");
         let argv = helper_argv(
             &classify_helper(Lang::CCpp, Path::new("/opt/cindex"), "test"),
             Path::new("/repo"),
@@ -6379,18 +6375,18 @@ mod tests {
     #[test]
     fn the_escape_hatch_is_explicit_and_opt_in() {
         let _guard = env_lock();
-        std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
+        std::env::remove_var("RVL_ALLOW_MISSING_HELPERS");
         assert!(!allow_missing_helpers(), "silence must NOT permit a gap");
         for v in ["1", "true"] {
-            std::env::set_var("RVLSCAN_ALLOW_MISSING_HELPERS", v);
+            std::env::set_var("RVL_ALLOW_MISSING_HELPERS", v);
             assert!(allow_missing_helpers(), "{v} should opt in");
         }
         // Anything else is not consent: a typo must fail closed, not open.
         for v in ["0", "false", "yes", ""] {
-            std::env::set_var("RVLSCAN_ALLOW_MISSING_HELPERS", v);
+            std::env::set_var("RVL_ALLOW_MISSING_HELPERS", v);
             assert!(!allow_missing_helpers(), "{v:?} must not opt in");
         }
-        std::env::remove_var("RVLSCAN_ALLOW_MISSING_HELPERS");
+        std::env::remove_var("RVL_ALLOW_MISSING_HELPERS");
     }
 
     // A repository of pure infrastructure needs NO helper, so there is nothing
@@ -6427,9 +6423,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("my-goindex");
         touch(&fake);
-        std::env::set_var("RVLSCAN_GOINDEX", &fake);
+        std::env::set_var("RVL_GOINDEX", &fake);
         let resolved = resolve_helper(Lang::Go);
-        std::env::remove_var("RVLSCAN_GOINDEX");
+        std::env::remove_var("RVL_GOINDEX");
         let resolved = resolved.expect("env override must resolve");
         assert_eq!(resolved.path, fake);
         assert_eq!(resolved.kind, HelperKind::Executable);
@@ -6438,9 +6434,9 @@ mod tests {
     #[test]
     fn resolve_helper_env_override_missing_file_errors() {
         let _guard = env_lock();
-        std::env::set_var("RVLSCAN_GOINDEX", "/definitely/not/here/goindex");
+        std::env::set_var("RVL_GOINDEX", "/definitely/not/here/goindex");
         let resolved = resolve_helper(Lang::Go);
-        std::env::remove_var("RVLSCAN_GOINDEX");
+        std::env::remove_var("RVL_GOINDEX");
         assert!(resolved.is_err(), "a missing override path must error");
     }
 
@@ -6565,13 +6561,13 @@ mod tests {
         // patched retriever must not be silently served the canonical copy.
         let other = dir.path().join("patched-csindex.dll");
         touch(&other);
-        std::env::set_var("RVLSCAN_CSINDEX", &other);
+        std::env::set_var("RVL_CSINDEX", &other);
         let overridden = resolve_helper(Lang::CSharp);
-        std::env::remove_var("RVLSCAN_CSINDEX");
+        std::env::remove_var("RVL_CSINDEX");
         std::env::remove_var("HOME");
         let overridden = overridden.expect("env override must resolve");
         assert_eq!(overridden.path, other);
-        assert_eq!(overridden.source, "env:RVLSCAN_CSINDEX");
+        assert_eq!(overridden.source, "env:RVL_CSINDEX");
     }
 
     #[test]

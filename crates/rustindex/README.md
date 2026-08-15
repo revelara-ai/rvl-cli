@@ -5,7 +5,7 @@ sibling of `goindex`/`pyindex`/`tsindex`, with one structural difference: it
 lives IN the rvl workspace (the toolchain is guaranteed wherever rvl
 builds), so the packet contract types come from `rvl-core` directly and field
 agreement is by construction. It is still invoked as a subprocess through the
-same HelperRetriever seam (`RVLSCAN_RUSTINDEX`, adjacent-to-binary, PATH), so
+same HelperRetriever seam (`RVL_RUSTINDEX`, adjacent-to-binary, PATH), so
 the packet contract is identical to every other helper.
 
     rustindex --retrieve --root <repo> --name <snapshot>   # full load
@@ -23,13 +23,13 @@ pre-registered escape valve via the migration protocol — not used.
 Identity enforcement, recorded per-stream in a `rust_workspace_provenance`
 record:
 
-- version vs pin: mismatch warns (fatal under `RVLSCAN_RUSTINDEX_STRICT_PIN=1`).
-- checksum: `RVLSCAN_RUST_ANALYZER_SHA256`, when set, must match the binary's
+- version vs pin: mismatch warns (fatal under `RVL_RUSTINDEX_STRICT_PIN=1`).
+- checksum: `RVL_RUST_ANALYZER_SHA256`, when set, must match the binary's
   sha256 (fail closed). The actual sha256 is always recorded.
 - the moniker fixture test (`tests/fixture.rs`) is the behavioral canary: a
   rust-analyzer upgrade that changes moniker shapes fails it loudly.
 
-`RVLSCAN_RUST_ANALYZER` overrides binary discovery (else PATH).
+`RVL_RUST_ANALYZER` overrides binary discovery (else PATH).
 
 ## Build-dep gate (binding)
 
