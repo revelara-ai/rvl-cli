@@ -530,7 +530,7 @@ fn explain_shows_named_incidents_control_and_fix() {
     assert!(out.contains("RC-019"), "control shown");
     assert!(out.contains("set a Timeout"), "fix shown");
     assert!(
-        out.contains(&format!("rvlscan suppress {}", finding.id)),
+        out.contains(&format!("rvl suppress {}", finding.id)),
         "suppress hint shown"
     );
 }

@@ -8,6 +8,7 @@
 //! as they were. Network failure degrades to the verified cached copy with
 //! a warning; verification failure aborts with an actionable error.
 
+use rvl_core::BIN;
 use std::path::Path;
 
 use crate::fetch::Fetcher;
@@ -70,7 +71,7 @@ fn check_cached_signature(
             verify_tarball(bytes, &key).map_err(|e| {
                 anyhow::anyhow!(
                     "cached skills for {editor} fail integrity verification ({e}); \
-                     re-run 'rvlscan skills install' online to refetch"
+                     re-run '{BIN} skills install' online to refetch"
                 )
             })?;
             Ok(())
@@ -283,7 +284,7 @@ pub struct CachedStatus {
 }
 
 /// One install recorded only by rvl-cli's v1 metadata (not yet adopted
-/// into rvlscan's own store).
+/// into rvl's own store).
 pub struct V1InstallStatus {
     pub harness: String,
     pub version: String,
@@ -298,7 +299,7 @@ pub struct StatusReport {
     pub server_note: Option<String>,
     pub harnesses: Vec<HarnessStatus>,
     /// Installs known only from rvl-cli's v1 records (read-only fallback);
-    /// harnesses rvlscan's own store already tracks are excluded.
+    /// harnesses rvl's own store already tracks are excluded.
     pub v1_installs: Vec<V1InstallStatus>,
     pub cached: Vec<CachedStatus>,
 }

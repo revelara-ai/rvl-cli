@@ -2,16 +2,16 @@ use std::process::Command;
 
 #[test]
 fn version_flag_reports_name_and_semver() {
-    let out = Command::new(env!("CARGO_BIN_EXE_rvlscan"))
+    let out = Command::new(env!("CARGO_BIN_EXE_rvl"))
         .arg("--version")
         .output()
-        .expect("failed to run rvlscan binary");
+        .expect("failed to run rvl binary");
 
     assert!(out.status.success(), "--version exited non-zero");
     let stdout = String::from_utf8(out.stdout).expect("stdout not utf-8");
     assert_eq!(
         stdout.trim(),
-        concat!("rvlscan ", env!("CARGO_PKG_VERSION")),
+        concat!("rvl ", env!("CARGO_PKG_VERSION")),
         "--version must print '<binary> <semver>'"
     );
 }
@@ -19,13 +19,13 @@ fn version_flag_reports_name_and_semver() {
 // --- spec-cache distribution surface (po-3t3oj.13) ---
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rvlscan"))
+    Command::new(env!("CARGO_BIN_EXE_rvl"))
 }
 
 /// The `scan` exit code that means "BLOCKING findings remain" — the gate
 /// firing. Kept distinct from 1 (scanner broke) and 2 (usage error) so a CI
 /// gate can tell "your code has a problem" from "the scanner is broken".
-/// Mirrors `EXIT_BLOCKED` in `crates/rvlscan/src/main.rs`.
+/// Mirrors `EXIT_BLOCKED` in `crates/rvl/src/main.rs`.
 const EXIT_BLOCKED: i32 = 3;
 
 /// "The scan RAN" — it reached a verdict, clean (0) or blocked (EXIT_BLOCKED).
@@ -43,7 +43,7 @@ fn cache_status_reports_empty_store() {
         .args(["cache", "status"])
         .env("RVLSCAN_CACHE_DIR", dir.path())
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         out.status.success(),
         "cache status must not fail on an empty store"
@@ -60,7 +60,7 @@ fn sync_respects_offline_kill_switch() {
         .env("RVLSCAN_CACHE_DIR", dir.path())
         .env("RVLSCAN_OFFLINE", "1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success(), "offline sync is a successful no-op");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
@@ -76,7 +76,7 @@ fn cache_import_refuses_missing_signature() {
         .arg(&art)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         !out.status.success(),
         "missing sig must fail the import (missing sig = failed sig)"
@@ -119,7 +119,7 @@ fn scan_with_specs_file_emits_findings_and_coverage() {
         .arg(&out_path)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -164,21 +164,21 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
         .arg(&packets)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("empty-cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         !out.status.success(),
         "no verifiable spec cache must fail the scan"
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("rvlscan sync") || stderr.contains("cache import"),
+        stderr.contains("rvl sync") || stderr.contains("cache import"),
         "error must point at sync/import: {stderr}"
     );
 }
 
 // --- single-command scan: helper orchestration (po-3t3oj.25) ---
 
-/// End-to-end: `rvlscan scan <dir>` with NO `--retrieved` must detect the Go
+/// End-to-end: `rvl scan <dir>` with NO `--retrieved` must detect the Go
 /// source, run goindex itself, and feed the packets into the pipeline. Requires
 /// a `go` toolchain to build the helper; if `go` is absent the test is skipped
 /// with a log line rather than failing (the feature is exercised, the CI env is
@@ -230,7 +230,7 @@ fn scan_without_retrieved_runs_the_go_helper() {
         .env("RVLSCAN_GOINDEX", &goindex_bin)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
@@ -269,7 +269,7 @@ fn scan_errors_with_guidance_when_a_needed_retriever_is_absent() {
         .env_remove("RVLSCAN_GOINDEX")
         .env("PATH", "/nonexistent")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         !out.status.success(),
         "a missing needed retriever must fail"
@@ -299,7 +299,7 @@ fn an_empty_dir_no_longer_fails_for_having_no_source() {
         .arg(&target)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
         !stderr.contains("no supported source files"),
@@ -327,7 +327,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
         .arg(&repo)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     // The scan RAN (it is not a scanner error), and it BLOCKED. Asserting
@@ -366,7 +366,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
         .arg(&repo)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout2 = String::from_utf8(out2.stdout).unwrap();
     assert!(out2.status.success(), "waived scan must succeed: {stdout2}");
     assert!(
@@ -387,7 +387,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
 
 // --- exit-code contract (po-av01j.94) ---
 //
-// `rvlscan scan` is wired into pre-commit hooks and CI gates, so its exit code
+// `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
 // IS the gate. The contract, in one place:
 //
 //   0  scan completed, nothing blocking remains after waivers
@@ -417,7 +417,7 @@ fn blocking_scan_exits_with_the_blocked_code_not_zero() {
         .arg(&repo)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     // Guard against a vacuous pass: the run must actually have blocked.
@@ -460,7 +460,7 @@ fn advisory_only_scan_exits_zero() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     // Guard against a vacuous pass: there must be findings, just not blocking.
@@ -538,7 +538,7 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
         .arg(&out_path)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -606,7 +606,7 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}");
     assert!(
@@ -625,7 +625,7 @@ fn index_status_reports_empty_then_populated() {
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert!(
         out.status.success(),
         "index status must work on an empty index"
@@ -644,7 +644,7 @@ fn index_init_indexes_packets_from_a_stream() {
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "index init failed: {stdout} {stderr}");
@@ -659,7 +659,7 @@ fn index_init_indexes_packets_from_a_stream() {
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         !stdout.contains("0 file"),
@@ -686,7 +686,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rvlscan");
+        .expect("spawn rvl");
 
     // Read one byte, then drop the pipe: this is what `| head -1` does.
     let mut stdout = child.stdout.take().unwrap();
@@ -761,7 +761,7 @@ fn index_reindex_live_mode_runs_the_go_helper() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -780,7 +780,7 @@ fn index_reindex_live_mode_runs_the_go_helper() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let status_out = String::from_utf8(status.stdout).unwrap();
     assert!(
         !status_out.starts_with("0 file(s)"),
@@ -796,7 +796,7 @@ fn index_reindex_live_mode_runs_the_go_helper() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let again_out = String::from_utf8(again.stdout).unwrap();
     assert!(
         again_out.contains("retrieved 0"),
@@ -823,7 +823,7 @@ fn index_reindex_detach_returns_immediately_and_child_indexes() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let parent_elapsed = started.elapsed();
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(out.status.success(), "detach parent must exit 0: {stdout}");
@@ -858,7 +858,7 @@ fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, se
             .env("RVLSCAN_INDEX_DIR", index_dir)
             .env("RVLSCAN_CACHE_DIR", cache_dir)
             .output()
-            .expect("failed to run rvlscan");
+            .expect("failed to run rvl");
         if status.status.success() {
             let s = String::from_utf8(status.stdout).unwrap();
             if !s.starts_with("0 file(s)") {
@@ -916,7 +916,7 @@ fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
         .env("RVLSCAN_INDEX_DIR", &index_dir)
         .env("RVLSCAN_CACHE_DIR", &cache_dir)
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         out.status.success(),
         "detach parent must exit 0: {}",
@@ -985,7 +985,7 @@ fn scan_runs_the_config_lane_and_reports_config_coverage() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -1037,7 +1037,7 @@ fn config_findings_are_waivable_by_format_key_rule() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}");
     assert!(
@@ -1089,7 +1089,7 @@ fn scan_runs_the_dep_manifests_family_with_seed_specs() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", root.join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -1173,7 +1173,7 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -1260,7 +1260,7 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -1335,7 +1335,7 @@ fn declared_bound_converts_finding_to_satisfies_with_provenance() {
             .arg(&out_path)
             .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
             .output()
-            .expect("failed to run rvlscan");
+            .expect("failed to run rvl");
         assert!(
             out.status.success() || out.status.code() == Some(1),
             "scan errored: {}",
@@ -1411,7 +1411,7 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
         .arg(&out_path)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         out.status.success() || out.status.code() == Some(1),
         "scan errored: {}",
@@ -1448,7 +1448,7 @@ fn helper_fixture(helper: &str) -> std::path::PathBuf {
         .join("fixture")
 }
 
-/// Run `rvlscan scan <fixture>` with the seed background-job specs and return
+/// Run `rvl scan <fixture>` with the seed background-job specs and return
 /// the findings rows from `--out`. `envs` carries the helper override.
 fn scan_fixture_findings(
     dir: &std::path::Path,
@@ -1467,7 +1467,7 @@ fn scan_fixture_findings(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("failed to run rvlscan");
+    let out = cmd.output().expect("failed to run rvl");
     assert!(
         out.status.success() || out.status.code() == Some(1),
         "scan errored: {}\n{}",
@@ -1590,7 +1590,7 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
         .arg(&out_path)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -1688,7 +1688,7 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
         )
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         out.status.success() || out.status.code() == Some(1),
         "scan errored: {}\n{}",
@@ -1801,12 +1801,12 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
 
 // --- C/C++ G1 lane (po-av01j.12) ---
 
-/// Locate the cindex helper (a workspace bin built alongside rvlscan) and
+/// Locate the cindex helper (a workspace bin built alongside rvl) and
 /// verify its libclang engine loads. None (with a SKIP log line) when the
 /// binary is missing or no libclang is installed — the e2e is exercised
 /// wherever the engine exists, and the environment gap is loud, not silent.
 fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
-    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
         .join("cindex");
@@ -1866,7 +1866,7 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         .env("RVLSCAN_CINDEX", &cindex)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
     // This fixture plants blocking identities, so a working scan exits
@@ -1934,7 +1934,7 @@ fn live_go_scan_surfaces_g4_emission_findings() {
         .env("RVLSCAN_GOINDEX", &goindex_bin)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
@@ -1970,7 +1970,7 @@ fn live_py_scan_surfaces_g4_emission_findings() {
         .env("RVLSCAN_PYINDEX", &pyindex)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
@@ -2015,7 +2015,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
         .env("RVLSCAN_TSINDEX", tsdir.join("tsindex.js"))
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
@@ -2082,7 +2082,7 @@ fn scan_decides_java_sites_end_to_end() {
         .env("RVLSCAN_JAVAINDEX", &javaindex)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         out.status.success() || out.status.code() == Some(1),
         "scan errored: {}\n{}",
@@ -2138,7 +2138,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
         .env("RVLSCAN_JAVAINDEX", &javaindex)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -2162,8 +2162,8 @@ fn rust_seed_specs() -> std::path::PathBuf {
         .join("rust_seed_specs.json")
 }
 
-/// Rust, live end to end: `rvlscan scan <fixture>` must detect Rust, run the
-/// rustindex helper (a workspace binary — built by cargo next to rvlscan, the
+/// Rust, live end to end: `rvl scan <fixture>` must detect Rust, run the
+/// rustindex helper (a workspace binary — built by cargo next to rvl, the
 /// same adjacency a release ships), and feed its packets through the pipeline
 /// with the seed specs. Skipped when rust-analyzer is unavailable, matching
 /// the goindex skip convention.
@@ -2181,8 +2181,8 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
-    // The helper is a workspace bin: usually already built next to rvlscan.
-    let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvlscan"))
+    // The helper is a workspace bin: usually already built next to rvl.
+    let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
         .join("rustindex");
@@ -2222,7 +2222,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .env("RVLSCAN_RUSTINDEX", &rustindex)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
@@ -2265,7 +2265,7 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -2359,7 +2359,7 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
         .env("RVLSCAN_AGENT_CMD", &stub)
         .env("HOME", &home)
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
@@ -2415,7 +2415,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", &home)
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
@@ -2488,7 +2488,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "scan failed: {stdout} {stderr}");
@@ -2596,7 +2596,7 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     // The `:latest` retag below is a high-severity config violation, so this
@@ -2726,7 +2726,7 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
         .arg(&out_path)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -2830,7 +2830,7 @@ fn scan_decides_csharp_sites_end_to_end() {
         .env("RVLSCAN_CSINDEX", &csindex_dll)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -2908,7 +2908,7 @@ fn report_payload_names_each_surface_language_and_never_carries_source() {
         .arg("--json")
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "report failed: {stdout} {stderr}");
@@ -2975,7 +2975,7 @@ fn generated_files_are_excluded_and_the_exclusion_is_reported() {
         .args(["scan", dir.path().to_str().unwrap()])
         .env("RVLSCAN_ALLOW_MISSING_HELPERS", "1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     if !scan_reached_a_verdict(&out) {
         return; // no Go helper on this machine; nothing to assert about
     }
@@ -3010,7 +3010,7 @@ fn a_generated_banner_is_matched_by_evidence_not_by_path() {
         .args(["scan", dir.path().to_str().unwrap()])
         .env("RVLSCAN_ALLOW_MISSING_HELPERS", "1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     if !scan_reached_a_verdict(&out) {
         return;
     }
@@ -3200,7 +3200,7 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "submit failed: {stdout}\n{stderr}");
@@ -3259,7 +3259,7 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
         body.contains(r#""repo_url":"https://example.com/repo""#),
         "{body}"
     );
-    assert!(body.contains(r#""scanner_id":"rvlscan/"#), "{body}");
+    assert!(body.contains(r#""scanner_id":"rvl/"#), "{body}");
     assert!(body.contains(r#""idempotency_key":""#), "{body}");
 }
 
@@ -3285,7 +3285,7 @@ fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "submit failed: {stdout}\n{stderr}");
@@ -3352,7 +3352,7 @@ fn scan_submission_carries_team_ownership_and_honors_the_override() {
             .env("RVL_API_URL", &server.base_url)
             .env("HOME", &home)
             .env_remove("RVL_ORG_NAME");
-        let out = cmd.output().expect("failed to run rvlscan");
+        let out = cmd.output().expect("failed to run rvl");
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert!(out.status.success(), "submit failed: {stderr}");
         stderr
@@ -3428,7 +3428,7 @@ fn scan_submission_rejects_an_unusable_team_slug() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(!out.status.success(), "{stderr}");
     assert!(
@@ -3459,7 +3459,7 @@ fn scan_submission_dry_run_prints_summary_and_never_posts() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "dry run failed: {stdout}\n{stderr}");
@@ -3500,7 +3500,7 @@ fn scan_submission_cleanup_on_success_removes_parts() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success());
     assert!(!parts.exists(), "scan parts must be removed after a 2xx");
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -3528,7 +3528,7 @@ fn scan_submission_failure_preserves_parts_with_rerun_hint() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert_eq!(out.status.code(), Some(1), "submit failure exits 1");
     assert!(parts.exists(), "scan parts survive a failed submit");
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -3552,7 +3552,7 @@ fn scan_service_without_input_source_is_an_error() {
         .env("HOME", &home)
         .env_remove("RVL_ORG_NAME")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -3561,7 +3561,7 @@ fn scan_service_without_input_source_is_an_error() {
     );
 }
 
-/// Plain `rvlscan scan <path>` (no submission flag) still runs the
+/// Plain `rvl scan <path>` (no submission flag) still runs the
 /// deterministic scanner: no network, no submit output, same verdict
 /// surface as before this feature landed.
 #[test]
@@ -3575,7 +3575,7 @@ fn plain_scan_stays_deterministic_and_never_submits() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         scan_reached_a_verdict(&out),
         "deterministic scan must still reach a verdict"
@@ -3630,7 +3630,7 @@ fn plugin_agents_json_contract_reads_installed_claude_agents() {
         .env("HOME", &home)
         .env("RVLSCAN_SKILLS_CACHE_DIR", &cache)
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "agents --json failed: {stderr}");
@@ -3674,7 +3674,7 @@ fn plugin_agents_json_emits_empty_contract_when_nothing_installed() {
         .env("HOME", &home)
         .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success(), "empty JSON listing must exit 0");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout.trim(), r#"{"agents":[]}"#, "got: {stdout}");
@@ -3698,7 +3698,7 @@ fn plugin_editors_degrades_to_builtin_list_offline() {
         .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .env("RVLSCAN_OFFLINE", "1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("built-in"), "got: {stdout}");
@@ -3720,7 +3720,7 @@ fn plugin_remove_yes_is_idempotent_for_claude() {
         .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .env("PATH", "")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "remove failed: {stdout}\n{stderr}");
@@ -3731,7 +3731,7 @@ fn plugin_remove_yes_is_idempotent_for_claude() {
     );
 }
 
-/// Day-one continuity after the rename: with NO rvlscan-store record but a
+/// Day-one continuity after the rename: with NO rvl-store record but a
 /// v1 rvl-cli install recorded in ~/.revelara/plugins.json, `plugin agents
 /// --json` must list the installed agents via the v1 fallback, with the
 /// contract shape unchanged.
@@ -3771,7 +3771,7 @@ fn plugin_agents_json_falls_back_to_v1_rvl_cli_records() {
         .env("HOME", &home)
         .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "agents --json failed: {stderr}");
@@ -3803,7 +3803,7 @@ fn plugin_list_surfaces_v1_installs_marked_as_rvl_cli() {
         .env("RVLSCAN_SKILLS_CACHE_DIR", dir.path().join("skills-cache"))
         .env("RVLSCAN_OFFLINE", "1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
@@ -3819,7 +3819,7 @@ fn plugin_list_surfaces_v1_installs_marked_as_rvl_cli() {
 }
 
 /// `plugin update` ADOPTS v1-recorded installs: the harness is targeted
-/// even though rvlscan's own store is empty. (Offline here, so the install
+/// even though rvl's own store is empty. (Offline here, so the install
 /// itself fails without a cache — the assertion is about targeting.)
 #[test]
 fn plugin_update_targets_v1_recorded_installs_for_adoption() {
@@ -3840,7 +3840,7 @@ fn plugin_update_targets_v1_recorded_installs_for_adoption() {
         .env("RVLSCAN_OFFLINE", "1")
         .env("PATH", "")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -3885,7 +3885,7 @@ fn config_show_masks_the_api_key() {
     let out = config_bin(home)
         .args(["config", "show"])
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(
@@ -3913,7 +3913,7 @@ fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
     let out = config_bin(home)
         .args(["config", "set", "org_name", "my-org"])
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -3940,7 +3940,7 @@ fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
     let out = config_bin(home)
         .args(["config", "show"])
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("org_name: my-org\n"), "{stdout}");
@@ -3953,7 +3953,7 @@ fn config_set_invalid_key_errors_with_rvl_cli_wording() {
     let out = config_bin(dir.path())
         .args(["config", "set", "bogus", "v"])
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -3972,12 +3972,12 @@ fn completion_generates_a_script_for_each_shell() {
         let out = bin()
             .args(["completion", shell])
             .output()
-            .expect("failed to run rvlscan");
+            .expect("failed to run rvl");
         assert!(out.status.success(), "completion {shell} exited non-zero");
         let stdout = String::from_utf8(out.stdout).unwrap();
         assert!(!stdout.is_empty(), "completion {shell} produced no output");
         assert!(
-            stdout.contains("rvlscan"),
+            stdout.contains("rvl"),
             "completion {shell} does not mention the binary name"
         );
     }
@@ -4008,7 +4008,7 @@ fn deterministic_scan_rejects_each_submission_only_flag() {
             .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
             .env("HOME", dir.path())
             .output()
-            .expect("failed to run rvlscan");
+            .expect("failed to run rvl");
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert_eq!(
             out.status.code(),
@@ -4042,7 +4042,7 @@ fn the_stray_flag_error_precedes_the_spec_cache_check() {
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .env("HOME", dir.path())
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -4059,7 +4059,7 @@ fn a_plain_deterministic_scan_is_unchanged() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", dir.path().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         scan_reached_a_verdict(&out),
         "a flagless scan must still reach a verdict, got {:?}",
@@ -4089,7 +4089,7 @@ fn submission_mode_still_accepts_the_same_flags() {
         .env("RVL_API_KEY", "test-key")
         .env("RVL_API_URL", "http://127.0.0.1:1")
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_ne!(
@@ -4114,7 +4114,7 @@ fn submission_mode_still_accepts_the_same_flags() {
 fn write_runtime_python_fixture(
     tag: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!("rvlscan-judgments-{tag}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("rvl-judgments-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let src = root.join("svc");
     std::fs::create_dir_all(&src).unwrap();
@@ -4166,7 +4166,7 @@ fn judged_findings_block_the_commit_and_exit_3() {
         .arg(&judgments)
         .env("RVLSCAN_CACHE_DIR", root.join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
@@ -4197,7 +4197,7 @@ fn unjudged_findings_stay_advisory_and_exit_0() {
         .arg(&specs)
         .env("RVLSCAN_CACHE_DIR", root.join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
@@ -4231,7 +4231,7 @@ fn the_judgments_override_is_loudly_announced() {
         .arg(&judgments)
         .env("RVLSCAN_CACHE_DIR", root.join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         stderr.to_uppercase().contains("UNVERIFIED") && stderr.contains("--judgments"),
@@ -4260,7 +4260,7 @@ fn write_build_tooling_fixture(
     tag: &str,
     pyproject: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let base = std::env::temp_dir().join(format!("rvlscan-devscope-{tag}-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("rvl-devscope-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let root = base.join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -4340,7 +4340,7 @@ fn scan_fixture(
         .arg(root.parent().unwrap().join("judgments.json"))
         .env("RVLSCAN_CACHE_DIR", root.parent().unwrap().join("cache"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -4487,7 +4487,7 @@ fn the_fixtures_pre_existing_finding_really_blocks_an_unscoped_scan() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert_eq!(
         out.status.code(),
         Some(EXIT_BLOCKED),
@@ -4529,7 +4529,7 @@ fn cold_index_gates_on_the_staged_file_only_not_the_whole_repo() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(
@@ -4579,7 +4579,7 @@ fn the_gate_verdict_is_identical_cold_and_warm() {
             .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
             .env("HOME", dir.path().join("home"))
             .output()
-            .expect("failed to run rvlscan");
+            .expect("failed to run rvl");
         codes.push(out.status.code());
     }
     assert_eq!(
@@ -4621,7 +4621,7 @@ fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(
@@ -4661,7 +4661,7 @@ fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         stderr.contains("half.py") && stderr.contains("unstaged edits"),
@@ -4710,7 +4710,7 @@ fn pre_push_gates_on_the_pushed_range_not_the_working_tree() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
@@ -4755,7 +4755,7 @@ fn changed_only_outside_a_git_repo_refuses_instead_of_gating_on_everything() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(
         out.status.code(),
@@ -4793,7 +4793,7 @@ fn a_full_scan_outside_a_git_repo_still_works() {
         .env("RVLSCAN_INDEX_DIR", dir.path().join("index"))
         .env("HOME", dir.path().join("home"))
         .output()
-        .expect("failed to run rvlscan");
+        .expect("failed to run rvl");
     assert!(
         scan_reached_a_verdict(&out),
         "unscoped scans must be unaffected by the git requirement: {}",

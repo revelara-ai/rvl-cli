@@ -687,7 +687,7 @@ fn auth_error_message_matches_rvl_cli_401_contract() {
     assert_eq!(f.code, 1);
     assert!(
         f.msg
-            .contains("authentication failed (401) - run 'rvlscan login' to reconfigure"),
+            .contains("authentication failed (401) - run 'rvl login' to reconfigure"),
         "{}",
         f.msg
     );

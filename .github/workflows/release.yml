@@ -151,7 +151,7 @@ jobs:
           esac
           # CGO off so the helper is static and cross-builds without a C toolchain;
           # goindex drives the `go` tool at runtime, not libc-linked analysis.
-          out="$GITHUB_WORKSPACE/crates/rvlscan/dist-extras/goindex"
+          out="$GITHUB_WORKSPACE/crates/rvl/dist-extras/goindex"
           mkdir -p "$(dirname "$out")"
           CGO_ENABLED=0 go build -C helpers/goindex -trimpath -o "$out" .
           chmod +x "$out"

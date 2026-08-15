@@ -1,14 +1,15 @@
 //! Human-facing scan output (po-3t3oj.9): the severity-ladder hook default and
 //! the per-finding explain view. The raw verdict-count dump was correct but
 //! unreadable; this groups findings by effective severity, says WHY each one
-//! rises to blocking, and reserves the noisy detail for `rvlscan explain`.
+//! rises to blocking, and reserves the noisy detail for `rvl explain`.
 //!
 //! Two shapes:
 //!   - ladder (hook default): findings grouped BLOCKING / ADVISORY, a coverage
 //!     line, and a blocked-or-pass footer. Incident detail is counts only.
 //!   - explain: one finding as an evidence block with the snippet, named
-//!     incident citations, control, and fix. Invoked via `rvlscan explain`.
+//!     incident citations, control, and fix. Invoked via `rvl explain`.
 
+use rvl_data::BIN;
 use rvl_spec::DefaultBound;
 use std::fmt::Write as _;
 
@@ -51,7 +52,7 @@ pub enum Section {
 /// last-scan state file that `explain`/`suppress` resolve ids from.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
-    /// Stable short id for `rvlscan explain <id>` and durable suppression.
+    /// Stable short id for `rvl explain <id>` and durable suppression.
     pub id: String,
     /// Primary site "file:line" shown in the ladder.
     pub site: String,
@@ -72,7 +73,7 @@ pub struct Finding {
     pub example_sites: Vec<String>,
     /// The waiver key for this finding: the class key `client_type.method`
     /// (e.g. `db.RLSPool.QueryRow`). Matched case-insensitively against
-    /// `.revelara.yaml` waivers; also the value written by `rvlscan suppress`.
+    /// `.revelara.yaml` waivers; also the value written by `rvl suppress`.
     pub class_rule: String,
     /// Set when a `.revelara.yaml` waiver suppresses this finding. Folded into
     /// the Suppressed section like `low_value`, kept out of BLOCKING/ADVISORY.
@@ -413,7 +414,7 @@ pub fn render_ladder(
     let _ = writeln!(
         o,
         "{} {}",
-        paint("rvlscan", "1", color),
+        paint(BIN, "1", color),
         paint(elapsed, "2", color)
     );
     o.push('\n');
@@ -718,7 +719,7 @@ fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
     if !f.control.is_empty() {
         let _ = write!(tail, "control {} \u{00b7} ", f.control);
     }
-    let _ = write!(tail, "explain: rvlscan explain {}", f.id);
+    let _ = write!(tail, "explain: {BIN} explain {}", f.id);
     let _ = writeln!(o, "    {}", paint(&tail, "2", color));
 }
 
@@ -761,7 +762,7 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
         "  {}",
         paint(
             &format!(
-                "suppress: rvlscan suppress {} --reason=\"...\"  (writes .revelara.yaml, shared via git)",
+                "suppress: {BIN} suppress {} --reason=\"...\"  (writes .revelara.yaml, shared via git)",
                 f.id
             ),
             "2",

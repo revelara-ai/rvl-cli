@@ -1,4 +1,4 @@
-//! `rvlscan doctor [--fix]` — diagnose (and where it is safe, repair) this
+//! `rvl doctor [--fix]` — diagnose (and where it is safe, repair) this
 //! machine's ability to scan THIS repository (po-av01j.169).
 //!
 //! po-aml3h removed most first-run friction: the scripted retrievers ride
@@ -197,7 +197,7 @@ fn repo_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
             .collect();
         out.push(
             Check::new("repo", Status::Warn, "no retriever exists").detail(format!(
-                "{} — these lanes cannot be read by any version of rvlscan yet",
+                "{} — these lanes cannot be read by any version of {BIN} yet",
                 list.join(", ")
             )),
         );
@@ -452,7 +452,7 @@ fn hook_checks(root: &Path) -> Vec<Check> {
         .into_iter()
         .map(|c| {
             // `hook doctor`'s details already END in the command to run
-            // ("run `rvlscan hook install --pre-commit`"). Appending a generic
+            // ("run `rvl hook install --pre-commit`"). Appending a generic
             // remedy under those would print the same instruction twice, so
             // one is added only where the detail carries none.
             let has_command = c.detail.contains("run `") || c.detail.contains("run rvl");
@@ -625,7 +625,7 @@ fn csindex_install_dir() -> PathBuf {
 }
 
 /// The csindex project on THIS machine, if it is here at all: a clone of the
-/// rvlscan repository (running the doctor from inside one, or a source build
+/// rvl repository (running the doctor from inside one, or a source build
 /// whose binary sits under the same tree). Returns `None` for the ordinary
 /// `brew install` case, where the honest answer is to print the clone command.
 fn csindex_project_dir() -> Option<PathBuf> {
@@ -829,9 +829,9 @@ mod tests {
     fn the_text_report_names_a_command_for_every_non_passing_row() {
         let checks = vec![Check::new("spec cache", Status::Fail, "installed")
             .detail("no verifiable spec cache")
-            .remedy("run `rvlscan sync`")];
+            .remedy("run `rvl sync`")];
         let text = render_text(Path::new("."), &checks, Status::Fail, false);
-        assert!(text.contains("fix: run `rvlscan sync`"), "{text}");
+        assert!(text.contains("fix: run `rvl sync`"), "{text}");
         assert!(text.contains("gap(s) remain"), "{text}");
     }
 }

@@ -1,8 +1,8 @@
 # rustindex — Rust retriever helper
 
-Emits the versioned packet stream rvlscan consumes, for Rust source. The Rust
+Emits the versioned packet stream rvl consumes, for Rust source. The Rust
 sibling of `goindex`/`pyindex`/`tsindex`, with one structural difference: it
-lives IN the rvlscan workspace (the toolchain is guaranteed wherever rvlscan
+lives IN the rvl workspace (the toolchain is guaranteed wherever rvl
 builds), so the packet contract types come from `rvl-core` directly and field
 agreement is by construction. It is still invoked as a subprocess through the
 same HelperRetriever seam (`RVLSCAN_RUSTINDEX`, adjacent-to-binary, PATH), so
@@ -94,5 +94,5 @@ precision Wilson LB >= 0.90 on n >= 50 quarantined gate-grade sites; gate
 sets are single-use, minted at first gate and re-verified at cutover. The
 gate machinery is language-generic (`rvl-eval gate`, `language: rust` in the
 manifest); minting + adjudication is HITL and tracked as its own bead under
-the epic. The seed spec corpus (`crates/rvlscan/tests/testdata/
+the epic. The seed spec corpus (`crates/rvl/tests/testdata/
 rust_seed_specs.json`) is test-grade and permanently gate-ineligible.

@@ -1,7 +1,7 @@
 //! SECURITY CONTRACT — customer code never leaves the machine.
 //!
-//! rvlscan is going OPEN SOURCE, so this must be true and auditable BY
-//! CONSTRUCTION, not by convention. When rvlscan tells the Revelara spec factory
+//! rvl is going OPEN SOURCE, so this must be true and auditable BY
+//! CONSTRUCTION, not by convention. When rvl tells the Revelara spec factory
 //! about API surfaces it could not decide (no spec exists yet), the payload
 //! carries ONLY the public API SHAPE, the language it was written in, and a
 //! count:
@@ -28,7 +28,7 @@
 //! confidently wrong language is a worse answer than no language at all.
 //!
 //! `lang` is ALSO the one field on this payload whose value comes from an
-//! external packet stream rather than from rvlscan's own analysis, so it is
+//! external packet stream rather than from rvl's own analysis, so it is
 //! normalized before it can ride: [`normalize_lang`] admits only a short
 //! identifier and reduces everything else to empty. A snippet cannot survive
 //! that check, which is what keeps "structurally incapable of carrying source"
@@ -79,7 +79,7 @@ const LANG_MAX_LEN: usize = 24;
 /// Reduce a scanner-supplied language to the short identifier that may ride on
 /// the wire, or to empty.
 ///
-/// This is a SHAPE check, not an allowlist: it admits every language rvlscan
+/// This is a SHAPE check, not an allowlist: it admits every language rvl
 /// emits today and any it adds later, while refusing prose, whitespace,
 /// newlines, punctuation and quotes. That refusal is the point. `lang` arrives
 /// on a `--retrieved` packet stream, which is external input; without this,
@@ -120,7 +120,7 @@ impl GroupAcc {
     /// A site with no language is an ABSENCE OF EVIDENCE, not a third opinion:
     /// it never makes a group mixed. Two different languages do, and then the
     /// group reports none. This is exactly the rule `specfactory.BuildQuestions`
-    /// applies on the Revelara side, applied here because rvlscan is what does
+    /// applies on the Revelara side, applied here because rvl is what does
     /// the aggregating: a group arrives there as ONE surface, so if this end
     /// picked an arbitrary winner the other end would faithfully state a
     /// language that is wrong for some of the sites behind it. Folding with the
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn lang_is_normalized_so_a_snippet_cannot_ride() {
-        // `lang` is free-form on the wire INTO rvlscan. Everything that is not
+        // `lang` is free-form on the wire INTO rvl. Everything that is not
         // a short identifier is reduced to empty, so the field cannot become a
         // side channel for the source the rest of this payload refuses to carry.
         for hostile in [
@@ -346,7 +346,7 @@ mod tests {
                 "hostile lang must normalize away: {hostile:?}"
             );
         }
-        // Every language rvlscan's helpers emit survives, no allowlist needed.
+        // Every language rvl's helpers emit survives, no allowlist needed.
         for good in [
             "go",
             "python",

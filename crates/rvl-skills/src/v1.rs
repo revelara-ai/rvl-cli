@@ -2,7 +2,7 @@
 //! after the CLI cutover: every existing user's install was recorded by
 //! rvl-cli in `~/.revelara/plugins.json` (legacy `~/.relynce/plugins.json`),
 //! a JSON ARRAY of `{"editor","version","installed","location"}` objects
-//! (rvl-cli `internal/plugin/types.go` `PluginInfo`). rvlscan reads these
+//! (rvl-cli `internal/plugin/types.go` `PluginInfo`). rvl reads these
 //! records as a fallback wherever its own store has none; it NEVER writes
 //! them — adoption happens by performing a normal v2 install, which records
 //! in the v2 store and takes precedence from then on.

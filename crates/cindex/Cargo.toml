@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "C/C++ retriever helper for rvlscan (libclang C API, runtime-loaded)"
+description = "C/C++ retriever helper for rvl (libclang C API, runtime-loaded)"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -22,8 +22,8 @@ clang-sys = { version = "1.8", features = ["runtime", "clang_6_0"] }
 [dev-dependencies]
 tempfile = "3"
 
-# Not its own release app: cindex rides the rvlscan archive (po-aml3h), listed
-# in rvlscan's `[package.metadata.dist] binaries`. Left as a separate dist app
+# Not its own release app: cindex rides the rvl archive (po-aml3h), listed
+# in rvl's `[package.metadata.dist] binaries`. Left as a separate dist app
 # it would publish a separate Homebrew formula nobody should have to install.
 [package.metadata.dist]
 dist = false

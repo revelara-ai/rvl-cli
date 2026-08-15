@@ -1,6 +1,6 @@
 # csindex
 
-C# retriever helper for rvlscan. Emits the same versioned JSONL packet stream
+C# retriever helper for rvl. Emits the same versioned JSONL packet stream
 as `goindex` / `pyindex` / `tsindex` (packet schema v2), for C# source.
 Retrieval only, no verdicts.
 
@@ -60,9 +60,9 @@ Build requires a .NET 8 SDK and NuGet access for the Roslyn package:
 dotnet build -c Release
 ```
 
-rvlscan discovers the helper via `RVLSCAN_CSINDEX` (pointing at either a
+rvl discovers the helper via `RVLSCAN_CSINDEX` (pointing at either a
 published `csindex` executable or a framework-dependent `csindex.dll`, which
-runs under `dotnet`), a `csindex`/`csindex.dll` adjacent to the rvlscan
+runs under `dotnet`), a `csindex`/`csindex.dll` adjacent to the rvl
 binary, or `PATH`.
 
 ## Fixture

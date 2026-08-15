@@ -1,6 +1,6 @@
 //! A FRESH INSTALL SCANS (po-aml3h).
 //!
-//! The regression these tests exist for: `brew install rvlscan` delivered the
+//! The regression these tests exist for: `brew install rvl` delivered the
 //! binary and none of the seven retriever helpers, so the first scan of any
 //! real repository died on "no retriever for N of the N language(s) in this
 //! repo, so it cannot be scanned honestly" before looking at a single line.
@@ -8,7 +8,7 @@
 //! Every test here runs a COPY of the binary in an otherwise empty directory,
 //! with HOME pointed at a tempdir. That is not ceremony: the developer machine
 //! that runs the suite usually has `make helpers` output sitting next to
-//! `target/debug/rvlscan`, which resolution finds first and which would make
+//! `target/debug/rvl`, which resolution finds first and which would make
 //! these tests pass without the feature existing at all.
 
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .expect("crates/rvlscan lives two levels under the workspace root")
+        .expect("crates/rvl lives two levels under the workspace root")
         .to_path_buf()
 }
 
@@ -33,12 +33,12 @@ fn seed_specs() -> PathBuf {
         .join("background_jobs_specs.json")
 }
 
-/// The rvlscan binary copied into an EMPTY directory, i.e. what a package
+/// The rvl binary copied into an EMPTY directory, i.e. what a package
 /// manager hands a user before any helper has been installed by hand.
 fn lone_binary(bin_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(bin_dir).unwrap();
-    let dest = bin_dir.join("rvlscan");
-    std::fs::copy(env!("CARGO_BIN_EXE_rvlscan"), &dest).expect("copying the scanner binary");
+    let dest = bin_dir.join("rvl");
+    std::fs::copy(env!("CARGO_BIN_EXE_rvl"), &dest).expect("copying the scanner binary");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -136,10 +136,10 @@ fn run_retrying_etxtbsy(cmd: &mut Command) -> std::process::Output {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(e) => panic!("failed to run rvlscan: {e:?}"),
+            Err(e) => panic!("failed to run rvl: {e:?}"),
         }
     }
-    panic!("rvlscan stayed ETXTBSY for a second; the copied binary never became executable")
+    panic!("rvl stayed ETXTBSY for a second; the copied binary never became executable")
 }
 
 /// THE ACCEPTANCE TEST. A lone binary, an empty HOME, a polyglot repo, and no
@@ -259,7 +259,7 @@ fn add_csharp(repo: &Path) {
     .unwrap();
 }
 
-/// csindex is the one retriever rvlscan does not carry, so its install hint
+/// csindex is the one retriever rvl does not carry, so its install hint
 /// names a canonical build location — and a location we name is a location the
 /// binary must search. Found there with NO env var, and reported as the user's
 /// own install rather than as something we shipped.
@@ -340,7 +340,7 @@ fn a_missing_csindex_fails_closed_with_a_single_actionable_command() {
     );
     assert!(
         !stderr.contains("RVLSCAN_CSINDEX="),
-        "the command writes where rvlscan looks, so no env var may be demanded:\n{stderr}"
+        "the command writes where rvl looks, so no env var may be demanded:\n{stderr}"
     );
 }
 

@@ -8,6 +8,7 @@
 //! any agent. Registration commands for Claude Code are *returned* to the
 //! caller (the CLI layer decides whether to run them).
 
+use rvl_core::BIN;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +53,7 @@ pub struct RemoveReceipt {
     pub register: Option<Registration>,
 }
 
-/// A coding-agent environment rvlscan can install the workflow skills into.
+/// A coding-agent environment rvl can install the workflow skills into.
 pub trait Harness {
     /// Registry key, also the `installed.json` key (e.g. "claude").
     fn name(&self) -> &'static str;
@@ -168,7 +169,7 @@ impl Harness for DirHarness {
         let Some(files) = files else {
             anyhow::bail!(
                 "no cached plugin tarball for {name}: cannot determine which files were \
-                 installed. Re-run 'rvlscan plugin install {name}' once to reseed the \
+                 installed. Re-run '{BIN} plugin install {name}' once to reseed the \
                  cache, then remove; or delete the Revelara files under {root} manually",
                 name = self.name,
                 root = root.display()
@@ -358,7 +359,7 @@ impl Harness for ClaudeHarness {
     }
 }
 
-/// All harnesses rvlscan knows how to install into, Claude Code first. The
+/// All harnesses rvl knows how to install into, Claude Code first. The
 /// universal entries mirror rvl-cli's registry paths for the same editors.
 pub fn registry() -> Vec<Box<dyn Harness>> {
     vec![

@@ -1,9 +1,9 @@
-//! `rvlscan doctor [--fix]` end to end (po-av01j.169).
+//! `rvl doctor [--fix]` end to end (po-av01j.169).
 //!
 //! Every test runs a COPY of the binary in an otherwise empty directory with
 //! HOME pointed at a tempdir, for the same reason `fresh_install.rs` does: the
 //! developer machine that runs this suite has `make helpers` output sitting
-//! next to `target/debug/rvlscan` and a populated `~/.revelara`, either of
+//! next to `target/debug/rvl` and a populated `~/.revelara`, either of
 //! which would make a doctor test pass without the feature existing.
 
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ const EXIT_GAP: i32 = 1;
 
 fn lone_binary(bin_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(bin_dir).unwrap();
-    let dest = bin_dir.join("rvlscan");
-    std::fs::copy(env!("CARGO_BIN_EXE_rvlscan"), &dest).expect("copying the scanner binary");
+    let dest = bin_dir.join("rvl");
+    std::fs::copy(env!("CARGO_BIN_EXE_rvl"), &dest).expect("copying the scanner binary");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -36,10 +36,10 @@ fn run(cmd: &mut Command) -> std::process::Output {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(e) => panic!("failed to run rvlscan: {e:?}"),
+            Err(e) => panic!("failed to run rvl: {e:?}"),
         }
     }
-    panic!("rvlscan stayed ETXTBSY for a second")
+    panic!("rvl stayed ETXTBSY for a second")
 }
 
 /// A doctor invocation with NOTHING pre-arranged: empty HOME, empty cache,

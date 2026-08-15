@@ -4,10 +4,10 @@
 //!
 //! The v2 hook invokes the NATIVE deterministic gate — `rvl scan .
 //! --incremental --changed-only --hook <name>` — not rvl-cli's agent-scan
-//! command. RATIFIED DECISION: the installed hook script hard-codes the
-//! binary name `rvl` (the post-rename name), because this installer only
-//! ships after the cutover; user-facing command hints still route through
-//! [`rvl_data::BIN`] like every other surface.
+//! command. The binary name written into the script is [`rvl_data::BIN`],
+//! the same constant every other surface uses; it was hard-coded to the
+//! post-rename name while this installer waited on the cutover, and folded
+//! back into BIN when the cutover landed (po-av01j.154).
 //!
 //! Install is lefthook-aware, like rvl-cli's: when a lefthook config is
 //! present it prints a ready-to-paste snippet instead of writing
@@ -21,12 +21,10 @@ use rvl_data::BIN;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The binary name written into hook scripts. See the module doc: always
-/// `rvl`, never the pre-rename name.
-const HOOK_BIN: &str = "rvl";
-
-/// The marker that identifies a hook file as a Revelara scan gate (also
-/// matches v1 rvl-cli agent-scan shims, which install upgrades in place).
+/// The marker that identifies a hook file as a Revelara scan gate. Kept a
+/// literal rather than built from [`BIN`] because it must ALSO match v1
+/// rvl-cli agent-scan shims (which invoke `rvl scan` too), so install
+/// upgrades them in place instead of refusing them as foreign hooks.
 const SHIM_MARKER: &str = "rvl scan";
 
 #[derive(Subcommand)]
@@ -65,14 +63,14 @@ pub fn run(cmd: HookCmd) -> ExitCode {
 /// The native deterministic gate command for a hook (the whole point of
 /// the v2 port: no agent invocation, no model calls).
 fn gate_cmd(hook: &str) -> String {
-    format!("{HOOK_BIN} scan . --incremental --changed-only --hook {hook}")
+    format!("{BIN} scan . --incremental --changed-only --hook {hook}")
 }
 
 /// The POSIX shim body written into `.git/hooks/<name>`.
 fn shim_body(hook: &str) -> String {
     format!(
         "#!/bin/sh\n\
-         # Installed by `{HOOK_BIN} hook install`: Revelara deterministic scan gate.\n\
+         # Installed by `{BIN} hook install`: Revelara deterministic scan gate.\n\
          # Exit 3 means BLOCKING findings remain; 0 is clean. No model calls.\n\
          exec {}\n",
         gate_cmd(hook)
@@ -229,7 +227,7 @@ pub(crate) fn git_toplevel(dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// A doctor check outcome (rvl-cli `checkStatus`).
 ///
-/// `pub(crate)` so `rvlscan doctor` can FOLD IN these checks rather than
+/// `pub(crate)` so `rvl doctor` can FOLD IN these checks rather than
 /// growing a second implementation of them (po-av01j.169): the hook state a
 /// user needs is the same state whether they asked `hook doctor` or `doctor`,
 /// and two copies would disagree the first time one of them was edited.
@@ -299,7 +297,7 @@ pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // The binary the installed hooks invoke (`rvl`, the post-rename name).
-    match look_path_in(HOOK_BIN, path_env) {
+    match look_path_in(BIN, path_env) {
         Some(p) => checks.push(Check::new(
             Status::Pass,
             "rvl binary",
@@ -308,7 +306,7 @@ pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
         None => checks.push(Check::new(
             Status::Fail,
             "rvl binary",
-            format!("\"{HOOK_BIN}\" not found on PATH; the installed hooks invoke it"),
+            format!("\"{BIN}\" not found on PATH; the installed hooks invoke it"),
         )),
     }
 

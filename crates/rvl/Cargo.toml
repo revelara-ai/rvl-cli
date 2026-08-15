@@ -1,5 +1,5 @@
 [package]
-name = "rvlscan"
+name = "rvl"
 description = "Revelara reliability scanner"
 version.workspace = true
 edition.workspace = true
@@ -51,19 +51,19 @@ rvl-index = { path = "../rvl-index" }
 
 # RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
 # this each of cindex/rustindex was its own dist "app" — its own archive, its
-# own Homebrew formula — so `brew install rvlscan` delivered the scanner and
+# own Homebrew formula — so `brew install rvl` delivered the scanner and
 # none of the retrievers, and the first scan of a polyglot repo hard-failed.
 #
 # `binaries` packs the workspace's native helpers into the SAME archive as
-# rvlscan, which is where resolution looks first (adjacent to the binary), and
+# rvl, which is where resolution looks first (adjacent to the binary), and
 # Homebrew's generated formula `bin.install`s all three together.
 #
 # `include` carries goindex, which cargo cannot build: release CI cross-builds
 # it per target into `dist-extras/` before `dist build` runs. It is not a cargo
-# bin target, so Homebrew files it under `<prefix>/share/rvlscan` rather than
+# bin target, so Homebrew files it under `<prefix>/share/rvl` rather than
 # in `bin` — `packaged_helper_dirs` in main.rs looks there for exactly that
 # reason. csindex is deliberately absent: ~9 MB of Roslyn is more than the rest
 # of the archive combined.
 [package.metadata.dist]
-binaries = { "*" = ["rvlscan", "cindex", "rustindex"] }
+binaries = { "*" = ["rvl", "cindex", "rustindex"] }
 include = ["dist-extras/goindex"]

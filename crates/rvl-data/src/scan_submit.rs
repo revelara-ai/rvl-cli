@@ -1162,7 +1162,7 @@ fn fail(f: Failure) -> ExitCode {
 }
 
 /// Run the scan submission end to end. `version` feeds the
-/// `scanner_id: "rvlscan/<version>"` metadata field.
+/// `scanner_id: "rvl/<version>"` metadata field.
 pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     let format = match args.format.as_deref() {
         None | Some("text") => OutputFormat::Text,
@@ -1544,7 +1544,7 @@ mod tests {
             })]),
             ..Default::default()
         };
-        req.metadata.scanner_id = "rvlscan/0.1.0".into();
+        req.metadata.scanner_id = "rvl/0.1.0".into();
         req
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
         let body = request_body(&req, true);
         assert_eq!(
             body,
-            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{"git_commit":"abc123","scanner_id":"rvlscan/0.1.0"},"business_criticality":0.9,"service_tolerance":{"tolerance_target":25,"strict_enforcement":true},"idempotency_key":"k"}"#
+            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{"git_commit":"abc123","scanner_id":"rvl/0.1.0"},"business_criticality":0.9,"service_tolerance":{"tolerance_target":25,"strict_enforcement":true},"idempotency_key":"k"}"#
         );
     }
 

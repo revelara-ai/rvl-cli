@@ -486,7 +486,7 @@ mod tests {
     use clap::Parser;
 
     /// Test-only wrapper so the Go arg-parsing tests can drive the same
-    /// clap surface `rvlscan feedback` exposes.
+    /// clap surface `rvl feedback` exposes.
     #[derive(Parser)]
     #[command(name = "test")]
     struct Wrap {

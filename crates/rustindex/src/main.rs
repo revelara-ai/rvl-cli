@@ -4,7 +4,7 @@
 //!     rustindex --retrieve --root <repo> --files a.rs,b.rs   # incremental
 //!     rustindex --packet-schema                              # negotiate
 //!
-//! Matches the argv contract `rvlscan` builds in `helper_argv` for an
+//! Matches the argv contract `rvl` builds in `helper_argv` for an
 //! Executable helper. The incremental path is a filtered full run: the
 //! rust-analyzer `scip` engine has no per-file mode, so the cold cost is paid
 //! and only the requested files' sites are emitted.
@@ -12,13 +12,13 @@
 use anyhow::Context;
 
 /// Exit code meaning "I ran correctly and am declining to analyse this tree".
-/// Must agree with `HELPER_EXIT_ABSTAIN` in rvlscan (po-av01j.102): rvlscan
+/// Must agree with `HELPER_EXIT_ABSTAIN` in rvl (po-av01j.102): rvl
 /// degrades this language and scans the rest of the repo, instead of aborting.
 /// 2 stays the generic failure code, so the two are never confused.
 const EXIT_ABSTAIN: i32 = 3;
 
-/// Must agree with `HELPER_EXIT_PREREQ_MISSING` in rvlscan (po-av01j.147): the
-/// toolchain this helper drives is not installed. rvlscan renders it as
+/// Must agree with `HELPER_EXIT_PREREQ_MISSING` in rvl (po-av01j.147): the
+/// toolchain this helper drives is not installed. rvl renders it as
 /// "helper not installed" with the install hint, rather than as a failure.
 const EXIT_PREREQ_MISSING: i32 = 4;
 

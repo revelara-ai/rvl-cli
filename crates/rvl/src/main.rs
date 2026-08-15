@@ -16,10 +16,11 @@ mod waiver;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, SyncOutcome};
+use rvl_data::BIN;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// EXIT-CODE CONTRACT (po-av01j.94). `rvlscan scan` is wired into pre-commit
+/// EXIT-CODE CONTRACT (po-av01j.94). `rvl scan` is wired into pre-commit
 /// hooks and CI gates, so the exit code IS the gate:
 ///
 /// * `0` — the scan completed and nothing blocking remains after waivers
@@ -40,7 +41,7 @@ use std::process::ExitCode;
 const EXIT_BLOCKED: u8 = 3;
 
 #[derive(Parser)]
-#[command(name = "rvlscan", version, about = "Revelara reliability scanner")]
+#[command(name = rvl_data::BIN, version, about = "Revelara reliability scanner")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -49,7 +50,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Scan a repo against the signed spec cache: spec matching, propagation,
-    /// triage. Deterministic, no model calls. With no `--retrieved`, rvlscan
+    /// triage. Deterministic, no model calls. With no `--retrieved`, rvl
     /// detects the languages under PATH and runs the matching retriever helper
     /// itself; `--retrieved` is an escape hatch for a prebuilt packet stream.
     ///
@@ -198,7 +199,7 @@ enum Cmd {
     },
     /// Explain one finding as an evidence block: the sites it covers, the
     /// control, and the fix. Takes the same inputs as `scan` plus the finding
-    /// id shown in the ladder (e.g. `rvlscan explain 2ben path/to/repo`).
+    /// id shown in the ladder (e.g. `rvl explain 2ben path/to/repo`).
     Explain {
         /// The finding id from the ladder's `explain:` hint.
         id: String,
@@ -367,8 +368,8 @@ enum Cmd {
         cmd: rvl_data::config::ConfigCmd,
     },
     /// Generate shell completion scripts (bash, zsh, fish).
-    /// Bash/zsh: eval "$(rvlscan completion bash)" in your rc file.
-    /// Fish: rvlscan completion fish > ~/.config/fish/completions/rvlscan.fish
+    /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
+    /// Fish: rvl completion fish > ~/.config/fish/completions/rvl.fish
     Completion {
         /// Shell to generate a completion script for.
         #[arg(value_enum)]
@@ -401,11 +402,11 @@ impl From<CompletionShell> for clap_complete::Shell {
 /// hook-adjudication pointer.
 fn agent_alias_notice() {
     eprintln!(
-        "note: --agent is a deprecated rvl-cli compatibility alias; rvlscan runs its \
+        "note: --agent is a deprecated rvl-cli compatibility alias; {BIN} runs its \
          deterministic scan (no model calls) — drop --agent. For consented agent \
          adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
-         scanner.agent_hooks in .revelara.yaml and run 'rvlscan scan --incremental \
-         --hook <pre-commit|pre-push>'; see 'rvlscan skills' for the agent-side \
+         scanner.agent_hooks in .revelara.yaml and run '{BIN} scan --incremental \
+         --hook <pre-commit|pre-push>'; see '{BIN} skills' for the agent-side \
          workflow surface"
     );
 }
@@ -435,14 +436,14 @@ enum SkillsCmd {
     Status,
 }
 
-/// `rvlscan plugin`: the rvl-cli `rvl plugin` parity surface. Install and
+/// `rvl plugin`: the rvl-cli `rvl plugin` parity surface. Install and
 /// update DELEGATE to the skills machinery (same download/verify/cache
-/// engine as `rvlscan skills`); list/remove/editors/agents are machinery
+/// engine as `rvl skills`); list/remove/editors/agents are machinery
 /// capabilities exposed under the names rvl-cli users know.
 #[derive(Subcommand)]
 enum PluginCmd {
     /// Install the plugin content for a harness. With no name, installs
-    /// into every detected harness (same engine as `rvlscan skills install`).
+    /// into every detected harness (same engine as `rvl skills install`).
     Install {
         /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
         harness: Option<String>,
@@ -536,7 +537,7 @@ enum CacheCmd {
 }
 
 /// All runtime configuration, resolved once. `base_url` and `org_key` layer
-/// three sources (rvlscan-specific env / shared rvl-cli env / shared config
+/// three sources (scanner-specific env / shared rvl-cli env / shared config
 /// file) over a default; that merge happens in this constructor and nowhere
 /// else. The signing keyset is deliberately NOT here: pinned keys are compiled
 /// in, and a configurable keyset would be the verification bypass the
@@ -604,7 +605,7 @@ impl Config {
     }
 }
 
-/// CLI-only exit mapping: an EXPLICIT `rvlscan sync` exits nonzero when the
+/// CLI-only exit mapping: an EXPLICIT `rvl sync` exits nonzero when the
 /// refresh didn't happen, because the user asked for it and scripts need the
 /// signal. Scan-path sync must consume `SyncOutcome` directly and never call
 /// this — "sync never fails a scan" is the library's contract, not this one.
@@ -637,7 +638,7 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
         SyncOutcome::InstallFailed { reason } => {
             eprintln!(
                 "install failed: {reason} (a verified cache survives in current or \
-                 last-good; run 'rvlscan cache status' to see which)"
+                 last-good; run '{BIN} cache status' to see which)"
             );
             ExitCode::FAILURE
         }
@@ -708,7 +709,7 @@ fn triage_to_findings(
 /// Map repo-structure control verdicts into ladder findings. Only violations
 /// surface (satisfies/abstain outcomes stay in the facts record); every one
 /// renders ADVISORY — a structural shape never blocks a commit. The waiver
-/// key is `repo_structure.RC-XXX`, so `rvlscan suppress` and `.revelara.yaml`
+/// key is `repo_structure.RC-XXX`, so `rvl suppress` and `.revelara.yaml`
 /// waivers work on these like any other finding.
 fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<render::Finding> {
     findings
@@ -766,7 +767,7 @@ fn resolve_structure_findings(
 /// renders ADVISORY — a missing health endpoint or rate limiter is real
 /// exposure but not a commit-blocker, and limiting may live at a gateway the
 /// scanner cannot see. The waiver key is `server_entry.RC-XXX`, so
-/// `rvlscan suppress` and `.revelara.yaml` waivers work on these like any
+/// `rvl suppress` and `.revelara.yaml` waivers work on these like any
 /// other finding.
 fn server_to_findings(
     findings: &[rvl_propagate::server_entry::ServerEntryFinding],
@@ -806,9 +807,9 @@ fn server_to_findings(
 // --- single-command scan: language detection + helper orchestration (po-3t3oj.25) ---
 //
 // Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
-// it is omitted, rvlscan discovers and runs the language retriever helper over
+// it is omitted, rvl discovers and runs the language retriever helper over
 // the target itself and feeds the packets into the same pipeline. Helper
-// PACKAGING (po-aml3h). A fresh `brew install rvlscan` used to deliver the
+// PACKAGING (po-aml3h). A fresh `brew install rvl` used to deliver the
 // binary and NONE of the seven helpers, so the first scan of any real repo
 // hard-failed. Each helper now ships by the cheapest route its nature allows:
 //
@@ -816,18 +817,18 @@ fn server_to_findings(
 //       extracted to ~/.revelara/helpers/<version>/ on first use. They are
 //       platform-independent text, so one build carries them everywhere.
 //   cindex / rustindex                          workspace bins, packed into
-//       the same release archive as rvlscan (dist `binaries` in Cargo.toml).
+//       the same release archive as rvl (dist `binaries` in Cargo.toml).
 //   goindex                                     built per target by release CI
 //       and packed into the archive alongside the binary.
 //   csindex                                     NOT carried: it needs ~9 MB of
 //       Roslyn assemblies. Built by the user into ~/.revelara/helpers/csindex,
 //       which resolution searches, so the build IS the install.
 //
-// Discovery order: env override, adjacent to the rvlscan binary (or the
+// Discovery order: env override, adjacent to the rvl binary (or the
 // packaged share dir next to it), the extracted copy, the canonical helper
 // dir, then PATH.
 
-/// A source language rvlscan knows how to retrieve packets for. `Ord` (variant
+/// A source language rvl knows how to retrieve packets for. `Ord` (variant
 /// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
 /// stable `BTreeMap` key, so a multi-language incremental retrieval runs
 /// helpers in the same
@@ -949,7 +950,7 @@ fn has_csharp_marker(root: &Path) -> bool {
 /// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
 /// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
 /// helpers in a deterministic order.
-/// Source extensions rvlscan has NO retriever for, mapped to a display name.
+/// Source extensions rvl has NO retriever for, mapped to a display name.
 ///
 /// The third state (po-av01j.128): a repository can carry a language nothing
 /// here can read, and before this it was reported as nothing at all --
@@ -1173,7 +1174,7 @@ fn language_is_incidental(root: &Path, lang: Lang) -> bool {
 
 /// Classify a resolved helper path into how it must be invoked. Go, Rust, and
 /// C/C++ helpers are always executables (rustindex and cindex are workspace
-/// binaries built next to rvlscan); a Python helper is a `python3` script when
+/// binaries built next to rvl); a Python helper is a `python3` script when
 /// it ends in `.py`, a TypeScript helper is a `node` script when it ends in
 /// `.js`, a Java helper is a `java` source-file script when it ends in
 /// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
@@ -1236,13 +1237,13 @@ fn embedded_for(lang: Lang) -> Option<&'static embedded_helpers::Embedded> {
 /// Directories a PACKAGED helper may sit in, given the running binary. The
 /// first is the release archive's own layout (everything unpacked side by
 /// side); the second is where Homebrew files an archive's non-binary members,
-/// `<prefix>/share/rvlscan`, since `bin.install` only relocates executables and
+/// `<prefix>/share/rvl`, since `bin.install` only relocates executables and
 /// leaves the rest in pkgshare. Without the second entry a `brew install` would
 /// carry goindex in the bottle and still not find it.
 fn packaged_helper_dirs(exe_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![exe_dir.to_path_buf()];
     if let Some(prefix) = exe_dir.parent() {
-        dirs.push(prefix.join("share").join("rvlscan"));
+        dirs.push(prefix.join("share").join("rvl"));
     }
     dirs
 }
@@ -1259,15 +1260,15 @@ fn missing_helper_hint(lang: Lang) -> String {
     match lang {
         // Built per target by release CI and packed next to the binary, so its
         // absence means a source build or a hand-assembled install.
-        Lang::Go => String::from(
-            "goindex ships next to the rvlscan binary; if you built from source run `make helpers`, \
+        Lang::Go => format!(
+            "goindex ships next to the {BIN} binary; if you built from source run `make helpers`, \
              or build it once with `go build -C helpers/goindex -o ~/.revelara/helpers/goindex .` \
-             (needs Go 1.21+), where rvlscan finds it with no further setup",
+             (needs Go 1.21+), where {BIN} finds it with no further setup",
         ),
         Lang::Rust | Lang::CCpp => format!(
-            "{base} ships next to the rvlscan binary in the release archive; if you built from \
+            "{base} ships next to the {BIN} binary in the release archive; if you built from \
              source run `cargo build --release -p {base}` and copy it to \
-             ~/.revelara/helpers/{base}, where rvlscan finds it with no further setup",
+             ~/.revelara/helpers/{base}, where {BIN} finds it with no further setup",
             base = lang.helper_base(),
         ),
         // The one helper deliberately NOT carried: the .NET assembly itself is
@@ -1275,15 +1276,15 @@ fn missing_helper_hint(lang: Lang) -> String {
         // which is more than the rest of the release archive combined. The
         // -o directory is the per-helper canonical dir, so the build IS the
         // install: `install_dirs` looks inside it for csindex.dll.
-        Lang::CSharp => String::from(
+        Lang::CSharp => format!(
             "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
              then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
              `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
-             — rvlscan finds it there with no further setup",
+             — {BIN} finds it there with no further setup",
         ),
         // Embedded — reaching this arm means extraction itself failed.
         Lang::Python | Lang::TypeScript | Lang::Java => format!(
-            "{base} is carried inside the rvlscan binary but could not be written out; set \
+            "{base} is carried inside the {BIN} binary but could not be written out; set \
              {dir} to a writable directory, or set {env} to a {base} you installed yourself",
             base = lang.helper_base(),
             dir = embedded_helpers::HELPER_DIR_ENV,
@@ -1931,7 +1932,7 @@ struct RetrievedStream {
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
-/// that file is read verbatim (the escape hatch). Otherwise rvlscan detects the
+/// that file is read verbatim (the escape hatch). Otherwise rvl detects the
 /// languages under `path`, runs each matching helper, and concatenates their
 /// stdout.
 ///
@@ -2172,7 +2173,7 @@ fn resolve_findings(
 /// every class landed on `unjudged`, unjudged renders advisory, and the
 /// deterministic gate could not fire however serious the finding. The corpus
 /// now ships inside the same signed bytes as the specs, so a user who runs
-/// `rvlscan scan .` gets graded, control-mapped, blocking-eligible findings
+/// `rvl scan .` gets graded, control-mapped, blocking-eligible findings
 /// with no flag at all.
 ///
 /// `--judgments` survives as a DEV OVERRIDE and is announced on stderr every
@@ -2225,7 +2226,7 @@ fn resolve_judgments(
         Err(e) => {
             eprintln!(
                 "WARNING: the signed cache's judgments section did not parse ({e}); \
-                 every finding will be advisory. Run `rvlscan sync` for a newer artifact."
+                 every finding will be advisory. Run `{BIN} sync` for a newer artifact."
             );
             Ok(Vec::new())
         }
@@ -2426,7 +2427,7 @@ fn findings_from_sites(
 
 /// Map emission-lane violations into triage items. The class key is
 /// (`emission`, control code), so the ladder renders `emission.RC-XXX — <why>`
-/// and `.revelara.yaml` waivers / `rvlscan suppress` match on
+/// and `.revelara.yaml` waivers / `rvl suppress` match on
 /// `emission.RC-XXX` like any other class rule.
 fn emission_items(
     call_sites: &[rvl_core::Site],
@@ -2517,7 +2518,7 @@ fn content_judgments(findings: &[rvl_content::ContentFinding]) -> Vec<rvl_triage
 /// Run the content lane over `path` and triage its findings into ladder items.
 /// Verdicts are pre-decided (`Violates`): a content-pattern match IS the
 /// evidence, there is no spec question to propagate. The waiver key downstream
-/// is the class rule `secret.<rule_id>`, so `rvlscan suppress` and hand-written
+/// is the class rule `secret.<rule_id>`, so `rvl suppress` and hand-written
 /// `.revelara.yaml` waivers work unchanged (po-3t3oj.27).
 fn content_items(path: &Path) -> Vec<rvl_triage::TriagedItem> {
     let findings = rvl_content::scan_root(path);
@@ -2651,7 +2652,7 @@ fn run_scan(
 }
 
 /// What `scan` persists for `explain`/`suppress` to resolve finding ids from.
-/// The ladder prints `explain: rvlscan explain <id>` as a copy-pasteable hint;
+/// The ladder prints `explain: rvl explain <id>` as a copy-pasteable hint;
 /// without this state the hint silently re-scans the CURRENT directory with
 /// DEFAULT inputs, which is a different scan (po-3t3oj.38: a scan run with
 /// --retrieved/--specs-file printed ids that bare `explain` could never find).
@@ -2691,7 +2692,7 @@ fn save_last_scan(state: &std::path::Path, root: &std::path::Path, findings: &[r
     };
     if let Err(e) = write() {
         eprintln!(
-            "warning: could not save scan state to {} ({e}); `rvlscan explain <id>` \
+            "warning: could not save scan state to {} ({e}); `{BIN} explain <id>` \
              will need the same path/flags this scan used",
             state.display()
         );
@@ -3455,7 +3456,7 @@ fn run_scan_incremental(
                 // partially staged file is judged in its working-tree form.
                 eprintln!(
                     "note: {} staged file(s) also have unstaged edits ({}); \
-                     rvlscan reads working-tree content, so those hunks are \
+                     rvl reads working-tree content, so those hunks are \
                      included in the judgment even though they are not being \
                      committed",
                     cs.dirty.len(),
@@ -3655,7 +3656,7 @@ fn run_explain(
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
-             ids come from `rvlscan scan` -- re-run it and use an id it prints",
+             ids come from `{BIN} scan` -- re-run it and use an id it prints",
             path.display()
         );
         return Ok(ExitCode::FAILURE);
@@ -3723,7 +3724,7 @@ fn run_suppress(
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
-                         ids come from `rvlscan scan` -- re-run it and use an id it prints",
+                         ids come from `{BIN} scan` -- re-run it and use an id it prints",
                         scan_path.display()
                     );
                     return Ok(ExitCode::FAILURE);
@@ -4046,7 +4047,7 @@ fn run_skills_install(
             };
             if update {
                 // Adopt v1 rvl-cli installs: an update targets them too, and
-                // the resulting v2 install records them in rvlscan's store so
+                // the resulting v2 install records them in rvl's store so
                 // every later operation uses v2 records.
                 for p in rvl_skills::v1::read_v1_installs(env.home) {
                     if rvl_skills::harness::by_name(&p.editor).is_some()
@@ -4065,7 +4066,7 @@ fn run_skills_install(
                     "No supported coding-agent harness detected (supported: {}).",
                     supported()
                 );
-                println!("Install one, or name it explicitly: rvlscan skills install <harness>");
+                println!("Install one, or name it explicitly: {BIN} skills install <harness>");
                 return Ok((0, 0));
             }
             names
@@ -4105,7 +4106,7 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
         // v1-only installs still count as installed: the section below
         // renders them instead of a misleading "nothing installed".
         if report.v1_installs.is_empty() {
-            println!("\nNo skills installed. Run 'rvlscan skills install'.");
+            println!("\nNo skills installed. Run '{BIN} skills install'.");
         }
     } else {
         println!("\nInstalled:");
@@ -4125,7 +4126,7 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
             );
         }
         if drift {
-            println!("\nRun 'rvlscan skills update' to upgrade.");
+            println!("\nRun '{BIN} skills update' to upgrade.");
         }
     }
 
@@ -4134,7 +4135,7 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
         for p in &report.v1_installs {
             println!("  {:<10} {:<10} {}", p.harness, p.version, p.location);
         }
-        println!("Run 'rvlscan plugin update' to adopt these into rvlscan.");
+        println!("Run '{BIN} plugin update' to adopt these into {BIN}.");
     }
 
     if !report.cached.is_empty() {
@@ -4150,7 +4151,7 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
 
 /// Everything the `skills` and `plugin` surfaces need, resolved once: home,
 /// the skills cache store, the HTTP fetcher, and the policy env switches.
-/// Uses the same base URL/org key resolution as `sync` (rvlscan env >
+/// Uses the same base URL/org key resolution as `sync` (rvl env >
 /// rvl-cli env > shared config file) and the spec cache's offline kill
 /// switch.
 struct SkillsCtx {
@@ -4213,7 +4214,7 @@ impl SkillsCtx {
     }
 }
 
-/// `rvlscan skills`: resolve env/config once, then dispatch.
+/// `rvl skills`: resolve env/config once, then dispatch.
 fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
     let ctx = SkillsCtx::resolve(cfg)?;
     let env = ctx.env();
@@ -4241,7 +4242,7 @@ fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// `rvlscan plugin`: the rvl-cli parity command surface over the same
+/// `rvl plugin`: the rvl-cli parity command surface over the same
 /// machinery. Install/update delegate to [`run_skills_install`]; list
 /// renders the same drift report `skills status` uses; remove, editors, and
 /// agents call the corresponding machinery capabilities.
@@ -4370,7 +4371,7 @@ fn run_plugin_editors(env: &rvl_skills::flow::Env) {
             }
         }
     }
-    println!("\nInstall:  rvlscan plugin install <name>");
+    println!("\nInstall:  {BIN} plugin install <name>");
 }
 
 /// `plugin agents`: list installed lenses from disk (never the network).
@@ -4392,7 +4393,7 @@ fn run_plugin_agents(
         Some("table") | Some("text") | Some("") | None => json,
         Some(other) => anyhow::bail!("invalid --format {other:?} (valid: table, json)"),
     };
-    // rvlscan's own record wins; a v1 rvl-cli record is the fallback so an
+    // rvl's own record wins; a v1 rvl-cli record is the fallback so an
     // upgraded user's lens listing keeps working on day one.
     let agents = rvl_skills::agents::installed_agents_dir(env.store, env.home, editor)
         .and_then(|(dir, source)| Ok((rvl_skills::agents::list_agents(&dir)?, source)));
@@ -4409,7 +4410,7 @@ fn run_plugin_agents(
                 if source == rvl_skills::agents::RecordSource::V1 {
                     eprintln!(
                         "note: {editor} skills were installed by rvl-cli; run \
-                         'rvlscan plugin update {editor}' to adopt them into rvlscan"
+                         '{BIN} plugin update {editor}' to adopt them into {BIN}"
                     );
                 }
                 for a in agents {
@@ -4683,7 +4684,7 @@ fn run() -> anyhow::Result<ExitCode> {
             clap_complete::generate(
                 clap_complete::Shell::from(shell),
                 &mut command,
-                "rvlscan",
+                "rvl",
                 &mut std::io::stdout(),
             );
             return Ok(ExitCode::SUCCESS);
@@ -4896,7 +4897,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     }
                     Err(_) => {
                         println!(
-                            "no spec cache installed; run 'rvlscan sync' or 'rvlscan cache import'"
+                            "no spec cache installed; run '{BIN} sync' or '{BIN} cache import'"
                         )
                     }
                 }
@@ -5240,7 +5241,7 @@ mod tests {
     #[test]
     fn judgments_load_from_the_signed_cache_with_no_flag() {
         // The bead's core defect: judgments were readable ONLY from
-        // --judgments, so a plain `rvlscan scan .` had nothing to grade with.
+        // --judgments, so a plain `rvl scan .` had nothing to grade with.
         let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
         assert_eq!(js.len(), 1, "the cache's corpus must load with no flag");
         assert_eq!(js[0].api, "requests.get");
@@ -5512,7 +5513,7 @@ mod tests {
                 },
                 render::RetrieverInfo {
                     lang: "Go".into(),
-                    path: "/opt/rvlscan/goindex".into(),
+                    path: "/opt/rvl/goindex".into(),
                     source: "bundled".into(),
                 },
             ],
@@ -5524,7 +5525,7 @@ mod tests {
             out.contains("/home/u/.local/bin/pyindex.py (PATH)"),
             "got: {out}"
         );
-        assert!(out.contains("/opt/rvlscan/goindex (bundled)"), "got: {out}");
+        assert!(out.contains("/opt/rvl/goindex (bundled)"), "got: {out}");
     }
 
     #[test]
@@ -6469,11 +6470,9 @@ mod tests {
         // and files everything else under <prefix>/share/<app>. goindex rides
         // the archive as a non-cargo file, so without this dir a brew install
         // would carry it and never find it.
-        let dirs = packaged_helper_dirs(Path::new("/opt/homebrew/Cellar/rvlscan/1.0/bin"));
-        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvlscan/1.0/bin")));
-        assert!(dirs.contains(&PathBuf::from(
-            "/opt/homebrew/Cellar/rvlscan/1.0/share/rvlscan"
-        )));
+        let dirs = packaged_helper_dirs(Path::new("/opt/homebrew/Cellar/rvl/1.0/bin"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvl/1.0/bin")));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvl/1.0/share/rvl")));
     }
 
     #[test]
@@ -6621,7 +6620,7 @@ mod tests {
 
     #[test]
     fn explain_hint_resolves_from_the_persisted_last_scan() {
-        // Regression (po-3t3oj.38): the ladder prints `rvlscan explain <id>`;
+        // Regression (po-3t3oj.38): the ladder prints `rvl explain <id>`;
         // that verbatim command must find the id WITHOUT re-running the scan's
         // inputs. Persist a ladder, then resolve the id from the state file.
         let dir = tempfile::tempdir().unwrap();
@@ -6668,11 +6667,11 @@ mod tests {
     #[test]
     fn data_command_surface_parses_rvl_cli_spellings() {
         for argv in [
-            vec!["rvlscan", "login"],
-            vec!["rvlscan", "logout"],
-            vec!["rvlscan", "status"],
+            vec!["rvl", "login"],
+            vec!["rvl", "logout"],
+            vec!["rvl", "status"],
             vec![
-                "rvlscan",
+                "rvl",
                 "risk",
                 "list",
                 "--status=applicable",
@@ -6681,35 +6680,35 @@ mod tests {
                 "--limit=50",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "risk",
                 "ready",
                 "--limit",
                 "20",
                 "--category=change_management",
             ],
-            vec!["rvlscan", "risk", "show", "R-001", "--format=json"],
-            vec!["rvlscan", "risk", "context", "CR-001", "--format", "json"],
-            vec!["rvlscan", "risk", "stale"],
+            vec!["rvl", "risk", "show", "R-001", "--format=json"],
+            vec!["rvl", "risk", "context", "CR-001", "--format", "json"],
+            vec!["rvl", "risk", "stale"],
             vec![
-                "rvlscan",
+                "rvl",
                 "risk",
                 "resolve",
                 "R-001",
                 "--reason",
                 "Fixed by timeout",
             ],
-            vec!["rvlscan", "risk", "accept", "R-001", "--reason=known cost"],
+            vec!["rvl", "risk", "accept", "R-001", "--reason=known cost"],
             vec![
-                "rvlscan",
+                "rvl",
                 "control",
                 "list",
                 "--category=fault_tolerance",
                 "--format=json",
             ],
-            vec!["rvlscan", "control", "show", "RC-018", "--format=json"],
+            vec!["rvl", "control", "show", "RC-018", "--format=json"],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "search",
                 "circuit",
@@ -6718,21 +6717,21 @@ mod tests {
                 "--min-class=best",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "facts",
                 "--vertical=fault-tolerance",
                 "--technology=go",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "procedures",
                 "--control=RC-018",
                 "--format=json",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "patterns",
                 "--type=failure_mode",
@@ -6740,7 +6739,7 @@ mod tests {
             ],
             // The plugin scan.md Step 3C invocations, verbatim.
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "graph-search",
                 "timeout failures",
@@ -6749,7 +6748,7 @@ mod tests {
                 "--limit=5",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "foresight",
                 "--entity-type=technology",
@@ -6759,14 +6758,14 @@ mod tests {
                 "--format=json",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "enrich",
                 "--query=timeout failure",
                 "--limit=10",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "enrich",
                 "--vertical=fault-tolerance",
@@ -6775,7 +6774,7 @@ mod tests {
             ],
             // The rvl-cli knowledge usage examples, verbatim.
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "relationships",
                 "fact",
@@ -6783,7 +6782,7 @@ mod tests {
                 "--format=json",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "knowledge",
                 "graph",
                 "fact",
@@ -6792,9 +6791,9 @@ mod tests {
                 "--min-strength=0.3",
                 "--type=causes,mitigates",
             ],
-            vec!["rvlscan", "knowledge", "health"],
+            vec!["rvl", "knowledge", "health"],
             vec![
-                "rvlscan",
+                "rvl",
                 "evidence",
                 "submit",
                 "--control=RC-018",
@@ -6804,13 +6803,13 @@ mod tests {
                 "--git-hash=abc",
             ],
             vec![
-                "rvlscan",
+                "rvl",
                 "evidence",
                 "list",
                 "--status=configured",
                 "--limit=5",
             ],
-            vec!["rvlscan", "evidence", "verify", "ev-123", "--format=json"],
+            vec!["rvl", "evidence", "verify", "ev-123", "--format=json"],
         ] {
             let joined = argv.join(" ");
             assert!(Cli::try_parse_from(&argv).is_ok(), "must parse: {joined}");
@@ -6820,17 +6819,17 @@ mod tests {
     #[test]
     fn data_command_unknown_flags_fail_like_rvl_cli() {
         for argv in [
-            vec!["rvlscan", "risk", "list", "--bogus"],
-            vec!["rvlscan", "risk", "stale", "--anything"],
-            vec!["rvlscan", "control", "show"], // missing required code
-            vec!["rvlscan", "knowledge", "search"], // missing required query
-            vec!["rvlscan", "knowledge", "graph-search"], // missing required query
-            vec!["rvlscan", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
-            vec!["rvlscan", "knowledge", "enrich", "--bogus"],
-            vec!["rvlscan", "knowledge", "foresight", "--min-strength=abc"], // not a number
-            vec!["rvlscan", "knowledge", "relationships", "fact"],           // missing entity id
-            vec!["rvlscan", "knowledge", "graph", "fact", "f1", "--depth=0"], // depth must be >= 1
-            vec!["rvlscan", "knowledge", "health", "--bogus"],
+            vec!["rvl", "risk", "list", "--bogus"],
+            vec!["rvl", "risk", "stale", "--anything"],
+            vec!["rvl", "control", "show"], // missing required code
+            vec!["rvl", "knowledge", "search"], // missing required query
+            vec!["rvl", "knowledge", "graph-search"], // missing required query
+            vec!["rvl", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
+            vec!["rvl", "knowledge", "enrich", "--bogus"],
+            vec!["rvl", "knowledge", "foresight", "--min-strength=abc"], // not a number
+            vec!["rvl", "knowledge", "relationships", "fact"],           // missing entity id
+            vec!["rvl", "knowledge", "graph", "fact", "f1", "--depth=0"], // depth must be >= 1
+            vec!["rvl", "knowledge", "health", "--bogus"],
         ] {
             let joined = argv.join(" ");
             assert!(
@@ -6844,7 +6843,7 @@ mod tests {
     fn scan_agent_alias_parses_and_stays_deterministic() {
         // `rvl scan --agent` compat: the flag parses alongside normal scan
         // inputs; run() prints a notice and takes the deterministic path.
-        let cli = Cli::try_parse_from(["rvlscan", "scan", "--agent", "some/path"]).unwrap();
+        let cli = Cli::try_parse_from(["rvl", "scan", "--agent", "some/path"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan { agent, path, .. }) => {
                 assert!(agent);
@@ -6860,7 +6859,7 @@ mod tests {
         // exactly so existing skill content invoking
         // `rvl scan --service X --target Y --scan-dir DIR` works verbatim.
         let cli = Cli::try_parse_from([
-            "rvlscan",
+            "rvl",
             "scan",
             "--service",
             "checkout-api",
@@ -6900,17 +6899,9 @@ mod tests {
         }
 
         // Short-flag spellings (-s/-t/-f) and --stdin.
-        let cli = Cli::try_parse_from([
-            "rvlscan",
-            "scan",
-            "-s",
-            "svc",
-            "-t",
-            ".",
-            "-f",
-            "findings.json",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["rvl", "scan", "-s", "svc", "-t", ".", "-f", "findings.json"])
+                .unwrap();
         match cli.cmd {
             Some(Cmd::Scan { service, file, .. }) => {
                 assert_eq!(service.as_deref(), Some("svc"));
@@ -6918,7 +6909,7 @@ mod tests {
             }
             _ => panic!("expected scan"),
         }
-        let cli = Cli::try_parse_from(["rvlscan", "scan", "--service", "svc", "--stdin"]).unwrap();
+        let cli = Cli::try_parse_from(["rvl", "scan", "--service", "svc", "--stdin"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan { stdin, .. }) => assert!(stdin),
             _ => panic!("expected scan"),
@@ -6929,7 +6920,7 @@ mod tests {
     fn plain_scan_parses_without_submission_flags() {
         // The deterministic scan surface is untouched: no submission flag,
         // no submission routing inputs set.
-        let cli = Cli::try_parse_from(["rvlscan", "scan", "some/path"]).unwrap();
+        let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan {
                 service,
@@ -6995,7 +6986,7 @@ mod tests {
         // makes this a hard error rather than a warning. Clap gives these
         // flags no default value, so absent is `None`/`false`.
         assert!(stray_submission_flags(None, None, false, None, None).is_empty());
-        let cli = Cli::try_parse_from(["rvlscan", "scan", "some/path"]).unwrap();
+        let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan {
                 team,
@@ -7057,7 +7048,7 @@ mod tests {
         // The hook-adjudication surface (po-av01j.15): `--hook <name>` rides
         // the normal scan invocation a git hook makes.
         let cli = Cli::try_parse_from([
-            "rvlscan",
+            "rvl",
             "scan",
             "--incremental",
             "--hook",

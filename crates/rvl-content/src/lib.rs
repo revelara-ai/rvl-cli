@@ -340,7 +340,7 @@ fn quoted_literal(line: &str, span: std::ops::Range<usize>) -> bool {
 }
 
 /// Inline allow pragma. `rvl:allow` is the canonical form, chosen ahead of the
-/// rvl-cli cutover (the tool is renaming rvlscan -> rvl); it lives in users'
+/// rename of the scanner binary from `rvlscan` to `rvl`; it lives in users'
 /// source, so accepting it now means fewer files to migrate later. The older
 /// `rvlscan:allow` stays honored so existing suppressions keep working, and
 /// `gitleaks:allow` so a repo migrating from gitleaks keeps its suppressions.

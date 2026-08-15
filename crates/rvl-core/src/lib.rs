@@ -10,6 +10,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The binary name used in user-facing hints ("run 'rvl login'").
+/// Flipped from "rvlscan" to "rvl" at the v1.0.0 cutover (po-av01j.154).
+///
+/// It lives in this leaf crate, not in `rvl-data`, so that every crate that
+/// prints a hint can reach it without taking a dependency on the data
+/// commands. `rvl_data::BIN` re-exports it, so the ~57 existing call sites
+/// are unaffected. Never hardcode the name at a call site: a hardcoded name
+/// is what made the rename a 341-site sweep instead of a one-line change.
+pub const BIN: &str = "rvl";
+
 /// The packet contract version this consumer understands. It MUST agree with
 /// the emitters' constants (goindex `PacketSchema`, pyindex `PACKET_SCHEMA`,
 /// tsindex `PACKET_SCHEMA`); each helper prints its version via
@@ -654,7 +664,7 @@ mod tests {
     fn build_tool_names_alone_never_exempt_a_file() {
         // THE CONSERVATIVE HALF. A false dev_only hides a real finding, so a
         // name is only enough when a tool's SPECIFICATION fixes its meaning.
-        // These do not qualify, and the repo-evidence lane (rvlscan::devscope)
+        // These do not qualify, and the repo-evidence lane (rvl::devscope)
         // is what exempts the first one — and only when pyproject declares it.
         assert_eq!(scope_of("hatch_build.py"), ScopeClass::Runtime);
         // Celery's/RQ's conventional worker module has the same name as

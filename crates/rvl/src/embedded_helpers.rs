@@ -1,9 +1,9 @@
-//! The scripted retrievers, carried INSIDE the rvlscan binary (po-aml3h).
+//! The scripted retrievers, carried INSIDE the rvl binary (po-aml3h).
 //!
 //! `pyindex.py`, `tsindex.js` and `javaindex.java` are platform-independent
-//! TEXT — one build of rvlscan can carry them for every target it ships to —
+//! TEXT — one build of rvl can carry them for every target it ships to —
 //! so they are `include_str!`d and materialized on first use instead of being
-//! hand-installed. Before this, `brew install rvlscan` delivered the binary
+//! hand-installed. Before this, `brew install rvl` delivered the binary
 //! and none of the seven helpers, and a fresh user's first scan hard-failed
 //! with "no retriever for N of the N language(s) in this repo".
 //!
@@ -14,7 +14,7 @@
 //!
 //! ## Where the extracted copy lives, and when it is rewritten
 //!
-//! `$HOME/.revelara/helpers/<rvlscan version>/`, VERSIONED so two rvlscan
+//! `$HOME/.revelara/helpers/<rvl version>/`, VERSIONED so two rvl
 //! builds on one machine cannot hand each other a helper from the wrong
 //! generation — a scripted helper and the binary that drives it share a packet
 //! contract, and a stale script is a silently wrong scan rather than a loud
@@ -154,7 +154,7 @@ fn memo() -> &'static Mutex<HashMap<PathBuf, ()>> {
 /// different build that happened to share the version dir — is rewritten.
 ///
 /// The write goes to a temporary sibling and is renamed into place, so a
-/// concurrent rvlscan reading the helper never observes a partial file.
+/// concurrent rvl reading the helper never observes a partial file.
 pub fn ensure(helper: &Embedded) -> anyhow::Result<PathBuf> {
     let root = cache_root().ok_or_else(|| {
         anyhow::anyhow!(
@@ -171,7 +171,7 @@ pub fn ensure(helper: &Embedded) -> anyhow::Result<PathBuf> {
     if current.as_deref() != Some(want.as_str()) {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("creating helper cache {}", root.display()))?;
-        // Unique per process: two rvlscan runs extracting at once must not
+        // Unique per process: two rvl runs extracting at once must not
         // write the same temporary path and truncate each other's bytes.
         let tmp = root.join(format!("{}.{}.tmp", helper.file_name, std::process::id()));
         std::fs::write(&tmp, helper.contents)

@@ -115,7 +115,7 @@ type Provenance struct {
 }
 
 // RetrievedSite is what the labeller's evidence packet is built from.
-// PacketSchema is the version of the emitted packet contract. rvlscan
+// PacketSchema is the version of the emitted packet contract. rvl
 // absorbs helper churn behind this number: a consumer that does not know a
 // version refuses the stream rather than guessing at its shape. It MUST
 // agree with pyindex's and tsindex's PACKET_SCHEMA and rvl_core::PACKET_SCHEMA.

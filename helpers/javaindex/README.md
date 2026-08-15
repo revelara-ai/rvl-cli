@@ -1,6 +1,6 @@
 # javaindex — Java retriever helper
 
-Emits the versioned packet stream rvlscan consumes, for Java source. The Java
+Emits the versioned packet stream rvl consumes, for Java source. The Java
 sibling of `goindex`, `pyindex`, and `tsindex`. Retrieval only: this helper
 decides nothing about reliability, it only says what the code is.
 
@@ -18,7 +18,7 @@ through `ToolProvider.getSystemJavaCompiler()` — `JavacTask.parse()` +
 javaindex.java …`): in-memory compile, no build step, no dependency jars, the
 same scripted-helper shape as `pyindex.py` under `python3` and `tsindex.js`
 under `node`. Discovery is env override (`RVLSCAN_JAVAINDEX`) → a
-`javaindex.java` next to the rvlscan binary → `PATH`.
+`javaindex.java` next to the rvl binary → `PATH`.
 
 Rejected alternatives: Eclipse JDT (a dependency jar and a build system in
 the toolchain for capability the JDK already ships), and a javac *plugin*
@@ -130,7 +130,7 @@ From this directory, with a JDK:
     java test/JavaIndexTest.java
 
 Plain Java, no JUnit (the helper's toolchain rule is "a JDK and nothing
-else"). It spawns the helper as a subprocess exactly the way rvlscan does
+else"). It spawns the helper as a subprocess exactly the way rvl does
 and asserts: schema negotiation, `site_key` formula + uniqueness, the
 typed/attributed/unresolved tier behavior, noise suppression, all three site
 kinds, `const_args` evidence, the `repo_config` constructions, and

@@ -1,12 +1,12 @@
 # Extra steps spliced into dist's per-target build job (dist `github-build-setup`).
 #
 # goindex is the one retriever cargo cannot build (po-aml3h). Without this it
-# is absent from the release archive, and a fresh `brew install rvlscan`
+# is absent from the release archive, and a fresh `brew install rvl`
 # followed by a scan of any Go repository hard-fails with "no goindex helper
 # found" — the exact class of first-run failure this bead removes.
 #
-# The output lands in `crates/rvlscan/dist-extras/goindex`, which
-# `[package.metadata.dist] include` packs into the archive next to the rvlscan
+# The output lands in `crates/rvl/dist-extras/goindex`, which
+# `[package.metadata.dist] include` packs into the archive next to the rvl
 # binary; resolution then finds it with no environment set. The build MUST run
 # before `dist build`, which is where dist splices these steps in.
 - name: Install Go (for the goindex retriever)
@@ -34,7 +34,7 @@
     esac
     # CGO off so the helper is static and cross-builds without a C toolchain;
     # goindex drives the `go` tool at runtime, not libc-linked analysis.
-    out="$GITHUB_WORKSPACE/crates/rvlscan/dist-extras/goindex"
+    out="$GITHUB_WORKSPACE/crates/rvl/dist-extras/goindex"
     mkdir -p "$(dirname "$out")"
     CGO_ENABLED=0 go build -C helpers/goindex -trimpath -o "$out" .
     chmod +x "$out"

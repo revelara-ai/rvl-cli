@@ -12,6 +12,7 @@
 
 use base64::Engine;
 use ed25519_dalek::Verifier;
+use rvl_core::BIN;
 use serde::Deserialize;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -249,7 +250,7 @@ impl CacheStore {
     fn schema_hint(env: &Envelope, active: &str) -> String {
         format!(
             "spec cache {} uses schema {} (this binary supports up to {SUPPORTED_SCHEMA}); \
-             upgrade rvlscan to use it — continuing on {active}",
+             upgrade {BIN} to use it — continuing on {active}",
             env.content_version, env.schema
         )
     }
@@ -358,7 +359,7 @@ impl CacheStore {
             }
             anyhow::anyhow!(
                 "no verifiable spec cache (current failed, last-good: {e}); \
-                 run 'rvlscan sync' or 'rvlscan cache import'"
+                 run '{BIN} sync' or '{BIN} cache import'"
             )
         })?;
         anyhow::ensure!(
@@ -445,7 +446,7 @@ pub fn staleness_note(content_version: &str, today: &str) -> Option<String> {
     let age = now - minted;
     (age > STALENESS_DAYS).then(|| {
         format!(
-            "spec cache is {age} days old (from {}); run 'rvlscan sync' to refresh",
+            "spec cache is {age} days old (from {}); run '{BIN} sync' to refresh",
             &content_version[..10]
         )
     })

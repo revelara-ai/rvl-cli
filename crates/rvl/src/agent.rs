@@ -10,7 +10,7 @@
 //!   overrides, filters, or re-ranks engine findings.
 //! * Approved-agent transport: the hatch shells out to a coding agent the user
 //!   already runs on this codebase (Claude Code, Copilot, or a custom command
-//!   via `RVLSCAN_AGENT_CMD`). rvlscan introduces zero new data flows,
+//!   via `RVLSCAN_AGENT_CMD`). rvl introduces zero new data flows,
 //!   endpoints, or key handling; the prompt goes to the USER'S OWN agent.
 //! * ONE batched headless invocation per hook run, capped at
 //!   [`MAX_BATCH_SITES`] sites.
@@ -1440,7 +1440,7 @@ scanner:
 
     #[test]
     fn telemetry_records_append_jsonl() {
-        let dir = std::env::temp_dir().join(format!("rvlscan-agent-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rvl-agent-test-{}", std::process::id()));
         let path = dir.join("agent-telemetry.jsonl");
         let _ = std::fs::remove_file(&path);
         let t = build_telemetry(

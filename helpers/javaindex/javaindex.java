@@ -1,8 +1,8 @@
-// javaindex -- Java retriever helper for rvlscan.
+// javaindex -- Java retriever helper for rvl.
 //
 // Retrieval mode: emit the SOURCE that bears on a call site, never a verdict.
 // This is the Java sibling of helpers/goindex, helpers/pyindex, and
-// helpers/tsindex. It emits the SAME versioned packet stream rvlscan
+// helpers/tsindex. It emits the SAME versioned packet stream rvl
 // consumes, for Java source.
 //
 // The split this enforces
@@ -17,7 +17,7 @@
 // by the jdk.compiler module) driven through ToolProvider's system compiler:
 // JavacTask.parse() + analyze(), Trees for positions and type mirrors. The
 // helper is a single .java source file run in JEP 330 source-file mode
-// (`java javaindex.java ...`), discovered by rvlscan the same way pyindex.py
+// (`java javaindex.java ...`), discovered by rvl the same way pyindex.py
 // runs under python3 and tsindex.js under node. No build step, no dependency
 // jars; requires a JDK (11+), not just a JRE.
 //
@@ -100,7 +100,7 @@ import javax.tools.ToolProvider;
 
 class JavaIndex {
 
-    // PACKET_SCHEMA is the version of the emitted packet contract. rvlscan
+    // PACKET_SCHEMA is the version of the emitted packet contract. rvl
     // absorbs helper churn behind this number: a consumer that does not know a
     // version refuses the stream rather than guessing at its shape. It MUST
     // agree with goindex's PacketSchema, pyindex's and tsindex's

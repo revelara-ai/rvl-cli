@@ -19,5 +19,5 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 pr-run-mode = "plan"
 # Extra steps spliced into each per-target build job before `dist build`.
 # Cross-builds goindex, the one retriever cargo cannot produce, into
-# crates/rvlscan/dist-extras/ so `include` can pack it (po-aml3h).
+# crates/rvl/dist-extras/ so `include` can pack it (po-aml3h).
 github-build-setup = "build-setup.yml"

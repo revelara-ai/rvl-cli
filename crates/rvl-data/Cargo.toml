@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+rvl-core = { path = "../rvl-core" }
 clap = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

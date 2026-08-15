@@ -1,4 +1,4 @@
-//! End-to-end tests for `rvlscan feedback` / `rvlscan bugreport` against a
+//! End-to-end tests for `rvl feedback` / `rvl bugreport` against a
 //! mock HTTP backend: the real binary, real flag parsing, real stdin and
 //! confirmation flow. No live API calls, ever.
 
@@ -91,11 +91,11 @@ fn handle(
     Ok(())
 }
 
-/// The rvlscan binary configured for a hermetic run: temp HOME (no
+/// The rvl binary configured for a hermetic run: temp HOME (no
 /// ~/.revelara/config.yaml), env-var credentials pointing at the mock, no
 /// org name (skips org resolution), cwd outside any git repo.
 fn bin(server: &MockServer, home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rvlscan"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rvl"));
     cmd.env("HOME", home)
         .env("RVL_API_KEY", "pk_e2e_key")
         .env("RVL_API_URL", &server.base_url)
@@ -112,14 +112,14 @@ fn run_with_stdin(cmd: &mut Command, input: &str) -> std::process::Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rvlscan");
+        .expect("spawn rvl");
     child
         .stdin
         .take()
         .unwrap()
         .write_all(input.as_bytes())
         .unwrap();
-    child.wait_with_output().expect("wait rvlscan")
+    child.wait_with_output().expect("wait rvl")
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn yes_bypasses_confirmation_and_posts_feedback() {
     let out = bin(&server, home.path())
         .args(["feedback", "--message", "great tool", "--yes"])
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -172,7 +172,7 @@ fn bugreport_defaults_bug_category_and_json_output_is_go_shaped() {
             "--format=json",
         ])
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -254,7 +254,7 @@ fn invalid_category_is_a_usage_error_with_help_pointer() {
     let out = bin(&server, home.path())
         .args(["feedback", "--message=m", "--category=rant", "--yes"])
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -262,7 +262,7 @@ fn invalid_category_is_a_usage_error_with_help_pointer() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("Run 'rvlscan feedback --help' for usage."),
+        stderr.contains("Run 'rvl feedback --help' for usage."),
         "{stderr}"
     );
     assert_eq!(server.recorded().len(), 0);
@@ -275,7 +275,7 @@ fn missing_message_points_at_stdin_form() {
     let out = bin(&server, home.path())
         .args(["bugreport", "--yes"])
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
@@ -283,7 +283,7 @@ fn missing_message_points_at_stdin_form() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("Run 'rvlscan bugreport --help' for usage."),
+        stderr.contains("Run 'rvl bugreport --help' for usage."),
         "{stderr}"
     );
 }
@@ -299,7 +299,7 @@ fn api_failure_is_a_runtime_error() {
     let out = bin(&server, home.path())
         .args(["bugreport", "--message=broke", "--yes"])
         .output()
-        .expect("run rvlscan");
+        .expect("run rvl");
     assert_eq!(out.status.code(), Some(1), "runtime failures exit 1");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(

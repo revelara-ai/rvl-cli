@@ -7,7 +7,7 @@
 //! On-disk shape (mirrors rvl-cli `internal/project/config.go`): waivers live
 //! under the `scanner.waivers` list, each entry `{matcher, paths, expires,
 //! reason}`. The `matcher` slug is the waiver KEY; rvl-cli maps it onto its
-//! engine's `Rule` (see `mapWaivers`). rvlscan uses the readable class key
+//! engine's `Rule` (see `mapWaivers`). rvl uses the readable class key
 //! `"{client_type}.{method}"` (e.g. `db.RLSPool.QueryRow`) as its matcher,
 //! which is a DISJOINT namespace from rvl-cli's agent-lens rule slugs
 //! (missing-timeout, etc.). As the `mapWaivers` comment documents, disjoint
@@ -27,7 +27,7 @@ use std::path::Path;
 /// on-disk `.revelara.yaml` key (`scanner.waivers[].matcher`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiver {
-    /// The waiver key. For rvlscan this is the class key `client_type.method`.
+    /// The waiver key. For rvl this is the class key `client_type.method`.
     /// Serialized as `matcher` to interoperate with rvl-cli.
     #[serde(rename = "matcher")]
     pub rule: String,

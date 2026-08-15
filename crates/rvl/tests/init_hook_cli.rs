@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rvlscan"))
+    Command::new(env!("CARGO_BIN_EXE_rvl"))
 }
 
 fn git_init(dir: &Path) {
@@ -221,7 +221,7 @@ fn hook_install_writes_the_native_gate_shim() {
     );
     assert!(
         !body.contains("rvlscan"),
-        "shim must say `rvl`, got: {body}"
+        "shim must say `rvl`, never the pre-rename name, got: {body}"
     );
     #[cfg(unix)]
     {

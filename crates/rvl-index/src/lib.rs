@@ -16,6 +16,7 @@
 use anyhow::Context;
 use redb::ReadableTableMetadata;
 use rvl_core::Site;
+use rvl_core::BIN;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -75,7 +76,7 @@ struct Entry {
 /// promptly rather than look like it hung.
 pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The index could not be acquired because another rvlscan process holds
+/// The index could not be acquired because another rvl process holds
 /// redb's exclusive lock.
 ///
 /// redb permits exactly one process to have the database open, so this is a
@@ -92,7 +93,7 @@ impl std::fmt::Display for IndexBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "index busy: another rvlscan process holds {} (waited {:.1}s)",
+            "index busy: another {BIN} process holds {} (waited {:.1}s)",
             self.path.display(),
             self.waited.as_secs_f32()
         )

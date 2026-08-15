@@ -1,9 +1,9 @@
 //! Shared `~/.revelara/config.yaml` loading.
 //!
-//! rvlscan reads the SAME config file the sibling `rvl-cli` writes, so a user
+//! rvl reads the SAME config file the sibling `rvl-cli` writes, so a user
 //! who ran `rvl config set api_key <key>` does not have to export anything to
-//! run `rvlscan sync`. This mirrors rvl-cli's format VERBATIM: a YAML document
-//! with `api_url`, `api_key`, and `org_name` keys. rvlscan consumes only
+//! run `rvl sync`. This mirrors rvl-cli's format VERBATIM: a YAML document
+//! with `api_url`, `api_key`, and `org_name` keys. rvl consumes only
 //! `api_url` and `api_key`; `org_name` (and any future rvl-cli keys) are
 //! tolerated and ignored — rvl-cli owns them.
 //!
@@ -19,7 +19,7 @@
 
 use serde::Deserialize;
 
-/// The subset of `~/.revelara/config.yaml` that rvlscan consumes.
+/// The subset of `~/.revelara/config.yaml` that rvl consumes.
 ///
 /// `#[serde(default)]` makes both fields optional and — crucially — the struct
 /// does NOT use `deny_unknown_fields`, so `org_name` and any future rvl-cli
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_future_keys() {
-        // rvl-cli may add keys later; they must not break rvlscan parsing.
+        // rvl-cli may add keys later; they must not break rvl parsing.
         let text = "api_key: pk_x\nsome_future_key: whatever\nnested:\n  a: 1\n";
         let cfg = SharedConfig::from_yaml_str(text);
         assert_eq!(cfg.api_key.as_deref(), Some("pk_x"));

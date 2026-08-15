@@ -528,7 +528,7 @@ func main() {
 		// had nothing to load, which is a different claim from "loaded the code
 		// and found no client calls". Returning an empty stream with exit 0 for
 		// both made a monorepo scan report Go as scanned and clean when Go was
-		// never looked at. Exit 3 is the helper ABSTAIN code rvlscan reads
+		// never looked at. Exit 3 is the helper ABSTAIN code rvl reads
 		// (po-av01j.102); rustindex already does this for an unloadable cargo
 		// workspace and this is the same charter: no heuristic tier, abstain
 		// rather than guess.

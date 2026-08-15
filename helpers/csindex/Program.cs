@@ -1,8 +1,8 @@
-// csindex -- C# retriever helper for rvlscan.
+// csindex -- C# retriever helper for rvl.
 //
 // Retrieval mode: emit the SOURCE that bears on a call site, never a verdict.
 // This is the C# sibling of helpers/goindex, helpers/pyindex, and
-// helpers/tsindex. It emits the SAME versioned packet stream rvlscan
+// helpers/tsindex. It emits the SAME versioned packet stream rvl
 // consumes, for C# source instead of Go/Python/TypeScript.
 //
 // The split this enforces
@@ -42,7 +42,7 @@ namespace Csindex;
 
 internal static class Program
 {
-    // PACKET_SCHEMA is the version of the emitted packet contract. rvlscan
+    // PACKET_SCHEMA is the version of the emitted packet contract. rvl
     // absorbs helper churn behind this number: a consumer that does not know
     // a version refuses the stream rather than guessing at its shape. It MUST
     // agree with goindex's PacketSchema, pyindex's PACKET_SCHEMA, tsindex's

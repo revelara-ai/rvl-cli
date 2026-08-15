@@ -3,13 +3,13 @@
 //! Same file (`~/.revelara/config.yaml`), same keys (`api_url`, `api_key`,
 //! `org_name`), same env override contract (`RVL_API_KEY` / `RVL_API_URL` /
 //! `RVL_ORG_NAME` beat the file; the CI use case has no config file at all).
-//! The rvlscan-specific `RVLSCAN_API_BASE` / `RVLSCAN_ORG_KEY` overrides used
+//! The scanner-specific `RVLSCAN_API_BASE` / `RVLSCAN_ORG_KEY` overrides used
 //! by the scan surface are honored at the top of the chain so one binary has
 //! one consistent story.
 //!
 //! SECURITY: this module reads/writes ONLY `api_url` / `api_key` /
 //! `org_name`. Signing-key material must never become a config field (see
-//! the shared-config security contract in the rvlscan crate).
+//! the shared-config security contract in the rvl crate).
 
 use crate::{CmdResult, Failure, BIN};
 use clap::Subcommand;
@@ -114,7 +114,7 @@ fn write_config_text(path: &Path, data: &str) -> Result<(), String> {
 // --- `config` subcommand (show, set) — ported from rvl-cli
 // `internal/commands/config_cmd.go` (po-av01j.164). ---
 
-/// `rvlscan config`: view and edit CLI configuration.
+/// `rvl config`: view and edit CLI configuration.
 #[derive(Subcommand)]
 pub enum ConfigCmd {
     /// Show current configuration (API key masked)
@@ -397,7 +397,7 @@ mod tests {
         let out = show_output(None);
         assert_eq!(
             out,
-            "No configuration found. Run 'rvlscan login' first, or set RVL_API_KEY for headless/CI use.\n"
+            "No configuration found. Run 'rvl login' first, or set RVL_API_KEY for headless/CI use.\n"
         );
     }
 

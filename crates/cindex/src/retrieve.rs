@@ -21,7 +21,7 @@ use clang_sys::*;
 use crate::PACKET_SCHEMA;
 
 /// Load libclang at runtime and report its version string. Fails with
-/// actionable guidance when no library can be found — rvlscan surfaces this
+/// actionable guidance when no library can be found — rvl surfaces this
 /// stderr, so a detected C/C++ repo fails CLOSED rather than silently
 /// under-reporting.
 pub fn load_engine() -> Result<String, String> {

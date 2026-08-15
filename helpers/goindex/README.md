@@ -1,6 +1,6 @@
 # goindex — Go retriever helper
 
-Emits the versioned packet stream rvlscan consumes. Retrieval only: this
+Emits the versioned packet stream rvl consumes. Retrieval only: this
 helper decides nothing about reliability, it only says what the code is.
 
     goindex -root <repo> -retrieve -name <snapshot>     # full load
@@ -9,7 +9,7 @@ helper decides nothing about reliability, it only says what the code is.
 
 Every emitted record carries:
 
-- `packet_schema` — the contract version (currently `2`). rvlscan absorbs
+- `packet_schema` — the contract version (currently `2`). rvl absorbs
   helper churn behind this number; a consumer that does not know a version
   refuses the stream rather than guessing at its shape. It agrees with
   pyindex's and tsindex's `PACKET_SCHEMA` and `rvl_core::PACKET_SCHEMA`.

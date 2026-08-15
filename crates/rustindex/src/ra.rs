@@ -122,7 +122,7 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
 /// rustindex ran correctly and is DECLINING to analyse this tree.
 ///
 /// Typed, rather than a plain error string, so `main` can exit with the
-/// ABSTAIN code instead of the generic error code. rvlscan degrades the Rust
+/// ABSTAIN code instead of the generic error code. rvl degrades the Rust
 /// language and scans the rest of the repo on the first, and reports a broken
 /// toolchain on the second — and it can only tell them apart if this
 /// distinction survives the process boundary (po-av01j.102).
@@ -250,7 +250,7 @@ mod tests {
         // The reported case (po-av01j.102): the dogfood repo holds 1660 .go files and a
         // single .rs test fixture, with no Cargo.toml anywhere. Declining is
         // correct; being INDISTINGUISHABLE from a broken toolchain is not,
-        // because rvlscan uses that difference to decide whether to keep
+        // because rvl uses that difference to decide whether to keep
         // scanning the other 1660 files.
         let dir = std::env::temp_dir().join(format!("rustindex-abstain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
