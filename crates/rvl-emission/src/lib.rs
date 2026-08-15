@@ -18,7 +18,7 @@
 //! emission-point packet, proving a G4-capable emitter ran; a pre-G4 stream
 //! abstains instead of minting false violations.
 
-use rvl_core::{scope_of, ScopeClass, Site, Verdict};
+use rvl_core::{ScopeClass, Site, Verdict};
 use rvl_spec::{EmissionSpec, MIN_CONFIDENCE};
 use std::collections::BTreeSet;
 
@@ -75,7 +75,7 @@ fn matching_spec<'a>(
 /// or dev tooling neither satisfy nor violate an observability control for
 /// the production surface.
 fn runtime(site: &Site) -> bool {
-    scope_of(&site.file_path) == ScopeClass::Runtime
+    site.scope() == ScopeClass::Runtime
 }
 
 /// The (file, enclosing function) identity used to ask "does this function
