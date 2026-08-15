@@ -10,7 +10,7 @@
 //! and combines them mechanically. Every rule below traces to a measurement or
 //! to a human adjudication, not to intuition.
 
-use rvl_core::{scope_of, ConstArg, CtxEvidence, Site, Verdict};
+use rvl_core::{ConstArg, CtxEvidence, Site, Verdict};
 use rvl_spec::{
     client_family, spec_gate, Bounds, Family, Mechanism, Scope, ServedBound, SpecCache,
 };
@@ -211,7 +211,7 @@ pub fn propagate(
     // Scope is checked AFTER the API gate so a non-I/O call in an exempt scope
     // still reports as not_applicable rather than as a scope pass: those are
     // different facts and collapsing them hides extractor errors.
-    let scope = scope_of(&site.file_path);
+    let scope = site.scope();
     if let Some(sp) = specs.scope_exempt(scope.as_str()) {
         return Finding {
             site_id: id,

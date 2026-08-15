@@ -323,6 +323,17 @@ pub struct Site {
     /// specs never fire on a server-entry site or vice versa.
     #[serde(default)]
     pub site_kind: String,
+    /// Scope assigned from REPO EVIDENCE rather than from the path alone: a
+    /// declaration in the project's own manifest (a hatchling build hook named
+    /// by `pyproject.toml`), or a layout fact no path substring can express (a
+    /// root-level script nothing in the repo references). Set by the scan
+    /// pipeline before propagation; `None` means "no evidence was found, so
+    /// the path decides" and is the only state a retriever ever emits.
+    ///
+    /// Read through [`Site::scope`], never directly: every consumer must get
+    /// the same answer, and half of them only hold a `Site` (po-av01j.173).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_override: Option<ScopeClass>,
 }
 
 /// The `site_kind` a G2 server-entry record carries: an HTTP handler, route,
@@ -380,6 +391,15 @@ impl Site {
         };
         (t, self.method.clone())
     }
+    /// Where this site lives. Repo evidence first ([`Site::scope_override`]),
+    /// the path second ([`scope_of`]). THE ONLY correct way to ask: reading
+    /// `scope_of(&site.file_path)` directly skips the evidence and re-files a
+    /// declared build hook as Runtime.
+    pub fn scope(&self) -> ScopeClass {
+        self.scope_override
+            .unwrap_or_else(|| scope_of(&self.file_path))
+    }
+
     /// All source in scope of this site: the enclosing function plus every
     /// retrieved caller and callee. Deadlines are established above and below.
     pub fn scope_source(&self) -> String {
@@ -418,11 +438,35 @@ impl ScopeClass {
     }
 }
 
+/// Filenames whose meaning is fixed by a tool's SPECIFICATION, not by
+/// convention or by where they sit: `setup.py` is setuptools' build script
+/// (the legacy PEP 517 entry point, executed by the packaging frontend), and
+/// `noxfile.py` is nox's configuration file, read only by the `nox` runner.
+/// Neither is importable product code in any project that follows the spec,
+/// so an unbounded `subprocess` call in one blocks a BUILD, never a request.
+///
+/// Deliberately short. Every name here is a name a tool DEFINES; convention
+/// alone is not enough, because a false dev_only hides a real finding. Two
+/// names that look like they belong and do not:
+///   - `tasks.py` — invoke's default, and equally Celery's/RQ's conventional
+///     task module. Demoting it would exempt production worker code, which is
+///     precisely the surface an unbounded call hurts most.
+///   - `hatch_build.py` — a name hatchling only honours when pyproject.toml
+///     declares it (see the scan pipeline's `devscope` lane). Undeclared, it
+///     is an ordinary module and stays Runtime.
+///
+/// (`conftest.py`, pytest's fixture module, is already routed to TestSupport.)
+const DEV_TOOL_ENTRY_POINTS: &[&str] = &["setup.py", "noxfile.py"];
+
 /// Classify by path. Deliberately crude and deliberately not a verdict: a
 /// mis-classification routes a site to the wrong SPEC, where a human can see
 /// and correct one answer, rather than silently deciding the site itself.
+///
+/// Path-only, and therefore blind to anything a manifest declares. Prefer
+/// [`Site::scope`], which consults repo evidence first.
 pub fn scope_of(path: &str) -> ScopeClass {
     let p = path.to_ascii_lowercase();
+    let base = p.rsplit('/').next().unwrap_or(p.as_str()).to_string();
     if p.contains("/migrations/") || p.starts_with("migrations/") || p.contains("/migrate/") {
         ScopeClass::Migration
     } else if p.contains("backfill") {
@@ -464,6 +508,9 @@ pub fn scope_of(path: &str) -> ScopeClass {
         || p.contains("/scripts/")
         || p.starts_with("cmd/")
         || p.contains("/devtools/")
+        // Checked LAST, after the test/example guards: a `setup.py` shipped as
+        // a packaging fixture under tests/ is test material first.
+        || DEV_TOOL_ENTRY_POINTS.contains(&base.as_str())
     {
         ScopeClass::DevOnly
     } else {
@@ -587,6 +634,73 @@ mod tests {
             scope_of("src/latestrelease/handler.go"),
             ScopeClass::Runtime
         );
+    }
+
+    #[test]
+    fn specified_dev_tool_entry_points_are_dev_only() {
+        // po-av01j.173. `setup.py` and `noxfile.py` are names a TOOL defines:
+        // the packaging frontend runs one, the nox runner reads the other, and
+        // neither is imported by product code. An unbounded call in them
+        // blocks a build, not a request.
+        assert_eq!(scope_of("setup.py"), ScopeClass::DevOnly);
+        assert_eq!(scope_of("svc/setup.py"), ScopeClass::DevOnly);
+        assert_eq!(scope_of("noxfile.py"), ScopeClass::DevOnly);
+        // A packaging FIXTURE keeps its test-support class: the test guards
+        // run first, so this is material for a test, not tooling for a build.
+        assert_eq!(scope_of("tests/fixtures/setup.py"), ScopeClass::TestSupport);
+    }
+
+    #[test]
+    fn build_tool_names_alone_never_exempt_a_file() {
+        // THE CONSERVATIVE HALF. A false dev_only hides a real finding, so a
+        // name is only enough when a tool's SPECIFICATION fixes its meaning.
+        // These do not qualify, and the repo-evidence lane (rvlscan::devscope)
+        // is what exempts the first one — and only when pyproject declares it.
+        assert_eq!(scope_of("hatch_build.py"), ScopeClass::Runtime);
+        // Celery's/RQ's conventional worker module has the same name as
+        // invoke's task file. Demoting it would exempt production workers.
+        assert_eq!(scope_of("tasks.py"), ScopeClass::Runtime);
+        assert_eq!(scope_of("app/tasks.py"), ScopeClass::Runtime);
+        assert_eq!(scope_of("manage.py"), ScopeClass::Runtime);
+        // Not a suffix match: a product module whose name merely ends in one
+        // of the tooling names stays runtime.
+        assert_eq!(scope_of("app/prod_setup.py"), ScopeClass::Runtime);
+    }
+
+    #[test]
+    fn repo_evidence_overrides_the_path_class() {
+        // po-av01j.173: the scan pipeline stamps what the repo DECLARES, and
+        // every consumer reads it through `Site::scope`.
+        let mut s = Site {
+            file_path: "hatch_build.py".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.scope(), ScopeClass::Runtime, "no evidence: path decides");
+        s.scope_override = Some(ScopeClass::DevOnly);
+        assert_eq!(s.scope(), ScopeClass::DevOnly);
+    }
+
+    #[test]
+    fn a_scope_override_round_trips_and_is_absent_when_unset() {
+        // Sites cross the packet stream and the incremental index as JSON.
+        let s = Site {
+            file_path: "hatch_build.py".into(),
+            scope_override: Some(ScopeClass::DevOnly),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"scope_override\":\"dev_only\""), "{text}");
+        let back: Site = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.scope(), ScopeClass::DevOnly);
+        // Unset stays off the wire: retrievers emit no such field, and their
+        // records must keep matching the shape byte for byte.
+        let plain = Site {
+            file_path: "a.py".into(),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("scope_override"));
     }
 
     #[test]

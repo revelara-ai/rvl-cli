@@ -4239,3 +4239,179 @@ fn the_judgments_override_is_loudly_announced() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- build/dev scope from repo evidence (po-av01j.173) ---
+
+/// A Python project shaped like open-webui's root: product code in a package,
+/// a hatchling build hook and a maintenance script at the top level, both
+/// calling `subprocess.run` with no timeout. `pyproject` is written verbatim,
+/// so a caller can vary the ONE thing under test — whether the manifest
+/// declares the build hook.
+///
+/// Built under a name we choose, not a raw tempdir: scope is path-derived and
+/// a random temp name containing "test" would demote every site to test
+/// support. Packet paths are repo-relative, as the real retrievers emit them.
+///
+/// The scan artifacts (packets, specs, judgments) sit OUTSIDE the scanned
+/// tree. Inside it they would be repo evidence themselves — the packet stream
+/// names every file it carries, which is exactly the "something references
+/// this script" signal the unreferenced-script rule looks for.
+fn write_build_tooling_fixture(
+    tag: &str,
+    pyproject: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("rvlscan-devscope-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    w("pyproject.toml", pyproject);
+    w(
+        "hatch_build.py",
+        "import subprocess\n\n\nclass CustomBuildHook:\n    def initialize(self):\n        \
+         subprocess.run(['npm', 'run', 'build'])\n",
+    );
+    w(
+        "contribution_stats.py",
+        "import subprocess\n\n\ndef main():\n    subprocess.run(['git', 'ls-files'])\n\n\n\
+         if __name__ == '__main__':\n    main()\n",
+    );
+    w(
+        "pkg/plugin.py",
+        "import subprocess\n\n\ndef install(name):\n    subprocess.run(['pip', 'install', name])\n",
+    );
+
+    let packets = base.join("retrieved.jsonl");
+    let site = |f: &str, line: u32| {
+        format!(
+            "{{\"snapshot_id\":\"fixture\",\"file_path\":\"{f}\",\"line_number\":{line},\
+             \"func\":\"run\",\"client_type\":\"subprocess\",\
+             \"snippet\":\"subprocess.run(cmd)\",\"lang\":\"python\"}}\n"
+        )
+    };
+    std::fs::write(
+        &packets,
+        format!(
+            "{}{}{}",
+            site("hatch_build.py", 6),
+            site("contribution_stats.py", 5),
+            site("pkg/plugin.py", 5),
+        ),
+    )
+    .unwrap();
+
+    let specs = base.join("specs.json");
+    std::fs::write(
+        &specs,
+        r#"{"apis":[{"type":"subprocess","method":"run","site_count":3,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"subprocess.run waits forever without timeout="}],"configs":[]}"#,
+    )
+    .unwrap();
+
+    let judgments = base.join("judgments.json");
+    std::fs::write(
+        &judgments,
+        r#"[{"api":"subprocess.run","scope":"runtime","verdict":"surface","severity":"high","fix":"Pass timeout=. RC-019.","control":"RC-019"}]"#,
+    )
+    .unwrap();
+    (root, packets, specs)
+}
+
+/// Everything before the ADVISORY section: the findings that wedge a commit.
+fn blocking_section(stdout: &str) -> &str {
+    stdout.split("■ ADVISORY").next().unwrap_or(stdout)
+}
+
+fn scan_fixture(
+    root: &std::path::Path,
+    packets: &std::path::Path,
+    specs: &std::path::Path,
+) -> String {
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(packets)
+        .arg(root)
+        .arg("--specs-file")
+        .arg(specs)
+        .arg("--judgments")
+        .arg(root.parent().unwrap().join("judgments.json"))
+        .env("RVLSCAN_CACHE_DIR", root.parent().unwrap().join("cache"))
+        .output()
+        .expect("failed to run rvlscan");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The bug (po-av01j.173): on open-webui 3 of 6 blocking findings were build
+/// tooling, so the gate failed a commit over a build hook and a contributor
+/// stats script. Declared tooling must not block; product code must.
+#[test]
+fn declared_build_tooling_does_not_block_but_product_code_still_does() {
+    let (root, packets, specs) = write_build_tooling_fixture(
+        "declared",
+        "[project]\nname = \"demo\"\n\n[tool.hatch.build.hooks.custom]\n",
+    );
+    let stdout = scan_fixture(&root, &packets, &specs);
+    let blocking = blocking_section(&stdout);
+    assert!(
+        blocking.contains("pkg/plugin.py"),
+        "a real runtime path must still wedge the commit: {stdout}"
+    );
+    assert!(
+        !blocking.contains("hatch_build.py"),
+        "a build hook the manifest declares must not block: {stdout}"
+    );
+    assert!(
+        !blocking.contains("contribution_stats.py"),
+        "a root script nothing in the repo references must not block: {stdout}"
+    );
+    // DEMOTED, NEVER HIDDEN. Both tooling sites collapse into one advisory
+    // dev_only class (the ladder shows one example site per class, so the
+    // count is what proves the second one is in there) — the finding is still
+    // on screen, it just no longer wedges the commit.
+    let advisory = stdout.split("■ ADVISORY").nth(1).unwrap_or_default();
+    assert!(
+        advisory.contains("hatch_build.py") && advisory.contains("2 sites"),
+        "both tooling sites must still be reported, as advisory: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// The other half of the rule, and the reason this is evidence and not a
+/// filename list: with no `[tool.hatch.build.hooks.custom]` table, hatchling
+/// never runs `hatch_build.py`, so it is ordinary code and keeps blocking.
+/// The FILE IS BYTE-IDENTICAL between the two tests; only the manifest differs.
+#[test]
+fn an_undeclared_hatch_build_py_still_blocks() {
+    let (root, packets, specs) =
+        write_build_tooling_fixture("undeclared", "[project]\nname = \"demo\"\n");
+    let stdout = scan_fixture(&root, &packets, &specs);
+    assert!(
+        blocking_section(&stdout).contains("hatch_build.py"),
+        "without the declaration the name proves nothing: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// A root script the repo DOES wire up (a Makefile recipe here) is not
+/// tooling-by-absence: one mention anywhere keeps it on the runtime path.
+#[test]
+fn a_referenced_root_script_still_blocks() {
+    let (root, packets, specs) = write_build_tooling_fixture(
+        "referenced",
+        "[project]\nname = \"demo\"\n\n[tool.hatch.build.hooks.custom]\n",
+    );
+    std::fs::write(
+        root.join("Makefile"),
+        "stats:\n\tpython contribution_stats.py\n",
+    )
+    .unwrap();
+    let stdout = scan_fixture(&root, &packets, &specs);
+    assert!(
+        blocking_section(&stdout).contains("contribution_stats.py"),
+        "a script the repo invokes must keep blocking: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}

@@ -1125,6 +1125,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "hex",
+ "ignore",
  "libc",
  "rvl-cache",
  "rvl-config",
@@ -1143,6 +1144,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

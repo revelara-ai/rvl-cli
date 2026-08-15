@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod config_lane;
+mod devscope;
 mod doctor;
 mod embedded_helpers;
 mod hook;
@@ -2132,20 +2133,12 @@ fn resolve_findings(
     stream: &str,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
-    policy_root: Option<&std::path::Path>,
+    repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
-        store,
-        keyset,
-        sites,
-        &repo_cfg,
-        skipped,
-        specs_file,
-        judgments,
-        policy_root,
-        verbose,
+        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, repo_root, verbose,
     )
 }
 
@@ -2229,12 +2222,12 @@ fn resolve_judgments(
 fn findings_from_sites(
     store: &CacheStore,
     keyset: &Keyset,
-    sites: Vec<rvl_core::Site>,
+    mut sites: Vec<rvl_core::Site>,
     repo_cfg: &rvl_core::RepoConfig,
     skipped: usize,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
-    policy_root: Option<&std::path::Path>,
+    repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
     // The signed artifact carries BOTH halves of the answer: the specs that
@@ -2298,6 +2291,22 @@ fn findings_from_sites(
     // This is the epic's recurring confusion inverted: elsewhere absence was
     // reported as success, here it was reported as failure. Both come from
     // collapsing "I found nothing" and "I could not look" into one outcome.
+    // REPO EVIDENCE BEATS THE PATH (po-av01j.173). `scope_of` reads the path
+    // and nothing else, so a hatchling build hook and a maintenance script at
+    // the repo root both class as Runtime and their unbounded `subprocess`
+    // calls block a commit. Stamped here, once, before ANY lane looks at a
+    // scope: propagation, triage, the emission lane and `--out` all ask
+    // `Site::scope`, so they cannot disagree about where a file lives.
+    if let Some(root) = repo_root {
+        let dev = devscope::DevScope::detect(root);
+        dev.annotate(&mut sites);
+        if verbose && !dev.is_empty() {
+            println!(
+                "dev scope {} file(s) (declared build hooks / unreferenced root scripts)",
+                dev.len()
+            );
+        }
+    }
     // G2 (po-av01j.3): server-entry records ride the same stream but are
     // judged by their own lane. Partition them out BEFORE propagation so the
     // G1 coverage numbers, the `--out` eval rows, and the shape-only report
@@ -2319,7 +2328,7 @@ fn findings_from_sites(
     // statement_timeout, an infra deadline). Merged as exact-type
     // whole-call this-client ConfigSpecs with the policy provenance; the
     // declaration is committed to the repo, so the audit trail is git.
-    if let Some(root) = policy_root {
+    if let Some(root) = repo_root {
         let declared =
             waiver::load_declared_bounds(&root.join(".revelara.yaml"), &rvl_cache::today_utc());
         if !declared.is_empty() {
