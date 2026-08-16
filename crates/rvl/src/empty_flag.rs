@@ -263,6 +263,18 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // stpa.go:194: an empty --service prints the same "[skip]" notice as
     // omitting it.
     ("stpa submit", "service", Empty::Absent),
+    // list-ucas, un-retired by po-av01j.202. All three string filters are
+    // guarded before they reach the query or the client-side filter, so an
+    // empty value is the flag not being given:
+    //   stpa.go:540 `if source != ""`
+    //   stpa.go:543 `if ucaType != ""`
+    //   stpa.go:562 `if controlCode != ""`
+    ("stpa list-ucas", "source", Empty::Absent),
+    ("stpa list-ucas", "uca-type", Empty::Absent),
+    ("stpa list-ucas", "control-code", Empty::Absent),
+    // stpa.go:524-530 Atoi("") fails and exits 2 BEFORE any network call
+    // (po-cj4s7), which clap's typed range parse reproduces.
+    ("stpa list-ucas", "limit", Empty::Error),
 ];
 
 /// Normalize THIS binary's own commands (the ones whose flags are consumed in

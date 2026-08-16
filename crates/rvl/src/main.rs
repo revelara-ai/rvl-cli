@@ -458,10 +458,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::config::ConfigCmd,
     },
-    /// Ingest an STPA-inspired design review (`stpa submit --file`): the
+    /// STPA-inspired safety analysis. `stpa submit --file` ingests the
     /// losses, UCAs, loss scenarios and control-structure model produced by
-    /// the `stpa-review` skill. This is that skill's only ingestion path —
+    /// the `stpa-review` skill — that skill's only ingestion path, since
     /// `scan --cs-file` carries the control structure alone (po-av01j.183).
+    /// `stpa list-ucas` reads the UCA store back, including the design-review
+    /// UCAs that never become risks and so never show up in `risk list`
+    /// (po-av01j.202).
     ///
     /// Revelara's analysis is STPA-inspired (adapted from Systems-Theoretic
     /// Process Analysis, Leveson & Thomas, MIT). Findings are candidates for

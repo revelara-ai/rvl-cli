@@ -21,15 +21,24 @@
 //! the process still exits 0. Only a missing/unreadable/unparseable file or
 //! a config failure aborts.
 //!
-//! Note: `stpa list-ucas` is deliberately NOT ported — cutover decision 2
-//! ratified its retirement. That retirement covered list-ucas ONLY.
+//! `stpa list-ucas` is ALSO ported (po-av01j.202), reversing the part of
+//! cutover decision 2 that had retired it. Decision 2 called it redundant
+//! because "STPA fields ride `risk context`"; measured against the live API
+//! that premise is false. `list-ucas` returns 137 UCAs with id, type, source,
+//! control mapping, detection count and content text; the risk listing
+//! carries a bare `uca_type` enum on 54 of 58 risks. Design-review UCAs
+//! arrive through `stpa submit` and never become risks, so the risk listing
+//! structurally cannot see them. Two populations, not two views of one.
+//! The rest of decision 2 stands.
 
 use crate::client::{self, Client};
 use crate::control;
+use crate::display;
 use crate::gojson::{compact, path_escape, G};
-use crate::{Failure, BIN};
+use crate::{CmdResult, Failure, BIN};
 use rvl_core::flag::EmptyFlag;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::process::ExitCode;
 
 #[derive(clap::Subcommand)]
@@ -43,6 +52,24 @@ pub enum StpaCmd {
         /// Service name / repo URL used to scope the control structure
         #[arg(long)]
         service: Option<String>,
+    },
+    /// List candidate unsafe control actions from STPA-inspired analysis.
+    /// Covers UCAs from every source, including the design-review ones that
+    /// never become risks and so never appear in `risk list`.
+    ListUcas {
+        /// Filter by source (scan, design_review, cast, manual)
+        #[arg(long)]
+        source: Option<String>,
+        /// Filter by UCA type (not_provided, providing_incorrectly,
+        /// wrong_timing, wrong_duration)
+        #[arg(long = "uca-type")]
+        uca_type: Option<String>,
+        /// Filter by control code (e.g. RC-018)
+        #[arg(long = "control-code")]
+        control_code: Option<String>,
+        /// Maximum results (default 50)
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
     },
 }
 
@@ -328,6 +355,28 @@ pub fn run(cmd: StpaCmd) -> ExitCode {
                     ExitCode::from(f.code)
                 }
             }
+        }
+        // EMPTY-FLAG SEMANTICS (po-av01j.192): stpa.go:540/543/562 guard each
+        // filter with `!= ""`, so an empty value is the flag not being given;
+        // stpa.go:524-530 runs `strconv.Atoi` on --limit and exits 2 when it
+        // fails, which clap's typed range parse produces for free.
+        StpaCmd::ListUcas {
+            source,
+            uca_type,
+            control_code,
+            limit,
+        } => {
+            let res = (|| -> CmdResult {
+                let (_cfg, client) = client::load_and_resolve()?;
+                list_ucas_output(
+                    &client,
+                    source.empty_is_absent(),
+                    uca_type.empty_is_absent(),
+                    control_code.empty_is_absent(),
+                    limit,
+                )
+            })();
+            crate::finish(res)
         }
     }
 }
@@ -658,6 +707,115 @@ fn submit_control_structure(
     );
 }
 
+// ----------------------------------------------------------- list-ucas --
+
+/// One row of `GET /api/v1/ucas`. Only the fields rvl-cli's `ucaListItem`
+/// carries; the rest of the server body is ignored, as in Go.
+#[derive(Debug, Default, Deserialize)]
+pub struct UcaListItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub uca_type: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub control_code: String,
+    #[serde(default)]
+    pub detection_count: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UcaListResponse {
+    #[serde(default)]
+    pub ucas: Vec<UcaListItem>,
+}
+
+/// Go builds this query by raw string concatenation (stpa.go:538-546), NOT
+/// through `url.Values`, so a value with a space or `&` in it goes to the
+/// wire unescaped. Reproduced verbatim: escaping here would change which
+/// rows the server returns for such a filter.
+pub fn list_ucas_url(
+    api_url: &str,
+    source: Option<&str>,
+    uca_type: Option<&str>,
+    limit: u32,
+) -> String {
+    let mut params = vec![format!("limit={limit}")];
+    if let Some(s) = source {
+        params.push(format!("source={s}"));
+    }
+    // The server spells the UCA-type parameter `type`, not `uca-type`.
+    if let Some(t) = uca_type {
+        params.push(format!("type={t}"));
+    }
+    format!("{api_url}/api/v1/ucas?{}", params.join("&"))
+}
+
+pub fn list_ucas_output(
+    client: &Client,
+    source: Option<&str>,
+    uca_type: Option<&str>,
+    control_code: Option<&str>,
+    limit: u32,
+) -> CmdResult {
+    let url = list_ucas_url(&client.api_url, source, uca_type, limit);
+    let body = client
+        .request("GET", &url, None)
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+    let mut resp: UcaListResponse = serde_json::from_slice(&body)
+        .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
+
+    // stpa.go:562 — `--control-code` has no server-side parameter, so it is
+    // applied client-side to whatever the (limited) page returned, case
+    // insensitively.
+    if let Some(code) = control_code {
+        resp.ucas
+            .retain(|u| u.control_code.eq_ignore_ascii_case(code));
+    }
+
+    Ok(render_ucas(&resp.ucas))
+}
+
+/// The table Go prints at stpa.go:572-604. Split out so the parity tests can
+/// exercise the exact rendering the command uses, with no HTTP in the way.
+pub fn render_ucas(ucas: &[UcaListItem]) -> String {
+    let mut out = String::new();
+    if ucas.is_empty() {
+        let _ = writeln!(out, "No UCAs found.");
+        return out;
+    }
+
+    let _ = writeln!(out, "Found {} UCAs:\n", ucas.len());
+    let _ = writeln!(
+        out,
+        "{:<8} {:<20} {:<15} {:<10} {:<5} CONTENT",
+        "ID", "UCA TYPE", "SOURCE", "CONTROL", "COUNT"
+    );
+    let _ = writeln!(out, "{}", "-".repeat(100));
+
+    for u in ucas {
+        let control = if u.control_code.is_empty() {
+            "-"
+        } else {
+            &u.control_code
+        };
+        let _ = writeln!(
+            out,
+            "{:<8} {:<20} {:<15} {:<10} {:<5} {}",
+            display::cut_at_boundary(&u.id, 8),
+            display::format_uca_type(&u.uca_type),
+            display::format_category(&u.source),
+            control,
+            u.detection_count,
+            truncate(&u.content, 40, 37)
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +967,109 @@ mod tests {
         let mut order: Vec<usize> = (0..levels.len()).collect();
         sort_scenarios(&mut order, |i| level_order(levels[i]));
         assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn list_ucas_url_is_built_by_raw_concatenation() {
+        assert_eq!(
+            list_ucas_url("https://api.example.com", None, None, 50),
+            "https://api.example.com/api/v1/ucas?limit=50"
+        );
+        assert_eq!(
+            list_ucas_url(
+                "https://api.example.com",
+                Some("design_review"),
+                Some("not_provided"),
+                20
+            ),
+            "https://api.example.com/api/v1/ucas?limit=20&source=design_review&type=not_provided"
+        );
+        // Unescaped, exactly as Go's string concatenation leaves it.
+        assert_eq!(
+            list_ucas_url("https://api.example.com", Some("a b&c"), None, 1),
+            "https://api.example.com/api/v1/ucas?limit=1&source=a b&c"
+        );
+    }
+
+    fn uca_row(
+        id: &str,
+        ty: &str,
+        src: &str,
+        code: &str,
+        count: i64,
+        content: &str,
+    ) -> UcaListItem {
+        UcaListItem {
+            id: id.into(),
+            content: content.into(),
+            uca_type: ty.into(),
+            source: src.into(),
+            control_code: code.into(),
+            detection_count: count,
+        }
+    }
+
+    /// The command's own render, after the client-side `--control-code`
+    /// filter list_ucas_output applies (stpa.go:562-570).
+    fn render(resp: UcaListResponse, control_code: Option<&str>) -> String {
+        let mut resp = resp;
+        if let Some(code) = control_code {
+            resp.ucas
+                .retain(|u| u.control_code.eq_ignore_ascii_case(code));
+        }
+        render_ucas(&resp.ucas)
+    }
+
+    #[test]
+    fn list_ucas_table_matches_gos_column_widths() {
+        let resp = UcaListResponse {
+            ucas: vec![
+                uca_row(
+                    "0f3ac1de-9b21-4c77-8d0e-5a1b2c3d4e5f",
+                    "not_provided",
+                    "design_review",
+                    "RC-018",
+                    3,
+                    "PARITY PROBE 183: checkout does not retry the payment authorization",
+                ),
+                uca_row("abc", "wrong_timing", "scan", "", 1, "short"),
+            ],
+        };
+        assert_eq!(
+            render(resp, None),
+            concat!(
+                "Found 2 UCAs:\n",
+                "\n",
+                "ID       UCA TYPE             SOURCE          CONTROL    COUNT CONTENT\n",
+                "----------------------------------------------------------------------------------------------------\n",
+                "0f3ac1de Not Provided         Design Review   RC-018     3     PARITY PROBE 183: checkout does not r...\n",
+                "abc      Wrong Timing         Scan            -          1     short\n",
+            )
+        );
+    }
+
+    #[test]
+    fn list_ucas_empty_result_prints_the_no_ucas_line() {
+        assert_eq!(render(UcaListResponse::default(), None), "No UCAs found.\n");
+        // ...including when the client-side control filter emptied the page.
+        let resp = UcaListResponse {
+            ucas: vec![uca_row("a", "not_provided", "scan", "RC-018", 1, "c")],
+        };
+        assert_eq!(render(resp, Some("RC-099")), "No UCAs found.\n");
+    }
+
+    #[test]
+    fn control_code_filter_is_case_insensitive() {
+        let resp = UcaListResponse {
+            ucas: vec![
+                uca_row("a", "not_provided", "scan", "RC-018", 1, "keep"),
+                uca_row("b", "not_provided", "scan", "RC-019", 1, "drop"),
+            ],
+        };
+        let out = render(resp, Some("rc-018"));
+        assert!(out.contains("Found 1 UCAs:"), "{out}");
+        assert!(out.contains("keep"), "{out}");
+        assert!(!out.contains("drop"), "{out}");
     }
 
     #[test]
