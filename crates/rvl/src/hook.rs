@@ -12,10 +12,12 @@
 //! Install is lefthook-aware, like rvl-cli's: when a lefthook config is
 //! present it prints a ready-to-paste snippet instead of writing
 //! `.git/hooks`, so it never fights lefthook for the hook file. Install is
-//! idempotent — a hook file that already carries a Revelara scan command
-//! (including a v1 rvl-cli shim) is refreshed in place; a foreign hook is
-//! refused unless `--force`, which backs it up to `<name>.pre-rvl`.
+//! idempotent — a hook file that already carries this binary's gate is
+//! refreshed in place; an rvl-cli v1 shim is REPAIRED in place (see
+//! [`crate::compat`]); a foreign hook is refused unless `--force`, which
+//! backs it up to `<name>.pre-rvl`.
 
+use crate::compat;
 use clap::Subcommand;
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
@@ -30,14 +32,28 @@ const SHIM_MARKER: &str = "rvl scan";
 /// The marker that identifies a hook file as THIS binary's deterministic
 /// gate, as opposed to any other `rvl scan` invocation.
 ///
-/// [`SHIM_MARKER`] is deliberately broad — `doctor` should report "a scan
-/// gate is wired" for a v1 rvl-cli agent-scan shim too. Install must NOT be
-/// that broad: a v1 shim runs `rvl scan --agent`, a coding-agent review, and
-/// silently rewriting it to the deterministic gate swaps one gate for a
-/// different one behind the user's back (po-av01j.185 item 10). rvl-cli
-/// refuses ANY pre-existing hook file without `--force`; this refuses
-/// everything except a file that is already our own gate, which keeps
-/// re-running `hook install` idempotent.
+/// [`SHIM_MARKER`] is deliberately broad — any `rvl scan` line is a scan gate
+/// of some sort. Install must NOT be that broad: rvl-cli refuses ANY
+/// pre-existing hook file without `--force`, and this refuses everything
+/// except a file we can prove WE wrote, which keeps re-running `hook install`
+/// idempotent without ever stomping a hook someone else authored.
+///
+/// Three states, not two (po-av01j.191):
+///
+/// 1. this marker present — our CURRENT gate, refreshed in place;
+/// 2. [`compat::is_v1_shim`] — our OWN PREDECESSOR's gate, which we know is
+///    stale, repaired in place, backed up, no `--force`;
+/// 3. anything else — foreign, refused without `--force`.
+///
+/// po-av01j.185 item 10 put (2) in the foreign bucket, reasoning that a v1
+/// shim runs `rvl scan --agent`, a coding-agent review, so rewriting it swaps
+/// one gate for a different one behind the user's back. That reasoning was
+/// right for a v1 binary and is void for this one: `--agent` here is a
+/// documented no-op alias that runs the deterministic scan, so a v1 shim and a
+/// v2 shim now do the SAME THING. Rewriting it is not swapping gates, it is
+/// normalizing the spelling — and refusing left the user with a repo they
+/// could not commit to and a tool telling them everything was fine. Refusing a
+/// FOREIGN hook is still right, and is unchanged.
 const NATIVE_GATE_MARKER: &str = "Revelara deterministic scan gate";
 
 #[derive(Subcommand)]
@@ -191,27 +207,29 @@ fn hooks_dir(root: &Path) -> anyhow::Result<PathBuf> {
     })
 }
 
-/// Write the shim for `hook` into `hooks_dir`. A file that is ALREADY this
-/// binary's deterministic gate is refreshed in place, so re-running install
-/// is idempotent. Any other existing hook — a foreign hook, or a v1 rvl-cli
-/// `rvl scan --agent` shim, which is a DIFFERENT gate — is refused unless
-/// `force`, which backs it up to `<name>.pre-rvl` first (rvl-cli
-/// `writeHookShim` refuses every existing file the same way).
+/// Write the shim for `hook` into `hooks_dir`, per the three-state rule on
+/// [`NATIVE_GATE_MARKER`]: refresh our current gate in place, REPAIR our
+/// predecessor's in place (backing it up), refuse a foreign hook unless
+/// `force` — which backs it up to `<name>.pre-rvl` first, exactly as rvl-cli
+/// `writeHookShim` does for every existing file.
 fn write_hook_shim(hooks_dir: &Path, hook: &str, force: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(hooks_dir).map_err(|e| anyhow::anyhow!("create hooks dir: {e}"))?;
     let path = hooks_dir.join(hook);
+    let mut repaired_v1 = false;
     if path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         if !existing.contains(NATIVE_GATE_MARKER) {
+            // Our own predecessor: known stale, and we authored it. Repair
+            // without demanding --force (po-av01j.191).
+            repaired_v1 = compat::is_v1_shim(&existing);
             let what = if existing.contains(SHIM_MARKER) {
-                " (it invokes a scan, but not this binary's deterministic gate — \
-                 an rvl-cli agent-scan hook is a different gate, not an older \
-                 copy of this one)"
+                " (it invokes a scan, but neither this binary's deterministic gate \
+                 nor an rvl-cli v1 shim, so it is not ours to rewrite)"
             } else {
                 ""
             };
             anyhow::ensure!(
-                force,
+                repaired_v1 || force,
                 "{} already exists{what}; re-run with --force to overwrite \
                  (the old hook is backed up to {hook}.pre-rvl)",
                 path.display()
@@ -222,6 +240,12 @@ fn write_hook_shim(hooks_dir: &Path, hook: &str, force: bool) -> anyhow::Result<
         }
     }
     std::fs::write(&path, shim_body(hook)).map_err(|e| anyhow::anyhow!("write hook shim: {e}"))?;
+    if repaired_v1 {
+        println!(
+            "Repaired {hook} hook: it was an rvl-cli v1 agent-scan shim \
+             (backed up to {hook}.pre-rvl)."
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -337,7 +361,20 @@ pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
     match detect_lefthook(root) {
         Some(lp) => {
             let data = std::fs::read_to_string(&lp).unwrap_or_default();
-            if data.contains(SHIM_MARKER) {
+            if compat::lefthook_has_v1_command(&data) {
+                // v1's `hook install` printed `run: rvl scan --agent ...`
+                // snippets for users to paste. There is no shim file to
+                // inspect, so the config line is the only place this shows up.
+                checks.push(Check::new(
+                    Status::Warn,
+                    "lefthook",
+                    format!(
+                        "rvl-cli v1 agent-scan command: it runs through the deprecated v1 \
+                         compatibility aliases; replace the run line with \
+                         `{BIN} scan . --incremental --changed-only --hook <pre-commit|pre-push>`"
+                    ),
+                ));
+            } else if data.contains(SHIM_MARKER) {
                 checks.push(Check::new(
                     Status::Pass,
                     "lefthook",
@@ -372,17 +409,34 @@ pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
                     format!("not installed; run `{BIN} hook install --{name}`"),
                 )),
                 Ok(body) if body.contains(SHIM_MARKER) => {
-                    if is_executable(&p) {
-                        checks.push(Check::new(
-                            Status::Pass,
-                            label,
-                            "native scan gate installed",
-                        ));
-                    } else {
+                    if !is_executable(&p) {
                         checks.push(Check::new(
                             Status::Fail,
                             label,
                             format!("installed but not executable; run chmod +x {}", p.display()),
+                        ));
+                    } else if compat::is_v1_shim(&body) {
+                        // NEVER PASS on a v1 shim (po-av01j.191). Before the
+                        // compatibility aliases landed this file could not run
+                        // at all, and doctor called it healthy because
+                        // SHIM_MARKER matched the bare literal `rvl scan`. It
+                        // runs now, but on a deprecated path, and the user
+                        // deserves to be told which hook and which command
+                        // fixes it.
+                        checks.push(Check::new(
+                            Status::Warn,
+                            label,
+                            format!(
+                                "rvl-cli v1 shim (`rvl scan --agent ...`): it runs only through \
+                                 the deprecated v1 compatibility aliases; repair it with \
+                                 `{BIN} hook install` (no --force needed)"
+                            ),
+                        ));
+                    } else {
+                        checks.push(Check::new(
+                            Status::Pass,
+                            label,
+                            "native scan gate installed",
                         ));
                     }
                 }
@@ -481,38 +535,75 @@ mod tests {
         assert!(hook.contains("--hook pre-push"));
     }
 
-    /// A v1 rvl-cli agent-scan shim is a DIFFERENT gate (a coding-agent
-    /// review), not an older copy of this one. Silently rewriting it to the
-    /// deterministic gate would swap the user's gate behind their back, so it
-    /// is refused exactly like a foreign hook (po-av01j.185 item 10).
+    /// A v1 rvl-cli shim is OUR OWN PREDECESSOR's gate, and we know it is
+    /// stale, so install repairs it WITHOUT `--force` (po-av01j.191). The old
+    /// file is still backed up, so nothing is destroyed.
     #[test]
-    fn a_v1_agent_scan_shim_is_refused_without_force_and_backed_up_with_it() {
+    fn a_v1_shim_is_repaired_in_place_without_force() {
         let tmp = git_repo();
         let hd = hooks_dir(tmp.path()).unwrap();
-        let v1 = "#!/bin/sh\n\
-                  # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
-                  exec rvl scan --agent --staged --mode enforce\n";
+        let v1 = crate::compat::V1_PRE_COMMIT_SHIM;
         std::fs::write(hd.join("pre-commit"), v1).unwrap();
 
-        let err = write_hook_shim(&hd, "pre-commit", false).unwrap_err();
-        assert!(
-            err.to_string().contains("--force"),
-            "must point at --force: {err}"
-        );
-        // Refusal leaves the user's gate exactly as it was.
-        assert_eq!(std::fs::read_to_string(hd.join("pre-commit")).unwrap(), v1);
-        // SHIM_MARKER still matches it — that breadth is doctor's, not
-        // install's.
-        assert!(v1.contains(SHIM_MARKER));
-
-        write_hook_shim(&hd, "pre-commit", true).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(hd.join("pre-commit.pre-rvl")).unwrap(),
-            v1
-        );
+        write_hook_shim(&hd, "pre-commit", false).unwrap();
         let now = std::fs::read_to_string(hd.join("pre-commit")).unwrap();
         assert!(now.contains(NATIVE_GATE_MARKER));
         assert!(!now.contains("--agent"));
+        assert_eq!(
+            std::fs::read_to_string(hd.join("pre-commit.pre-rvl")).unwrap(),
+            v1,
+            "the replaced shim must be recoverable"
+        );
+
+        // The pre-push shim too, and a second run stays idempotent.
+        std::fs::write(hd.join("pre-push"), crate::compat::V1_PRE_PUSH_SHIM).unwrap();
+        write_hook_shim(&hd, "pre-push", false).unwrap();
+        write_hook_shim(&hd, "pre-push", false).unwrap();
+        let now = std::fs::read_to_string(hd.join("pre-push")).unwrap();
+        assert!(now.contains("--hook pre-push"));
+    }
+
+    /// doctor must never call a v1 shim healthy: that PASS is half of what
+    /// made po-av01j.191 severe rather than merely broken.
+    #[test]
+    fn doctor_names_a_v1_shim_instead_of_passing_it() {
+        let tmp = git_repo();
+        let hd = hooks_dir(tmp.path()).unwrap();
+        std::fs::write(hd.join("pre-commit"), crate::compat::V1_PRE_COMMIT_SHIM).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hd.join("pre-commit"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let checks = doctor_checks(tmp.path(), "");
+        let c = checks
+            .iter()
+            .find(|c| c.label == "pre-commit hook")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn, "detail: {}", c.detail);
+        assert!(c.detail.contains("rvl-cli v1 shim"), "got: {}", c.detail);
+        assert!(c.detail.contains("hook install"), "got: {}", c.detail);
+    }
+
+    /// A lefthook config carrying v1's pasted `run: rvl scan --agent ...` has
+    /// no shim file to inspect, so the config line is the only place the stale
+    /// invocation surfaces.
+    #[test]
+    fn doctor_names_a_v1_lefthook_command() {
+        let tmp = git_repo();
+        std::fs::write(
+            tmp.path().join("lefthook.yml"),
+            "pre-commit:\n  commands:\n    agent-scan:\n      run: rvl scan --agent --staged\n",
+        )
+        .unwrap();
+        let checks = doctor_checks(tmp.path(), "");
+        let c = checks.iter().find(|c| c.label == "lefthook").unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("rvl-cli v1"), "got: {}", c.detail);
     }
 
     #[test]

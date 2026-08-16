@@ -528,11 +528,15 @@ fn hook_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(".git").join("hooks").join(name)
 }
 
-/// An rvl-cli agent-scan hook is a DIFFERENT gate (a coding-agent review),
-/// not an older copy of this one, so install refuses it exactly as rvl-cli
-/// refuses any pre-existing hook — no silent swap (po-av01j.185 item 10).
+/// An rvl-cli v1 shim is OUR OWN PREDECESSOR's gate, and after the cutover we
+/// know it is stale, so install REPAIRS it without `--force` (po-av01j.191);
+/// the replaced file is still backed up. po-av01j.185 item 10 refused it,
+/// reasoning that a v1 shim runs a different (coding-agent) gate — true of a
+/// v1 binary, void of this one, where `--agent` is a documented no-op.
+///
+/// The full repair/doctor/upgrade-path matrix lives in `v1_hook_compat.rs`.
 #[test]
-fn hook_install_refuses_a_v1_agent_scan_hook_without_force() {
+fn hook_install_repairs_a_v1_agent_scan_hook_without_force() {
     let tmp = tempfile::tempdir().unwrap();
     git_init(tmp.path());
     let path = hook_path(tmp.path(), "pre-commit");
@@ -546,22 +550,9 @@ fn hook_install_refuses_a_v1_agent_scan_hook_without_force() {
         .args(["hook", "install"])
         .output()
         .expect("run hook install");
-    assert!(!out.status.success(), "must refuse");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--force"), "got: {stderr}");
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        v1,
-        "a refusal must leave the user's gate untouched"
-    );
-
-    let out = bin()
-        .current_dir(tmp.path())
-        .args(["hook", "install", "--force"])
-        .output()
-        .expect("run hook install --force");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "got: {stdout}");
+    assert!(stdout.contains("Repaired pre-commit hook"), "got: {stdout}");
     assert_eq!(
         std::fs::read_to_string(hook_path(tmp.path(), "pre-commit.pre-rvl")).unwrap(),
         v1,
