@@ -132,6 +132,14 @@ fn usage_failure(err: &str, help_cmd: &str) -> Failure {
 
 /// Resolve clap-parsed flags to options, mirroring `parseFeedbackArgs`:
 /// same defaults, same invalid `--attach-diagnostics` error.
+///
+/// EMPTY-FLAG SEMANTICS (po-av01j.192): every flag here is `Empty::Error`,
+/// so NOTHING is normalized away — the empty string has to reach the checks
+/// below. feedback.go:195 requires a non-blank `--message`; :198 rejects a
+/// `--category` outside {feedback,bug}, and an empty value REPLACES the
+/// default rather than falling back to it; :201 validates `--format`
+/// unguarded, so `--format=` is `invalid --format ""`; :174 rejects any
+/// `--attach-diagnostics` value that is not true/false. All exit 2.
 pub fn resolve_options(args: FeedbackArgs, default_category: &str) -> Result<Options, String> {
     let attach_diagnostics = match args.attach_diagnostics.as_deref() {
         None | Some("true") => true,

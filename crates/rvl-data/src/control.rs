@@ -6,6 +6,7 @@ use crate::client::Client;
 use crate::display;
 use crate::gojson::{compact, compact_raw, path_escape, query_encode, G};
 use crate::{CmdResult, Failure, BIN};
+use rvl_core::flag::{absent_if_empty, EmptyFlag};
 use serde::Deserialize;
 use std::fmt::Write as _;
 
@@ -127,9 +128,22 @@ pub fn run(cmd: ControlCmd) -> std::process::ExitCode {
                 limit,
                 format,
             } => {
+                // control.go:163 wraps ValidateFormat in `if format != ""`,
+                // so `--format=` renders the table while `--format=xyz` still
+                // exits 2. Normalizing BEFORE the validator reproduces that
+                // guard instead of re-deriving it inside every validator.
+                // control.go:176 guards --category the same way; `--limit=`
+                // is rejected by clap's typed parse, as Atoi("") is at
+                // control.go:128.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let (_, client) = crate::client::load_and_resolve()?;
-                list_output(&client, category.as_deref(), limit, format.as_deref())
+                list_output(
+                    &client,
+                    category.empty_is_absent(),
+                    limit,
+                    format.empty_is_absent(),
+                )
             }
             ControlCmd::Show {
                 code,
@@ -137,15 +151,18 @@ pub fn run(cmd: ControlCmd) -> std::process::ExitCode {
                 service,
                 format,
             } => {
+                // control.go:251, same guarded validator. --team/--service
+                // are rvl-native scope filters and follow the filter rule.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 check_not_risk_code(&code)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 show_output(
                     &client,
                     &code,
-                    team.as_deref(),
-                    service.as_deref(),
-                    format.as_deref(),
+                    team.empty_is_absent(),
+                    service.empty_is_absent(),
+                    format.empty_is_absent(),
                 )
             }
         }

@@ -69,6 +69,13 @@ pub fn run(cmd: IncidentCmd) -> std::process::ExitCode {
                 limit,
                 format,
             } => {
+                // EMPTY-FLAG SEMANTICS (po-av01j.192): incident.go:163 calls
+                // ValidateFormat UNGUARDED — unlike control/evidence/knowledge,
+                // which wrap it in `if format != ""` — so `incident search
+                // --format=` is a usage error in rvl-cli. No normalization
+                // here on purpose: the validator below must see the empty
+                // string and reject it. `--limit=` errors via clap's typed
+                // parse, matching Atoi("") at incident.go:152.
                 validate_format(&format)?;
                 let query = query.join(" ");
                 if query.is_empty() {

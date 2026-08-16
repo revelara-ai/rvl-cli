@@ -14,6 +14,7 @@ use crate::client::Client;
 use crate::display;
 use crate::gojson::{compact, path_escape, pretty, query_encode, query_escape, G};
 use crate::{CmdResult, Failure, BIN};
+use rvl_core::flag::{absent_if_empty, EmptyFlag};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -501,6 +502,15 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 min_class,
                 format,
             } => {
+                // EMPTY-FLAG SEMANTICS (po-av01j.192), from knowledge.go:
+                //  * --format: :413 guards ValidateFormat with `!= ""`, so
+                //    `--format=` renders the table (normalized below).
+                //  * --min-class: :372 switches on the raw value with no
+                //    guard, so "" falls to `default` and exits 2 — NOT
+                //    normalized, the validator must see the empty string.
+                //  * --limit/--offset: Atoi("") at :382/:391 exits 2, which
+                //    clap's typed parse reproduces.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 validate_min_class(&min_class)?;
                 let query = query.join(" ");
@@ -513,8 +523,8 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     &query,
                     limit,
                     offset,
-                    min_class.as_deref(),
-                    format.as_deref(),
+                    min_class.empty_is_value(),
+                    format.empty_is_absent(),
                 )
             }
             KnowledgeCmd::Facts {
@@ -525,16 +535,19 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 offset,
                 format,
             } => {
+                // knowledge.go:559/562/565 guard every filter with `!= ""`;
+                // :545 guards ValidateFormat the same way.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 facts_output(
                     &client,
-                    vertical.as_deref(),
-                    technology.as_deref(),
-                    status.as_deref(),
+                    vertical.empty_is_absent(),
+                    technology.empty_is_absent(),
+                    status.empty_is_absent(),
                     limit,
                     offset,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             KnowledgeCmd::Procedures {
@@ -546,17 +559,21 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 offset,
                 format,
             } => {
+                // knowledge.go:677/680/683/687 (--control is guarded three
+                // times: query param, JSON mode, and the client-side filter)
+                // and :663 for --format.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 procedures_output(
                     &client,
-                    vertical.as_deref(),
-                    technology.as_deref(),
-                    proc_type.as_deref(),
-                    control.as_deref(),
+                    vertical.empty_is_absent(),
+                    technology.empty_is_absent(),
+                    proc_type.empty_is_absent(),
+                    control.empty_is_absent(),
                     limit,
                     offset,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             KnowledgeCmd::Patterns {
@@ -567,16 +584,20 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 offset,
                 format,
             } => {
+                // knowledge.go:852/855 for the filters, :838 for --format;
+                // --min-occurrences/--limit/--offset are Atoi'd at
+                // :800/:810/:820 and error on empty.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 patterns_output(
                     &client,
-                    vertical.as_deref(),
-                    pattern_type.as_deref(),
+                    vertical.empty_is_absent(),
+                    pattern_type.empty_is_absent(),
                     min_occurrences,
                     limit,
                     offset,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             KnowledgeCmd::Relationships {
@@ -584,8 +605,10 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 entity_id,
                 format,
             } => {
+                // knowledge.go:959 stores --format and only ever compares
+                // it to "json"; there is no validator on this subcommand.
                 let (_, client) = crate::client::load_and_resolve()?;
-                relationships_output(&client, &entity_type, &entity_id, format.as_deref())
+                relationships_output(&client, &entity_type, &entity_id, format.empty_is_absent())
             }
             KnowledgeCmd::Graph {
                 entity_type,
@@ -594,6 +617,10 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 min_strength,
                 relation_type,
             } => {
+                // knowledge.go:1045 does a bare TrimPrefix on
+                // --min-strength with no parse and no guard, so `&min_strength=`
+                // is what rvl-cli puts on the wire; graph_output interpolates
+                // it verbatim for that reason. --type is guarded at :1057.
                 let (_, client) = crate::client::load_and_resolve()?;
                 graph_output(
                     &client,
@@ -601,7 +628,7 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     &entity_id,
                     depth,
                     &min_strength,
-                    relation_type.as_deref(),
+                    relation_type.empty_is_absent(),
                 )
             }
             KnowledgeCmd::GraphSearch {
@@ -614,8 +641,10 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 if query.is_empty() {
                     return Err(Failure::usage("Error: search query required"));
                 }
+                // knowledge.go:1296 guards --types before splitting it, so
+                // an empty value never becomes a one-element [""] body.
                 let (_, client) = crate::client::load_and_resolve()?;
-                graph_search_output(&client, &query, limit, depth, types.as_deref())
+                graph_search_output(&client, &query, limit, depth, types.empty_is_absent())
             }
             KnowledgeCmd::Foresight {
                 entity_type,
@@ -636,8 +665,8 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     depth,
                     min_strength,
                     include_mitigations,
-                    relation_types.as_deref(),
-                    format.as_deref(),
+                    relation_types.empty_is_absent(),
+                    format.empty_is_absent(),
                 )
             }
             KnowledgeCmd::Enrich {
@@ -647,13 +676,18 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 query,
                 limit,
             } => {
+                // knowledge.go:1354/1360: `--vertical=` REPLACES the
+                // "fault-tolerance" default and is interpolated into the
+                // patterns (:1409) and procedures (:1426) URLs unguarded, so
+                // the empty value is a real value here. --control/--technology
+                // /--query are guarded at :1427/:1460/:1482.
                 let (_, client) = crate::client::load_and_resolve()?;
                 enrich_output(
                     &client,
                     &vertical,
-                    control.as_deref(),
-                    technology.as_deref(),
-                    query.as_deref(),
+                    control.empty_is_absent(),
+                    technology.empty_is_absent(),
+                    query.empty_is_absent(),
                     limit,
                 )
             }

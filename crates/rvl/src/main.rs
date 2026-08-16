@@ -7,6 +7,7 @@ mod context_files;
 mod devscope;
 mod doctor;
 mod embedded_helpers;
+mod empty_flag;
 mod force;
 mod hook;
 mod init;
@@ -159,16 +160,18 @@ enum Cmd {
         team: Option<String>,
         /// Submission mode: project directory the scan describes (default:
         /// cwd); git_commit/git_branch metadata come from here.
-        #[arg(long, short = 't')]
+        #[arg(long, short = 't', value_parser = empty_flag::path_allowing_empty)]
         target: Option<PathBuf>,
         /// Submission mode: read findings JSON from stdin.
         #[arg(long)]
         stdin: bool,
         /// Submission mode: read findings from a file.
-        #[arg(long, short = 'f')]
+        #[arg(long, short = 'f', value_parser = empty_flag::path_allowing_empty)]
         file: Option<PathBuf>,
         /// Submission mode: merge all *.json part files from a directory.
-        #[arg(long)]
+        /// `--scan-dir=` is guarded `!= ""` by rvl-cli (scan.go:557), so an
+        /// empty value means "not given" rather than "the directory named ''".
+        #[arg(long, value_parser = empty_flag::path_allowing_empty)]
         scan_dir: Option<PathBuf>,
         /// Submission mode: remove --scan-dir contents after a successful
         /// submit.
@@ -4980,53 +4983,20 @@ fn stray_submission_flag_error(flags: &[&str]) -> String {
     )
 }
 
-/// Drop long flags written with an EXPLICIT EMPTY VALUE (`--control=`) before
-/// clap ever sees them, so they mean ABSENT — which is what rvl-cli means by
-/// them and what every script written against rvl-cli assumes (po-av01j.185
-/// item 7).
-///
-/// rvl-cli parses flags by hand: `--control=` yields the empty string, and
-/// every consumer then guards with `if control != ""`, so the flag is simply
-/// not there. clap instead yields `Some("")` — a PRESENT flag whose value is
-/// empty — which turns `evidence list --control=` from "list everything" into
-/// a request for the control named "", i.e. a 404. The same shape hits
-/// `knowledge procedures --control=` and `knowledge enrich
-/// --technology=`/`--query=`.
-///
-/// Fixed here, once, at the argument vector rather than per subcommand:
-/// a per-flag fix would have to be re-applied to every flag added later, and
-/// the flags that got missed are exactly how this was found.
-///
-/// Deliberately narrow:
-/// * only `--name=` with nothing after the `=` (a `-c=` short form is left
-///   alone: rvl-cli's short flags take a separate argument, never `=`)
-/// * nothing after a `--` separator, where arguments are data, not flags
-/// * `--=` and a bare `--` are not touched
-fn drop_empty_valued_flags(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut past_separator = false;
-    for a in args {
-        if past_separator {
-            out.push(a);
-            continue;
-        }
-        if a == "--" {
-            past_separator = true;
-            out.push(a);
-            continue;
-        }
-        let is_empty_valued =
-            a.starts_with("--") && a.ends_with('=') && a.len() > 3 && a.matches('=').count() == 1;
-        if is_empty_valued {
-            continue;
-        }
-        out.push(a);
-    }
-    out
-}
-
 fn run() -> anyhow::Result<ExitCode> {
-    let cli = Cli::parse_from(drop_empty_valued_flags(std::env::args()));
+    // EMPTY FLAG VALUES (po-av01j.192): argv is handed to clap UNTOUCHED.
+    // po-av01j.185 stripped `--x=` tokens here so they would read as absent,
+    // but argv only knows a token's shape: the strip also swallowed the
+    // usage errors a numeric flag owes on `--limit=`, the exit-2 a MISSPELLED
+    // flag owes whatever its spelling, and the empty values that rvl-cli
+    // deliberately puts on the wire (`risk resolve --reason=`). Empty means
+    // whatever the CONSUMER says it means, exactly as in rvl-cli — see
+    // `empty_flag::SEMANTICS` for the per-flag audit, and
+    // `empty_flag::normalize` for this binary's own commands.
+    let mut cli = Cli::parse_from(std::env::args());
+    if let Some(cmd) = cli.cmd.as_mut() {
+        empty_flag::normalize(cmd);
+    }
     let Some(cmd) = cli.cmd else {
         // Bootstrap behavior preserved: bare invocation prints help, exits 0.
         use clap::CommandFactory;
@@ -7638,79 +7608,109 @@ mod tests {
 
     // --- rvl-cli surface parity (po-av01j.185 / .188) ---
 
-    /// `--flag=` (explicit empty value) means ABSENT, as in rvl-cli. clap
-    /// would otherwise hand the subcommand `Some("")`, a present-but-empty
-    /// flag, which is how `evidence list --control=` became a 404 instead of
-    /// "list everything".
+    /// THE PREMISE THIS TEST USED TO PIN WAS FALSE (po-av01j.192). It read:
+    /// "`--control \"\"` is an explicit empty argument in both CLIs", and used
+    /// it to justify dropping only the `--control=` SHAPE from argv. rvl-cli
+    /// draws no such distinction: `cliutil.FlagValue` (cliutil.go:69-79)
+    /// returns `""` for `--control=` AND for `--control ''`, and the consumer
+    /// then decides — `evidence.go:304` guards `if controlCode != ""`, so
+    /// BOTH spellings mean "no filter". Dropping one shape at argv therefore
+    /// fixed half the divergence and created three new ones (empty numeric
+    /// flags silently defaulted, misspelled `--x=` flags silently ignored,
+    /// `--reason=` silently replaced by a default).
+    ///
+    /// What is true, and what this test now pins: clap hands the subcommand
+    /// `Some("")` for both spellings, identically, and the consumer applies
+    /// the rule recorded in `empty_flag::SEMANTICS`.
     #[test]
-    fn an_explicitly_empty_long_flag_is_dropped_before_clap_sees_it() {
-        let got =
-            drop_empty_valued_flags(["rvl", "evidence", "list", "--control="].map(String::from));
-        assert_eq!(got, vec!["rvl", "evidence", "list"]);
-
-        // Only the empty ones go.
-        assert_eq!(
-            drop_empty_valued_flags(
-                ["rvl", "knowledge", "enrich", "--technology=", "--query=go"].map(String::from)
-            ),
-            vec!["rvl", "knowledge", "enrich", "--query=go"]
-        );
-
-        // A separate-argument empty value is NOT this shape and is left
-        // alone: `--control ""` is an explicit empty argument in both CLIs.
-        assert_eq!(
-            drop_empty_valued_flags(["rvl", "risk", "show", "--service", ""].map(String::from)),
-            vec!["rvl", "risk", "show", "--service", ""]
-        );
-
-        // Values containing '=' are untouched, and so is anything after `--`.
-        assert_eq!(
-            drop_empty_valued_flags(["rvl", "--flag=a=", "--", "--x="].map(String::from)),
-            vec!["rvl", "--flag=a=", "--", "--x="]
-        );
-
-        // Degenerate tokens are not flags.
-        assert_eq!(
-            drop_empty_valued_flags(["rvl", "--", "-", "--="].map(String::from)),
-            vec!["rvl", "--", "-", "--="]
-        );
-    }
-
-    /// The real rvl-cli invocations from the parity diff now parse to the
-    /// same shape they have with the flag omitted entirely.
-    #[test]
-    fn empty_valued_flags_parse_as_absent_on_the_commands_that_regressed() {
-        for (with_empty, without) in [
+    fn both_empty_spellings_parse_identically_and_are_left_to_the_consumer() {
+        for (equals, space) in [
             (
                 vec!["rvl", "evidence", "list", "--control="],
-                vec!["rvl", "evidence", "list"],
+                vec!["rvl", "evidence", "list", "--control", ""],
             ),
             (
                 vec!["rvl", "knowledge", "procedures", "--control="],
-                vec!["rvl", "knowledge", "procedures"],
+                vec!["rvl", "knowledge", "procedures", "--control", ""],
             ),
-            (
-                vec!["rvl", "knowledge", "enrich", "--technology=", "--query="],
-                vec!["rvl", "knowledge", "enrich"],
-            ),
-            // risk/control were verified clean by the parity diff; they must
-            // STAY clean, so they are asserted here rather than assumed.
             (
                 vec!["rvl", "risk", "list", "--service="],
-                vec!["rvl", "risk", "list"],
+                vec!["rvl", "risk", "list", "--service", ""],
             ),
             (
                 vec!["rvl", "control", "list", "--category="],
-                vec!["rvl", "control", "list"],
+                vec!["rvl", "control", "list", "--category", ""],
             ),
         ] {
-            let a = drop_empty_valued_flags(with_empty.iter().map(|s| s.to_string()));
+            let a = Cli::try_parse_from(&equals).unwrap_or_else(|e| panic!("{equals:?}: {e}"));
+            let b = Cli::try_parse_from(&space).unwrap_or_else(|e| panic!("{space:?}: {e}"));
             assert_eq!(
-                a,
-                without.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "{with_empty:?}"
+                empty_string_flags(&a),
+                empty_string_flags(&b),
+                "{equals:?} and {space:?} must parse to the same thing"
             );
-            Cli::try_parse_from(&a).unwrap_or_else(|e| panic!("{with_empty:?}: {e}"));
+            assert_eq!(
+                empty_string_flags(&a),
+                1,
+                "{equals:?}: the empty value must reach the consumer, not be \
+                 deleted from argv"
+            );
+        }
+    }
+
+    /// How many of the parsed command's string flags carry an empty value.
+    /// Only the flags the cases above set are inspected, which is enough to
+    /// tell "reached the consumer as Some(\"\")" from "deleted at argv".
+    fn empty_string_flags(cli: &Cli) -> usize {
+        use rvl_data::{
+            control::ControlCmd, evidence::EvidenceCmd, knowledge::KnowledgeCmd, risk::RiskCmd,
+        };
+        let n = |v: &Option<String>| usize::from(v.as_deref() == Some(""));
+        match &cli.cmd {
+            Some(Cmd::Evidence {
+                cmd: EvidenceCmd::List { control, .. },
+            }) => n(control),
+            Some(Cmd::Knowledge {
+                cmd: KnowledgeCmd::Procedures { control, .. },
+            }) => n(control),
+            Some(Cmd::Risk {
+                cmd: RiskCmd::List { service, .. },
+            }) => n(service),
+            Some(Cmd::Control {
+                cmd: ControlCmd::List { category, .. },
+            }) => n(category),
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    /// The invocations from the parity diff still PARSE — the fix removed the
+    /// argv strip, it did not make empty values a parse error. What each one
+    /// then means is the consumer's decision, recorded per flag in
+    /// `empty_flag::SEMANTICS` and exercised end-to-end against a stub server
+    /// in `tests/empty_flag_parity.rs`.
+    #[test]
+    fn empty_valued_flags_still_parse_on_the_commands_that_regressed() {
+        for argv in [
+            vec!["rvl", "evidence", "list", "--control="],
+            vec!["rvl", "knowledge", "procedures", "--control="],
+            vec!["rvl", "knowledge", "enrich", "--technology=", "--query="],
+            vec!["rvl", "risk", "list", "--service="],
+            vec!["rvl", "control", "list", "--category="],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        // ...but the flags whose empty value rvl-cli REJECTS are still
+        // rejected, which the argv strip had disabled wholesale.
+        for argv in [
+            vec!["rvl", "risk", "list", "--limit="],
+            vec!["rvl", "evidence", "list", "--limit="],
+            vec!["rvl", "knowledge", "facts", "--offset="],
+            vec!["rvl", "risk", "list", "--serivce="],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must be a usage error"
+            );
         }
     }
 

@@ -16,6 +16,7 @@ use crate::display;
 use crate::gojson::{compact, path_escape, pretty, query_encode, G};
 use crate::risk_context_render as render;
 use crate::{CmdResult, Failure, BIN};
+use rvl_core::flag::EmptyFlag;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -294,6 +295,10 @@ pub struct CategoryCoverage {
     pub assessed: i64,
 }
 
+/// EMPTY-FLAG SEMANTICS (po-av01j.192): every field is destructured by name
+/// here — no `..` — so a flag added to `RiskCmd` later cannot reach the wire
+/// without its author deciding, at this site, what an empty value means. The
+/// decisions below are read off `internal/commands/risk.go`.
 pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
     let res = (|| -> CmdResult {
         match cmd {
@@ -304,14 +309,17 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 format,
                 limit,
             } => {
+                // risk.go:417/420/423 — each filter is guarded `!= ""`, so an
+                // empty one is simply not a filter. `--limit=` is rejected by
+                // clap's typed parse, as `strconv.Atoi("")` is at risk.go:351.
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(
                     &client,
-                    status.as_deref(),
-                    category.as_deref(),
-                    service.as_deref(),
+                    status.empty_is_absent(),
+                    category.empty_is_absent(),
+                    service.empty_is_absent(),
                     limit,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Ready {
@@ -320,22 +328,25 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 format,
                 limit,
             } => {
+                // risk.go:532/535.
                 let (_, client) = crate::client::load_and_resolve()?;
                 ready_output(
                     &client,
-                    category.as_deref(),
-                    service.as_deref(),
+                    category.empty_is_absent(),
+                    service.empty_is_absent(),
                     limit as usize,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Show { code, format } => {
+                // risk.go:751 only ever compares `format == "json"`.
                 let (_, client) = crate::client::load_and_resolve()?;
-                show_output(&client, &code, format.as_deref())
+                show_output(&client, &code, format.empty_is_absent())
             }
             RiskCmd::Context { code, format } => {
+                // risk.go:920, same comparison.
                 let (_, client) = crate::client::load_and_resolve()?;
-                context_output(&client, &code, format.as_deref())
+                context_output(&client, &code, format.empty_is_absent())
             }
             RiskCmd::Stale => {
                 let (_, client) = crate::client::load_and_resolve()?;
@@ -346,17 +357,22 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 reason,
                 format,
             } => {
+                // risk.go:1097/1152: `--reason=` OVERRIDES the "Resolved"
+                // default and is POSTed as {"reason":""}. Falling back to the
+                // default would write a sentence into the risk register that
+                // the operator did not type.
                 let (_, client) = crate::client::load_and_resolve()?;
                 resolve_output(
                     &client,
                     &code,
-                    reason.as_deref().unwrap_or("Resolved"),
-                    format.as_deref(),
+                    reason.empty_is_value().unwrap_or("Resolved"),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Accept { code, reason } => {
+                // risk.go:1205 — same, with "" as the default reason.
                 let (_, client) = crate::client::load_and_resolve()?;
-                accept_output(&client, &code, reason.as_deref().unwrap_or(""))
+                accept_output(&client, &code, reason.empty_is_value().unwrap_or(""))
             }
         }
     })();
