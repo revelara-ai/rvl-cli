@@ -33,6 +33,7 @@ pub mod scan_cached_output;
 pub mod scan_normalize;
 pub mod scan_submit;
 pub mod scan_team;
+pub mod stpa;
 
 use std::process::ExitCode;
 

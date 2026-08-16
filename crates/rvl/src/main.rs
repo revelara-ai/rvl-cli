@@ -367,6 +367,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::config::ConfigCmd,
     },
+    /// Ingest an STPA-inspired design review (`stpa submit --file`): the
+    /// losses, UCAs, loss scenarios and control-structure model produced by
+    /// the `stpa-review` skill. This is that skill's only ingestion path —
+    /// `scan --cs-file` carries the control structure alone (po-av01j.183).
+    ///
+    /// Revelara's analysis is STPA-inspired (adapted from Systems-Theoretic
+    /// Process Analysis, Leveson & Thomas, MIT). Findings are candidates for
+    /// engineer review, not a substitute for expert hazard analysis of
+    /// safety-critical systems.
+    Stpa {
+        #[command(subcommand)]
+        cmd: rvl_data::stpa::StpaCmd,
+    },
     /// Generate shell completion scripts (bash, zsh, fish).
     /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
     /// Fish: rvl completion fish > ~/.config/fish/completions/rvl.fish
@@ -4674,6 +4687,7 @@ fn run() -> anyhow::Result<ExitCode> {
             ))
         }
         Cmd::Config { cmd } => return Ok(rvl_data::config::run(cmd)),
+        Cmd::Stpa { cmd } => return Ok(rvl_data::stpa::run(cmd)),
         Cmd::Completion { shell } => {
             use clap::CommandFactory as _;
             let mut command = Cli::command();
@@ -4919,6 +4933,7 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Feedback { .. }
         | Cmd::Bugreport { .. }
         | Cmd::Config { .. }
+        | Cmd::Stpa { .. }
         | Cmd::Completion { .. } => {
             unreachable!("data commands dispatch before the store opens")
         }
