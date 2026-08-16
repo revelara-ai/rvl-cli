@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod changed;
+mod compat;
 mod config_lane;
 mod context_files;
 mod devscope;
@@ -119,6 +120,23 @@ enum Cmd {
         /// (po-av01j.15, `--hook`); this flag never invokes a model.
         #[arg(long)]
         agent: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
+        /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
+        /// the same question `--hook pre-commit` asks. Accepted because v1's
+        /// `hook install` wrote it into `.git/hooks/pre-commit`, where no
+        /// human can update it before the next `git commit` (po-av01j.191).
+        #[arg(long)]
+        staged: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
+        /// --hook pre-push`. Same reason as `--staged`; v1's lefthook snippet
+        /// told users to paste this one by hand.
+        #[arg(long)]
+        pre_push: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS: `enforce` (v1's default, and the
+        /// only mode this binary has) changes nothing; `eval` reports findings
+        /// without blocking, exit 0.
+        #[arg(long)]
+        mode: Option<String>,
         /// Name the git hook this scan runs under (pre-commit|pre-push).
         /// With `--incremental`, enables the CONSENTED hook-mode agent
         /// adjudication lane for delta-scoped undecided sites — OFF by
@@ -2955,6 +2973,13 @@ fn render_scan_output(
     // status — derived from the same `classify` the footer used, never a second
     // opinion. See EXIT_BLOCKED for the full contract.
     if blocked {
+        // rvl-cli v1's `--mode eval` (po-av01j.191): the user disarmed this
+        // gate deliberately, and an upgrade must not re-arm it. Reported, not
+        // silent — the ladder above already printed every finding.
+        if compat::never_block() {
+            println!("{}", compat::EVAL_MODE_NOTE);
+            return Ok(ExitCode::SUCCESS);
+        }
         // Name the AUDITED way through (po-av01j.182). Without this line the
         // only bypass a blocked committer can find is `--no-verify`, which
         // skips every hook and leaves no record; the force-through leaves one.
@@ -5122,11 +5147,41 @@ fn run() -> anyhow::Result<ExitCode> {
             strict,
             changed_only,
             agent,
+            staged,
+            pre_push,
+            mode,
             hook,
             ..
         } => {
-            if agent {
-                agent_alias_notice();
+            // rvl-cli v1 hook shims run THIS binary after a `brew upgrade`
+            // (the cask keeps the name `rvl`), so their flags must resolve
+            // here or `git commit` fails and no commit is created
+            // (po-av01j.191). See `compat` for the mapping and its rationale.
+            let compat::Scoping {
+                incremental,
+                changed_only,
+                hook,
+                notice,
+                never_block,
+            } = compat::resolve(
+                compat::V1Flags {
+                    agent,
+                    staged,
+                    pre_push,
+                    mode: mode.as_deref(),
+                },
+                incremental,
+                changed_only,
+                hook.as_deref(),
+            )?;
+            compat::set_never_block(never_block);
+            match notice {
+                // The v1 notice already names `--agent` and says exactly what
+                // ran instead, so the generic alias paragraph would only add
+                // noise to every commit in a not-yet-repaired repo.
+                Some(n) => eprint!("{n}"),
+                None if agent => agent_alias_notice(),
+                None => {}
             }
             let path = path.unwrap_or_else(|| PathBuf::from("."));
             // Only the incremental path implements change scoping. Refuse
