@@ -46,6 +46,22 @@ fn planted_secret() -> String {
     format!("AWS_KEY = \"{}\"\n", ["AKIA", "ZZ3RVLQ7SG7JBX2Q"].concat())
 }
 
+/// Drop CI's OWN base-ref env from a child (po-av01j.194). This suite runs in
+/// GitHub Actions, where a `pull_request` event exports `GITHUB_BASE_REF`, and
+/// the v1 `--changed-only` alias now READS that chain — inherited, it would
+/// change which question these hooks ask between a laptop and CI. Hooks
+/// inherit the git process's environment, so it is cleared on both factories.
+/// The base-ref mapping itself is exercised deliberately, with the value set.
+fn clear_base_ref_env(c: &mut Command) {
+    for k in [
+        "RVL_BASE_REF",
+        "GITHUB_BASE_REF",
+        "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
+    ] {
+        c.env_remove(k);
+    }
+}
+
 fn git(root: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -149,6 +165,7 @@ impl Fixture {
             .env("RVL_CACHE_DIR", self.dir.path().join("cache"))
             .env("RVL_INDEX_DIR", self.dir.path().join("index"))
             .env("RVL_OFFLINE", "1");
+        clear_base_ref_env(&mut c);
         c
     }
 
@@ -160,6 +177,7 @@ impl Fixture {
             .env("RVL_CACHE_DIR", self.dir.path().join("cache"))
             .env("RVL_INDEX_DIR", self.dir.path().join("index"))
             .env("RVL_OFFLINE", "1");
+        clear_base_ref_env(&mut c);
         c
     }
 
@@ -281,6 +299,62 @@ fn a_v1_pre_push_shim_gates_the_pushed_range() {
         "the pre-push gate must still fire:\n{}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// po-av01j.194 REVISITS THE .191 MAPPING. v1's bare `--changed-only`
+/// resolved a base ref and diffed `base...HEAD`; .191 could only map it to
+/// `--hook pre-push` because v2 had no chain to resolve against. Now it does,
+/// so in CI — where the chain IS populated — the same shim asks v1's actual
+/// question, against v1's actual base ref.
+///
+/// Both halves matter: the scope line must name the base range (not the
+/// pre-push question), and the gate must still fire.
+#[test]
+fn a_v1_changed_only_shim_resolves_the_base_ref_chain_when_ci_sets_one() {
+    let f = Fixture::new();
+    let remote = f.dir.path().join("remote.git");
+    Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&remote)
+        .output()
+        .expect("init bare remote");
+    git(
+        &f.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&f.root, &["push", "-q", "origin", "main"]);
+    git(&f.root, &["checkout", "-q", "-b", "feature"]);
+
+    f.install_v1_hook("pre-push", V1_PRE_PUSH);
+
+    std::fs::write(f.root.join("prod.env"), planted_secret()).unwrap();
+    git(&f.root, &["add", "prod.env"]);
+    git(&f.root, &["commit", "-qm", "leak"]);
+
+    let out = f
+        .git()
+        // Exactly what a GitHub `pull_request` event exports.
+        .env("GITHUB_BASE_REF", "main")
+        .args(["push", "origin", "feature"])
+        .output()
+        .unwrap();
+    let all = combined(&out);
+    assert!(
+        !out.status.success(),
+        "the gate must still fire on the PR's committed leak:\n{all}"
+    );
+    assert!(
+        all.contains("main...HEAD"),
+        "the v1 alias must resolve v1's question — base...HEAD: {all}"
+    );
+    assert!(
+        all.contains("base-ref chain"),
+        "and the compatibility notice must say which scope it ran: {all}"
+    );
+    assert!(
+        !all.contains("--hook pre-push"),
+        "with a base ref in play the .191 pre-push mapping must NOT be used: {all}"
     );
 }
 

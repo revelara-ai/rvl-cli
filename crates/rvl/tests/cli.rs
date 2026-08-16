@@ -19,7 +19,22 @@ fn version_flag_reports_name_and_semver() {
 // --- spec-cache distribution surface (po-3t3oj.13) ---
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rvl"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_rvl"));
+    // THE SUITE MUST NOT INHERIT CI'S OWN BASE REF (po-av01j.194). These very
+    // tests run inside GitHub Actions, where a `pull_request` event exports
+    // `GITHUB_BASE_REF` — which the scanner now READS. Left inherited, a
+    // `--changed-only` test would silently change question between a laptop
+    // and CI, and a base ref naming THIS repo's PR target would resolve
+    // against whatever a temp fixture repo happens to call `main`. Every test
+    // that wants the chain populates it explicitly.
+    for k in [
+        "RVL_BASE_REF",
+        "GITHUB_BASE_REF",
+        "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
+    ] {
+        c.env_remove(k);
+    }
+    c
 }
 
 /// The `scan` exit code that means "BLOCKING findings remain" — the gate
@@ -5353,4 +5368,378 @@ fn a_full_scan_outside_a_git_repo_still_works() {
         "unscoped scans must be unaffected by the git requirement: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// --- the CI base-ref chain: `--changed-only` in a PR checkout (po-av01j.194) ---
+
+/// THE SHAPE THE GATE EXISTS FOR, synthesized exactly as CI produces it: a
+/// base branch, a feature branch whose commits carry the offending code, a
+/// CLEAN working tree, and HEAD detached-equivalent on the feature tip. The
+/// base branch also moves on afterwards, as it does in any real PR, so the
+/// three-dot range has something to exclude.
+///
+/// The planted secret is the content lane's, so this runs with an empty spec
+/// file and no language helper: what is under test is the SCOPE, not a
+/// detector.
+fn pr_checkout_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"svc\"\n").unwrap();
+    std::fs::write(root.join("clean.py"), "VALUE = 1\n").unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "seed"]);
+
+    // The PR: one commit, carrying the finding, COMMITTED (so the tree is
+    // clean, exactly as a CI checkout leaves it).
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        root.join("leak.py"),
+        format!("SECRET = \"{}\"\n", ["AKIA", "ZZ3RVLQ7SG7JBX2Q"].concat()),
+    )
+    .unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "pr work"]);
+
+    // Meanwhile, unrelated work lands on the base branch.
+    git(&root, &["checkout", "-q", "main"]);
+    std::fs::write(root.join("other.py"), "OTHER = 2\n").unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "unrelated"]);
+    git(&root, &["checkout", "-q", "feature"]);
+    root
+}
+
+fn pr_scan(root: &std::path::Path, dir: &std::path::Path, specs: &std::path::Path) -> Command {
+    let mut c = bin();
+    c.arg("scan")
+        .arg(root)
+        .args(["--incremental", "--changed-only", "--specs-file"])
+        .arg(specs)
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .env("RVL_INDEX_DIR", dir.join("index"))
+        .env("HOME", dir.join("home"));
+    c
+}
+
+fn empty_specs(dir: &std::path::Path) -> std::path::PathBuf {
+    let specs = dir.join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    specs
+}
+
+/// THE BEAD, end to end. Same repo, same commit, same command — the only
+/// difference is whether the base-ref chain is populated, which in a real
+/// GitHub PR run it always is.
+///
+/// BEFORE (no base ref anywhere): the working-tree question, a clean tree, an
+/// empty changed set, and exit 0 — a gate reporting success having read no
+/// files. AFTER (`GITHUB_BASE_REF`, no flag): `main...HEAD`, the PR's own
+/// file, and the gate fires.
+#[test]
+fn a_clean_pr_checkout_passes_with_no_base_ref_and_blocks_once_github_base_ref_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    // BEFORE: nothing in the chain. The clean tree answers "nothing changed".
+    let out = pr_scan(&root, dir.path(), &specs)
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "with no base ref the working-tree question is empty — this is the \
+         silent pass: {stderr}"
+    );
+    assert!(
+        stderr.contains("working tree"),
+        "and it must at least say which question it asked: {stderr}"
+    );
+
+    // AFTER: the env var every `pull_request` event exports, and NO --base.
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("GITHUB_BASE_REF", "main")
+        .output()
+        .expect("run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "the PR's own committed finding must fire the gate:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("main...HEAD") && stderr.contains("GITHUB_BASE_REF"),
+        "the scan must state its scope and which link produced it: {stderr}"
+    );
+    assert!(
+        !stdout.contains("other.py"),
+        "work that landed on the base branch is not this PR's: {stdout}"
+    );
+}
+
+/// `--base` is the TOP of the chain: it wins over an env var that would have
+/// scoped the run somewhere else. `GITHUB_BASE_REF=feature` alone would make
+/// the range empty (HEAD is `feature`) and pass; the flag makes it fire.
+#[test]
+fn the_base_flag_outranks_the_ci_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("GITHUB_BASE_REF", "feature")
+        .output()
+        .expect("run rvl");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "control: HEAD...HEAD is genuinely empty"
+    );
+
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("GITHUB_BASE_REF", "feature")
+        .args(["--base", "main"])
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "--base must outrank GITHUB_BASE_REF: {stderr}"
+    );
+    assert!(stderr.contains("--base flag"), "{stderr}");
+}
+
+/// `.revelara.yaml scanner.base_ref` is the BOTTOM of the chain, not the top:
+/// it answers when nothing else does, and a CI event's base branch outranks a
+/// checked-in default. Both halves are asserted, because getting this
+/// backwards would silently pin every CI run to a stale repo default.
+#[test]
+fn the_yaml_base_ref_answers_last_and_the_ci_env_outranks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    // Only the config: it answers, and the gate fires.
+    std::fs::write(
+        root.join(".revelara.yaml"),
+        "project: svc\nscanner:\n  base_ref: main\n",
+    )
+    .unwrap();
+    let out = pr_scan(&root, dir.path(), &specs)
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "scanner.base_ref must be read: {stderr}"
+    );
+    assert!(stderr.contains("scanner.base_ref"), "{stderr}");
+
+    // Config says `feature` (an empty range); the CI event says `main`. The
+    // event wins, so the gate still fires.
+    std::fs::write(
+        root.join(".revelara.yaml"),
+        "project: svc\nscanner:\n  base_ref: feature\n",
+    )
+    .unwrap();
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("GITHUB_BASE_REF", "main")
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "the CI event must outrank the checked-in default: {stderr}"
+    );
+    assert!(stderr.contains("GITHUB_BASE_REF"), "{stderr}");
+}
+
+/// Both remaining env links are honoured, at their own positions: GitLab's
+/// merge-request variable, and rvl's own override which outranks both CI ones.
+#[test]
+fn the_gitlab_and_rvl_env_links_are_honoured_at_their_own_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("CI_MERGE_REQUEST_TARGET_BRANCH_NAME", "main")
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(EXIT_BLOCKED), "{stderr}");
+    assert!(
+        stderr.contains("CI_MERGE_REQUEST_TARGET_BRANCH_NAME"),
+        "{stderr}"
+    );
+
+    // RVL_BASE_REF sits ABOVE both CI variables: it is the operator's
+    // override, so it answers even when the CI event named something else.
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("RVL_BASE_REF", "main")
+        .env("GITHUB_BASE_REF", "feature")
+        .env("CI_MERGE_REQUEST_TARGET_BRANCH_NAME", "feature")
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(EXIT_BLOCKED), "{stderr}");
+    assert!(stderr.contains("RVL_BASE_REF"), "{stderr}");
+}
+
+/// UNFETCHED IS NOT UNSET, and it is NOT a pass. A shallow CI clone (the
+/// `actions/checkout` default) has `GITHUB_BASE_REF` set to a branch it never
+/// downloaded. Falling back to the working-tree question there would be the
+/// original bug wearing a different hat: clean tree, no findings, exit 0.
+/// Instead the run FAILS, names the unfetched ref, and prints the fix.
+#[test]
+fn a_configured_but_unfetched_base_ref_fails_loudly_instead_of_passing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    let out = pr_scan(&root, dir.path(), &specs)
+        .env("GITHUB_BASE_REF", "release-2.0")
+        .output()
+        .expect("run rvl");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a base ref we cannot see must fail the run, never pass it: {stderr}"
+    );
+    assert!(
+        stderr.contains("release-2.0") && stderr.contains("not fetched"),
+        "the refusal must name the ref and say it is unfetched, not unset: {stderr}"
+    );
+    assert!(
+        stderr.contains("fetch-depth: 0"),
+        "and give the fix that actually applies: {stderr}"
+    );
+}
+
+/// The refusal is scoped to callers who ASKED to be scoped. An unscoped
+/// `--incremental` run never claimed a base-relative scope, so a shallow clone
+/// must not start failing it.
+#[test]
+fn an_unreachable_base_ref_does_not_fail_a_run_that_never_asked_for_scoping() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args(["--incremental", "--specs-file"])
+        .arg(&specs)
+        .env("GITHUB_BASE_REF", "release-2.0")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("run rvl");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "an unscoped scan is not a base-ref question: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--hook pre-commit` READS THE INDEX and is untouched by the chain. A
+/// developer whose shell exports `GITHUB_BASE_REF` (or who works in a repo
+/// with `scanner.base_ref` set) must still have their commit judged on what is
+/// STAGED — not on everything committed since the branch point, which would
+/// block them for their colleagues' work.
+#[test]
+fn the_pre_commit_hook_is_unaffected_by_a_configured_base_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+    // A clean staged file: the leak is already COMMITTED on this branch, so a
+    // base-relative question would include it and block.
+    std::fs::write(root.join("new.py"), "NEW = 3\n").unwrap();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["add", "new.py"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("GITHUB_BASE_REF", "main")
+        .env("RVL_BASE_REF", "main")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a pre-commit gate judges the INDEX, not a base range:\n{stdout}\n{stderr}"
+    );
+    assert!(stderr.contains("staged paths"), "and must say so: {stderr}");
+    assert!(
+        !stderr.contains("main...HEAD"),
+        "the chain must not reach the pre-commit path: {stderr}"
+    );
+}
+
+/// `--base=` is "not given" and falls through to the next link, exactly as
+/// rvl-cli's `TrimSpace`-then-`!= ""` chain does. It must not become a request
+/// to diff against a ref named "" (which would error) nor silently disable the
+/// scoping.
+#[test]
+fn an_empty_base_value_falls_through_to_the_next_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = pr_checkout_repo(dir.path());
+    let specs = empty_specs(dir.path());
+
+    for empty in [vec!["--base="], vec!["--base", ""]] {
+        let out = pr_scan(&root, dir.path(), &specs)
+            .env("GITHUB_BASE_REF", "main")
+            .args(&empty)
+            .output()
+            .expect("run rvl");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_BLOCKED),
+            "{empty:?} must fall through to GITHUB_BASE_REF: {stderr}"
+        );
+        assert!(stderr.contains("GITHUB_BASE_REF"), "{empty:?}: {stderr}");
+    }
 }
