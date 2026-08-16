@@ -28,6 +28,7 @@ use crate::client::{self, Client};
 use crate::control;
 use crate::gojson::{compact, path_escape, G};
 use crate::{Failure, BIN};
+use rvl_core::flag::EmptyFlag;
 use serde::Deserialize;
 use std::process::ExitCode;
 
@@ -315,13 +316,19 @@ fn goq(s: &str) -> String {
 
 pub fn run(cmd: StpaCmd) -> ExitCode {
     match cmd {
-        StpaCmd::Submit { file, service } => match submit(file.as_deref(), service.as_deref()) {
-            Ok(code) => code,
-            Err(f) => {
-                eprintln!("{}", f.msg);
-                ExitCode::from(f.code)
+        // EMPTY-FLAG SEMANTICS (po-av01j.192): stpa.go:152 rejects an empty
+        // --file with "is required" (exit 2) — `submit` re-checks below, so
+        // both spellings fail as in Go; stpa.go:194 guards --service with
+        // `!= ""` and prints the same "[skip]" notice as omitting it.
+        StpaCmd::Submit { file, service } => {
+            match submit(file.empty_is_value(), service.empty_is_absent()) {
+                Ok(code) => code,
+                Err(f) => {
+                    eprintln!("{}", f.msg);
+                    ExitCode::from(f.code)
+                }
             }
-        },
+        }
     }
 }
 

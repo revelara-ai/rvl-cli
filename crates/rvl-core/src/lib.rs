@@ -8,6 +8,8 @@
 //! twice in the Python prototype and both times produced a matcher that failed
 //! its own sanity check.
 
+pub mod flag;
+
 use serde::{Deserialize, Serialize};
 
 /// The binary name used in user-facing hints ("run 'rvl login'").

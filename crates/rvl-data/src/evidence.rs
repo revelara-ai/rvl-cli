@@ -8,6 +8,7 @@ use crate::control;
 use crate::display;
 use crate::gojson::{compact, query_encode, G};
 use crate::{CmdResult, Failure, BIN};
+use rvl_core::flag::{absent_if_empty, EmptyFlag};
 use serde::Deserialize;
 use std::fmt::Write as _;
 
@@ -159,6 +160,17 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 service,
                 format,
             } => {
+                // EMPTY-FLAG SEMANTICS (po-av01j.192), read off evidence.go:
+                //  * --control/--type/--name: :142/:146/:150 reject an empty
+                //    value with "is required" (exit 2) — `require` below
+                //    already treats Some("") as missing, so `--control=` and
+                //    `--control ''` both fail exactly as in Go.
+                //  * --url/--description: :197/:198 put both keys in the POST
+                //    body unconditionally, so an empty value is TRANSMITTED.
+                //  * --git-hash: :136 re-runs `git rev-parse HEAD` when the
+                //    value is empty, i.e. empty == omitted.
+                //  * --format: :129 guards ValidateFormat with `!= ""`.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let control = require(control, "--control is required (e.g., --control=RC-018)")?;
                 let evidence_type = require(
@@ -167,19 +179,21 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 )?;
                 let name = require(name, "--name is required")?;
                 check_not_risk_code(&control)?;
-                let git_hash = git_hash.or_else(detect_git_hash).unwrap_or_default();
+                let git_hash = absent_if_empty(git_hash)
+                    .or_else(detect_git_hash)
+                    .unwrap_or_default();
                 let (_, client) = crate::client::load_and_resolve()?;
                 submit_output(
                     &client,
                     &control,
                     &evidence_type,
                     &name,
-                    url.as_deref().unwrap_or(""),
-                    description.as_deref().unwrap_or(""),
+                    url.empty_is_value().unwrap_or(""),
+                    description.empty_is_value().unwrap_or(""),
                     &git_hash,
-                    team.as_deref().unwrap_or(""),
-                    service.as_deref().unwrap_or(""),
-                    format.as_deref(),
+                    team.empty_is_absent().unwrap_or(""),
+                    service.empty_is_absent().unwrap_or(""),
+                    format.empty_is_absent(),
                 )
             }
             EvidenceCmd::List {
@@ -192,6 +206,19 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 limit,
                 format,
             } => {
+                // evidence.go:304/:298/:283 guard --control/--type/--status
+                // with `!= ""`, and the `--status=` guard skips the enum
+                // check as well, so an empty filter is no filter at all.
+                // --team/--service/--scope-state are rvl-native filters and
+                // follow the same rule. `--limit=` errors in clap's typed
+                // parse, as Atoi("") does at evidence.go:258.
+                let control = absent_if_empty(control);
+                let evidence_type = absent_if_empty(evidence_type);
+                let status = absent_if_empty(status);
+                let team = absent_if_empty(team);
+                let service = absent_if_empty(service);
+                let scope_state = absent_if_empty(scope_state);
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 validate_status(&status)?;
                 validate_scope_state(&scope_state)?;
@@ -209,9 +236,11 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 )
             }
             EvidenceCmd::Verify { id, format } => {
+                // evidence.go:381, the same guarded validator.
+                let format = absent_if_empty(format);
                 validate_format(&format)?;
                 let (_, client) = crate::client::load_and_resolve()?;
-                verify_output(&client, &id, format.as_deref())
+                verify_output(&client, &id, format.empty_is_absent())
             }
         }
     })();
