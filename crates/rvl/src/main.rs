@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 mod agent;
+mod base_ref;
 mod changed;
 mod compat;
 mod config_lane;
@@ -51,6 +52,13 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+/// `Scan` carries every scan flag inline and so dwarfs the other variants.
+/// Boxing it to even the sizes would buy nothing measurable — exactly ONE of
+/// these is ever constructed, from argv, once per process, and it is consumed
+/// immediately — while costing the clap derive its flat field list and every
+/// dispatch site an extra deref. The lint is about enums held in bulk; this
+/// one is held in a single `Option<Cmd>`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Scan a repo against the signed spec cache: spec matching, propagation,
@@ -115,6 +123,24 @@ enum Cmd {
         /// did not introduce are noise you learn to ignore.
         #[arg(long)]
         changed_only: bool,
+        /// Base ref for `--changed-only`: the gate scopes to `<ref>...HEAD`,
+        /// the committed work on this branch since it diverged (po-av01j.194,
+        /// rvl-cli parity). THE FLAG IS THE TOP OF A CHAIN — `--base`,
+        /// `RVL_BASE_REF`, `GITHUB_BASE_REF`,
+        /// `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `.revelara.yaml`
+        /// `scanner.base_ref` — so CI needs no flag at all: a GitHub PR event
+        /// already exports `GITHUB_BASE_REF`.
+        ///
+        /// Without it a `--changed-only` run asks the WORKING-TREE question,
+        /// which answers "nothing" in a CI pull-request checkout (clean tree,
+        /// HEAD at the PR head) and exits 0 having read no files. A base ref
+        /// that is set but not present in the clone (a shallow checkout) is a
+        /// REFUSAL, never a fallback.
+        ///
+        /// `--base=` means "not given" and falls through to the next link,
+        /// exactly as rvl-cli's `!= ""` guard does (scan.go:473/500).
+        #[arg(long)]
+        base: Option<String>,
         /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
         /// one-line deprecation notice and runs the deterministic scan.
         /// Consented hook adjudication is configured separately
@@ -3510,6 +3536,71 @@ fn run_index_build(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Which git question `--changed-only` asks, once the base-ref chain is folded
+/// in (po-av01j.194).
+///
+/// THE THREE OUTCOMES, and why each is what it is:
+///
+/// * A HOOK NAMES THE QUESTION. `--hook pre-commit` reads the index and
+///   `--hook pre-push` reads the pushed range; neither is a base-ref question,
+///   so the chain cannot change what they ask. It reaches pre-push only as the
+///   fallback for a branch with no upstream — the slot rvl-cli's `defaultBase`
+///   occupies — so `--base` is honoured there instead of being a flag that
+///   silently does nothing.
+/// * A CONFIGURED BASE REF THAT RESOLVES gives `base...HEAD`. This is the
+///   whole point: in a CI pull-request checkout the tree is CLEAN and HEAD is
+///   the PR head, so the working-tree question below returns an empty set and
+///   the gate exits 0 having read nothing.
+/// * A CONFIGURED BASE REF THAT DOES NOT RESOLVE is a REFUSAL, not a fallback.
+///   Falling back to the working tree here would reproduce the defect exactly:
+///   the caller asked for base-relative scope, we could not compute it, and a
+///   clean tree would report "no findings, exit 0" for a check that never ran.
+///   rvl-cli refuses the same way (`FormatNoBaseRefDiagnostic`).
+///
+/// With NOTHING configured anywhere the working-tree question stands, which is
+/// the honest answer at a keyboard and the one v2 has always given. That is a
+/// deliberate divergence from rvl-cli, which refuses: rvl-cli's
+/// `--changed-only` had no working-tree meaning to preserve. It does not
+/// reopen the hole, because the environment this bead is about always
+/// populates the chain — `GITHUB_BASE_REF` is exported by every
+/// `pull_request` event and `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` by every
+/// GitLab MR pipeline.
+fn changed_mode(
+    path: &std::path::Path,
+    hook: Option<&str>,
+    changed_only: bool,
+    base_chain: &base_ref::Chain,
+) -> anyhow::Result<changed::Mode> {
+    match changed::Mode::from_hook(hook) {
+        // Resolved LAZILY, per mode: pre-commit never asks the chain a
+        // question, and it sits on a hook where every extra `git rev-parse` is
+        // wall-clock the author pays on each commit.
+        changed::Mode::PreCommit => Ok(changed::Mode::PreCommit),
+        changed::Mode::PrePush { .. } => Ok(changed::Mode::PrePush {
+            fallback_base: base_ref::resolve(path, base_chain).ok().map(|r| r.git_ref),
+        }),
+        // No hook: the base-relative question when there is a base ref.
+        _ => match base_ref::resolve(path, base_chain) {
+            Ok(r) => Ok(changed::Mode::BaseRange {
+                base: r.git_ref,
+                source: r.source.label().to_string(),
+            }),
+            // Configured and unreachable: refuse, loudly, and only when the
+            // caller actually asked to be scoped. An unscoped `--incremental`
+            // run never claimed a scope, so a shallow clone must not start
+            // failing it.
+            Err(base_ref::Unresolved::NoBaseRef(misses))
+                if changed_only && base_chain.is_configured() =>
+            {
+                anyhow::bail!("{}", base_ref::diagnostic(&misses))
+            }
+            // Nothing configured, or not a git repo at all — the latter gets
+            // the changed-set resolver's own, more specific refusal.
+            Err(_) => Ok(changed::Mode::WorkingTree),
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan_incremental(
     store: &CacheStore,
@@ -3524,6 +3615,7 @@ fn run_scan_incremental(
     strict: bool,
     changed_only: bool,
     hook: Option<&str>,
+    base_chain: &base_ref::Chain,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
 
@@ -3532,7 +3624,7 @@ fn run_scan_incremental(
     // that index is a RETRIEVAL cache, and deriving "what changed" from it
     // made a cold cache mean "everything changed" -- the whole repo's
     // pre-existing findings gating the first commit after hook install.
-    let mode = changed::Mode::from_hook(hook);
+    let mode = changed_mode(path, hook, changed_only, base_chain)?;
     let resolved = changed::resolve(path, mode);
     if changed_only {
         if let Err(e) = &resolved {
@@ -5245,6 +5337,7 @@ fn run() -> anyhow::Result<ExitCode> {
             incremental,
             strict,
             changed_only,
+            base,
             agent,
             staged,
             pre_push,
@@ -5252,6 +5345,14 @@ fn run() -> anyhow::Result<ExitCode> {
             hook,
             ..
         } => {
+            let path = path.unwrap_or_else(|| PathBuf::from("."));
+            // The base-ref chain (po-av01j.194), resolved once and used twice:
+            // to pick the changed-set question below, and HERE to decide what
+            // a v1 `--changed-only` meant. v1 resolved that flag against this
+            // same chain, so with a base ref in play the alias must too —
+            // po-av01j.191 could only map it to `--hook pre-push` because the
+            // chain did not exist yet.
+            let base_chain = base_ref::chain(base.as_deref(), &path);
             // rvl-cli v1 hook shims run THIS binary after a `brew upgrade`
             // (the cask keeps the name `rvl`), so their flags must resolve
             // here or `git commit` fails and no commit is created
@@ -5272,6 +5373,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 incremental,
                 changed_only,
                 hook.as_deref(),
+                base_chain.is_configured(),
             )?;
             compat::set_never_block(never_block);
             match notice {
@@ -5282,7 +5384,6 @@ fn run() -> anyhow::Result<ExitCode> {
                 None if agent => agent_alias_notice(),
                 None => {}
             }
-            let path = path.unwrap_or_else(|| PathBuf::from("."));
             // Only the incremental path implements change scoping. Refuse
             // rather than silently scanning the whole repo while the caller
             // believes it is scoped -- a gate that lies about its scope is
@@ -5310,6 +5411,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     strict,
                     changed_only,
                     hook.as_deref(),
+                    &base_chain,
                 )
             } else {
                 // Hook adjudication is delta-scoped by definition; without

@@ -89,6 +89,15 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("compliance report", "format", Empty::Absent),
     ("scan", "color", Empty::Absent),
     ("scan", "hook", Empty::Absent),
+    // po-av01j.194's `--base`. rvl-cli parses it two ways and BOTH end at
+    // `ResolveBaseRef`, whose first act is `strings.TrimSpace(cfg.FlagBaseRef)`
+    // and whose chain treats `""` as "this link is unset" and walks on to
+    // RVL_BASE_REF (wire.go:148/155-158). So `--base=` is not a request to
+    // diff against the ref named "" — it is the flag not being given, and the
+    // env/config links still get their turn. (The SPACE form with no value at
+    // all is a different thing: scan.go:468 exits 2 with "--base requires a
+    // value", which clap produces for free.)
+    ("scan", "base", Empty::Absent),
     // rvl-cli submission-mode flags. scan.go:520 (`--target`),
     // scan_agent.go:230, scan.go:557/1022 all guard with `!= ""`.
     ("scan", "service", Empty::Absent),
@@ -274,6 +283,7 @@ pub fn normalize(cmd: &mut crate::Cmd) {
             out,
             color,
             hook,
+            base,
             service,
             team,
             target,
@@ -289,7 +299,7 @@ pub fn normalize(cmd: &mut crate::Cmd) {
             for p in [target, file, scan_dir] {
                 absent_path(p);
             }
-            for s in [color, hook, service, team, timeout, format] {
+            for s in [color, hook, base, service, team, timeout, format] {
                 absent_str(s);
             }
         }
@@ -667,6 +677,7 @@ mod tests {
                 out,
                 color,
                 hook,
+                base,
                 service,
                 team,
                 target,
@@ -676,7 +687,7 @@ mod tests {
                 format,
                 ..
             } => format!(
-                "{retrieved:?}{specs_file:?}{judgments:?}{out:?}{color:?}{hook:?}\
+                "{retrieved:?}{specs_file:?}{judgments:?}{out:?}{color:?}{hook:?}{base:?}\
                  {service:?}{team:?}{target:?}{file:?}{scan_dir:?}{timeout:?}{format:?}"
             ),
             Cmd::Report {

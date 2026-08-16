@@ -32,25 +32,45 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Which git question answers "what changed" for this invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// `--hook pre-commit`: the staged paths. What is being committed.
+    ///
+    /// THE INDEX, NOT A BASE REF. This mode is deliberately untouched by the
+    /// base-ref chain (po-av01j.194): a pre-commit gate judges the content of
+    /// the commit being created, which exists nowhere but the index. Diffing
+    /// it against a CI base branch would both miss staged work already on that
+    /// branch's tip and drag in every commit made since branching — neither of
+    /// which is "what am I about to commit".
     PreCommit,
     /// `--hook pre-push`: the paths touched by the commits being pushed.
-    PrePush,
-    /// `--changed-only` with no hook: the working tree against HEAD. The
-    /// honest answer to "what did this change touch" outside a hook.
+    /// `fallback_base` is the resolved base-ref chain, consulted ONLY when the
+    /// branch has no upstream — the same position rvl-cli gives it
+    /// (`runAgentPrePush`'s `defaultBase`, used when a pushed ref carries no
+    /// remote sha).
+    PrePush { fallback_base: Option<String> },
+    /// `--changed-only` with a base ref in play: `base...HEAD`, the committed
+    /// work on this branch since it diverged. rvl-cli's `--changed-only`
+    /// question, and the ONLY one that answers correctly in a CI pull-request
+    /// checkout, where the tree is clean and HEAD is the PR head
+    /// (po-av01j.194).
+    BaseRange { base: String, source: String },
+    /// `--changed-only` with no hook and no base ref anywhere: the working
+    /// tree against HEAD. The honest answer to "what did this change touch" at
+    /// a keyboard, where the uncommitted work IS the change.
     WorkingTree,
 }
 
 impl Mode {
-    /// The mode a `--hook <name>` selects. An unrecognized hook name falls to
-    /// the working-tree question rather than to "everything": a gate must
-    /// never widen because of a typo.
+    /// The mode a `--hook <name>` selects, ignoring the base-ref chain. An
+    /// unrecognized hook name falls to the working-tree question rather than
+    /// to "everything": a gate must never widen because of a typo.
     pub fn from_hook(hook: Option<&str>) -> Self {
         match hook {
             Some(h) if h.eq_ignore_ascii_case("pre-commit") => Mode::PreCommit,
-            Some(h) if h.eq_ignore_ascii_case("pre-push") => Mode::PrePush,
+            Some(h) if h.eq_ignore_ascii_case("pre-push") => Mode::PrePush {
+                fallback_base: None,
+            },
             _ => Mode::WorkingTree,
         }
     }
@@ -197,6 +217,35 @@ fn untracked(root: &Path) -> anyhow::Result<Vec<String>> {
     )?))
 }
 
+/// Paths changed on HEAD's side of `base...head`: the three-dot range, i.e.
+/// the diff from the MERGE BASE, not from the base tip. Commits landed on the
+/// base branch since this one forked are somebody else's change and must never
+/// enter this gate's scope. Same range rvl-cli's `RangeChangeSetBetween`
+/// computes.
+///
+/// `--` terminates the revision arguments: placed the other way round git
+/// reads the range as a pathspec and the diff comes back SILENTLY EMPTY
+/// (rvl-cli po-t8acf). A leading dash is refused rather than handed to git.
+fn range_paths(root: &Path, base: &str, head: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        !base.starts_with('-') && !head.starts_with('-'),
+        "invalid revision range {base}...{head}: leading dash"
+    );
+    let range = format!("{base}...{head}");
+    Ok(nul_paths(&git(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--relative",
+            "--diff-filter=ACMR",
+            &range,
+            "--",
+        ],
+    )?))
+}
+
 /// Resolve the changed set for `mode`, rooted at `root`.
 ///
 /// `--relative` throughout, so paths come back relative to the scanned root
@@ -219,7 +268,15 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                 dirty,
             ))
         }
-        Mode::PrePush => {
+        Mode::BaseRange { base, source } => {
+            let files = range_paths(root, &base, "HEAD")?;
+            Ok(ChangedSet::new(
+                files,
+                format!("git range {base}...HEAD (base ref from {source})"),
+                Vec::new(),
+            ))
+        }
+        Mode::PrePush { fallback_base } => {
             if let Some(up) = upstream(root) {
                 let range = format!("{up}..HEAD");
                 let files = nul_paths(&git(
@@ -239,9 +296,21 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                     Vec::new(),
                 ));
             }
-            // No upstream: the commits being pushed are the ones no remote
-            // ref contains. Only valid when remote refs EXIST (see
-            // `has_remote_refs`).
+            // No upstream, but a base ref was configured: use it. This is the
+            // slot rvl-cli's `defaultBase` occupies — the chain answers only
+            // when the push protocol itself could not, so `--base` is honoured
+            // here instead of being a flag that silently does nothing.
+            if let Some(base) = fallback_base {
+                let files = range_paths(root, &base, "HEAD")?;
+                return Ok(ChangedSet::new(
+                    files,
+                    format!("git range {base}...HEAD (base ref; branch has no upstream)"),
+                    Vec::new(),
+                ));
+            }
+            // No upstream and no base ref: the commits being pushed are the
+            // ones no remote ref contains. Only valid when remote refs EXIST
+            // (see `has_remote_refs`).
             anyhow::ensure!(
                 has_remote_refs(root),
                 "this branch has no upstream and the repository has no remote-tracking \
@@ -335,7 +404,12 @@ mod tests {
     #[test]
     fn hook_names_map_to_modes_and_an_unknown_name_never_widens() {
         assert_eq!(Mode::from_hook(Some("pre-commit")), Mode::PreCommit);
-        assert_eq!(Mode::from_hook(Some("pre-push")), Mode::PrePush);
+        assert_eq!(
+            Mode::from_hook(Some("pre-push")),
+            Mode::PrePush {
+                fallback_base: None
+            }
+        );
         assert_eq!(Mode::from_hook(None), Mode::WorkingTree);
         // A typo must not become "scan everything".
         assert_eq!(Mode::from_hook(Some("precommit")), Mode::WorkingTree);
@@ -468,7 +542,13 @@ mod tests {
         run(&root, &["add", "-A"]);
         run(&root, &["commit", "-qm", "b"]);
 
-        let cs = resolve(&root, Mode::PrePush).unwrap();
+        let cs = resolve(
+            &root,
+            Mode::PrePush {
+                fallback_base: None,
+            },
+        )
+        .unwrap();
         assert_eq!(
             cs.files,
             vec!["new_a.go".to_string(), "new_b.go".to_string()],
@@ -495,7 +575,13 @@ mod tests {
         run(&root, &["add", "-A"]);
         run(&root, &["commit", "-qm", "unpushed"]);
 
-        let cs = resolve(&root, Mode::PrePush).unwrap();
+        let cs = resolve(
+            &root,
+            Mode::PrePush {
+                fallback_base: None,
+            },
+        )
+        .unwrap();
         assert_eq!(cs.files, vec!["unpushed.go".to_string()]);
         assert!(cs.source.contains("not present on any remote"));
     }
@@ -506,8 +592,190 @@ mod tests {
     fn pre_push_with_no_remote_at_all_refuses_rather_than_returning_everything() {
         let dir = tempfile::tempdir().unwrap();
         let root = repo(&dir);
-        let err = resolve(&root, Mode::PrePush).unwrap_err().to_string();
+        let err = resolve(
+            &root,
+            Mode::PrePush {
+                fallback_base: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("no upstream"), "got: {err}");
+    }
+
+    // --- the CI base-ref range (po-av01j.194) ---
+
+    /// The PR-checkout shape, synthesized exactly: a base branch, a feature
+    /// branch with committed work, a CLEAN tree, and HEAD parked on the
+    /// feature tip. Returns the repo root.
+    fn pr_checkout(dir: &tempfile::TempDir) -> PathBuf {
+        let root = repo(dir); // main, one commit, legacy.go
+        run(&root, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("added.go"), "package main\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "pr commit 1"]);
+        std::fs::write(root.join("also_added.go"), "package main\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "pr commit 2"]);
+        // ... and main moves on underneath, as it does in any real PR.
+        run(&root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("someone_elses.go"), "package main\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "unrelated work on main"]);
+        run(&root, &["checkout", "-q", "feature"]);
+        root
+    }
+
+    /// THE BUG (po-av01j.194). In the environment the gate exists for — a CI
+    /// pull-request checkout — the working-tree question answers "nothing",
+    /// because the tree is clean and HEAD is the PR head. Same repo, same
+    /// commit, with a base ref: the PR's own files. One of these two answers
+    /// makes a gate; the other makes a gate that reports success having read
+    /// no files at all.
+    #[test]
+    fn a_clean_pr_checkout_sees_nothing_without_a_base_ref_and_the_prs_files_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir);
+
+        let without = resolve(&root, Mode::WorkingTree).unwrap();
+        assert!(
+            without.files.is_empty(),
+            "a clean PR checkout has no working-tree changes — this is the silent pass: {:?}",
+            without.files
+        );
+
+        let with = resolve(
+            &root,
+            Mode::BaseRange {
+                base: "main".into(),
+                source: "GITHUB_BASE_REF env var (PR events)".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with.files,
+            vec!["added.go".to_string(), "also_added.go".to_string()],
+            "the gate must see every file the PR touched"
+        );
+        assert!(with.source.contains("main...HEAD"), "{}", with.source);
+        assert!(
+            with.source.contains("GITHUB_BASE_REF"),
+            "the scan must name which link of the chain scoped it: {}",
+            with.source
+        );
+    }
+
+    /// THREE DOTS, NOT TWO. `main...HEAD` diffs from the MERGE BASE, so a
+    /// commit landed on main after this branch forked is not this PR's change.
+    /// Two dots would drag `someone_elses.go` into the author's gate — the
+    /// noise `--changed-only` exists to remove.
+    #[test]
+    fn the_base_range_excludes_commits_that_landed_on_the_base_after_the_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir);
+        let cs = resolve(
+            &root,
+            Mode::BaseRange {
+                base: "main".into(),
+                source: "test".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            !cs.files.contains(&"someone_elses.go".to_string()),
+            "work that landed on the base branch is not this change: {:?}",
+            cs.files
+        );
+        assert!(
+            !cs.files.contains(&"legacy.go".to_string()),
+            "and neither is the repo's pre-existing content: {:?}",
+            cs.files
+        );
+    }
+
+    /// A base ref that does not resolve is an ERROR, never an empty set. The
+    /// caller turns it into a refusal; silently answering "nothing changed"
+    /// is the failure this bead removes.
+    #[test]
+    fn an_unresolvable_base_ref_errors_rather_than_returning_an_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir);
+        assert!(resolve(
+            &root,
+            Mode::BaseRange {
+                base: "no-such-branch".into(),
+                source: "test".into(),
+            },
+        )
+        .is_err());
+    }
+
+    /// Argument injection: a revision that begins with a dash never reaches
+    /// git as an option.
+    #[test]
+    fn a_dash_leading_base_is_refused_before_git_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir);
+        let err = resolve(
+            &root,
+            Mode::BaseRange {
+                base: "--output=/tmp/pwned".into(),
+                source: "test".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("leading dash"), "got: {err}");
+    }
+
+    /// PRE-PUSH IS UNCHANGED WHEN IT HAS AN UPSTREAM. The pushed range is the
+    /// better answer (it is the actual push target), so a configured base ref
+    /// does not displace it — the same precedence rvl-cli gives the pushed
+    /// ref's remote sha over its `defaultBase`.
+    #[test]
+    fn pre_push_prefers_its_upstream_over_a_configured_base_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo(&dir);
+        let remote = dir.path().join("remote.git");
+        run(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        run(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&root, &["push", "-q", "-u", "origin", "main"]);
+        std::fs::write(root.join("unpushed.go"), "package main\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "unpushed"]);
+
+        let cs = resolve(
+            &root,
+            Mode::PrePush {
+                fallback_base: Some("main".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(cs.files, vec!["unpushed.go".to_string()]);
+        assert!(cs.source.contains("branch upstream"), "{}", cs.source);
+    }
+
+    /// ... but with NO upstream, the base ref answers rather than `--base`
+    /// being a flag that silently does nothing.
+    #[test]
+    fn pre_push_without_an_upstream_uses_the_configured_base_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir); // `feature`, no upstream, no remote
+        let cs = resolve(
+            &root,
+            Mode::PrePush {
+                fallback_base: Some("main".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cs.files,
+            vec!["added.go".to_string(), "also_added.go".to_string()]
+        );
+        assert!(cs.source.contains("no upstream"), "{}", cs.source);
     }
 
     /// No hook: the working-tree question, which includes unstaged edits and
@@ -573,9 +841,15 @@ mod tests {
         let plain = dir.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("a.go"), "package main\n").unwrap();
-        for mode in [Mode::PreCommit, Mode::PrePush, Mode::WorkingTree] {
+        for mode in [
+            Mode::PreCommit,
+            Mode::PrePush {
+                fallback_base: None,
+            },
+            Mode::WorkingTree,
+        ] {
             assert!(
-                resolve(&plain, mode).is_err(),
+                resolve(&plain, mode.clone()).is_err(),
                 "{mode:?} must not invent a changed set outside a git work tree"
             );
         }
