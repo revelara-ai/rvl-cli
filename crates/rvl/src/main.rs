@@ -3456,7 +3456,17 @@ fn incremental_scan_pass(
     // budget thread.
     let lang_degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
     let collector = std::sync::Arc::clone(&lang_degraded);
+    // How many languages this pass ASKED a helper for -- the denominator
+    // `retrieval_verdict` needs, recorded where the question is actually put
+    // (po-av01j.199). Shared for the same reason `lang_degraded` is: the
+    // closure is `FnOnce` and moves.
+    let attempted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let attempted_w = std::sync::Arc::clone(&attempted);
     let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
+        attempted_w.store(
+            langs_of_paths(changed).len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Budget only the potentially-slow helper retrieval.
         let retriever = HelperRetriever {
             degraded: std::sync::Arc::clone(&collector),
@@ -3473,7 +3483,63 @@ fn incremental_scan_pass(
     if let Ok(mut g) = lang_degraded.lock() {
         scan.lang_degraded = std::mem::take(&mut g);
     }
+    apply_retrieval_policy(
+        &mut scan,
+        attempted.load(std::sync::atomic::Ordering::Relaxed),
+        strict,
+    )?;
     Ok(scan)
+}
+
+/// The distinct languages a set of files would be retrieved as. The
+/// denominator for `retrieval_verdict` on the warm path.
+fn langs_of_paths(files: &[PathBuf]) -> std::collections::BTreeSet<Lang> {
+    files.iter().filter_map(|p| lang_of_path(p)).collect()
+}
+
+/// Apply the SAME retrieval policy the full path applies (po-av01j.199).
+///
+/// THE BUG: the incremental path collected `lang_degraded` and rendered it as
+/// per-language COVERAGE lines, but never ran it through `retrieval_verdict`,
+/// so the one case that function calls fatal at any strictness -- every
+/// attempted language degraded, i.e. nothing was scanned at all -- arrived at
+/// the footer indistinguishable from a clean scan. Reproduced by hand: a repo
+/// whose only language is Python, an unbounded `requests.get` staged, no
+/// `python3` on PATH, and the gate `hook install` writes printed
+/// "0 advisory - commit clean", exit 0. With `python3` present the identical
+/// commit was blocked. This is the third instance in this gate path (after
+/// .182 and .194) of "nothing was scanned" and "nothing was wrong" rendering
+/// alike, and the loudest: the other two failed commits that should have
+/// passed, which gets noticed in seconds; this one passes commits that should
+/// have blocked, which is never noticed at all.
+///
+/// The DENOMINATOR is the delta, not the repository. A language whose files
+/// did not change was not retrieved and did not fail -- its packets came out
+/// of the index keyed by the files' CURRENT content hash, which is a real
+/// scan, not a gap. Counting repo-wide languages here would report a Go+Python
+/// repo as fully degraded whenever a Python-only commit hit a missing
+/// `python3`, and calling a scan incomplete that was in fact complete is the
+/// false alarm that teaches people to ignore the word.
+///
+/// The note is APPENDED rather than assigned: `resolve_budgeted` may already
+/// have recorded a wall-budget degradation, and the two are independent facts
+/// about the same pass.
+fn apply_retrieval_policy(
+    scan: &mut IncrementalScan,
+    attempted: usize,
+    strict: bool,
+) -> anyhow::Result<()> {
+    // `?` is the fail-CLOSED half and is load-bearing: `--strict` promises CI
+    // a whole answer or none, and it was being bypassed here along with
+    // everything else.
+    let Some(note) = retrieval_verdict(attempted, &scan.lang_degraded, strict)? else {
+        return Ok(());
+    };
+    scan.degraded_note = Some(match scan.degraded_note.take() {
+        Some(prev) => format!("{prev}; {note}"),
+        None => note,
+    });
+    Ok(())
 }
 
 /// The argv a detached reindex child re-runs: everything except `--detach`
@@ -7261,6 +7327,124 @@ mod tests {
         assert!(
             scan.degraded_note.is_none() && scan.lang_degraded.is_empty(),
             "nothing degraded -- there was nothing to run"
+        );
+        // po-av01j.199: and the policy must leave it alone. "Nothing to scan"
+        // is not "could not scan", so this pass keeps its clean verdict.
+        let mut scan = scan;
+        apply_retrieval_policy(&mut scan, 0, false).expect("nothing degraded, nothing to say");
+        assert!(
+            scan.degraded_note.is_none(),
+            "a source-free repo must not be told its scan was incomplete"
+        );
+    }
+
+    // --- po-av01j.199: the warm path applies the retrieval policy too ---
+
+    /// A warm pass that retrieved nothing, carrying exactly the degradations
+    /// under test.
+    fn warm_scan(lang_degraded: Vec<LangDegradation>) -> IncrementalScan {
+        IncrementalScan {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            reused_files: 0,
+            retrieved_files: 0,
+            degraded_note: None,
+            reparsed_files: Vec::new(),
+            lang_degraded,
+            no_supported_sources: false,
+        }
+    }
+
+    fn missing_python() -> LangDegradation {
+        LangDegradation {
+            lang: Lang::Python,
+            kind: DegradeKind::NotInstalled,
+            reason: "`python3` is not installed, so pyindex.py cannot run".into(),
+        }
+    }
+
+    // THE BEAD. Every language the pass tried failed, so no call site was
+    // read; the footer used to render "0 advisory - commit clean" over it.
+    #[test]
+    fn a_warm_pass_whose_every_language_degraded_is_marked_incomplete() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        apply_retrieval_policy(&mut scan, 1, false).expect("fail-open: this must not error");
+        let note = scan
+            .degraded_note
+            .expect("the pass scanned nothing and must say so");
+        assert!(
+            note.contains("every detected language failed to retrieve"),
+            "the warm path must reach the SAME verdict the full path renders: {note}"
+        );
+        assert!(
+            note.contains("python3"),
+            "and must name what to install: {note}"
+        );
+    }
+
+    // Fail-OPEN PER LANGUAGE is the documented default: one language of three
+    // is a normal report, not an incomplete scan. The reader still learns the
+    // language was skipped -- that is the per-language COVERAGE line, which is
+    // rendered from `lang_degraded` independently of this note.
+    #[test]
+    fn one_language_of_three_degrading_is_not_an_incomplete_scan() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        apply_retrieval_policy(&mut scan, 3, false).expect("fail-open per language");
+        assert!(
+            scan.degraded_note.is_none(),
+            "two of three languages were scanned; calling that incomplete is a false alarm"
+        );
+        assert_eq!(
+            scan.lang_degraded.len(),
+            1,
+            "the skipped language stays reportable"
+        );
+    }
+
+    // --strict was bypassed by the same gap: CI asked for a whole answer or
+    // none and was getting a partial one silently.
+    #[test]
+    fn strict_still_fails_closed_on_the_warm_path() {
+        for attempted in [1usize, 3] {
+            let mut scan = warm_scan(vec![missing_python()]);
+            let err = apply_retrieval_policy(&mut scan, attempted, true)
+                .expect_err("--strict refuses a partial answer");
+            assert!(
+                format!("{err:#}").contains("--strict"),
+                "the error must name the flag that caused it: {err:#}"
+            );
+        }
+    }
+
+    // The wall budget and a dead retriever are independent facts about one
+    // pass, so neither may overwrite the other's sentence.
+    #[test]
+    fn a_budget_degradation_and_a_total_retrieval_failure_are_both_reported() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        scan.degraded_note = Some("retrieval capped at 10s".into());
+        apply_retrieval_policy(&mut scan, 1, false).unwrap();
+        let note = scan.degraded_note.unwrap();
+        assert!(note.contains("retrieval capped at 10s"), "{note}");
+        assert!(note.contains("every detected language failed"), "{note}");
+    }
+
+    // The denominator is the DELTA, not the repository: files that did not
+    // change were served from the index at their current content hash, which
+    // is a real scan and must not be counted as a language that failed.
+    #[test]
+    fn the_attempted_language_count_comes_from_the_changed_files() {
+        let files = vec![
+            PathBuf::from("/r/a.py"),
+            PathBuf::from("/r/b.py"),
+            PathBuf::from("/r/c.go"),
+            PathBuf::from("/r/README.md"),
+        ];
+        let langs = langs_of_paths(&files);
+        assert_eq!(langs.len(), 2, "two languages, four files: {langs:?}");
+        assert!(langs.contains(&Lang::Python) && langs.contains(&Lang::Go));
+        assert!(
+            langs_of_paths(&[PathBuf::from("/r/README.md")]).is_empty(),
+            "a docs-only delta asks no helper anything"
         );
     }
 

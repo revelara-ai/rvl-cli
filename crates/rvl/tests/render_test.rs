@@ -697,6 +697,70 @@ fn an_empty_lane_with_no_degradation_still_reads_as_nothing_to_scan() {
     assert!(!out.contains("INCOMPLETE"), "{out}");
 }
 
+// po-av01j.199. The COVERAGE line above was fixed by .139; the FOOTER was not,
+// and the footer is the line a committer reads. A machine with no `python3`
+// got "call-site lane INCOMPLETE" three lines above a green
+// "0 advisory - commit clean", and passed an unbounded `requests.get`.
+#[test]
+fn an_empty_lane_after_a_degraded_pass_does_not_render_the_clean_verdict() {
+    let cov = Coverage {
+        degraded_note: Some("every detected language failed to retrieve".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        !out.contains("commit clean"),
+        "a scan that read nothing may not report a clean commit: {out}"
+    );
+    assert!(
+        out.contains("NOT CLEAN") && out.contains("nothing was scanned"),
+        "the verdict line must carry the fact, not just the coverage block: {out}"
+    );
+    assert!(
+        out.contains("fails open"),
+        "and must say the commit is still allowed, or the reader reads it as a block: {out}"
+    );
+}
+
+// The genuinely empty scope (po-av01j.198) keeps its clean verdict: "nothing
+// to scan" and "could not scan" are opposite statements and this is the first.
+#[test]
+fn an_empty_lane_with_nothing_to_scan_keeps_the_clean_verdict() {
+    let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+    assert!(out.contains("commit clean"), "{out}");
+    assert!(!out.contains("NOT CLEAN"), "{out}");
+}
+
+// A PARTIAL pass is fail-open by design: sites WERE scanned, the skipped
+// language is named above, and the verdict stays clean. Calling this "not
+// clean" would spend the word on the ordinary case.
+#[test]
+fn a_partial_pass_keeps_the_clean_verdict() {
+    let cov = Coverage {
+        resolved: 10,
+        total: 12,
+        degraded_note: Some("retrieval failed (helper `python3`)".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("commit clean"), "{out}");
+    assert!(out.contains("PARTIAL"), "the reader is still told: {out}");
+}
+
+// Blocking findings still own the verdict line: an incomplete scan that found
+// something anyway is blocked, not merely "not clean".
+#[test]
+fn a_blocking_finding_still_wins_the_verdict_line_over_an_incomplete_scan() {
+    let f = f("blocking", "high", "surface", 1);
+    let cov = Coverage {
+        degraded_note: Some("every detected language failed to retrieve".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[f], cov, None, "0.1s", false);
+    assert!(out.contains("blocked"), "{out}");
+    assert!(!out.contains("NOT CLEAN"), "{out}");
+}
+
 // A PARTIAL pass must be flagged too: the percentage describes the reused
 // portion, not the repo, and a reader comparing it to a previous run would
 // otherwise read a retrieval failure as a coverage regression.

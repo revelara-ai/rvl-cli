@@ -641,16 +641,52 @@ pub fn render_ladder(
         .filter(|f| classify(f) == Section::Suppressed)
         .count();
 
+    // THE VERDICT LINE MUST NOT SAY "CLEAN" OVER A SCAN THAT NEVER RAN
+    // (po-av01j.199). The COVERAGE block above already distinguishes "I found
+    // nothing" from "I could not look", but the FOOTER -- the one line a
+    // committer actually reads -- said "commit clean" for both, so a machine
+    // with no `python3` passed an unbounded `requests.get` under a green
+    // checkmark. Same condition as the INCOMPLETE coverage line on purpose:
+    // one predicate drives both, so the two sentences can never disagree
+    // (po-av01j.94's invariant, applied to the prose instead of the exit code).
+    //
+    // Deliberately NOT extended to a PARTIAL pass (total > 0 with a note).
+    // Fail-open per language is the documented policy: some sites really were
+    // scanned, the reader is told which language was skipped by the coverage
+    // lines above, and calling that "not clean" would train people to ignore
+    // the word.
+    let nothing_scanned = cov.total == 0 && cov.degraded_note.is_some();
     if blocking.is_empty() {
         let mut foot = format!(
             "{} {} advisory",
-            paint("\u{2713}", "32", color),
+            if nothing_scanned {
+                paint("\u{26a0}", "33", color)
+            } else {
+                paint("\u{2713}", "32", color)
+            },
             advisory.len()
         );
         if suppressed > 0 {
             let _ = write!(foot, " \u{00b7} {suppressed} suppressed");
         }
-        let _ = writeln!(o, "{foot} \u{00b7} commit clean");
+        if nothing_scanned {
+            // The exit code stays 0: a broken retriever is OUR defect and must
+            // not block someone's commit (ruled po-av01j.199, and what
+            // `--strict`'s help has always promised). So the verdict line is
+            // the whole signal, and it has to carry the fact and the reason.
+            let _ = writeln!(
+                o,
+                "{foot} \u{00b7} {}",
+                paint(
+                    "NOT CLEAN \u{2014} nothing was scanned (see COVERAGE); \
+                     commit allowed, rvl fails open",
+                    "33",
+                    color
+                )
+            );
+        } else {
+            let _ = writeln!(o, "{foot} \u{00b7} commit clean");
+        }
     } else {
         let _ = writeln!(
             o,
