@@ -68,6 +68,25 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("scan", "specs-file", Empty::Error),
     ("scan", "judgments", Empty::Error),
     ("scan", "out", Empty::Error),
+    // Added when po-av01j.185 and .191 merged in alongside .192; this table is
+    // what caught them. Each read off rvl-cli origin/main, not inferred:
+    //
+    // scan.go:667 `if csFile != ""` guards the read, so empty == not given.
+    ("scan", "cs-file", Empty::Absent),
+    // scan_agent.go:189 `if a.mode != ""` guards the override, leaving
+    // scan_agent.go:114 Mode: GateModeEnforce. So empty == not given, NOT a
+    // request for an empty mode.
+    ("scan", "mode", Empty::Absent),
+    // report.go:75 lowercases/trims then validates unguarded:
+    // `if set != "starter" && set != "full"` -> exit 2. Empty is rejected.
+    ("compliance report", "set", Empty::Error),
+    // report.go:44 defaults "soc2" but nothing guards the override, and the
+    // value is interpolated straight into the URL path, so `--framework=`
+    // really does request /api/v1/compliance//readiness. Faithful, if odd.
+    ("compliance report", "framework", Empty::Value),
+    // report.go:46 defaults to "" and only ever asks `if format == "json"`
+    // (report.go:91), so empty IS the default and means table output.
+    ("compliance report", "format", Empty::Absent),
     ("scan", "color", Empty::Absent),
     ("scan", "hook", Empty::Absent),
     // rvl-cli submission-mode flags. scan.go:520 (`--target`),
