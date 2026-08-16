@@ -459,12 +459,18 @@ enum PluginCmd {
     /// Install the plugin content for a harness. With no name, installs
     /// into every detected harness (same engine as `rvl skills install`).
     Install {
-        /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
+        /// Harness name; `plugin editors` lists every supported target.
         harness: Option<String>,
         /// Stage files but do not run the harness's plugin registration
         /// commands (Claude Code); they are printed for manual use instead.
         #[arg(long)]
         no_register: bool,
+        /// Install into THIS REPOSITORY instead of your home directory
+        /// (`<repo>/.cursor`, `<repo>/.agents/skills`, ...), so the skills
+        /// can be committed and every contributor gets them. Harnesses
+        /// whose install is user-level (Claude Code) refuse it.
+        #[arg(long)]
+        project: bool,
     },
     /// Update installed plugin content to the served version (install and
     /// update are the same operation, mirroring `rvl plugin update`).
@@ -485,6 +491,10 @@ enum PluginCmd {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Remove the PROJECT-LOCAL install from this repository instead of
+        /// the one in your home directory.
+        #[arg(long)]
+        project: bool,
     },
     /// List the supported editor targets served by the Revelara API
     /// (GET /api/v1/plugin/editors), with a built-in fallback offline.
@@ -3960,7 +3970,10 @@ fn print_registration_commands(reg: &rvl_skills::harness::Registration) {
 /// Run the harness registration commands (e.g. `claude plugin marketplace
 /// add`). The first command is cleanup and may fail harmlessly; any later
 /// failure falls back to printing the remaining commands for manual use.
-fn run_registration(reg: &rvl_skills::harness::Registration) {
+/// Returns whether the WHOLE sequence completed, which is what gates the
+/// post-registration hook (Claude Code's stale-cache prune must not run
+/// against a registry that was never updated).
+fn run_registration(reg: &rvl_skills::harness::Registration) -> bool {
     for (i, argv) in reg.commands.iter().enumerate() {
         let result = std::process::Command::new(reg.binary).args(argv).output();
         let ok = match &result {
@@ -3983,13 +3996,14 @@ fn run_registration(reg: &rvl_skills::harness::Registration) {
         for argv in &reg.commands[i..] {
             eprintln!("  {} {}", reg.binary, argv.join(" "));
         }
-        return;
+        return false;
     }
     println!("registered with {}", reg.binary);
+    true
 }
 
 /// Print one install's outcome and handle its registration step.
-fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: bool) {
+fn render_install_report(home: &Path, report: &rvl_skills::flow::InstallReport, no_register: bool) {
     let source = if report.from_cache {
         " (from cache)"
     } else {
@@ -4005,21 +4019,39 @@ fn render_install_report(report: &rvl_skills::flow::InstallReport, no_register: 
     for w in &report.warnings {
         eprintln!("  warning: {w}");
     }
+    for n in &report.notes {
+        println!("  {n}");
+    }
     if let Some(reg) = &report.receipt.register {
-        if no_register {
+        let registered = if no_register {
             println!("skipping registration (--no-register); to register manually:");
             print_registration_commands(reg);
+            false
         } else if binary_on_path(reg.binary) {
-            run_registration(reg);
+            run_registration(reg)
         } else {
             println!(
                 "'{}' not found on PATH; to register once it is:",
                 reg.binary
             );
             print_registration_commands(reg);
+            false
+        };
+        // Only after the harness's own registry actually moved: the prune
+        // reads that registry to learn which version is live.
+        if registered {
+            if let Some(h) = rvl_skills::harness::by_name(&report.harness) {
+                match h.post_register(home) {
+                    Ok(Some(note)) => println!("  {note}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("  warning: {e}"),
+                }
+            }
         }
     }
-    println!("  {}", report.receipt.note);
+    if !report.receipt.note.is_empty() {
+        println!("  {}", report.receipt.note);
+    }
 }
 
 /// Install or update the named harness, or every relevant one when omitted
@@ -4064,11 +4096,21 @@ fn run_skills_install(
             if update {
                 // Adopt v1 rvl-cli installs: an update targets them too, and
                 // the resulting v2 install records them in rvl's store so
-                // every later operation uses v2 records.
+                // every later operation uses v2 records. A record rvl cannot
+                // adopt is NAMED rather than dropped — silently discarding it
+                // is how an upgraded user's install becomes unmanageable
+                // without ever being told (po-av01j.162).
                 for p in rvl_skills::v1::read_v1_installs(env.home) {
-                    if rvl_skills::harness::by_name(&p.editor).is_some()
-                        && !names.contains(&p.editor)
-                    {
+                    if rvl_skills::harness::by_name(&p.editor).is_none() {
+                        eprintln!(
+                            "note: rvl-cli recorded an install for {} at {}, which this \
+                             version does not support; it is left untouched and still \
+                             listed by '{BIN} plugin list'",
+                            p.editor, p.location
+                        );
+                        continue;
+                    }
+                    if !names.contains(&p.editor) {
                         println!("adopting {} (installed by rvl-cli)", p.editor);
                         names.push(p.editor);
                     }
@@ -4098,7 +4140,7 @@ fn run_skills_install(
         };
         match rvl_skills::flow::install_one(env, h.as_ref()) {
             Ok(report) => {
-                render_install_report(&report, no_register);
+                render_install_report(env.home, &report, no_register);
                 installed += 1;
             }
             Err(e) => {
@@ -4267,8 +4309,14 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
         PluginCmd::Install {
             harness,
             no_register,
+            project,
         } => {
             ctx.require_key()?;
+            if project {
+                let root = detect_project_root()?;
+                let failed = run_plugin_install_project(&env, harness, &root)?;
+                return Ok(skills_exit(failed));
+            }
             let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
             Ok(skills_exit(failed))
         }
@@ -4282,9 +4330,14 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
         }
         PluginCmd::List => {
             render_skills_status(&rvl_skills::flow::status(&env));
+            render_project_installs();
             Ok(ExitCode::SUCCESS)
         }
-        PluginCmd::Remove { harness, yes } => run_plugin_remove(&env, &harness, yes),
+        PluginCmd::Remove {
+            harness,
+            yes,
+            project,
+        } => run_plugin_remove(&env, &harness, yes, project),
         PluginCmd::Editors => {
             run_plugin_editors(&env);
             Ok(ExitCode::SUCCESS)
@@ -4294,6 +4347,104 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
             json,
             format,
         } => run_plugin_agents(&env, &editor, json, format.as_deref()),
+    }
+}
+
+/// The repository a `--project` install/remove targets: the git root when
+/// there is one, else the current directory (rvl-cli `detectProjectRoot`).
+fn detect_project_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !root.is_empty() {
+                return Ok(PathBuf::from(root));
+            }
+        }
+    }
+    Ok(cwd)
+}
+
+/// `plugin install --project`: write the skills into THIS repository so they
+/// can be committed. With no harness named, every detected harness that has
+/// a project-local layout gets one (the rest are reported as skipped, never
+/// silently dropped). Returns the failure count.
+fn run_plugin_install_project(
+    env: &rvl_skills::flow::Env,
+    harness: Option<String>,
+    project_root: &Path,
+) -> anyhow::Result<usize> {
+    let targets: Vec<String> = match harness {
+        Some(name) => {
+            anyhow::ensure!(
+                rvl_skills::harness::by_name(&name).is_some(),
+                "unsupported harness: {name} (supported: {})",
+                rvl_skills::harness::supported_names().join(", ")
+            );
+            vec![name]
+        }
+        None => {
+            let detected = rvl_skills::harness::detect_installed(env.home);
+            if detected.is_empty() {
+                println!(
+                    "No supported coding-agent harness detected (supported: {}).",
+                    rvl_skills::harness::supported_names().join(", ")
+                );
+                return Ok(0);
+            }
+            detected
+        }
+    };
+
+    let mut failed = 0usize;
+    for name in &targets {
+        let Some(h) = rvl_skills::harness::by_name(name) else {
+            continue;
+        };
+        if h.local_dir().is_none() {
+            // Named explicitly, this is an error the caller must see; in a
+            // detected sweep it is just not applicable.
+            if targets.len() == 1 {
+                anyhow::bail!(
+                    "--project is not supported for {name}: its install is user-level, \
+                     not project-local. Run '{BIN} plugin install {name}' without --project."
+                );
+            }
+            println!("skipping {name} (no project-local layout)");
+            continue;
+        }
+        match rvl_skills::flow::install_one_project(env, h.as_ref(), project_root) {
+            Ok(report) => render_install_report(env.home, &report, true),
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok(failed)
+}
+
+/// The "Project-local installations" section of `plugin list`: the skills a
+/// repository carries itself, which live outside the install store because
+/// the repo IS the record.
+fn render_project_installs() {
+    let Ok(root) = detect_project_root() else {
+        return;
+    };
+    let installs = rvl_skills::flow::project_installs(&root);
+    if installs.is_empty() {
+        return;
+    }
+    println!("\nProject-local installations ({}):", root.display());
+    for p in installs {
+        // Several harnesses share `.agents/skills`; one line per directory
+        // names them all instead of repeating the same path seven times.
+        println!("  {}  ({})", p.dir.display(), p.harnesses.join(", "));
     }
 }
 
@@ -4315,6 +4466,7 @@ fn run_plugin_remove(
     env: &rvl_skills::flow::Env,
     harness: &str,
     yes: bool,
+    project: bool,
 ) -> anyhow::Result<ExitCode> {
     let Some(h) = rvl_skills::harness::by_name(harness) else {
         anyhow::bail!(
@@ -4322,11 +4474,24 @@ fn run_plugin_remove(
             rvl_skills::harness::supported_names().join(", ")
         );
     };
-    if !yes && !confirm(&format!("Remove Revelara skills for {harness}?")) {
+    let scope = if project { "project-local" } else { "global" };
+    // Resolve the project directory BEFORE prompting, so a harness that
+    // cannot be removed project-locally says so instead of asking first.
+    let project_root = if project {
+        let root = detect_project_root()?;
+        rvl_skills::flow::project_dir(h.as_ref(), &root)?;
+        Some(root)
+    } else {
+        None
+    };
+    if !yes && !confirm(&format!("Remove {scope} Revelara skills for {harness}?")) {
         println!("Cancelled.");
         return Ok(ExitCode::SUCCESS);
     }
-    let report = rvl_skills::flow::remove_one(env, h.as_ref())?;
+    let report = match &project_root {
+        Some(root) => rvl_skills::flow::remove_one_project(env, h.as_ref(), root)?,
+        None => rvl_skills::flow::remove_one(env, h.as_ref())?,
+    };
     match report.receipt.files_removed {
         Some(n) => println!(
             "removed {harness}: {n} file(s) under {}",
@@ -4334,7 +4499,7 @@ fn run_plugin_remove(
         ),
         None => println!("removed {harness}: {}", report.receipt.location.display()),
     }
-    if let Some(reg) = &report.receipt.register {
+    if let Some(reg) = report.receipt.register.as_ref().filter(|_| !project) {
         if binary_on_path(reg.binary) {
             run_removal_registration(reg);
         } else {
