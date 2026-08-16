@@ -596,12 +596,52 @@ pub fn request_body(req: &ScanRequest, include_key: bool) -> String {
     compact(&request_g(req, include_key))
 }
 
+/// Metadata fields that describe *who submitted* a scan rather than *what
+/// was scanned*, and are therefore blanked before the idempotency key is
+/// derived (po-av01j.186).
+///
+/// - `scanner_id` names the binary (`rely-cli-<ver>` in v1, `rvl/<ver>` in
+///   v2). Its value is deliberately distinguishable so v1-vs-v2 adoption
+///   can be measured, which is exactly why it must not reach the key: the
+///   same scan of the same tree submitted by one binary and retried by the
+///   other has to land on the same server-side cache row.
+/// - `git_commit` / `git_branch` record where HEAD happened to be. They are
+///   provenance labels, not scan content: an amend, a rebase, or a branch
+///   rename moves them while the scanned tree and the findings are
+///   unchanged, and v1 never populated them at all. Leaving them in the key
+///   would void the "rerun after a client timeout replays the cached
+///   response" property this key exists to provide.
+///
+/// Everything else stays in the key. What identifies a scan is what was
+/// scanned and what was found: service, scan type/mode, findings, control
+/// structure, stack/components/dependencies/catalog, criticality,
+/// tolerance, team assignment, and the scanner-capability metadata
+/// (skill and matcher versions, excluded matchers, applied waivers) that
+/// determines what a rerun would produce.
+fn key_identity_request(req: &ScanRequest) -> ScanRequest {
+    let mut clone = req.clone();
+    clone.idempotency_key = String::new();
+    clone.metadata.scanner_id = String::new();
+    clone.metadata.git_commit = String::new();
+    clone.metadata.git_branch = String::new();
+    clone
+}
+
+/// The exact bytes hashed into the idempotency key: the Go-parity request
+/// marshal with the submitter-identifying fields blanked. Exposed so the Go
+/// v1 client and the Rust v2 client can be diffed byte-for-byte.
+pub fn idempotency_canonical_body(req: &ScanRequest) -> String {
+    request_body(&key_identity_request(req), false)
+}
+
 /// A stable 32-hex-char key derived from the request body with the
-/// idempotency key cleared. Two invocations against the same service with
-/// the same findings/metadata produce the same key, so the server-side
-/// cache recognizes the second submission as a retry.
+/// idempotency key and the submitter-identifying metadata cleared (see
+/// [`key_identity_request`]). Two invocations against the same service with
+/// the same findings/scan metadata produce the same key — including across
+/// the v1 Go binary and the v2 Rust binary — so the server-side cache
+/// recognizes the second submission as a retry.
 pub fn derive_idempotency_key(req: &ScanRequest) -> String {
-    let canonical = request_body(req, false);
+    let canonical = idempotency_canonical_body(req);
     let sum = Sha256::digest(canonical.as_bytes());
     hex::encode(&sum[..16])
 }
@@ -1629,6 +1669,89 @@ mod tests {
         // And the wire body carries the key while the canonical form omits it.
         assert!(request_body(&b, true).contains("idempotency_key"));
         assert!(!request_body(&b, false).contains("idempotency_key"));
+    }
+
+    /// po-av01j.186: `scanner_id` names the submitting binary, not the scan.
+    /// The value stays on the wire (adoption telemetry for the v1->v2
+    /// cutover) but must not reach the key, or a scan submitted by
+    /// `rely-cli-<ver>` and retried by `rvl/<ver>` misses the server-side
+    /// dedup and creates a second scan.
+    #[test]
+    fn scanner_id_does_not_participate_in_the_key() {
+        let mut v1 = base_request();
+        v1.metadata.scanner_id = "rely-cli-0.8.13".into();
+        let mut v2 = base_request();
+        v2.metadata.scanner_id = "rvl/1.0.0".into();
+        assert_eq!(
+            derive_idempotency_key(&v1),
+            derive_idempotency_key(&v2),
+            "the same scan retried by the other binary must dedupe"
+        );
+        // ...while staying distinguishable on the wire.
+        assert!(request_body(&v1, true).contains(r#""scanner_id":"rely-cli-0.8.13""#));
+        assert!(request_body(&v2, true).contains(r#""scanner_id":"rvl/1.0.0""#));
+    }
+
+    /// po-av01j.186: git_commit/git_branch are provenance labels for where
+    /// HEAD happened to be, not scan content. v1 never populated them and v2
+    /// auto-detects them, so keeping them in the key both breaks cross-binary
+    /// dedup and voids "rerun after a timeout replays the cached response"
+    /// whenever an amend/rebase/branch-rename moves HEAD under an unchanged
+    /// tree.
+    #[test]
+    fn git_metadata_does_not_participate_in_the_key() {
+        let v1 = base_request(); // rvl-cli leaves these empty
+        let mut v2 = base_request();
+        v2.metadata.git_commit = "9f1c0e2a7b5d4c3e2f1a0b9c8d7e6f5a4b3c2d1e".into();
+        v2.metadata.git_branch = "feat/timeouts".into();
+        assert_eq!(derive_idempotency_key(&v1), derive_idempotency_key(&v2));
+        assert!(request_body(&v2, true).contains(r#""git_branch":"feat/timeouts""#));
+    }
+
+    /// Everything that genuinely describes the scan still moves the key.
+    #[test]
+    fn scan_identifying_metadata_still_moves_the_key() {
+        let base = base_request();
+        let mut matcher = base_request();
+        matcher.metadata.matcher_version = "2026.08.1".into();
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&matcher)
+        );
+
+        let mut skill = base_request();
+        skill.metadata.skill_version = "0.3.0".into();
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&skill)
+        );
+
+        let mut excluded = base_request();
+        excluded.metadata.excluded_matchers = vec!["no-timeout".into()];
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&excluded)
+        );
+
+        let mut mode = base_request();
+        mode.scan_mode = "ci".into();
+        assert_ne!(derive_idempotency_key(&base), derive_idempotency_key(&mode));
+    }
+
+    /// The canonical bytes are the contract shared with the Go v1 client:
+    /// the submitter-identifying metadata is blanked, so `metadata` collapses
+    /// to `{}` for a request that carried nothing else.
+    #[test]
+    fn canonical_key_body_blanks_submitter_metadata() {
+        let mut req = base_request();
+        req.metadata.scanner_id = "rvl/1.0.0".into();
+        req.metadata.git_commit = "abc123".into();
+        req.metadata.git_branch = "main".into();
+        req.idempotency_key = "k".into();
+        assert_eq!(
+            idempotency_canonical_body(&req),
+            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{}}"#
+        );
     }
 
     // --- request emission ---

@@ -171,8 +171,17 @@ fn write_obj(out: &mut String, fields: &[(String, G)], depth: usize, indent: boo
 
 /// Arbitrary JSON, the way Go re-marshals `map[string]any`: object keys
 /// sorted (serde_json's default map is a BTreeMap, already sorted) and
-/// every number coerced through float64 — including the precision loss Go
-/// incurs, which is exactly the parity we want.
+/// every number coerced through float64 — including the widening Go incurs
+/// (`1e5` -> `100000`, `25.0` -> `25`), which is exactly the parity we want.
+///
+/// The coercion Go incurs is the *only* one allowed: `strconv.ParseFloat`
+/// is correctly rounded, so a literal that already round-trips comes back
+/// out unchanged. po-av01j.184: serde_json's default parser is a fast
+/// approximation that can land 1 ULP off, which silently rewrote
+/// `0.9500000000000003` to `...04` on 23 of 54 risks. The crate enables
+/// serde_json's `float_roundtrip` feature to put the parse on the
+/// correctly-rounded path — without it this emitter is fed a corrupted
+/// f64 and no amount of formatting care can recover the original.
 fn write_dyn(out: &mut String, v: &Value, depth: usize, indent: bool) {
     match v {
         Value::Null => out.push_str("null"),
@@ -417,6 +426,43 @@ mod tests {
         assert_eq!(fmt_go_f64(2.5e-7), "2.5e-7");
         assert_eq!(fmt_go_f64(1.5e-10), "1.5e-10");
         assert_eq!(fmt_go_f64(1e-6), "0.000001");
+    }
+
+    /// po-av01j.184: `--format=json` is the scripted/agent surface, so a
+    /// float has to survive the server body -> serde_json -> Go-parity
+    /// emitter round trip bit-for-bit.
+    ///
+    /// serde_json's default float parser is a fast approximation that lands
+    /// up to 1 ULP away from the correctly-rounded value, so
+    /// `0.9500000000000003` came back out as `0.9500000000000004` — a
+    /// *different* f64, corrupted at parse time, before any formatting ran.
+    /// Go's `map[string]any` decode uses `strconv.ParseFloat`, which is
+    /// correctly rounded. The `float_roundtrip` feature (Cargo.toml) puts
+    /// serde_json on the correctly-rounded path; this test fails without it.
+    #[test]
+    fn dyn_floats_round_trip_bit_for_bit() {
+        // The literals the pre-cutover parity diff caught drifting.
+        for lit in [
+            "0.9500000000000003",
+            "0.44160833770367436",
+            "0.30000000000000004",
+            "8.98846567431158e307",
+            "5e-324",
+            "0.1",
+            "123456789.12345679",
+        ] {
+            let v: Value = serde_json::from_str(lit).unwrap();
+            assert_eq!(
+                v.as_f64().unwrap().to_bits(),
+                lit.parse::<f64>().unwrap().to_bits(),
+                "serde_json must parse {lit} to the correctly-rounded f64"
+            );
+        }
+        // End to end through the emitter the composed --format=json bodies
+        // use (keys come back sorted, the way Go re-marshals a map).
+        let body = r#"{"confidence":0.9500000000000003,"score":0.30000000000000004,"similarity":0.44160833770367436}"#;
+        let v: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(compact(&G::Dyn(v)), body);
     }
 
     #[test]
