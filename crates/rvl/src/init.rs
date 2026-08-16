@@ -8,19 +8,24 @@
 //! install the plugin skills, check credentials, fire the onboarding
 //! milestone, and print the summary.
 //!
+//! Steps 4 and 5 write the REVELARA MANAGED BLOCK into `AGENTS.md` and
+//! `CLAUDE.md` (see [`crate::context_files`]). init OWNS those files during
+//! onboarding: it prompts about them itself, which is why the plugin step it
+//! delegates to must not write them a second time.
+//!
 //! Deliberate deviations from the Go source:
 //! * The plugin step DELEGATES to the rvl skills machinery (the same
 //!   engine as `plugin install`) via a caller-supplied closure instead of
 //!   porting rvl-cli's `internal/plugin` installer.
-//! * rvl-cli's AGENTS.md / CLAUDE.md managed-block steps are not ported:
-//!   that machinery lives in rvl-cli's plugin package, and the rvl
-//!   skills installer owns harness content here.
+//! * `--no-context-files` is accepted here as well as on `plugin
+//!   install`/`update`; rvl-cli carries it on the plugin commands only.
 //! * Interactive prompts are plain stdin lines (matching `login`), not huh
 //!   TUI forms. Only non-interactive paths (`-y`, flags) are tested.
 //! * `--force` overwrites an existing `.revelara.yaml` without prompting,
 //!   which is what rvl-cli's help text promises ("Overwrite existing config
 //!   and plugin without prompting") even though its code still prompted.
 
+use crate::context_files::Action;
 use rvl_data::BIN;
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -34,6 +39,8 @@ pub struct InitArgs {
     pub skip_plugin: bool,
     pub force: bool,
     pub yes: bool,
+    /// Skip steps 4 and 5 (the AGENTS.md/CLAUDE.md managed blocks).
+    pub no_context_files: bool,
 }
 
 /// One `components:` entry in `.revelara.yaml` (rvl-cli
@@ -133,7 +140,30 @@ pub fn run(args: InitArgs, install_plugin: impl FnOnce() -> anyhow::Result<bool>
         println!();
     }
 
-    // Step 4: check credentials; on success record the onboarding
+    // Step 4: the AGENTS.md managed block. Written for every repo, plugin
+    // or not: it is how a harness with no slash commands finds rvl at all.
+    let agents_md_action = if args.no_context_files {
+        None
+    } else {
+        ensure_agents_md_interactive(&git_root, args.force, args.yes)
+    };
+
+    // Step 5: the CLAUDE.md managed block, only once skills are installed
+    // (rvl-cli gates this on `pluginInstalled` — with no agent on the
+    // machine there is nothing to give the extra Claude-only routing to).
+    let claude_md_action = if args.no_context_files || !plugin_installed {
+        None
+    } else {
+        report_context_action(
+            "CLAUDE.md",
+            crate::context_files::ensure_claude_md(&git_root, args.yes || args.force),
+        )
+    };
+    if agents_md_action.is_some() || claude_md_action.is_some() {
+        println!();
+    }
+
+    // Step 6: check credentials; on success record the onboarding
     // milestone (fire-and-forget, mirroring rvl-cli's "cli_setup").
     let mut credentials_configured = false;
     if let Ok(Some(cfg)) = rvl_data::config::load() {
@@ -146,14 +176,78 @@ pub fn run(args: InitArgs, install_plugin: impl FnOnce() -> anyhow::Result<bool>
     }
     println!();
 
-    // Step 5: summary.
+    // Step 7: summary.
     print_summary(
         &project,
         &components,
         plugin_installed,
         credentials_configured,
+        agents_md_action,
+        claude_md_action,
     );
     ExitCode::SUCCESS
+}
+
+/// rvl-cli `commands.EnsureAgentsMd`: prompt before touching an EXISTING
+/// AGENTS.md (creating a fresh one was never prompted for), then delegate the
+/// write so init and `plugin install` share one implementation.
+fn ensure_agents_md_interactive(git_root: &Path, force: bool, yes: bool) -> Option<Action> {
+    use crate::context_files::State;
+    let mut proceed = force || yes;
+    if !proceed {
+        let title = match crate::context_files::agents_md_state(git_root) {
+            State::Missing => {
+                proceed = true;
+                None
+            }
+            State::Unmanaged => Some("AGENTS.md exists but has no Revelara section. Append?"),
+            State::Managed => Some("AGENTS.md already has Revelara section. Update?"),
+        };
+        if let Some(title) = title {
+            if !crate::confirm(title) {
+                println!("AGENTS.md: Skipped");
+                return None;
+            }
+            proceed = true;
+        }
+    }
+    if !proceed {
+        println!("AGENTS.md: Skipped");
+        return None;
+    }
+    report_context_action(
+        "AGENTS.md",
+        crate::context_files::ensure_agents_md(git_root, true),
+    )
+}
+
+/// Print rvl-cli's per-action line and return the action when it wrote
+/// something. A failure is a WARNING: init has already produced the config
+/// the user asked for, and a context file is not worth failing over.
+fn report_context_action(name: &str, res: anyhow::Result<Action>) -> Option<Action> {
+    match res {
+        Err(e) => {
+            eprintln!("Warning: could not set up {name}: {e}");
+            None
+        }
+        Ok(Action::Skipped) => {
+            println!("{name}: Skipped");
+            None
+        }
+        Ok(action) => {
+            let verb = match action {
+                Action::Created => "Created",
+                Action::Appended => "Appended Revelara managed block to",
+                Action::Updated => "Updated Revelara managed block in",
+                Action::Skipped => unreachable!(),
+            };
+            match action {
+                Action::Created => println!("Created {name} with Revelara managed block"),
+                _ => println!("{verb} {name}"),
+            }
+            Some(action)
+        }
+    }
 }
 
 /// Fire-and-forget onboarding milestone. Errors are silently discarded so
@@ -177,14 +271,15 @@ fn post_onboarding_milestone(cfg: &rvl_data::config::DataConfig) {
     );
 }
 
-/// Port of rvl-cli's `printInitSummary`, minus the AGENTS.md/CLAUDE.md rows
-/// (those steps are not ported) and the skills version (the install
-/// machinery prints per-harness versions as it runs).
+/// Port of rvl-cli's `printInitSummary`, minus the skills version (the
+/// install machinery prints per-harness versions as it runs).
 fn print_summary(
     project: &str,
     components: &[Component],
     plugin_installed: bool,
     credentials_configured: bool,
+    agents_md_action: Option<Action>,
+    claude_md_action: Option<Action>,
 ) {
     println!("=== Revelara Initialization Complete ===");
     println!();
@@ -199,6 +294,12 @@ fn print_summary(
     } else {
         println!("Skills: Not installed");
     }
+    if let Some(a) = agents_md_action {
+        println!("AGENTS.md: {}", a.as_str());
+    }
+    if let Some(a) = claude_md_action {
+        println!("CLAUDE.md: {}", a.as_str());
+    }
     if credentials_configured {
         println!("Credentials: Configured");
     } else {
@@ -212,7 +313,13 @@ fn print_summary(
     } else if !plugin_installed {
         println!("  1. {BIN} plugin install claude");
     }
-    println!("  - Commit .revelara.yaml to your repository");
+    match (agents_md_action.is_some(), claude_md_action.is_some()) {
+        (true, true) => {
+            println!("  - Commit .revelara.yaml, AGENTS.md, and CLAUDE.md to your repository")
+        }
+        (true, false) => println!("  - Commit .revelara.yaml and AGENTS.md to your repository"),
+        _ => println!("  - Commit .revelara.yaml to your repository"),
+    }
     println!(
         "  - Open Claude Code in this directory and run /rvl:scan to scan for reliability risks"
     );

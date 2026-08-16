@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 mod agent;
 mod changed;
 mod config_lane;
+mod context_files;
 mod devscope;
 mod doctor;
 mod embedded_helpers;
@@ -168,6 +169,18 @@ enum Cmd {
         /// critical/high findings were reported.
         #[arg(long)]
         format: Option<String>,
+        /// rvl-cli COMPATIBILITY ALIAS for `--format json`: rvl-cli's `--ci`
+        /// sets `scan_mode: "ci"`, which is exactly what `--format json`
+        /// already selects here. An explicit `--format` wins.
+        #[arg(long)]
+        ci: bool,
+        /// rvl-cli COMPATIBILITY NO-OP. rvl-cli's `--auto-infer` skips its
+        /// interactive review prompt, selecting `scan_mode: "auto"`.
+        /// Submission here is always non-interactive, so "auto" is already
+        /// the default and this flag has nothing left to turn off. Accepted
+        /// so rvl-cli invocations keep running.
+        #[arg(long)]
+        auto_infer: bool,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method`, the language it
@@ -287,6 +300,12 @@ enum Cmd {
         /// Accept all auto-detected defaults non-interactively
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks. rvl-cli
+        /// carries this flag on `plugin install`/`update` only; it is
+        /// accepted here too so one flag turns the context files off
+        /// wherever they would be written.
+        #[arg(long)]
+        no_context_files: bool,
     },
     /// Diagnose (and with `--fix`, repair) this machine's ability to scan
     /// THIS repository: the retriever for every language actually present,
@@ -381,6 +400,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::stpa::StpaCmd,
     },
+    /// Print the version. rvl-cli spells this as a SUBCOMMAND (`rvl version`)
+    /// and has no `--version` flag; this binary accepts both, so a script
+    /// written against either spelling keeps working (po-av01j.185 item 3).
+    Version,
     /// Generate shell completion scripts (bash, zsh, fish).
     /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
     /// Fish: rvl completion fish > ~/.config/fish/completions/rvl.fish
@@ -471,6 +494,15 @@ enum PluginCmd {
         /// whose install is user-level (Claude Code) refuse it.
         #[arg(long)]
         project: bool,
+        /// rvl-cli COMPATIBILITY ALIAS: this binary spells "every harness"
+        /// as OMITTING the harness name, so `--all` is exactly the default
+        /// and is accepted rather than rejected (po-av01j.188).
+        #[arg(long)]
+        all: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
+        /// current git repository.
+        #[arg(long)]
+        no_context_files: bool,
     },
     /// Update installed plugin content to the served version (install and
     /// update are the same operation, mirroring `rvl plugin update`).
@@ -480,6 +512,14 @@ enum PluginCmd {
         /// Stage files but do not run registration commands (Claude Code).
         #[arg(long)]
         no_register: bool,
+        /// rvl-cli COMPATIBILITY ALIAS for the default "every installed
+        /// harness" sweep (po-av01j.188).
+        #[arg(long)]
+        all: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
+        /// current git repository.
+        #[arg(long)]
+        no_context_files: bool,
     },
     /// List installed plugin content with versions and update availability.
     List,
@@ -4076,7 +4116,7 @@ fn run_skills_install(
     harness: Option<String>,
     no_register: bool,
     update: bool,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(Vec<String>, usize)> {
     let supported = || rvl_skills::harness::supported_names().join(", ");
     let targets: Vec<String> = match harness {
         Some(name) => {
@@ -4125,13 +4165,13 @@ fn run_skills_install(
                     supported()
                 );
                 println!("Install one, or name it explicitly: {BIN} skills install <harness>");
-                return Ok((0, 0));
+                return Ok((Vec::new(), 0));
             }
             names
         }
     };
 
-    let mut installed = 0usize;
+    let mut installed: Vec<String> = Vec::new();
     let mut failed = 0usize;
     for name in &targets {
         // by_name is total over `targets` by construction; skip defensively.
@@ -4141,7 +4181,7 @@ fn run_skills_install(
         match rvl_skills::flow::install_one(env, h.as_ref()) {
             Ok(report) => {
                 render_install_report(env.home, &report, no_register);
-                installed += 1;
+                installed.push(name.clone());
             }
             Err(e) => {
                 eprintln!("{name}: {e}");
@@ -4310,22 +4350,31 @@ fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
             harness,
             no_register,
             project,
+            all,
+            no_context_files,
         } => {
+            let harness = resolve_all_alias(harness, all)?;
             ctx.require_key()?;
             if project {
                 let root = detect_project_root()?;
-                let failed = run_plugin_install_project(&env, harness, &root)?;
-                return Ok(skills_exit(failed));
+                let installed = run_plugin_install_project(&env, harness, &root)?;
+                write_context_files(&root, &installed.0, no_context_files);
+                return Ok(skills_exit(installed.1));
             }
-            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            let (installed, failed) = run_skills_install(&env, harness, no_register, false)?;
+            write_context_files(Path::new("."), &installed, no_context_files);
             Ok(skills_exit(failed))
         }
         PluginCmd::Update {
             harness,
             no_register,
+            all,
+            no_context_files,
         } => {
+            let harness = resolve_all_alias(harness, all)?;
             ctx.require_key()?;
-            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            let (installed, failed) = run_skills_install(&env, harness, no_register, true)?;
+            write_context_files(Path::new("."), &installed, no_context_files);
             Ok(skills_exit(failed))
         }
         PluginCmd::List => {
@@ -4373,12 +4422,12 @@ fn detect_project_root() -> anyhow::Result<PathBuf> {
 /// `plugin install --project`: write the skills into THIS repository so they
 /// can be committed. With no harness named, every detected harness that has
 /// a project-local layout gets one (the rest are reported as skipped, never
-/// silently dropped). Returns the failure count.
+/// silently dropped). Returns the installed harness names and failure count.
 fn run_plugin_install_project(
     env: &rvl_skills::flow::Env,
     harness: Option<String>,
     project_root: &Path,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(Vec<String>, usize)> {
     let targets: Vec<String> = match harness {
         Some(name) => {
             anyhow::ensure!(
@@ -4395,12 +4444,13 @@ fn run_plugin_install_project(
                     "No supported coding-agent harness detected (supported: {}).",
                     rvl_skills::harness::supported_names().join(", ")
                 );
-                return Ok(0);
+                return Ok((Vec::new(), 0));
             }
             detected
         }
     };
 
+    let mut installed: Vec<String> = Vec::new();
     let mut failed = 0usize;
     for name in &targets {
         let Some(h) = rvl_skills::harness::by_name(name) else {
@@ -4419,14 +4469,62 @@ fn run_plugin_install_project(
             continue;
         }
         match rvl_skills::flow::install_one_project(env, h.as_ref(), project_root) {
-            Ok(report) => render_install_report(env.home, &report, true),
+            Ok(report) => {
+                render_install_report(env.home, &report, true);
+                installed.push(name.clone());
+            }
             Err(e) => {
                 eprintln!("{name}: {e}");
                 failed += 1;
             }
         }
     }
-    Ok(failed)
+    Ok((installed, failed))
+}
+
+/// Resolve rvl-cli's `--all` spelling (po-av01j.188). This binary already
+/// means "every harness" by OMITTING the name, so `--all` is that default
+/// under rvl-cli's name. Combining it with a harness name is contradictory
+/// and is refused rather than silently resolved one way.
+fn resolve_all_alias(harness: Option<String>, all: bool) -> anyhow::Result<Option<String>> {
+    if all {
+        if let Some(name) = harness {
+            anyhow::bail!(
+                "--all installs into every harness, so it cannot be combined with \
+                 '{name}'. Drop one: '{BIN} plugin install' (all) or \
+                 '{BIN} plugin install {name}' (just that one)."
+            );
+        }
+        return Ok(None);
+    }
+    Ok(harness)
+}
+
+/// The post-install context-file step, mirroring rvl-cli's split: AGENTS.md
+/// is written for EVERY harness (rvl-cli `installContextFiles`, called
+/// centrally by `InstallPluginWithOptions`), and CLAUDE.md additionally when
+/// the Claude harness was one of them (rvl-cli's Claude custom installer).
+///
+/// `git_root` detection and the "not a git repo" notice live in
+/// [`context_files::install_context_files`]; CLAUDE.md piggybacks on the same
+/// detection so the two files can never disagree about which repo they're in.
+fn write_context_files(start_dir: &Path, installed: &[String], skip: bool) {
+    if skip {
+        println!("Skipping AGENTS.md/CLAUDE.md context files (--no-context-files)");
+        return;
+    }
+    context_files::install_context_files(start_dir, false, &mut std::io::stdout());
+    if !installed.iter().any(|h| h == "claude") {
+        return;
+    }
+    let Ok(git_root) = hook::git_toplevel(start_dir) else {
+        return;
+    };
+    match context_files::ensure_claude_md(&git_root, true) {
+        Err(e) => eprintln!("Warning: could not set up CLAUDE.md: {e}"),
+        Ok(context_files::Action::Skipped) => {}
+        Ok(action) => println!("✓ CLAUDE.md: {}", action.as_str()),
+    }
 }
 
 /// The "Project-local installations" section of `plugin list`: the skills a
@@ -4696,6 +4794,7 @@ fn stray_submission_flags(
     cleanup_on_success: bool,
     timeout: Option<&str>,
     format: Option<&str>,
+    ci: bool,
 ) -> Vec<&'static str> {
     let mut out = Vec::new();
     if team.is_some() {
@@ -4712,6 +4811,13 @@ fn stray_submission_flags(
     }
     if format.is_some() {
         out.push("--format");
+    }
+    // `--ci` is `--format json` under another name, so it is stray for the
+    // same reason `--format` is, and is named by the flag the user typed.
+    // `--auto-infer` is NOT here: it selects the mode submission already
+    // uses, so nothing is dropped by ignoring it anywhere.
+    if ci {
+        out.push("--ci");
     }
     out
 }
@@ -4737,7 +4843,9 @@ fn stray_submission_flag_error(flags: &[&str]) -> String {
             .iter()
             .map(|f| format!(
                 " {f}{}",
-                if *f == "--cleanup-on-success" {
+                // Boolean flags take no value; showing "<value>" after one
+                // hands the reader a command that fails differently.
+                if matches!(*f, "--cleanup-on-success" | "--ci") {
                     ""
                 } else {
                     " <value>"
@@ -4747,8 +4855,53 @@ fn stray_submission_flag_error(flags: &[&str]) -> String {
     )
 }
 
+/// Drop long flags written with an EXPLICIT EMPTY VALUE (`--control=`) before
+/// clap ever sees them, so they mean ABSENT — which is what rvl-cli means by
+/// them and what every script written against rvl-cli assumes (po-av01j.185
+/// item 7).
+///
+/// rvl-cli parses flags by hand: `--control=` yields the empty string, and
+/// every consumer then guards with `if control != ""`, so the flag is simply
+/// not there. clap instead yields `Some("")` — a PRESENT flag whose value is
+/// empty — which turns `evidence list --control=` from "list everything" into
+/// a request for the control named "", i.e. a 404. The same shape hits
+/// `knowledge procedures --control=` and `knowledge enrich
+/// --technology=`/`--query=`.
+///
+/// Fixed here, once, at the argument vector rather than per subcommand:
+/// a per-flag fix would have to be re-applied to every flag added later, and
+/// the flags that got missed are exactly how this was found.
+///
+/// Deliberately narrow:
+/// * only `--name=` with nothing after the `=` (a `-c=` short form is left
+///   alone: rvl-cli's short flags take a separate argument, never `=`)
+/// * nothing after a `--` separator, where arguments are data, not flags
+/// * `--=` and a bare `--` are not touched
+fn drop_empty_valued_flags(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut past_separator = false;
+    for a in args {
+        if past_separator {
+            out.push(a);
+            continue;
+        }
+        if a == "--" {
+            past_separator = true;
+            out.push(a);
+            continue;
+        }
+        let is_empty_valued =
+            a.starts_with("--") && a.ends_with('=') && a.len() > 3 && a.matches('=').count() == 1;
+        if is_empty_valued {
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
 fn run() -> anyhow::Result<ExitCode> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(drop_empty_valued_flags(std::env::args()));
     let Some(cmd) = cli.cmd else {
         // Bootstrap behavior preserved: bare invocation prints help, exits 0.
         use clap::CommandFactory;
@@ -4787,6 +4940,7 @@ fn run() -> anyhow::Result<ExitCode> {
             dry_run,
             timeout,
             format,
+            ci,
             ..
         } if selects_submission(
             stdin,
@@ -4796,6 +4950,12 @@ fn run() -> anyhow::Result<ExitCode> {
             dry_run,
         ) =>
         {
+            // rvl-cli `--ci` == this binary's `--format json` (both land on
+            // `scan_mode: "ci"`). An explicit `--format` is never overridden.
+            let format = match (format, ci) {
+                (None, true) => Some("json".to_string()),
+                (f, _) => f,
+            };
             return Ok(rvl_data::scan_submit::run(
                 rvl_data::scan_submit::SubmitArgs {
                     service,
@@ -4828,6 +4988,7 @@ fn run() -> anyhow::Result<ExitCode> {
             cleanup_on_success,
             ref timeout,
             ref format,
+            ci,
             ..
         } if !stray_submission_flags(
             team.as_deref(),
@@ -4835,6 +4996,7 @@ fn run() -> anyhow::Result<ExitCode> {
             cleanup_on_success,
             timeout.as_deref(),
             format.as_deref(),
+            ci,
         )
         .is_empty() =>
         {
@@ -4844,6 +5006,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 cleanup_on_success,
                 timeout.as_deref(),
                 format.as_deref(),
+                ci,
             );
             let f = rvl_data::Failure::usage(stray_submission_flag_error(&stray));
             eprintln!("error: {}", f.msg);
@@ -4857,6 +5020,7 @@ fn run() -> anyhow::Result<ExitCode> {
             skip_plugin,
             force,
             yes,
+            no_context_files,
         } => {
             let cfg = Config::from_env();
             return Ok(init::run(
@@ -4865,6 +5029,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     skip_plugin,
                     force,
                     yes,
+                    no_context_files,
                 },
                 || {
                     let ctx = SkillsCtx::resolve(&cfg)?;
@@ -4873,11 +5038,17 @@ fn run() -> anyhow::Result<ExitCode> {
                     // rvl-cli marks the plugin installed when ANY editor
                     // ended up with skills; per-harness failures were
                     // already reported by the machinery.
-                    Ok(installed > 0)
+                    Ok(!installed.is_empty())
                 },
             ));
         }
         Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
+        // Same bytes clap's `--version` prints, so the two spellings can
+        // never drift apart.
+        Cmd::Version => {
+            println!("{BIN} {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
         // Environment diagnosis (po-av01j.169). Dispatches before the store
         // opens because a MISSING spec cache is one of the things it reports:
         // opening the store here would turn that report into exit 1 from the
@@ -5155,6 +5326,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // returned before the store opened, above.
         Cmd::Init { .. }
         | Cmd::Hook { .. }
+        | Cmd::Version
         | Cmd::Doctor { .. }
         | Cmd::Login
         | Cmd::Logout
@@ -7186,23 +7358,23 @@ mod tests {
     fn submission_only_flags_are_stray_on_a_deterministic_scan() {
         // po-av01j.168: every one of these was accepted and silently dropped.
         assert_eq!(
-            stray_submission_flags(Some("backend-team"), None, false, None, None),
+            stray_submission_flags(Some("backend-team"), None, false, None, None, false),
             vec!["--team"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, false, None, Some("json")),
+            stray_submission_flags(None, None, false, None, Some("json"), false),
             vec!["--format"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, false, Some("90s"), None),
+            stray_submission_flags(None, None, false, Some("90s"), None, false),
             vec!["--timeout"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, true, None, None),
+            stray_submission_flags(None, None, true, None, None, false),
             vec!["--cleanup-on-success"]
         );
         assert_eq!(
-            stray_submission_flags(None, Some(Path::new("/tmp/p")), false, None, None),
+            stray_submission_flags(None, Some(Path::new("/tmp/p")), false, None, None, false),
             vec!["--target"]
         );
         // Every flag at once still names every flag: a reader who typed two
@@ -7213,16 +7385,199 @@ mod tests {
                 Some(Path::new("/tmp/p")),
                 true,
                 Some("90s"),
-                Some("json")
+                Some("json"),
+                true
             ),
             vec![
                 "--team",
                 "--target",
                 "--cleanup-on-success",
                 "--timeout",
-                "--format"
+                "--format",
+                "--ci"
             ]
         );
+        // `--ci` is stray for the same reason `--format` is: it IS
+        // `--format json`, so a deterministic scan would drop a requested
+        // output contract on the floor (po-av01j.185 item 2).
+        assert_eq!(
+            stray_submission_flags(None, None, false, None, None, true),
+            vec!["--ci"]
+        );
+        // `--auto-infer` is NOT stray: it selects the mode submission
+        // already uses, so it drops nothing anywhere.
+        assert!(
+            Cli::try_parse_from(["rvl", "scan", ".", "--auto-infer"]).is_ok(),
+            "--auto-infer must parse on a deterministic scan"
+        );
+    }
+
+    // --- rvl-cli surface parity (po-av01j.185 / .188) ---
+
+    /// `--flag=` (explicit empty value) means ABSENT, as in rvl-cli. clap
+    /// would otherwise hand the subcommand `Some("")`, a present-but-empty
+    /// flag, which is how `evidence list --control=` became a 404 instead of
+    /// "list everything".
+    #[test]
+    fn an_explicitly_empty_long_flag_is_dropped_before_clap_sees_it() {
+        let got =
+            drop_empty_valued_flags(["rvl", "evidence", "list", "--control="].map(String::from));
+        assert_eq!(got, vec!["rvl", "evidence", "list"]);
+
+        // Only the empty ones go.
+        assert_eq!(
+            drop_empty_valued_flags(
+                ["rvl", "knowledge", "enrich", "--technology=", "--query=go"].map(String::from)
+            ),
+            vec!["rvl", "knowledge", "enrich", "--query=go"]
+        );
+
+        // A separate-argument empty value is NOT this shape and is left
+        // alone: `--control ""` is an explicit empty argument in both CLIs.
+        assert_eq!(
+            drop_empty_valued_flags(["rvl", "risk", "show", "--service", ""].map(String::from)),
+            vec!["rvl", "risk", "show", "--service", ""]
+        );
+
+        // Values containing '=' are untouched, and so is anything after `--`.
+        assert_eq!(
+            drop_empty_valued_flags(["rvl", "--flag=a=", "--", "--x="].map(String::from)),
+            vec!["rvl", "--flag=a=", "--", "--x="]
+        );
+
+        // Degenerate tokens are not flags.
+        assert_eq!(
+            drop_empty_valued_flags(["rvl", "--", "-", "--="].map(String::from)),
+            vec!["rvl", "--", "-", "--="]
+        );
+    }
+
+    /// The real rvl-cli invocations from the parity diff now parse to the
+    /// same shape they have with the flag omitted entirely.
+    #[test]
+    fn empty_valued_flags_parse_as_absent_on_the_commands_that_regressed() {
+        for (with_empty, without) in [
+            (
+                vec!["rvl", "evidence", "list", "--control="],
+                vec!["rvl", "evidence", "list"],
+            ),
+            (
+                vec!["rvl", "knowledge", "procedures", "--control="],
+                vec!["rvl", "knowledge", "procedures"],
+            ),
+            (
+                vec!["rvl", "knowledge", "enrich", "--technology=", "--query="],
+                vec!["rvl", "knowledge", "enrich"],
+            ),
+            // risk/control were verified clean by the parity diff; they must
+            // STAY clean, so they are asserted here rather than assumed.
+            (
+                vec!["rvl", "risk", "list", "--service="],
+                vec!["rvl", "risk", "list"],
+            ),
+            (
+                vec!["rvl", "control", "list", "--category="],
+                vec!["rvl", "control", "list"],
+            ),
+        ] {
+            let a = drop_empty_valued_flags(with_empty.iter().map(|s| s.to_string()));
+            assert_eq!(
+                a,
+                without.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{with_empty:?}"
+            );
+            Cli::try_parse_from(&a).unwrap_or_else(|e| panic!("{with_empty:?}: {e}"));
+        }
+    }
+
+    /// rvl-cli spells this as a subcommand and has no `--version` flag; this
+    /// binary answers to both (po-av01j.185 item 3).
+    #[test]
+    fn version_is_accepted_as_a_subcommand_and_as_a_flag() {
+        assert!(matches!(
+            Cli::try_parse_from(["rvl", "version"]).unwrap().cmd,
+            Some(Cmd::Version)
+        ));
+        // clap intercepts `--version` before producing a Cmd.
+        let Err(err) = Cli::try_parse_from(["rvl", "--version"]) else {
+            panic!("--version must be intercepted by clap");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    /// `--ci` and `--auto-infer` are rvl-cli's documented public surface and
+    /// must parse rather than exit 2 (po-av01j.185 item 2).
+    #[test]
+    fn ci_and_auto_infer_parse_and_ci_selects_the_json_contract() {
+        match Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--service",
+            "api",
+            "--stdin",
+            "--ci",
+            "--auto-infer",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Some(Cmd::Scan {
+                ci,
+                auto_infer,
+                format,
+                ..
+            }) => {
+                assert!(ci);
+                assert!(auto_infer);
+                // --ci is the alias; the resolution to json happens at
+                // dispatch so an explicit --format can still win.
+                assert_eq!(format, None);
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    /// rvl-cli's `--all` is this binary's "omit the harness name"
+    /// (po-av01j.188).
+    #[test]
+    fn plugin_all_is_an_alias_for_the_whole_sweep() {
+        assert_eq!(resolve_all_alias(None, true).unwrap(), None);
+        assert_eq!(
+            resolve_all_alias(Some("claude".into()), false).unwrap(),
+            Some("claude".into())
+        );
+        // Naming a harness AND --all is contradictory; refuse rather than
+        // silently picking one.
+        let err = resolve_all_alias(Some("claude".into()), true).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        for argv in [
+            vec!["rvl", "plugin", "install", "--all"],
+            vec!["rvl", "plugin", "update", "--all"],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// `--no-context-files` is accepted wherever the managed blocks would be
+    /// written (po-av01j.163).
+    #[test]
+    fn no_context_files_is_accepted_on_init_and_the_plugin_commands() {
+        for argv in [
+            vec!["rvl", "init", "--no-context-files"],
+            vec!["rvl", "plugin", "install", "claude", "--no-context-files"],
+            vec!["rvl", "plugin", "update", "--no-context-files"],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// rvl-cli's `knowledge health` takes no arguments and ignores whatever
+    /// it is given, exiting 0 (po-av01j.185 item 8).
+    #[test]
+    fn knowledge_health_accepts_and_ignores_format() {
+        Cli::try_parse_from(["rvl", "knowledge", "health", "--format=json"]).unwrap();
+        Cli::try_parse_from(["rvl", "knowledge", "health"]).unwrap();
     }
 
     #[test]
@@ -7230,7 +7585,7 @@ mod tests {
         // The defaults must never trip the check — that is the property that
         // makes this a hard error rather than a warning. Clap gives these
         // flags no default value, so absent is `None`/`false`.
-        assert!(stray_submission_flags(None, None, false, None, None).is_empty());
+        assert!(stray_submission_flags(None, None, false, None, None, false).is_empty());
         let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan {
@@ -7239,6 +7594,7 @@ mod tests {
                 cleanup_on_success,
                 timeout,
                 format,
+                ci,
                 ..
             }) => assert!(stray_submission_flags(
                 team.as_deref(),
@@ -7246,6 +7602,7 @@ mod tests {
                 cleanup_on_success,
                 timeout.as_deref(),
                 format.as_deref(),
+                ci,
             )
             .is_empty()),
             _ => panic!("expected scan"),
