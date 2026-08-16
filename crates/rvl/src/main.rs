@@ -4160,6 +4160,16 @@ fn skills_exit(failed: usize) -> ExitCode {
     }
 }
 
+/// Name the harnesses that left evidence on the machine and were still
+/// passed over. A detection sweep that says nothing turns a wrong verdict
+/// into an invisible one — the failure mode of po-av01j.193, where a
+/// PATH-only harness produced "installed nothing" with no error.
+fn print_near_misses(env: &rvl_skills::harness::DetectEnv) {
+    for line in rvl_skills::harness::near_misses(env) {
+        println!("  skipped {line}");
+    }
+}
+
 /// Returns `(installed, failed)` counts so callers (the `skills`/`plugin`
 /// arms, and `init`'s delegated plugin step) can distinguish "everything
 /// installed", "some harness failed", and "nothing to do".
@@ -4209,15 +4219,27 @@ fn run_skills_install(
                 }
             }
             if names.is_empty() {
-                names = rvl_skills::harness::detect_installed(env.home);
-            }
-            if names.is_empty() {
+                // Detection only runs when there is nothing recorded to
+                // update; report it so a wrong detection is distinguishable
+                // from a right one (po-av01j.193).
+                let detect_env = rvl_skills::harness::DetectEnv::new(env.home);
+                names = rvl_skills::harness::detect_installed(&detect_env);
+                if names.is_empty() {
+                    println!(
+                        "No supported coding-agent harness detected (supported: {}).",
+                        supported()
+                    );
+                    print_near_misses(&detect_env);
+                    println!("Install one, or name it explicitly: {BIN} skills install <harness>");
+                    return Ok((Vec::new(), 0));
+                }
                 println!(
-                    "No supported coding-agent harness detected (supported: {}).",
-                    supported()
+                    "Detected {} coding-agent harness(es): {}",
+                    names.len(),
+                    names.join(", ")
                 );
-                println!("Install one, or name it explicitly: {BIN} skills install <harness>");
-                return Ok((Vec::new(), 0));
+                print_near_misses(&detect_env);
+                println!();
             }
             names
         }
@@ -4549,14 +4571,23 @@ fn run_plugin_install_project(
             vec![name]
         }
         None => {
-            let detected = rvl_skills::harness::detect_installed(env.home);
+            let detect_env = rvl_skills::harness::DetectEnv::new(env.home);
+            let detected = rvl_skills::harness::detect_installed(&detect_env);
             if detected.is_empty() {
                 println!(
                     "No supported coding-agent harness detected (supported: {}).",
                     rvl_skills::harness::supported_names().join(", ")
                 );
+                print_near_misses(&detect_env);
                 return Ok((Vec::new(), 0));
             }
+            println!(
+                "Detected {} coding-agent harness(es): {}",
+                detected.len(),
+                detected.join(", ")
+            );
+            print_near_misses(&detect_env);
+            println!();
             detected
         }
     };

@@ -9,6 +9,34 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rvl"))
 }
 
+/// A PATH holding `git` and NOTHING else, shared by every test in this file.
+///
+/// Harness detection reads PATH as well as HOME (po-av01j.193), so leaving
+/// the developer's PATH in place makes these tests detect whichever coding
+/// agents that particular machine has installed — the suite would pass or
+/// fail by accident of the laptop. It cannot simply be empty either: `init`
+/// shells out to `git` to find the repository root.
+fn git_only_path() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir for the sanitized PATH");
+        let git = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.join("git"))
+            .find(|c| c.is_file())
+            .expect("git must be on PATH to run these tests");
+        let link = dir.path().join("git");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&git, &link).expect("link git into the sanitized PATH");
+        #[cfg(not(unix))]
+        std::fs::copy(&git, &link).expect("copy git into the sanitized PATH");
+        dir
+    })
+    .path()
+}
+
 fn git_init(dir: &Path) {
     let out = Command::new("git")
         .args(["init", "-q"])
@@ -26,6 +54,7 @@ fn init_cmd(dir: &Path) -> Command {
     let mut c = bin();
     c.current_dir(dir)
         .env("HOME", dir)
+        .env("PATH", git_only_path())
         .env("RVL_OFFLINE", "1")
         .env_remove("RVL_API_KEY")
         .env_remove("RVL_API_URL")
@@ -380,6 +409,7 @@ fn offline_install_cmd(dir: &Path, home: &Path, cache: &Path) -> Command {
     let mut c = bin();
     c.current_dir(dir)
         .env("HOME", home)
+        .env("PATH", git_only_path())
         .env("RVL_SKILLS_CACHE_DIR", cache)
         .env("RVL_ALLOW_UNSIGNED_PLUGIN", "1")
         .env("RVL_OFFLINE", "1")

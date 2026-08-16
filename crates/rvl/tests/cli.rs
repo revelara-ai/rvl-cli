@@ -4157,6 +4157,136 @@ fn plugin_remove_yes_is_idempotent_for_claude() {
     );
 }
 
+/// Run `plugin install --all` with an isolated HOME and a SYNTHESIZED PATH,
+/// returning stdout. Offline, so nothing is downloaded: the assertion is on
+/// which harnesses the sweep SELECTED, which is printed before any fetch.
+fn detect_sweep(home: &std::path::Path, path: &std::path::Path, cache: &std::path::Path) -> String {
+    let out = bin()
+        .args(["plugin", "install", "--all"])
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("RVL_SKILLS_CACHE_DIR", cache)
+        .env("RVL_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvl");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn put_executable(dir: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// END TO END, BOTH HALVES OF THE INVERSION (po-av01j.193). rvl-cli detects
+/// a harness by binary on PATH **OR** config directory. Probing only the
+/// config directory made the two tools disagree on the same machine, in both
+/// directions — `codex` on PATH installed NOTHING, with no error. Driven
+/// through the real binary because `plugin install`, `plugin install --all`
+/// and `init` all share this one sweep.
+#[test]
+fn plugin_install_sweep_detects_by_path_and_by_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("skills-cache");
+
+    // Half one: the binary is on PATH and the config dir does not exist.
+    let home = dir.path().join("home-path-only");
+    let path_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    put_executable(&path_dir, "codex");
+    let stdout = detect_sweep(&home, &path_dir, &cache);
+    assert!(
+        stdout.contains("Detected 1 coding-agent harness(es): codex"),
+        "a PATH-only harness must be installed into: {stdout}"
+    );
+    assert!(!home.join(".codex").exists(), "no config dir was involved");
+
+    // Half two: the config dir exists and no binary is anywhere on PATH.
+    let home = dir.path().join("home-config-only");
+    std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let stdout = detect_sweep(&home, &empty, &cache);
+    assert!(
+        stdout.contains("Detected 1 coding-agent harness(es): cursor"),
+        "a config-dir-only harness must be installed into: {stdout}"
+    );
+
+    // Neither signal: nothing installed, nothing skipped, and no error.
+    let home = dir.path().join("home-empty");
+    std::fs::create_dir_all(&home).unwrap();
+    let stdout = detect_sweep(&home, &empty, &cache);
+    assert!(
+        stdout.contains("No supported coding-agent harness detected"),
+        "got: {stdout}"
+    );
+    assert!(!stdout.contains("skipped"), "nothing to explain: {stdout}");
+
+    // Evidence that was passed over is NAMED: a user who expects Codex and
+    // gets nothing had no signal at all before (po-av01j.193).
+    let home = dir.path().join("home-codex-dir");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    let stdout = detect_sweep(&home, &empty, &cache);
+    assert!(
+        stdout.contains("No supported coding-agent harness detected"),
+        "rvl-cli gives Codex no config dir, so ~/.codex alone is not it: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped OpenAI Codex (codex): ~/.codex exists"),
+        "the near miss must be reported: {stdout}"
+    );
+}
+
+/// `--all` is an alias for the bare sweep (po-av01j.188). That equivalence
+/// is only meaningful once both spellings compute the SAME set the way
+/// rvl-cli does, so it is pinned against a machine where detection comes
+/// from PATH, from a config dir, and from a binary whose name is not the
+/// registry key.
+#[test]
+fn plugin_install_all_matches_the_bare_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("skills-cache");
+    let home = dir.path().join("home");
+    let path_dir = dir.path().join("bin");
+    std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    put_executable(&path_dir, "codex");
+    put_executable(&path_dir, "auggie"); // Augment Code's shipped command
+
+    let with_all = detect_sweep(&home, &path_dir, &cache);
+    let bare = String::from_utf8(
+        bin()
+            .args(["plugin", "install"])
+            .env("HOME", &home)
+            .env("PATH", &path_dir)
+            .env("RVL_SKILLS_CACHE_DIR", &cache)
+            .env("RVL_OFFLINE", "1")
+            .output()
+            .expect("failed to run rvl")
+            .stdout,
+    )
+    .unwrap();
+
+    let line = |s: &str| {
+        s.lines()
+            .find(|l| l.starts_with("Detected "))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(line(&with_all), line(&bare), "--all must be the bare sweep");
+    assert!(
+        line(&bare).contains("codex")
+            && line(&bare).contains("cursor")
+            && line(&bare).contains("augment"),
+        "got: {}",
+        line(&bare)
+    );
+}
+
 /// Day-one continuity after the rename: with NO rvl-store record but a
 /// v1 rvl-cli install recorded in ~/.revelara/plugins.json, `plugin agents
 /// --json` must list the installed agents via the v1 fallback, with the
