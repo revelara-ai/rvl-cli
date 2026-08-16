@@ -176,6 +176,220 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
     );
 }
 
+// --- the audited emergency gate bypass (po-av01j.182) ---
+
+/// A git repo to arm and force through, plus the path of its audit log.
+fn init_force_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["init", "-q"])
+        .status()
+        .expect("git init")
+        .success();
+    assert!(ok, "git init failed");
+    let audit = dir.path().join(".git").join("rvl-audit.jsonl");
+    (dir, audit)
+}
+
+/// The one force-through audit record, parsed. Fails loudly if the trail is
+/// missing — "the bypass ran but left no record" is the failure mode the whole
+/// mechanism exists to prevent.
+fn sole_audit_event(audit: &std::path::Path) -> serde_json::Value {
+    let log = std::fs::read_to_string(audit)
+        .unwrap_or_else(|e| panic!("no audit record at {}: {e}", audit.display()));
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "exactly one audit event: {log}");
+    let ev: serde_json::Value = serde_json::from_str(lines[0]).expect("audit line is JSON");
+    assert_eq!(ev["kind"], "force-through", "{log}");
+    ev
+}
+
+/// `rvl scan force-next` is a SUBCOMMAND, not a path. Before this it parsed as
+/// a directory named `force-next`, printed "commit clean", and exited 0 having
+/// bypassed nothing — the documented safety valve reporting success.
+///
+/// Armed, then consumed by the next scan: the scan is SKIPPED (proved by an
+/// empty cache dir, which otherwise fails the scan closed), the override is
+/// announced, the audit record names `marker`, and the marker is gone so it
+/// cannot apply to a later run.
+#[test]
+fn force_next_arms_a_one_shot_marker_consumed_by_the_next_scan() {
+    let (dir, audit) = init_force_repo();
+    let marker = dir.path().join(".git").join("rvl-force-next");
+
+    let arm = bin()
+        .args(["scan", "force-next", "--target"])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run rvl");
+    let arm_out = String::from_utf8(arm.stdout).unwrap();
+    assert!(
+        arm.status.success(),
+        "arming failed: {arm_out}{}",
+        String::from_utf8_lossy(&arm.stderr)
+    );
+    assert!(arm_out.contains("Force-through armed:"), "{arm_out}");
+    assert!(marker.exists(), "marker must exist at {}", marker.display());
+    assert!(
+        !audit.exists(),
+        "arming alone records nothing; the bypass does"
+    );
+
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .env_remove("RVL_FORCE")
+        .output()
+        .expect("failed to run rvl");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "a force-through exits 0 even with no verifiable spec cache: {stderr}"
+    );
+    assert!(
+        stderr.contains("FORCED THROUGH (mechanism: marker) - scan skipped, event audited"),
+        "{stderr}"
+    );
+    assert_eq!(sole_audit_event(&audit)["detail"]["mechanism"], "marker");
+    assert!(!marker.exists(), "the marker is one-shot");
+}
+
+/// `RVL_FORCE=1` is the CI / shell-one-liner mechanism: same skip, same exit 0,
+/// same audit record, reported as `env`.
+#[test]
+fn rvl_force_env_var_bypasses_the_gate_and_is_audited() {
+    let (dir, audit) = init_force_repo();
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .env("RVL_FORCE", "1")
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("FORCED THROUGH (mechanism: env) - scan skipped, event audited"),
+        "{stderr}"
+    );
+    assert_eq!(sole_audit_event(&audit)["detail"]["mechanism"], "env");
+}
+
+/// An `RVL_FORCE` run also CONSUMES a marker armed alongside it, so the marker
+/// cannot silently apply to a later commit.
+#[test]
+fn env_force_consumes_a_marker_armed_alongside_it() {
+    let (dir, audit) = init_force_repo();
+    let marker = dir.path().join(".git").join("rvl-force-next");
+    assert!(bin()
+        .args(["scan", "force-next", "--target"])
+        .arg(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(marker.exists());
+
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .env("RVL_FORCE", "1")
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    assert_eq!(sole_audit_event(&audit)["detail"]["mechanism"], "env");
+    assert!(
+        !marker.exists(),
+        "a stale marker must not survive an env-mechanism force"
+    );
+}
+
+/// `RVL_FORCE` set to anything but `1` is NOT a bypass: the scan runs (and here
+/// fails closed on the empty cache) and nothing is audited.
+#[test]
+fn rvl_force_only_triggers_on_exactly_one() {
+    let (dir, audit) = init_force_repo();
+    let out = bin()
+        .arg("scan")
+        .arg(dir.path())
+        .env("RVL_FORCE", "true")
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.contains("FORCED THROUGH"), "{stderr}");
+    assert!(!audit.exists(), "nothing to audit when nothing was forced");
+}
+
+/// A scan target that does not exist is an ERROR, not a clean pass. This is the
+/// root enabler behind `scan force-next` silently succeeding: a gate that
+/// reports "commit clean" for input it never read will mislead again under some
+/// other name. Message and exit code are rvl-cli's.
+#[test]
+fn nonexistent_scan_target_is_an_error_not_a_clean_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-dir");
+    let out = bin()
+        .arg("scan")
+        .arg(&missing)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .env_remove("RVL_FORCE")
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(2), "usage error, not 0 and not 1");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "Error: target is not a directory: {}",
+            missing.display()
+        )),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("commit clean"),
+        "a target we never read must never read as clean: {stdout}"
+    );
+}
+
+/// A file where a directory belongs gets the same refusal.
+#[test]
+fn scan_target_that_is_a_file_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&file)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .env_remove("RVL_FORCE")
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("Error: target is not a directory:"));
+}
+
+/// Arming outside a git work tree is refused rather than writing a marker
+/// somewhere nothing would ever read.
+#[test]
+fn force_next_outside_a_repo_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["scan", "force-next", "--target"])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("is not inside a git repository"));
+}
+
 // --- single-command scan: helper orchestration (po-3t3oj.25) ---
 
 /// End-to-end: `rvl scan <dir>` with NO `--retrieved` must detect the Go

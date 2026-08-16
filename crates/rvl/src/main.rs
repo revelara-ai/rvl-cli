@@ -5,6 +5,7 @@ mod config_lane;
 mod devscope;
 mod doctor;
 mod embedded_helpers;
+mod force;
 mod hook;
 mod init;
 mod out_doc;
@@ -2904,6 +2905,10 @@ fn render_scan_output(
     // status — derived from the same `classify` the footer used, never a second
     // opinion. See EXIT_BLOCKED for the full contract.
     if blocked {
+        // Name the AUDITED way through (po-av01j.182). Without this line the
+        // only bypass a blocked committer can find is `--no-verify`, which
+        // skips every hook and leaves no record; the force-through leaves one.
+        println!("{}", force::force_through_hint());
         return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
@@ -4447,6 +4452,45 @@ fn run_plugin_agents(
     }
 }
 
+/// The positional SUBCOMMAND of `scan` that arms the one-shot force-through
+/// marker (po-av01j.182). It occupies the same slot as the scan path, which is
+/// why it must be recognized before anything treats that slot as a directory.
+const FORCE_NEXT: &str = "force-next";
+
+/// Everything that must be decided before the spec cache is opened, for a
+/// deterministic scan (po-av01j.182). Returns `Some(exit)` when the scan must
+/// not run.
+///
+/// 1. The target must exist and be a directory. Before this, `rvl scan
+///    <path-that-does-not-exist>` walked an empty tree, found nothing, and
+///    printed "0 advisory - commit clean" with exit 0 — a gate that reports
+///    success for an input it never read. That is the root enabler behind
+///    `scan force-next` silently passing, and it would have come back under
+///    some other name. The message and the exit code are rvl-cli's, from the
+///    equivalent check on its own gate entrypoint (`scan --agent`, which exits
+///    `ExitUsage` for a target that does not stat as a directory).
+///
+/// 2. An armed force-through skips the scan ENTIRELY and exits 0, after
+///    announcing itself, writing the audit record, and consuming the marker.
+///    Skipping outright is the point: the bypass exists for shipping a lesser
+///    risk to fix a greater one, so it must not pay the scan's wall clock.
+fn scan_preflight(path: Option<&Path>, retrieved: Option<&Path>) -> Option<ExitCode> {
+    let target = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    // `--retrieved` is a prebuilt packet stream; the path is documented as
+    // ignored in that mode, so it is not validated here either.
+    if retrieved.is_none() {
+        let abs = std::path::absolute(&target).unwrap_or_else(|_| target.clone());
+        if !abs.is_dir() {
+            eprintln!("Error: target is not a directory: {}", abs.display());
+            return Some(ExitCode::from(2));
+        }
+    }
+    let root = force::git_toplevel(&target).unwrap_or(target);
+    let mechanism = force::force_state(&root)?;
+    force::handle_force_through(&root, mechanism);
+    Some(ExitCode::SUCCESS)
+}
+
 /// Does this `scan` invocation select SUBMISSION mode?
 ///
 /// The single definition of the rule, so the dispatch guard and the
@@ -4550,6 +4594,18 @@ fn run() -> anyhow::Result<ExitCode> {
     // config/exit-code contract inside rvl-data (rvl-cli parity) and never
     // touch the spec cache, so they dispatch before the store opens.
     let cmd = match cmd {
+        // `scan force-next` is a positional SUBCOMMAND, not a path
+        // (po-av01j.182). Intercepted first, exactly as rvl-cli intercepts it
+        // before flag parsing: otherwise it parses as a directory to scan and
+        // the documented emergency bypass reports "commit clean", exit 0,
+        // having bypassed nothing.
+        Cmd::Scan {
+            ref path,
+            ref target,
+            ..
+        } if path.as_deref().map(Path::as_os_str) == Some(FORCE_NEXT.as_ref()) => {
+            return Ok(force::run_force_next(target.as_deref()));
+        }
         // Scan SUBMISSION mode (po-av01j.153): `--scan-dir`/`--file`/
         // `--stdin` (or a lone `--service`, which rvl-cli answers with its
         // "must specify an input" error) routes to the ported rvl-cli
@@ -4701,6 +4757,19 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         other => other,
     };
+    // Deterministic-scan pre-flight (po-av01j.182), BEFORE the store opens, for
+    // the same reason the stray-flag arm above is: neither answer depends on
+    // this machine having a verifiable spec cache, and neither may be masked by
+    // exit 1 from the cache load. A force-through in particular must survive a
+    // broken cache — it is the emergency path.
+    if let Cmd::Scan {
+        path, retrieved, ..
+    } = &cmd
+    {
+        if let Some(code) = scan_preflight(path.as_deref(), retrieved.as_deref()) {
+            return Ok(code);
+        }
+    }
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
     let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
