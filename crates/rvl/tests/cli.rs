@@ -3561,6 +3561,218 @@ fn scan_service_without_input_source_is_an_error() {
     );
 }
 
+// --- .revelara.yaml on the submission wire (po-av01j.181) ---
+
+/// A target repo declaring `project:`, `criticality:`, and `components:`, plus
+/// a findings file whose evidence paths hit one component, miss both, and name
+/// the other. This is the shape that exposed all three regressions.
+fn write_revelara_target(
+    dir: &std::path::Path,
+    criticality: Option<&str>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let repo = dir.join("audit-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let crit_line = criticality
+        .map(|c| format!("criticality: {c}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        format!(
+            "project: audit-test\n\
+             {crit_line}\
+             components:\n\
+             \x20 - name: api\n\
+             \x20   path: cmd/api\n\
+             \x20 - name: worker\n\
+             \x20   path: cmd/worker\n"
+        ),
+    )
+    .unwrap();
+    let findings = dir.join("findings.json");
+    std::fs::write(
+        &findings,
+        r#"{"findings":[
+          {"title":"Missing timeout","category":"resilience","likelihood":"high","impact":"high","risk_score":61,
+           "evidence":[{"path":"cmd/api/handler.go","line":12}]},
+          {"title":"No circuit breaker","category":"resilience","likelihood":"medium","impact":"high","risk_score":55,
+           "evidence":[{"path":"docs/architecture.md","line":3}]}
+        ]}"#,
+    )
+    .unwrap();
+    (repo, findings)
+}
+
+/// The .181 wire contract in one submission: per-finding `linked_services`
+/// resolved from the components, `business_criticality` derived from
+/// `criticality:`, the service resolved from the target's `project:` (with the
+/// explicit `--service` overridden and warned about), and a finding whose path
+/// matches no component left unattributed rather than guessed at.
+#[test]
+fn scan_target_yaml_drives_service_linked_services_and_criticality() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, findings) = write_revelara_target(dir.path(), Some("critical"));
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--service", "WRONG-NAME", "--target"])
+        .arg(&repo)
+        .arg("--file")
+        .arg(&findings)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvl");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "submit failed: {stderr}");
+
+    // The override warning, byte-for-byte with rvl-cli's.
+    assert!(
+        stderr.contains(
+            "Warning: --service \"WRONG-NAME\" overridden by target's .revelara.yaml project: \"audit-test\""
+        ),
+        "{stderr}"
+    );
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(
+        body.starts_with(r#"{"service":"audit-test","#),
+        "the target's project: is authoritative: {body}"
+    );
+    assert!(
+        body.contains(r#""linked_services":["audit-test/api"]"#),
+        "the matching finding binds to its component: {body}"
+    );
+    assert!(
+        body.contains(r#""business_criticality":1"#),
+        "criticality: critical is 1.0 on the wire: {body}"
+    );
+    // The unmatched finding gets no attribution, and the operator is told.
+    assert_eq!(
+        body.matches("linked_services").count(),
+        1,
+        "only the matching finding is attributed: {body}"
+    );
+    assert!(
+        stderr.contains("1/2 findings have no `component` or `linked_services`"),
+        "{stderr}"
+    );
+}
+
+/// Every documented `criticality:` label reaches the wire with the multiplier
+/// rvl-cli sends, and a repo that declares none sends the field at all.
+#[test]
+fn scan_business_criticality_covers_every_label_and_absence() {
+    for (label, want) in [
+        (Some("critical"), Some(r#""business_criticality":1"#)),
+        (
+            Some("customer-facing"),
+            Some(r#""business_criticality":0.6"#),
+        ),
+        (Some("internal"), Some(r#""business_criticality":0.25"#)),
+        (None, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, findings) = write_revelara_target(dir.path(), label);
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let server = submit_mock::MockServer::start(vec![(200, SUBMIT_RESPONSE)]);
+
+        let out = bin()
+            .args(["scan", "--target"])
+            .arg(&repo)
+            .arg("--file")
+            .arg(&findings)
+            .env("RVL_API_KEY", "pk_cli_test")
+            .env("RVL_API_URL", &server.base_url)
+            .env("HOME", &home)
+            .env_remove("RVL_ORG_NAME")
+            .output()
+            .expect("failed to run rvl");
+        assert!(
+            out.status.success(),
+            "criticality {label:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let reqs = server.recorded();
+        let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+        match want {
+            Some(fragment) => assert!(body.contains(fragment), "criticality {label:?}: {body}"),
+            None => assert!(
+                !body.contains("business_criticality"),
+                "a repo declaring no criticality sends no multiplier: {body}"
+            ),
+        }
+    }
+}
+
+/// `rvl scan --target <path> --file <f>` — rvl-cli's own documented example —
+/// works with NO `--service`: the target's `project:` supplies it.
+#[test]
+fn scan_target_and_file_resolves_service_without_service_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, findings) = write_revelara_target(dir.path(), None);
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = submit_mock::MockServer::start(vec![(200, SUBMIT_RESPONSE)]);
+
+    let out = bin()
+        .args(["scan", "--target"])
+        .arg(&repo)
+        .arg("--file")
+        .arg(&findings)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvl");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "{stderr}");
+    // Nothing was overridden, so nothing is warned about.
+    assert!(!stderr.contains("overridden by target's"), "{stderr}");
+    let body = String::from_utf8(server.recorded()[0].body.clone()).unwrap();
+    assert!(body.starts_with(r#"{"service":"audit-test","#), "{body}");
+}
+
+/// With no `.revelara.yaml` to resolve from, `--service` is still required and
+/// the error names the escape hatch (rvl-cli's wording).
+#[test]
+fn scan_target_without_project_yaml_still_requires_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let findings = dir.path().join("findings.json");
+    std::fs::write(&findings, r#"{"findings":[]}"#).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin()
+        .args(["scan", "--target"])
+        .arg(&bare)
+        .arg("--file")
+        .arg(&findings)
+        .env("RVL_API_KEY", "pk_cli_test")
+        .env("RVL_API_URL", "http://127.0.0.1:9")
+        .env("HOME", &home)
+        .env_remove("RVL_ORG_NAME")
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "Error: --service is required (or use --target with a project that has .revelara.yaml)"
+        ),
+        "{stderr}"
+    );
+}
+
 /// Plain `rvl scan <path>` (no submission flag) still runs the
 /// deterministic scanner: no network, no submit output, same verdict
 /// surface as before this feature landed.

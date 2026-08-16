@@ -1210,8 +1210,37 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         None => PathBuf::from("."),
     };
 
-    let Some(service) = args.service.filter(|s| !s.is_empty()) else {
-        eprintln!("Error: --service is required");
+    // `.revelara.yaml` is the submission-side view of the target repo: the
+    // service name, the criticality multiplier, the components each finding is
+    // attributed to, and the team ownership. Loaded ONCE, here, and threaded
+    // through the rest of the run.
+    let project_cfg = crate::project_config::load_project_config_from(&target);
+
+    // `--target` resolves the service from the TARGET's `project:`, overriding
+    // an explicit `--service` with a warning (rvl-cli scan.go). The target's
+    // own declaration is authoritative: a `--service` typed from muscle memory
+    // while scanning someone else's repo would otherwise file the findings
+    // under the wrong service, silently. This also makes `--service` optional
+    // for `scan --target <path> --file <f>`, which rvl-cli documents.
+    let mut service = args.service.filter(|s| !s.is_empty());
+    if args.target.is_some() {
+        if let Some(cfg) = project_cfg.as_ref().filter(|c| !c.project.is_empty()) {
+            if let Some(explicit) = service.as_deref() {
+                if explicit != cfg.project {
+                    eprintln!(
+                        "Warning: --service {explicit:?} overridden by target's .revelara.yaml project: {:?}",
+                        cfg.project
+                    );
+                }
+            }
+            service = Some(cfg.project.clone());
+        }
+    }
+
+    let Some(service) = service else {
+        eprintln!(
+            "Error: --service is required (or use --target with a project that has .revelara.yaml)"
+        );
         eprintln!(
             "Usage: {BIN} scan --service <name> [--stdin|--file <path>|--scan-dir <path>] [--target <path>]"
         );
@@ -1306,10 +1335,26 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         OutputFormat::Text => "auto".to_string(),
     };
 
+    // `.revelara.yaml` attribution and scoring (rvl-cli scan.go, same order):
+    // per-finding `linked_services` from the components, then the criticality
+    // multiplier. Both are silent-degradation paths — omitting them submits
+    // successfully while the register attributes every finding to the bare
+    // service label and scores it below what rvl-cli scored.
+    if let Some(cfg) = project_cfg.as_ref() {
+        if !cfg.components.is_empty() {
+            if let Some(findings) = req.findings.as_mut() {
+                crate::project_mapping::map_findings_to_components(findings, cfg);
+            }
+        }
+        let crit = cfg.criticality_score();
+        if crit > 0.0 {
+            req.business_criticality = Some(crit);
+        }
+    }
+
     // po-77b6w.1: carry team ownership on the submission. --team overrides the
     // whole submission; otherwise `.revelara.yaml` `team:` (repo default) and
     // per-component `team:` entries apply.
-    let project_cfg = crate::project_config::load_project_config_from(&target);
     apply_team_assignments(&mut req, project_cfg.as_ref(), &team_flag);
 
     // Dry run (po-4g59y): machine-readable summary on stdout so the scan

@@ -27,6 +27,7 @@ pub mod gojson;
 pub mod incident;
 pub mod knowledge;
 pub mod project_config;
+pub mod project_mapping;
 pub mod risk;
 pub mod scan_cached_output;
 pub mod scan_normalize;
