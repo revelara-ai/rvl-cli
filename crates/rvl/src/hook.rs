@@ -27,6 +27,19 @@ use std::process::ExitCode;
 /// upgrades them in place instead of refusing them as foreign hooks.
 const SHIM_MARKER: &str = "rvl scan";
 
+/// The marker that identifies a hook file as THIS binary's deterministic
+/// gate, as opposed to any other `rvl scan` invocation.
+///
+/// [`SHIM_MARKER`] is deliberately broad — `doctor` should report "a scan
+/// gate is wired" for a v1 rvl-cli agent-scan shim too. Install must NOT be
+/// that broad: a v1 shim runs `rvl scan --agent`, a coding-agent review, and
+/// silently rewriting it to the deterministic gate swaps one gate for a
+/// different one behind the user's back (po-av01j.185 item 10). rvl-cli
+/// refuses ANY pre-existing hook file without `--force`; this refuses
+/// everything except a file that is already our own gate, which keeps
+/// re-running `hook install` idempotent.
+const NATIVE_GATE_MARKER: &str = "Revelara deterministic scan gate";
+
 #[derive(Subcommand)]
 pub enum HookCmd {
     /// Wire the deterministic scan gate into this repo's git hooks. With
@@ -178,19 +191,29 @@ fn hooks_dir(root: &Path) -> anyhow::Result<PathBuf> {
     })
 }
 
-/// Write the shim for `hook` into `hooks_dir`. A file already carrying a
-/// Revelara scan command is refreshed in place (idempotent, and upgrades
-/// v1 rvl-cli shims to the native gate). A foreign hook is refused unless
-/// `force`, which backs it up to `<name>.pre-rvl` first.
+/// Write the shim for `hook` into `hooks_dir`. A file that is ALREADY this
+/// binary's deterministic gate is refreshed in place, so re-running install
+/// is idempotent. Any other existing hook — a foreign hook, or a v1 rvl-cli
+/// `rvl scan --agent` shim, which is a DIFFERENT gate — is refused unless
+/// `force`, which backs it up to `<name>.pre-rvl` first (rvl-cli
+/// `writeHookShim` refuses every existing file the same way).
 fn write_hook_shim(hooks_dir: &Path, hook: &str, force: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(hooks_dir).map_err(|e| anyhow::anyhow!("create hooks dir: {e}"))?;
     let path = hooks_dir.join(hook);
     if path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.contains(SHIM_MARKER) {
+        if !existing.contains(NATIVE_GATE_MARKER) {
+            let what = if existing.contains(SHIM_MARKER) {
+                " (it invokes a scan, but not this binary's deterministic gate — \
+                 an rvl-cli agent-scan hook is a different gate, not an older \
+                 copy of this one)"
+            } else {
+                ""
+            };
             anyhow::ensure!(
                 force,
-                "{} already exists; re-run with --force to overwrite (the old hook is backed up)",
+                "{} already exists{what}; re-run with --force to overwrite \
+                 (the old hook is backed up to {hook}.pre-rvl)",
                 path.display()
             );
             let backup = hooks_dir.join(format!("{hook}.pre-rvl"));
@@ -456,6 +479,40 @@ mod tests {
         assert!(backup.contains("echo custom"));
         let hook = std::fs::read_to_string(hd.join("pre-push")).unwrap();
         assert!(hook.contains("--hook pre-push"));
+    }
+
+    /// A v1 rvl-cli agent-scan shim is a DIFFERENT gate (a coding-agent
+    /// review), not an older copy of this one. Silently rewriting it to the
+    /// deterministic gate would swap the user's gate behind their back, so it
+    /// is refused exactly like a foreign hook (po-av01j.185 item 10).
+    #[test]
+    fn a_v1_agent_scan_shim_is_refused_without_force_and_backed_up_with_it() {
+        let tmp = git_repo();
+        let hd = hooks_dir(tmp.path()).unwrap();
+        let v1 = "#!/bin/sh\n\
+                  # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+                  exec rvl scan --agent --staged --mode enforce\n";
+        std::fs::write(hd.join("pre-commit"), v1).unwrap();
+
+        let err = write_hook_shim(&hd, "pre-commit", false).unwrap_err();
+        assert!(
+            err.to_string().contains("--force"),
+            "must point at --force: {err}"
+        );
+        // Refusal leaves the user's gate exactly as it was.
+        assert_eq!(std::fs::read_to_string(hd.join("pre-commit")).unwrap(), v1);
+        // SHIM_MARKER still matches it — that breadth is doctor's, not
+        // install's.
+        assert!(v1.contains(SHIM_MARKER));
+
+        write_hook_shim(&hd, "pre-commit", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(hd.join("pre-commit.pre-rvl")).unwrap(),
+            v1
+        );
+        let now = std::fs::read_to_string(hd.join("pre-commit")).unwrap();
+        assert!(now.contains(NATIVE_GATE_MARKER));
+        assert!(!now.contains("--agent"));
     }
 
     #[test]

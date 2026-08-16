@@ -188,7 +188,16 @@ pub enum KnowledgeCmd {
         limit: u32,
     },
     /// Show knowledge base health statistics
-    Health,
+    Health {
+        /// ACCEPTED AND IGNORED, for rvl-cli parity: rvl-cli's `knowledge
+        /// health` takes no arguments at all and prints its fixed table, so
+        /// `--format=json` there is silently ignored and exits 0. Rejecting
+        /// it here would turn a working (if pointless) rvl-cli invocation
+        /// into exit 2 (po-av01j.185 item 8). There is no JSON rendering to
+        /// select — rvl-cli has none either.
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -648,7 +657,7 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                     limit,
                 )
             }
-            KnowledgeCmd::Health => {
+            KnowledgeCmd::Health { format: _ } => {
                 let (_, client) = crate::client::load_and_resolve()?;
                 health_output(&client)
             }

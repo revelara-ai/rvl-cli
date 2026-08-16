@@ -1,0 +1,38 @@
+### Expert Routing (ambient invocation)
+
+When the conversation enters a reliability domain and the user is making design decisions or implementing non-trivial patterns, you can invoke a domain expert agent via the Task tool. Use your judgment — not every mention of a topic needs an expert.
+
+| Domain | Agent | When to Invoke |
+|--------|-------|----------------|
+| Observability, tracing, metrics, logging | `observability-pro` | Designing instrumentation or alerting strategy |
+| Circuit breakers, retries, timeouts, fallbacks | `resilience-pro` | Implementing fault tolerance patterns |
+| CI/CD pipelines, deployment gates, automation | `cicd-pro` | Designing deployment pipeline or build process |
+| LLM/AI integration, prompts, eval pipelines | `ai-reliability-pro` | Building AI features or LLM integrations |
+| Capacity planning, autoscaling, query optimization | `capacity-planning-pro` | Sizing resources, optimizing queries, load testing |
+| Scalability, 10x growth, sharding, hot keys, fan-out, cache stampede | `scalability-pro` | Designing for the next order of magnitude of load, data, or tenants |
+| Memory leaks, lock contention, blocking I/O, profiling | `performance-pro` | Diagnosing hot-path performance and resource-leak issues |
+| Cloud costs, budgets, quotas | `cost-governance-pro` | Cost optimization or budget planning |
+| Blue-green, canary, GitOps, rollback | `deployment-excellence-pro` | Designing rollout or rollback strategy |
+| Test pyramid, coverage, chaos testing | `development-testing-pro` | Designing test strategy or improving coverage |
+| DB backup, PITR, disaster recovery | `disaster-recovery-pro` | Backup strategy or DR planning |
+| On-call, runbooks, escalation | `incident-response-pro` | Setting up on-call or incident procedures |
+| Postmortems, blameless culture, learning | `post-incident-pro` | Running postmortems or improving incident learning |
+| Risk register, error budgets, reliability culture | `reliability-culture-pro` | Reliability planning or organizational practices |
+| Dependency scanning, SBOM, supply chain, auth | `security-supply-chain-pro` | Security review or supply chain hardening |
+| SLI/SLO definition, burn rate alerts | `slo-monitoring-pro` | Defining SLOs or setting up error budget alerts |
+| Go reliability patterns | `golang-pro` | Go-specific reliability implementation |
+| JavaScript/TypeScript reliability | `javascript-pro` | JS/TS-specific reliability patterns |
+| Python reliability patterns | `python-pro` | Python-specific reliability implementation |
+| Rust reliability patterns | `rust-pro` | Rust-specific reliability implementation |
+| Java/JVM reliability patterns | `java-pro` | Java-specific reliability implementation |
+| C#/.NET reliability patterns | `csharp-pro` | C#-specific reliability implementation |
+| Ruby/Rails reliability patterns | `ruby-pro` | Ruby-specific reliability implementation |
+| PHP reliability patterns | `php-pro` | PHP-specific reliability implementation |
+| Elixir/OTP reliability patterns | `elixir-pro` | Elixir-specific reliability implementation |
+| Scala reliability patterns | `scala-pro` | Scala-specific reliability implementation |
+| C/C++ reliability patterns | `c-cpp-pro` | C/C++-specific reliability implementation |
+
+**When NOT to invoke ambiently:**
+- Simple factual questions the AI can answer from general knowledge
+- The user is clearly focused on non-reliability work
+- The topic was already covered by a recent `/rvl:ask` invocation

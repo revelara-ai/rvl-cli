@@ -176,6 +176,17 @@ working offline (`RVL_OFFLINE=1` or network failure fall back to the
 verified cached copy). This surface only downloads; it never uploads
 anything.
 
+`rvl init` and `rvl plugin install`/`update` also maintain a **managed
+context block** in your repository's `AGENTS.md` (and `CLAUDE.md` once skills
+are installed), delimited by
+`<!-- BEGIN REVELARA MANAGED BLOCK - DO NOT EDIT -->` /
+`<!-- END REVELARA MANAGED BLOCK -->`. That block is how a harness with no
+slash commands discovers `rvl` at all. It is created when the file is
+missing, appended when the file exists without it, and **replaced in place**
+otherwise — so re-running never duplicates it, and edits made INSIDE the
+markers do not survive the next run. Everything outside the markers is left
+alone. Pass `--no-context-files` to skip the step entirely.
+
 ## Privacy
 
 **Customer code never leaves the machine.** `rvl` is open source so this is
