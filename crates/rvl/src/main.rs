@@ -1851,6 +1851,34 @@ fn snapshot_name(path: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
+/// Fail loudly when the scan target cannot be READ, so that an empty walk can
+/// safely be read as "nothing here" (po-av01j.198).
+///
+/// The source walks below tolerate `read_dir` failures on purpose: one
+/// unreadable vendored directory must not abort a whole scan. That tolerance
+/// means a target that does not exist, is a file rather than a tree, or is
+/// mode-000 produces exactly the same empty result as a docs-only repository.
+/// One of those is a clean pass and the other is a scanner that never looked;
+/// this is the check that keeps them apart.
+///
+/// `scan_preflight` (po-av01j.182) already refuses a target that does not stat
+/// as a directory, and for the same reason. This adds the dimension it cannot
+/// see — a directory that exists but cannot be OPENED — and it lives here, on
+/// the walk itself, so `report --incremental` and any future caller that never
+/// passes through the `scan` dispatch inherit the guarantee rather than having
+/// to remember it.
+fn ensure_scannable_root(path: &Path) -> anyhow::Result<()> {
+    let md = std::fs::metadata(path).with_context(|| format!("cannot scan {}", path.display()))?;
+    anyhow::ensure!(
+        md.is_dir(),
+        "cannot scan {}: not a directory (pass a repository root, or --retrieved for a \
+         prebuilt packet stream)",
+        path.display()
+    );
+    std::fs::read_dir(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(())
+}
+
 /// Collect the candidate source files (`*.go` / `*.py` / `*.ts` / `*.cs`)
 /// under `root` for the incremental hash-gate, using the same bounded,
 /// vendored-dir-skipping walk `detect_languages` relies on. Paths are
@@ -2675,6 +2703,16 @@ fn run_scan(
     strict: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+    // The full path treats "no language detected" as a clean pass too
+    // (po-av01j.148), so it wants the same root guarantee as the incremental
+    // one: an unreadable tree must not render as "commit clean". Overlaps
+    // `scan_preflight`'s is_dir() check on the `scan` dispatch, deliberately —
+    // this one also catches a directory that exists but cannot be opened, and
+    // costs one stat. Skipped for `--retrieved`, where PATH is ignored
+    // entirely and the packet stream is the input.
+    if retrieved.is_none() {
+        ensure_scannable_root(path)?;
+    }
     // Content lane first: it is language-agnostic, so it must not depend on
     // the language pipeline having anything to do. With `--retrieved` the scan
     // is an escape-hatch replay of a prebuilt stream, possibly from another
@@ -3246,6 +3284,28 @@ struct IncrementalScan {
     /// (po-av01j.102). Distinct from `degraded_note`, which is about the wall
     /// budget: this is about a language contributing nothing at all.
     lang_degraded: Vec<LangDegradation>,
+    /// The candidate set was EMPTY: this tree holds no file any retriever
+    /// reads (po-av01j.198). Not a degradation and not an error — there was
+    /// nothing to retrieve — but the caller must SAY so, because a gate that
+    /// prints an empty report reads as broken just like one that errors.
+    no_supported_sources: bool,
+}
+
+impl IncrementalScan {
+    /// The warm pass over a tree with no supported source: everything zero,
+    /// nothing degraded, and the flag that makes the emptiness explainable.
+    fn no_source() -> Self {
+        Self {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            reused_files: 0,
+            retrieved_files: 0,
+            degraded_note: None,
+            reparsed_files: Vec::new(),
+            lang_degraded: Vec::new(),
+            no_supported_sources: true,
+        }
+    }
 }
 
 /// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
@@ -3318,6 +3378,9 @@ where
         // Filled in by the caller that owns the retriever handle; this function
         // is retriever-agnostic so a fake can drive it in tests.
         lang_degraded: Vec::new(),
+        // This function is only reached with a candidate set in hand; the
+        // no-source case short-circuits in `incremental_scan_pass`.
+        no_supported_sources: false,
     })
 }
 
@@ -3329,12 +3392,35 @@ fn incremental_scan_pass(
     path: &std::path::Path,
     strict: bool,
 ) -> anyhow::Result<IncrementalScan> {
+    // PREFLIGHT THE ROOT BEFORE READING THE EMPTY SET AS BENIGN
+    // (po-av01j.198). `walk_source_files` swallows every `read_dir` error by
+    // design — one unreadable subdirectory must not abort a scan — so a typo'd
+    // path, a deleted worktree or a root we lack permission on arrives here as
+    // an empty Vec that is INDISTINGUISHABLE from "this repo has no supported
+    // language". Making the empty set a clean pass without this check would
+    // trade a false alarm for a silent one, which is the failure shape of
+    // po-av01j.182/.194. So: the walk not FINDING anything is benign; the walk
+    // being unable to LOOK is still a hard error.
+    ensure_scannable_root(path)?;
     let candidates = walk_source_files(path);
-    anyhow::ensure!(
-        !candidates.is_empty(),
-        "no supported source files found under {}; pass --retrieved to scan a prebuilt packet stream",
-        path.display()
-    );
+    if candidates.is_empty() {
+        // NO SUPPORTED SOURCE IS NOT AN ERROR (po-av01j.198), the same
+        // principle po-av01j.148 already settled on the full-scan path (see
+        // `resolve_packet_stream` and its `a_repo_with_no_source_still_scans_
+        // its_config` / `an_empty_dir_no_longer_fails_for_having_no_source`
+        // tests). There is no file for any retriever to read, so NO helper is
+        // needed and nothing can fail: docs repos, terraform/YAML repos, shell
+        // repos and any polyglot repo before its first Go/Py/TS/Rust/C file
+        // lands. `hook install` writes `--incremental --changed-only` into
+        // .git/hooks/pre-commit, so bailing here failed EVERY commit in those
+        // repos with a scanner error rather than a finding.
+        //
+        // The index is deliberately NOT opened: it is a retrieval cache, and
+        // with nothing to retrieve or reuse a cache fault is not a fact about
+        // this commit. The caller still runs the content, config and structure
+        // lanes over the live tree, so a secret in a docs repo still blocks.
+        return Ok(IncrementalScan::no_source());
+    }
 
     let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
     let name = snapshot_name(path);
@@ -3551,6 +3637,32 @@ fn run_scan_incremental(
 
     let scan = incremental_scan_pass(index_dir, path, strict)?;
 
+    // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
+    // empty report looks as broken as one that errors, so the no-source case
+    // gets the same treatment the full-scan path gives it: a stated reason on
+    // stderr and a COVERAGE roll-call built from the languages we DID see and
+    // do not support. Without this the reader cannot tell "there was nothing to
+    // scan" from "nothing got scanned" -- the distinction render_scan_output's
+    // own degraded_note comment calls out.
+    let lang_status: Vec<render::LangStatus> = if scan.no_supported_sources {
+        eprintln!(
+            "incremental: no supported source files under {} -- no retriever was needed; \
+             the content, config and structure lanes still ran over the tree",
+            path.display()
+        );
+        detect_unsupported(path)
+            .into_iter()
+            .map(|(name, count)| render::LangStatus {
+                lang: name,
+                state: render::LangState::Unsupported,
+                detail: format!("{count} files"),
+            })
+            .collect()
+    } else {
+        // The incremental path reuses an index rather than running every
+        // helper, so it has no roll-call to report.
+        Vec::new()
+    };
     // One-line reuse summary to stderr; the ladder itself goes to stdout.
     // "re-parsed" is the honest word: it counts what the INDEX had to reload,
     // which is independent of what the change touched.
@@ -3696,9 +3808,7 @@ fn run_scan_incremental(
         color,
         start,
         &scan.lang_degraded,
-        // The incremental path reuses an index rather than running every
-        // helper, so it has no roll-call to report.
-        Vec::new(),
+        lang_status,
         Vec::new(),
         scan.degraded_note.clone(),
         // The incremental path reuses indexed packets, which were already
@@ -6991,6 +7101,73 @@ mod tests {
             stream.total_failure.is_none(),
             "nothing failed -- there was nothing to run"
         );
+    }
+
+    // po-av01j.198: the SAME principle on the incremental path, which is the
+    // one `hook install` writes into .git/hooks. It used to bail here, so
+    // every commit in a docs/terraform/shell repo failed with a scanner error.
+    #[test]
+    fn an_incremental_pass_over_a_repo_with_no_source_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("README.md"), "# docs\n").unwrap();
+        std::fs::write(repo.join("config.yml"), "a: 1\n").unwrap();
+        assert!(
+            walk_source_files(&repo).is_empty(),
+            "the fixture must genuinely have no candidate source"
+        );
+
+        let scan = incremental_scan_pass(&dir.path().join("index"), &repo, false)
+            .expect("no supported source is not an error: nothing was needed");
+        assert!(scan.sites.is_empty());
+        assert!(
+            scan.no_supported_sources,
+            "the caller needs the flag to EXPLAIN the empty scope"
+        );
+        assert!(
+            scan.degraded_note.is_none() && scan.lang_degraded.is_empty(),
+            "nothing degraded -- there was nothing to run"
+        );
+    }
+
+    // The other side of that coin. An unreadable root walks to the identical
+    // empty candidate set, and `walk_source_files` swallows the `read_dir`
+    // error by design, so without this check the fix above would turn a
+    // scanner that never looked into a clean bill of health.
+    #[test]
+    fn an_unreadable_root_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ensure_scannable_root(&dir.path().join("nope")).is_err(),
+            "a target that does not exist cannot be scanned"
+        );
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            ensure_scannable_root(&file).is_err(),
+            "a file is not a repository root"
+        );
+        assert!(
+            ensure_scannable_root(dir.path()).is_ok(),
+            "an ordinary readable directory is fine"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Running as root defeats the permission bit; skip rather than
+            // assert something the environment cannot produce.
+            if std::fs::read_dir(&locked).is_err() {
+                assert!(
+                    ensure_scannable_root(&locked).is_err(),
+                    "a directory that cannot be opened is not an empty repo"
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     #[test]
