@@ -722,13 +722,37 @@ pub fn context_output(client: &Client, code: &str, format: Option<&str>) -> CmdR
     }
 
     let base = format!("{}/api/v1/risks/{}", client.api_url, path_escape(code));
-    let detail_res = client.request("GET", &base, None);
-    let ctx_res = client.request("GET", &format!("{base}/context"), None);
-    let stats_res = client.request(
-        "GET",
-        &format!("{}/api/v1/risks/stats", client.api_url),
-        None,
-    );
+
+    // po-av01j.200: the three fetches run CONCURRENTLY, mirroring rvl-cli's
+    // sync.WaitGroup (internal/commands/risk.go). This is load-bearing, not a
+    // micro-optimization: `risk context` is the richest read in the CLI and the
+    // command `/rvl:fix` runs to ground a remediation, so serializing three
+    // round trips roughly triples the latency a developer waits on. Scoped
+    // threads rather than an async runtime because the HTTP client is blocking
+    // (ureq) and the workspace has no executor; three threads for one call site
+    // is a far smaller change than adopting one.
+    //
+    // Shape matches Go exactly: fire all three, wait for all three, then decide.
+    // No cancel-on-first-error, and no shared deadline — each request keeps its
+    // own per-request timeout. The decision below reads the three results in a
+    // fixed order, so the outcome cannot depend on which reply lands first.
+    fn join_fetch(
+        h: std::thread::ScopedJoinHandle<'_, Result<Vec<u8>, String>>,
+    ) -> Result<Vec<u8>, String> {
+        h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+    let (detail_res, ctx_res, stats_res) = std::thread::scope(|s| {
+        let detail = s.spawn(|| client.request("GET", &base, None));
+        let ctx = s.spawn(|| client.request("GET", &format!("{base}/context"), None));
+        let stats = s.spawn(|| {
+            client.request(
+                "GET",
+                &format!("{}/api/v1/risks/stats", client.api_url),
+                None,
+            )
+        });
+        (join_fetch(detail), join_fetch(ctx), join_fetch(stats))
+    });
 
     if let (Err(de), Err(_)) = (&detail_res, &ctx_res) {
         return Err(Failure::runtime(format!(
