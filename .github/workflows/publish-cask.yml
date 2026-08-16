@@ -1,0 +1,90 @@
+name: Publish Homebrew cask
+
+# Writes Casks/rvl.rb into revelara-ai/homebrew-tap.
+#
+# This is a cargo-dist CUSTOM PUBLISH JOB: it is declared in dist-workspace.toml
+# as `publish-jobs = ["./publish-cask"]` and called by the generated release.yml
+# after the `host` job, with the plan manifest passed in and secrets inherited.
+# `workflow_call` is its ONLY trigger, and release.yml only reaches `host` on a
+# pushed version tag, so nothing here runs on a branch or a pull request. The
+# tag guard below is a second lock on the same door.
+#
+# It exists because cargo-dist 0.32 can emit a Homebrew formula and not a cask,
+# and the tap is Casks-only. See dist-workspace.toml and ci/render-cask.sh for
+# the full reasoning, and ci/render-cask.sh for the release-ordering hazard the
+# cask urls carry.
+#
+# EXACTLY ONE REPO MAY PUBLISH THIS FILE. The Go rvl-cli repo published it via
+# goreleaser `homebrew_casks:` until po-av01j.154 removed that block. If it ever
+# comes back, the two repos race for the same path and the later release wins,
+# which is how a v1 security patch ends up downgrading everyone off v2.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "cargo-dist plan manifest (unused directly; the manifests are read from the run's artifacts)"
+        required: true
+        type: string
+
+jobs:
+  publish-cask:
+    # Belt and braces: the caller only gets here on a tag, and this makes a
+    # stray manual/reusable invocation from a branch a no-op rather than a
+    # publish.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out this repo (for ci/render-cask.sh)
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          path: src
+
+      - name: Check out the tap
+        uses: actions/checkout@v6
+        with:
+          repository: revelara-ai/homebrew-tap
+          path: tap
+          persist-credentials: true
+          # A PAT with contents:write on revelara-ai/homebrew-tap. The default
+          # GITHUB_TOKEN is scoped to this repo and cannot push to the tap.
+          #
+          # NOTE: this is a REPO-level secret. It followed the Go rvl-cli repo,
+          # not the `rvl-cli` name, so renaming repos does NOT bring it along —
+          # it has to be added to this repo (or promoted to an org secret)
+          # before the first tag, or this job fails at checkout.
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Fetch this release's dist artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Render Casks/rvl.rb
+        run: |
+          set -euo pipefail
+          src/ci/render-cask.sh dist-artifacts > tap/Casks/rvl.rb
+          echo "--- rendered cask ---"
+          cat tap/Casks/rvl.rb
+          # Cheap generator-bug catcher: a cask is Ruby, so a syntax error here
+          # is a broken tap for everyone until someone notices.
+          ruby -c tap/Casks/rvl.rb
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "revelara-release-bot"
+          git config user.email "release@revelara.ai"
+          git add Casks/rvl.rb
+          if git diff --cached --quiet; then
+            echo "cask unchanged; nothing to publish"
+            exit 0
+          fi
+          git commit -m "brew: rvl ${TAG}"
+          git push

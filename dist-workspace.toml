@@ -7,12 +7,32 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["homebrew"]
-# A GitHub repo to push Homebrew formulas to
-tap = "revelara-ai/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# The installers to generate for each app.
+#
+# Deliberately EMPTY, and specifically NOT ["homebrew"]. cargo-dist 0.32 can
+# only emit a Homebrew FORMULA, and revelara-ai/homebrew-tap has no Formula/
+# directory at all: it ships `rvl` as a CASK (Casks/rvl.rb), because that is
+# what the Go rvl-cli published via goreleaser. Formulae and casks are separate
+# Homebrew namespaces, so dropping a Formula/rvl.rb next to Casks/rvl.rb makes
+# `brew install revelara-ai/tap/rvl` ambiguous AND leaves every existing cask
+# user stranded on the old binary, since `brew upgrade` will not migrate them
+# across namespaces. So we render the cask ourselves instead, from this same
+# cargo-dist release's dist-manifest.json. If cargo-dist ever gains real cask
+# support, that is the moment to delete ci/render-cask.sh, not before.
+installers = []
+# No `tap = ...` key: it only feeds cargo-dist's own homebrew installer, which
+# is switched off above. The tap repo is named in ci/render-cask.sh and in
+# .github/workflows/publish-cask.yml, which is what actually writes to it.
+#
+# Publish jobs to run in CI. "./publish-cask" is a custom job: cargo-dist calls
+# .github/workflows/publish-cask.yml as a reusable workflow after `host`, with
+# the plan manifest passed in and secrets inherited.
+publish-jobs = ["./publish-cask"]
+# Publish jobs default to id-token+packages write and NOTHING else, which means
+# `contents: none` and a failing `actions/checkout` of this repo. The cask job
+# needs to read this repo (for ci/render-cask.sh) and nothing more; it reaches
+# the tap with a PAT, not GITHUB_TOKEN.
+github-custom-job-permissions = { "publish-cask" = { contents = "read" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests
