@@ -176,6 +176,12 @@ working offline (`RVL_OFFLINE=1` or network failure fall back to the
 verified cached copy). This surface only downloads; it never uploads
 anything.
 
+Verification is fail-closed: a server with no signing key configured (a
+self-hosted deployment, typically) refuses the install rather than
+installing unverified content. Set **`RVL_ALLOW_UNSIGNED_PLUGIN=1`** to opt
+out — the same variable name rvl-cli used, so existing self-hosted CI keeps
+working unchanged.
+
 `rvl init` and `rvl plugin install`/`update` also maintain a **managed
 context block** in your repository's `AGENTS.md` (and `CLAUDE.md` once skills
 are installed), delimited by

@@ -18,6 +18,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod compliance;
 pub mod config;
 pub mod control;
 pub mod display;
@@ -29,11 +30,14 @@ pub mod knowledge;
 pub mod project_config;
 pub mod project_mapping;
 pub mod risk;
+pub mod risk_context_render;
 pub mod scan_cached_output;
 pub mod scan_normalize;
 pub mod scan_submit;
 pub mod scan_team;
 pub mod stpa;
+pub mod update_check;
+pub mod upgrade_hint;
 
 use std::process::ExitCode;
 

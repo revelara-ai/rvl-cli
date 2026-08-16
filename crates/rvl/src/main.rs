@@ -181,6 +181,21 @@ enum Cmd {
         /// so rvl-cli invocations keep running.
         #[arg(long)]
         auto_infer: bool,
+        /// Submission mode: send the wire value rvl-cli sends for an
+        /// INTERACTIVE run, `scan_mode: "review"`. That is all it does —
+        /// rvl-cli's confirmation TUI is not ported, and the server's
+        /// canonical idempotency key excludes `scan_mode`, so this cannot
+        /// change dedup. rvl-cli's precedence applies: `--ci` (i.e.
+        /// `--format json`) and `--auto-infer` both win over it.
+        #[arg(long)]
+        review: bool,
+        /// Submission mode: merge a control structure from a SEPARATE JSON
+        /// file into this submission. Not the same thing as `stpa submit`,
+        /// which ingests a whole STPA model at `/control-structure/model`;
+        /// this attaches `control_structure` (and a `repo_url` fallback) to
+        /// the scan payload. An in-band control structure wins.
+        #[arg(long)]
+        cs_file: Option<PathBuf>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about
     /// unknown API surfaces: shape only — `client_type.method`, the language it
@@ -356,6 +371,15 @@ enum Cmd {
     Control {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
+    },
+    /// Compliance framework views. `compliance report` is rvl-cli's `rvl
+    /// report` readiness scorecard, renamed because this binary already
+    /// spells `report` for the scan privacy-payload preview
+    /// (po-av01j.185 item 2). Readiness/supporting framing only, never
+    /// certification.
+    Compliance {
+        #[command(subcommand)]
+        cmd: rvl_data::compliance::ComplianceCmd,
     },
     /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, relationships, graph, foresight, enrich, health)
     Knowledge {
@@ -4247,6 +4271,65 @@ fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
     }
 }
 
+/// The "Plugins:" section `status` prints (po-av01j.185 item 1), from the
+/// same drift report `skills status` renders.
+///
+/// Deliberately rvl-cli's `status` shape, not `skills status`'s: one
+/// `<harness>: v<version> (state)` line per install, the "run install"
+/// hint when there are none, and the per-harness upgrade command when a
+/// newer version is served. rvl-cli's `status` reads only its own
+/// `plugins.json`; this also lists the v1 records the v2 store has not
+/// adopted yet, so a mid-cutover user sees every install they have.
+fn render_status_plugins(report: &rvl_skills::flow::StatusReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\nPlugins:\n");
+    if report.harnesses.is_empty() && report.v1_installs.is_empty() {
+        out.push_str("  No plugins installed\n");
+        let _ = writeln!(out, "  Run '{BIN} plugin install <agent>' to install");
+        let available: Vec<&str> = rvl_skills::harness::registry()
+            .iter()
+            .map(|h| h.editor_param())
+            .collect();
+        let _ = writeln!(out, "  Available: {}", available.join(", "));
+        return out;
+    }
+    for h in &report.harnesses {
+        match &h.update_available {
+            Some(v) => {
+                let _ = writeln!(
+                    out,
+                    "  {}: v{} (update available: v{v})",
+                    h.harness, h.installed_version
+                );
+                let _ = writeln!(
+                    out,
+                    "    Run '{BIN} plugin update {}' to upgrade",
+                    h.harness
+                );
+            }
+            None if report.served_version.is_some() => {
+                let _ = writeln!(
+                    out,
+                    "  {}: v{} (up to date)",
+                    h.harness, h.installed_version
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  {}: v{}", h.harness, h.installed_version);
+            }
+        }
+    }
+    for p in &report.v1_installs {
+        let _ = writeln!(
+            out,
+            "  {}: v{} (installed by rvl-cli)",
+            p.harness, p.version
+        );
+        let _ = writeln!(out, "    Run '{BIN} plugin update {}' to adopt", p.harness);
+    }
+    out
+}
+
 /// Everything the `skills` and `plugin` surfaces need, resolved once: home,
 /// the skills cache store, the HTTP fetcher, and the policy env switches.
 /// Uses the same base URL/org key resolution as `sync` (rvl env >
@@ -4282,7 +4365,7 @@ impl SkillsCtx {
             fetcher,
             offline: cfg.offline,
             has_key: !cfg.org_key.is_empty(),
-            allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED").ok().as_deref() == Some("1"),
+            allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED_PLUGIN").ok().as_deref() == Some("1"),
             allow_missing_checksum: std::env::var("RVL_ALLOW_MISSING_CHECKSUM").ok().as_deref()
                 == Some("1"),
         })
@@ -4788,36 +4871,53 @@ const SUBMISSION_SELECTORS: &str = "--stdin, --file, --scan-dir, --service, or -
 /// `true` proves the user typed it. Nothing here can be tripped by a default
 /// value, which is the property that lets this be a hard error rather than a
 /// warning.
-fn stray_submission_flags(
-    team: Option<&str>,
-    target: Option<&Path>,
+/// The submission-only flags as clap parsed them, borrowed from the
+/// `Cmd::Scan` arm. A struct rather than eight positional parameters so a
+/// new flag cannot silently take the wrong slot at a call site.
+#[derive(Default)]
+struct SubmissionFlags<'a> {
+    team: Option<&'a str>,
+    target: Option<&'a Path>,
     cleanup_on_success: bool,
-    timeout: Option<&str>,
-    format: Option<&str>,
+    timeout: Option<&'a str>,
+    format: Option<&'a str>,
     ci: bool,
-) -> Vec<&'static str> {
+    review: bool,
+    cs_file: Option<&'a Path>,
+}
+
+fn stray_submission_flags(f: &SubmissionFlags) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if team.is_some() {
+    if f.team.is_some() {
         out.push("--team");
     }
-    if target.is_some() {
+    if f.target.is_some() {
         out.push("--target");
     }
-    if cleanup_on_success {
+    if f.cleanup_on_success {
         out.push("--cleanup-on-success");
     }
-    if timeout.is_some() {
+    if f.timeout.is_some() {
         out.push("--timeout");
     }
-    if format.is_some() {
+    if f.format.is_some() {
         out.push("--format");
     }
     // `--ci` is `--format json` under another name, so it is stray for the
     // same reason `--format` is, and is named by the flag the user typed.
     // `--auto-infer` is NOT here: it selects the mode submission already
     // uses, so nothing is dropped by ignoring it anywhere.
-    if ci {
+    if f.ci {
         out.push("--ci");
+    }
+    // `--review` and `--cs-file` DO drop something on a local scan: the
+    // requested `scan_mode` and an entire control structure. Same rule as
+    // `--ci`, opposite of `--auto-infer`.
+    if f.review {
+        out.push("--review");
+    }
+    if f.cs_file.is_some() {
+        out.push("--cs-file");
     }
     out
 }
@@ -4845,7 +4945,7 @@ fn stray_submission_flag_error(flags: &[&str]) -> String {
                 " {f}{}",
                 // Boolean flags take no value; showing "<value>" after one
                 // hands the reader a command that fails differently.
-                if matches!(*f, "--cleanup-on-success" | "--ci") {
+                if matches!(*f, "--cleanup-on-success" | "--ci" | "--review") {
                     ""
                 } else {
                     " <value>"
@@ -4941,6 +5041,9 @@ fn run() -> anyhow::Result<ExitCode> {
             timeout,
             format,
             ci,
+            auto_infer,
+            review,
+            cs_file,
             ..
         } if selects_submission(
             stdin,
@@ -4968,6 +5071,13 @@ fn run() -> anyhow::Result<ExitCode> {
                     dry_run,
                     timeout,
                     format,
+                    // rvl-cli resolves `--ci > --auto-infer > --review`.
+                    // `--ci` is folded into `--format json` above;
+                    // `--auto-infer` selects the default mode, so it wins
+                    // over `--review` by cancelling it here rather than by
+                    // an extra branch in the mode match.
+                    review: review && !auto_infer,
+                    cs_file,
                 },
                 env!("CARGO_PKG_VERSION"),
             ));
@@ -4989,25 +5099,31 @@ fn run() -> anyhow::Result<ExitCode> {
             ref timeout,
             ref format,
             ci,
+            review,
+            ref cs_file,
             ..
-        } if !stray_submission_flags(
-            team.as_deref(),
-            target.as_deref(),
+        } if !stray_submission_flags(&SubmissionFlags {
+            team: team.as_deref(),
+            target: target.as_deref(),
             cleanup_on_success,
-            timeout.as_deref(),
-            format.as_deref(),
+            timeout: timeout.as_deref(),
+            format: format.as_deref(),
             ci,
-        )
+            review,
+            cs_file: cs_file.as_deref(),
+        })
         .is_empty() =>
         {
-            let stray = stray_submission_flags(
-                team.as_deref(),
-                target.as_deref(),
+            let stray = stray_submission_flags(&SubmissionFlags {
+                team: team.as_deref(),
+                target: target.as_deref(),
                 cleanup_on_success,
-                timeout.as_deref(),
-                format.as_deref(),
+                timeout: timeout.as_deref(),
+                format: format.as_deref(),
                 ci,
-            );
+                review,
+                cs_file: cs_file.as_deref(),
+            });
             let f = rvl_data::Failure::usage(stray_submission_flag_error(&stray));
             eprintln!("error: {}", f.msg);
             return Ok(ExitCode::from(f.code));
@@ -5058,9 +5174,22 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
-        Cmd::Status => return Ok(rvl_data::auth::run_status(env!("CARGO_PKG_VERSION"))),
+        // The plugin section is a closure so it runs only AFTER the
+        // credential check passes: it makes its own server call, and
+        // rvl-cli does not reach out for it on a failed connection either.
+        Cmd::Status => {
+            let cfg = Config::from_env();
+            return Ok(rvl_data::auth::run_status(
+                env!("CARGO_PKG_VERSION"),
+                || {
+                    let ctx = SkillsCtx::resolve(&cfg).ok()?;
+                    Some(render_status_plugins(&rvl_skills::flow::status(&ctx.env())))
+                },
+            ));
+        }
         Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
         Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
+        Cmd::Compliance { cmd } => return Ok(rvl_data::compliance::run(cmd)),
         Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
         Cmd::Incident { cmd } => return Ok(rvl_data::incident::run(cmd)),
         Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
@@ -5333,6 +5462,7 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Status
         | Cmd::Risk { .. }
         | Cmd::Control { .. }
+        | Cmd::Compliance { .. }
         | Cmd::Knowledge { .. }
         | Cmd::Incident { .. }
         | Cmd::Evidence { .. }
@@ -7358,51 +7488,90 @@ mod tests {
     fn submission_only_flags_are_stray_on_a_deterministic_scan() {
         // po-av01j.168: every one of these was accepted and silently dropped.
         assert_eq!(
-            stray_submission_flags(Some("backend-team"), None, false, None, None, false),
+            stray_submission_flags(&SubmissionFlags {
+                team: Some("backend-team"),
+                ..Default::default()
+            }),
             vec!["--team"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, false, None, Some("json"), false),
+            stray_submission_flags(&SubmissionFlags {
+                format: Some("json"),
+                ..Default::default()
+            }),
             vec!["--format"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, false, Some("90s"), None, false),
+            stray_submission_flags(&SubmissionFlags {
+                timeout: Some("90s"),
+                ..Default::default()
+            }),
             vec!["--timeout"]
         );
         assert_eq!(
-            stray_submission_flags(None, None, true, None, None, false),
+            stray_submission_flags(&SubmissionFlags {
+                cleanup_on_success: true,
+                ..Default::default()
+            }),
             vec!["--cleanup-on-success"]
         );
         assert_eq!(
-            stray_submission_flags(None, Some(Path::new("/tmp/p")), false, None, None, false),
+            stray_submission_flags(&SubmissionFlags {
+                target: Some(Path::new("/tmp/p")),
+                ..Default::default()
+            }),
             vec!["--target"]
         );
         // Every flag at once still names every flag: a reader who typed two
         // must not have to run twice to learn about the second.
         assert_eq!(
-            stray_submission_flags(
-                Some("t"),
-                Some(Path::new("/tmp/p")),
-                true,
-                Some("90s"),
-                Some("json"),
-                true
-            ),
+            stray_submission_flags(&SubmissionFlags {
+                team: Some("t"),
+                target: Some(Path::new("/tmp/p")),
+                cleanup_on_success: true,
+                timeout: Some("90s"),
+                format: Some("json"),
+                ci: true,
+                review: true,
+                cs_file: Some(Path::new("/tmp/cs.json")),
+            }),
             vec![
                 "--team",
                 "--target",
                 "--cleanup-on-success",
                 "--timeout",
                 "--format",
-                "--ci"
+                "--ci",
+                "--review",
+                "--cs-file"
             ]
         );
         // `--ci` is stray for the same reason `--format` is: it IS
         // `--format json`, so a deterministic scan would drop a requested
         // output contract on the floor (po-av01j.185 item 2).
         assert_eq!(
-            stray_submission_flags(None, None, false, None, None, true),
+            stray_submission_flags(&SubmissionFlags {
+                ci: true,
+                ..Default::default()
+            }),
             vec!["--ci"]
+        );
+        // po-av01j.185 item 3: `--review` carries a scan_mode and
+        // `--cs-file` an entire control structure, so both DROP something on
+        // a deterministic scan — the `--ci` rule, not the `--auto-infer` one.
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                review: true,
+                ..Default::default()
+            }),
+            vec!["--review"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                cs_file: Some(Path::new("/tmp/cs.json")),
+                ..Default::default()
+            }),
+            vec!["--cs-file"]
         );
         // `--auto-infer` is NOT stray: it selects the mode submission
         // already uses, so it drops nothing anywhere.
@@ -7537,6 +7706,56 @@ mod tests {
         }
     }
 
+    /// `--review` and `--cs-file` parse on a submission and reach
+    /// [`rvl_data::scan_submit::SubmitArgs`] (po-av01j.185 item 3).
+    #[test]
+    fn review_and_cs_file_parse_on_a_submission() {
+        match Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--service",
+            "api",
+            "--stdin",
+            "--review",
+            "--cs-file",
+            "cs.json",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Some(Cmd::Scan {
+                review,
+                cs_file,
+                auto_infer,
+                ..
+            }) => {
+                assert!(review);
+                assert!(!auto_infer);
+                assert_eq!(cs_file, Some(PathBuf::from("cs.json")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    /// rvl-cli resolves `--ci > --auto-infer > --review`, so `--auto-infer`
+    /// with `--review` sends "auto". The dispatch expresses that by
+    /// cancelling `review`; assert the cancellation rule itself.
+    #[test]
+    fn auto_infer_outranks_review_the_way_rvl_cli_does() {
+        for (auto_infer, review, want) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, false),
+            (true, false, false),
+        ] {
+            assert_eq!(
+                review && !auto_infer,
+                want,
+                "auto_infer={auto_infer} review={review}"
+            );
+        }
+    }
+
     /// rvl-cli's `--all` is this binary's "omit the harness name"
     /// (po-av01j.188).
     #[test]
@@ -7585,7 +7804,7 @@ mod tests {
         // The defaults must never trip the check — that is the property that
         // makes this a hard error rather than a warning. Clap gives these
         // flags no default value, so absent is `None`/`false`.
-        assert!(stray_submission_flags(None, None, false, None, None, false).is_empty());
+        assert!(stray_submission_flags(&SubmissionFlags::default()).is_empty());
         let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
         match cli.cmd {
             Some(Cmd::Scan {
@@ -7595,15 +7814,19 @@ mod tests {
                 timeout,
                 format,
                 ci,
+                review,
+                cs_file,
                 ..
-            }) => assert!(stray_submission_flags(
-                team.as_deref(),
-                target.as_deref(),
+            }) => assert!(stray_submission_flags(&SubmissionFlags {
+                team: team.as_deref(),
+                target: target.as_deref(),
                 cleanup_on_success,
-                timeout.as_deref(),
-                format.as_deref(),
+                timeout: timeout.as_deref(),
+                format: format.as_deref(),
                 ci,
-            )
+                review,
+                cs_file: cs_file.as_deref(),
+            })
             .is_empty()),
             _ => panic!("expected scan"),
         }

@@ -10,6 +10,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Semver comparison shared by every surface that reports version drift:
+/// plugin content (`rvl-skills`) and the CLI update nag (`rvl-data`). It
+/// lives in this leaf crate for the same reason [`BIN`] does — so both can
+/// reach it without one depending on the other, and so the two surfaces can
+/// never disagree about what "newer" means.
+pub mod semver;
+
 /// The binary name used in user-facing hints ("run 'rvl login'").
 /// Flipped from "rvlscan" to "rvl" at the v1.0.0 cutover (po-av01j.154).
 ///

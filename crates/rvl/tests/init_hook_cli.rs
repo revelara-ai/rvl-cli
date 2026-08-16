@@ -381,7 +381,7 @@ fn offline_install_cmd(dir: &Path, home: &Path, cache: &Path) -> Command {
     c.current_dir(dir)
         .env("HOME", home)
         .env("RVL_SKILLS_CACHE_DIR", cache)
-        .env("RVL_ALLOW_UNSIGNED", "1")
+        .env("RVL_ALLOW_UNSIGNED_PLUGIN", "1")
         .env("RVL_OFFLINE", "1")
         .env("RVL_API_KEY", "pk_test")
         .env("RVL_API_URL", "http://127.0.0.1:9")

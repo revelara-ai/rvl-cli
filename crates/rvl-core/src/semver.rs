@@ -1,5 +1,9 @@
 //! Semver comparison for installed-vs-served drift, mirroring rvl-cli's
 //! `internal/plugin/semver.go` so both surfaces report drift identically.
+//!
+//! Two callers: plugin-content drift (`rvl-skills`) and the `status` CLI
+//! update nag (`rvl-data`). rvl-cli uses the one `plugin.SemVerNewer` for
+//! both, so this crate does too.
 
 /// Strip build metadata (after `+`) from a version string.
 /// "0.2.0+abc123f" -> "0.2.0"; "dev-abc123f+abc123f" -> "dev-abc123f".

@@ -24,7 +24,7 @@ pub struct Env<'a> {
     pub home: &'a Path,
     /// RVL_OFFLINE=1: no fetch attempted, cache-only.
     pub offline: bool,
-    /// RVL_ALLOW_UNSIGNED=1: accept content without a verifiable
+    /// RVL_ALLOW_UNSIGNED_PLUGIN=1: accept content without a verifiable
     /// integrity manifest (self-hosted servers without signing).
     pub allow_unsigned: bool,
     /// RVL_ALLOW_MISSING_CHECKSUM=1: accept a download without the
@@ -86,7 +86,7 @@ fn check_cached_signature(
             Ok(())
         }
         None => anyhow::bail!(
-            "cached skills for {editor} carry no signing key; set RVL_ALLOW_UNSIGNED=1 \
+            "cached skills for {editor} carry no signing key; set RVL_ALLOW_UNSIGNED_PLUGIN=1 \
              to install them anyway, or re-run online against a signing-enabled server"
         ),
     }
@@ -142,12 +142,12 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
         }
         Err(e) if env.allow_unsigned => {
             warnings.push(format!(
-                "installing without signature verification (RVL_ALLOW_UNSIGNED=1): {e}"
+                "installing without signature verification (RVL_ALLOW_UNSIGNED_PLUGIN=1): {e}"
             ));
         }
         Err(e) => anyhow::bail!(
             "could not fetch signing key for integrity verification: {e}; \
-             set RVL_ALLOW_UNSIGNED=1 to install unsigned content"
+             set RVL_ALLOW_UNSIGNED_PLUGIN=1 to install unsigned content"
         ),
     }
 
@@ -759,7 +759,10 @@ mod tests {
 
         let env = fx.env(&store, &fetcher);
         let err = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
-        assert!(err.to_string().contains("RVL_ALLOW_UNSIGNED"), "got: {err}");
+        assert!(
+            err.to_string().contains("RVL_ALLOW_UNSIGNED_PLUGIN"),
+            "got: {err}"
+        );
 
         let mut env = fx.env(&store, &fetcher);
         env.allow_unsigned = true;

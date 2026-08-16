@@ -4,9 +4,13 @@
 //! `login` is interactive (no JSON contract); `status` is a human report
 //! whose behavior contract is: show the configured endpoint/key/org, make
 //! one live credential check, exit 1 with "Connection failed" when it
-//! fails. rvl-cli's update-check and editor-plugin sections are not
-//! ported — the Rust binary's equivalent surface is `skills status`, and
-//! `status` points there instead.
+//! fails, then report CLI-update and installed-plugin drift.
+//!
+//! The update nag and the plugin section were briefly dropped in the port
+//! and restored in po-av01j.185: the v1 -> v2 cutover's P4 step relies on
+//! the nag to move stragglers, and it is the ONLY signal a v1 holdout
+//! gets. The plugin section is rendered by the caller (`rvl`), which owns
+//! the skills machinery this crate deliberately does not depend on.
 
 use crate::client::{resolve_organization_id, validate_credentials, Client};
 use crate::config::{self, DataConfig, DEFAULT_API_URL};
@@ -123,8 +127,15 @@ pub fn run_logout() -> ExitCode {
     }
 }
 
-/// `status`: report the active configuration and check the connection.
-pub fn run_status(version: &str) -> ExitCode {
+/// `status`: report the active configuration, check the connection, then
+/// report CLI-update and installed-plugin drift.
+///
+/// `plugins` renders the "Plugins:" section and is called ONLY after the
+/// credential check passes — it makes its own server call, and rvl-cli
+/// does not reach the network for it on a connection failure either. It is
+/// a callback because the skills machinery lives in `rvl-skills`, which
+/// this crate does not (and should not) depend on.
+pub fn run_status(version: &str, plugins: impl FnOnce() -> Option<String>) -> ExitCode {
     let (cfg, client) = match crate::client::load_and_resolve() {
         Ok(v) => v,
         Err(f) => {
@@ -135,6 +146,17 @@ pub fn run_status(version: &str) -> ExitCode {
     match status_output(&cfg, &client, version) {
         Ok(out) => {
             print!("{out}");
+            // rvl-cli puts the whole update block on stderr so a piped
+            // `status` stays parseable; same here.
+            if let Some(notice) = crate::update_check::update_notice(
+                version,
+                crate::update_check::fetch_latest_cli_version().as_deref(),
+            ) {
+                eprint!("{notice}");
+            }
+            if let Some(section) = plugins() {
+                print!("{section}");
+            }
             ExitCode::SUCCESS
         }
         Err(f) => {
@@ -179,10 +201,6 @@ pub fn status_output(cfg: &DataConfig, client: &Client, version: &str) -> CmdRes
     }
     let _ = writeln!(out, "\nChecking connection...");
     let _ = writeln!(out, "Status: Connected");
-    let _ = writeln!(
-        out,
-        "\nSkills: run '{BIN} skills status' for installed workflow-skill versions."
-    );
     Ok(out)
 }
 

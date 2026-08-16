@@ -653,6 +653,39 @@ pub fn derive_idempotency_key(req: &ScanRequest) -> String {
 /// request. Array fields (findings, components, dependencies) concatenate;
 /// scalar/object fields use the last non-zero value, with a stderr warning
 /// when a later file overrides an earlier one.
+/// Merge `--cs-file` into a submission (po-av01j.185 item 3), mirroring
+/// rvl-cli `scan.go`.
+///
+/// Works with `--file` and `--scan-dir` alike. Both merges are FALLBACKS,
+/// never overrides: an in-band `control_structure` wins over the file's,
+/// and the file's `repo_url` fills in only when the submission has none.
+/// That ordering is what makes the flag safe to add to an existing
+/// invocation — it can only fill gaps.
+///
+/// This is NOT `stpa submit`: that POSTs a whole STPA model (losses, UCAs,
+/// loss scenarios) to `/control-structure/model`. This attaches the control
+/// structure to the scan payload and nothing else.
+pub fn merge_cs_file(path: &Path, req: &mut ScanRequest) -> Result<(), Failure> {
+    let data = std::fs::read(path)
+        .map_err(|e| Failure::runtime(format!("Error reading --cs-file: {e}")))?;
+    #[derive(serde::Deserialize)]
+    struct CsPayload {
+        #[serde(default)]
+        repo_url: String,
+        #[serde(default)]
+        control_structure: Option<ControlStructureData>,
+    }
+    let payload: CsPayload = serde_json::from_slice(&data)
+        .map_err(|e| Failure::runtime(format!("Error parsing --cs-file: {e}")))?;
+    if !payload.repo_url.is_empty() && req.repo_url.is_empty() {
+        req.repo_url = payload.repo_url;
+    }
+    if payload.control_structure.is_some() && req.control_structure.is_none() {
+        req.control_structure = payload.control_structure;
+    }
+    Ok(())
+}
+
 pub fn merge_scan_dir(dir: &Path, req: &mut ScanRequest) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("glob scan-dir: {e}"))?;
     let mut files: Vec<PathBuf> = entries
@@ -1189,11 +1222,42 @@ pub struct SubmitArgs {
     pub dry_run: bool,
     pub timeout: Option<String>,
     pub format: Option<String>,
+    /// rvl-cli `--review`: the wire value an INTERACTIVE rvl-cli run sends,
+    /// `scan_mode: "review"` (po-av01j.185 item 3). The flag carries the
+    /// mode and NOTHING else here — rvl-cli's interactive confirmation TUI
+    /// is deliberately not ported, and the server's canonical idempotency
+    /// key excludes `scan_mode`, so this cannot change dedup behavior.
+    /// rvl-cli's own precedence is `--ci > --auto-infer > --review`.
+    pub review: bool,
+    /// rvl-cli `--cs-file`: merge a control structure from a SEPARATE file
+    /// into this submission (po-av01j.185 item 3). Distinct from `stpa
+    /// submit`, which POSTs a full STPA model to
+    /// `/control-structure/model`; this only attaches `control_structure`
+    /// (and a `repo_url` fallback) to the scan payload.
+    pub cs_file: Option<PathBuf>,
 }
 
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// The `scan_mode` this submission puts on the wire.
+///
+/// Submission is non-interactive here, so the mode is a WIRE VALUE only:
+/// "ci" carries the JSON contract, "review" is what rvl-cli sends for an
+/// interactive run, "auto" is everything else. rvl-cli resolves
+/// `--ci > --auto-infer > --review > (TTY ? review : auto)`; here `--ci`
+/// folds into `--format json` and `--auto-infer` selects the default (the
+/// caller cancels `review` when both are typed), so checking json first
+/// reproduces the whole chain. rvl-cli's interactive confirmation TUI is
+/// deliberately not ported — `--review` carries the mode and nothing else.
+fn resolve_scan_mode(format: &OutputFormat, review: bool) -> &'static str {
+    match (format, review) {
+        (OutputFormat::Json, _) => "ci",
+        (OutputFormat::Text, true) => "review",
+        (OutputFormat::Text, false) => "auto",
+    }
 }
 
 fn fail(f: Failure) -> ExitCode {
@@ -1359,6 +1423,15 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     }
 
+    // Merge a control structure from a separate file, before normalization
+    // so a hand-written file gets the same field-name fixups (rvl-cli
+    // scan.go does the merge in the same position).
+    if let Some(path) = &args.cs_file {
+        if let Err(f) = merge_cs_file(path, &mut req) {
+            return fail(f);
+        }
+    }
+
     normalize_control_structure(&mut req.control_structure);
 
     req.service = service.clone();
@@ -1368,12 +1441,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     req.metadata.scanner_id = format!("{BIN}/{version}");
     populate_git_metadata(&mut req.metadata, &target);
 
-    // Submission is non-interactive here: "ci" carries the JSON contract,
-    // "auto" everything else (the interactive review prompt is not ported).
-    req.scan_mode = match format {
-        OutputFormat::Json => "ci".to_string(),
-        OutputFormat::Text => "auto".to_string(),
-    };
+    req.scan_mode = resolve_scan_mode(&format, args.review).to_string();
 
     // `.revelara.yaml` attribution and scoring (rvl-cli scan.go, same order):
     // per-finding `linked_services` from the components, then the criticality
@@ -2121,5 +2189,100 @@ mod tests {
         assert!(arr.is_err(), "bare array must not parse as a request");
         let findings: Vec<Value> = serde_json::from_str(r#"[{"title":"t"}]"#).unwrap();
         assert_eq!(findings.len(), 1);
+    }
+
+    // --- po-av01j.185 item 3: --review and --cs-file ---
+
+    #[test]
+    fn scan_mode_reproduces_rvl_clis_precedence() {
+        // Default: the non-interactive mode, unchanged by this item.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Text, false), "auto");
+        // --review carries the wire value an interactive rvl-cli run sends.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Text, true), "review");
+        // --ci / --format json outrank --review, exactly as rvl-cli does.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Json, false), "ci");
+        assert_eq!(resolve_scan_mode(&OutputFormat::Json, true), "ci");
+    }
+
+    #[test]
+    fn scan_mode_moves_the_client_key_which_is_why_the_server_recomputes_one() {
+        // Honest statement of the mechanism, not a wish: scan_mode IS part
+        // of the request body, so it moves the CLIENT-derived key. That is
+        // exactly the poisoning the server-side canonical key (backend
+        // commit a40b6d8e, po-av01j.186/.189) exists to absorb: it re-derives a
+        // content identity with scanner_id, git_commit, git_branch,
+        // scan_mode and idempotency_key excluded, and looks up on that key
+        // first. So `--review` is safe to add to an existing invocation
+        // even though this local hash changes.
+        let mut auto = base_request();
+        auto.scan_mode = "auto".into();
+        let mut review = base_request();
+        review.scan_mode = "review".into();
+        assert_ne!(
+            derive_idempotency_key(&auto),
+            derive_idempotency_key(&review)
+        );
+        // ...and the only difference between the two bodies is that field,
+        // which is what makes the server's exclusion sufficient.
+        assert_eq!(
+            idempotency_canonical_body(&auto)
+                .replace(r#""scan_mode":"auto""#, r#""scan_mode":"review""#),
+            idempotency_canonical_body(&review)
+        );
+    }
+
+    fn write_cs(dir: &std::path::Path, body: &str) -> PathBuf {
+        let p = dir.join("cs.json");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn cs_file_supplies_the_control_structure_and_a_repo_url_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_cs(
+            tmp.path(),
+            r#"{"repo_url":"https://example.test/repo","control_structure":{"nodes":[{"id":"api"}],"scanned_files":12,"scanned_lines":3400}}"#,
+        );
+        let mut req = base_request();
+        req.repo_url = String::new();
+        req.control_structure = None;
+        merge_cs_file(&path, &mut req).unwrap();
+        assert_eq!(req.repo_url, "https://example.test/repo");
+        let cs = req.control_structure.as_ref().expect("merged");
+        assert_eq!(cs.scanned_files, 12);
+        assert_eq!(cs.scanned_lines, 3400);
+    }
+
+    #[test]
+    fn cs_file_never_overrides_what_the_submission_already_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_cs(
+            tmp.path(),
+            r#"{"repo_url":"https://example.test/from-file","control_structure":{"nodes":[{"id":"from-file"}],"scanned_files":1}}"#,
+        );
+        let mut req = base_request();
+        req.repo_url = "https://example.test/in-band".into();
+        req.control_structure = Some(ControlStructureData {
+            scanned_files: 99,
+            ..Default::default()
+        });
+        merge_cs_file(&path, &mut req).unwrap();
+        assert_eq!(req.repo_url, "https://example.test/in-band");
+        assert_eq!(req.control_structure.as_ref().unwrap().scanned_files, 99);
+    }
+
+    #[test]
+    fn cs_file_errors_name_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = base_request();
+        let missing = tmp.path().join("nope.json");
+        let e = merge_cs_file(&missing, &mut req).unwrap_err();
+        assert!(e.msg.starts_with("Error reading --cs-file:"), "{}", e.msg);
+        assert_eq!(e.code, 1);
+
+        let bad = write_cs(tmp.path(), "not json");
+        let e = merge_cs_file(&bad, &mut req).unwrap_err();
+        assert!(e.msg.starts_with("Error parsing --cs-file:"), "{}", e.msg);
     }
 }
