@@ -636,10 +636,21 @@ pub fn idempotency_canonical_body(req: &ScanRequest) -> String {
 
 /// A stable 32-hex-char key derived from the request body with the
 /// idempotency key and the submitter-identifying metadata cleared (see
-/// [`key_identity_request`]). Two invocations against the same service with
-/// the same findings/scan metadata produce the same key — including across
-/// the v1 Go binary and the v2 Rust binary — so the server-side cache
-/// recognizes the second submission as a retry.
+/// [`key_identity_request`]). Two invocations of THIS binary against the same
+/// service with the same findings/scan metadata produce the same key, so the
+/// server-side cache recognizes the second submission as a retry.
+///
+/// It does NOT agree with rvl-cli v1's key, and cannot: v1's
+/// `deriveIdempotencyKey` (scan.go:1039) clears only the key field, leaving
+/// `scanner_id` in the hash — and `scanner_id` differs by construction
+/// (`rely-cli-<v>` vs `rvl/<v>`). An earlier version of this comment claimed
+/// cross-binary agreement; that was never achievable, and the user ruled
+/// against patching v1 to make it so (po-av01j.186).
+///
+/// Cross-version dedup is handled SERVER-side instead: the API computes its
+/// own canonical key over the scan's content, ignoring submitter identity,
+/// so a v1 submission and a v2 retry collapse to one scan regardless of what
+/// either client sends here (backend migration 269).
 pub fn derive_idempotency_key(req: &ScanRequest) -> String {
     let canonical = idempotency_canonical_body(req);
     let sum = Sha256::digest(canonical.as_bytes());

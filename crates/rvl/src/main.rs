@@ -241,7 +241,14 @@ enum Cmd {
         /// which ingests a whole STPA model at `/control-structure/model`;
         /// this attaches `control_structure` (and a `repo_url` fallback) to
         /// the scan payload. An in-band control structure wins.
-        #[arg(long)]
+        ///
+        /// `path_allowing_empty` for the same reason as --target/--file/
+        /// --scan-dir: rvl-cli guards this at scan.go:667 with
+        /// `if csFile != ""`, so an empty value means "not given" and the scan
+        /// proceeds. clap's stock PathBuf parser rejects an empty path, which
+        /// made both spellings exit 2 and contradicted this flag's own
+        /// Empty::Absent row (audit 3).
+        #[arg(long, value_parser = empty_flag::path_allowing_empty)]
         cs_file: Option<PathBuf>,
     },
     /// Show EXACTLY what a scan would report to the Revelara spec factory about

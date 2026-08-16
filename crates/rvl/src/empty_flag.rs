@@ -491,7 +491,7 @@ mod tests {
             }
             let mut argv: Vec<String> = std::iter::once("rvl".to_string())
                 .chain(path.split(' ').map(String::from))
-                .chain(sample_positionals(path).iter().map(|s| s.to_string()))
+                .chain(sample_positionals(&root, path))
                 .collect();
             argv.push(format!("--{flag}="));
             let equals = Cli::try_parse_from(&argv).is_err();
@@ -520,12 +520,56 @@ mod tests {
             }
             let mut argv: Vec<String> = std::iter::once("rvl".to_string())
                 .chain(path.split(' ').map(String::from))
-                .chain(sample_positionals(path).iter().map(|s| s.to_string()))
+                .chain(sample_positionals(&root, path))
                 .collect();
             argv.push(format!("--{flag}="));
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
                 "{path} --{flag}= must be a usage error (rvl-cli exits 2)"
+            );
+        }
+    }
+
+    /// The other half, and the half whose absence let a wrong row survive
+    /// three audits: an `Absent`/`Value` row CLAIMS the parser accepts an
+    /// empty value, and until now nothing checked that claim.
+    ///
+    /// `("scan", "cs-file", Empty::Absent)` was wrong for exactly this
+    /// reason — clap's stock `PathBuf` parser rejected an empty path, so both
+    /// spellings exited 2 while the table said the flag was absent. The row
+    /// was read off the right Go guard (scan.go:667) and was still wrong
+    /// about our own binary, which is what a fixture can drift into when it
+    /// is only ever checked in one direction.
+    ///
+    /// Both spellings, because they diverged: rvl-cli's hand-rolled parsers
+    /// accept `--flag=` and `--flag ''` down different code paths.
+    #[test]
+    fn every_non_error_flag_accepts_an_empty_value() {
+        let root = Cli::command();
+        for (path, flag, kind) in SEMANTICS {
+            if *kind == Empty::Error {
+                continue;
+            }
+            let base: Vec<String> = std::iter::once("rvl".to_string())
+                .chain(path.split(' ').map(String::from))
+                .chain(sample_positionals(&root, path))
+                .collect();
+
+            let mut equals = base.clone();
+            equals.push(format!("--{flag}="));
+            assert!(
+                Cli::try_parse_from(&equals).is_ok(),
+                "{path} --{flag}= is declared {kind:?}, so the parser must ACCEPT it \
+                 and leave the decision to the consumer — it was rejected instead"
+            );
+
+            let mut spaced = base;
+            spaced.push(format!("--{flag}"));
+            spaced.push(String::new());
+            assert!(
+                Cli::try_parse_from(&spaced).is_ok(),
+                "{path} --{flag} '' is declared {kind:?}, so the parser must ACCEPT it \
+                 — it was rejected instead (the two spellings must not diverge)"
             );
         }
     }
@@ -544,12 +588,19 @@ mod tests {
         arg(root, path, flag).is_some_and(clap::Arg::is_require_equals_set)
     }
 
-    fn arg<'a>(root: &'a clap::Command, path: &str, flag: &str) -> Option<&'a clap::Arg> {
+    /// Walk a space-separated subcommand path to its `clap::Command`.
+    fn resolve<'a>(root: &'a clap::Command, path: &str) -> Option<&'a clap::Command> {
         let mut cmd = root;
         for seg in path.split(' ').filter(|s| !s.is_empty()) {
             cmd = cmd.get_subcommands().find(|c| c.get_name() == seg)?;
         }
-        cmd.get_arguments().find(|a| a.get_long() == Some(flag))
+        Some(cmd)
+    }
+
+    fn arg<'a>(root: &'a clap::Command, path: &str, flag: &str) -> Option<&'a clap::Arg> {
+        resolve(root, path)?
+            .get_arguments()
+            .find(|a| a.get_long() == Some(flag))
     }
 
     /// `risk list --limit=` must NOT quietly become the default (regression
@@ -635,6 +686,7 @@ mod tests {
     /// divergence by construction.
     #[test]
     fn the_two_empty_spellings_normalize_to_the_same_thing() {
+        let root = Cli::command();
         for (path, flag, _) in SEMANTICS.iter().filter(|(p, _, _)| {
             // The rvl-native commands normalized by `normalize`.
             matches!(
@@ -644,7 +696,7 @@ mod tests {
         }) {
             let base: Vec<String> = std::iter::once("rvl".to_string())
                 .chain(path.split(' ').map(String::from))
-                .chain(sample_positionals(path).iter().map(|s| s.to_string()))
+                .chain(sample_positionals(&root, path))
                 .collect();
             let mut eq = base.clone();
             eq.push(format!("--{flag}="));
@@ -672,11 +724,35 @@ mod tests {
         }
     }
 
-    fn sample_positionals(path: &str) -> &'static [&'static str] {
-        match path {
-            "explain" | "suppress" => &["2ben"],
-            _ => &[],
-        }
+    /// Placeholder values for a subcommand's REQUIRED positionals, derived
+    /// from the clap tree rather than hardcoded.
+    ///
+    /// This used to be a two-entry `match` covering `explain` and `suppress`,
+    /// which quietly weakened every test that used it: a command with an
+    /// unsatisfied positional fails to parse for that reason, so
+    /// `every_typed_error_flag_is_rejected_at_parse_time` could pass on a
+    /// `MissingRequiredArgument` without the empty value ever being judged.
+    /// Deriving them means a new subcommand with a positional is handled the
+    /// day it lands instead of silently hollowing out the assertions.
+    fn sample_positionals(root: &clap::Command, path: &str) -> Vec<String> {
+        let Some(cmd) = resolve(root, path) else {
+            return Vec::new();
+        };
+        cmd.get_positionals()
+            .filter(|p| p.is_required_set())
+            .map(|p| {
+                // Values that satisfy the typed parsers we actually use for
+                // positionals; anything else takes a harmless string.
+                match p
+                    .get_value_names()
+                    .and_then(|n| n.first())
+                    .map(|v| v.as_str())
+                {
+                    Some("ENTITY_TYPE") => "fact".to_string(),
+                    _ => "x".to_string(),
+                }
+            })
+            .collect()
     }
 
     /// Debug rendering is enough to compare two parses of the same command.
