@@ -540,7 +540,7 @@ pub fn scope_of(path: &str) -> ScopeClass {
 /// Repo-scoped construction facts. An `http.Server`'s WriteTimeout bounds a
 /// handler but appears in no handler's caller chain, so it is carried forward
 /// from here rather than dragged backward into a packet.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigFact {
     #[serde(rename = "type", default)]
     pub type_name: String,
@@ -560,6 +560,42 @@ pub struct RepoConfig {
     pub snapshot_id: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub constructions: Vec<ConfigFact>,
+}
+
+impl RepoConfig {
+    /// Fold a second repo-scoped record into this one.
+    ///
+    /// The concatenated multi-language stream carries one `repo_config` per
+    /// helper RUN: each of goindex/tsindex/javaindex emits one, and a batched
+    /// `--files` invocation emits one PER BATCH. Until po-av01j.209's
+    /// follow-up, [`parse_stream`] let the LAST one win unconditionally, so a
+    /// later language's EMPTY `repo_config` erased an earlier language's
+    /// construction facts — on a Go+Java repo, javaindex's "emitted even when
+    /// empty" record silently dropped every `http.Server{WriteTimeout: ...}`
+    /// fact goindex had just put on the wire. Only a non-empty check in one
+    /// caller (`retrieve_full`) papered over one instance of that hazard.
+    ///
+    /// Merging is the faithful semantics: construction facts are keyed by
+    /// type name downstream, and type names are language-qualified
+    /// (`net/http.Server` vs `java.net.http.HttpClient`), so facts from two
+    /// languages never collide — they accumulate. Duplicates are dropped by
+    /// full equality because a batched helper emits its whole-repo
+    /// constructions once per batch; under last-wins that self-deduplicated,
+    /// under merge it must be explicit.
+    ///
+    /// The first non-empty `snapshot_id` wins: every helper in one scan is
+    /// invoked with the same `--name`, so later values are either identical
+    /// or the empty string of a zero-valued record.
+    pub fn absorb(&mut self, other: RepoConfig) {
+        if self.snapshot_id.is_empty() {
+            self.snapshot_id = other.snapshot_id;
+        }
+        for fact in other.constructions {
+            if !self.constructions.contains(&fact) {
+                self.constructions.push(fact);
+            }
+        }
+    }
 }
 
 /// Parse a retriever's JSONL stream into sites plus the repo-scoped record.
@@ -599,7 +635,10 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
             // serde would mint a junk site out of it.
             if kind == "repo_config" {
                 if let Ok(rc) = serde_json::from_value::<RepoConfig>(v) {
-                    cfg = rc;
+                    // MERGED, never replaced (see [`RepoConfig::absorb`]): on
+                    // a polyglot stream a later language's empty repo_config
+                    // must not erase an earlier language's construction facts.
+                    cfg.absorb(rc);
                 }
             }
             continue;
@@ -771,6 +810,70 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(sites[0].id(), "a.go:7");
+    }
+
+    /// THE POLYGLOT ERASURE HAZARD (po-av01j.209 follow-up). The concatenated
+    /// multi-language stream carries one `repo_config` per helper run —
+    /// goindex, tsindex and javaindex each emit one, javaindex "even when
+    /// empty" — and last-wins meant whichever language ran LAST decided
+    /// whether every other language's construction facts survived. A Go
+    /// `http.Server{WriteTimeout}` fact erased by Java's empty record is a
+    /// timeout the propagation layer can no longer see: a silent false
+    /// negative. Facts must survive in BOTH orders.
+    #[test]
+    fn a_second_empty_repo_config_does_not_erase_construction_facts() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#;
+        let java_empty = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        for (name, stream) in [
+            ("facts first", format!("{go}\n{java_empty}\n")),
+            ("empty first", format!("{java_empty}\n{go}\n")),
+        ] {
+            let (_, cfg, skipped) = parse_stream(&stream);
+            assert_eq!(skipped, 0, "{name}");
+            assert_eq!(
+                cfg.constructions.len(),
+                1,
+                "{name}: the non-empty language's facts must survive"
+            );
+            assert_eq!(cfg.constructions[0].type_name, "net/http.Server", "{name}");
+            assert_eq!(cfg.snapshot_id, "x", "{name}");
+        }
+    }
+
+    /// Two languages that BOTH carry facts accumulate — merging is the point,
+    /// not a tiebreak. And a repeated record (a batched helper emits its
+    /// whole-repo constructions once per `--files` batch) must not duplicate:
+    /// last-wins deduplicated that by accident, the merge does it on purpose.
+    #[test]
+    fn repo_configs_from_two_languages_merge_and_batches_do_not_duplicate() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#;
+        let ts = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"axios.AxiosInstance","fields":["timeout"]}]}"#;
+        let stream = format!("{go}\n{ts}\n{go}\n");
+        let (_, cfg, skipped) = parse_stream(&stream);
+        assert_eq!(skipped, 0);
+        let types: Vec<&str> = cfg
+            .constructions
+            .iter()
+            .map(|c| c.type_name.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["net/http.Server", "axios.AxiosInstance"],
+            "both languages' facts must be present, each exactly once"
+        );
+    }
+
+    /// The degenerate record the original bug emitted
+    /// (`{"kind":"","snapshot_id":"","constructions":null}`) has an empty
+    /// kind, so it never reaches the repo_config arm at all — but a
+    /// zero-valued record that DOES say repo_config must also change nothing.
+    #[test]
+    fn a_zero_valued_repo_config_changes_nothing() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#;
+        let zero = r#"{"kind":"repo_config","snapshot_id":"","constructions":null}"#;
+        let (_, cfg, _) = parse_stream(&format!("{go}\n{zero}\n"));
+        assert_eq!(cfg.constructions.len(), 1);
+        assert_eq!(cfg.snapshot_id, "x");
     }
 
     #[test]

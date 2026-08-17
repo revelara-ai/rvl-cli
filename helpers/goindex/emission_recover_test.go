@@ -21,7 +21,7 @@ func recoverFixture(t *testing.T, body string) []RetrievedSite {
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := runRetrieveAll(dir, "t")
+	got, _, _ := runRetrieveAll(dir, "t")
 	var sw []RetrievedSite
 	for _, s := range got {
 		if s.ClientType == "recover_block" {
@@ -170,7 +170,7 @@ func Handler() {
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := runRetrieveAll(dir, "t")
+	got, _, _ := runRetrieveAll(dir, "t")
 	for _, s := range got {
 		if s.ClientType == "recover_block" {
 			t.Fatalf("a recover that logs via the stdlib is not a swallow: %+v", s)
