@@ -650,7 +650,7 @@ mod tests {
     // half in this repo, by design), so the matrix exercises the layering
     // seam above the stores: TieredLoaded built from constructed envelopes.
     // The store paths themselves are covered live by the flywheel acceptance
-    // harness (polaris scripts/flywheel_acceptance.sh step 7).
+    // harness (server-side repo, scripts/flywheel_acceptance.sh step 7).
 
     fn loaded_with(specs: serde_json::Value, judgments: Option<serde_json::Value>) -> Loaded {
         Loaded {
