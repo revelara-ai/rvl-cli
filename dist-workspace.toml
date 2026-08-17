@@ -40,4 +40,4 @@ pr-run-mode = "plan"
 # Extra steps spliced into each per-target build job before `dist build`.
 # Cross-builds goindex, the one retriever cargo cannot produce, into
 # crates/rvl/dist-extras/ so `include` can pack it (po-aml3h).
-github-build-setup = "build-setup.yml"
+github-build-setup = "../build-setup.yml"
