@@ -196,3 +196,60 @@ func TestStandardLogIsRecognisedButLogSubpackagesAreNotDoubleCounted(t *testing.
 		t.Error("a package merely starting with 'log' must not match")
 	}
 }
+
+// po-av01j.142, fourth shape, found on nats-server AFTER the first fix shipped.
+// The same panic-to-error idiom one indirection over: the failure goes back
+// through a POINTER OUT-PARAMETER rather than a named result. A
+// `defer convertPanicToError(&tok, &err)` helper is the ordinary Go way to
+// share this across call sites, and nats names the function exactly that.
+func TestRecoverAssigningAnErrorOutParamIsNotASwallow(t *testing.T) {
+	sw := recoverFixture(t, `
+func ConvertPanicToError(e *error) {
+	if e == nil || *e != nil {
+		return
+	} else if err := recover(); err == nil {
+		return
+	} else {
+		*e = fmt.Errorf("%v", err)
+	}
+}
+`)
+	if len(sw) != 0 {
+		t.Fatalf("propagation through *error reported as a swallow: %+v", sw)
+	}
+}
+
+// The slice form nats uses for its error LIST.
+func TestRecoverAppendingToAnErrorSliceOutParamIsNotASwallow(t *testing.T) {
+	sw := recoverFixture(t, `
+func ConvertPanicToErrorList(errors *[]error) {
+	if errors == nil {
+		return
+	} else if err := recover(); err == nil {
+		return
+	} else {
+		*errors = append(*errors, fmt.Errorf("%v", err))
+	}
+}
+`)
+	if len(sw) != 0 {
+		t.Fatalf("propagation through *[]error reported as a swallow: %+v", sw)
+	}
+}
+
+// A pointer parameter of some OTHER type is not an escape hatch: writing the
+// panic into an unrelated out-param still loses the error.
+func TestRecoverWritingToANonErrorOutParamIsStillASwallow(t *testing.T) {
+	sw := recoverFixture(t, `
+func StashIt(msg *string) {
+	defer func() {
+		if r := recover(); r != nil {
+			*msg = fmt.Sprint(r)
+		}
+	}()
+}
+`)
+	if len(sw) != 1 {
+		t.Fatalf("a non-error out-param must not clear the swallow, got %+v", sw)
+	}
+}

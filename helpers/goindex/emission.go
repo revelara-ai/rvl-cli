@@ -184,6 +184,56 @@ func collectEmissions(pkgs []*packages.Package, src *srcIndex, root, snapshot st
 	return out
 }
 
+// errorOutParams returns the identifiers of parameters through which a
+// recovered panic can be handed BACK to the caller: a pointer to an error, or
+// a pointer to a slice of them.
+//
+// Found on nats-server (po-av01j.142): the first version of this check only
+// understood named RESULTS, so it still flagged
+//
+//	// use in defer to recover from panic and turn it into an error
+//	func convertPanicToError(lastToken *token, e *error) {
+//	    ... else if err := recover(); err == nil { return
+//	    } else { *e = &configErr{*lastToken, fmt.Sprint(err)} }
+//
+// which is the same idiom one indirection over. A `defer f(&tok, &err)` helper
+// is the ordinary Go way to share panic-to-error conversion across call sites,
+// and the function name says so outright.
+func errorOutParams(ft *ast.FuncType) map[string]bool {
+	out := map[string]bool{}
+	if ft == nil || ft.Params == nil {
+		return out
+	}
+	for _, f := range ft.Params.List {
+		star, ok := f.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		// *error, or *[]error.
+		isErr := func(e ast.Expr) bool {
+			if id, ok := e.(*ast.Ident); ok {
+				return id.Name == "error"
+			}
+			return false
+		}
+		ok = isErr(star.X)
+		if !ok {
+			if arr, isArr := star.X.(*ast.ArrayType); isArr {
+				ok = isErr(arr.Elt)
+			}
+		}
+		if !ok {
+			continue
+		}
+		for _, n := range f.Names {
+			if n.Name != "" && n.Name != "_" {
+				out[n.Name] = true
+			}
+		}
+	}
+	return out
+}
+
 // namedResults returns the identifiers of a function type's named return
 // values. A function with unnamed results cannot propagate a recovered panic
 // by assignment, only by re-panicking.
@@ -256,8 +306,15 @@ func recoverPropagates(info *types.Info, fd *ast.FuncDecl) bool {
 			return isB && b.Name() == "panic"
 		case *ast.AssignStmt:
 			for _, lhs := range s.Lhs {
+				// A named result: `err = ...`
 				if id, ok := lhs.(*ast.Ident); ok && named[id.Name] {
 					return true
+				}
+				// An error out-parameter: `*e = ...` / `*errors = append(...)`
+				if star, ok := lhs.(*ast.StarExpr); ok {
+					if id, ok := star.X.(*ast.Ident); ok && named[id.Name] {
+						return true
+					}
 				}
 			}
 		}
@@ -306,7 +363,11 @@ func recoverPropagates(info *types.Info, fd *ast.FuncDecl) bool {
 			if r, o := scopeHas(fl.Body, named); r && o {
 				prop = true
 			}
-			if walk(fl.Body, namedResults(fl.Type)) {
+			inner := namedResults(fl.Type)
+			for k := range errorOutParams(fl.Type) {
+				inner[k] = true
+			}
+			if walk(fl.Body, inner) {
 				prop = true
 			}
 			return false
@@ -316,7 +377,13 @@ func recoverPropagates(info *types.Info, fd *ast.FuncDecl) bool {
 		}
 		return prop
 	}
-	return walk(fd.Body, namedResults(fd.Type))
+	// Propagation targets for a scope are its named results AND its error
+	// out-parameters: both hand the failure back to the caller.
+	targets := namedResults(fd.Type)
+	for k := range errorOutParams(fd.Type) {
+		targets[k] = true
+	}
+	return walk(fd.Body, targets)
 }
 
 // functionEmissions aggregates one function's emission calls, plus the
