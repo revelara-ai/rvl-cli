@@ -87,7 +87,7 @@ pub struct Keyset {
 ///    caches.
 /// 2. The PRODUCTION key (minted 2026-08-17, po-av01j.79): private half lives
 ///    only in GCP Secret Manager (revelara-prod-spec-signing-key) and reaches
-///    the prod polaris-worker via the revelara-prod-spec-signing
+///    the production spec-factory worker via the revelara-prod-spec-signing
 ///    ExternalSecret. Everything api.revelara.ai publishes is signed with
 ///    this key.
 pub const DEV_KEYSET_HEX: &[&str] = &[
