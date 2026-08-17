@@ -154,7 +154,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cindex"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clang-sys",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "rustindex"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "rvl"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "cindex",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-cache"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-config"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "ignore",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-content"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "ignore",
  "regex",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-data"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-emission"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rvl-core",
  "rvl-spec",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-eval"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-index"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-propagate"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-skills"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-spec"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-structure"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-triage"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "rvl-core",
