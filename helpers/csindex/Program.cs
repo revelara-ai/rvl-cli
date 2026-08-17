@@ -78,11 +78,39 @@ internal static class Program
         if (retrieve)
         {
             var absRoot = Path.GetFullPath(root);
+            // A root that is not a directory is a caller error, not an empty
+            // repo. The old walk silently yielded nothing here, which read as
+            // "scanned, zero sites" -- the po-av01j.209 shape.
+            if (!Directory.Exists(absRoot))
+            {
+                Console.Error.WriteLine($"csindex: --root {absRoot} is not a directory");
+                return 2;
+            }
             var snapshot = name ?? Path.GetFileName(absRoot.TrimEnd(Path.DirectorySeparatorChar));
             if (string.IsNullOrEmpty(snapshot)) snapshot = absRoot;
-            var records = Retriever.Run(absRoot, snapshot, files);
-            Emit(records);
-            Console.Error.WriteLine($"{snapshot}: {records.Count} retrieved sites");
+            var result = Retriever.Run(absRoot, snapshot, files);
+            Emit(result.Records);
+            EmitStats(snapshot, result);
+            Console.Error.WriteLine(
+                $"{snapshot}: {result.Records.Count} retrieved sites " +
+                $"({result.FilesTotal} files, {result.FilesFailed} failed)");
+            // Exit non-zero when NOTHING was read, so the lane degrades
+            // loudly instead of recording a successful retrieval of zero
+            // sites (po-av01j.209). A tree with genuinely zero .cs files
+            // stays exit 0: the stats record proves the helper ran.
+            if (result.RequestedFilesMatched == 0 && result.FilesRequested > 0)
+            {
+                Console.Error.WriteLine(
+                    $"csindex: none of the requested --files exist under {absRoot}");
+                return 2;
+            }
+            if (result.FilesTotal > 0 && result.FilesParsed == 0)
+            {
+                Console.Error.WriteLine(
+                    "csindex: every discovered file failed to read or parse; " +
+                    "no C# source was retrieved");
+                return 2;
+            }
             return 0;
         }
 
@@ -121,6 +149,58 @@ internal static class Program
         }
         stdout.Flush();
     }
+
+    /// The repo-scoped record this helper writes on EVERY run, whether or not
+    /// any site matched (po-av01j.209). rvl's silent-zero guard keys on it: a
+    /// stream carrying no record rvl recognizes means the helper bailed before
+    /// reaching its own emit path -- exactly the shape that gave a repo whose
+    /// toolchain was broken a permanently green gate. The kind follows
+    /// cindex's `retrieval_stats`, and is deliberately NOT an empty
+    /// `repo_config`: parse_stream folds every repo_config on the concatenated
+    /// polyglot stream into one, so this helper must never put a
+    /// construction-facts record it has no construction facts for on the wire.
+    /// No site_key on purpose -- rvl counts sites by that field.
+    private static void EmitStats(string snapshot, RetrievalResult result)
+    {
+        var stats = new StatsOut
+        {
+            SnapshotId = snapshot,
+            FilesTotal = result.FilesTotal,
+            FilesParsed = result.FilesParsed,
+            FilesFailed = result.FilesFailed,
+            Sites = result.Records.Count,
+        };
+        Console.Out.WriteLine(JsonSerializer.Serialize(stats));
+        Console.Out.Flush();
+    }
+}
+
+/// The unconditional repo-scoped record (po-av01j.209): what this run
+/// attempted, whether or not any site matched.
+internal sealed class StatsOut
+{
+    [JsonPropertyName("packet_schema")] public int PacketSchemaVersion { get; set; } = 2;
+    [JsonPropertyName("kind")] public string Kind { get; set; } = "retrieval_stats";
+    [JsonPropertyName("snapshot_id")] public string SnapshotId { get; set; } = "";
+    [JsonPropertyName("lang")] public string Lang { get; set; } = "csharp";
+    [JsonPropertyName("files_total")] public int FilesTotal { get; set; }
+    [JsonPropertyName("files_parsed")] public int FilesParsed { get; set; }
+    [JsonPropertyName("files_failed")] public int FilesFailed { get; set; }
+    [JsonPropertyName("sites")] public int Sites { get; set; }
+}
+
+/// What a retrieval run produced and, for the stats record, what it attempted.
+internal sealed class RetrievalResult
+{
+    public List<Packet> Records { get; set; } = new();
+    public int FilesTotal { get; set; }
+    public int FilesParsed { get; set; }
+    public int FilesFailed { get; set; }
+    /// How many repo-relative files `--files` requested (0 when unset).
+    public int FilesRequested { get; set; }
+    /// How many of those matched a discovered file. `--files` naming only
+    /// files that do not exist is a loud failure, never an empty success.
+    public int RequestedFilesMatched { get; set; }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,13 +414,18 @@ internal static class Retriever
         ".git", "bin", "obj", "node_modules", "packages", ".vs", "TestResults", "artifacts",
     };
 
-    public static List<Packet> Run(string root, string snapshot, string filesArg)
+    public static RetrievalResult Run(string root, string snapshot, string filesArg)
     {
         // Discover every .cs file (the whole tree feeds the semantic model
         // even when --files narrows what is EMITTED, so an incremental reload
         // still resolves receivers declared in unchanged files).
         var all = Discover(root).ToList();
         var emitOnly = ParseFilesArg(root, filesArg);
+        var result = new RetrievalResult
+        {
+            FilesTotal = all.Count,
+            FilesRequested = emitOnly?.Count ?? 0,
+        };
 
         var trees = new List<SyntaxTree>();
         var pathOf = new Dictionary<SyntaxTree, (string Abs, string Rel)>();
@@ -353,12 +438,18 @@ internal static class Retriever
             }
             catch (Exception err)
             {
+                // Counted, never silently collapsed into "parsed and empty"
+                // (po-av01j.209): a run where EVERY file lands here read
+                // nothing, and exits 2 rather than reporting a clean zero.
                 Console.Error.WriteLine($"skip {rel}: {err.Message}");
+                result.FilesFailed++;
                 continue;
             }
             var tree = CSharpSyntaxTree.ParseText(SourceText.From(text), path: abs);
             trees.Add(tree);
             pathOf[tree] = (abs, rel);
+            result.FilesParsed++;
+            if (emitOnly != null && emitOnly.Contains(rel)) result.RequestedFilesMatched++;
         }
 
         var compilation = CSharpCompilation.Create(
@@ -367,23 +458,24 @@ internal static class Retriever
             PlatformReferences(),
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        var records = new List<Packet>();
         foreach (var tree in trees)
         {
             var (_, rel) = pathOf[tree];
             if (emitOnly != null && !emitOnly.Contains(rel)) continue;
             try
             {
-                records.AddRange(RetrieveTree(tree, compilation.GetSemanticModel(tree), rel, snapshot));
+                result.Records.AddRange(RetrieveTree(tree, compilation.GetSemanticModel(tree), rel, snapshot));
             }
             catch (Exception err)
             {
                 // Honest degradation: a file the walker cannot process is a
                 // logged skip, never a silent hole or a guessed packet.
                 Console.Error.WriteLine($"retrieve failed {rel}: {err.Message}");
+                result.FilesParsed--;
+                result.FilesFailed++;
             }
         }
-        return records;
+        return result;
     }
 
     /// Metadata references for the RUNNING runtime's trusted platform
