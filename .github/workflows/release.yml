@@ -128,7 +128,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Install Go (for the goindex retriever)"
-        uses: "actions/setup-go@v6"
+        uses: "actions/setup-go@v7"
         with:
           "cache": false
           "go-version-file": "helpers/goindex/go.mod"
