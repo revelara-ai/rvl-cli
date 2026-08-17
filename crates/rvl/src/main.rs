@@ -1761,7 +1761,114 @@ fn retrieval_verdict(
 /// A non-zero exit is returned as a typed degradation rather than an error:
 /// deciding whether one language's silence should sink the whole scan is the
 /// orchestrator's call, not this function's.
+/// Is this helper CONTRACTED to put at least one repo-scoped record on its
+/// stream every time it runs successfully?
+///
+/// THE MODEL FIX FOR po-av01j.209. The old model recorded one number per
+/// language -- the SITE count -- so "the retriever produced no packets at all"
+/// and "the retriever produced packets and none of them were call sites"
+/// collapsed into the same `{"state":"scanned","detail":"0"}`. Only the first
+/// is suspicious; the second is an ordinary, common repository. With one number
+/// there was no way to tell them apart, so no guard could be written that did
+/// not also fire on every Go service that happens to make no client calls.
+///
+/// The distinction the stream can already carry is a REPO-SCOPED record: a
+/// per-run record that exists whether or not any site matched. Five of the
+/// seven helpers already emit one unconditionally, verified by reading each
+/// emit path:
+///
+///   goindex     `repo_config`, emitted after every successful retrieve
+///   tsindex     `repo_config`, "one repo-scoped record per run"
+///   javaindex   `repo_config`, "emitted even when empty, like tsindex"
+///   rustindex   `rust_workspace_provenance`, unconditional
+///   cindex      `retrieval_stats`, unconditional
+///
+/// For those, a stream with ZERO records rvl recognizes means the helper never
+/// reached its own emit path -- it gave up early and still exited 0, which is
+/// exactly the po-av01j.209 shape and is a defect no matter which helper does
+/// it. The guard therefore does not depend on any helper's exit-code hygiene.
+///
+/// pyindex and csindex emit SITE packets only, so an empty stream is their
+/// legitimate "no call sites here" answer and the guard cannot speak for them.
+/// That is a helper-contract gap, not a guard bug: giving them a repo-scoped
+/// record of their own would close it. It must be a NEW kind rather than an
+/// empty `repo_config`, because `rvl_core::parse_stream` lets the last
+/// `repo_config` on the concatenated multi-language stream win, so an empty one
+/// from pyindex would erase the Go construction facts.
+fn helper_emits_repo_scoped_record(lang: Lang) -> bool {
+    match lang {
+        Lang::Go | Lang::TypeScript | Lang::Java | Lang::Rust | Lang::CCpp => true,
+        Lang::Python | Lang::CSharp => false,
+    }
+}
+
+/// Records on a helper's stream that rvl can RECOGNIZE: a site packet, or a
+/// repo-scoped record carrying a non-empty `kind`.
+///
+/// Textual rather than a full JSON parse, matching the `"site_key"` counting
+/// idiom already used for the site total: the stream is re-parsed properly
+/// downstream and paying for a second parse of a multi-megabyte stream to
+/// answer a yes/no question is not worth it. Over-counting is the safe
+/// direction -- it can only make the guard quieter, never noisier.
+///
+/// A `kind` of `""` deliberately does NOT count. That is not a hypothetical:
+/// goindex's zero-value `RepoConfig` serialises as
+/// `{"kind":"","snapshot_id":"","constructions":null}`, which is what a helper
+/// emits when it bailed before doing any work.
+fn recognized_records(text: &str) -> usize {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains("\"site_key\"") || has_non_empty_kind(l))
+        .count()
+}
+
+/// `"kind": "<something>"` with a non-empty value, tolerating the whitespace a
+/// pretty-printer might insert.
+fn has_non_empty_kind(line: &str) -> bool {
+    line.split("\"kind\"").skip(1).any(|rest| {
+        let Some(rest) = rest.trim_start().strip_prefix(':') else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        rest.starts_with('"') && !rest.starts_with("\"\"")
+    })
+}
+
+/// The structural guard (po-av01j.209): a language that was DETECTED, whose
+/// helper exited 0, and whose stream carried nothing rvl recognizes, did not
+/// scan anything -- whatever the exit code claimed.
+///
+/// Returns the degradation to report, or `None` when the stream is fine.
+///
+/// This is deliberately INDEPENDENT of helper exit codes. The bead's helper
+/// printed its error, emitted a degenerate record and exited 0; every downstream
+/// honesty mechanism keys on a lane that failed, so all of them stayed silent.
+/// Fixing that helper is necessary and not sufficient: the next helper to
+/// acquire the same bug would be equally invisible. A check that would have
+/// caught it without anyone knowing goindex was broken belongs here, at the one
+/// place every helper's output passes through.
+///
+/// `DegradeKind::Failed` and not `NotInstalled`: something IS broken -- either
+/// the helper or the toolchain it drives -- and rvl cannot tell which from here.
+/// Fail-open is preserved by the caller: this degrades one language, which
+/// renders NOT CLEAN at exit 0 and fails only under `--strict` (po-av01j.199).
+fn empty_stream_degradation(lang: Lang, stream: &str) -> Option<(DegradeKind, String)> {
+    if !helper_emits_repo_scoped_record(lang) || recognized_records(stream) > 0 {
+        return None;
+    }
+    Some((
+        DegradeKind::Failed,
+        format!(
+            "{} exited 0 but emitted no packets at all, not even the repo-scoped record it \
+             writes on every successful run — so no {lang} source was read. A scan reporting \
+             zero findings here would be a clean bill of health over unread code.",
+            lang.helper_base()
+        ),
+    ))
+}
+
 fn run_helper(
+    lang: Lang,
     helper: &ResolvedHelper,
     root: &Path,
     name: &str,
@@ -1822,6 +1929,12 @@ fn run_helper(
             )));
         }
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    // The structural guard runs on the MERGED stream, after every batch: one
+    // batch legitimately contributing nothing is not the failure being looked
+    // for, a whole run contributing nothing is.
+    if let Some(d) = empty_stream_degradation(lang, &merged) {
+        return Ok(Err(d));
     }
     Ok(Ok(merged))
 }
@@ -2247,7 +2360,7 @@ fn resolve_packet_stream(
             path: helper.path.display().to_string(),
             source: helper.source.clone(),
         });
-        match run_helper(&helper, path, &name, &[])? {
+        match run_helper(lang, &helper, path, &name, &[])? {
             Ok(out) => {
                 // Drop machine-generated files BEFORE counting. Filtering after
                 // the roll-call was built left "Java 33744 sites" printed above
@@ -3171,7 +3284,7 @@ impl HelperRetriever {
                     continue;
                 }
             };
-            let stream = match run_helper(&helper, &self.root, &self.name, &files)? {
+            let stream = match run_helper(lang, &helper, &self.root, &self.name, &files)? {
                 Ok(s) => s,
                 Err((kind, reason)) => {
                     self.push_degradation(LangDegradation { lang, kind, reason });
@@ -3200,11 +3313,29 @@ impl rvl_index::Retriever for HelperRetriever {
 /// degradation note when the wall budget was hit or the retriever errored under
 /// fail-open. `degraded` gates re-indexing: files we did not actually retrieve
 /// must NOT be recorded as scanned, or the next run skips them.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RetrieveResult {
     sites: Vec<rvl_core::Site>,
     repo_cfg: rvl_core::RepoConfig,
     degraded_note: Option<String>,
+    /// Languages whose helper contributed nothing to THIS pass. The same
+    /// re-indexing rule as `degraded_note`, applied per language instead of to
+    /// the whole pass (po-av01j.209).
+    ///
+    /// `degraded_note` is set only for a whole-pass failure (wall budget, a
+    /// retriever error under fail-open); a single language degrading inside
+    /// `retrieve_full` left it `None`, so the changed files of that language
+    /// were written to the index as SCANNED WITH ZERO PACKETS. The next run
+    /// found them unchanged, reused the empty result, never ran the helper, and
+    /// therefore never degraded — a clean verdict over unread code, one run
+    /// later. That is the same "permanently green gate" this bead is about,
+    /// merely deferred, and it would have made the rest of the fix hollow.
+    ///
+    /// Per-language rather than per-pass on purpose: fail-open per language is
+    /// the documented default, so a Python failure must not stop the Go files
+    /// of the same commit from warming the index, and must not alter the
+    /// verdict line either.
+    degraded_langs: Vec<Lang>,
 }
 
 /// The outcome of running a closure under a wall-clock cap.
@@ -3250,6 +3381,9 @@ fn resolve_budgeted(
             sites,
             repo_cfg,
             degraded_note: None,
+            // Filled in by the caller, which holds the per-language degradation
+            // collector this function never sees.
+            degraded_langs: Vec::new(),
         }),
         Budgeted::TimedOut => {
             if strict {
@@ -3266,6 +3400,8 @@ fn resolve_budgeted(
                     "retrieval capped at {cap:?}: {changed_len} changed file(s) not re-scanned; \
                      results cover the reused portion only"
                 )),
+                // A whole-pass degradation already blocks re-indexing outright.
+                degraded_langs: Vec::new(),
             })
         }
         Budgeted::Failed(e) => {
@@ -3278,6 +3414,7 @@ fn resolve_budgeted(
                 degraded_note: Some(format!(
                     "retrieval failed ({e}); results cover the reused portion only"
                 )),
+                degraded_langs: Vec::new(),
             })
         }
     }
@@ -3377,11 +3514,7 @@ where
 
     // Retrieve the changed files (skip the helper entirely when nothing changed).
     let rr = if plan.changed.is_empty() {
-        RetrieveResult {
-            sites: Vec::new(),
-            repo_cfg: rvl_core::RepoConfig::default(),
-            degraded_note: None,
-        }
+        RetrieveResult::default()
     } else {
         retrieve(&plan.changed)?
     };
@@ -3390,8 +3523,16 @@ where
     // when NOT degraded: recording a file we did not actually retrieve would
     // make the next run skip it.
     let degraded = rr.degraded_note.is_some();
+    let mut indexed = 0usize;
     if !degraded {
         for f in &plan.changed {
+            // po-av01j.209: a file whose LANGUAGE degraded was never read, so
+            // recording it as scanned-with-zero-packets would let the next run
+            // reuse that emptiness, skip the helper, and report clean over
+            // unread code. Same rule as `degraded` above, one granularity down.
+            if lang_of_path(f).is_some_and(|l| rr.degraded_langs.contains(&l)) {
+                continue;
+            }
             let rel = repo_relative(root, f);
             let for_file: Vec<rvl_core::Site> = rr
                 .sites
@@ -3401,9 +3542,10 @@ where
                 .collect();
             let h = rvl_index::hash_file(f)?;
             index.put(f, &h, &for_file)?;
+            indexed += 1;
         }
     }
-    let retrieved_files = if degraded { 0 } else { plan.changed.len() };
+    let retrieved_files = if degraded { 0 } else { indexed };
 
     let sites = merge_on_site_key(reused, rr.sites);
     Ok(IncrementalScan {
@@ -3490,7 +3632,15 @@ fn incremental_scan_pass(
         let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
             retriever.retrieve_full(&changed_owned)
         });
-        resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
+        let mut rr = resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)?;
+        // Carry the per-language degradations into the re-indexing decision
+        // (po-av01j.209). Read here rather than inside `retrieve_full` because
+        // this is the last point that still owns the collector handle and the
+        // first that has a `RetrieveResult` to put them on.
+        if let Ok(g) = collector.lock() {
+            rr.degraded_langs = g.iter().map(|d| d.lang).collect();
+        }
+        Ok(rr)
     })?;
     if let Ok(mut g) = lang_degraded.lock() {
         scan.lang_degraded = std::mem::take(&mut g);
@@ -3680,17 +3830,26 @@ fn run_index_build(
     );
 
     let name = snapshot_name(&root);
+    let degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
     let retriever = HelperRetriever {
-        degraded: Default::default(),
+        degraded: std::sync::Arc::clone(&degraded),
         root: root.clone(),
         name,
     };
     let scan = incremental_sites(&idx, &root, &candidates, |changed| {
         let (sites, repo_cfg) = retriever.retrieve_full(changed)?;
+        // The background warm must not record a degraded language's files as
+        // scanned either (po-av01j.209): a poisoned index outlives the run that
+        // poisoned it, and this path runs behind a commit with nobody watching.
+        let degraded_langs = degraded
+            .lock()
+            .map(|g| g.iter().map(|d| d.lang).collect())
+            .unwrap_or_default();
         Ok(RetrieveResult {
             sites,
             repo_cfg,
             degraded_note: None,
+            degraded_langs,
         })
     })?;
     println!(
@@ -6314,6 +6473,73 @@ mod tests {
         assert_eq!(classify_helper_exit(None), DegradeKind::Failed);
     }
 
+    /// po-av01j.209. The whole guard turns on telling two zeros apart, so the
+    /// two zeros get a test each.
+    #[test]
+    fn a_stream_with_no_recognizable_record_is_not_a_scan() {
+        // What the bug actually emitted: one line of JSON whose `kind` is
+        // empty, because the helper bailed before doing any work and then
+        // serialised its zero-valued struct anyway.
+        let bug = r#"{"kind":"","snapshot_id":"","constructions":null}"#;
+        assert_eq!(recognized_records(bug), 0);
+        assert!(empty_stream_degradation(Lang::Go, bug).is_some());
+        assert!(empty_stream_degradation(Lang::Go, "").is_some());
+        assert_eq!(
+            empty_stream_degradation(Lang::Go, bug).unwrap().0,
+            DegradeKind::Failed
+        );
+
+        // THE OTHER ZERO, and the false positive that would make this guard
+        // unusable: the helper loaded the code, wrote its repo-scoped record,
+        // and there were simply no call sites. Common and legitimate.
+        let honest =
+            r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        assert_eq!(recognized_records(honest), 1);
+        assert!(empty_stream_degradation(Lang::Go, honest).is_none());
+
+        // A stream of sites needs no repo-scoped record to prove it ran.
+        let sites = "{\"site_key\":\"a.go:1:C:Do\"}\n{\"site_key\":\"a.go:2:C:Do\"}\n";
+        assert_eq!(recognized_records(sites), 2);
+        assert!(empty_stream_degradation(Lang::Go, sites).is_none());
+
+        // The other repo-scoped kinds the sibling helpers emit.
+        for k in [
+            "retrieval_stats",
+            "rust_workspace_provenance",
+            "repo_structure",
+        ] {
+            let line = format!("{{\"kind\":\"{k}\",\"snapshot_id\":\"x\"}}");
+            assert_eq!(recognized_records(&line), 1, "{k}");
+        }
+        // Whitespace after the colon must not defeat the check.
+        assert!(has_non_empty_kind(r#"{"kind" : "repo_config"}"#));
+        assert!(!has_non_empty_kind(r#"{"kind": ""}"#));
+    }
+
+    /// The guard may only speak for helpers whose contract it can rely on.
+    /// pyindex and csindex emit site packets ONLY, so an empty stream is their
+    /// legitimate "no call sites here" — firing there would call every Python
+    /// service with no outbound calls unscanned.
+    #[test]
+    fn the_guard_stays_silent_for_helpers_with_no_repo_scoped_record() {
+        for lang in [Lang::Python, Lang::CSharp] {
+            assert!(
+                empty_stream_degradation(lang, "").is_none(),
+                "{lang} has no repo-scoped record to expect"
+            );
+            assert!(!helper_emits_repo_scoped_record(lang));
+        }
+        for lang in [
+            Lang::Go,
+            Lang::TypeScript,
+            Lang::Java,
+            Lang::Rust,
+            Lang::CCpp,
+        ] {
+            assert!(helper_emits_repo_scoped_record(lang), "{lang}");
+        }
+    }
+
     #[test]
     fn one_language_degrading_does_not_sink_the_scan() {
         // The reported bug: 1660 .go files and ONE .rs fixture, and the Go scan
@@ -7173,6 +7399,7 @@ mod tests {
                 sites,
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
+                degraded_langs: Vec::new(),
             })
         };
         let candidates = walk_source_files(dir.path());
@@ -7197,6 +7424,7 @@ mod tests {
                     .collect(),
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
+                degraded_langs: Vec::new(),
             })
         };
         let scan2 = incremental_sites(&idx, dir.path(), &candidates, fake2).unwrap();
