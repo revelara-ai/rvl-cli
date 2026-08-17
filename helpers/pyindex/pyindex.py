@@ -715,18 +715,23 @@ def _enclosing_functions(tree):
 
 
 def retrieve_file(abs_path, file_path, snapshot):
-    """Parse one Python file and return a list of site records (dicts)."""
+    """Parse one Python file and return a list of site records (dicts), or
+    None when the file could not be read or parsed.
+
+    None vs [] is the distinction the retrieval_stats record carries
+    downstream (po-av01j.209): a file that FAILED is counted, never silently
+    collapsed into "parsed and empty"."""
     try:
         with open(abs_path, "r", encoding="utf-8") as fh:
             source = fh.read()
     except (OSError, UnicodeDecodeError) as err:
         print("skip {}: {}".format(file_path, err), file=sys.stderr)
-        return []
+        return None
     try:
         tree = ast.parse(source, filename=abs_path)
     except SyntaxError as err:
         print("parse failed {}: {}".format(file_path, err), file=sys.stderr)
-        return []
+        return None
 
     idx = FileIndex(source)
     idx.collect_imports(tree)
@@ -959,10 +964,52 @@ def discover(root, files_arg):
 
 
 def run_retrieve(root, snapshot, files_arg):
+    """Retrieve every discovered file. Returns (records, stats) where stats
+    counts what was attempted: {"files_total", "files_parsed", "files_failed"}.
+    """
     records = []
+    total = parsed = failed = 0
     for abs_path, file_path in discover(root, files_arg):
-        records.extend(retrieve_file(abs_path, file_path, snapshot))
-    return records
+        total += 1
+        got = retrieve_file(abs_path, file_path, snapshot)
+        if got is None:
+            failed += 1
+            continue
+        parsed += 1
+        records.extend(got)
+    return records, {
+        "files_total": total,
+        "files_parsed": parsed,
+        "files_failed": failed,
+    }
+
+
+def emit_stats(snapshot, stats, n_sites, out=sys.stdout):
+    """The repo-scoped record this helper writes on EVERY run, whether or not
+    any site matched (po-av01j.209).
+
+    rvl's silent-zero guard keys on it: a stream with no record rvl recognizes
+    means the helper never reached its own emit path -- it bailed early and
+    still exited 0, which is exactly the shape that gave a Go repo without the
+    Go toolchain a permanently green gate. Site packets alone cannot carry
+    that signal, because "no call sites here" is a legitimate, common answer.
+
+    The kind is `retrieval_stats`, following cindex, and deliberately NOT an
+    empty `repo_config`: rvl_core::parse_stream folds every repo_config on the
+    concatenated polyglot stream into one, so this helper must never put a
+    construction-facts record it has no construction facts for on the wire.
+    No site_key on purpose -- rvl counts sites by that field."""
+    out.write(json.dumps({
+        "packet_schema": PACKET_SCHEMA,
+        "kind": "retrieval_stats",
+        "snapshot_id": snapshot,
+        "lang": "python",
+        "files_total": stats["files_total"],
+        "files_parsed": stats["files_parsed"],
+        "files_failed": stats["files_failed"],
+        "sites": n_sites,
+    }))
+    out.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -998,11 +1045,35 @@ def main(argv=None):
 
     if args.retrieve:
         root = os.path.abspath(args.root)
+        # A root that is not a directory is a caller error, not an empty repo.
+        # os.walk on a missing path silently yields nothing, which used to
+        # read as "scanned, zero sites" -- the po-av01j.209 shape.
+        if not os.path.isdir(root):
+            print("pyindex: --root {} is not a directory".format(root),
+                  file=sys.stderr)
+            return 2
         snapshot = args.name or os.path.basename(root.rstrip(os.sep)) or root
-        records = run_retrieve(root, snapshot, args.files)
+        records, stats = run_retrieve(root, snapshot, args.files)
         emit(records)
-        print("{}: {} retrieved sites".format(snapshot, len(records)),
-              file=sys.stderr)
+        emit_stats(snapshot, stats, len(records))
+        print("{}: {} retrieved sites ({} files, {} failed)".format(
+            snapshot, len(records), stats["files_total"],
+            stats["files_failed"]), file=sys.stderr)
+        # Exit non-zero when NOTHING was read, so the lane degrades loudly
+        # instead of recording a successful retrieval of zero sites:
+        #   - --files named files that do not exist here (all filtered out);
+        #   - every discovered file failed to read or parse.
+        # A tree with genuinely zero .py files (a pyproject.toml-only repo)
+        # stays exit 0: the stats record proves the helper ran and read the
+        # tree, and "nothing to read" is a real answer.
+        if args.files.strip(",").strip() and stats["files_total"] == 0:
+            print("pyindex: none of the requested --files exist under {}"
+                  .format(root), file=sys.stderr)
+            return 2
+        if stats["files_total"] > 0 and stats["files_parsed"] == 0:
+            print("pyindex: every discovered file failed to read or parse; "
+                  "no Python source was retrieved", file=sys.stderr)
+            return 2
         return 0
 
     build_parser().print_usage(sys.stderr)

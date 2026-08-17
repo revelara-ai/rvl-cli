@@ -9,7 +9,7 @@ edition.workspace = true
 # hand-mirror the contract in their own languages) field agreement here is by
 # construction, not by convention.
 rvl-core = { path = "../rvl-core" }
-scip = "0.5"
+scip = "0.9"
 protobuf = "3"
 serde_json = { workspace = true }
 anyhow = { workspace = true }
