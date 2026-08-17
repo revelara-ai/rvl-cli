@@ -3303,11 +3303,13 @@ impl HelperRetriever {
             };
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
-            // The last non-empty construction record wins; helpers emit
-            // whole-repo constructions regardless of `--files`.
-            if !cfg.constructions.is_empty() {
-                repo_cfg = cfg;
-            }
+            // MERGED across languages (RepoConfig::absorb): helpers emit
+            // whole-repo constructions regardless of `--files`, and one
+            // language's facts must never erase another's. The old
+            // last-non-empty-wins here kept ONE language's facts at most, and
+            // was also the only thing standing between an empty repo_config
+            // and the erasure hazard parse_stream itself now guards against.
+            repo_cfg.absorb(cfg);
         }
         Ok((sites, repo_cfg))
     }
