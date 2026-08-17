@@ -35,7 +35,7 @@ serde = { workspace = true }
 # build-hook declaration out of pyproject.toml, `ignore` walks the tree the
 # way the config and content lanes do (gitignore-aware). Both already ship in
 # the workspace via rvl-config, so neither adds to the dependency surface.
-toml = "0.8"
+toml = "1.1"
 ignore = "0.4"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
