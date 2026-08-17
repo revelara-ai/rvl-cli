@@ -1,0 +1,10 @@
+# Default owner for everything in the repo.
+# The `main` ruleset requires code-owner review, which is a no-op without this file.
+* @josebiro
+
+# Supply-chain sensitive paths: release, CI, and security policy.
+/.github/            @josebiro
+/ci/                 @josebiro
+/dist-workspace.toml @josebiro
+/Cargo.lock          @josebiro
+/SECURITY.md         @josebiro
