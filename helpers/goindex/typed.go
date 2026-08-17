@@ -92,8 +92,16 @@ func loadTyped(root string) (*typedIndex, error) {
 		Tests: false,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
+	// Load failure, no packages, and packages with no type information are the
+	// same fact at three depths: nothing was analysed (po-av01j.209). Reporting
+	// any of them as an empty index would let the caller emit an empty stream
+	// and exit 0.
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("go/packages could not load %s: %w", root, err)
+	}
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf(
+			"go/packages loaded no packages at all under %s, so no Go source was analysed", root)
 	}
 	ix := &typedIndex{root: root, funcs: map[string]*typedFunc{},
 		callers: map[string][]*typedFunc{}, ctors: map[string][]string{}}
@@ -212,6 +220,11 @@ func loadTyped(root string) (*typedIndex, error) {
 	}
 	fmt.Fprintf(os.Stderr, "  typed packages: %d ok, %d unusable; %d funcs, %d ctor types\n",
 		typed, broken, len(ix.funcs), len(ix.ctors))
+	if typed == 0 {
+		return nil, fmt.Errorf(
+			"go/packages returned %d package(s) under %s but none carried type information, "+
+				"so no Go source was analysed", broken, root)
+	}
 	return ix, nil
 }
 
@@ -255,11 +268,10 @@ func (ix *typedIndex) ancestry(fn *typedFunc) (bounded bool, depth int, entry bo
 
 
 // typedSites walks I/O call sites with resolved receiver types.
-func runTyped(root, name string) []Site {
+func runTyped(root, name string) ([]Site, error) {
 	ix, err := loadTyped(root)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "typed load failed:", err)
-		return nil
+		return nil, err
 	}
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
@@ -267,8 +279,10 @@ func runTyped(root, name string) []Site {
 		Dir: root, Tests: false,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
+	// This arm returned nil with no message at all -- an even quieter version
+	// of the same defect (po-av01j.209).
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("go/packages could not re-load %s: %w", root, err)
 	}
 	var out []Site
 	for _, p := range pkgs {
@@ -357,5 +371,5 @@ func runTyped(root, name string) []Site {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
