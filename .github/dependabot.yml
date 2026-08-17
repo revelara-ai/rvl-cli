@@ -11,6 +11,19 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    # Major bumps are deliberately NOT auto-PR'd. A cargo major is a code
+    # migration, not a version edit, and dependabot cannot write the
+    # migration -- so every major PR arrives failing `fmt + clippy + test`
+    # and sits red (#68-#75 were six of these at once, none security-driven).
+    # Majors are scheduled as engineering work instead; several of this
+    # crate's majors carry real compatibility stakes (ureq: the HTTP client
+    # surface; redb: the packet index's on-disk format; ed25519-dalek: spec
+    # cache signature verification against the server's signer). Security
+    # advisories are unaffected: Dependabot security updates ignore this
+    # filter and still open PRs at any semver level.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
