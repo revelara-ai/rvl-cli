@@ -20,7 +20,7 @@ mod waiver;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, SyncOutcome};
+use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome};
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -2553,7 +2553,7 @@ fn findings_from_sites(
     // decide whether a call is bounded, and the judgments that decide what an
     // unbounded one means (po-av01j.106). They are loaded together because they
     // arrive together, inside one signature.
-    let (specs_text, cache_judgments) = match specs_file {
+    let (specs_text, overlay_text, cache_judgments) = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
             // spec cache must never load quietly.
@@ -2564,29 +2564,39 @@ fn findings_from_sites(
             );
             // No envelope was opened, so there are no cache judgments to carry.
             // A dev spec file plus `--judgments` is the full offline pairing.
-            (std::fs::read_to_string(p)?, None)
+            (std::fs::read_to_string(p)?, None, None)
         }
         None => {
-            let loaded = store.load(keyset, &rvl_cache::today_utc())?;
-            if let Some(hint) = &loaded.upgrade_hint {
-                eprintln!("{hint}");
+            // Tiered load (po-scnmv.13): the OSS vocabulary baseline plus the
+            // commercial judgment lanes when a keyed sync installed them.
+            // Either tier alone scans; only BOTH missing is fatal.
+            let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+            let tiers = rvl_cache::load_tiered(store, &oss_store, keyset, &rvl_cache::today_utc());
+            for loaded in [&tiers.commercial, &tiers.oss].into_iter().flatten() {
+                if let Some(hint) = &loaded.upgrade_hint {
+                    eprintln!("{hint}");
+                }
+                if let Some(note) = &loaded.staleness_note {
+                    eprintln!("{note}");
+                }
+                // Gated by `verbose` (like the sites|specs line below) so
+                // quiet callers such as `explain` and `report --json` keep
+                // stdout clean. Staleness/upgrade hints stay on stderr.
+                if verbose {
+                    println!(
+                        "spec cache {} (schema {}, {:?})",
+                        loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                    );
+                }
             }
-            if let Some(note) = &loaded.staleness_note {
-                eprintln!("{note}");
+            let judgments = tiers.judgments();
+            match tiers.spec_texts()? {
+                Some((base, overlay)) => (base, overlay, judgments),
+                None => anyhow::bail!(
+                    "no spec cache tier loadable: run '{BIN} sync' \
+                     (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
+                ),
             }
-            // Gated by `verbose` (like the sites|specs line below) so quiet
-            // callers such as `explain` and `report --json` keep stdout clean
-            // for their own payload. Staleness/upgrade hints stay on stderr.
-            if verbose {
-                println!(
-                    "spec cache {} (schema {}, {:?})",
-                    loaded.envelope.content_version, loaded.envelope.schema, loaded.source
-                );
-            }
-            (
-                serde_json::to_string(&loaded.envelope.specs)?,
-                loaded.envelope.judgments,
-            )
         }
     };
 
@@ -2642,6 +2652,12 @@ fn findings_from_sites(
     let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
         sites.into_iter().partition(|s| s.is_emission_point());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
+    // Commercial tier layered over the OSS baseline (po-scnmv.13): the
+    // existing merge policy applies — higher confidence wins, judgment lanes
+    // only exist in the overlay, so an upgrade is a config change.
+    if let Some(overlay) = &overlay_text {
+        cache.merge(rvl_spec::SpecCache::load(overlay)?);
+    }
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
     // statement_timeout, an infra deadline). Merged as exact-type
@@ -5884,16 +5900,47 @@ fn run() -> anyhow::Result<ExitCode> {
             judgments.as_deref(),
         ),
         Cmd::Sync => {
-            if !cfg.offline && cfg.org_key.is_empty() {
-                anyhow::bail!(
-                    "no API key found: set RVL_API_KEY, or add \
-                     `api_key` to ~/.revelara/config.yaml (or set RVL_OFFLINE=1)"
-                );
+            // Tiered sync (po-scnmv.13). The OSS vocabulary tier syncs with
+            // NO credentials — the public binary works out of the box; the
+            // commercial tier still requires the org key. No-key is no longer
+            // an error: it is the OSS-only install, and the exit code is
+            // governed by the only tier that applies.
+            let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+            let oss_fetcher = OssHttpFetcher {
+                base_url: cfg.base_url.clone(),
+            };
+            {
+                use std::io::Write;
+                print!("oss tier: ");
+                let _ = std::io::stdout().flush();
+            }
+            let oss_code = report(&rvl_cache::sync(
+                &oss_store,
+                &oss_fetcher,
+                &keyset,
+                cfg.offline,
+            ));
+            if cfg.org_key.is_empty() {
+                if !cfg.offline {
+                    eprintln!(
+                        "note: no API key; the commercial judgment lanes were not synced. \
+                         Set RVL_API_KEY (or `api_key` in ~/.revelara/config.yaml) to layer them."
+                    );
+                }
+                return Ok(oss_code);
             }
             let fetcher = HttpFetcher {
                 base_url: cfg.base_url,
                 org_key: cfg.org_key,
             };
+            {
+                use std::io::Write;
+                print!("commercial tier: ");
+                let _ = std::io::stdout().flush();
+            }
+            // A keyed install's exit code stays governed by the commercial
+            // sync, exactly as before this slice; an OSS hiccup is reported
+            // above but must not fail a healthy commercial sync.
             Ok(report(&rvl_cache::sync(
                 &store,
                 &fetcher,
@@ -5942,6 +5989,18 @@ fn run() -> anyhow::Result<ExitCode> {
                 Ok(report(&store.import(&artifact, &sig, &keyset)?))
             }
             CacheCmd::Status => {
+                // Both tiers report (po-scnmv.13); an absent OSS tier on an
+                // older install is normal and says how to get one.
+                let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+                match oss_store.load(&keyset, &rvl_cache::today_utc()) {
+                    Ok(loaded) => println!(
+                        "oss tier {} (schema {}, {:?})",
+                        loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                    ),
+                    Err(_) => {
+                        println!("oss tier: not installed (run '{BIN} sync' - no API key needed)")
+                    }
+                }
                 match store.load(&keyset, &rvl_cache::today_utc()) {
                     Ok(loaded) => {
                         println!(
