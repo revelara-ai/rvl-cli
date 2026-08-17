@@ -120,6 +120,13 @@ orchestrator. The orchestrator uses it to:
   suite migrated with a mechanical one-line-per-site shift, 49/49 green).
 - Additive evolution only within v1: new fields may appear, existing fields
   never change meaning. Breaking changes bump `schema`.
+
+- `findings[].class` is a CONTRACT field with lane-dependent meaning: for
+  spec-lane findings it is the producing spec's identity
+  (`client_type.method`, the waiver key — e.g. `net/http.Client.Do`); for
+  vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
+  `emission.`, `repo_structure.`, `config.`). The server's precision arm
+  (fleet FP evidence) attributes findings to specs through this field.
 - Consumers MUST ignore unknown fields.
 
 ## What this contract deliberately excludes

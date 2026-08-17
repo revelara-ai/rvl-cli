@@ -332,6 +332,44 @@ mod tests {
         );
     }
 
+    /// CONTRACT LOCK (po-scnmv.16): for spec-lane findings, `class` IS the
+    /// producing spec's identity — `class_rule` = `client_type.method`, the
+    /// same key waivers use. The server's precision arm attributes
+    /// adjudicated false positives to specs through this field, so renaming
+    /// or restructuring it is a breaking change to the flywheel, not a
+    /// cosmetic one. Vocabulary/structure lanes keep their fixed prefixes
+    /// (`server_entry.`, `emission.`, `repo_structure.`, `config.`), which
+    /// is how consumers tell the two apart.
+    #[test]
+    fn class_carries_spec_identity_verbatim() {
+        let f = render::Finding {
+            id: "abcd".into(),
+            site: "a.go:1".into(),
+            description: "d".into(),
+            disposition: "surface".into(),
+            severity: "low".into(),
+            incident_count: 0,
+            critical_count: 0,
+            control: "RC-019".into(),
+            fix: "f".into(),
+            site_count: 1,
+            example_sites: vec![],
+            class_rule: "github.com/cli/cli/v2/api.Client.Do".into(),
+            suppressed: false,
+            gate_exempt: false,
+        };
+        let doc = build(
+            std::slice::from_ref(&f),
+            &render::Coverage::default(),
+            None,
+            &[],
+            &[],
+            None,
+            false,
+        );
+        assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE
     /// bucketing uses; resolved classes land in `covered_classes`.
     #[test]
