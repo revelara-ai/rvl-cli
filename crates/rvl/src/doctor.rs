@@ -205,8 +205,10 @@ fn repo_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
     out
 }
 
-/// The interpreter a resolved helper is driven by, when it needs one. A native
-/// helper (goindex, cindex, rustindex) needs nothing.
+/// The interpreter a resolved helper is driven by, when it needs one. `None`
+/// means "not driven by an interpreter", NOT "needs nothing at runtime": the
+/// native helpers have runtime prerequisites of their own, probed by
+/// [`native_lane_checks`] (po-av01j.206).
 fn runtime_for(kind: HelperKind) -> Option<&'static str> {
     match kind {
         HelperKind::Executable => None,
@@ -214,6 +216,140 @@ fn runtime_for(kind: HelperKind) -> Option<&'static str> {
         HelperKind::NodeScript => Some("node"),
         HelperKind::DotnetAssembly => Some("dotnet"),
         HelperKind::JavaSource => Some("java"),
+    }
+}
+
+/// Probe what the scan will ACTUALLY need to run a native helper's lane
+/// (po-av01j.206).
+///
+/// "The helper is a native binary we shipped" is not "the helper can run":
+/// goindex shells the `go` tool, cindex dlopens libclang at process start
+/// (clang-sys with the `runtime` feature — `ldd` shows libclang is NOT
+/// linked), and rustindex drives rust-analyzer over a loadable cargo
+/// workspace. doctor used to answer "native — no runtime prereq" for all
+/// three before checking anything, so a missing toolchain read PASS here
+/// while the scan's own lane failed — an honest scan verdict under a
+/// dishonest doctor verdict, which sends the reader to their code or config
+/// for a problem that is one missing install. Gaps are reported exactly like
+/// the interpreted lanes: the named gap plus the command that closes it.
+fn native_lane_checks(
+    lang: Lang,
+    helper: &crate::ResolvedHelper,
+    gap: Status,
+    label: String,
+    where_from: &str,
+) -> Vec<Check> {
+    match lang {
+        // goindex shells the `go` tool for its package-graph load; without it
+        // the helper exits 2 and the lane fails (po-av01j.209).
+        Lang::Go => match find_on_path("go") {
+            Some(p) => vec![Check::new("retrievers", Status::Pass, label)
+                .detail(format!("{where_from}, drives `go` at {}", p.display()))],
+            None => vec![Check::new("retrievers", gap, label)
+                .detail(format!(
+                    "{where_from}, but `go` is not installed, so this lane cannot run"
+                ))
+                .remedy(format!(
+                    "install go with your system package manager, then re-run `{BIN} doctor`"
+                ))],
+        },
+        // Probed by CAPABILITY through the helper's own `--engine-check`,
+        // which prints the loaded clang version or fails with the same
+        // message (and the same discovery) the scan itself would — a second
+        // libclang discovery here could only drift from the real one.
+        Lang::CCpp => {
+            let probe = Command::new(&helper.path).arg("--engine-check").output();
+            vec![match probe {
+                Ok(o) if o.status.success() => {
+                    let version = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    Check::new("retrievers", Status::Pass, label)
+                        .detail(format!("{where_from}, libclang loads ({version})"))
+                }
+                Ok(o) => {
+                    let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let why = if why.is_empty() {
+                        format!("`--engine-check` exited {}", o.status)
+                    } else {
+                        why
+                    };
+                    Check::new("retrievers", gap, label)
+                        .detail(format!("{where_from}, but {why}"))
+                        .remedy(
+                            "install libclang (e.g. `apt install libclang-dev`), or point \
+                             LIBCLANG_PATH at one",
+                        )
+                }
+                Err(e) => Check::new("retrievers", gap, label).detail(format!(
+                    "{where_from}, but it could not be run to probe libclang: {e}"
+                )),
+            }]
+        }
+        // rustindex needs rust-analyzer (RVL_RUST_ANALYZER override, else
+        // PATH — the same discovery order ra::discover uses) AND a loadable
+        // cargo workspace. The workspace half is probed by the PRESENCE of
+        // `cargo` only: `cargo metadata` is a full workspace load (it can
+        // resolve dependencies and write the lockfile), which is far too
+        // expensive and side-effectful for a doctor that may run per repo.
+        Lang::Rust => {
+            let mut out = Vec::new();
+            let ra_env = std::env::var_os(rustindex::ra::ENV_RA_PATH)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            out.push(match ra_env {
+                Some(p) if p.is_file() => {
+                    Check::new("retrievers", Status::Pass, label).detail(format!(
+                        "{where_from}, rust-analyzer at {} ({})",
+                        p.display(),
+                        rustindex::ra::ENV_RA_PATH
+                    ))
+                }
+                Some(p) => Check::new("retrievers", gap, label)
+                    .detail(format!(
+                        "{where_from}, but {} points at {} which does not exist",
+                        rustindex::ra::ENV_RA_PATH,
+                        p.display()
+                    ))
+                    .remedy(format!(
+                        "point {} at a rust-analyzer binary, or unset it and \
+                         `rustup component add rust-analyzer`",
+                        rustindex::ra::ENV_RA_PATH
+                    )),
+                None => match find_on_path("rust-analyzer") {
+                    Some(p) => Check::new("retrievers", Status::Pass, label)
+                        .detail(format!("{where_from}, rust-analyzer at {}", p.display())),
+                    // The scan error's own wording: "no rust-analyzer found:
+                    // set RVL_RUST_ANALYZER to the binary, or install the
+                    // rustup component".
+                    None => Check::new("retrievers", gap, label)
+                        .detail(format!(
+                            "{where_from}, but no rust-analyzer was found, so this lane \
+                             cannot run"
+                        ))
+                        .remedy(format!(
+                            "rustup component add rust-analyzer (or set {} to the binary)",
+                            rustindex::ra::ENV_RA_PATH
+                        )),
+                },
+            });
+            if find_on_path("cargo").is_none() {
+                out.push(
+                    Check::new("retrievers", gap, "Rust workspace (cargo)")
+                        .detail(
+                            "rustindex loads the workspace via `cargo metadata`, and `cargo` \
+                             is not installed"
+                                .to_string(),
+                        )
+                        .remedy("install rustup (https://rustup.rs), which provides cargo"),
+                );
+            }
+            out
+        }
+        // A helper for a scripted language found as a native executable (a
+        // user's own build on PATH): nothing further is known to probe.
+        _ => {
+            vec![Check::new("retrievers", Status::Pass, label)
+                .detail(format!("{where_from}, native"))]
+        }
     }
 }
 
@@ -264,10 +400,9 @@ fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
                 // exists" is the whole diagnosis.
                 let where_from = format!("{} ({})", h.path.display(), h.source);
                 match runtime_for(h.kind) {
-                    None => out.push(
-                        Check::new("retrievers", Status::Pass, label)
-                            .detail(format!("{where_from}, native — no runtime prereq")),
-                    ),
+                    // Native: no interpreter, but NOT "no runtime prereq" —
+                    // probe what the scan will actually need (po-av01j.206).
+                    None => out.extend(native_lane_checks(lang, &h, gap, label, &where_from)),
                     Some(rt) if find_on_path(rt).is_none() => out.push(
                         Check::new("retrievers", gap, label)
                             .detail(format!(
@@ -756,14 +891,45 @@ mod tests {
     }
 
     #[test]
-    fn native_helpers_report_no_runtime_prereq() {
-        // The roll-call must not invent an interpreter for goindex/cindex/
-        // rustindex, or a Go shop would be told to install node.
+    fn native_helpers_are_probed_not_waved_through() {
+        // The roll-call must not invent an INTERPRETER for goindex/cindex/
+        // rustindex, or a Go shop would be told to install node...
         assert_eq!(runtime_for(HelperKind::Executable), None);
         assert_eq!(runtime_for(HelperKind::PyScript), Some("python3"));
         assert_eq!(runtime_for(HelperKind::NodeScript), Some("node"));
         assert_eq!(runtime_for(HelperKind::DotnetAssembly), Some("dotnet"));
         assert_eq!(runtime_for(HelperKind::JavaSource), Some("java"));
+
+        // ...but `None` no longer short-circuits to a PASS (po-av01j.206):
+        // the old row said "native — no runtime prereq", which was false for
+        // all three native lanes (goindex shells `go`, cindex dlopens
+        // libclang, rustindex needs rust-analyzer + a cargo workspace), so
+        // doctor said PASS while the scan's own lane failed. Native lanes
+        // route through native_lane_checks; a cindex whose engine probe
+        // cannot even run must be a gap that says so, never a silent PASS.
+        let helper = crate::ResolvedHelper {
+            path: PathBuf::from("/nonexistent/cindex-for-doctor-test"),
+            kind: HelperKind::Executable,
+            source: "bundled".into(),
+        };
+        let checks = native_lane_checks(
+            Lang::CCpp,
+            &helper,
+            Status::Fail,
+            "C/C++ (cindex)".to_string(),
+            "cindex (bundled)",
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(
+            checks[0].detail.contains("libclang"),
+            "the gap must name what was being probed: {}",
+            checks[0].detail
+        );
+        assert!(
+            !checks[0].detail.contains("no runtime prereq"),
+            "the false claim this bead deletes must not come back"
+        );
     }
 
     #[test]

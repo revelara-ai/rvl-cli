@@ -77,6 +77,17 @@ fn write(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
 }
 
+/// Like [`write`], and executable: for stubs the doctor will actually RUN
+/// (the cindex `--engine-check` probe), not merely resolve.
+fn write_exec(path: &Path, body: &str) {
+    write(path, body);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// A repo with the two lanes that survive manual setup BY DESIGN (C#, which
 /// needs a .NET SDK plus a build; TypeScript, which needs the pinned
 /// compiler) alongside two that do not.
@@ -227,17 +238,55 @@ fn the_roll_call_names_the_slot_each_helper_came_from() {
     );
 }
 
+/// A doctor invocation whose PATH we control completely, so a tool can be
+/// present or absent by choice rather than by luck of the test machine.
+fn doctor_with_path(bin: &Path, repo: &Path, home: &Path, path: &Path) -> std::process::Output {
+    let mut cmd = Command::new(bin);
+    cmd.arg("doctor")
+        .arg(repo)
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("RVL_CACHE_DIR", home.join("cache"))
+        .env("RVL_OFFLINE", "1");
+    for var in ["RVL_RUST_ANALYZER", "RVL_HELPER_DIR", "RVL_SRC"] {
+        cmd.env_remove(var);
+    }
+    run(&mut cmd)
+}
+
+fn row<'a>(stdout: &'a str, needle: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or_default()
+}
+
+/// The fix line printed under a non-passing row, or "".
+fn fix_under<'a>(stdout: &'a str, needle: &str) -> &'a str {
+    let mut lines = stdout.lines();
+    while let Some(l) = lines.next() {
+        if l.contains(needle) {
+            let next = lines.next().unwrap_or_default();
+            if next.trim_start().starts_with("fix:") {
+                return next;
+            }
+            return "";
+        }
+    }
+    ""
+}
+
 /// A lane whose runtime prereq is genuinely absent degrades THAT lane and
 /// says why. The others are untouched — a polyglot repo missing one toolchain
-/// still has the rest worth reading.
+/// still has the rest worth reading. Since po-av01j.206 the Go lane is probed
+/// too (goindex shells the `go` tool), so the sandbox PATH carries `go` and
+/// nothing else: Go survives on its own merits, Python fails on its own.
 #[test]
 fn a_missing_runtime_degrades_only_its_own_lane() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let bin_dir = dir.path().join("bin");
     let bin = lone_binary(&bin_dir);
-    // A native Go helper next to the binary: no interpreter, so its lane
-    // cannot be affected by an empty PATH.
     write(&bin_dir.join("goindex"), "#!/bin/sh\nexit 0\n");
 
     let repo = dir.path().join("repo");
@@ -249,33 +298,175 @@ fn a_missing_runtime_degrades_only_its_own_lane() {
         "import requests\n\n\ndef f(u):\n    return requests.get(u)\n",
     );
 
-    // An empty PATH is the cheapest honest way to make `python3` absent.
-    let empty = dir.path().join("empty");
-    std::fs::create_dir_all(&empty).unwrap();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("doctor")
-        .arg(&repo)
-        .env("HOME", &home)
-        .env("PATH", &empty)
-        .env("RVL_CACHE_DIR", home.join("cache"))
-        .env("RVL_OFFLINE", "1");
-    let stdout = String::from_utf8(run(&mut cmd).stdout).unwrap();
+    // A closed PATH carrying only `go`: python3 is absent by construction.
+    let toolbin = dir.path().join("toolbin");
+    std::fs::create_dir_all(&toolbin).unwrap();
+    let real_go = which("go");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_go, toolbin.join("go")).unwrap();
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &toolbin).stdout).unwrap();
 
-    let go_row = stdout
-        .lines()
-        .find(|l| l.contains("Go (goindex)"))
-        .unwrap_or_default();
+    let go_row = row(&stdout, "Go (goindex)");
     assert!(
-        go_row.trim_start().starts_with("PASS"),
-        "the Go lane needs no interpreter, so it must survive: {go_row}"
+        go_row.trim_start().starts_with("PASS") && go_row.contains("drives `go`"),
+        "the Go lane has its toolchain, so it must survive AND say what it probed: {go_row}"
     );
-    let py_row = stdout
-        .lines()
-        .find(|l| l.contains("Python (pyindex)"))
-        .unwrap_or_default();
+    let py_row = row(&stdout, "Python (pyindex)");
     assert!(
         py_row.trim_start().starts_with("FAIL") && py_row.contains("python3"),
         "the Python lane must name the runtime that is missing: {py_row}"
+    );
+}
+
+/// First match for `name` on the CURRENT process PATH; panics with the reason
+/// when the test machine cannot provide it.
+fn which(name: &str) -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(name))
+                .find(|c| c.is_file())
+        })
+        .unwrap_or_else(|| panic!("this test machine has no `{name}`"))
+}
+
+/// po-av01j.209's doctor half: `runtime_for(Executable) → None` used to
+/// short-circuit the Go lane to "PASS ... native — no runtime prereq" while
+/// the scan's goindex exited 2 for want of the `go` tool. The doctor verdict
+/// must AGREE with what a scan does: no `go`, no PASS — and the gap carries
+/// its install line, exactly like a missing python3.
+#[test]
+fn a_go_repo_without_the_go_tool_is_a_gap_not_a_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin_dir = dir.path().join("bin");
+    let bin = lone_binary(&bin_dir);
+    write(&bin_dir.join("goindex"), "#!/bin/sh\nexit 0\n");
+    let repo = dir.path().join("repo");
+    write(&repo.join("go.mod"), "module svc\n\ngo 1.21\n");
+    write(&repo.join("main.go"), "package main\n\nfunc main() {}\n");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &empty).stdout).unwrap();
+    let go_row = row(&stdout, "Go (goindex)");
+    assert!(
+        go_row.trim_start().starts_with("FAIL") && go_row.contains("`go` is not installed"),
+        "doctor must probe the tool the scan will shell: {go_row}"
+    );
+    assert!(
+        fix_under(&stdout, "Go (goindex)").contains("install go"),
+        "and the gap must carry its install line:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("no runtime prereq"),
+        "the false claim po-av01j.206 deletes must be gone everywhere:\n{stdout}"
+    );
+}
+
+/// po-av01j.206, the Rust lane: rustindex needs rust-analyzer AND a loadable
+/// cargo workspace, and doctor never probed either. Absent both, the lane
+/// reports two named gaps with their commands; with both present (presence is
+/// the probe — a full `cargo metadata` load per repo is too expensive), the
+/// lane passes and says what it found.
+#[test]
+fn the_rust_lane_probes_rust_analyzer_and_cargo() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin_dir = dir.path().join("bin");
+    let bin = lone_binary(&bin_dir);
+    write(&bin_dir.join("rustindex"), "#!/bin/sh\nexit 0\n");
+    let repo = dir.path().join("repo");
+    write(
+        &repo.join("Cargo.toml"),
+        "[package]\nname = \"svc\"\nversion = \"0.1.0\"\n",
+    );
+    write(&repo.join("src/main.rs"), "fn main() {}\n");
+
+    // Machine-shape 1: neither tool anywhere.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &empty).stdout).unwrap();
+    let ra_row = row(&stdout, "Rust (rustindex)");
+    assert!(
+        ra_row.trim_start().starts_with("FAIL") && ra_row.contains("rust-analyzer"),
+        "the missing engine must be named: {ra_row}"
+    );
+    assert!(
+        fix_under(&stdout, "Rust (rustindex)").contains("rustup component add rust-analyzer"),
+        "the fix line must be the scan error's own command:\n{stdout}"
+    );
+    let cargo_row = row(&stdout, "Rust workspace (cargo)");
+    assert!(
+        cargo_row.trim_start().starts_with("FAIL") && cargo_row.contains("cargo metadata"),
+        "the workspace prerequisite must be probed too: {cargo_row}"
+    );
+
+    // Machine-shape 2: both present (dummy files are enough — the probe is
+    // presence, deliberately not an execution).
+    let toolbin = dir.path().join("toolbin");
+    std::fs::create_dir_all(&toolbin).unwrap();
+    write(&toolbin.join("rust-analyzer"), "#!/bin/sh\nexit 0\n");
+    write(&toolbin.join("cargo"), "#!/bin/sh\nexit 0\n");
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &toolbin).stdout).unwrap();
+    let ra_row = row(&stdout, "Rust (rustindex)");
+    assert!(
+        ra_row.trim_start().starts_with("PASS") && ra_row.contains("rust-analyzer at"),
+        "a healthy machine still passes, naming what it found: {ra_row}"
+    );
+    assert!(
+        row(&stdout, "Rust workspace (cargo)").is_empty(),
+        "no cargo gap row on a machine that has cargo:\n{stdout}"
+    );
+}
+
+/// po-av01j.206, the C/C++ lane: cindex dlopens libclang at process start
+/// (clang-sys `runtime` feature — libclang is NOT linked), so "native binary
+/// present" proves nothing. The probe shells the helper's own
+/// `--engine-check` rather than reimplementing libclang discovery; a failing
+/// engine is a gap carrying the helper's own message and the install line,
+/// and a loading engine passes with the clang version.
+#[test]
+fn the_c_lane_probes_libclang_through_engine_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin_dir = dir.path().join("bin");
+    let bin = lone_binary(&bin_dir);
+    let repo = dir.path().join("repo");
+    write(&repo.join("main.c"), "int main(void) { return 0; }\n");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    // Machine-shape: the engine cannot load. The stub prints the same message
+    // the real cindex --engine-check does.
+    write_exec(
+        &bin_dir.join("cindex"),
+        "#!/bin/sh\nif [ \"$1\" = \"--engine-check\" ]; then\n\
+         echo 'cindex requires libclang (engine pin po-ae75b.9) and none could be loaded' >&2\n\
+         exit 1\nfi\nexit 0\n",
+    );
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &empty).stdout).unwrap();
+    let c_row = row(&stdout, "C/C++ (cindex)");
+    assert!(
+        c_row.trim_start().starts_with("FAIL") && c_row.contains("libclang"),
+        "a broken engine must be a named gap: {c_row}"
+    );
+    assert!(
+        fix_under(&stdout, "C/C++ (cindex)").contains("LIBCLANG_PATH"),
+        "and carry the install line:\n{stdout}"
+    );
+
+    // Machine-shape: the engine loads.
+    write_exec(
+        &bin_dir.join("cindex"),
+        "#!/bin/sh\nif [ \"$1\" = \"--engine-check\" ]; then\n\
+         echo 'clang version 17.0.6'\nexit 0\nfi\nexit 0\n",
+    );
+    let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &empty).stdout).unwrap();
+    let c_row = row(&stdout, "C/C++ (cindex)");
+    assert!(
+        c_row.trim_start().starts_with("PASS") && c_row.contains("clang version 17.0.6"),
+        "a loading engine passes with its version: {c_row}"
     );
 }
 
