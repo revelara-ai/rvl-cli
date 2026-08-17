@@ -8,6 +8,17 @@
 //! Retrieval only: this helper decides nothing about reliability, it only
 //! says what the code is. See README.md for the packet contract, the
 //! compile-db rules, and the C/C++ typing tiers.
+//!
+//! WHY THIS IS A LIBRARY AND NOT A BINARY (po-av01j.154 release fix): the
+//! `cindex` executable is a bin target of the `rvl` PACKAGE
+//! (`crates/rvl/src/bin/cindex.rs`), which is a one-line shim over [`run`].
+//! It has to live there because cargo-dist builds one app from one cargo
+//! package: an app's archive can only contain that package's own bins, so a
+//! `cindex` bin defined here would never be packed next to `rvl` — and being
+//! next to `rvl` is exactly how `resolve_helper` finds it after a `brew
+//! install`. Two packages cannot both define a `cindex` bin (cargo warns
+//! "output filename collision" and the winner at `target/<profile>/cindex`
+//! is arbitrary), so this crate deliberately ships no bin of its own.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,7 +38,8 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-fn main() -> ExitCode {
+/// The `cindex` CLI entry point. Called by the `rvl` package's `cindex` bin.
+pub fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut do_retrieve = false;
     let mut do_schema = false;

@@ -16,6 +16,8 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
-# Not its own release app: rustindex rides the rvl archive (po-aml3h).
+# Not its own release app: rustindex rides the rvl archive (po-aml3h). Since
+# po-av01j.154 this crate is a LIBRARY; the executable is a bin target of the
+# rvl package (crates/rvl/src/bin/rustindex.rs). See crates/cindex/Cargo.toml.
 [package.metadata.dist]
 dist = false

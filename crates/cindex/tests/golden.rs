@@ -6,8 +6,37 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Locate the `cindex` executable.
+///
+/// It is NOT a bin of this package — it is a bin of `rvl`
+/// (`crates/rvl/src/bin/cindex.rs`), so release packaging can pack it beside
+/// `rvl`; see the note at the top of `src/lib.rs`. That means
+/// `CARGO_BIN_EXE_cindex` does not exist here, so the binary is found the only
+/// way a non-owning package can: walk up from this test executable
+/// (`target/<profile>/deps/golden-<hash>`) to the profile directory, where
+/// cargo puts every workspace bin.
+fn bin_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("target/<profile> directory");
+    profile_dir.join(if cfg!(windows) {
+        "cindex.exe"
+    } else {
+        "cindex"
+    })
+}
+
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cindex"))
+    let path = bin_path();
+    assert!(
+        path.is_file(),
+        "cindex is not built at {} — it is a bin of the `rvl` package, so build it with \
+         `cargo build -p rvl --bin cindex` (a plain `cargo build --workspace` also does it)",
+        path.display()
+    );
+    Command::new(path)
 }
 
 fn fixture(name: &str) -> PathBuf {

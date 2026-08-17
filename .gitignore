@@ -3,3 +3,9 @@
 # .NET build artifacts (csindex + its test fixture)
 obj/
 bin/
+# ...but crates/rvl/src/bin is SOURCE: it holds the cindex and rustindex bin
+# targets, which must be bins of the rvl package for release packaging to pack
+# them beside rvl (see the RELEASE PACKAGING note in crates/rvl/Cargo.toml).
+# Without this negation `bin/` above silently drops them from every commit, and
+# the release fails with "failed to find bin cindex for .../crates/rvl".
+!crates/rvl/src/bin/

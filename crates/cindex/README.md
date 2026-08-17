@@ -140,7 +140,10 @@ What is implemented now vs deliberately documented for later:
 
 ## Tests
 
-`cargo test -p cindex`. Golden packet tests run the built helper over the
+`cargo test --workspace` (or `cargo build -p rvl --bin cindex && cargo test -p
+cindex` — the `cindex` executable is a bin of the `rvl` package, not of this
+one, so that this helper ships inside rvl's release archive; see `src/lib.rs`).
+Golden packet tests run the built helper over the
 checked-in fixtures (`testdata/fixture-c`, `fixture-cpp`, `fixture-nodb`)
 and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
