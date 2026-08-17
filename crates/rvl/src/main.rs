@@ -1423,7 +1423,7 @@ fn missing_helper_hint(lang: Lang) -> String {
         // install: `install_dirs` looks inside it for csindex.dll.
         Lang::CSharp => format!(
             "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
-             then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
+             then from a clone of https://github.com/revelara-ai/rvl-cli run one command: \
              `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
              — {BIN} finds it there with no further setup",
         ),
