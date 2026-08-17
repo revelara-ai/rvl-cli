@@ -58,8 +58,11 @@ jobs:
 
       # Builds cindex so the C/C++ live e2e runs instead of skipping itself.
       # A helper the suite never builds is a lane the suite never covers.
+      # Both helpers are bin targets of the `rvl` PACKAGE (their crates are
+      # libraries) so that release packaging can pack them beside `rvl` — see
+      # the RELEASE PACKAGING note in crates/rvl/Cargo.toml.
       - name: Build the in-workspace helpers
-        run: cargo build -p cindex -p rustindex
+        run: cargo build -p rvl --bin cindex --bin rustindex
 
       - name: Test
         run: cargo test --workspace

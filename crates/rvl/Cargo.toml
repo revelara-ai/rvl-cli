@@ -11,6 +11,13 @@ homepage.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+# The two native retriever helpers. They are dependencies of this package
+# because their EXECUTABLES are bin targets of this package
+# (src/bin/cindex.rs, src/bin/rustindex.rs) — see the RELEASE PACKAGING note
+# at the bottom of this file. Neither is used by the `rvl` binary itself, so
+# neither is linked into it; `rvl` still shells out to them at scan time.
+cindex = { path = "../cindex" }
+rustindex = { path = "../rustindex" }
 rvl-cache = { path = "../rvl-cache" }
 rvl-config = { path = "../rvl-config" }
 rvl-content = { path = "../rvl-content" }
@@ -54,9 +61,28 @@ rvl-index = { path = "../rvl-index" }
 # own Homebrew formula — so `brew install rvl` delivered the scanner and
 # none of the retrievers, and the first scan of a polyglot repo hard-failed.
 #
-# `binaries` packs the workspace's native helpers into the SAME archive as
-# rvl, which is where resolution looks first (adjacent to the binary), and
-# Homebrew's generated formula `bin.install`s all three together.
+# `binaries` names the bins THIS PACKAGE builds, and they all go in the same
+# archive — which is where resolution looks first (adjacent to the binary).
+#
+# WHY cindex/rustindex ARE BIN TARGETS OF *THIS* PACKAGE (po-av01j.154). This
+# key is a filter over the package's own bin targets, not a way to borrow
+# another package's. Listing helpers that lived in `crates/cindex` and
+# `crates/rustindex` let `dist plan` resolve and print an archive containing
+# all three, then failed at build time with "failed to find bin cindex for
+# .../crates/rvl", because dist builds `-p rvl` and that package produced no
+# such bin. So the executables are declared here, as `src/bin/cindex.rs` and
+# `src/bin/rustindex.rs`, one-line shims over the sibling crates (now
+# libraries). Those crates must NOT also define a bin of the same name: cargo
+# warns "output filename collision" and which one lands at
+# `target/<profile>/cindex` is arbitrary.
+#
+# Do not "simplify" this by cross-building the two into `dist-extras/` and
+# shipping them via `include` the way goindex is. goindex has no choice — it
+# is a Go build. These are cargo bins, and keeping them cargo bins is what
+# makes dist build them for every target with the release profile, list them
+# in dist-manifest.json as executables, and lets ci/render-cask.sh check the
+# archive against that list. Moving them to `include` would silently drop
+# them from that check.
 #
 # `include` carries goindex, which cargo cannot build: release CI cross-builds
 # it per target into `dist-extras/` before `dist build` runs. It is not a cargo

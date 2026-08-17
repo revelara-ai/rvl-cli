@@ -19,6 +19,7 @@
 //!   expansion-internal calls do not leak occurrences to the call site.
 
 pub mod catalog;
+pub mod cli;
 pub mod derive;
 pub mod ra;
 pub mod symbol;

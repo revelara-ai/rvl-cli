@@ -22,8 +22,11 @@ clang-sys = { version = "1.8", features = ["runtime", "clang_6_0"] }
 [dev-dependencies]
 tempfile = "3"
 
-# Not its own release app: cindex rides the rvl archive (po-aml3h), listed
-# in rvl's `[package.metadata.dist] binaries`. Left as a separate dist app
-# it would publish a separate Homebrew formula nobody should have to install.
+# Not its own release app: cindex rides the rvl archive (po-aml3h). Since
+# po-av01j.154 this crate is a LIBRARY and the executable is a bin target of
+# the rvl package (crates/rvl/src/bin/cindex.rs) — dist can only pack a
+# package's own bins, so that is the only placement that puts the helper
+# beside `rvl` in the archive. Kept explicit anyway: a bin re-added here would
+# otherwise turn this back into a separate dist app with its own archive.
 [package.metadata.dist]
 dist = false

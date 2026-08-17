@@ -28,7 +28,7 @@ exclude = ["crates/rustindex/testdata/fixture"]
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/revelara-ai/rvlscan"
+repository = "https://github.com/revelara-ai/rvl-cli"
 homepage = "https://revelara.ai"
 
 [workspace.dependencies]

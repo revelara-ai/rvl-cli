@@ -1,13 +1,20 @@
 //! rustindex CLI — the Rust retriever helper.
 //!
-//!     rustindex --retrieve --root <repo> --name <snapshot>   # full load
-//!     rustindex --retrieve --root <repo> --files a.rs,b.rs   # incremental
-//!     rustindex --packet-schema                              # negotiate
+//! ```text
+//! rustindex --retrieve --root <repo> --name <snapshot>   # full load
+//! rustindex --retrieve --root <repo> --files a.rs,b.rs   # incremental
+//! rustindex --packet-schema                              # negotiate
+//! ```
 //!
 //! Matches the argv contract `rvl` builds in `helper_argv` for an
 //! Executable helper. The incremental path is a filtered full run: the
 //! rust-analyzer `scip` engine has no per-file mode, so the cold cost is paid
 //! and only the requested files' sites are emitted.
+//!
+//! This module is the CLI, not the bin. The `rustindex` executable is a bin
+//! target of the `rvl` PACKAGE (`crates/rvl/src/bin/rustindex.rs`), a one-line
+//! shim over [`run`]; see the note at the top of `crates/cindex/src/lib.rs`
+//! for why release packaging forces that placement.
 
 use anyhow::Context;
 
@@ -22,12 +29,14 @@ const EXIT_ABSTAIN: i32 = 3;
 /// "helper not installed" with the install hint, rather than as a failure.
 const EXIT_PREREQ_MISSING: i32 = 4;
 
-fn main() {
-    if let Err(e) = run() {
+/// The `rustindex` CLI entry point. Called by the `rvl` package's
+/// `rustindex` bin.
+pub fn run() {
+    if let Err(e) = execute() {
         eprintln!("rustindex: {e:#}");
-        let code = if e.downcast_ref::<rustindex::ra::Abstain>().is_some() {
+        let code = if e.downcast_ref::<crate::ra::Abstain>().is_some() {
             EXIT_ABSTAIN
-        } else if e.downcast_ref::<rustindex::ra::MissingPrereq>().is_some() {
+        } else if e.downcast_ref::<crate::ra::MissingPrereq>().is_some() {
             EXIT_PREREQ_MISSING
         } else {
             2
@@ -36,7 +45,7 @@ fn main() {
     }
 }
 
-fn run() -> anyhow::Result<()> {
+fn execute() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut retrieve = false;
     let mut root: Option<String> = None;
@@ -93,10 +102,10 @@ fn run() -> anyhow::Result<()> {
 
     // Engine discovery + identity (pin/checksum), then the build-dep gate:
     // a workspace that does not load ABSTAINS — no heuristic tier.
-    let ra = rustindex::ra::discover()?;
+    let ra = crate::ra::discover()?;
     let lock_pre_existing = root.join("Cargo.lock").is_file();
-    rustindex::ra::require_workspace_loads(&root)?;
-    let lock = rustindex::ra::lockfile_provenance(&root, lock_pre_existing);
+    crate::ra::require_workspace_loads(&root)?;
+    let lock = crate::ra::lockfile_provenance(&root, lock_pre_existing);
     if !lock.pre_existing {
         eprintln!(
             "rustindex: no committed Cargo.lock; resolution was minted at scan time \
@@ -105,13 +114,13 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
-    let index = rustindex::ra::run_scip(&ra, &root)?;
+    let index = crate::ra::run_scip(&ra, &root)?;
     let only = if files.is_empty() {
         None
     } else {
         Some(files.as_slice())
     };
-    let derived = rustindex::derive::derive(&root, &snapshot, &index, only);
+    let derived = crate::derive::derive(&root, &snapshot, &index, only);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -143,7 +152,7 @@ fn run() -> anyhow::Result<()> {
         "rust_analyzer": {
             "version": ra.version_line,
             "sha256": ra.sha256,
-            "pinned_version": rustindex::ra::PINNED_VERSION,
+            "pinned_version": crate::ra::PINNED_VERSION,
             "matches_pin": ra.matches_pin,
         },
         "cargo_lockfile": {

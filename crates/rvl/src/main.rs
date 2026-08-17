@@ -961,8 +961,10 @@ fn server_to_findings(
 //   pyindex.py / tsindex.js / javaindex.java   embedded in this binary and
 //       extracted to ~/.revelara/helpers/<version>/ on first use. They are
 //       platform-independent text, so one build carries them everywhere.
-//   cindex / rustindex                          workspace bins, packed into
-//       the same release archive as rvl (dist `binaries` in Cargo.toml).
+//   cindex / rustindex                          bin targets of THIS package
+//       (src/bin/), so dist packs them into the same release archive as rvl
+//       (`binaries` in Cargo.toml). Their crates are libraries; see the
+//       RELEASE PACKAGING note in Cargo.toml for why the bins live here.
 //   goindex                                     built per target by release CI
 //       and packed into the archive alongside the binary.
 //   csindex                                     NOT carried: it needs ~9 MB of
@@ -1318,8 +1320,8 @@ fn language_is_incidental(root: &Path, lang: Lang) -> bool {
 }
 
 /// Classify a resolved helper path into how it must be invoked. Go, Rust, and
-/// C/C++ helpers are always executables (rustindex and cindex are workspace
-/// binaries built next to rvl); a Python helper is a `python3` script when
+/// C/C++ helpers are always executables (rustindex and cindex are bins of the
+/// rvl package, built next to rvl); a Python helper is a `python3` script when
 /// it ends in `.py`, a TypeScript helper is a `node` script when it ends in
 /// `.js`, a Java helper is a `java` source-file script when it ends in
 /// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
@@ -1421,7 +1423,7 @@ fn missing_helper_hint(lang: Lang) -> String {
         // install: `install_dirs` looks inside it for csindex.dll.
         Lang::CSharp => format!(
             "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
-             then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
+             then from a clone of https://github.com/revelara-ai/rvl-cli run one command: \
              `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
              — {BIN} finds it there with no further setup",
         ),

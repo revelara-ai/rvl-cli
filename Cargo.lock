@@ -956,11 +956,13 @@ name = "rvl"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "cindex",
  "clap",
  "clap_complete",
  "hex",
  "ignore",
  "libc",
+ "rustindex",
  "rvl-cache",
  "rvl-config",
  "rvl-content",

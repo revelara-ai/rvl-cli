@@ -18,7 +18,7 @@ brew install revelara-ai/tap/rvl
 ```
 
 Or download a release archive from the
-[releases page](https://github.com/revelara-ai/rvlscan/releases).
+[releases page](https://github.com/revelara-ai/rvl-cli/releases).
 
 ## Usage
 

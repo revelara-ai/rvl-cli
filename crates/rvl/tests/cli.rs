@@ -2040,7 +2040,7 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
         .unwrap()
         .join("cindex");
     if !bin.is_file() {
-        eprintln!("SKIP {test}: cindex not built (run `cargo build -p cindex`)");
+        eprintln!("SKIP {test}: cindex not built (run `cargo build -p rvl --bin cindex`)");
         return None;
     }
     match std::process::Command::new(&bin)
@@ -2410,14 +2410,15 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
-    // The helper is a workspace bin: usually already built next to rvl.
+    // The helper is a bin of this same package, so cargo has already built it
+    // next to rvl before running this test.
     let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
         .join("rustindex");
     if !rustindex.is_file() {
         let build = Command::new("cargo")
-            .args(["build", "-p", "rustindex"])
+            .args(["build", "-p", "rvl", "--bin", "rustindex"])
             .current_dir(&workspace)
             .output();
         match build {

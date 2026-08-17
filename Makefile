@@ -14,10 +14,12 @@
 # without a rebuild of rvl. (A rebuild re-embeds it either way.)
 #
 # `helpers` still matters for goindex, which is a Go binary this Makefile is
-# the only local way to produce. rustindex and cindex are workspace crates, so
-# a plain `cargo build` already lands them next to rvl; rustindex needs
-# rust-analyzer at runtime (`rustup component add rust-analyzer`) and cindex
-# needs a system libclang.
+# the only local way to produce. rustindex and cindex are bin targets of the
+# `rvl` package (their crates are libraries, so that release packaging can pack
+# the executables beside rvl — see crates/rvl/Cargo.toml), so a plain
+# `cargo build` already lands them next to rvl; rustindex needs rust-analyzer
+# at runtime (`rustup component add rust-analyzer`) and cindex needs a system
+# libclang.
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).
@@ -50,7 +52,9 @@ rebuild:
 
 ## install: release-build rvl + goindex/pyindex/cindex/rustindex and put them on PATH (BINDIR)
 install:
-	$(CARGO) build --release -p rvl -p cindex -p rustindex
+	@# cindex and rustindex are bin targets of the `rvl` package (their crates
+	@# are libraries), so `-p rvl` alone builds all three next to each other.
+	$(CARGO) build --release -p rvl
 	$(GO) build -C helpers/goindex -o $(abspath target/release)/goindex .
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/rvl "$(BINDIR)/rvl"
@@ -85,7 +89,7 @@ uninstall:
 	@echo "removed rvl + goindex + cindex + rustindex + pyindex.py + tsindex.js + javaindex.java from $(BINDIR)"
 
 ## helpers: build goindex and place goindex + pyindex + javaindex next to the rvl binary
-## (cindex and rustindex are workspace bins: `build` already drops them in the
+## (cindex and rustindex are bins of the rvl package: `build` already drops them in the
 ## adjacent slot; scanning C/C++ additionally needs a system libclang until
 ## releases vendor a pinned LLVM; scanning Rust needs rust-analyzer at runtime)
 helpers: build
