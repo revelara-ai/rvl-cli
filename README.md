@@ -143,6 +143,12 @@ from "the scanner is broken" (`1`) — a broken scanner must not be silently
 read as a clean tree. Advisory findings never affect the exit code. Do not
 write a gate that only checks for non-zero.
 
+**Exit `0` means nothing blocking was found, not that your code was scanned.**
+A scan whose retrievers produced nothing still exits `0`. Read the `COVERAGE`
+block, which names the per-language site count and any lane that failed:
+`languages: Go 0 sites` on a Go repository means the gate passed over
+unread code. The next section covers how to catch that in CI.
+
 To get past a blocked commit deliberately, `RVL_FORCE=1 git commit …` or arm
 a one-shot override with `rvl scan force-next`.
 
@@ -159,8 +165,36 @@ rvl scan . --incremental --changed-only --strict
 chain: `--base`, `RVL_BASE_REF`, `GITHUB_BASE_REF`,
 `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `.revelara.yaml`
 `scanner.base_ref`. A GitHub pull-request event already exports
-`GITHUB_BASE_REF`, so a PR job usually needs no flag at all. `--strict` makes
-a retriever error fail the job instead of degrading to a partial scan.
+`GITHUB_BASE_REF`, so a PR job usually needs no flag at all.
+
+`--strict` matters more than it looks. By default a scan **fails open**: when
+a retriever errors, the scan degrades to whatever it did read, prints
+`NOT CLEAN — nothing was scanned (see COVERAGE)`, and still exits `0` so a
+commit is not held hostage to a broken toolchain. That is the right default on
+a laptop and the wrong one on a build runner, where an image missing a
+language toolchain would otherwise produce a green gate forever. `--strict`
+turns that case into exit `1`.
+
+`--strict` is not a complete backstop, because it only catches a retriever
+that **errors**. A retriever that exits cleanly having read nothing is not an
+error, so it is reported as a genuine empty result and `--strict` passes it.
+The Go lane does exactly this when the `go` tool is absent: `goindex` exits
+`0` with zero packets, the scan prints `languages: Go 0 sites` and
+`✓ commit clean`, and both plain and `--strict` runs exit `0`. Until that is
+fixed, a CI job that must not silently pass over unread code should assert on
+coverage as well as on the exit code. `--out` writes a
+`coverage.lang_status` array (`state`, and `detail` carrying the site count on
+a scanned lane or the error on a failed one), which makes that one command:
+
+```sh
+rvl scan . --strict --out findings.json
+jq -e '.coverage.lang_status
+       | all(.state == "scanned" and ((.detail | tonumber?) // 0) > 0)' \
+  findings.json
+```
+
+That fails the job on a lane that errored *and* on a lane that read zero
+sites, which is the gap `--strict` leaves open.
 
 ## How a scan finds your code
 
@@ -210,6 +244,15 @@ safe, idempotent, local repairs, announcing each one first; anything needing a
 system package manager or `sudo` is printed, never run. Exit codes: `0`
 everything this repo needs is in place, `1` a gap remains, `2` usage error.
 `--format=json` emits the same checks for scripts.
+
+One caveat worth knowing before you trust a green `doctor`: it reports the
+three compiled helpers (`goindex`, `cindex`, `rustindex`) as
+`native — no runtime prereq`, because it checks that the helper itself is
+resolvable and does not probe the toolchain that helper drives. So a machine
+with no `go`, no `libclang` or no `rust-analyzer` still shows `PASS` on that
+lane. `cindex --engine-check` prints the libclang it resolved, and the scan's
+own `COVERAGE` block is the authority on whether a lane actually read
+anything.
 
 Helpers are resolved in this order, and the scan's `retrievers:` line names
 both the path and the slot it came from (`env:VAR` / `bundled` / `embedded` /
