@@ -8,6 +8,7 @@ homepage.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+rvl-core = { path = "../rvl-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }

@@ -1,6 +1,6 @@
 # tsindex — TypeScript retriever helper
 
-Emits the versioned packet stream rvlscan consumes, for TypeScript source. The
+Emits the versioned packet stream rvl consumes, for TypeScript source. The
 TypeScript sibling of `goindex` and `pyindex`. Retrieval only: this helper
 decides nothing about reliability, it only says what the code is.
 
@@ -8,17 +8,17 @@ decides nothing about reliability, it only says what the code is.
     node tsindex.js --retrieve --root <repo> --files a.ts,b.ts     # incremental reload
     node tsindex.js --packet-schema                                # negotiate before loading
 
-Install once with `npm install` (its only dependency is `typescript`). rvlscan
+Install once with `npm install` (its only dependency is `typescript`). rvl
 invokes it as `node tsindex.js …`, the same way it runs `pyindex.py` under
-`python3`; helper discovery is env override (`RVLSCAN_TSINDEX`) → a helper next
-to the rvlscan binary → `PATH`.
+`python3`; helper discovery is env override (`RVL_TSINDEX`) → a helper next
+to the rvl binary → `PATH`.
 
 ## What it emits
 
 One JSON object per line (JSONL) to stdout, one per detected call site. A site
 is a `receiver.method(...)` call. Every record carries:
 
-- `packet_schema` — the contract version (currently `2`). rvlscan absorbs
+- `packet_schema` — the contract version (currently `2`). rvl absorbs
   helper churn behind this number; a consumer that does not know a version
   refuses the stream rather than guessing at its shape. It agrees with
   goindex's `PacketSchema`, pyindex's `PACKET_SCHEMA`, and

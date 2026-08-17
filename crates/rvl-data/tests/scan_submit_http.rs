@@ -142,7 +142,7 @@ fn request_fixture() -> ScanRequest {
         ]
     }))
     .unwrap();
-    req.metadata.scanner_id = "rvlscan/0.0.0-test".into();
+    req.metadata.scanner_id = "rvl/0.0.0-test".into();
     req
 }
 
@@ -244,7 +244,7 @@ fn auth_failure_names_the_api_url_and_login_hint() {
     assert_eq!(
         err,
         format!(
-            "authentication failed against {} - run 'rvlscan login' to reconfigure (status 401)",
+            "authentication failed against {} - run 'rvl login' to reconfigure (status 401)",
             server.base_url
         )
     );

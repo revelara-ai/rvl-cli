@@ -9,6 +9,7 @@
 //! <root>/installed.json           # harness -> installed version/location
 //! ```
 
+use rvl_core::BIN;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,7 +99,7 @@ impl SkillsStore {
         anyhow::ensure!(
             actual == meta.sha256,
             "cached skills tarball for {editor} is corrupt (sha256 mismatch); \
-             re-run 'rvlscan skills install {editor}' online to refetch"
+             re-run '{BIN} skills install {editor}' online to refetch"
         );
         Ok(Some((tarball, meta)))
     }

@@ -13,7 +13,7 @@ env:
 
 # Runner selection follows the org convention: the `CI_RUNNER` variable selects
 # the self-hosted fleet, and an unset variable falls back to GitHub-hosted.
-# rvlscan goes PUBLIC at cutover (po-av01j.18), and public repos are kept on
+# rvl goes PUBLIC at cutover (po-av01j.18), and public repos are kept on
 # free GitHub-hosted minutes rather than the shared fleet -- at that point set a
 # REPO-level `CI_RUNNER=""` to override the org value, no workflow edit needed.
 jobs:

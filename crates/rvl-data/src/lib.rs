@@ -12,11 +12,13 @@
 //!   2  usage error (unknown flag, invalid argument) — clap parse errors
 //!      already exit 2; validation failures use [`Failure::usage`].
 //!
-//! The binary name is `rvlscan` today and becomes `rvl` at cutover; every
-//! user-facing hint routes through [`BIN`] so the rename is one constant.
+//! The binary is named `rvl` (renamed from `rvlscan` at the v1.0.0 cutover,
+//! po-av01j.154); every user-facing hint routes through [`BIN`] (defined in
+//! `rvl-core`, re-exported here), which is why the rename was one constant.
 
 pub mod auth;
 pub mod client;
+pub mod compliance;
 pub mod config;
 pub mod control;
 pub mod display;
@@ -26,17 +28,23 @@ pub mod gojson;
 pub mod incident;
 pub mod knowledge;
 pub mod project_config;
+pub mod project_mapping;
 pub mod risk;
+pub mod risk_context_render;
 pub mod scan_cached_output;
 pub mod scan_normalize;
 pub mod scan_submit;
 pub mod scan_team;
+pub mod stpa;
+pub mod update_check;
+pub mod upgrade_hint;
 
 use std::process::ExitCode;
 
-/// The binary name used in user-facing hints ("run 'rvlscan login'").
-/// Flips to "rvl" at the public-release cutover (po-av01j.18).
-pub const BIN: &str = "rvlscan";
+/// The binary name used in user-facing hints ("run 'rvl login'"), re-exported
+/// from [`rvl_core`] so the ~57 `rvl_data::BIN` call sites keep working while
+/// crates that do not depend on rvl-data can reach the same constant.
+pub use rvl_core::BIN;
 
 /// A command failure: the exact stderr message plus the process exit code.
 #[derive(Debug, PartialEq, Eq)]

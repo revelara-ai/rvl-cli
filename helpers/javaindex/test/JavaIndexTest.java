@@ -4,7 +4,7 @@
 //     java test/JavaIndexTest.java
 //
 // It spawns the helper as a subprocess (`java javaindex.java ...`), exactly
-// the way rvlscan invokes it, and asserts the properties every consumer
+// the way rvl invokes it, and asserts the properties every consumer
 // depends on: schema stamped, site_key unique and equal to the
 // file:line:client_type:func formula, typed vs import-attributed vs
 // unresolved confidence behavior, the G2/G3/G4 site kinds, const_args

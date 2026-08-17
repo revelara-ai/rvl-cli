@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// tsindex -- TypeScript retriever helper for rvlscan.
+// tsindex -- TypeScript retriever helper for rvl.
 //
 // Retrieval mode: emit the SOURCE that bears on a call site, never a verdict.
 // This is the TypeScript sibling of helpers/goindex and helpers/pyindex. It
-// emits the SAME versioned packet stream rvlscan consumes, for TypeScript
+// emits the SAME versioned packet stream rvl consumes, for TypeScript
 // source instead of Go/Python.
 //
 // The split this enforces
@@ -19,7 +19,7 @@
 // its TypeChecker. Unlike Python, TypeScript ships a real type system, so we
 // lean on it: a receiver's type is resolved through the checker rather than
 // guessed from imports. The tradeoff is a Node runtime in the toolchain (the
-// helper is a `.js` run under `node`, discovered by rvlscan the same way
+// helper is a `.js` run under `node`, discovered by rvl the same way
 // pyindex.py is discovered and run under `python3`). We deliberately use the
 // stable `typescript` compiler API rather than the pre-release native port.
 //
@@ -34,13 +34,13 @@ const fs = require('fs');
 const path = require('path');
 
 // The `typescript` package is this helper's PREREQUISITE, not part of it: the
-// script is embedded in the rvlscan binary and extracted to
+// script is embedded in the rvl binary and extracted to
 // ~/.revelara/helpers/<version>/, and the compiler is 9 MB that would have to
-// be carried for every target (po-aml3h). rvlscan points NODE_PATH at the
+// be carried for every target (po-aml3h). rvl points NODE_PATH at the
 // scanned repository, so a project with its own `node_modules` needs nothing;
 // anything else gets ONE command rather than a raw module-resolution stack.
 //
-// Exit 4 is rvlscan's HELPER_EXIT_PREREQ_MISSING: "not set up yet", which
+// Exit 4 is rvl's HELPER_EXIT_PREREQ_MISSING: "not set up yet", which
 // degrades this language and scans the rest of the repo, as distinct from
 // "broken" (which asks the reader to file a bug).
 // The version is PINNED, and the pin is load-bearing: npm's `typescript` now
@@ -65,7 +65,7 @@ try {
 } catch (e) {
   missingTypeScript('the `typescript` package is not installed where node can find it');
 }
-// Checked by CAPABILITY rather than by version string: rvlscan points NODE_PATH
+// Checked by CAPABILITY rather than by version string: rvl points NODE_PATH
 // at the repository being scanned, so the compiler that answers here is
 // whatever that project depends on, and "does it expose the API we drive"
 // survives a version scheme changing under us. Without this the 7.x port
@@ -78,7 +78,7 @@ if (!ts || typeof ts.createProgram !== 'function' || !ts.sys) {
   );
 }
 
-// PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
+// PACKET_SCHEMA is the version of the emitted packet contract. rvl absorbs
 // helper churn behind this number: a consumer that does not know a version
 // refuses the stream rather than guessing at its shape. It MUST agree with
 // goindex's PacketSchema, pyindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
@@ -1404,7 +1404,7 @@ function nestRouteRecords(node, sf, relPath, snapshot, checker) {
 
 // Write a string to fd 1 (stdout) SYNCHRONOUSLY and completely. process.exit()
 // discards whatever process.stdout.write() has buffered, and on a PIPE (how
-// rvlscan captures the helper via std::process .output()) large writes buffer
+// rvl captures the helper via std::process .output()) large writes buffer
 // heavily -- so an async write + process.exit truncates the tail
 // nondeterministically (po-3t3oj.37: identical scans returned 14k/5k/2k/463
 // sites). A blocking fd write with an EAGAIN retry loop cannot be truncated:
@@ -1576,7 +1576,7 @@ function main(argv) {
     //
     // Same charter as rustindex on an unloadable cargo workspace and goindex
     // with no module: abstain rather than guess. Exit 3 is the helper ABSTAIN
-    // code rvlscan reads (po-av01j.102), so it surfaces as a COVERAGE line.
+    // code rvl reads (po-av01j.102), so it surfaces as a COVERAGE line.
     const missing = missingDependencyTrees(root);
     if (missing.length > 0) {
       process.stderr.write(

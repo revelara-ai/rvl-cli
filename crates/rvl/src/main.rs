@@ -1,0 +1,8453 @@
+use std::io::IsTerminal;
+mod agent;
+mod base_ref;
+mod changed;
+mod compat;
+mod config_lane;
+mod context_files;
+mod devscope;
+mod doctor;
+mod embedded_helpers;
+mod empty_flag;
+mod force;
+mod hook;
+mod init;
+mod out_doc;
+mod render;
+mod report;
+mod shared_config;
+mod waiver;
+
+use anyhow::Context as _;
+use clap::{Parser, Subcommand};
+use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, SyncOutcome};
+use rvl_data::BIN;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+/// EXIT-CODE CONTRACT (po-av01j.94). `rvl scan` is wired into pre-commit
+/// hooks and CI gates, so the exit code IS the gate:
+///
+/// * `0` — the scan completed and nothing blocking remains after waivers
+///   ("commit clean").
+/// * `1` — the scan could not complete: no verifiable spec cache, a retriever
+///   error under `--strict`, an IO failure. The SCANNER broke; the code was
+///   never judged. (`ExitCode::FAILURE`, and `rvl_data::Failure::runtime`.)
+/// * `2` — usage error: an unknown or invalid flag/argument. (clap's default,
+///   and `rvl_data::Failure::usage`.)
+/// * `3` — the scan completed and BLOCKING findings remain: fix or suppress
+///   them. This is the gate firing.
+///
+/// "Blocked" gets its own code instead of reusing `1` because a hook must be
+/// able to distinguish "your code has a problem" from "the scanner is broken",
+/// and `1`/`2` already mean the latter two things throughout this binary. That
+/// makes the contract additive: no previously non-zero code changed meaning,
+/// only the previously-and-wrongly-zero blocked case moved.
+const EXIT_BLOCKED: u8 = 3;
+
+#[derive(Parser)]
+#[command(name = rvl_data::BIN, version, about = "Revelara reliability scanner")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+/// `Scan` carries every scan flag inline and so dwarfs the other variants.
+/// Boxing it to even the sizes would buy nothing measurable — exactly ONE of
+/// these is ever constructed, from argv, once per process, and it is consumed
+/// immediately — while costing the clap derive its flat field list and every
+/// dispatch site an extra deref. The lint is about enums held in bulk; this
+/// one is held in a single `Option<Cmd>`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum Cmd {
+    /// Scan a repo against the signed spec cache: spec matching, propagation,
+    /// triage. Deterministic, no model calls. With no `--retrieved`, rvl
+    /// detects the languages under PATH and runs the matching retriever helper
+    /// itself; `--retrieved` is an escape hatch for a prebuilt packet stream.
+    ///
+    /// Exit codes: 0 = clean, 3 = BLOCKING findings remain (the gate fires),
+    /// 1 = the scan could not complete, 2 = usage error.
+    ///
+    /// SUBMISSION MODE (rvl-cli parity, po-av01j.153): when `--scan-dir`,
+    /// `--file`, `--stdin`, or `--service` is present, this command instead
+    /// submits risk findings to the Revelara risk register — same flags and
+    /// wire contract as `rvl scan --service <name> --scan-dir <dir>`, so
+    /// plugin skill content works against this binary verbatim. The
+    /// deterministic scan above is untouched when none of those flags appear.
+    Scan {
+        /// Repo/dir to scan (default: current directory). Ignored when
+        /// `--retrieved` is given.
+        path: Option<PathBuf>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL). When
+        /// present, helper orchestration is skipped entirely.
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        /// DEV ONLY: bypass the signed cache and load specs from a file.
+        /// Loudly announced; never silent.
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        /// DEV ONLY: override the signed cache's judgments with a JSON array.
+        /// The ratified corpus ships inside the cache, so no flag is needed;
+        /// this is loudly announced when used. Unjudged classes still surface,
+        /// they are never dropped.
+        #[arg(long)]
+        judgments: Option<PathBuf>,
+        /// Write findings JSON here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Color output: auto (default), always, or never. NO_COLOR is honored.
+        #[arg(long)]
+        color: Option<String>,
+        /// Warm re-scan: reuse the persistent packet index and re-retrieve only
+        /// files whose content hash changed. Ignored when `--retrieved` is given.
+        #[arg(long)]
+        incremental: bool,
+        /// Fail CLOSED when the incremental wall budget is exhausted or a
+        /// retriever errors (CI). Default is fail-open: degrade to the reused
+        /// portion so a scan never blocks.
+        #[arg(long)]
+        strict: bool,
+        /// Report and gate ONLY on findings in the files this change touched
+        /// (po-av01j.127). The changed set comes from GIT, never from the
+        /// packet index (po-sg7jb): staged paths under `--hook pre-commit`,
+        /// the pushed range under `--hook pre-push`, otherwise the working
+        /// tree against HEAD. Outside a git work tree the scan REFUSES rather
+        /// than widening to the whole repository. Requires `--incremental`,
+        /// which is the only path that implements the scoping. Without it,
+        /// `--incremental` is an index-reuse
+        /// optimization only: it re-retrieves just the stale files but still
+        /// reports the WHOLE repo, so a one-file docs commit surfaces the same
+        /// rows as a nine-file code commit. That is the right shape for a
+        /// manual audit and the wrong one for a commit hook, where findings you
+        /// did not introduce are noise you learn to ignore.
+        #[arg(long)]
+        changed_only: bool,
+        /// Base ref for `--changed-only`: the gate scopes to `<ref>...HEAD`,
+        /// the committed work on this branch since it diverged (po-av01j.194,
+        /// rvl-cli parity). THE FLAG IS THE TOP OF A CHAIN — `--base`,
+        /// `RVL_BASE_REF`, `GITHUB_BASE_REF`,
+        /// `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `.revelara.yaml`
+        /// `scanner.base_ref` — so CI needs no flag at all: a GitHub PR event
+        /// already exports `GITHUB_BASE_REF`.
+        ///
+        /// Without it a `--changed-only` run asks the WORKING-TREE question,
+        /// which answers "nothing" in a CI pull-request checkout (clean tree,
+        /// HEAD at the PR head) and exits 0 having read no files. A base ref
+        /// that is set but not present in the clone (a shallow checkout) is a
+        /// REFUSAL, never a fallback.
+        ///
+        /// `--base=` means "not given" and falls through to the next link,
+        /// exactly as rvl-cli's `!= ""` guard does (scan.go:473/500).
+        #[arg(long)]
+        base: Option<String>,
+        /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
+        /// one-line deprecation notice and runs the deterministic scan.
+        /// Consented hook adjudication is configured separately
+        /// (po-av01j.15, `--hook`); this flag never invokes a model.
+        #[arg(long)]
+        agent: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
+        /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
+        /// the same question `--hook pre-commit` asks. Accepted because v1's
+        /// `hook install` wrote it into `.git/hooks/pre-commit`, where no
+        /// human can update it before the next `git commit` (po-av01j.191).
+        #[arg(long)]
+        staged: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
+        /// --hook pre-push`. Same reason as `--staged`; v1's lefthook snippet
+        /// told users to paste this one by hand.
+        #[arg(long)]
+        pre_push: bool,
+        /// rvl-cli v1 COMPATIBILITY ALIAS: `enforce` (v1's default, and the
+        /// only mode this binary has) changes nothing; `eval` reports findings
+        /// without blocking, exit 0.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Name the git hook this scan runs under (pre-commit|pre-push).
+        /// With `--incremental`, enables the CONSENTED hook-mode agent
+        /// adjudication lane for delta-scoped undecided sites — OFF by
+        /// default at every layer; see `scanner.use_agent` and
+        /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
+        /// deterministic scan is unchanged either way; advisory agent verdicts
+        /// cannot affect the exit code, and gate-mode verdicts
+        /// (`scanner.agent_verdicts: gate`) block exactly like any other
+        /// BLOCKING row — see EXIT_BLOCKED.
+        #[arg(long)]
+        hook: Option<String>,
+        /// Submission mode: service name the findings belong to (selects
+        /// submission when combined with --scan-dir/--file/--stdin).
+        #[arg(long, short = 's')]
+        service: Option<String>,
+        /// Submission mode: owning team for the whole submission. Overrides
+        /// every `.revelara.yaml` `team:` value (repo-level and per-component)
+        /// and creates the team on first sight.
+        #[arg(long)]
+        team: Option<String>,
+        /// Submission mode: project directory the scan describes (default:
+        /// cwd); git_commit/git_branch metadata come from here.
+        #[arg(long, short = 't', value_parser = empty_flag::path_allowing_empty)]
+        target: Option<PathBuf>,
+        /// Submission mode: read findings JSON from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Submission mode: read findings from a file.
+        #[arg(long, short = 'f', value_parser = empty_flag::path_allowing_empty)]
+        file: Option<PathBuf>,
+        /// Submission mode: merge all *.json part files from a directory.
+        /// `--scan-dir=` is guarded `!= ""` by rvl-cli (scan.go:557), so an
+        /// empty value means "not given" rather than "the directory named ''".
+        #[arg(long, value_parser = empty_flag::path_allowing_empty)]
+        scan_dir: Option<PathBuf>,
+        /// Submission mode: remove --scan-dir contents after a successful
+        /// submit.
+        #[arg(long)]
+        cleanup_on_success: bool,
+        /// Submission mode: validate, normalize, and print the submit
+        /// summary (JSON on stdout) without submitting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Submission mode: HTTP submission timeout (e.g. 90, 90s, 2m;
+        /// default 60s or RVL_SCAN_TIMEOUT).
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Submission mode: output format (text|json). json mirrors
+        /// rvl-cli's CI contract: response JSON on stdout, exit 1 when
+        /// critical/high findings were reported.
+        #[arg(long)]
+        format: Option<String>,
+        /// rvl-cli COMPATIBILITY ALIAS for `--format json`: rvl-cli's `--ci`
+        /// sets `scan_mode: "ci"`, which is exactly what `--format json`
+        /// already selects here. An explicit `--format` wins.
+        #[arg(long)]
+        ci: bool,
+        /// rvl-cli COMPATIBILITY NO-OP. rvl-cli's `--auto-infer` skips its
+        /// interactive review prompt, selecting `scan_mode: "auto"`.
+        /// Submission here is always non-interactive, so "auto" is already
+        /// the default and this flag has nothing left to turn off. Accepted
+        /// so rvl-cli invocations keep running.
+        #[arg(long)]
+        auto_infer: bool,
+        /// Submission mode: send the wire value rvl-cli sends for an
+        /// INTERACTIVE run, `scan_mode: "review"`. That is all it does —
+        /// rvl-cli's confirmation TUI is not ported, and the server's
+        /// canonical idempotency key excludes `scan_mode`, so this cannot
+        /// change dedup. rvl-cli's precedence applies: `--ci` (i.e.
+        /// `--format json`) and `--auto-infer` both win over it.
+        #[arg(long)]
+        review: bool,
+        /// Submission mode: merge a control structure from a SEPARATE JSON
+        /// file into this submission. Not the same thing as `stpa submit`,
+        /// which ingests a whole STPA model at `/control-structure/model`;
+        /// this attaches `control_structure` (and a `repo_url` fallback) to
+        /// the scan payload. An in-band control structure wins.
+        ///
+        /// `path_allowing_empty` for the same reason as --target/--file/
+        /// --scan-dir: rvl-cli guards this at scan.go:667 with
+        /// `if csFile != ""`, so an empty value means "not given" and the scan
+        /// proceeds. clap's stock PathBuf parser rejects an empty path, which
+        /// made both spellings exit 2 and contradicted this flag's own
+        /// Empty::Absent row (audit 3).
+        #[arg(long, value_parser = empty_flag::path_allowing_empty)]
+        cs_file: Option<PathBuf>,
+    },
+    /// Show EXACTLY what a scan would report to the Revelara spec factory about
+    /// unknown API surfaces: shape only — `client_type.method`, the language it
+    /// was written in, and a site count, NEVER source, file paths, or line
+    /// numbers. This visibility IS the privacy feature; you can audit precisely
+    /// what would ever leave this machine. Reporting is LOCAL-ONLY today: this
+    /// command shows/writes the payload, it does not transmit it. Mirrors
+    /// `scan`'s inputs.
+    Report {
+        /// Repo/dir to scan (default: current directory). Ignored when
+        /// `--retrieved` is given.
+        path: Option<PathBuf>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL).
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        /// DEV ONLY: bypass the signed cache and load specs from a file.
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        /// Warm re-scan: reuse the persistent packet index. Ignored when
+        /// `--retrieved` is given.
+        #[arg(long)]
+        incremental: bool,
+        /// Print the exact `Report` JSON payload (what the wire would carry)
+        /// instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Write the exact `Report` JSON payload to this file.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Explain one finding as an evidence block: the sites it covers, the
+    /// control, and the fix. Takes the same inputs as `scan` plus the finding
+    /// id shown in the ladder (e.g. `rvl explain 2ben path/to/repo`).
+    Explain {
+        /// The finding id from the ladder's `explain:` hint.
+        id: String,
+        /// Repo/dir to scan (default: current directory). Ignored when
+        /// `--retrieved` is given.
+        path: Option<PathBuf>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL).
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        #[arg(long)]
+        judgments: Option<PathBuf>,
+        /// Color output: auto (default), always, or never. NO_COLOR is honored.
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Waive a finding: append a rule waiver to `./.revelara.yaml` (under
+    /// `scanner.waivers`, the same list rvl-cli reads) so it no longer surfaces
+    /// as blocking/advisory. Takes the same inputs as `explain` plus the finding
+    /// id; the waived rule is the finding's class key `client_type.method`.
+    Suppress {
+        /// The finding id from the ladder's `explain:`/`suppress:` hint.
+        id: String,
+        /// Repo/dir to scan and where `.revelara.yaml` is written (default: cwd).
+        path: Option<PathBuf>,
+        /// Optional audit reason recorded on the waiver.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional `YYYY-MM-DD` expiry; after it the waiver is inert. Empty is
+        /// open-ended.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Escape hatch: a prebuilt retriever packet stream (JSONL).
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        #[arg(long)]
+        specs_file: Option<PathBuf>,
+        #[arg(long)]
+        judgments: Option<PathBuf>,
+    },
+    /// Refresh the spec cache from the Revelara API (async-safe, never
+    /// blocks a scan; RVL_OFFLINE=1 disables all fetches).
+    Sync,
+    /// Spec-cache maintenance.
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+    /// Incremental-scan packet index (content-hash keyed).
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCmd,
+    },
+    /// Install the Revelara workflow skills and lenses (the /rvl:scan lens
+    /// set, CAST/STPA interrogatory workflows, assessment skills) into your
+    /// coding-agent harness. Download-only: content is fetched from the
+    /// Revelara API, verified, and cached; nothing leaves this machine.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+    /// rvl-cli parity surface over the same skills machinery: manage the
+    /// Revelara plugin content per coding-agent harness (install, update,
+    /// list, remove, editors, agents). `plugin agents --json` is the
+    /// machine-readable lens listing the scan skill consumes.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+    /// Initialize Revelara for this repository: write .revelara.yaml with
+    /// the project name and detected components, install the plugin skills,
+    /// and check credentials (rvl-cli `rvl init` parity, po-av01j.163).
+    Init {
+        /// Set project name (default: from git remote or directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Skip installing the Revelara plugin for coding agents
+        #[arg(long, alias = "skip-skills")]
+        skip_plugin: bool,
+        /// Overwrite existing config without prompting
+        #[arg(long)]
+        force: bool,
+        /// Accept all auto-detected defaults non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks. rvl-cli
+        /// carries this flag on `plugin install`/`update` only; it is
+        /// accepted here too so one flag turns the context files off
+        /// wherever they would be written.
+        #[arg(long)]
+        no_context_files: bool,
+    },
+    /// Diagnose (and with `--fix`, repair) this machine's ability to scan
+    /// THIS repository: the retriever for every language actually present,
+    /// which slot it resolved from and whether its runtime exists, plus
+    /// credentials, spec cache and git-hook wiring.
+    ///
+    /// Repo-aware by design: it reports only on languages this tree contains,
+    /// so a Go shop is never told about .NET.
+    ///
+    /// Exit codes: 0 = everything this repo needs is in place, 1 = a gap
+    /// remains, 2 = usage error.
+    Doctor {
+        /// Repo/dir to diagnose (default: current directory).
+        path: Option<PathBuf>,
+        /// Attempt the safe, idempotent repairs: extract the embedded
+        /// helpers, install the PINNED typescript into the helper dir, build
+        /// csindex when a .NET SDK and the project source are both already
+        /// present, refresh the spec cache when credentials are configured.
+        /// Anything needing a package manager or sudo is printed, never run.
+        #[arg(long)]
+        fix: bool,
+        /// Output format (text|json).
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Install or check the git-hook scan gate: `hook install` writes a
+    /// pre-commit/pre-push shim invoking the native deterministic scan;
+    /// `hook doctor` preflights it (rvl-cli `rvl hook` parity).
+    Hook {
+        #[command(subcommand)]
+        cmd: hook::HookCmd,
+    },
+    // --- rvl-cli data-command port (po-av01j.17): rvl-cli is the output
+    // contract (same subcommands/flags, byte-identical --format=json);
+    // implementations live in crates/rvl-data with golden-parity suites. ---
+    /// Configure Revelara API credentials interactively
+    Login,
+    /// Remove stored credentials from ~/.revelara/config.yaml
+    Logout,
+    /// Check connection and authentication status
+    Status,
+    /// Manage risk lifecycle (list, ready, show, context, stale, resolve, accept)
+    Risk {
+        #[command(subcommand)]
+        cmd: rvl_data::risk::RiskCmd,
+    },
+    /// Query the reliability controls catalog (list, show)
+    Control {
+        #[command(subcommand)]
+        cmd: rvl_data::control::ControlCmd,
+    },
+    /// Compliance framework views. `compliance report` is rvl-cli's `rvl
+    /// report` readiness scorecard, renamed because this binary already
+    /// spells `report` for the scan privacy-payload preview
+    /// (po-av01j.185 item 2). Readiness/supporting framing only, never
+    /// certification.
+    Compliance {
+        #[command(subcommand)]
+        cmd: rvl_data::compliance::ComplianceCmd,
+    },
+    /// Query the organizational knowledge base (search, graph-search, facts, procedures, patterns, relationships, graph, foresight, enrich, health)
+    Knowledge {
+        #[command(subcommand)]
+        cmd: rvl_data::knowledge::KnowledgeCmd,
+    },
+    /// Search indexed incident postmortems
+    Incident {
+        #[command(subcommand)]
+        cmd: rvl_data::incident::IncidentCmd,
+    },
+    /// Manage control evidence (submit, list, verify)
+    Evidence {
+        #[command(subcommand)]
+        cmd: rvl_data::evidence::EvidenceCmd,
+    },
+    /// Send feedback to the Revelara team
+    Feedback {
+        #[command(flatten)]
+        args: rvl_data::feedback::FeedbackArgs,
+    },
+    /// Send a bug report to the Revelara team
+    Bugreport {
+        #[command(flatten)]
+        args: rvl_data::feedback::FeedbackArgs,
+    },
+    /// View and edit CLI configuration (~/.revelara/config.yaml)
+    Config {
+        #[command(subcommand)]
+        cmd: rvl_data::config::ConfigCmd,
+    },
+    /// STPA-inspired safety analysis. `stpa submit --file` ingests the
+    /// losses, UCAs, loss scenarios and control-structure model produced by
+    /// the `stpa-review` skill — that skill's only ingestion path, since
+    /// `scan --cs-file` carries the control structure alone (po-av01j.183).
+    /// `stpa list-ucas` reads the UCA store back, including the design-review
+    /// UCAs that never become risks and so never show up in `risk list`
+    /// (po-av01j.202).
+    ///
+    /// Revelara's analysis is STPA-inspired (adapted from Systems-Theoretic
+    /// Process Analysis, Leveson & Thomas, MIT). Findings are candidates for
+    /// engineer review, not a substitute for expert hazard analysis of
+    /// safety-critical systems.
+    Stpa {
+        #[command(subcommand)]
+        cmd: rvl_data::stpa::StpaCmd,
+    },
+    /// Print the version. rvl-cli spells this as a SUBCOMMAND (`rvl version`)
+    /// and has no `--version` flag; this binary accepts both, so a script
+    /// written against either spelling keeps working (po-av01j.185 item 3).
+    Version,
+    /// Generate shell completion scripts (bash, zsh, fish).
+    /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
+    /// Fish: rvl completion fish > ~/.config/fish/completions/rvl.fish
+    Completion {
+        /// Shell to generate a completion script for.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+/// The shells `rvl completion` supports (rvl-cli parity: bash, zsh, fish).
+/// A deliberate subset of `clap_complete::Shell` so `--help` and error
+/// messages advertise exactly what rvl-cli does.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(s: CompletionShell) -> Self {
+        match s {
+            CompletionShell::Bash => clap_complete::Shell::Bash,
+            CompletionShell::Zsh => clap_complete::Shell::Zsh,
+            CompletionShell::Fish => clap_complete::Shell::Fish,
+        }
+    }
+}
+
+/// The `scan --agent` compatibility notice. One line, stderr, then the
+/// deterministic scan proceeds. Extended per po-av01j.15 with the consented
+/// hook-adjudication pointer.
+fn agent_alias_notice() {
+    eprintln!(
+        "note: --agent is a deprecated rvl-cli compatibility alias; {BIN} runs its \
+         deterministic scan (no model calls) — drop --agent. For consented agent \
+         adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
+         scanner.agent_hooks in .revelara.yaml and run '{BIN} scan --incremental \
+         --hook <pre-commit|pre-push>'; see '{BIN} skills' for the agent-side \
+         workflow surface"
+    );
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// Install skills into a harness. With no name, installs into every
+    /// detected harness (Claude Code first).
+    Install {
+        /// Harness name: claude, codex, gemini, cursor, copilot, windsurf.
+        harness: Option<String>,
+        /// Stage files but do not run the harness's plugin registration
+        /// commands (Claude Code); they are printed for manual use instead.
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Update installed skills to the served version. With no name, updates
+    /// every harness recorded by a previous install.
+    Update {
+        /// Harness name; defaults to everything previously installed.
+        harness: Option<String>,
+        /// Stage files but do not run registration commands (Claude Code).
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Show installed, cached, and served skill versions (drift report).
+    Status,
+}
+
+/// `rvl plugin`: the rvl-cli `rvl plugin` parity surface. Install and
+/// update DELEGATE to the skills machinery (same download/verify/cache
+/// engine as `rvl skills`); list/remove/editors/agents are machinery
+/// capabilities exposed under the names rvl-cli users know.
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install the plugin content for a harness. With no name, installs
+    /// into every detected harness (same engine as `rvl skills install`).
+    Install {
+        /// Harness name; `plugin editors` lists every supported target.
+        harness: Option<String>,
+        /// Stage files but do not run the harness's plugin registration
+        /// commands (Claude Code); they are printed for manual use instead.
+        #[arg(long)]
+        no_register: bool,
+        /// Install into THIS REPOSITORY instead of your home directory
+        /// (`<repo>/.cursor`, `<repo>/.agents/skills`, ...), so the skills
+        /// can be committed and every contributor gets them. Harnesses
+        /// whose install is user-level (Claude Code) refuse it.
+        #[arg(long)]
+        project: bool,
+        /// rvl-cli COMPATIBILITY ALIAS: this binary spells "every harness"
+        /// as OMITTING the harness name, so `--all` is exactly the default
+        /// and is accepted rather than rejected (po-av01j.188).
+        #[arg(long)]
+        all: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
+        /// current git repository.
+        #[arg(long)]
+        no_context_files: bool,
+    },
+    /// Update installed plugin content to the served version (install and
+    /// update are the same operation, mirroring `rvl plugin update`).
+    Update {
+        /// Harness name; defaults to everything previously installed.
+        harness: Option<String>,
+        /// Stage files but do not run registration commands (Claude Code).
+        #[arg(long)]
+        no_register: bool,
+        /// rvl-cli COMPATIBILITY ALIAS for the default "every installed
+        /// harness" sweep (po-av01j.188).
+        #[arg(long)]
+        all: bool,
+        /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
+        /// current git repository.
+        #[arg(long)]
+        no_context_files: bool,
+    },
+    /// List installed plugin content with versions and update availability.
+    List,
+    /// Remove installed plugin content for a harness. Deletes exactly the
+    /// files the install placed (never the editor's own configuration).
+    Remove {
+        /// Harness name to remove.
+        harness: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Remove the PROJECT-LOCAL install from this repository instead of
+        /// the one in your home directory.
+        #[arg(long)]
+        project: bool,
+    },
+    /// List the supported editor targets served by the Revelara API
+    /// (GET /api/v1/plugin/editors), with a built-in fallback offline.
+    Editors,
+    /// List installed agent lenses. `--json` output is the contract the
+    /// scan skill parses: {"agents":[{"id":"...","description":"..."}]}.
+    Agents {
+        /// Harness whose installed agents to list.
+        #[arg(long, default_value = "claude")]
+        editor: String,
+        /// Alias for --format=json (rvl-cli back-compat).
+        #[arg(long)]
+        json: bool,
+        /// Output format: table (default) or json.
+        #[arg(long)]
+        format: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCmd {
+    /// Build the index. Explicit and off the hook path: a cold full load is
+    /// never paid during a commit. With --retrieved, loads a prebuilt packet
+    /// stream; without, runs the language helpers over the repo itself.
+    Init {
+        /// Repository root to index (defaults to the current directory).
+        path: Option<PathBuf>,
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+    },
+    /// Re-index. What a post-commit hook invokes: live mode (no --retrieved)
+    /// hash-gates the sources and re-retrieves only what changed.
+    Reindex {
+        /// Repository root to re-index (defaults to the current directory).
+        path: Option<PathBuf>,
+        #[arg(long)]
+        retrieved: Option<PathBuf>,
+        /// Comma-separated repo-relative files to consider (defaults to every
+        /// supported source file under the root).
+        #[arg(long)]
+        files: Option<String>,
+        /// Spawn the reindex detached and return immediately, so a commit
+        /// hook never waits on the warm.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Show how many files are indexed.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Air-gapped import of a signed spec-cache artifact (same verification
+    /// as sync; there is no bypass).
+    Import {
+        /// The artifact file (signed envelope JSON).
+        artifact: PathBuf,
+        /// Detached signature; defaults to <artifact>.sig.
+        #[arg(long)]
+        sig: Option<PathBuf>,
+    },
+    /// Show installed cache versions and staleness.
+    Status,
+}
+
+/// All runtime configuration, resolved once. `base_url` and `org_key` layer
+/// three sources (scanner-specific env / shared rvl-cli env / shared config
+/// file) over a default; that merge happens in this constructor and nowhere
+/// else. The signing keyset is deliberately NOT here: pinned keys are compiled
+/// in, and a configurable keyset would be the verification bypass the
+/// distribution contract forbids. `shared_config` reads ONLY api_url/api_key.
+struct Config {
+    cache_dir: PathBuf,
+    index_dir: PathBuf,
+    offline: bool,
+    base_url: String,
+    org_key: String,
+}
+
+/// The production default API endpoint, matching rvl-cli's `DefaultAPIURL`.
+const DEFAULT_API_URL: &str = "https://api.revelara.ai";
+
+impl Config {
+    fn from_env() -> Self {
+        let cache_dir = std::env::var_os("RVL_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                home.join(".revelara").join("cache").join("specs")
+            });
+        let index_dir = std::env::var_os("RVL_INDEX_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                home.join(".revelara").join("cache").join("index")
+            });
+
+        // Read the shared rvl-cli config file once (missing/malformed → empty).
+        let shared = shared_config::load_shared_config();
+
+        // Precedence (highest first), for BOTH values:
+        //   base_url: RVL_API_URL > file api_url > default
+        //   org_key:  RVL_API_KEY > file api_key > (empty)
+        // There is ONE env name per value: the scan surface and the data
+        // surface read the same variable the sibling rvl-cli already uses.
+        // Empty strings are skipped so an exported-but-empty env var never
+        // shadows a real value from a lower-precedence source.
+        let base_url = shared_config::first_nonempty(&[
+            std::env::var("RVL_API_URL").ok(),
+            shared.api_url.clone(),
+            Some(DEFAULT_API_URL.to_string()),
+        ])
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+
+        let org_key = shared_config::first_nonempty(&[
+            std::env::var("RVL_API_KEY").ok(),
+            shared.api_key.clone(),
+        ])
+        .unwrap_or_default();
+
+        Self {
+            cache_dir,
+            index_dir,
+            offline: offline_from_env(std::env::var("RVL_OFFLINE").ok().as_deref()),
+            base_url,
+            org_key,
+        }
+    }
+}
+
+/// CLI-only exit mapping: an EXPLICIT `rvl sync` exits nonzero when the
+/// refresh didn't happen, because the user asked for it and scripts need the
+/// signal. Scan-path sync must consume `SyncOutcome` directly and never call
+/// this — "sync never fails a scan" is the library's contract, not this one.
+fn report(outcome: &SyncOutcome) -> ExitCode {
+    match outcome {
+        SyncOutcome::Offline => {
+            println!("offline (RVL_OFFLINE=1): no fetch attempted");
+            ExitCode::SUCCESS
+        }
+        SyncOutcome::UpToDate => {
+            println!("spec cache is up to date");
+            ExitCode::SUCCESS
+        }
+        SyncOutcome::Installed { content_version } => {
+            println!("installed spec cache {content_version}");
+            ExitCode::SUCCESS
+        }
+        SyncOutcome::SchemaTooNew { hint } => {
+            println!("{hint}");
+            ExitCode::SUCCESS
+        }
+        SyncOutcome::Rejected { reason } => {
+            eprintln!("rejected: {reason} (artifact quarantined; continuing on last-good)");
+            ExitCode::FAILURE
+        }
+        SyncOutcome::FetchFailed { reason } => {
+            eprintln!("fetch failed: {reason} (continuing on the installed cache)");
+            ExitCode::FAILURE
+        }
+        SyncOutcome::InstallFailed { reason } => {
+            eprintln!(
+                "install failed: {reason} (a verified cache survives in current or \
+                 last-good; run '{BIN} cache status' to see which)"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Map triaged items to renderable findings. Incident-linkage fields
+/// (counts, control) are not yet populated — they arrive from the corpus/
+/// judgment layer — so they default to empty and the ladder degrades to
+/// severity + coverage until that data flows.
+fn triage_to_findings(
+    items: &[rvl_triage::TriagedItem],
+    specs: Option<&rvl_spec::SpecCache>,
+) -> Vec<render::Finding> {
+    items
+        .iter()
+        .map(|it| {
+            let ck = &it.class;
+            // The id must be unique per rendered class. ClassKey distinguishes
+            // by reason too (e.g. "no bound anywhere" vs "only phase bounds"),
+            // so the reason belongs in the id key or distinct classes collide.
+            let key = format!(
+                "{}.{}:{}:{}",
+                ck.client_type, ck.method, ck.scope, ck.reason
+            );
+            let short = ck.client_type.rsplit('/').next().unwrap_or(&ck.client_type);
+            render::Finding {
+                id: render::finding_id(&key),
+                site: it
+                    .example_sites
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("{} sites", it.site_count)),
+                // What the LIBRARY does with no explicit bound is spec
+                // knowledge, so the sentence is derived from the spec rather
+                // than asserted (po-av01j.175). No spec, or a spec that never
+                // declared it, leaves it Unknown and the wording stops at what
+                // the search actually verified.
+                description: render::humanize_bound_reason(
+                    short,
+                    &ck.method,
+                    &ck.reason,
+                    specs
+                        .and_then(|c| c.api(&(ck.client_type.clone(), ck.method.clone())))
+                        .map(|s| s.default_bound)
+                        .unwrap_or_default(),
+                ),
+                disposition: it.disposition.clone(),
+                severity: it.severity.clone(),
+                incident_count: 0,
+                critical_count: 0,
+                control: it.control.clone(),
+                fix: it.fix.clone(),
+                site_count: it.site_count,
+                example_sites: it.example_sites.clone(),
+                // The waiver key: the readable class key `client_type.method`.
+                // Matched against `.revelara.yaml` waivers; written by suppress.
+                class_rule: format!("{}.{}", ck.client_type, ck.method),
+                suppressed: false,
+                gate_exempt: false,
+            }
+        })
+        .collect()
+}
+
+// --- G7 repo-structure lane (po-av01j.7) ---
+
+/// Map repo-structure control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the facts record); every one
+/// renders ADVISORY — a structural shape never blocks a commit. The waiver
+/// key is `repo_structure.RC-XXX`, so `rvl suppress` and `.revelara.yaml`
+/// waivers work on these like any other finding.
+fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("repo_structure.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f.evidence.first().cloned().unwrap_or_else(|| "repo".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium/low severity + zero incident counts is
+                // exactly the Advisory cell of render::classify. Structure
+                // verdicts are judged by the evaluator itself, so they are
+                // not "unjudged" (which would print "severity unrated").
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
+                suppressed: false,
+                gate_exempt: false,
+            }
+        })
+        .collect()
+}
+
+/// The ladder findings for this scan's repo-structure lane. Live scans
+/// inventory the tree directly; a `--retrieved` scan has no tree, so the
+/// facts come from the `repo_structure` record riding the prebuilt stream
+/// (absent record = no facts = no findings, honestly).
+fn resolve_structure_findings(
+    retrieved: Option<&Path>,
+    stream: &str,
+    path: &Path,
+) -> Vec<render::Finding> {
+    let facts = if retrieved.is_some() {
+        rvl_structure::parse_record(stream)
+    } else {
+        Some(rvl_structure::retrieve(path, &snapshot_name(path)))
+    };
+    facts
+        .map(|f| structure_to_findings(&rvl_structure::evaluate(&f)))
+        .unwrap_or_default()
+}
+
+// --- G2 server-entry lane (po-av01j.3) ---
+
+/// Map server-entry control verdicts into ladder findings. Only violations
+/// surface (satisfies/abstain outcomes stay in the lane's record); every one
+/// renders ADVISORY — a missing health endpoint or rate limiter is real
+/// exposure but not a commit-blocker, and limiting may live at a gateway the
+/// scanner cannot see. The waiver key is `server_entry.RC-XXX`, so
+/// `rvl suppress` and `.revelara.yaml` waivers work on these like any
+/// other finding.
+fn server_to_findings(
+    findings: &[rvl_propagate::server_entry::ServerEntryFinding],
+) -> Vec<render::Finding> {
+    findings
+        .iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| {
+            let class_rule = format!("server_entry.{}", f.control);
+            render::Finding {
+                id: render::finding_id(&class_rule),
+                site: f
+                    .evidence
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "server".into()),
+                description: format!("{} \u{2014} {}", f.control_name, f.reason),
+                // "surface" + medium severity + zero incident counts is the
+                // Advisory cell of render::classify, same as the structure
+                // lane: judged by the evaluator, so never "unjudged".
+                disposition: "surface".into(),
+                severity: f.severity.to_string(),
+                incident_count: 0,
+                critical_count: 0,
+                control: f.control.to_string(),
+                fix: f.fix.clone(),
+                site_count: f.evidence.len().max(1),
+                example_sites: f.evidence.clone(),
+                class_rule,
+                suppressed: false,
+                gate_exempt: false,
+            }
+        })
+        .collect()
+}
+
+// --- single-command scan: language detection + helper orchestration (po-3t3oj.25) ---
+//
+// Today a scan can be handed a prebuilt packet stream with `--retrieved`. When
+// it is omitted, rvl discovers and runs the language retriever helper over
+// the target itself and feeds the packets into the same pipeline. Helper
+// PACKAGING (po-aml3h). A fresh `brew install rvl` used to deliver the
+// binary and NONE of the seven helpers, so the first scan of any real repo
+// hard-failed. Each helper now ships by the cheapest route its nature allows:
+//
+//   pyindex.py / tsindex.js / javaindex.java   embedded in this binary and
+//       extracted to ~/.revelara/helpers/<version>/ on first use. They are
+//       platform-independent text, so one build carries them everywhere.
+//   cindex / rustindex                          workspace bins, packed into
+//       the same release archive as rvl (dist `binaries` in Cargo.toml).
+//   goindex                                     built per target by release CI
+//       and packed into the archive alongside the binary.
+//   csindex                                     NOT carried: it needs ~9 MB of
+//       Roslyn assemblies. Built by the user into ~/.revelara/helpers/csindex,
+//       which resolution searches, so the build IS the install.
+//
+// Discovery order: env override, adjacent to the rvl binary (or the
+// packaged share dir next to it), the extracted copy, the canonical helper
+// dir, then PATH.
+
+/// A source language rvl knows how to retrieve packets for. `Ord` (variant
+/// order Go < Python < Rust < TypeScript < CSharp < Java < C/C++) makes it a
+/// stable `BTreeMap` key, so a multi-language incremental retrieval runs
+/// helpers in the same
+/// deterministic order the single-command path documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Lang {
+    Go,
+    Python,
+    Rust,
+    TypeScript,
+    CSharp,
+    Java,
+    /// One retriever for both C and C++ (cindex, po-av01j.12): the compile
+    /// db, not the extension, decides how a TU parses.
+    CCpp,
+}
+
+impl Lang {
+    /// The retriever helper's base name.
+    fn helper_base(self) -> &'static str {
+        match self {
+            Lang::Go => "goindex",
+            Lang::Python => "pyindex",
+            Lang::Rust => "rustindex",
+            Lang::TypeScript => "tsindex",
+            Lang::CSharp => "csindex",
+            Lang::Java => "javaindex",
+            Lang::CCpp => "cindex",
+        }
+    }
+    /// The env var that overrides helper discovery for this language.
+    fn env_override(self) -> &'static str {
+        match self {
+            Lang::Go => "RVL_GOINDEX",
+            Lang::Python => "RVL_PYINDEX",
+            Lang::Rust => "RVL_RUSTINDEX",
+            Lang::TypeScript => "RVL_TSINDEX",
+            Lang::CSharp => "RVL_CSINDEX",
+            Lang::Java => "RVL_JAVAINDEX",
+            Lang::CCpp => "RVL_CINDEX",
+        }
+    }
+}
+
+impl std::fmt::Display for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Lang::Go => "Go",
+            Lang::Python => "Python",
+            Lang::Rust => "Rust",
+            Lang::TypeScript => "TypeScript",
+            Lang::CSharp => "C#",
+            Lang::Java => "Java",
+            Lang::CCpp => "C/C++",
+        })
+    }
+}
+
+/// How a resolved helper is invoked. A Go helper (or a pyindex/tsindex/
+/// javaindex executable on PATH) runs directly; a pyindex `.py` script runs
+/// under `python3`, a tsindex `.js` script runs under `node`, a javaindex
+/// `.java` source file runs under `java` (JEP 330 source-file mode: in-memory
+/// compile, no packaging step, JDK 11+), and a csindex `.dll` (a
+/// framework-dependent .NET build) runs under `dotnet`. A csindex published
+/// with an apphost is a plain executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperKind {
+    Executable,
+    PyScript,
+    NodeScript,
+    DotnetAssembly,
+    JavaSource,
+}
+
+/// A helper located on disk, ready to be turned into a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedHelper {
+    path: PathBuf,
+    kind: HelperKind,
+    /// Where resolution found it: "env:<VAR>", "bundled", or "PATH". Printed
+    /// with the coverage block (po-vd7ii): a stale helper shadowing via PATH
+    /// is invisible in every other line of output.
+    source: String,
+}
+
+/// Directory names never worth descending into during language detection.
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "vendor", "__pycache__"];
+
+/// A TypeScript declaration file (`*.d.ts`) is types-only, not scannable source.
+/// Its extension is still `ts`, so it must be filtered by name, not extension.
+fn is_declaration_ts(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".d.ts"))
+}
+
+/// Whether the root directory itself carries a C# project marker (`*.csproj`
+/// or `*.sln`). Unlike `go.mod`/`tsconfig.json` the marker's NAME varies per
+/// project, so this is a single non-recursive `read_dir` over root, not a
+/// fixed-name `is_file` probe.
+fn has_csharp_marker(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x == "csproj" || x == "sln")
+    })
+}
+
+/// Detect which supported languages have source under `root`. Pure and
+/// bounded: marker files (`go.mod`, `pyproject.toml`, `setup.py`,
+/// `Cargo.toml`, `tsconfig.json`, a root `*.csproj`/`*.sln`, `pom.xml`,
+/// `build.gradle`, `build.gradle.kts`, `compile_commands.json`)
+/// short-circuit, otherwise a walk that skips vendored/build dirs looks for
+/// `*.go` / `*.py` / `*.rs` / `*.ts`|`*.tsx` (never `*.d.ts`) / `*.cs` /
+/// `*.java` / `*.c`|`*.cc`|`*.cpp`|`*.cxx`. Order is stable (Go, Python,
+/// Rust, TypeScript, C#, Java, C/C++) so a multi-language repo runs its
+/// helpers in a deterministic order.
+/// Source extensions rvl has NO retriever for, mapped to a display name.
+///
+/// The third state (po-av01j.128): a repository can carry a language nothing
+/// here can read, and before this it was reported as nothing at all --
+/// indistinguishable from a language that was scanned and came back clean. The
+/// list is short and holds only what is unambiguous; an extension shared with
+/// something else would turn a clean report into a false alarm.
+const UNSUPPORTED_SOURCE_EXTS: &[(&str, &str)] = &[
+    ("rb", "Ruby"),
+    ("php", "PHP"),
+    ("ex", "Elixir"),
+    ("exs", "Elixir"),
+    ("scala", "Scala"),
+    ("swift", "Swift"),
+    ("kt", "Kotlin"),
+    ("kts", "Kotlin"),
+    ("dart", "Dart"),
+    ("lua", "Lua"),
+    ("pl", "Perl"),
+    ("erl", "Erlang"),
+    ("hs", "Haskell"),
+    ("clj", "Clojure"),
+];
+
+/// Count files whose extension names a language with no retriever, so the scan
+/// can say "seen, and nothing here reads it" instead of staying silent.
+///
+/// Bounded exactly like `walk_for_sources`: same skip list, and it stops
+/// counting a language at a cap because the number only has to establish
+/// PRESENCE and prevalence, never precision.
+fn detect_unsupported(root: &Path) -> Vec<(String, usize)> {
+    const CAP: usize = 5000;
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some((_, disp)) = UNSUPPORTED_SOURCE_EXTS.iter().find(|(e, _)| *e == ext) {
+                    let c = counts.entry(*disp).or_insert(0);
+                    if *c < CAP {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+fn detect_languages(root: &Path) -> Vec<Lang> {
+    let mut go = root.join("go.mod").is_file();
+    let mut py = root.join("pyproject.toml").is_file() || root.join("setup.py").is_file();
+    let mut rs = root.join("Cargo.toml").is_file();
+    // package.json counts as a marker too: a Node project without a tsconfig
+    // is the ordinary JavaScript case (po-av01j.137).
+    let mut ts = root.join("tsconfig.json").is_file() || root.join("package.json").is_file();
+    let mut cs = has_csharp_marker(root);
+    let mut java = root.join("pom.xml").is_file()
+        || root.join("build.gradle").is_file()
+        || root.join("build.gradle.kts").is_file();
+    // The compile db is the C/C++ marker (and the retrieval tier gate); bare
+    // sources without one still detect via the walk and ride the allowlist
+    // fallback tier.
+    let mut cc = root.join("compile_commands.json").is_file()
+        || root.join("build").join("compile_commands.json").is_file();
+    if !(go && py && rs && ts && cs && java && cc) {
+        walk_for_sources(
+            root, &mut go, &mut py, &mut rs, &mut ts, &mut cs, &mut java, &mut cc,
+        );
+    }
+    let mut out = Vec::new();
+    if go {
+        out.push(Lang::Go);
+    }
+    if py {
+        out.push(Lang::Python);
+    }
+    if rs {
+        out.push(Lang::Rust);
+    }
+    if ts {
+        out.push(Lang::TypeScript);
+    }
+    if cs {
+        out.push(Lang::CSharp);
+    }
+    if java {
+        out.push(Lang::Java);
+    }
+    if cc {
+        out.push(Lang::CCpp);
+    }
+    out
+}
+
+/// Bounded directory walk: sets `go`/`py`/`rs`/`ts`/`cs`/`java`/`cc` when a
+/// matching source file is seen, and stops early once all are found. Skips
+/// `.git`, `node_modules`, `target`, `vendor`, `__pycache__` so a big
+/// checkout does not turn detection into a full-tree crawl.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_sources(
+    root: &Path,
+    go: &mut bool,
+    py: &mut bool,
+    rs: &mut bool,
+    ts: &mut bool,
+    cs: &mut bool,
+    java: &mut bool,
+    cc: &mut bool,
+) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if *go && *py && *rs && *ts && *cs && *java && *cc {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(entry.path());
+                }
+            } else if ft.is_file() {
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("go") => *go = true,
+                    Some("py") => *py = true,
+                    Some("rs") => *rs = true,
+                    // JavaScript detects the same lane as TypeScript
+                    // (po-av01j.137): tsindex reads both, and excluding .js here
+                    // meant a plain-JS backend was never even offered to it.
+                    Some("ts" | "tsx") if !is_declaration_ts(&path) => *ts = true,
+                    Some("js" | "jsx" | "mjs" | "cjs") => *ts = true,
+                    Some("cs" | "csproj" | "sln") => *cs = true,
+                    Some("java") => *java = true,
+                    Some("c" | "cc" | "cpp" | "cxx") => *cc = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Source extensions for a language, for the incidental-language check.
+/// Marker files (.csproj, pom.xml) are NOT here — only actual source.
+fn language_source_exts(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Go => &["go"],
+        Lang::Python => &["py"],
+        Lang::Rust => &["rs"],
+        Lang::TypeScript => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+        Lang::CSharp => &["cs"],
+        Lang::Java => &["java"],
+        Lang::CCpp => &["c", "cc", "cpp", "cxx", "h", "hpp"],
+    }
+}
+
+/// True when a language appears in the repo ONLY as non-production material —
+/// every source file classifies non-runtime (testdata/fixtures/examples via
+/// rvl-core::scope_of), or there is no real source at all (a lone marker like
+/// a stray .csproj). Such a language must not hard-fail the whole scan for a
+/// missing helper (po-hjte8): a real backend repo carries one C# file, a skilleval TEST
+/// FIXTURE, and it should not brick a scan of the real Go/TS/Python code. A
+/// language with even one production-scope file is NOT incidental — a helper
+/// we cannot run for real code must still fail loudly (po-av01j.145).
+fn language_is_incidental(root: &Path, lang: Lang) -> bool {
+    let exts = language_source_exts(lang);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+            } else if ft.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| exts.contains(&e))
+            {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rvl_core::scope_of(&rel) == rvl_core::ScopeClass::Runtime {
+                    return false; // a real production file — not incidental
+                }
+            }
+        }
+    }
+    // No production source found: marker-only, or all non-production.
+    true
+}
+
+/// Classify a resolved helper path into how it must be invoked. Go, Rust, and
+/// C/C++ helpers are always executables (rustindex and cindex are workspace
+/// binaries built next to rvl); a Python helper is a `python3` script when
+/// it ends in `.py`, a TypeScript helper is a `node` script when it ends in
+/// `.js`, a Java helper is a `java` source-file script when it ends in
+/// `.java`, a C# helper is a `dotnet` assembly when it ends in `.dll`,
+/// otherwise an executable on PATH.
+fn classify_helper(lang: Lang, path: &Path, source: &str) -> ResolvedHelper {
+    let ext = path.extension().and_then(|e| e.to_str());
+    let kind = match lang {
+        Lang::Go | Lang::Rust | Lang::CCpp => HelperKind::Executable,
+        Lang::Python if ext == Some("py") => HelperKind::PyScript,
+        Lang::Python => HelperKind::Executable,
+        Lang::TypeScript if ext == Some("js") => HelperKind::NodeScript,
+        Lang::TypeScript => HelperKind::Executable,
+        Lang::CSharp if ext == Some("dll") => HelperKind::DotnetAssembly,
+        Lang::CSharp => HelperKind::Executable,
+        Lang::Java if ext == Some("java") => HelperKind::JavaSource,
+        Lang::Java => HelperKind::Executable,
+    };
+    ResolvedHelper {
+        path: path.to_path_buf(),
+        kind,
+        source: source.to_string(),
+    }
+}
+
+/// First matching file named `name` on `PATH`.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|cand| cand.is_file())
+}
+
+/// The deliberate escape hatch for a repo that knowingly cannot install a
+/// helper (po-av01j.148). Without one the rule is unusable on a mixed monorepo
+/// where one language's toolchain is genuinely unavailable, and an unusable
+/// rule gets disabled wholesale rather than scoped.
+///
+/// An ENV var rather than a silent default: the operator has to say it out
+/// loud, and it shows up in the command that ran.
+fn allow_missing_helpers() -> bool {
+    matches!(
+        std::env::var("RVL_ALLOW_MISSING_HELPERS").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// The script this binary CARRIES for `lang`, when it carries one (po-aml3h).
+/// The native helpers ride the release archive instead; C# rides neither.
+fn embedded_for(lang: Lang) -> Option<&'static embedded_helpers::Embedded> {
+    match lang {
+        Lang::Python => Some(&embedded_helpers::PYINDEX),
+        Lang::TypeScript => Some(&embedded_helpers::TSINDEX),
+        Lang::Java => Some(&embedded_helpers::JAVAINDEX),
+        Lang::Go | Lang::Rust | Lang::CSharp | Lang::CCpp => None,
+    }
+}
+
+/// Directories a PACKAGED helper may sit in, given the running binary. The
+/// first is the release archive's own layout (everything unpacked side by
+/// side); the second is where Homebrew files an archive's non-binary members,
+/// `<prefix>/share/rvl`, since `bin.install` only relocates executables and
+/// leaves the rest in pkgshare. Without the second entry a `brew install` would
+/// carry goindex in the bottle and still not find it.
+fn packaged_helper_dirs(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![exe_dir.to_path_buf()];
+    if let Some(prefix) = exe_dir.parent() {
+        dirs.push(prefix.join("share").join("rvl"));
+    }
+    dirs
+}
+
+/// What a reader should DO when `lang` has no retriever: the specific install,
+/// and the one command that performs it. Generic advice ("install the helper")
+/// is what this bead exists to delete.
+///
+/// Every command here writes into a location `resolve_helper` already searches,
+/// so nothing in this text asks for a follow-up step. A hint that ends in "now
+/// export VAR=<the path you just typed>" is a hint that stopped one move short.
+fn missing_helper_hint(lang: Lang) -> String {
+    let env = lang.env_override();
+    match lang {
+        // Built per target by release CI and packed next to the binary, so its
+        // absence means a source build or a hand-assembled install.
+        Lang::Go => format!(
+            "goindex ships next to the {BIN} binary; if you built from source run `make helpers`, \
+             or build it once with `go build -C helpers/goindex -o ~/.revelara/helpers/goindex .` \
+             (needs Go 1.21+), where {BIN} finds it with no further setup",
+        ),
+        Lang::Rust | Lang::CCpp => format!(
+            "{base} ships next to the {BIN} binary in the release archive; if you built from \
+             source run `cargo build --release -p {base}` and copy it to \
+             ~/.revelara/helpers/{base}, where {BIN} finds it with no further setup",
+            base = lang.helper_base(),
+        ),
+        // The one helper deliberately NOT carried: the .NET assembly itself is
+        // ~39 KB but drags ~9 MB of Microsoft.CodeAnalysis (Roslyn) with it,
+        // which is more than the rest of the release archive combined. The
+        // -o directory is the per-helper canonical dir, so the build IS the
+        // install: `install_dirs` looks inside it for csindex.dll.
+        Lang::CSharp => format!(
+            "csindex is not bundled (it needs ~9 MB of Roslyn assemblies). Install a .NET 8 SDK, \
+             then from a clone of https://github.com/revelara-ai/rvlscan run one command: \
+             `dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex` \
+             — {BIN} finds it there with no further setup",
+        ),
+        // Embedded — reaching this arm means extraction itself failed.
+        Lang::Python | Lang::TypeScript | Lang::Java => format!(
+            "{base} is carried inside the {BIN} binary but could not be written out; set \
+             {dir} to a writable directory, or set {env} to a {base} you installed yourself",
+            base = lang.helper_base(),
+            dir = embedded_helpers::HELPER_DIR_ENV,
+        ),
+    }
+}
+
+/// Locate the retriever helper for `lang`, failing closed with actionable
+/// guidance when none is found (never silently skip a detected language, that
+/// would under-report). Precedence:
+///   1. env override (`RVL_GOINDEX` / `RVL_PYINDEX` / ...),
+///   2. a helper packaged with the binary (adjacent, or in its pkgshare dir),
+///   3. the copy extracted from THIS binary (pyindex/tsindex/javaindex),
+///   4. a helper the user built into the canonical helper dir,
+///   5. a helper on `PATH` (for Python, `pyindex` or `pyindex.py`).
+///
+/// Packaged beats embedded so a deliberately installed helper — the Makefile's
+/// `make helpers`, a release archive's goindex — still wins over the carried
+/// copy. Embedded beats the canonical dir so a hand-dropped copy of a script
+/// we carry cannot go stale unnoticed (extraction repairs its own file; it
+/// would never repair one found ahead of it). Both beat PATH, so a fresh
+/// machine needs no PATH surgery and an unrelated `pyindex` cannot quietly
+/// answer for ours. Every step records WHERE it found the file and the
+/// "retrievers:" roll-call prints it: a shadowing helper is undiagnosable from
+/// any other line of output.
+fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
+    // (1) explicit env override wins.
+    if let Some(p) = std::env::var_os(lang.env_override()) {
+        let p = PathBuf::from(p);
+        anyhow::ensure!(
+            p.exists(),
+            "{} points at {} which does not exist",
+            lang.env_override(),
+            p.display()
+        );
+        return Ok(classify_helper(
+            lang,
+            &p,
+            &format!("env:{}", lang.env_override()),
+        ));
+    }
+    let base = lang.helper_base();
+    // The scripted-helper filename to also look for, for a language whose helper
+    // ships as a script rather than a native binary (pyindex.py, tsindex.js).
+    let script_name = match lang {
+        Lang::Python => Some(format!("{base}.py")),
+        Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::CSharp => Some(format!("{base}.dll")),
+        Lang::Java => Some(format!("{base}.java")),
+        Lang::Go | Lang::Rust | Lang::CCpp => None,
+    };
+    // (2) packaged with the binary: adjacent, or in the pkgshare dir a
+    // package manager files the archive's non-binary members into.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for dir in packaged_helper_dirs(exe_dir) {
+                let cand = dir.join(base);
+                if cand.is_file() {
+                    return Ok(classify_helper(lang, &cand, "bundled"));
+                }
+                if let Some(script) = &script_name {
+                    let cand_script = dir.join(script);
+                    if cand_script.is_file() {
+                        return Ok(classify_helper(lang, &cand_script, "bundled"));
+                    }
+                }
+            }
+        }
+    }
+    // (3) the copy carried inside this binary, written out on first use.
+    // Best-effort: an unwritable HOME degrades to the PATH lookup below rather
+    // than failing a scan that a helper on PATH could have served.
+    let mut extract_failure: Option<String> = None;
+    if let Some(embedded) = embedded_for(lang) {
+        match embedded_helpers::ensure(embedded) {
+            Ok(path) => return Ok(classify_helper(lang, &path, "embedded")),
+            Err(e) => extract_failure = Some(format!("{e:#}")),
+        }
+    }
+    // (4) a helper the user built themselves, in the canonical helper dir.
+    // This is the other half of the install hints below: a message that names
+    // a location and then also demands an env var pointing at that same
+    // location has not actually removed a step.
+    for dir in embedded_helpers::install_dirs(base) {
+        let cand = dir.join(base);
+        if cand.is_file() {
+            return Ok(classify_helper(lang, &cand, "installed"));
+        }
+        if let Some(script) = &script_name {
+            let cand_script = dir.join(script);
+            if cand_script.is_file() {
+                return Ok(classify_helper(lang, &cand_script, "installed"));
+            }
+        }
+    }
+    // (5) on PATH.
+    if let Some(found) = find_on_path(base) {
+        return Ok(classify_helper(lang, &found, "PATH"));
+    }
+    if let Some(script) = &script_name {
+        if let Some(found) = find_on_path(script) {
+            return Ok(classify_helper(lang, &found, "PATH"));
+        }
+    }
+    // Name the extraction failure when there was one: "no helper found" would
+    // send the reader hunting for an install that this binary already carries.
+    if let Some(why) = extract_failure {
+        anyhow::bail!(
+            "no {base} helper for detected {lang} sources ({why}): {hint}",
+            hint = missing_helper_hint(lang),
+        );
+    }
+    anyhow::bail!(
+        "no {base} helper found for detected {lang} sources: {hint}",
+        hint = missing_helper_hint(lang),
+    )
+}
+
+/// Build the full argv (program first) for invoking a resolved helper against
+/// `root`, tagging the snapshot `name`. When `files` is non-empty, append
+/// `--files a,b,c` (repo-relative paths) so the helper emits packets ONLY for
+/// those files, the incremental reload path both goindex and pyindex support.
+/// Pure, so command construction is unit-testable without spawning a process.
+/// The largest `--files` payload one invocation may carry, in bytes.
+///
+/// Linux caps a SINGLE argv entry at MAX_ARG_STRLEN = 32 pages = 128 KiB,
+/// independently of ARG_MAX (2 MiB on a typical box). `--files` joins the whole
+/// changed set into one entry, so the binding limit is the per-argument one and
+/// ARG_MAX is a red herring: on apache/airflow the list is 7690 paths totalling
+/// ~1.46 MB, which fits ARG_MAX with room to spare and exceeds the real limit
+/// eleven times over. The spawn then fails before the helper runs, and because
+/// the incremental path is fail-open the scan reported a degraded result rather
+/// than a crash (po-av01j.141).
+///
+/// 96 KiB, not 128: the payload is one argument among several, and the kernel
+/// also counts the environment against ARG_MAX. The headroom costs one extra
+/// invocation on a very large batch and removes a cliff nobody would diagnose
+/// from the error text.
+const MAX_FILES_ARG_BYTES: usize = 96 * 1024;
+
+/// Split `files` into batches whose comma-joined length stays under
+/// [`MAX_FILES_ARG_BYTES`], so each batch survives exec.
+///
+/// A single path longer than the cap is still emitted, alone, rather than
+/// dropped: losing a file silently is the failure mode this whole epic keeps
+/// finding, and an over-long path fails loudly at exec with the path in the
+/// error instead.
+fn chunk_files(files: &[String], cap: usize) -> Vec<Vec<String>> {
+    if files.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for f in files {
+        // +1 for the comma that will join this entry to the previous one.
+        let add = f.len() + usize::from(!cur.is_empty());
+        if !cur.is_empty() && len + add > cap {
+            out.push(std::mem::take(&mut cur));
+            len = 0;
+        }
+        len += f.len() + usize::from(!cur.is_empty());
+        cur.push(f.clone());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String]) -> Vec<String> {
+    let root = root.display().to_string();
+    let helper_path = helper.path.display().to_string();
+    let mut tail = vec![
+        "--retrieve".to_string(),
+        "--root".to_string(),
+        root,
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    if !files.is_empty() {
+        tail.push("--files".to_string());
+        tail.push(files.join(","));
+    }
+    match helper.kind {
+        HelperKind::Executable => std::iter::once(helper_path).chain(tail).collect(),
+        HelperKind::PyScript => std::iter::once("python3".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::NodeScript => std::iter::once("node".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::DotnetAssembly => std::iter::once("dotnet".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+        HelperKind::JavaSource => std::iter::once("java".to_string())
+            .chain(std::iter::once(helper_path))
+            .chain(tail)
+            .collect(),
+    }
+}
+
+/// Exit code by which a retriever helper says "I ran correctly and am
+/// DECLINING to analyse this tree" (po-av01j.102).
+///
+/// A distinct code is necessary because the obvious candidates are already
+/// taken by real failures: rustindex exits 2 from its generic error arm and
+/// cindex exits 2 on a usage error, so 2 cannot also mean "declined". Without
+/// a separate value the orchestrator has only the stderr text to go on, and
+/// classifying behaviour by log wording silently reclassifies the day someone
+/// rewords a message.
+const HELPER_EXIT_ABSTAIN: i32 = 3;
+
+/// A helper says its PREREQUISITE is missing: the tool it drives is not
+/// installed (po-av01j.147). Distinct from both an abstention and a failure --
+/// nothing is broken and nothing was declined, the machine simply is not set up
+/// yet, and the fix is an install command rather than a bug report.
+const HELPER_EXIT_PREREQ_MISSING: i32 = 4;
+
+/// Why a language contributed no packets to the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradeKind {
+    /// The helper ran and deliberately declined: it can tell it has no basis
+    /// to analyse this tree (rustindex with no cargo workspace) and refuses to
+    /// guess. Not an error, and must not be reported as one.
+    Abstained,
+    /// The helper, or the toolchain it drives, is NOT INSTALLED
+    /// (po-av01j.147). Reported separately from a failure because the two ask
+    /// for opposite things from the reader: a failure is a defect to report, a
+    /// missing prerequisite is a command to run. Shipping the helper binary is
+    /// necessary and not sufficient -- rustindex ships and still needs a rustup
+    /// component -- so this is the ordinary state on a fresh machine, not an
+    /// edge case.
+    NotInstalled,
+    /// The helper crashed, was missing, or exited non-zero for any other
+    /// reason. Something is broken.
+    Failed,
+}
+
+/// One language that produced no packets, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LangDegradation {
+    lang: Lang,
+    kind: DegradeKind,
+    reason: String,
+}
+
+/// Classify a helper's non-success exit. Success is handled by the caller;
+/// everything that reaches here is a degradation of some kind.
+///
+/// `None` means the process was killed by a signal, which is a failure rather
+/// than a decline: the helper never got as far as deciding anything.
+fn classify_helper_exit(code: Option<i32>) -> DegradeKind {
+    match code {
+        Some(HELPER_EXIT_ABSTAIN) => DegradeKind::Abstained,
+        Some(HELPER_EXIT_PREREQ_MISSING) => DegradeKind::NotInstalled,
+        _ => DegradeKind::Failed,
+    }
+}
+
+/// Is this retrieval result fatal to the scan?
+///
+/// Default is fail-OPEN per language, which is what `--strict`'s own help text
+/// has always promised ("Fail CLOSED when ... a retriever errors (CI). Default
+/// is fail-open"). Two things override that:
+///
+///   `strict`  CI asked for a whole answer or none.
+///   ALL detected languages degraded. Degrading to zero languages is not
+///             degradation, it is a total failure rendered as "0 findings".
+///             A clean report over nothing scanned is the single outcome that
+///             must never be quiet, so this is fatal at any strictness.
+fn retrieval_verdict(
+    detected: usize,
+    degraded: &[LangDegradation],
+    strict: bool,
+) -> anyhow::Result<Option<String>> {
+    if degraded.is_empty() {
+        return Ok(None);
+    }
+    let summary = degraded
+        .iter()
+        .map(|d| format!("{} ({})", d.lang, d.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detected > 0 && degraded.len() >= detected {
+        // TOTAL RETRIEVAL FAILURE IS A DEGRADATION, NOT AN ABORT
+        // (po-av01j.145). It used to bail, which discarded the lanes that need
+        // no retriever at all -- config, secrets and repo structure all walk
+        // the tree themselves. Measured with no helpers installed, the config
+        // lane alone resolves 217 of 320 settings and produces real findings,
+        // and all of it was thrown away because the CALL-SITE lane could not
+        // run.
+        //
+        // The original concern stands and is preserved: reporting zero findings
+        // here would be a clean bill of health over an empty scan. That is why
+        // the summary is returned rather than swallowed -- COVERAGE renders it
+        // as "call-site lane INCOMPLETE" (po-av01j.139) and the reader is told
+        // plainly which languages went unread.
+        //
+        // This is po-av01j.139 one level up: there an EMPTY call-site lane
+        // aborted and took the other lanes with it; here a FAILED one did the
+        // same. The lesson did not generalise because it was applied at one
+        // call site instead of as a principle.
+        anyhow::ensure!(
+            !strict,
+            "--strict: every detected language failed to retrieve, so nothing was scanned: \
+             {summary}. Reporting zero findings here would be a clean bill of health over an \
+             empty scan."
+        );
+        return Ok(Some(format!(
+            "every detected language failed to retrieve, so no call site was scanned: {summary}"
+        )));
+    }
+    anyhow::ensure!(
+        !strict,
+        "--strict: retrieval degraded for {summary}. Re-run without --strict to scan the \
+         remaining languages."
+    );
+    Ok(None)
+}
+
+/// Run a resolved helper over `root` and return its stdout (the JSONL packet
+/// stream). When `files` is non-empty the helper emits only those files'
+/// packets.
+///
+/// A non-zero exit is returned as a typed degradation rather than an error:
+/// deciding whether one language's silence should sink the whole scan is the
+/// orchestrator's call, not this function's.
+fn run_helper(
+    helper: &ResolvedHelper,
+    root: &Path,
+    name: &str,
+    files: &[String],
+) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
+    // BATCHED so the `--files` payload cannot exceed the per-argument exec
+    // limit (po-av01j.141). A whole-repo changed set on a large repository is
+    // megabytes of paths in one argv entry, and the spawn fails before the
+    // helper runs. Batching keeps the existing helper contract exactly as it
+    // is -- all seven helpers work unchanged -- and bounds peak memory for the
+    // merged stream as a side effect.
+    //
+    // An empty `files` means "the whole tree", which is a DIFFERENT request
+    // from "these zero files", so it must still produce exactly one invocation.
+    let batches = if files.is_empty() {
+        vec![Vec::new()]
+    } else {
+        chunk_files(files, MAX_FILES_ARG_BYTES)
+    };
+    let mut merged = String::new();
+    for batch in &batches {
+        let argv = helper_argv(helper, root, name, batch);
+        let (program, args) = argv.split_first().expect("argv always has a program");
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if helper.kind == HelperKind::NodeScript {
+            cmd.env("NODE_PATH", node_path_for(root));
+        }
+        let output = match cmd.output() {
+            Ok(o) => o,
+            // The INTERPRETER is missing, not the helper: `dotnet`, `java`,
+            // `node` or `python3` is absent even though the helper file itself
+            // resolved. That is the same "not set up yet" state a helper's own
+            // exit 4 reports, and it must degrade this one language rather than
+            // abort the scan — a polyglot repo whose C# toolchain is absent
+            // still has four other languages worth reading.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Err((
+                    DegradeKind::NotInstalled,
+                    format!(
+                        "`{program}` is not installed, so {} cannot run",
+                        helper.path.display()
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("running retriever helper `{program}`"))
+                );
+            }
+        };
+        if !output.status.success() {
+            let kind = classify_helper_exit(output.status.code());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(Err((
+                kind,
+                helper_degrade_reason(kind, &output.status, &stderr),
+            )));
+        }
+        merged.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    Ok(Ok(merged))
+}
+
+/// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
+///
+/// tsindex drives the real TypeScript compiler API, so it needs the
+/// `typescript` package at runtime. Node resolves `require` by walking up from
+/// the SCRIPT's directory, and once the script is extracted to
+/// `~/.revelara/helpers/<version>/` that walk never reaches the repository
+/// being scanned — even though almost every TypeScript repo already has
+/// `typescript` in its own `node_modules`. Pointing NODE_PATH at the scanned
+/// tree makes the common case need no install at all, and uses the project's
+/// OWN compiler version, which is the more faithful answer anyway.
+///
+/// An existing NODE_PATH is preserved and takes precedence: an operator who
+/// set it meant it.
+fn node_path_for(root: &Path) -> std::ffi::OsString {
+    let repo_modules = root.join("node_modules");
+    match std::env::var_os("NODE_PATH") {
+        Some(existing) if !existing.is_empty() => {
+            let mut parts: Vec<PathBuf> = std::env::split_paths(&existing).collect();
+            parts.push(repo_modules);
+            std::env::join_paths(parts).unwrap_or(existing)
+        }
+        _ => repo_modules.into_os_string(),
+    }
+}
+
+/// A one-line reason for a degradation, for the COVERAGE block.
+///
+/// An abstaining helper explains itself in its last stderr line, and that
+/// sentence is the useful one ("cargo workspace ... failed to load"). A failed
+/// helper's stderr is a crash dump, so the exit status leads and the detail
+/// follows.
+fn helper_degrade_reason(
+    kind: DegradeKind,
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no detail on stderr")
+        .trim();
+    match kind {
+        DegradeKind::Abstained => last.to_string(),
+        // No exit status in the message: nothing crashed, and quoting a status
+        // code invites the reader to debug a tool that is simply absent.
+        DegradeKind::NotInstalled => last.to_string(),
+        DegradeKind::Failed => format!("{status}: {last}"),
+    }
+}
+
+/// Derive the snapshot tag for a scan target: the canonical base name of
+/// `path`, falling back to "repo" when that is unavailable (e.g. `.` at `/`).
+fn snapshot_name(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .ok()
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// Fail loudly when the scan target cannot be READ, so that an empty walk can
+/// safely be read as "nothing here" (po-av01j.198).
+///
+/// The source walks below tolerate `read_dir` failures on purpose: one
+/// unreadable vendored directory must not abort a whole scan. That tolerance
+/// means a target that does not exist, is a file rather than a tree, or is
+/// mode-000 produces exactly the same empty result as a docs-only repository.
+/// One of those is a clean pass and the other is a scanner that never looked;
+/// this is the check that keeps them apart.
+///
+/// `scan_preflight` (po-av01j.182) already refuses a target that does not stat
+/// as a directory, and for the same reason. This adds the dimension it cannot
+/// see — a directory that exists but cannot be OPENED — and it lives here, on
+/// the walk itself, so `report --incremental` and any future caller that never
+/// passes through the `scan` dispatch inherit the guarantee rather than having
+/// to remember it.
+fn ensure_scannable_root(path: &Path) -> anyhow::Result<()> {
+    let md = std::fs::metadata(path).with_context(|| format!("cannot scan {}", path.display()))?;
+    anyhow::ensure!(
+        md.is_dir(),
+        "cannot scan {}: not a directory (pass a repository root, or --retrieved for a \
+         prebuilt packet stream)",
+        path.display()
+    );
+    std::fs::read_dir(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(())
+}
+
+/// Collect the candidate source files (`*.go` / `*.py` / `*.ts` / `*.cs`)
+/// under `root` for the incremental hash-gate, using the same bounded,
+/// vendored-dir-skipping walk `detect_languages` relies on. Paths are
+/// `root`-prefixed so they hash directly and strip cleanly back to the
+/// repo-relative form the helpers emit.
+fn walk_source_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(entry.path());
+                }
+            } else if ft.is_file() {
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("go" | "py" | "rs" | "cs" | "java" | "c" | "cc" | "cpp" | "cxx") => {
+                        out.push(path)
+                    }
+                    Some("ts" | "tsx") if !is_declaration_ts(&path) => out.push(path),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The repo-relative, forward-slashed spelling of `file` under `root`. Matches
+/// the `file_path` the helpers emit (`filepath.Rel` + `ToSlash` on the Go side,
+/// `os.path.relpath` + `/` on the Python side), so a candidate path lines up
+/// with the sites retrieved from it.
+fn repo_relative(root: &Path, file: &Path) -> String {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The language whose helper retrieves a given source file, by extension. A
+/// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
+/// C/C++ HEADERS map to no helper: which TUs a changed header invalidates
+/// needs the include graph, so header edits ride the full-rescan path rather
+/// than guessing an incremental subset (follow-up bead under po-av01j.12).
+fn lang_of_path(path: &Path) -> Option<Lang> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("go") => Some(Lang::Go),
+        Some("py") => Some(Lang::Python),
+        Some("rs") => Some(Lang::Rust),
+        Some("ts") | Some("tsx") if !is_declaration_ts(path) => Some(Lang::TypeScript),
+        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Lang::TypeScript),
+        Some("cs") => Some(Lang::CSharp),
+        Some("java") => Some(Lang::Java),
+        Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
+        _ => None,
+    }
+}
+
+/// Normalize a repo-relative path for delta comparison: strip a leading `./`
+/// and collapse backslashes, so a "./" on one side of the comparison cannot
+/// silently drop every finding.
+fn normalize_rel(p: &str) -> String {
+    p.trim_start_matches("./").replace('\\', "/")
+}
+
+/// The changed-file set for `--changed-only`, normalized once.
+fn changed_set(changed: &[String]) -> std::collections::BTreeSet<String> {
+    changed.iter().map(|f| normalize_rel(f)).collect()
+}
+
+/// Is this site's file part of the change under scan (po-av01j.127)?
+///
+/// Deliberately fails CLOSED on an empty set: a change-scoped run with no
+/// changed files reports nothing, rather than falling open to the whole repo
+/// while still claiming to be scoped. The opposite bias is how `po-t8acf`
+/// shipped a vacuous gate -- there the scope argument was misparsed and the
+/// gate silently scanned nothing; here the danger is the mirror image, a gate
+/// that silently scans everything.
+fn site_is_changed(file_path: &str, changed: &std::collections::BTreeSet<String>) -> bool {
+    changed.contains(&normalize_rel(file_path))
+}
+
+/// A resolved packet stream plus whatever it cost to get one.
+/// Markers a file uses to declare itself machine-generated. Matched only in the
+/// first few lines, where every generator writes its banner, and matched
+/// case-insensitively.
+///
+/// EVIDENCE, NOT PATH GUESSING. A path rule like "contains /proto/" would
+/// misfile a hand-written package legitimately named `proto`, and would miss
+/// generated files that live anywhere else. The banner is the generator's own
+/// statement about the file (po-av01j.133.7).
+const GENERATED_MARKERS: &[&str] = &[
+    "do not edit",
+    "@generated",
+    "generated by the protocol buffer compiler",
+    "autogenerated",
+    "auto-generated",
+    "this file is generated",
+    "code generated by",
+];
+
+/// How much of a file to read looking for a generated-code banner. Generators
+/// put it in the first line or two; 2 KiB is generous and bounds the cost.
+const GENERATED_HEADER_BYTES: u64 = 2048;
+
+/// Whether `path` declares itself machine-generated in its opening bytes.
+fn is_generated_source(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if std::io::BufReader::new(f)
+        .take(GENERATED_HEADER_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+    GENERATED_MARKERS.iter().any(|m| head.contains(m))
+}
+
+/// Drop packet lines belonging to machine-generated files, returning the
+/// filtered stream and the number of distinct files dropped.
+///
+/// Generated code cannot be acted on: nobody edits it, so a finding there is
+/// noise, and counting it as scannable surface makes coverage meaningless. On
+/// mlflow one protobuf file of 312k lines produced 81% of the repo's sites and
+/// pushed reported coverage to 3% when real-source coverage was ~32%.
+///
+/// The count is returned rather than swallowed because a silent exclusion is
+/// indistinguishable from having scanned the files.
+fn strip_generated_packets(text: &str, root: &Path) -> (String, usize) {
+    let mut decided: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut kept = String::with_capacity(text.len());
+    let mut dropped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let file = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("file_path")
+                    .and_then(|f| f.as_str())
+                    .map(str::to_string)
+            });
+        if let Some(rel) = file {
+            let gen = *decided
+                .entry(rel.clone())
+                .or_insert_with(|| is_generated_source(&root.join(&rel)));
+            if gen {
+                dropped.insert(rel);
+                continue;
+            }
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    (kept, dropped.len())
+}
+
+struct RetrievedStream {
+    text: String,
+    /// Distinct machine-generated files whose packets were dropped. Reported in
+    /// COVERAGE: excluding them silently would read as having scanned them.
+    generated_skipped: usize,
+    /// Set when EVERY detected language failed, so the call-site lane is empty
+    /// for a reason the reader must be told (po-av01j.145). Rendered by the
+    /// COVERAGE block, never swallowed.
+    total_failure: Option<String>,
+    /// Languages that contributed nothing, and why. Reported in COVERAGE; a
+    /// skipped language is never silent.
+    degraded: Vec<LangDegradation>,
+    /// EVERY language seen and what happened to it, including the ones that
+    /// ran cleanly and the ones nothing here can read (po-av01j.128 / .132).
+    status: Vec<render::LangStatus>,
+    /// Which helper file ran per language and how it was found (po-vd7ii).
+    retrievers: Vec<render::RetrieverInfo>,
+}
+
+/// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
+/// that file is read verbatim (the escape hatch). Otherwise rvl detects the
+/// languages under `path`, runs each matching helper, and concatenates their
+/// stdout.
+///
+/// A helper that abstains or fails degrades ITS OWN language and no other
+/// (po-av01j.102). Before this, one `?` here discarded every other language's
+/// stream: the dogfood repo has 1660 .go files and one .rs test fixture, and that single
+/// fixture made the whole repo unscannable because rustindex correctly declines
+/// a tree with no Cargo.toml. See `retrieval_verdict` for when degradation is
+/// still fatal.
+fn resolve_packet_stream(
+    retrieved: Option<&Path>,
+    path: &Path,
+    strict: bool,
+) -> anyhow::Result<RetrievedStream> {
+    if let Some(p) = retrieved {
+        let text = std::fs::read_to_string(p)
+            .with_context(|| format!("reading --retrieved {}", p.display()))?;
+        return Ok(RetrievedStream {
+            text,
+            // A prebuilt stream is scanned as given: PATH is ignored on this
+            // branch, so there is no root to resolve its files against.
+            generated_skipped: 0,
+            total_failure: None,
+            degraded: Vec::new(),
+            // A prebuilt stream says nothing about which helpers ran, so the
+            // roll-call stays empty rather than inventing one.
+            status: Vec::new(),
+            retrievers: Vec::new(),
+        });
+    }
+    let langs = detect_languages(path);
+    // NO DETECTED LANGUAGE IS NOT AN ERROR (po-av01j.148). A repository of pure
+    // infrastructure -- terraform, workflows, manifests and nothing else -- has
+    // no source for any retriever to read, so NO helper is needed and there is
+    // nothing to fail about. The config, secret and structure lanes read the
+    // tree directly and were measured producing real findings on exactly such
+    // trees.
+    //
+    // This is the same principle as po-av01j.145 at a third location: a lane's
+    // absence may not silence a lane that did not depend on it. Erroring here
+    // made a pure-IaC repo unscannable, which is a shape the product will meet
+    // constantly.
+    if langs.is_empty() {
+        return Ok(RetrievedStream {
+            text: String::new(),
+            generated_skipped: 0,
+            total_failure: None,
+            retrievers: Vec::new(),
+            status: detect_unsupported(path)
+                .into_iter()
+                .map(|(name, count)| render::LangStatus {
+                    lang: name,
+                    state: render::LangState::Unsupported,
+                    detail: format!("{count} files"),
+                })
+                .collect(),
+            degraded: Vec::new(),
+        });
+    }
+    // DISCOVERY PROBE (po-av01j.148). Resolve every detected language's helper
+    // BEFORE running any of them, so a missing retriever is a preflight
+    // statement naming ALL of them at once rather than a mid-scan surprise that
+    // reports the first and hides the rest. A developer on a polyglot repo
+    // should get one list and one install step, not N runs.
+    //
+    // The probe ALSO extracts: `resolve_helper` materializes an embedded
+    // script the first time it is asked for one (po-aml3h), so the preflight
+    // both answers "can this repo be scanned" and does the setup that makes
+    // the answer yes. Extraction is hash-checked and memoized, so running the
+    // probe and then the loop costs one write, not two.
+    let missing: Vec<(Lang, String)> = langs
+        .iter()
+        .filter_map(|&l| match resolve_helper(l) {
+            Ok(_) => None,
+            Err(e) => Some((l, format!("{e:#}"))),
+        })
+        .collect();
+    // A missing helper for a language present ONLY as non-production material
+    // (one testdata fixture) must not abort the whole scan (po-hjte8). It still
+    // degrades to "not installed" in the loop below and is reported in
+    // COVERAGE; only a language with real production sources hard-fails, which
+    // preserves po-av01j.145 (no silent pass over a language nobody looked at).
+    let blocking_missing: Vec<&(Lang, String)> = missing
+        .iter()
+        .filter(|(l, _)| !language_is_incidental(path, *l))
+        .collect();
+    if !blocking_missing.is_empty() && !allow_missing_helpers() {
+        // A GATE THAT CANNOT READ A LANGUAGE THE REPO CONTAINS MUST NOT PASS.
+        // Reporting "commit clean" here would be a clean bill of health over a
+        // language nobody looked at -- the exact failure this epic has found
+        // repeatedly. Failing loudly with an install command is recoverable in
+        // seconds; a silent pass is never noticed at all.
+        let list = blocking_missing
+            .iter()
+            .map(|(l, why)| format!("  {l}: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "no retriever for {} of the {} language(s) in this repo with production sources, so it \
+             cannot be scanned honestly:\n{list}\n\nInstall the helper(s) above, or set \
+             RVL_ALLOW_MISSING_HELPERS=1 to scan the remaining lanes deliberately.",
+            blocking_missing.len(),
+            langs.len()
+        );
+    }
+    let name = snapshot_name(path);
+    let detected = langs.len();
+    let mut combined = String::new();
+    let mut generated_skipped = 0usize;
+    let mut degraded: Vec<LangDegradation> = Vec::new();
+    let mut status: Vec<render::LangStatus> = Vec::new();
+    let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
+    for lang in langs {
+        // A helper that cannot be FOUND is a degradation of that language too,
+        // not a fatal error: an unrelated language's toolchain being absent is
+        // exactly the polyglot case this bead exists for.
+        let helper = match resolve_helper(lang) {
+            Ok(h) => h,
+            Err(e) => {
+                // The helper binary itself is absent. That is a missing
+                // prerequisite, not a malfunction (po-av01j.147), and today it
+                // is the NORMAL state: five of the seven helpers are not
+                // shipped at all (po-av01j.144).
+                degraded.push(LangDegradation {
+                    lang,
+                    kind: DegradeKind::NotInstalled,
+                    reason: format!("{e:#}"),
+                });
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::NotInstalled,
+                    detail: format!("{e:#}"),
+                });
+                continue;
+            }
+        };
+        retrievers.push(render::RetrieverInfo {
+            lang: lang.to_string(),
+            path: helper.path.display().to_string(),
+            source: helper.source.clone(),
+        });
+        match run_helper(&helper, path, &name, &[])? {
+            Ok(out) => {
+                // Drop machine-generated files BEFORE counting. Filtering after
+                // the roll-call was built left "Java 33744 sites" printed above
+                // a total of 9002 -- a report claiming more than the scan has,
+                // which is the same defect shape as the RC-057 false negative.
+                let (out, gen) = strip_generated_packets(&out, path);
+                generated_skipped += gen;
+                // A ZERO here is a real answer, not an absence: the helper ran
+                // and found nothing. Counting site packets rather than lines
+                // keeps repo_config/retrieval_stats records out of the number.
+                let sites = out.matches("\"site_key\"").count();
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: render::LangState::Scanned,
+                    detail: sites.to_string(),
+                });
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&out);
+            }
+            Err((kind, reason)) => {
+                status.push(render::LangStatus {
+                    lang: lang.to_string(),
+                    state: match kind {
+                        DegradeKind::Abstained => render::LangState::Abstained,
+                        DegradeKind::NotInstalled => render::LangState::NotInstalled,
+                        DegradeKind::Failed => render::LangState::Failed,
+                    },
+                    detail: reason.clone(),
+                });
+                degraded.push(LangDegradation { lang, kind, reason })
+            }
+        }
+    }
+    for (name, count) in detect_unsupported(path) {
+        status.push(render::LangStatus {
+            lang: name,
+            state: render::LangState::Unsupported,
+            detail: format!("{count} files"),
+        });
+    }
+    let total_failure = retrieval_verdict(detected, &degraded, strict)?;
+    Ok(RetrievedStream {
+        text: combined,
+        generated_skipped,
+        total_failure,
+        status,
+        degraded,
+        retrievers,
+    })
+}
+
+/// What the resolve -> propagate -> triage pipeline hands back: the G1
+/// findings and triaged items, the G1 sites they are index-aligned with
+/// (server-entry sites are partitioned out), the loaded spec cache so callers
+/// can run the G6 config lane against the same specs, and the G2 server-entry
+/// lane's control findings (po-av01j.3).
+type ResolvedScan = (
+    Vec<rvl_propagate::Finding>,
+    Vec<rvl_triage::TriagedItem>,
+    Vec<rvl_core::Site>,
+    rvl_spec::SpecCache,
+    Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+);
+
+/// The scan: packets + verified specs -> propagation -> triage.
+/// Deterministic, no model calls. Undecided outcomes are reported in the
+/// coverage section, never promoted to a violation.
+/// The deterministic core shared by `scan` and `explain`: load verified specs,
+/// parse packets, propagate, triage. Returns the raw findings (for --out and
+/// coverage) alongside the triaged items and a `verbose` cache-status line.
+/// `verbose` gates the one-line "sites | specs" summary so `explain` stays quiet.
+/// Takes the already-resolved packet-stream text (see `resolve_packet_stream`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_findings(
+    store: &CacheStore,
+    keyset: &Keyset,
+    stream: &str,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    repo_root: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<ResolvedScan> {
+    let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
+    findings_from_sites(
+        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, repo_root, verbose,
+    )
+}
+
+/// Decide which judgments grade this scan: the ones inside the signed cache,
+/// or a dev-override file (po-av01j.106 / po-axk44).
+///
+/// THE DEFAULT IS THE CACHE. Judgments used to come only from `--judgments`,
+/// which meant the out-of-the-box scan had nothing to grade findings with:
+/// every class landed on `unjudged`, unjudged renders advisory, and the
+/// deterministic gate could not fire however serious the finding. The corpus
+/// now ships inside the same signed bytes as the specs, so a user who runs
+/// `rvl scan .` gets graded, control-mapped, blocking-eligible findings
+/// with no flag at all.
+///
+/// `--judgments` survives as a DEV OVERRIDE and is announced on stderr every
+/// time it is used, the same contract `--specs-file` has: a grading layer that
+/// did not come out of the signed artifact must never apply silently, because
+/// a judgment is the one input that can wedge a commit.
+///
+/// A cache judgments section that will not parse is a WARNING, not an error.
+/// Failing the scan would let one bad publish stop every commit in the fleet;
+/// degrading to advisory keeps scans running and keeps every finding visible,
+/// which is the floor the triage layer already guarantees. It is loud on
+/// stderr so the degradation is seen rather than inferred.
+fn resolve_judgments(
+    cache_judgments: Option<&serde_json::Value>,
+    override_file: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<Vec<rvl_triage::ClassJudgment>> {
+    if let Some(p) = override_file {
+        let from_cache = cache_judgments
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| a.len());
+        eprintln!(
+            "WARNING: grading with UNVERIFIED judgments from {} (--judgments is a dev override; \
+             production scans use the judgments inside the signed cache){}",
+            p.display(),
+            if from_cache > 0 {
+                format!(", REPLACING the {from_cache} judgment(s) the cache carries")
+            } else {
+                String::new()
+            }
+        );
+        return Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?);
+    }
+    let Some(raw) = cache_judgments else {
+        // An older artifact, or a deployment that publishes no corpus. Silent
+        // on stderr and reported in the verbose census below: absence is a
+        // valid state, not a fault.
+        if verbose {
+            println!("judgments 0 (cache carries none; every finding is advisory)");
+        }
+        return Ok(Vec::new());
+    };
+    match serde_json::from_value::<Vec<rvl_triage::ClassJudgment>>(raw.clone()) {
+        Ok(js) => {
+            if verbose {
+                println!("judgments {} (from the signed cache)", js.len());
+            }
+            Ok(js)
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: the signed cache's judgments section did not parse ({e}); \
+                 every finding will be advisory. Run `{BIN} sync` for a newer artifact."
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The pipeline shared by the packet-stream path and the incremental path:
+/// verified specs + already-assembled sites -> propagation -> triage. The
+/// incremental caller hands its merged (reused + freshly retrieved) sites here
+/// directly, skipping `parse_stream`.
+/// Also returns the loaded [`rvl_spec::SpecCache`] so callers can run the G6
+/// config lane against the SAME specs the code lane used (one signed artifact
+/// carries both; loading twice would double the verification and the
+/// staleness chatter).
+#[allow(clippy::too_many_arguments)]
+fn findings_from_sites(
+    store: &CacheStore,
+    keyset: &Keyset,
+    mut sites: Vec<rvl_core::Site>,
+    repo_cfg: &rvl_core::RepoConfig,
+    skipped: usize,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    repo_root: Option<&std::path::Path>,
+    verbose: bool,
+) -> anyhow::Result<ResolvedScan> {
+    // The signed artifact carries BOTH halves of the answer: the specs that
+    // decide whether a call is bounded, and the judgments that decide what an
+    // unbounded one means (po-av01j.106). They are loaded together because they
+    // arrive together, inside one signature.
+    let (specs_text, cache_judgments) = match specs_file {
+        Some(p) => {
+            // Dev override. Announced on stderr every time: an unverified
+            // spec cache must never load quietly.
+            eprintln!(
+                "WARNING: loading UNVERIFIED specs from {} (--specs-file is a dev override; \
+                 production scans use the signed cache)",
+                p.display()
+            );
+            // No envelope was opened, so there are no cache judgments to carry.
+            // A dev spec file plus `--judgments` is the full offline pairing.
+            (std::fs::read_to_string(p)?, None)
+        }
+        None => {
+            let loaded = store.load(keyset, &rvl_cache::today_utc())?;
+            if let Some(hint) = &loaded.upgrade_hint {
+                eprintln!("{hint}");
+            }
+            if let Some(note) = &loaded.staleness_note {
+                eprintln!("{note}");
+            }
+            // Gated by `verbose` (like the sites|specs line below) so quiet
+            // callers such as `explain` and `report --json` keep stdout clean
+            // for their own payload. Staleness/upgrade hints stay on stderr.
+            if verbose {
+                println!(
+                    "spec cache {} (schema {}, {:?})",
+                    loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                );
+            }
+            (
+                serde_json::to_string(&loaded.envelope.specs)?,
+                loaded.envelope.judgments,
+            )
+        }
+    };
+
+    // AN EMPTY SITE SET IS NOT AN ERROR (po-av01j.139). This used to
+    // `ensure!(!sites.is_empty())`, which exits 1 -- "the scan could not
+    // complete" -- and it fires on the NORMAL case in hook mode: a commit whose
+    // changed files carry no retrievable call site. Measured on a real repo,
+    // that is a docs-only commit, a test-only commit, a config change, or any
+    // edit to a file without I/O calls, i.e. most commits. A pre-commit hook
+    // that errors on ordinary work gets uninstalled, and what is lost is not
+    // this run but every future one.
+    //
+    // Nothing is given up by proceeding. A genuine retrieval FAILURE is already
+    // caught upstream by `retrieval_verdict`, which runs before this point and
+    // reports per-language degradation (po-av01j.102); a malformed stream is
+    // already counted as unparseable lines. So by here, empty means "there was
+    // nothing to look at" -- a clean result, and the config and structure lanes
+    // still have their own findings to report, which the old abort discarded
+    // along with everything else.
+    //
+    // This is the epic's recurring confusion inverted: elsewhere absence was
+    // reported as success, here it was reported as failure. Both come from
+    // collapsing "I found nothing" and "I could not look" into one outcome.
+    // REPO EVIDENCE BEATS THE PATH (po-av01j.173). `scope_of` reads the path
+    // and nothing else, so a hatchling build hook and a maintenance script at
+    // the repo root both class as Runtime and their unbounded `subprocess`
+    // calls block a commit. Stamped here, once, before ANY lane looks at a
+    // scope: propagation, triage, the emission lane and `--out` all ask
+    // `Site::scope`, so they cannot disagree about where a file lives.
+    if let Some(root) = repo_root {
+        let dev = devscope::DevScope::detect(root);
+        dev.annotate(&mut sites);
+        if verbose && !dev.is_empty() {
+            println!(
+                "dev scope {} file(s) (declared build hooks / unreferenced root scripts)",
+                dev.len()
+            );
+        }
+    }
+    // G2 (po-av01j.3): server-entry records ride the same stream but are
+    // judged by their own lane. Partition them out BEFORE propagation so the
+    // G1 coverage numbers, the `--out` eval rows, and the shape-only report
+    // all stay client-call-only (server-entry surfaces are control-level spec
+    // questions, not API-spec mint candidates).
+    let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
+        .into_iter()
+        .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
+    // G4 (po-av01j.5): emission-point aggregates ride the same stream but are
+    // NOT client-call surfaces. Partition them out before propagation so they
+    // never enter G1 coverage totals, `--out` eval rows, or triage classes;
+    // the emission lane consumes them below. (rvl_propagate::propagate also
+    // guards on site_kind — defense in depth for other stream consumers.)
+    let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_emission_point());
+    let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
+    // Out-of-code bound declarations (po-3t3oj.30): repo policy in
+    // `.revelara.yaml` asserting a bound no retrieval can see (a prod
+    // statement_timeout, an infra deadline). Merged as exact-type
+    // whole-call this-client ConfigSpecs with the policy provenance; the
+    // declaration is committed to the repo, so the audit trail is git.
+    if let Some(root) = repo_root {
+        let declared =
+            waiver::load_declared_bounds(&root.join(".revelara.yaml"), &rvl_cache::today_utc());
+        if !declared.is_empty() {
+            eprintln!(
+                "applying {} declared bound(s) from .revelara.yaml",
+                declared.len()
+            );
+            let overlay = rvl_spec::SpecFile {
+                apis: vec![],
+                scopes: vec![],
+                config_keys: vec![],
+                server: vec![],
+                emissions: vec![],
+                configs: declared
+                    .into_iter()
+                    .map(|d| rvl_spec::ConfigSpec {
+                        type_name: d.client_type,
+                        bounds: rvl_spec::Bounds::WholeCall,
+                        scope: rvl_spec::Scope::ThisClient,
+                        confidence: 1.0,
+                        rationale: format!("declared in .revelara.yaml: {}", d.reason),
+                        declared: true,
+                    })
+                    .collect(),
+            };
+            cache.merge(rvl_spec::SpecCache::from_file(overlay));
+        }
+    }
+    let served = cache.served_bound(repo_cfg);
+    let client = cache.client_bound_by_family(repo_cfg);
+    let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
+    let server_findings = rvl_propagate::server_entry::evaluate(&server_sites, &cache);
+
+    if verbose {
+        let server_note = if server_sites.is_empty() {
+            String::new()
+        } else {
+            format!(" | server-entry {}", server_sites.len())
+        };
+        println!(
+            "sites {}{server_note} | specs {} | unparseable lines {skipped}",
+            sites.len(),
+            cache.len()
+        );
+    }
+
+    // Triage: collapse violations into reader-facing classes. Unjudged classes
+    // still surface; they are never dropped.
+    let judgments = resolve_judgments(cache_judgments.as_ref(), judgments, verbose)?;
+    // Key each verdict on the site's UNIQUE site_key (not the finding's
+    // file:line site_id, which collides on chained calls), so triage rematches
+    // it to the right call and labels the finding correctly (po-3t3oj.35).
+    // findings are index-aligned with sites (propagate_all maps 1:1).
+    let verdict_rows: Vec<(String, rvl_core::Verdict, String)> = findings
+        .iter()
+        .zip(sites.iter())
+        .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
+        .collect();
+    let mut items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    // Emission lane (G4): judge the emission inventory against RC-027/RC-046/
+    // RC-061 with the cache's emission specs. Only violations surface, as
+    // triage items keyed `emission.RC-XXX` — the same waiver/suppress surface
+    // every other finding uses. Advisory by construction (severity is never
+    // "high"): an observability gap warrants a conversation, not a blocked
+    // commit.
+    items.extend(emission_items(
+        &sites,
+        &emission_sites,
+        cache.emission_specs(),
+    ));
+    Ok((findings, items, sites, cache, server_findings))
+}
+
+/// Map emission-lane violations into triage items. The class key is
+/// (`emission`, control code), so the ladder renders `emission.RC-XXX — <why>`
+/// and `.revelara.yaml` waivers / `rvl suppress` match on
+/// `emission.RC-XXX` like any other class rule.
+fn emission_items(
+    call_sites: &[rvl_core::Site],
+    emission_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::EmissionSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_emission::evaluate(call_sites, emission_sites, specs)
+        .into_iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "emission".into(),
+                method: f.control.to_string(),
+                // The control name leads so the ladder line reads
+                // "emission.RC-046 — distributed tracing: <why>".
+                reason: format!("{}: {}", f.control_name, f.reason),
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            control: f.control.to_string(),
+            site_count: f.evidence.len().max(1),
+            example_sites: f.evidence.into_iter().take(3).collect(),
+        })
+        .collect()
+}
+
+// --- G5 content lane: language-agnostic secret scanning, RC-043 (po-av01j.6) ---
+//
+// A pure-Rust in-process lane (crates/rvl-content), not an external helper:
+// content-pattern scanning needs no language toolchain, so the helper model's
+// per-target packaging cost buys nothing here. Content findings ride the same
+// packet schema (`client_type` "secret", `method` = rule id, snippet = masked
+// preview ONLY) and the same triage/waiver/render machinery, but they are kept
+// OUT of the spec-lane plumbing on purpose: never in coverage totals (they are
+// not API surfaces), never in `--out` eval rows (the eval harness scores spec
+// verdicts), and never in the shape-only report (their sites carry file paths,
+// which the report contract forbids).
+
+/// The control every content-lane secret finding maps to: RC-043, centralized
+/// secret management. The judgment layer owns control mapping; the content
+/// lane's judgments are built in, so its findings are born mapped.
+const SECRETS_CONTROL: &str = "RC-043";
+
+/// Fix guidance, from RC-043's remediation: an exposed secret is compromised
+/// the moment it is committed, so rotation is part of the fix, not an option.
+const SECRETS_FIX: &str = "remove the secret from source, rotate it immediately, and load it \
+     from a centralized secret manager (RC-043)";
+
+/// Built-in class judgments for content findings, one per rule x scope class.
+/// Token shapes are high severity (blocking) everywhere except test support,
+/// where a planted fixture credential is the common case; the generic entropy
+/// rule stays medium (advisory) everywhere because shape alone is weak
+/// evidence. `verdict` is always `surface`: a matched secret is never spam.
+fn content_judgments(findings: &[rvl_content::ContentFinding]) -> Vec<rvl_triage::ClassJudgment> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for f in findings {
+        if !seen.insert((f.rule_id.clone(), f.severity.clone())) {
+            continue;
+        }
+        for scope in [
+            "runtime",
+            "migration",
+            "test_support",
+            "dev_only",
+            "backfill",
+        ] {
+            let severity = if scope == "test_support" || f.severity != "high" {
+                "medium"
+            } else {
+                "high"
+            };
+            out.push(rvl_triage::ClassJudgment {
+                api: format!("secret.{}", f.rule_id),
+                scope: scope.to_string(),
+                verdict: "surface".to_string(),
+                severity: severity.to_string(),
+                fix: SECRETS_FIX.to_string(),
+                control: SECRETS_CONTROL.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Run the content lane over `path` and triage its findings into ladder items.
+/// Verdicts are pre-decided (`Violates`): a content-pattern match IS the
+/// evidence, there is no spec question to propagate. The waiver key downstream
+/// is the class rule `secret.<rule_id>`, so `rvl suppress` and hand-written
+/// `.revelara.yaml` waivers work unchanged (po-3t3oj.27).
+fn content_items(path: &Path) -> Vec<rvl_triage::TriagedItem> {
+    let findings = rvl_content::scan_root(path);
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let sites = rvl_content::to_sites(&findings, &snapshot_name(path));
+    let rows: Vec<(String, rvl_core::Verdict, String)> = sites
+        .iter()
+        .zip(findings.iter())
+        .map(|(s, f)| {
+            (
+                s.site_key(),
+                rvl_core::Verdict::Violates,
+                f.description.clone(),
+            )
+        })
+        .collect();
+    rvl_triage::triage(&sites, &rows, &content_judgments(&findings))
+}
+
+/// Resolve the color decision, honoring `--color` then NO_COLOR and a non-tty
+/// stdout. An unrecognized `--color` value falls back to auto.
+fn stdout_color(mode: Option<&str>) -> bool {
+    let mode = match mode {
+        Some("always") => render::ColorMode::Always,
+        Some("never") => render::ColorMode::Never,
+        _ => render::ColorMode::Auto,
+    };
+    mode.resolve(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan(
+    store: &CacheStore,
+    keyset: &Keyset,
+    state_path: &std::path::Path,
+    path: &std::path::Path,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+    strict: bool,
+) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
+    // The full path treats "no language detected" as a clean pass too
+    // (po-av01j.148), so it wants the same root guarantee as the incremental
+    // one: an unreadable tree must not render as "commit clean". Overlaps
+    // `scan_preflight`'s is_dir() check on the `scan` dispatch, deliberately —
+    // this one also catches a directory that exists but cannot be opened, and
+    // costs one stat. Skipped for `--retrieved`, where PATH is ignored
+    // entirely and the packet stream is the input.
+    if retrieved.is_none() {
+        ensure_scannable_root(path)?;
+    }
+    // Content lane first: it is language-agnostic, so it must not depend on
+    // the language pipeline having anything to do. With `--retrieved` the scan
+    // is an escape-hatch replay of a prebuilt stream, possibly from another
+    // tree entirely, so scanning PATH's content would mix two repos: skip.
+    let citems = if retrieved.is_none() {
+        content_items(path)
+    } else {
+        Vec::new()
+    };
+    // A repo with no supported languages but WITH content findings (an
+    // .env/terraform tree) still gets a scan: the ladder is the content lane
+    // alone and coverage reports zero API surfaces. Without content findings
+    // the original fail-closed guidance stands.
+    if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
+        // Content-only repo: no packet stream exists, so the structure lane
+        // inventories the live tree directly (same as the incremental path).
+        // The config lane is skipped on this early path (no spec cache gets
+        // resolved before the return) -- follow-up tracked on the epic.
+        let structure = resolve_structure_findings(None, "", path);
+        return render_scan_output(
+            state_path,
+            path,
+            &[],
+            &citems,
+            &[],
+            // No spec cache is resolved on this path, so every class renders
+            // the unknown-default wording -- which is the honest one.
+            None,
+            &structure,
+            None,
+            None,
+            out,
+            color,
+            start,
+            // No language was detected on this path, so nothing could degrade.
+            &[],
+            Vec::new(),
+            Vec::new(),
+            None,
+            0,
+        );
+    }
+    let stream = resolve_packet_stream(retrieved, path, strict)?;
+    let (findings, mut items, sites, specs, server) = resolve_findings(
+        store,
+        keyset,
+        &stream.text,
+        specs_file,
+        judgments,
+        Some(path),
+        true,
+    )?;
+    items.extend(citems);
+    // Structure + server-entry lanes join the ladder at the same seam: both
+    // are control-mapped advisory findings outside the per-class triage.
+    let mut structure = resolve_structure_findings(retrieved, &stream.text, path);
+    structure.extend(server_to_findings(&server));
+    // The G6 config lane: same repo, same specs, per-format retrievers.
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    render_scan_output(
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        Some(&specs),
+        &structure,
+        Some(&lane),
+        None,
+        out,
+        color,
+        start,
+        &stream.degraded,
+        stream.status.clone(),
+        stream.retrievers.clone(),
+        // Total retrieval failure (po-av01j.145) renders as "call-site lane
+        // INCOMPLETE" rather than aborting, so the helper-independent lanes
+        // below still report.
+        stream.total_failure.clone(),
+        stream.generated_skipped,
+    )
+}
+
+/// What `scan` persists for `explain`/`suppress` to resolve finding ids from.
+/// The ladder prints `explain: rvl explain <id>` as a copy-pasteable hint;
+/// without this state the hint silently re-scans the CURRENT directory with
+/// DEFAULT inputs, which is a different scan (po-3t3oj.38: a scan run with
+/// --retrieved/--specs-file printed ids that bare `explain` could never find).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LastScan {
+    /// Canonical root of the scanned repo; `suppress` writes its waiver here
+    /// when no path is given.
+    root: String,
+    findings: Vec<render::Finding>,
+}
+
+/// The last-scan state file: a sibling of the spec-cache dir, so it lives
+/// under the same RVL_CACHE_DIR umbrella and never touches the scanned
+/// repo.
+fn last_scan_path(cache_dir: &std::path::Path) -> PathBuf {
+    cache_dir
+        .parent()
+        .unwrap_or(cache_dir)
+        .join("last-scan.json")
+}
+
+/// Best-effort persist: a scan must never fail because its state file could
+/// not be written, but the degradation is said out loud because it breaks the
+/// verbatim `explain` hint.
+fn save_last_scan(state: &std::path::Path, root: &std::path::Path, findings: &[render::Finding]) {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let ls = LastScan {
+        root: canonical.to_string_lossy().into_owned(),
+        findings: findings.to_vec(),
+    };
+    let write = || -> anyhow::Result<()> {
+        if let Some(dir) = state.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(state, serde_json::to_string(&ls)?)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        eprintln!(
+            "warning: could not save scan state to {} ({e}); `{BIN} explain <id>` \
+             will need the same path/flags this scan used",
+            state.display()
+        );
+    }
+}
+
+/// Missing or unreadable state is simply "no last scan" (first run, cleared
+/// cache, or a corrupt file) -- callers fall back to a live re-scan.
+fn load_last_scan(state: &std::path::Path) -> Option<LastScan> {
+    serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()
+}
+
+/// Sites the specs resolved as BLOCKING BY DESIGN, and the distinct
+/// `<class> (<role>)` labels behind them (po-av01j.180).
+///
+/// These are already inside `resolved` (a not-applicable is a conclusion) and
+/// they produce no finding, because there is no deadline to add to a server's
+/// main loop. Without this they would leave the report in silence, and a class
+/// that vanishes without explanation is indistinguishable from a scanner that
+/// stopped looking — so the count and the identities are printed in COVERAGE.
+///
+/// The reason string is the propagation layer's output CONTRACT. `rvl_spec`
+/// owns both ends of this one — the format in `spec_gate`, the reader in
+/// `by_design_label` — so the two cannot drift apart here.
+fn by_design_coverage(findings: &[rvl_propagate::Finding]) -> (usize, Vec<String>) {
+    let mut count = 0;
+    let mut classes: Vec<String> = Vec::new();
+    for f in findings {
+        let Some(label) = rvl_spec::by_design_label(&f.reason) else {
+            continue;
+        };
+        count += 1;
+        if !classes.iter().any(|c| c == label) {
+            classes.push(label.to_string());
+        }
+    }
+    classes.sort();
+    (count, classes)
+}
+
+/// Render the ladder + optional `--out` JSON for a completed scan. Shared by
+/// the packet-stream path and the incremental path so both report identically.
+#[allow(clippy::too_many_arguments)]
+fn render_scan_output(
+    state_path: &std::path::Path,
+    path: &std::path::Path,
+    findings: &[rvl_propagate::Finding],
+    items: &[rvl_triage::TriagedItem],
+    sites: &[rvl_core::Site],
+    // The specs the propagation ran against. Carried this far because the
+    // ladder's sentence for an unbounded call depends on what the LIBRARY does
+    // with no explicit bound, and only the spec knows that (po-av01j.175).
+    // `None` on the content-only path, where no spec cache is resolved at all.
+    specs: Option<&rvl_spec::SpecCache>,
+    structure: &[render::Finding],
+    config: Option<&config_lane::LaneOutput>,
+    hook_agent: Option<&agent::HookOutput>,
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+    start: std::time::Instant,
+    degraded: &[LangDegradation],
+    // Every language seen and what happened to it (po-av01j.128 / .132).
+    lang_status: Vec<render::LangStatus>,
+    // Which helper file ran per language and how it was found (po-vd7ii).
+    retrievers: Vec<render::RetrieverInfo>,
+    // A whole-pass degradation from the incremental path (po-av01j.139): the
+    // retrieval covered only the reused portion. Threaded into COVERAGE rather
+    // than left on stderr, because when the lane comes back EMPTY the coverage
+    // line is the sentence that decides whether the reader believes there was
+    // nothing to scan or that nothing got scanned.
+    degraded_note: Option<String>,
+    // Machine-generated files dropped before evaluation (po-av01j.133.7).
+    generated_skipped: usize,
+) -> anyhow::Result<ExitCode> {
+    // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
+    // or non-blocking). The rest abstain; bucket them by the lever that closes
+    // each: no spec -> mint, truncated search -> retrieval depth, "depends" ->
+    // per-site judge. Reason strings are the propagation layer's output contract.
+    let resolved = findings.iter().filter(|f| f.verdict.is_resolved()).count();
+    let mut coverage = render::Coverage {
+        resolved,
+        total: sites.len(),
+        generated_skipped,
+        degraded_note,
+        lang_status,
+        retrievers,
+        // A language that never retrieved is NOT an abstaining site: it is
+        // absent from `total` entirely, so it has to be reported separately or
+        // the percentage silently describes a smaller repo than the user has.
+        degraded: degraded
+            .iter()
+            .map(|d| render::DegradedLang {
+                lang: d.lang.to_string(),
+                abstained: d.kind == DegradeKind::Abstained,
+                not_installed: d.kind == DegradeKind::NotInstalled,
+                reason: d.reason.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
+    for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
+        if f.reason.starts_with("no spec") {
+            coverage.abstain_no_spec += 1;
+        } else if f.reason.contains("truncated") {
+            coverage.abstain_bounds += 1;
+        } else if f.reason.contains("depends") || f.reason.contains("per-site") {
+            coverage.abstain_judge += 1;
+        } else {
+            coverage.abstain_other += 1;
+        }
+    }
+    let mut ladder_findings = triage_to_findings(items, specs);
+    // Repo-structure lane findings join the ladder (always Advisory) and the
+    // persisted last-scan state, so explain/suppress resolve their ids too.
+    ladder_findings.extend(structure.iter().cloned());
+    // Config-lane findings join the ladder as ordinary rows BEFORE waivers,
+    // so a `.revelara.yaml` waiver on `<format>.<key>` suppresses them the
+    // same way it suppresses a code class.
+    if let Some(lane) = config {
+        ladder_findings.extend(lane.findings.iter().cloned());
+    }
+    // Hook-mode agent adjudication (po-av01j.15): gate-mode rows join the
+    // ladder BEFORE waivers (so `agent.<type>.<method>` waivers suppress them
+    // like any class) — this list is EMPTY unless the repo committed
+    // `scanner.agent_verdicts: gate`; advisory verdicts live only in the
+    // agent block printed after the ladder. The eval rows (`--out`) below are
+    // built from `findings`, which agent verdicts never touch.
+    if let Some(a) = hook_agent {
+        ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
+
+    // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
+    // used). A waived finding is folded into the Suppressed section: reported in
+    // the footer count, kept out of BLOCKING/ADVISORY. Missing config = no-op.
+    let waivers = waiver::load_waivers(&path.join(".revelara.yaml"));
+    if !waivers.is_empty() {
+        let today = rvl_cache::today_utc();
+        for f in &mut ladder_findings {
+            if waiver::is_waived(&f.class_rule, &f.site, &waivers, &today) {
+                f.suppressed = true;
+            }
+        }
+    }
+
+    // Persist the ladder so the printed `explain:`/`suppress:` hints resolve
+    // verbatim, from any directory, without re-running this scan's inputs.
+    save_last_scan(state_path, path, &ladder_findings);
+
+    // The gate verdict, computed ONCE from the same `classify` the footer
+    // uses, then shared by the printed ladder, the --out document's `exit`
+    // field, and the process exit code, so no pair of them can ever disagree
+    // (po-av01j.94's invariant, extended to the document).
+    let blocked = render::blocking_count(&ladder_findings) > 0;
+
+    // Build the structured scan document (rvl-scan/v1) BEFORE the ladder
+    // render consumes `coverage`. Deterministic-engine truth only; the agent
+    // block rides as an opaque, provenance-tagged string.
+    let doc = out.map(|_| {
+        out_doc::build(
+            &ladder_findings,
+            &coverage,
+            config.map(|lane| &lane.coverage),
+            findings,
+            sites,
+            hook_agent
+                .map(|a| a.block.as_str())
+                .filter(|b| !b.is_empty()),
+            blocked,
+        )
+    });
+
+    let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
+    print!(
+        "{}",
+        render::render_ladder(
+            &ladder_findings,
+            coverage,
+            config.map(|lane| &lane.coverage),
+            &elapsed,
+            stdout_color(color)
+        )
+    );
+    // The agent block renders AFTER the ladder, in its own provenance-tagged
+    // section — agent output never mixes into the deterministic sections.
+    if let Some(a) = hook_agent {
+        if !a.block.is_empty() {
+            print!("\n{}", a.block);
+        }
+    }
+
+    if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
+        std::fs::write(p, serde_json::to_string_pretty(doc)?)?;
+        println!("\nwrote {}", p.display());
+    }
+    // The gate. Both scan paths (packet stream and incremental) funnel through
+    // here, so this is the single place the blocking verdict becomes a process
+    // status — derived from the same `classify` the footer used, never a second
+    // opinion. See EXIT_BLOCKED for the full contract.
+    if blocked {
+        // rvl-cli v1's `--mode eval` (po-av01j.191): the user disarmed this
+        // gate deliberately, and an upgrade must not re-arm it. Reported, not
+        // silent — the ladder above already printed every finding.
+        if compat::never_block() {
+            println!("{}", compat::EVAL_MODE_NOTE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        // Name the AUDITED way through (po-av01j.182). Without this line the
+        // only bypass a blocked committer can find is `--no-verify`, which
+        // skips every hook and leaves no record; the force-through leaves one.
+        println!("{}", force::force_through_hint());
+        return Ok(ExitCode::from(EXIT_BLOCKED));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// --- incremental scan: warm re-scan via the persistent packet index (po-3t3oj.14) ---
+//
+// A warm re-scan hashes the candidate source files, reuses indexed packets for
+// the ones whose content is unchanged, and re-retrieves ONLY the changed files
+// through the language helpers (`--files a,b,c`). Reused + freshly retrieved
+// sites are merged and fed into the same pipeline a full scan uses; the changed
+// files are re-indexed so the next run treats them as unchanged.
+//
+// Two invariants, inherited from rvl-index:
+//   * Reuse and merge key on the full `site_key` (path:line:client_type:method),
+//     never file:line: one location can resolve to several sites with different
+//     verdicts, and a file:line key silently drops one of a colliding pair.
+//   * The retrieval wall budget fails OPEN: when it is exhausted the scan
+//     degrades to the reused portion rather than blocking. `--strict` inverts
+//     that for CI, where a partial answer is worse than a failed job.
+
+/// Default wall-clock cap on the CHANGED-file retrieval, mirroring
+/// `rvl_index::Budget::hook()`. A warm scan sits on a pre-commit hook; it must
+/// never hang a commit, so it degrades to what it has once this elapses.
+const INCREMENTAL_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A real `rvl_index::Retriever`: shells out to the language helpers for a
+/// specific CHANGED-file list. Files are grouped by extension -> language and
+/// each language's helper runs once over just that language's changed files.
+struct HelperRetriever {
+    root: PathBuf,
+    name: String,
+    /// Languages that degraded during an incremental re-retrieve
+    /// (po-av01j.102). Shared rather than owned because the retriever is moved
+    /// into the wall-budget thread, so the caller needs a handle that survives
+    /// the move; `rvl_index::Retriever` also only hands out `&self`. The
+    /// alternative is letting one language's refusal abort the whole delta,
+    /// which is the same bug this bead fixes on the full path.
+    degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>>,
+}
+
+impl HelperRetriever {
+    /// Record a language that contributed nothing. A poisoned lock is ignored
+    /// rather than propagated: losing a COVERAGE line is not worth failing a
+    /// scan that otherwise succeeded, and the poison can only come from a
+    /// panic that is already being reported.
+    fn push_degradation(&self, d: LangDegradation) {
+        if let Ok(mut g) = self.degraded.lock() {
+            g.push(d);
+        }
+    }
+
+    /// Retrieve packets for `changed` (absolute paths), returning the sites and
+    /// the repo-scoped construction facts (carried by whichever helper ran).
+    /// Sites keep the repo-relative `file_path` the helpers emit.
+    fn retrieve_full(
+        &self,
+        changed: &[PathBuf],
+    ) -> anyhow::Result<(Vec<rvl_core::Site>, rvl_core::RepoConfig)> {
+        // Group changed files by language, as repo-relative paths for `--files`.
+        let mut by_lang: std::collections::BTreeMap<Lang, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for p in changed {
+            if let Some(lang) = lang_of_path(p) {
+                by_lang
+                    .entry(lang)
+                    .or_default()
+                    .push(repo_relative(&self.root, p));
+            }
+        }
+        let mut sites = Vec::new();
+        let mut repo_cfg = rvl_core::RepoConfig::default();
+        for (lang, files) in by_lang {
+            let helper = match resolve_helper(lang) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.push_degradation(LangDegradation {
+                        lang,
+                        kind: DegradeKind::Failed,
+                        reason: format!("{e:#}"),
+                    });
+                    continue;
+                }
+            };
+            let stream = match run_helper(&helper, &self.root, &self.name, &files)? {
+                Ok(s) => s,
+                Err((kind, reason)) => {
+                    self.push_degradation(LangDegradation { lang, kind, reason });
+                    continue;
+                }
+            };
+            let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
+            sites.append(&mut got);
+            // The last non-empty construction record wins; helpers emit
+            // whole-repo constructions regardless of `--files`.
+            if !cfg.constructions.is_empty() {
+                repo_cfg = cfg;
+            }
+        }
+        Ok((sites, repo_cfg))
+    }
+}
+
+impl rvl_index::Retriever for HelperRetriever {
+    fn retrieve(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<rvl_core::Site>> {
+        Ok(self.retrieve_full(paths)?.0)
+    }
+}
+
+/// What a budgeted retrieval produced: the fresh sites, the repo config, and a
+/// degradation note when the wall budget was hit or the retriever errored under
+/// fail-open. `degraded` gates re-indexing: files we did not actually retrieve
+/// must NOT be recorded as scanned, or the next run skips them.
+#[derive(Debug)]
+struct RetrieveResult {
+    sites: Vec<rvl_core::Site>,
+    repo_cfg: rvl_core::RepoConfig,
+    degraded_note: Option<String>,
+}
+
+/// The outcome of running a closure under a wall-clock cap.
+enum Budgeted<T> {
+    Done(T),
+    TimedOut,
+    Failed(anyhow::Error),
+}
+
+/// Run `f` on a worker thread and wait at most `cap`. On timeout the worker is
+/// left to finish and exit on its own (the process is short-lived); we never
+/// block past the cap. Sync by design: no async runtime, like the rest of the
+/// binary.
+fn run_with_budget<T, F>(cap: std::time::Duration, f: F) -> Budgeted<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(cap) {
+        Ok(Ok(v)) => Budgeted::Done(v),
+        Ok(Err(e)) => Budgeted::Failed(e),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Budgeted::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Budgeted::Failed(anyhow::anyhow!("retrieval worker exited without a result"))
+        }
+    }
+}
+
+/// Turn a budget outcome into a `RetrieveResult`, applying the fail-open /
+/// `--strict` policy. Pure and thread-free so the policy is unit-testable.
+fn resolve_budgeted(
+    outcome: Budgeted<(Vec<rvl_core::Site>, rvl_core::RepoConfig)>,
+    strict: bool,
+    changed_len: usize,
+    cap: std::time::Duration,
+) -> anyhow::Result<RetrieveResult> {
+    match outcome {
+        Budgeted::Done((sites, repo_cfg)) => Ok(RetrieveResult {
+            sites,
+            repo_cfg,
+            degraded_note: None,
+        }),
+        Budgeted::TimedOut => {
+            if strict {
+                anyhow::bail!(
+                    "wall budget of {:?} exhausted retrieving {changed_len} changed file(s); \
+                     --strict refuses a partial answer",
+                    cap
+                );
+            }
+            Ok(RetrieveResult {
+                sites: Vec::new(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: Some(format!(
+                    "retrieval capped at {cap:?}: {changed_len} changed file(s) not re-scanned; \
+                     results cover the reused portion only"
+                )),
+            })
+        }
+        Budgeted::Failed(e) => {
+            if strict {
+                return Err(e);
+            }
+            Ok(RetrieveResult {
+                sites: Vec::new(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: Some(format!(
+                    "retrieval failed ({e}); results cover the reused portion only"
+                )),
+            })
+        }
+    }
+}
+
+/// Merge reused and freshly-retrieved sites, de-duplicating on the full
+/// `site_key`. Reused and fresh come from disjoint file sets, so this normally
+/// drops nothing; keying on `site_key` (never file:line) guarantees a location
+/// that resolves to two sites with different client types keeps both.
+fn merge_on_site_key(
+    reused: Vec<rvl_core::Site>,
+    fresh: Vec<rvl_core::Site>,
+) -> Vec<rvl_core::Site> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(reused.len() + fresh.len());
+    for s in reused.into_iter().chain(fresh) {
+        if seen.insert(rvl_index::site_key(&s)) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The assembled result of a warm pass.
+struct IncrementalScan {
+    sites: Vec<rvl_core::Site>,
+    repo_cfg: rvl_core::RepoConfig,
+    reused_files: usize,
+    retrieved_files: usize,
+    degraded_note: Option<String>,
+    /// Repo-relative paths this pass RE-PARSED because their content hash
+    /// differed from the index — a retrieval fact, nothing more.
+    ///
+    /// DELIBERATELY NOT THE GATE'S CHANGED SET (po-sg7jb). It used to be, and
+    /// that made `--changed-only` a function of cache state: a cold index has
+    /// nothing to compare against, so every file landed here and the gate
+    /// widened to the whole repository. The changed set now comes from git
+    /// (`changed::resolve`); this field survives only as the advisory fallback
+    /// for a scan that is not in a git work tree and did not ask to be scoped.
+    reparsed_files: Vec<String>,
+    /// Languages whose helper abstained or failed during this pass
+    /// (po-av01j.102). Distinct from `degraded_note`, which is about the wall
+    /// budget: this is about a language contributing nothing at all.
+    lang_degraded: Vec<LangDegradation>,
+    /// The candidate set was EMPTY: this tree holds no file any retriever
+    /// reads (po-av01j.198). Not a degradation and not an error — there was
+    /// nothing to retrieve — but the caller must SAY so, because a gate that
+    /// prints an empty report reads as broken just like one that errors.
+    no_supported_sources: bool,
+}
+
+impl IncrementalScan {
+    /// The warm pass over a tree with no supported source: everything zero,
+    /// nothing degraded, and the flag that makes the emptiness explainable.
+    fn no_source() -> Self {
+        Self {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            reused_files: 0,
+            retrieved_files: 0,
+            degraded_note: None,
+            reparsed_files: Vec::new(),
+            lang_degraded: Vec::new(),
+            no_supported_sources: true,
+        }
+    }
+}
+
+/// Core of the warm path, retriever-agnostic so a fake can drive it in tests:
+/// hash-gate `candidates`, reuse indexed packets for the unchanged, retrieve the
+/// changed via `retrieve`, re-index what came back (unless degraded), and merge.
+fn incremental_sites<F>(
+    index: &rvl_index::PacketIndex,
+    root: &Path,
+    candidates: &[PathBuf],
+    retrieve: F,
+) -> anyhow::Result<IncrementalScan>
+where
+    F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
+{
+    let plan = index.plan_reload(candidates);
+    let reparsed_files: Vec<String> = plan
+        .changed
+        .iter()
+        .map(|f| repo_relative(root, f))
+        .collect();
+
+    // Reuse indexed packets for the unchanged files.
+    let mut reused = Vec::new();
+    for f in &plan.unchanged {
+        let h = rvl_index::hash_file(f)?;
+        if let Some(cached) = index.get(f, &h)? {
+            reused.extend(cached);
+        }
+    }
+    let reused_files = plan.unchanged.len();
+
+    // Retrieve the changed files (skip the helper entirely when nothing changed).
+    let rr = if plan.changed.is_empty() {
+        RetrieveResult {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            degraded_note: None,
+        }
+    } else {
+        retrieve(&plan.changed)?
+    };
+
+    // Re-index the freshly retrieved files so the next pass reuses them. Only
+    // when NOT degraded: recording a file we did not actually retrieve would
+    // make the next run skip it.
+    let degraded = rr.degraded_note.is_some();
+    if !degraded {
+        for f in &plan.changed {
+            let rel = repo_relative(root, f);
+            let for_file: Vec<rvl_core::Site> = rr
+                .sites
+                .iter()
+                .filter(|s| s.file_path == rel)
+                .cloned()
+                .collect();
+            let h = rvl_index::hash_file(f)?;
+            index.put(f, &h, &for_file)?;
+        }
+    }
+    let retrieved_files = if degraded { 0 } else { plan.changed.len() };
+
+    let sites = merge_on_site_key(reused, rr.sites);
+    Ok(IncrementalScan {
+        sites,
+        repo_cfg: rr.repo_cfg,
+        reused_files,
+        retrieved_files,
+        degraded_note: rr.degraded_note,
+        reparsed_files,
+        // Filled in by the caller that owns the retriever handle; this function
+        // is retriever-agnostic so a fake can drive it in tests.
+        lang_degraded: Vec::new(),
+        // This function is only reached with a candidate set in hand; the
+        // no-source case short-circuits in `incremental_scan_pass`.
+        no_supported_sources: false,
+    })
+}
+
+/// Run one warm incremental pass: hash-gate the candidate sources, reuse indexed
+/// packets, and budget-retrieve the changed files. Shared by `scan --incremental`
+/// and `report --incremental` so both assemble sites the same way.
+fn incremental_scan_pass(
+    index_dir: &std::path::Path,
+    path: &std::path::Path,
+    strict: bool,
+) -> anyhow::Result<IncrementalScan> {
+    // PREFLIGHT THE ROOT BEFORE READING THE EMPTY SET AS BENIGN
+    // (po-av01j.198). `walk_source_files` swallows every `read_dir` error by
+    // design — one unreadable subdirectory must not abort a scan — so a typo'd
+    // path, a deleted worktree or a root we lack permission on arrives here as
+    // an empty Vec that is INDISTINGUISHABLE from "this repo has no supported
+    // language". Making the empty set a clean pass without this check would
+    // trade a false alarm for a silent one, which is the failure shape of
+    // po-av01j.182/.194. So: the walk not FINDING anything is benign; the walk
+    // being unable to LOOK is still a hard error.
+    ensure_scannable_root(path)?;
+    let candidates = walk_source_files(path);
+    if candidates.is_empty() {
+        // NO SUPPORTED SOURCE IS NOT AN ERROR (po-av01j.198), the same
+        // principle po-av01j.148 already settled on the full-scan path (see
+        // `resolve_packet_stream` and its `a_repo_with_no_source_still_scans_
+        // its_config` / `an_empty_dir_no_longer_fails_for_having_no_source`
+        // tests). There is no file for any retriever to read, so NO helper is
+        // needed and nothing can fail: docs repos, terraform/YAML repos, shell
+        // repos and any polyglot repo before its first Go/Py/TS/Rust/C file
+        // lands. `hook install` writes `--incremental --changed-only` into
+        // .git/hooks/pre-commit, so bailing here failed EVERY commit in those
+        // repos with a scanner error rather than a finding.
+        //
+        // The index is deliberately NOT opened: it is a retrieval cache, and
+        // with nothing to retrieve or reuse a cache fault is not a fact about
+        // this commit. The caller still runs the content, config and structure
+        // lanes over the live tree, so a secret in a docs repo still blocks.
+        return Ok(IncrementalScan::no_source());
+    }
+
+    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
+    let name = snapshot_name(path);
+    let root = path.to_path_buf();
+
+    // Shared with the retriever so degradations survive its move into the
+    // budget thread.
+    let lang_degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
+    let collector = std::sync::Arc::clone(&lang_degraded);
+    // How many languages this pass ASKED a helper for -- the denominator
+    // `retrieval_verdict` needs, recorded where the question is actually put
+    // (po-av01j.199). Shared for the same reason `lang_degraded` is: the
+    // closure is `FnOnce` and moves.
+    let attempted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let attempted_w = std::sync::Arc::clone(&attempted);
+    let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
+        attempted_w.store(
+            langs_of_paths(changed).len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Budget only the potentially-slow helper retrieval.
+        let retriever = HelperRetriever {
+            degraded: std::sync::Arc::clone(&collector),
+            root: root.clone(),
+            name: name.clone(),
+        };
+        let changed_owned = changed.to_vec();
+        let changed_len = changed_owned.len();
+        let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
+            retriever.retrieve_full(&changed_owned)
+        });
+        resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)
+    })?;
+    if let Ok(mut g) = lang_degraded.lock() {
+        scan.lang_degraded = std::mem::take(&mut g);
+    }
+    apply_retrieval_policy(
+        &mut scan,
+        attempted.load(std::sync::atomic::Ordering::Relaxed),
+        strict,
+    )?;
+    Ok(scan)
+}
+
+/// The distinct languages a set of files would be retrieved as. The
+/// denominator for `retrieval_verdict` on the warm path.
+fn langs_of_paths(files: &[PathBuf]) -> std::collections::BTreeSet<Lang> {
+    files.iter().filter_map(|p| lang_of_path(p)).collect()
+}
+
+/// Apply the SAME retrieval policy the full path applies (po-av01j.199).
+///
+/// THE BUG: the incremental path collected `lang_degraded` and rendered it as
+/// per-language COVERAGE lines, but never ran it through `retrieval_verdict`,
+/// so the one case that function calls fatal at any strictness -- every
+/// attempted language degraded, i.e. nothing was scanned at all -- arrived at
+/// the footer indistinguishable from a clean scan. Reproduced by hand: a repo
+/// whose only language is Python, an unbounded `requests.get` staged, no
+/// `python3` on PATH, and the gate `hook install` writes printed
+/// "0 advisory - commit clean", exit 0. With `python3` present the identical
+/// commit was blocked. This is the third instance in this gate path (after
+/// .182 and .194) of "nothing was scanned" and "nothing was wrong" rendering
+/// alike, and the loudest: the other two failed commits that should have
+/// passed, which gets noticed in seconds; this one passes commits that should
+/// have blocked, which is never noticed at all.
+///
+/// The DENOMINATOR is the delta, not the repository. A language whose files
+/// did not change was not retrieved and did not fail -- its packets came out
+/// of the index keyed by the files' CURRENT content hash, which is a real
+/// scan, not a gap. Counting repo-wide languages here would report a Go+Python
+/// repo as fully degraded whenever a Python-only commit hit a missing
+/// `python3`, and calling a scan incomplete that was in fact complete is the
+/// false alarm that teaches people to ignore the word.
+///
+/// The note is APPENDED rather than assigned: `resolve_budgeted` may already
+/// have recorded a wall-budget degradation, and the two are independent facts
+/// about the same pass.
+fn apply_retrieval_policy(
+    scan: &mut IncrementalScan,
+    attempted: usize,
+    strict: bool,
+) -> anyhow::Result<()> {
+    // `?` is the fail-CLOSED half and is load-bearing: `--strict` promises CI
+    // a whole answer or none, and it was being bypassed here along with
+    // everything else.
+    let Some(note) = retrieval_verdict(attempted, &scan.lang_degraded, strict)? else {
+        return Ok(());
+    };
+    scan.degraded_note = Some(match scan.degraded_note.take() {
+        Some(prev) => format!("{prev}; {note}"),
+        None => note,
+    });
+    Ok(())
+}
+
+/// The argv a detached reindex child re-runs: everything except `--detach`
+/// itself, or the respawn would fork forever.
+fn strip_detach_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    args.into_iter().filter(|a| a != "--detach").collect()
+}
+
+/// Where a detached reindex child writes its output. One well-known path, so
+/// "the background warm did nothing" is always answerable.
+fn detached_log_path(cache_dir: &std::path::Path) -> PathBuf {
+    cache_dir.join("reindex.log")
+}
+
+/// How long a background warm waits for a busy index. Generous on purpose:
+/// it runs behind a commit with nobody watching, so waiting out a concurrent
+/// scan costs nothing while giving up loses the entire reindex.
+const INDEX_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `index init` / `index reindex`, both packet-stream and live modes.
+///
+/// Live mode (no --retrieved) is the background warm a post-commit hook
+/// triggers: hash-gate the sources, re-retrieve ONLY the changed files
+/// through the language helpers, store the fresh packets. Deliberately NOT
+/// under the incremental wall budget — the budget protects the commit path,
+/// and this runs behind it (with --detach, literally in the background).
+fn run_index_build(
+    cfg: &Config,
+    path: Option<PathBuf>,
+    retrieved: Option<PathBuf>,
+    files: Option<String>,
+    detach: bool,
+) -> anyhow::Result<ExitCode> {
+    if detach {
+        // Respawn ourselves without --detach and (on unix) in a new process
+        // group, so the hook's shell never waits and a terminal signal to the
+        // commit never kills the warm.
+        //
+        // The child's output goes to a log file, never to /dev/null. Nobody
+        // is watching a detached warm, so discarding its stderr means a
+        // failed reindex looks exactly like a successful one: the parent has
+        // already printed "detached ..." and exited 0 (po-l3jo5).
+        let log_path = detached_log_path(&cfg.cache_dir);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening detached reindex log at {}", log_path.display()))?;
+        let log_err = log.try_clone()?;
+        let exe = std::env::current_exe()?;
+        let args = strip_detach_args(std::env::args().skip(1));
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        println!(
+            "detached (pid {}): reindex continues in the background, logging to {}",
+            child.id(),
+            log_path.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The warm waits a long time for a busy index. It is a background batch
+    // job; losing the whole reindex because a status check held the lock for
+    // a few milliseconds is the bug this timeout exists to prevent.
+    let idx = rvl_index::PacketIndex::open_with_timeout(
+        &cfg.index_dir.join("packets.redb"),
+        INDEX_WARM_TIMEOUT,
+    )?;
+
+    if let Some(retrieved) = retrieved {
+        let stream = std::fs::read_to_string(&retrieved)?;
+        let (sites, _, skipped) = rvl_core::parse_stream(&stream);
+        // Group by originating file so each entry is keyed by that
+        // file's current content hash.
+        let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
+            std::collections::BTreeMap::new();
+        for s in sites {
+            by_file.entry(s.file_path.clone()).or_default().push(s);
+        }
+        let (mut indexed, mut missing) = (0usize, 0usize);
+        for (file, packets) in by_file {
+            let path = PathBuf::from(&file);
+            match rvl_index::hash_file(&path) {
+                Ok(h) => {
+                    idx.put(&path, &h, &packets)?;
+                    indexed += 1;
+                }
+                // The stream can name files this checkout does not
+                // have (foreign corpus); count them, never fail.
+                Err(_) => missing += 1,
+            }
+        }
+        println!("indexed {indexed} file(s) | unreadable {missing} | unparseable lines {skipped}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Live mode: run the helpers ourselves over the changed files.
+    let root = path
+        .unwrap_or_else(|| PathBuf::from("."))
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve repository root: {e}"))?;
+    let candidates: Vec<PathBuf> = match files {
+        Some(list) => list
+            .split(',')
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| root.join(f.trim()))
+            .collect(),
+        None => walk_source_files(&root),
+    };
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no supported source files under {}; nothing to index",
+        root.display()
+    );
+
+    let name = snapshot_name(&root);
+    let retriever = HelperRetriever {
+        degraded: Default::default(),
+        root: root.clone(),
+        name,
+    };
+    let scan = incremental_sites(&idx, &root, &candidates, |changed| {
+        let (sites, repo_cfg) = retriever.retrieve_full(changed)?;
+        Ok(RetrieveResult {
+            sites,
+            repo_cfg,
+            degraded_note: None,
+        })
+    })?;
+    println!(
+        "reindexed: reused {} unchanged, retrieved {} changed",
+        scan.reused_files, scan.retrieved_files
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Which git question `--changed-only` asks, once the base-ref chain is folded
+/// in (po-av01j.194).
+///
+/// THE THREE OUTCOMES, and why each is what it is:
+///
+/// * A HOOK NAMES THE QUESTION. `--hook pre-commit` reads the index and
+///   `--hook pre-push` reads the pushed range; neither is a base-ref question,
+///   so the chain cannot change what they ask. It reaches pre-push only as the
+///   fallback for a branch with no upstream — the slot rvl-cli's `defaultBase`
+///   occupies — so `--base` is honoured there instead of being a flag that
+///   silently does nothing.
+/// * A CONFIGURED BASE REF THAT RESOLVES gives `base...HEAD`. This is the
+///   whole point: in a CI pull-request checkout the tree is CLEAN and HEAD is
+///   the PR head, so the working-tree question below returns an empty set and
+///   the gate exits 0 having read nothing.
+/// * A CONFIGURED BASE REF THAT DOES NOT RESOLVE is a REFUSAL, not a fallback.
+///   Falling back to the working tree here would reproduce the defect exactly:
+///   the caller asked for base-relative scope, we could not compute it, and a
+///   clean tree would report "no findings, exit 0" for a check that never ran.
+///   rvl-cli refuses the same way (`FormatNoBaseRefDiagnostic`).
+///
+/// With NOTHING configured anywhere the working-tree question stands, which is
+/// the honest answer at a keyboard and the one v2 has always given. That is a
+/// deliberate divergence from rvl-cli, which refuses: rvl-cli's
+/// `--changed-only` had no working-tree meaning to preserve. It does not
+/// reopen the hole, because the environment this bead is about always
+/// populates the chain — `GITHUB_BASE_REF` is exported by every
+/// `pull_request` event and `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` by every
+/// GitLab MR pipeline.
+fn changed_mode(
+    path: &std::path::Path,
+    hook: Option<&str>,
+    changed_only: bool,
+    base_chain: &base_ref::Chain,
+) -> anyhow::Result<changed::Mode> {
+    match changed::Mode::from_hook(hook) {
+        // Resolved LAZILY, per mode: pre-commit never asks the chain a
+        // question, and it sits on a hook where every extra `git rev-parse` is
+        // wall-clock the author pays on each commit.
+        changed::Mode::PreCommit => Ok(changed::Mode::PreCommit),
+        changed::Mode::PrePush { .. } => Ok(changed::Mode::PrePush {
+            fallback_base: base_ref::resolve(path, base_chain).ok().map(|r| r.git_ref),
+        }),
+        // No hook: the base-relative question when there is a base ref.
+        _ => match base_ref::resolve(path, base_chain) {
+            Ok(r) => Ok(changed::Mode::BaseRange {
+                base: r.git_ref,
+                source: r.source.label().to_string(),
+            }),
+            // Configured and unreachable: refuse, loudly, and only when the
+            // caller actually asked to be scoped. An unscoped `--incremental`
+            // run never claimed a scope, so a shallow clone must not start
+            // failing it.
+            Err(base_ref::Unresolved::NoBaseRef(misses))
+                if changed_only && base_chain.is_configured() =>
+            {
+                anyhow::bail!("{}", base_ref::diagnostic(&misses))
+            }
+            // Nothing configured, or not a git repo at all — the latter gets
+            // the changed-set resolver's own, more specific refusal.
+            Err(_) => Ok(changed::Mode::WorkingTree),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan_incremental(
+    store: &CacheStore,
+    keyset: &Keyset,
+    index_dir: &std::path::Path,
+    state_path: &std::path::Path,
+    path: &std::path::Path,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    color: Option<&str>,
+    strict: bool,
+    changed_only: bool,
+    hook: Option<&str>,
+    base_chain: &base_ref::Chain,
+) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
+
+    // THE CHANGED SET IS A GIT QUESTION (po-sg7jb). Resolved BEFORE the scan
+    // so an unanswerable one costs nothing, and never from the packet index:
+    // that index is a RETRIEVAL cache, and deriving "what changed" from it
+    // made a cold cache mean "everything changed" -- the whole repo's
+    // pre-existing findings gating the first commit after hook install.
+    let mode = changed_mode(path, hook, changed_only, base_chain)?;
+    let resolved = changed::resolve(path, mode);
+    if changed_only {
+        if let Err(e) = &resolved {
+            // REFUSE, do not widen. Falling back to a full-repo gate here
+            // would recreate the exact defect this fix removes, and a gate
+            // that lies about its scope is worse than no gate
+            // (cf. the --changed-only/--incremental guard in `run`).
+            anyhow::bail!(
+                "--changed-only: could not determine the changed set from git ({e:#}).\n  \
+                 Refusing rather than gating on the whole repository: --changed-only exists \
+                 so a commit is never failed over findings its author did not introduce.\n  \
+                 Re-run without --changed-only for a full advisory scan."
+            );
+        }
+    }
+
+    let scan = incremental_scan_pass(index_dir, path, strict)?;
+
+    // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
+    // empty report looks as broken as one that errors, so the no-source case
+    // gets the same treatment the full-scan path gives it: a stated reason on
+    // stderr and a COVERAGE roll-call built from the languages we DID see and
+    // do not support. Without this the reader cannot tell "there was nothing to
+    // scan" from "nothing got scanned" -- the distinction render_scan_output's
+    // own degraded_note comment calls out.
+    let lang_status: Vec<render::LangStatus> = if scan.no_supported_sources {
+        eprintln!(
+            "incremental: no supported source files under {} -- no retriever was needed; \
+             the content, config and structure lanes still ran over the tree",
+            path.display()
+        );
+        detect_unsupported(path)
+            .into_iter()
+            .map(|(name, count)| render::LangStatus {
+                lang: name,
+                state: render::LangState::Unsupported,
+                detail: format!("{count} files"),
+            })
+            .collect()
+    } else {
+        // The incremental path reuses an index rather than running every
+        // helper, so it has no roll-call to report.
+        Vec::new()
+    };
+    // One-line reuse summary to stderr; the ladder itself goes to stdout.
+    // "re-parsed" is the honest word: it counts what the INDEX had to reload,
+    // which is independent of what the change touched.
+    eprintln!(
+        "incremental: reused {} files from index, re-parsed {} stale",
+        scan.reused_files, scan.retrieved_files
+    );
+    if let Some(note) = &scan.degraded_note {
+        eprintln!("incremental: degraded (fail-open): {note}");
+    }
+
+    // The delta the gate and the agent lane are scoped to. Git when we have
+    // it; the index's re-parse list only as an advisory fallback outside a git
+    // work tree, which `changed_only` has already refused above.
+    let changed_files = match &resolved {
+        Ok(cs) => {
+            eprintln!("changed set: {} file(s) from {}", cs.files.len(), cs.source);
+            if !cs.dirty.is_empty() {
+                // KNOWN GAP, STATED OUT LOUD: the changed PATHS come from the
+                // git index, but the retrievers read working-tree bytes, so a
+                // partially staged file is judged in its working-tree form.
+                eprintln!(
+                    "note: {} staged file(s) also have unstaged edits ({}); \
+                     rvl reads working-tree content, so those hunks are \
+                     included in the judgment even though they are not being \
+                     committed",
+                    cs.dirty.len(),
+                    cs.dirty.join(", ")
+                );
+            }
+            cs.files.clone()
+        }
+        Err(e) => {
+            eprintln!(
+                "note: changed set unavailable from git ({e:#}); \
+                 falling back to the index's re-parse list for advisory scoping only"
+            );
+            scan.reparsed_files.clone()
+        }
+    };
+
+    // SCOPE TO THE CHANGE, at the SITE level and before triage
+    // (po-av01j.127). Filtering the rendered ladder instead would leave
+    // class site_counts describing the whole repo and, worse, leave the exit
+    // code derived from unscoped findings -- the printed verdict and the
+    // process status diverging is exactly po-av01j.94.
+    let delta = changed_set(&changed_files);
+    let scan_sites = if changed_only {
+        scan.sites
+            .into_iter()
+            .filter(|s| site_is_changed(&s.file_path, &delta))
+            .collect()
+    } else {
+        scan.sites
+    };
+    let (findings, mut items, sites, specs, server) = findings_from_sites(
+        store,
+        keyset,
+        scan_sites,
+        &scan.repo_cfg,
+        0,
+        specs_file,
+        judgments,
+        Some(path),
+        true,
+    )?;
+    // The content lane is cheap (one regex pass over the tree) and its rules
+    // change with the binary, not the sources, so it runs FULL on every warm
+    // scan rather than riding the packet index.
+    // The content lane walks the live tree, so it needs the same scoping or a
+    // secret in an untouched file reappears on every commit.
+    let mut content = content_items(path);
+    if changed_only {
+        content.retain(|t| {
+            t.example_sites
+                .iter()
+                .any(|s| site_is_changed(s.rsplit_once(':').map_or(s.as_str(), |(f, _)| f), &delta))
+        });
+    }
+    items.extend(content);
+    // Incremental scans own the live tree, so the structure lane inventories
+    // it directly (one bounded walk; there is no packet stream to ride). The
+    // server-entry lane rode the packet index like every other site.
+    //
+    // Structure findings are REPO-level ("no test files for python"), so they
+    // are not attributable to a change at all. Under --changed-only they are
+    // dropped rather than shown: telling someone their one-line docs edit
+    // failed because the repo has no JS tests is the disproportionality this
+    // flag exists to remove.
+    let mut structure = if changed_only {
+        Vec::new()
+    } else {
+        resolve_structure_findings(None, "", path)
+    };
+    structure.extend(server_to_findings(&server));
+    // Config files are not content-hash indexed (parsing them is cheap): the
+    // lane simply re-runs on every warm scan, so it can never be stale.
+    let mut lane = config_lane::run(path, &specs, &snapshot_name(path));
+    if changed_only {
+        // po-av01j.140: SCOPE THE GATE, NOT THE REPORT. A config finding is
+        // usually a repo-wide FACT ("18 of 18 workflows declare permissions"),
+        // and the config lane's whole value is that it sees every file rather
+        // than a sample -- dropping the untouched ones would hide a
+        // misconfiguration until someone happened to edit the file carrying it.
+        // But failing a commit over a workflow the author never opened is the
+        // disproportionality --changed-only exists to remove. So they stay
+        // VISIBLE and become unable to block.
+        for f in &mut lane.findings {
+            let file = f.site.split_whitespace().next().unwrap_or("");
+            let file = file.rsplit_once(':').map_or(file, |(p, _)| p);
+            if !site_is_changed(file, &delta) {
+                f.gate_exempt = true;
+            }
+        }
+    }
+    // Hook-mode agent adjudication (po-av01j.15): runs AFTER the deterministic
+    // pipeline is fully assembled, under its own consent + budget, over the
+    // delta-scoped undecided sites only. Every failure path fails open; the
+    // deterministic result above is never at risk.
+    let hook_agent = hook.and_then(|h| {
+        agent::run_hook_adjudication(
+            h,
+            path,
+            &changed_files,
+            &findings,
+            &sites,
+            &agent::telemetry_path_from_state(state_path),
+            env!("CARGO_PKG_VERSION"),
+            stdout_color(color),
+        )
+    });
+    render_scan_output(
+        state_path,
+        path,
+        &findings,
+        &items,
+        &sites,
+        Some(&specs),
+        &structure,
+        Some(&lane),
+        hook_agent.as_ref(),
+        out,
+        color,
+        start,
+        &scan.lang_degraded,
+        lang_status,
+        Vec::new(),
+        scan.degraded_note.clone(),
+        // The incremental path reuses indexed packets, which were already
+        // filtered when they were first retrieved.
+        0,
+    )
+}
+
+/// Resolve a finding id the way the ladder's hint promises: from the LAST
+/// SCAN's persisted state. Only when no dev override flags are given -- an
+/// explicit --retrieved/--specs-file/--judgments asks for a live re-scan of
+/// exactly those inputs, and gets one.
+fn finding_from_last_scan(
+    state_path: &std::path::Path,
+    id: &str,
+    overridden: bool,
+) -> Option<(render::Finding, String)> {
+    if overridden {
+        return None;
+    }
+    let ls = load_last_scan(state_path)?;
+    let f = ls.findings.iter().find(|f| f.id == id)?.clone();
+    Some((f, ls.root))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_explain(
+    store: &CacheStore,
+    keyset: &Keyset,
+    state_path: &std::path::Path,
+    id: &str,
+    path: &std::path::Path,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+    color: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let overridden = retrieved.is_some() || specs_file.is_some() || judgments.is_some();
+    // The id came from a ladder; the last scan's state is where it resolves.
+    if let Some((f, root)) = finding_from_last_scan(state_path, id, overridden) {
+        eprintln!("finding {id} from the last scan (of {root})");
+        let incidents: Vec<(String, bool, String)> = Vec::new();
+        print!(
+            "{}",
+            render::render_explain(&f, &incidents, stdout_color(color))
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    // `explain` is lenient on purpose: it exists to resolve one finding id, so
+    // a degraded language must not stop it printing the finding the user asked
+    // about. Strictness belongs to `scan`, which is what gates.
+    let stream = resolve_packet_stream(retrieved, path, false)?;
+    let (_findings, mut items, _sites, specs, server) = resolve_findings(
+        store,
+        keyset,
+        &stream.text,
+        specs_file,
+        judgments,
+        Some(path),
+        false,
+    )?;
+    // Mirror the scan's content lane so a `secret.*` finding id resolves in
+    // the live fallback too (skipped for --retrieved, same as scan).
+    if retrieved.is_none() {
+        items.extend(content_items(path));
+    }
+    let mut ladder_findings = triage_to_findings(&items, Some(&specs));
+    ladder_findings.extend(resolve_structure_findings(retrieved, &stream.text, path));
+    ladder_findings.extend(server_to_findings(&server));
+    // Config-lane ids resolve here too: the fresh scan mirrors what the
+    // ladder printed, config rows included.
+    ladder_findings.extend(config_lane::run(path, &specs, &snapshot_name(path)).findings);
+    let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
+        eprintln!(
+            "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
+             ids come from `{BIN} scan` -- re-run it and use an id it prints",
+            path.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+    // Named incident citations arrive from the corpus/judgment layer, which is
+    // not yet wired; until then explain shows the structural evidence it has.
+    let incidents: Vec<(String, bool, String)> = Vec::new();
+    print!(
+        "{}",
+        render::render_explain(f, &incidents, stdout_color(color))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_suppress(
+    store: &CacheStore,
+    keyset: &Keyset,
+    state_path: &std::path::Path,
+    id: &str,
+    path: Option<&std::path::Path>,
+    reason: Option<&str>,
+    expires: Option<&str>,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    judgments: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    let overridden = retrieved.is_some() || specs_file.is_some() || judgments.is_some();
+    let cwd = PathBuf::from(".");
+    // Resolve the id from the last scan first (the hint's contract), falling
+    // back to the live resolve -> triage pipeline explain uses. The waiver file
+    // goes to an explicitly given path, else the recorded scan root, else cwd.
+    let (found, target): (render::Finding, PathBuf) =
+        match finding_from_last_scan(state_path, id, overridden) {
+            Some((f, root)) => {
+                let target = path.map(Path::to_path_buf).unwrap_or(PathBuf::from(root));
+                (f, target)
+            }
+            None => {
+                let scan_path = path.unwrap_or(&cwd);
+                let stream = resolve_packet_stream(retrieved, scan_path, false)?;
+                let (_findings, mut items, _sites, specs, server) = resolve_findings(
+                    store,
+                    keyset,
+                    &stream.text,
+                    specs_file,
+                    judgments,
+                    Some(scan_path),
+                    false,
+                )?;
+                // Same content-lane mirror as explain's live fallback.
+                if retrieved.is_none() {
+                    items.extend(content_items(scan_path));
+                }
+                let mut ladder_findings = triage_to_findings(&items, Some(&specs));
+                ladder_findings.extend(resolve_structure_findings(
+                    retrieved,
+                    &stream.text,
+                    scan_path,
+                ));
+                ladder_findings.extend(server_to_findings(&server));
+                ladder_findings.extend(
+                    config_lane::run(scan_path, &specs, &snapshot_name(scan_path)).findings,
+                );
+                let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
+                    eprintln!(
+                        "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
+                         ids come from `{BIN} scan` -- re-run it and use an id it prints",
+                        scan_path.display()
+                    );
+                    return Ok(ExitCode::FAILURE);
+                };
+                (f.clone(), scan_path.to_path_buf())
+            }
+        };
+    let f = &found;
+
+    let w = waiver::Waiver {
+        rule: f.class_rule.clone(),
+        paths: vec![],
+        expires: expires.unwrap_or("").trim().to_string(),
+        reason: reason.unwrap_or("").trim().to_string(),
+    };
+    let file = target.join(".revelara.yaml");
+    waiver::append_waiver(&file, &w)?;
+
+    println!("waived rule `{}` (finding {})", f.class_rule, f.id);
+    if !w.expires.is_empty() {
+        println!("expires {}", w.expires);
+    }
+    println!("wrote {}", file.display());
+    println!("this waiver is a local file; commit .revelara.yaml so your team shares it via git");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The shape-only privacy report. Runs the SAME resolve->scan pipeline `scan`
+/// uses to get findings + sites, then reduces to shape-only surfaces. Prints the
+/// human-readable audit view by default, the exact JSON payload with `--json`,
+/// and writes the JSON with `--out`. NEVER transmits: this shows/writes exactly
+/// what a future upload would carry, nothing more.
+#[allow(clippy::too_many_arguments)]
+fn run_report(
+    store: &CacheStore,
+    keyset: &Keyset,
+    index_dir: &std::path::Path,
+    path: &std::path::Path,
+    retrieved: Option<&std::path::Path>,
+    specs_file: Option<&std::path::Path>,
+    incremental: bool,
+    json: bool,
+    out: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    // Reporting is local-only today: this command shows/writes the payload; it
+    // does not transmit it.
+    eprintln!(
+        "note: reporting is local-only; this shows exactly what a scan WOULD send \
+         to the spec factory (shape + language + counts only), it does not \
+         transmit anything"
+    );
+
+    // Same resolve->scan pipeline scan uses, via the shared building blocks.
+    let (findings, sites) = if incremental && retrieved.is_none() {
+        // report is read-only and never blocks a workflow: fail-open (strict=false).
+        let scan = incremental_scan_pass(index_dir, path, false)?;
+        eprintln!(
+            "incremental: reused {} files from index, retrieved {} changed",
+            scan.reused_files, scan.retrieved_files
+        );
+        if let Some(note) = &scan.degraded_note {
+            eprintln!("incremental: degraded (fail-open): {note}");
+        }
+        // Server-entry sites were partitioned out of `sites` inside the
+        // pipeline: they are control-level spec questions, never candidates
+        // for the shape-only API-surface report.
+        let (findings, _items, sites, _specs, _server) = findings_from_sites(
+            store,
+            keyset,
+            scan.sites,
+            &scan.repo_cfg,
+            0,
+            specs_file,
+            None,
+            Some(path),
+            false,
+        )?;
+        (findings, sites)
+    } else {
+        let stream = resolve_packet_stream(retrieved, path, false)?;
+        let (findings, _items, sites, _specs, _server) = resolve_findings(
+            store,
+            keyset,
+            &stream.text,
+            specs_file,
+            None,
+            Some(path),
+            false,
+        )?;
+        (findings, sites)
+    };
+
+    let report = report::build_report(&sites, &findings, env!("CARGO_PKG_VERSION"));
+    let payload = serde_json::to_string_pretty(&report)?;
+
+    if let Some(p) = out {
+        std::fs::write(p, &payload)
+            .with_context(|| format!("writing report JSON to {}", p.display()))?;
+        eprintln!("wrote report payload to {}", p.display());
+    }
+
+    if json {
+        // The exact payload the wire would carry: shape + counts, nothing else.
+        println!("{payload}");
+    } else {
+        print!("{}", render_report_human(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The human-readable report: an explicit header stating precisely what would
+/// leave and that it carries no source/paths, the
+/// `site_count  lang  client_type.method` table, and a total-surface footer.
+/// This visibility IS the privacy feature, so the table shows EVERY field the
+/// payload carries — a column missing here would make the header a lie.
+fn render_report_human(report: &report::Report) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str(
+        "This is EXACTLY what a scan would send to the Revelara spec factory.\n\
+         It contains ONLY API shape (client_type.method), the language that shape \
+         was written in, and a per-surface count.\n\
+         No source code, no file paths, no line numbers, nothing repo-identifying \
+         ever leaves this machine.\n\n",
+    );
+
+    if report.surfaces.is_empty() {
+        s.push_str("No unknown API surfaces: nothing would be reported.\n");
+        return s;
+    }
+
+    // Width each column to its widest cell for a clean table.
+    const NO_LANG: &str = "-";
+    let w = report
+        .surfaces
+        .iter()
+        .map(|r| r.site_count.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max("sites".len());
+    let lw = report
+        .surfaces
+        .iter()
+        .map(|r| r.lang.len().max(NO_LANG.len()))
+        .max()
+        .unwrap_or(NO_LANG.len())
+        .max("lang".len());
+    let _ = writeln!(
+        s,
+        "  {:>w$}  {:<lw$}  surface",
+        "sites",
+        "lang",
+        w = w,
+        lw = lw
+    );
+    let _ = writeln!(
+        s,
+        "  {:>w$}  {:<lw$}  -------",
+        "-".repeat(w),
+        "-".repeat(lw),
+        w = w,
+        lw = lw
+    );
+    let mut any_unstated = false;
+    for r in &report.surfaces {
+        let lang = if r.lang.is_empty() {
+            any_unstated = true;
+            NO_LANG
+        } else {
+            &r.lang
+        };
+        let _ = writeln!(
+            s,
+            "  {:>w$}  {:<lw$}  {}.{}",
+            r.site_count,
+            lang,
+            r.client_type,
+            r.method,
+            w = w,
+            lw = lw
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n{} unknown API surface(s) would be reported.",
+        report.surfaces.len()
+    );
+    if any_unstated {
+        let _ = writeln!(
+            s,
+            "\"{NO_LANG}\" in the lang column: no language is claimed — either the \
+             scanner did not resolve one,\nor the shape was seen in more than one \
+             language and naming either would be wrong."
+        );
+    }
+    s
+}
+
+// --- skills distribution: install workflow skills/lenses into harnesses (po-av01j.14) ---
+
+/// Is `binary` a file on PATH? Used only to decide between running the
+/// Claude Code registration commands and printing them for manual use.
+fn binary_on_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|d| d.join(binary).is_file())
+}
+
+/// Print a registration's commands in copy-pasteable form.
+fn print_registration_commands(reg: &rvl_skills::harness::Registration) {
+    for argv in &reg.commands {
+        println!("  {} {}", reg.binary, argv.join(" "));
+    }
+}
+
+/// Run the harness registration commands (e.g. `claude plugin marketplace
+/// add`). The first command is cleanup and may fail harmlessly; any later
+/// failure falls back to printing the remaining commands for manual use.
+/// Returns whether the WHOLE sequence completed, which is what gates the
+/// post-registration hook (Claude Code's stale-cache prune must not run
+/// against a registry that was never updated).
+fn run_registration(reg: &rvl_skills::harness::Registration) -> bool {
+    for (i, argv) in reg.commands.iter().enumerate() {
+        let result = std::process::Command::new(reg.binary).args(argv).output();
+        let ok = match &result {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+        if ok || i == 0 {
+            continue; // cleanup (i == 0) is best-effort: nothing to remove is fine
+        }
+        let detail = match result {
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        eprintln!(
+            "registration step '{} {}' failed: {detail}",
+            reg.binary,
+            argv.join(" ")
+        );
+        eprintln!("finish registration manually:");
+        for argv in &reg.commands[i..] {
+            eprintln!("  {} {}", reg.binary, argv.join(" "));
+        }
+        return false;
+    }
+    println!("registered with {}", reg.binary);
+    true
+}
+
+/// Print one install's outcome and handle its registration step.
+fn render_install_report(home: &Path, report: &rvl_skills::flow::InstallReport, no_register: bool) {
+    let source = if report.from_cache {
+        " (from cache)"
+    } else {
+        ""
+    };
+    println!(
+        "installed {} skills {}{source}: {} file(s) at {}",
+        report.harness,
+        report.version,
+        report.receipt.files_written,
+        report.receipt.location.display()
+    );
+    for w in &report.warnings {
+        eprintln!("  warning: {w}");
+    }
+    for n in &report.notes {
+        println!("  {n}");
+    }
+    if let Some(reg) = &report.receipt.register {
+        let registered = if no_register {
+            println!("skipping registration (--no-register); to register manually:");
+            print_registration_commands(reg);
+            false
+        } else if binary_on_path(reg.binary) {
+            run_registration(reg)
+        } else {
+            println!(
+                "'{}' not found on PATH; to register once it is:",
+                reg.binary
+            );
+            print_registration_commands(reg);
+            false
+        };
+        // Only after the harness's own registry actually moved: the prune
+        // reads that registry to learn which version is live.
+        if registered {
+            if let Some(h) = rvl_skills::harness::by_name(&report.harness) {
+                match h.post_register(home) {
+                    Ok(Some(note)) => println!("  {note}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("  warning: {e}"),
+                }
+            }
+        }
+    }
+    if !report.receipt.note.is_empty() {
+        println!("  {}", report.receipt.note);
+    }
+}
+
+/// Install or update the named harness, or every relevant one when omitted
+/// (install: detected harnesses; update: previously installed harnesses —
+/// including v1 rvl-cli-recorded installs, which the update ADOPTS by
+/// performing a normal v2 install — falling back to detection). Mirrors
+/// `rvl plugin install/update`.
+/// Map a `run_skills_install` failure count to the command exit code.
+fn skills_exit(failed: usize) -> ExitCode {
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Name the harnesses that left evidence on the machine and were still
+/// passed over. A detection sweep that says nothing turns a wrong verdict
+/// into an invisible one — the failure mode of po-av01j.193, where a
+/// PATH-only harness produced "installed nothing" with no error.
+fn print_near_misses(env: &rvl_skills::harness::DetectEnv) {
+    for line in rvl_skills::harness::near_misses(env) {
+        println!("  skipped {line}");
+    }
+}
+
+/// Returns `(installed, failed)` counts so callers (the `skills`/`plugin`
+/// arms, and `init`'s delegated plugin step) can distinguish "everything
+/// installed", "some harness failed", and "nothing to do".
+fn run_skills_install(
+    env: &rvl_skills::flow::Env,
+    harness: Option<String>,
+    no_register: bool,
+    update: bool,
+) -> anyhow::Result<(Vec<String>, usize)> {
+    let supported = || rvl_skills::harness::supported_names().join(", ");
+    let targets: Vec<String> = match harness {
+        Some(name) => {
+            anyhow::ensure!(
+                rvl_skills::harness::by_name(&name).is_some(),
+                "unsupported harness: {name} (supported: {})",
+                supported()
+            );
+            vec![name]
+        }
+        None => {
+            let mut names: Vec<String> = if update {
+                env.store.read_installed().keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            if update {
+                // Adopt v1 rvl-cli installs: an update targets them too, and
+                // the resulting v2 install records them in rvl's store so
+                // every later operation uses v2 records. A record rvl cannot
+                // adopt is NAMED rather than dropped — silently discarding it
+                // is how an upgraded user's install becomes unmanageable
+                // without ever being told (po-av01j.162).
+                for p in rvl_skills::v1::read_v1_installs(env.home) {
+                    if rvl_skills::harness::by_name(&p.editor).is_none() {
+                        eprintln!(
+                            "note: rvl-cli recorded an install for {} at {}, which this \
+                             version does not support; it is left untouched and still \
+                             listed by '{BIN} plugin list'",
+                            p.editor, p.location
+                        );
+                        continue;
+                    }
+                    if !names.contains(&p.editor) {
+                        println!("adopting {} (installed by rvl-cli)", p.editor);
+                        names.push(p.editor);
+                    }
+                }
+            }
+            if names.is_empty() {
+                // Detection only runs when there is nothing recorded to
+                // update; report it so a wrong detection is distinguishable
+                // from a right one (po-av01j.193).
+                let detect_env = rvl_skills::harness::DetectEnv::new(env.home);
+                names = rvl_skills::harness::detect_installed(&detect_env);
+                if names.is_empty() {
+                    println!(
+                        "No supported coding-agent harness detected (supported: {}).",
+                        supported()
+                    );
+                    print_near_misses(&detect_env);
+                    println!("Install one, or name it explicitly: {BIN} skills install <harness>");
+                    return Ok((Vec::new(), 0));
+                }
+                println!(
+                    "Detected {} coding-agent harness(es): {}",
+                    names.len(),
+                    names.join(", ")
+                );
+                print_near_misses(&detect_env);
+                println!();
+            }
+            names
+        }
+    };
+
+    let mut installed: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    for name in &targets {
+        // by_name is total over `targets` by construction; skip defensively.
+        let Some(h) = rvl_skills::harness::by_name(name) else {
+            continue;
+        };
+        match rvl_skills::flow::install_one(env, h.as_ref()) {
+            Ok(report) => {
+                render_install_report(env.home, &report, no_register);
+                installed.push(name.clone());
+            }
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok((installed, failed))
+}
+
+/// Render the drift report, mirroring `rvl plugin list`'s UX.
+fn render_skills_status(report: &rvl_skills::flow::StatusReport) {
+    match (&report.served_version, &report.server_note) {
+        (Some(v), _) => println!("Served plugin version: {v}"),
+        (None, Some(note)) => println!("Served plugin version: unknown ({note})"),
+        (None, None) => println!("Served plugin version: unknown"),
+    }
+
+    if report.harnesses.is_empty() {
+        // v1-only installs still count as installed: the section below
+        // renders them instead of a misleading "nothing installed".
+        if report.v1_installs.is_empty() {
+            println!("\nNo skills installed. Run '{BIN} skills install'.");
+        }
+    } else {
+        println!("\nInstalled:");
+        let mut drift = false;
+        for h in &report.harnesses {
+            let state = match &h.update_available {
+                Some(v) => {
+                    drift = true;
+                    format!("update available: {v}")
+                }
+                None if report.served_version.is_some() => "up to date".to_string(),
+                None => "server version unknown".to_string(),
+            };
+            println!(
+                "  {:<10} {:<10} ({state})  {}",
+                h.harness, h.installed_version, h.location
+            );
+        }
+        if drift {
+            println!("\nRun '{BIN} skills update' to upgrade.");
+        }
+    }
+
+    if !report.v1_installs.is_empty() {
+        println!("\nInstalled by rvl-cli (v1 records):");
+        for p in &report.v1_installs {
+            println!("  {:<10} {:<10} {}", p.harness, p.version, p.location);
+        }
+        println!("Run '{BIN} plugin update' to adopt these into {BIN}.");
+    }
+
+    if !report.cached.is_empty() {
+        println!("\nCached:");
+        for c in &report.cached {
+            println!(
+                "  {:<10} {:<10} (fetched {})",
+                c.editor, c.version, c.fetched_at
+            );
+        }
+    }
+}
+
+/// The "Plugins:" section `status` prints (po-av01j.185 item 1), from the
+/// same drift report `skills status` renders.
+///
+/// Deliberately rvl-cli's `status` shape, not `skills status`'s: one
+/// `<harness>: v<version> (state)` line per install, the "run install"
+/// hint when there are none, and the per-harness upgrade command when a
+/// newer version is served. rvl-cli's `status` reads only its own
+/// `plugins.json`; this also lists the v1 records the v2 store has not
+/// adopted yet, so a mid-cutover user sees every install they have.
+fn render_status_plugins(report: &rvl_skills::flow::StatusReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\nPlugins:\n");
+    if report.harnesses.is_empty() && report.v1_installs.is_empty() {
+        out.push_str("  No plugins installed\n");
+        let _ = writeln!(out, "  Run '{BIN} plugin install <agent>' to install");
+        let available: Vec<&str> = rvl_skills::harness::registry()
+            .iter()
+            .map(|h| h.editor_param())
+            .collect();
+        let _ = writeln!(out, "  Available: {}", available.join(", "));
+        return out;
+    }
+    for h in &report.harnesses {
+        match &h.update_available {
+            Some(v) => {
+                let _ = writeln!(
+                    out,
+                    "  {}: v{} (update available: v{v})",
+                    h.harness, h.installed_version
+                );
+                let _ = writeln!(
+                    out,
+                    "    Run '{BIN} plugin update {}' to upgrade",
+                    h.harness
+                );
+            }
+            None if report.served_version.is_some() => {
+                let _ = writeln!(
+                    out,
+                    "  {}: v{} (up to date)",
+                    h.harness, h.installed_version
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  {}: v{}", h.harness, h.installed_version);
+            }
+        }
+    }
+    for p in &report.v1_installs {
+        let _ = writeln!(
+            out,
+            "  {}: v{} (installed by rvl-cli)",
+            p.harness, p.version
+        );
+        let _ = writeln!(out, "    Run '{BIN} plugin update {}' to adopt", p.harness);
+    }
+    out
+}
+
+/// Everything the `skills` and `plugin` surfaces need, resolved once: home,
+/// the skills cache store, the HTTP fetcher, and the policy env switches.
+/// Uses the same base URL/org key resolution as `sync` (rvl env >
+/// rvl-cli env > shared config file) and the spec cache's offline kill
+/// switch.
+struct SkillsCtx {
+    home: PathBuf,
+    store: rvl_skills::store::SkillsStore,
+    fetcher: rvl_skills::fetch::HttpFetcher,
+    offline: bool,
+    has_key: bool,
+    allow_unsigned: bool,
+    allow_missing_checksum: bool,
+}
+
+impl SkillsCtx {
+    fn resolve(cfg: &Config) -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate harness directories"))?;
+        let skills_cache_dir = std::env::var_os("RVL_SKILLS_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".revelara").join("cache").join("skills"));
+        let store = rvl_skills::store::SkillsStore::open(&skills_cache_dir)?;
+        let fetcher = rvl_skills::fetch::HttpFetcher {
+            base_url: cfg.base_url.clone(),
+            org_key: cfg.org_key.clone(),
+        };
+        Ok(Self {
+            home,
+            store,
+            fetcher,
+            offline: cfg.offline,
+            has_key: !cfg.org_key.is_empty(),
+            allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED_PLUGIN").ok().as_deref() == Some("1"),
+            allow_missing_checksum: std::env::var("RVL_ALLOW_MISSING_CHECKSUM").ok().as_deref()
+                == Some("1"),
+        })
+    }
+
+    fn env(&self) -> rvl_skills::flow::Env<'_> {
+        rvl_skills::flow::Env {
+            store: &self.store,
+            fetcher: &self.fetcher,
+            home: &self.home,
+            offline: self.offline,
+            allow_unsigned: self.allow_unsigned,
+            allow_missing_checksum: self.allow_missing_checksum,
+        }
+    }
+
+    fn require_key(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.offline || self.has_key,
+            "no API key found: set RVL_API_KEY, or add \
+             `api_key` to ~/.revelara/config.yaml (or set RVL_OFFLINE=1 \
+             to install from the local cache)"
+        );
+        Ok(())
+    }
+}
+
+/// `rvl skills`: resolve env/config once, then dispatch.
+fn run_skills(cfg: &Config, cmd: SkillsCmd) -> anyhow::Result<ExitCode> {
+    let ctx = SkillsCtx::resolve(cfg)?;
+    let env = ctx.env();
+    match cmd {
+        SkillsCmd::Install {
+            harness,
+            no_register,
+        } => {
+            ctx.require_key()?;
+            let (_, failed) = run_skills_install(&env, harness, no_register, false)?;
+            Ok(skills_exit(failed))
+        }
+        SkillsCmd::Update {
+            harness,
+            no_register,
+        } => {
+            ctx.require_key()?;
+            let (_, failed) = run_skills_install(&env, harness, no_register, true)?;
+            Ok(skills_exit(failed))
+        }
+        SkillsCmd::Status => {
+            render_skills_status(&rvl_skills::flow::status(&env));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `rvl plugin`: the rvl-cli parity command surface over the same
+/// machinery. Install/update delegate to [`run_skills_install`]; list
+/// renders the same drift report `skills status` uses; remove, editors, and
+/// agents call the corresponding machinery capabilities.
+fn run_plugin(cfg: &Config, cmd: PluginCmd) -> anyhow::Result<ExitCode> {
+    let ctx = SkillsCtx::resolve(cfg)?;
+    let env = ctx.env();
+    match cmd {
+        PluginCmd::Install {
+            harness,
+            no_register,
+            project,
+            all,
+            no_context_files,
+        } => {
+            let harness = resolve_all_alias(harness, all)?;
+            ctx.require_key()?;
+            if project {
+                let root = detect_project_root()?;
+                let installed = run_plugin_install_project(&env, harness, &root)?;
+                write_context_files(&root, &installed.0, no_context_files);
+                return Ok(skills_exit(installed.1));
+            }
+            let (installed, failed) = run_skills_install(&env, harness, no_register, false)?;
+            write_context_files(Path::new("."), &installed, no_context_files);
+            Ok(skills_exit(failed))
+        }
+        PluginCmd::Update {
+            harness,
+            no_register,
+            all,
+            no_context_files,
+        } => {
+            let harness = resolve_all_alias(harness, all)?;
+            ctx.require_key()?;
+            let (installed, failed) = run_skills_install(&env, harness, no_register, true)?;
+            write_context_files(Path::new("."), &installed, no_context_files);
+            Ok(skills_exit(failed))
+        }
+        PluginCmd::List => {
+            render_skills_status(&rvl_skills::flow::status(&env));
+            render_project_installs();
+            Ok(ExitCode::SUCCESS)
+        }
+        PluginCmd::Remove {
+            harness,
+            yes,
+            project,
+        } => run_plugin_remove(&env, &harness, yes, project),
+        PluginCmd::Editors => {
+            run_plugin_editors(&env);
+            Ok(ExitCode::SUCCESS)
+        }
+        PluginCmd::Agents {
+            editor,
+            json,
+            format,
+        } => run_plugin_agents(&env, &editor, json, format.as_deref()),
+    }
+}
+
+/// The repository a `--project` install/remove targets: the git root when
+/// there is one, else the current directory (rvl-cli `detectProjectRoot`).
+fn detect_project_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !root.is_empty() {
+                return Ok(PathBuf::from(root));
+            }
+        }
+    }
+    Ok(cwd)
+}
+
+/// `plugin install --project`: write the skills into THIS repository so they
+/// can be committed. With no harness named, every detected harness that has
+/// a project-local layout gets one (the rest are reported as skipped, never
+/// silently dropped). Returns the installed harness names and failure count.
+fn run_plugin_install_project(
+    env: &rvl_skills::flow::Env,
+    harness: Option<String>,
+    project_root: &Path,
+) -> anyhow::Result<(Vec<String>, usize)> {
+    let targets: Vec<String> = match harness {
+        Some(name) => {
+            anyhow::ensure!(
+                rvl_skills::harness::by_name(&name).is_some(),
+                "unsupported harness: {name} (supported: {})",
+                rvl_skills::harness::supported_names().join(", ")
+            );
+            vec![name]
+        }
+        None => {
+            let detect_env = rvl_skills::harness::DetectEnv::new(env.home);
+            let detected = rvl_skills::harness::detect_installed(&detect_env);
+            if detected.is_empty() {
+                println!(
+                    "No supported coding-agent harness detected (supported: {}).",
+                    rvl_skills::harness::supported_names().join(", ")
+                );
+                print_near_misses(&detect_env);
+                return Ok((Vec::new(), 0));
+            }
+            println!(
+                "Detected {} coding-agent harness(es): {}",
+                detected.len(),
+                detected.join(", ")
+            );
+            print_near_misses(&detect_env);
+            println!();
+            detected
+        }
+    };
+
+    let mut installed: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    for name in &targets {
+        let Some(h) = rvl_skills::harness::by_name(name) else {
+            continue;
+        };
+        if h.local_dir().is_none() {
+            // Named explicitly, this is an error the caller must see; in a
+            // detected sweep it is just not applicable.
+            if targets.len() == 1 {
+                anyhow::bail!(
+                    "--project is not supported for {name}: its install is user-level, \
+                     not project-local. Run '{BIN} plugin install {name}' without --project."
+                );
+            }
+            println!("skipping {name} (no project-local layout)");
+            continue;
+        }
+        match rvl_skills::flow::install_one_project(env, h.as_ref(), project_root) {
+            Ok(report) => {
+                render_install_report(env.home, &report, true);
+                installed.push(name.clone());
+            }
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok((installed, failed))
+}
+
+/// Resolve rvl-cli's `--all` spelling (po-av01j.188). This binary already
+/// means "every harness" by OMITTING the name, so `--all` is that default
+/// under rvl-cli's name. Combining it with a harness name is contradictory
+/// and is refused rather than silently resolved one way.
+fn resolve_all_alias(harness: Option<String>, all: bool) -> anyhow::Result<Option<String>> {
+    if all {
+        if let Some(name) = harness {
+            anyhow::bail!(
+                "--all installs into every harness, so it cannot be combined with \
+                 '{name}'. Drop one: '{BIN} plugin install' (all) or \
+                 '{BIN} plugin install {name}' (just that one)."
+            );
+        }
+        return Ok(None);
+    }
+    Ok(harness)
+}
+
+/// The post-install context-file step, mirroring rvl-cli's split: AGENTS.md
+/// is written for EVERY harness (rvl-cli `installContextFiles`, called
+/// centrally by `InstallPluginWithOptions`), and CLAUDE.md additionally when
+/// the Claude harness was one of them (rvl-cli's Claude custom installer).
+///
+/// `git_root` detection and the "not a git repo" notice live in
+/// [`context_files::install_context_files`]; CLAUDE.md piggybacks on the same
+/// detection so the two files can never disagree about which repo they're in.
+fn write_context_files(start_dir: &Path, installed: &[String], skip: bool) {
+    if skip {
+        println!("Skipping AGENTS.md/CLAUDE.md context files (--no-context-files)");
+        return;
+    }
+    context_files::install_context_files(start_dir, false, &mut std::io::stdout());
+    if !installed.iter().any(|h| h == "claude") {
+        return;
+    }
+    let Ok(git_root) = hook::git_toplevel(start_dir) else {
+        return;
+    };
+    match context_files::ensure_claude_md(&git_root, true) {
+        Err(e) => eprintln!("Warning: could not set up CLAUDE.md: {e}"),
+        Ok(context_files::Action::Skipped) => {}
+        Ok(action) => println!("✓ CLAUDE.md: {}", action.as_str()),
+    }
+}
+
+/// The "Project-local installations" section of `plugin list`: the skills a
+/// repository carries itself, which live outside the install store because
+/// the repo IS the record.
+fn render_project_installs() {
+    let Ok(root) = detect_project_root() else {
+        return;
+    };
+    let installs = rvl_skills::flow::project_installs(&root);
+    if installs.is_empty() {
+        return;
+    }
+    println!("\nProject-local installations ({}):", root.display());
+    for p in installs {
+        // Several harnesses share `.agents/skills`; one line per directory
+        // names them all instead of repeating the same path seven times.
+        println!("  {}  ({})", p.dir.display(), p.harnesses.join(", "));
+    }
+}
+
+/// One-line y/N confirmation on stdin (mirrors `rvl plugin remove`).
+fn confirm(prompt: &str) -> bool {
+    use std::io::Write as _;
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `plugin remove <harness>`: confirm, remove via the machinery, then run
+/// any unregistration commands best-effort.
+fn run_plugin_remove(
+    env: &rvl_skills::flow::Env,
+    harness: &str,
+    yes: bool,
+    project: bool,
+) -> anyhow::Result<ExitCode> {
+    let Some(h) = rvl_skills::harness::by_name(harness) else {
+        anyhow::bail!(
+            "unsupported harness: {harness} (supported: {})",
+            rvl_skills::harness::supported_names().join(", ")
+        );
+    };
+    let scope = if project { "project-local" } else { "global" };
+    // Resolve the project directory BEFORE prompting, so a harness that
+    // cannot be removed project-locally says so instead of asking first.
+    let project_root = if project {
+        let root = detect_project_root()?;
+        rvl_skills::flow::project_dir(h.as_ref(), &root)?;
+        Some(root)
+    } else {
+        None
+    };
+    if !yes && !confirm(&format!("Remove {scope} Revelara skills for {harness}?")) {
+        println!("Cancelled.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let report = match &project_root {
+        Some(root) => rvl_skills::flow::remove_one_project(env, h.as_ref(), root)?,
+        None => rvl_skills::flow::remove_one(env, h.as_ref())?,
+    };
+    match report.receipt.files_removed {
+        Some(n) => println!(
+            "removed {harness}: {n} file(s) under {}",
+            report.receipt.location.display()
+        ),
+        None => println!("removed {harness}: {}", report.receipt.location.display()),
+    }
+    if let Some(reg) = report.receipt.register.as_ref().filter(|_| !project) {
+        if binary_on_path(reg.binary) {
+            run_removal_registration(reg);
+        } else {
+            println!(
+                "'{}' not found on PATH; to unregister once it is:",
+                reg.binary
+            );
+            print_registration_commands(reg);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run post-removal unregistration commands. ALL steps are best-effort: a
+/// plugin that was never registered must not fail its removal.
+fn run_removal_registration(reg: &rvl_skills::harness::Registration) {
+    for argv in &reg.commands {
+        let ok = std::process::Command::new(reg.binary)
+            .args(argv)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "note: '{} {}' failed (already unregistered?)",
+                reg.binary,
+                argv.join(" ")
+            );
+        }
+    }
+}
+
+/// `plugin editors`: the server-side editor list, degrading to the built-in
+/// harness registry when the Revelara API is unreachable or offline.
+fn run_plugin_editors(env: &rvl_skills::flow::Env) {
+    match rvl_skills::flow::editors(env) {
+        Ok(editors) => {
+            println!("Supported editors (served by the Revelara API):");
+            for e in editors {
+                println!("  {:<14} {} (tier {})", e.name, e.display_name, e.tier);
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: {err}; showing the built-in harness list");
+            println!("Supported harnesses (built-in):");
+            for h in rvl_skills::harness::registry() {
+                println!("  {:<14} {}", h.name(), h.display_name());
+            }
+        }
+    }
+    println!("\nInstall:  {BIN} plugin install <name>");
+}
+
+/// `plugin agents`: list installed lenses from disk (never the network).
+/// The `--json` OUTPUT CONTRACT — {"agents":[{"id":"...","description":
+/// "..."}]} — is what the scan skill parses as the source of truth for
+/// available lenses, so on any resolution error JSON mode still emits the
+/// empty contract shape (warning on stderr) and exits 0; the parser must
+/// never see non-JSON on stdout.
+fn run_plugin_agents(
+    env: &rvl_skills::flow::Env,
+    editor: &str,
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let as_json = match format {
+        Some("json") => true,
+        // --json stays honored alongside an explicit table format,
+        // mirroring rvl-cli's alias semantics.
+        Some("table") | Some("text") | Some("") | None => json,
+        Some(other) => anyhow::bail!("invalid --format {other:?} (valid: table, json)"),
+    };
+    // rvl's own record wins; a v1 rvl-cli record is the fallback so an
+    // upgraded user's lens listing keeps working on day one.
+    let agents = rvl_skills::agents::installed_agents_dir(env.store, env.home, editor)
+        .and_then(|(dir, source)| Ok((rvl_skills::agents::list_agents(&dir)?, source)));
+    match agents {
+        Ok((agents, source)) => {
+            if as_json {
+                // The contract is IDENTICAL regardless of which record
+                // resolved the directory.
+                println!(
+                    "{}",
+                    serde_json::to_string(&rvl_skills::agents::AgentsOutput { agents })?
+                );
+            } else {
+                if source == rvl_skills::agents::RecordSource::V1 {
+                    eprintln!(
+                        "note: {editor} skills were installed by rvl-cli; run \
+                         '{BIN} plugin update {editor}' to adopt them into {BIN}"
+                    );
+                }
+                for a in agents {
+                    if a.description.is_empty() {
+                        println!("{}", a.id);
+                    } else {
+                        println!("{}\t{}", a.id, a.description);
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) if as_json => {
+            println!(
+                "{}",
+                serde_json::to_string(&rvl_skills::agents::AgentsOutput { agents: Vec::new() })?
+            );
+            eprintln!("warning: {e}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// The positional SUBCOMMAND of `scan` that arms the one-shot force-through
+/// marker (po-av01j.182). It occupies the same slot as the scan path, which is
+/// why it must be recognized before anything treats that slot as a directory.
+const FORCE_NEXT: &str = "force-next";
+
+/// Everything that must be decided before the spec cache is opened, for a
+/// deterministic scan (po-av01j.182). Returns `Some(exit)` when the scan must
+/// not run.
+///
+/// 1. The target must exist and be a directory. Before this, `rvl scan
+///    <path-that-does-not-exist>` walked an empty tree, found nothing, and
+///    printed "0 advisory - commit clean" with exit 0 — a gate that reports
+///    success for an input it never read. That is the root enabler behind
+///    `scan force-next` silently passing, and it would have come back under
+///    some other name. The message and the exit code are rvl-cli's, from the
+///    equivalent check on its own gate entrypoint (`scan --agent`, which exits
+///    `ExitUsage` for a target that does not stat as a directory).
+///
+/// 2. An armed force-through skips the scan ENTIRELY and exits 0, after
+///    announcing itself, writing the audit record, and consuming the marker.
+///    Skipping outright is the point: the bypass exists for shipping a lesser
+///    risk to fix a greater one, so it must not pay the scan's wall clock.
+fn scan_preflight(path: Option<&Path>, retrieved: Option<&Path>) -> Option<ExitCode> {
+    let target = path.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    // `--retrieved` is a prebuilt packet stream; the path is documented as
+    // ignored in that mode, so it is not validated here either.
+    if retrieved.is_none() {
+        let abs = std::path::absolute(&target).unwrap_or_else(|_| target.clone());
+        if !abs.is_dir() {
+            eprintln!("Error: target is not a directory: {}", abs.display());
+            return Some(ExitCode::from(2));
+        }
+    }
+    let root = force::git_toplevel(&target).unwrap_or(target);
+    let mechanism = force::force_state(&root)?;
+    force::handle_force_through(&root, mechanism);
+    Some(ExitCode::SUCCESS)
+}
+
+/// Does this `scan` invocation select SUBMISSION mode?
+///
+/// The single definition of the rule, so the dispatch guard and the
+/// stray-flag check below cannot drift apart: the day one grows a sixth
+/// selector and the other does not, a flag becomes silently ignored again,
+/// which is exactly the bug po-av01j.168 exists to close.
+fn selects_submission(
+    stdin: bool,
+    file: Option<&Path>,
+    scan_dir: Option<&Path>,
+    service: Option<&str>,
+    dry_run: bool,
+) -> bool {
+    stdin || file.is_some() || scan_dir.is_some() || service.is_some() || dry_run
+}
+
+/// The flags that select submission mode, as prose for the usage error. A
+/// reader who typed `--team` needs the RULE, not just the refusal.
+const SUBMISSION_SELECTORS: &str = "--stdin, --file, --scan-dir, --service, or --dry-run";
+
+/// Submission-only flags the caller EXPLICITLY typed on a deterministic scan
+/// (po-av01j.168).
+///
+/// Before this, `rvl scan --team=backend-team` ran an ordinary local scan and
+/// dropped the team on the floor: no error, no warning, nothing submitted. A
+/// silent no-op is the worst failure shape available here, because the user
+/// believes the flag took effect — and `--format=json` made it worse than
+/// cosmetic, since a script asking for JSON silently received the human
+/// ladder.
+///
+/// Every flag below is `Option`/`bool` with NO clap default, so `Some(_)` /
+/// `true` proves the user typed it. Nothing here can be tripped by a default
+/// value, which is the property that lets this be a hard error rather than a
+/// warning.
+/// The submission-only flags as clap parsed them, borrowed from the
+/// `Cmd::Scan` arm. A struct rather than eight positional parameters so a
+/// new flag cannot silently take the wrong slot at a call site.
+#[derive(Default)]
+struct SubmissionFlags<'a> {
+    team: Option<&'a str>,
+    target: Option<&'a Path>,
+    cleanup_on_success: bool,
+    timeout: Option<&'a str>,
+    format: Option<&'a str>,
+    ci: bool,
+    review: bool,
+    cs_file: Option<&'a Path>,
+}
+
+fn stray_submission_flags(f: &SubmissionFlags) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if f.team.is_some() {
+        out.push("--team");
+    }
+    if f.target.is_some() {
+        out.push("--target");
+    }
+    if f.cleanup_on_success {
+        out.push("--cleanup-on-success");
+    }
+    if f.timeout.is_some() {
+        out.push("--timeout");
+    }
+    if f.format.is_some() {
+        out.push("--format");
+    }
+    // `--ci` is `--format json` under another name, so it is stray for the
+    // same reason `--format` is, and is named by the flag the user typed.
+    // `--auto-infer` is NOT here: it selects the mode submission already
+    // uses, so nothing is dropped by ignoring it anywhere.
+    if f.ci {
+        out.push("--ci");
+    }
+    // `--review` and `--cs-file` DO drop something on a local scan: the
+    // requested `scan_mode` and an entire control structure. Same rule as
+    // `--ci`, opposite of `--auto-infer`.
+    if f.review {
+        out.push("--review");
+    }
+    if f.cs_file.is_some() {
+        out.push("--cs-file");
+    }
+    out
+}
+
+/// The usage error for [`stray_submission_flags`]: names every offending flag
+/// and what it requires, then shows the invocation that would honor it.
+fn stray_submission_flag_error(flags: &[&str]) -> String {
+    let (subject, verb) = if flags.len() == 1 {
+        (format!("{} is a submission-mode flag", flags[0]), "has")
+    } else {
+        (
+            format!("{} are submission-mode flags", flags.join(", ")),
+            "have",
+        )
+    };
+    format!(
+        "{subject} and {verb} no effect on a deterministic scan, so it would have been \
+         silently dropped. Submission mode is selected by {SUBMISSION_SELECTORS} — e.g. \
+         `{BIN} scan --service <name> --scan-dir <dir>{example}`. For a local scan, drop \
+         the flag.",
+        BIN = rvl_data::BIN,
+        example = flags
+            .iter()
+            .map(|f| format!(
+                " {f}{}",
+                // Boolean flags take no value; showing "<value>" after one
+                // hands the reader a command that fails differently.
+                if matches!(*f, "--cleanup-on-success" | "--ci" | "--review") {
+                    ""
+                } else {
+                    " <value>"
+                }
+            ))
+            .collect::<String>(),
+    )
+}
+
+fn run() -> anyhow::Result<ExitCode> {
+    // EMPTY FLAG VALUES (po-av01j.192): argv is handed to clap UNTOUCHED.
+    // po-av01j.185 stripped `--x=` tokens here so they would read as absent,
+    // but argv only knows a token's shape: the strip also swallowed the
+    // usage errors a numeric flag owes on `--limit=`, the exit-2 a MISSPELLED
+    // flag owes whatever its spelling, and the empty values that rvl-cli
+    // deliberately puts on the wire (`risk resolve --reason=`). Empty means
+    // whatever the CONSUMER says it means, exactly as in rvl-cli — see
+    // `empty_flag::SEMANTICS` for the per-flag audit, and
+    // `empty_flag::normalize` for this binary's own commands.
+    let mut cli = Cli::parse_from(std::env::args());
+    if let Some(cmd) = cli.cmd.as_mut() {
+        empty_flag::normalize(cmd);
+    }
+    let Some(cmd) = cli.cmd else {
+        // Bootstrap behavior preserved: bare invocation prints help, exits 0.
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        return Ok(ExitCode::SUCCESS);
+    };
+    // rvl-cli data-command port (po-av01j.17): these manage their own
+    // config/exit-code contract inside rvl-data (rvl-cli parity) and never
+    // touch the spec cache, so they dispatch before the store opens.
+    let cmd = match cmd {
+        // `scan force-next` is a positional SUBCOMMAND, not a path
+        // (po-av01j.182). Intercepted first, exactly as rvl-cli intercepts it
+        // before flag parsing: otherwise it parses as a directory to scan and
+        // the documented emergency bypass reports "commit clean", exit 0,
+        // having bypassed nothing.
+        Cmd::Scan {
+            ref path,
+            ref target,
+            ..
+        } if path.as_deref().map(Path::as_os_str) == Some(FORCE_NEXT.as_ref()) => {
+            return Ok(force::run_force_next(target.as_deref()));
+        }
+        // Scan SUBMISSION mode (po-av01j.153): `--scan-dir`/`--file`/
+        // `--stdin` (or a lone `--service`, which rvl-cli answers with its
+        // "must specify an input" error) routes to the ported rvl-cli
+        // submit surface. Dispatches before the store opens: submission
+        // needs API credentials, never the spec cache.
+        Cmd::Scan {
+            service,
+            team,
+            target,
+            stdin,
+            file,
+            scan_dir,
+            cleanup_on_success,
+            dry_run,
+            timeout,
+            format,
+            ci,
+            auto_infer,
+            review,
+            cs_file,
+            ..
+        } if selects_submission(
+            stdin,
+            file.as_deref(),
+            scan_dir.as_deref(),
+            service.as_deref(),
+            dry_run,
+        ) =>
+        {
+            // rvl-cli `--ci` == this binary's `--format json` (both land on
+            // `scan_mode: "ci"`). An explicit `--format` is never overridden.
+            let format = match (format, ci) {
+                (None, true) => Some("json".to_string()),
+                (f, _) => f,
+            };
+            return Ok(rvl_data::scan_submit::run(
+                rvl_data::scan_submit::SubmitArgs {
+                    service,
+                    team,
+                    target,
+                    stdin,
+                    file,
+                    scan_dir,
+                    cleanup_on_success,
+                    dry_run,
+                    timeout,
+                    format,
+                    // rvl-cli resolves `--ci > --auto-infer > --review`.
+                    // `--ci` is folded into `--format json` above;
+                    // `--auto-infer` selects the default mode, so it wins
+                    // over `--review` by cancelling it here rather than by
+                    // an extra branch in the mode match.
+                    review: review && !auto_infer,
+                    cs_file,
+                },
+                env!("CARGO_PKG_VERSION"),
+            ));
+        }
+        // Deterministic scan carrying a SUBMISSION-ONLY flag (po-av01j.168).
+        // Reaching this arm means the guard above already decided this is not
+        // a submission, so every flag `stray_submission_flags` finds is one
+        // the rest of this command would ignore. Refusing costs the user one
+        // corrected command; accepting costs them a scan they believe was
+        // submitted, or a script that asked for JSON and parsed a ladder.
+        //
+        // Placed BEFORE the store opens on purpose: a mistyped flag is a
+        // usage error whether or not this machine has a verifiable spec
+        // cache, and it must not be masked by exit 1 from the cache load.
+        Cmd::Scan {
+            ref team,
+            ref target,
+            cleanup_on_success,
+            ref timeout,
+            ref format,
+            ci,
+            review,
+            ref cs_file,
+            ..
+        } if !stray_submission_flags(&SubmissionFlags {
+            team: team.as_deref(),
+            target: target.as_deref(),
+            cleanup_on_success,
+            timeout: timeout.as_deref(),
+            format: format.as_deref(),
+            ci,
+            review,
+            cs_file: cs_file.as_deref(),
+        })
+        .is_empty() =>
+        {
+            let stray = stray_submission_flags(&SubmissionFlags {
+                team: team.as_deref(),
+                target: target.as_deref(),
+                cleanup_on_success,
+                timeout: timeout.as_deref(),
+                format: format.as_deref(),
+                ci,
+                review,
+                cs_file: cs_file.as_deref(),
+            });
+            let f = rvl_data::Failure::usage(stray_submission_flag_error(&stray));
+            eprintln!("error: {}", f.msg);
+            return Ok(ExitCode::from(f.code));
+        }
+        // Onboarding surface (po-av01j.163): init needs the skills machinery
+        // for its plugin step but never the spec cache; hook is pure file
+        // operations on .git/hooks. Both dispatch before the store opens.
+        Cmd::Init {
+            project,
+            skip_plugin,
+            force,
+            yes,
+            no_context_files,
+        } => {
+            let cfg = Config::from_env();
+            return Ok(init::run(
+                init::InitArgs {
+                    project,
+                    skip_plugin,
+                    force,
+                    yes,
+                    no_context_files,
+                },
+                || {
+                    let ctx = SkillsCtx::resolve(&cfg)?;
+                    ctx.require_key()?;
+                    let (installed, _failed) = run_skills_install(&ctx.env(), None, false, false)?;
+                    // rvl-cli marks the plugin installed when ANY editor
+                    // ended up with skills; per-harness failures were
+                    // already reported by the machinery.
+                    Ok(!installed.is_empty())
+                },
+            ));
+        }
+        Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
+        // Same bytes clap's `--version` prints, so the two spellings can
+        // never drift apart.
+        Cmd::Version => {
+            println!("{BIN} {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
+        // Environment diagnosis (po-av01j.169). Dispatches before the store
+        // opens because a MISSING spec cache is one of the things it reports:
+        // opening the store here would turn that report into exit 1 from the
+        // cache loader, which is the failure the command exists to explain.
+        Cmd::Doctor { path, fix, format } => {
+            return Ok(doctor::run(doctor::DoctorArgs { path, fix, format }))
+        }
+        Cmd::Login => return Ok(rvl_data::auth::run_login()),
+        Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
+        // The plugin section is a closure so it runs only AFTER the
+        // credential check passes: it makes its own server call, and
+        // rvl-cli does not reach out for it on a failed connection either.
+        Cmd::Status => {
+            let cfg = Config::from_env();
+            return Ok(rvl_data::auth::run_status(
+                env!("CARGO_PKG_VERSION"),
+                || {
+                    let ctx = SkillsCtx::resolve(&cfg).ok()?;
+                    Some(render_status_plugins(&rvl_skills::flow::status(&ctx.env())))
+                },
+            ));
+        }
+        Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
+        Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
+        Cmd::Compliance { cmd } => return Ok(rvl_data::compliance::run(cmd)),
+        Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
+        Cmd::Incident { cmd } => return Ok(rvl_data::incident::run(cmd)),
+        Cmd::Evidence { cmd } => return Ok(rvl_data::evidence::run(cmd)),
+        Cmd::Feedback { args } => {
+            return Ok(rvl_data::feedback::run(
+                args,
+                "feedback",
+                env!("CARGO_PKG_VERSION"),
+            ))
+        }
+        Cmd::Bugreport { args } => {
+            return Ok(rvl_data::feedback::run(
+                args,
+                "bug",
+                env!("CARGO_PKG_VERSION"),
+            ))
+        }
+        Cmd::Config { cmd } => return Ok(rvl_data::config::run(cmd)),
+        Cmd::Stpa { cmd } => return Ok(rvl_data::stpa::run(cmd)),
+        Cmd::Completion { shell } => {
+            use clap::CommandFactory as _;
+            let mut command = Cli::command();
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut command,
+                "rvl",
+                &mut std::io::stdout(),
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        other => other,
+    };
+    // Deterministic-scan pre-flight (po-av01j.182), BEFORE the store opens, for
+    // the same reason the stray-flag arm above is: neither answer depends on
+    // this machine having a verifiable spec cache, and neither may be masked by
+    // exit 1 from the cache load. A force-through in particular must survive a
+    // broken cache — it is the emergency path.
+    if let Cmd::Scan {
+        path, retrieved, ..
+    } = &cmd
+    {
+        if let Some(code) = scan_preflight(path.as_deref(), retrieved.as_deref()) {
+            return Ok(code);
+        }
+    }
+    let cfg = Config::from_env();
+    let store = CacheStore::open(&cfg.cache_dir)?;
+    let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
+    let state_path = last_scan_path(&cfg.cache_dir);
+    match cmd {
+        Cmd::Scan {
+            path,
+            retrieved,
+            specs_file,
+            judgments,
+            out,
+            color,
+            incremental,
+            strict,
+            changed_only,
+            base,
+            agent,
+            staged,
+            pre_push,
+            mode,
+            hook,
+            ..
+        } => {
+            let path = path.unwrap_or_else(|| PathBuf::from("."));
+            // The base-ref chain (po-av01j.194), resolved once and used twice:
+            // to pick the changed-set question below, and HERE to decide what
+            // a v1 `--changed-only` meant. v1 resolved that flag against this
+            // same chain, so with a base ref in play the alias must too —
+            // po-av01j.191 could only map it to `--hook pre-push` because the
+            // chain did not exist yet.
+            let base_chain = base_ref::chain(base.as_deref(), &path);
+            // rvl-cli v1 hook shims run THIS binary after a `brew upgrade`
+            // (the cask keeps the name `rvl`), so their flags must resolve
+            // here or `git commit` fails and no commit is created
+            // (po-av01j.191). See `compat` for the mapping and its rationale.
+            let compat::Scoping {
+                incremental,
+                changed_only,
+                hook,
+                notice,
+                never_block,
+            } = compat::resolve(
+                compat::V1Flags {
+                    agent,
+                    staged,
+                    pre_push,
+                    mode: mode.as_deref(),
+                },
+                incremental,
+                changed_only,
+                hook.as_deref(),
+                base_chain.is_configured(),
+            )?;
+            compat::set_never_block(never_block);
+            match notice {
+                // The v1 notice already names `--agent` and says exactly what
+                // ran instead, so the generic alias paragraph would only add
+                // noise to every commit in a not-yet-repaired repo.
+                Some(n) => eprint!("{n}"),
+                None if agent => agent_alias_notice(),
+                None => {}
+            }
+            // Only the incremental path implements change scoping. Refuse
+            // rather than silently scanning the whole repo while the caller
+            // believes it is scoped -- a gate that lies about its scope is
+            // worse than no gate (po-av01j.127). (The changed set itself comes
+            // from git, not from the incremental pass -- po-sg7jb.)
+            anyhow::ensure!(
+                !changed_only || (incremental && retrieved.is_none()),
+                "--changed-only requires --incremental (and is incompatible with --retrieved): \
+                 change scoping is implemented on the incremental path only, so there is \
+                 nothing to scope to without it"
+            );
+            // `--incremental` only applies when we own retrieval; `--retrieved`
+            // is a prebuilt stream with no per-file hash gate to reuse.
+            if incremental && retrieved.is_none() {
+                run_scan_incremental(
+                    &store,
+                    &keyset,
+                    &cfg.index_dir,
+                    &state_path,
+                    &path,
+                    specs_file.as_deref(),
+                    judgments.as_deref(),
+                    out.as_deref(),
+                    color.as_deref(),
+                    strict,
+                    changed_only,
+                    hook.as_deref(),
+                    &base_chain,
+                )
+            } else {
+                // Hook adjudication is delta-scoped by definition; without
+                // the incremental changed-file gate there is no delta, so the
+                // lane cannot run (the scan itself is unaffected).
+                if hook.is_some() {
+                    eprintln!(
+                        "note: --hook agent adjudication is delta-scoped and only runs with \
+                         --incremental (and without --retrieved); proceeding deterministic-only"
+                    );
+                }
+                run_scan(
+                    &store,
+                    &keyset,
+                    &state_path,
+                    &path,
+                    retrieved.as_deref(),
+                    specs_file.as_deref(),
+                    judgments.as_deref(),
+                    out.as_deref(),
+                    color.as_deref(),
+                    strict,
+                )
+            }
+        }
+        Cmd::Report {
+            path,
+            retrieved,
+            specs_file,
+            incremental,
+            json,
+            out,
+        } => run_report(
+            &store,
+            &keyset,
+            &cfg.index_dir,
+            &path.unwrap_or_else(|| PathBuf::from(".")),
+            retrieved.as_deref(),
+            specs_file.as_deref(),
+            incremental,
+            json,
+            out.as_deref(),
+        ),
+        Cmd::Explain {
+            id,
+            path,
+            retrieved,
+            specs_file,
+            judgments,
+            color,
+        } => run_explain(
+            &store,
+            &keyset,
+            &state_path,
+            &id,
+            &path.unwrap_or_else(|| PathBuf::from(".")),
+            retrieved.as_deref(),
+            specs_file.as_deref(),
+            judgments.as_deref(),
+            color.as_deref(),
+        ),
+        Cmd::Suppress {
+            id,
+            path,
+            reason,
+            expires,
+            retrieved,
+            specs_file,
+            judgments,
+        } => run_suppress(
+            &store,
+            &keyset,
+            &state_path,
+            &id,
+            path.as_deref(),
+            reason.as_deref(),
+            expires.as_deref(),
+            retrieved.as_deref(),
+            specs_file.as_deref(),
+            judgments.as_deref(),
+        ),
+        Cmd::Sync => {
+            if !cfg.offline && cfg.org_key.is_empty() {
+                anyhow::bail!(
+                    "no API key found: set RVL_API_KEY, or add \
+                     `api_key` to ~/.revelara/config.yaml (or set RVL_OFFLINE=1)"
+                );
+            }
+            let fetcher = HttpFetcher {
+                base_url: cfg.base_url,
+                org_key: cfg.org_key,
+            };
+            Ok(report(&rvl_cache::sync(
+                &store,
+                &fetcher,
+                &keyset,
+                cfg.offline,
+            )))
+        }
+        Cmd::Index { cmd } => match cmd {
+            IndexCmd::Init { path, retrieved } => {
+                run_index_build(&cfg, path, retrieved, None, false)
+            }
+            IndexCmd::Reindex {
+                path,
+                retrieved,
+                files,
+                detach,
+            } => run_index_build(&cfg, path, retrieved, files, detach),
+            IndexCmd::Status => {
+                match rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb")) {
+                    Ok(idx) => {
+                        println!(
+                            "{} file(s) indexed at {}",
+                            idx.len()?,
+                            cfg.index_dir.display()
+                        );
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    // A busy index is a normal transient state, not a broken
+                    // one. Say so plainly instead of reporting it as a
+                    // failure to open the database.
+                    Err(e) if e.downcast_ref::<rvl_index::IndexBusy>().is_some() => {
+                        eprintln!("{e}");
+                        Ok(ExitCode::FAILURE)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        },
+        Cmd::Cache { cmd } => match cmd {
+            CacheCmd::Import { artifact, sig } => {
+                let sig = sig.unwrap_or_else(|| {
+                    let mut p = artifact.clone().into_os_string();
+                    p.push(".sig");
+                    PathBuf::from(p)
+                });
+                Ok(report(&store.import(&artifact, &sig, &keyset)?))
+            }
+            CacheCmd::Status => {
+                match store.load(&keyset, &rvl_cache::today_utc()) {
+                    Ok(loaded) => {
+                        println!(
+                            "spec cache {} (schema {}, {:?})",
+                            loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                        );
+                        println!("artifact sha256 {}", loaded.artifact_sha256);
+                        if let Some(hint) = loaded.upgrade_hint {
+                            println!("{hint}");
+                        }
+                        if let Some(note) = loaded.staleness_note {
+                            println!("{note}");
+                        }
+                    }
+                    Err(_) => {
+                        println!(
+                            "no spec cache installed; run '{BIN} sync' or '{BIN} cache import'"
+                        )
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+        Cmd::Skills { cmd } => run_skills(&cfg, cmd),
+        Cmd::Plugin { cmd } => run_plugin(&cfg, cmd),
+        // Data and onboarding commands (Init/Hook/Login/Logout/Status/
+        // Risk/Control/Knowledge/Incident/Evidence/Feedback/Bugreport)
+        // returned before the store opened, above.
+        Cmd::Init { .. }
+        | Cmd::Hook { .. }
+        | Cmd::Version
+        | Cmd::Doctor { .. }
+        | Cmd::Login
+        | Cmd::Logout
+        | Cmd::Status
+        | Cmd::Risk { .. }
+        | Cmd::Control { .. }
+        | Cmd::Compliance { .. }
+        | Cmd::Knowledge { .. }
+        | Cmd::Incident { .. }
+        | Cmd::Evidence { .. }
+        | Cmd::Feedback { .. }
+        | Cmd::Bugreport { .. }
+        | Cmd::Config { .. }
+        | Cmd::Stpa { .. }
+        | Cmd::Completion { .. } => {
+            unreachable!("data commands dispatch before the store opens")
+        }
+    }
+}
+
+/// Rust sets SIGPIPE to SIG_IGN before main, so writing to a closed pipe
+/// returns EPIPE and `println!` panics. A scanner is piped into `head`,
+/// `less`, and `grep -q` constantly; restore the default disposition so the
+/// process dies quietly the way every other unix tool does.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the OS default before any
+    // output happens; no handler state to race with.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
+fn main() -> ExitCode {
+    restore_default_sigpipe();
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- judgments ship in the signed cache (po-av01j.106 / po-axk44) ---
+
+    /// The judgments section exactly as the factory publishes it: one ratified
+    /// blocking promotion for an unbounded `requests.get` on a production path.
+    fn cache_judgments_json() -> serde_json::Value {
+        serde_json::json!([{
+            "api": "requests.get",
+            "scope": "runtime",
+            "verdict": "surface",
+            "severity": "high",
+            "fix": "Pass timeout=(connect, read); requests defaults to NO timeout. RC-019.",
+            "control": "RC-019"
+        }])
+    }
+
+    /// One violating site, triaged and rendered exactly the way a scan does it,
+    /// so the returned findings are the ones the gate counts.
+    fn ladder_for(judgments: &[rvl_triage::ClassJudgment]) -> Vec<render::Finding> {
+        let sites = vec![rvl_core::Site {
+            file_path: "svc/http.py".into(),
+            line_number: 12,
+            client_type: "requests".into(),
+            method: "get".into(),
+            ..Default::default()
+        }];
+        let verdicts = vec![(
+            sites[0].site_key(),
+            rvl_core::Verdict::Violates,
+            "no bound anywhere".to_string(),
+        )];
+        triage_to_findings(&rvl_triage::triage(&sites, &verdicts, judgments), None)
+    }
+
+    // --- the ladder's sentence follows the spec's default bound (.175) ---
+
+    /// The class the scan actually triages for one unbounded site of
+    /// `<client_type>.<method>`, rendered through the same path a scan uses.
+    fn description_for(
+        client_type: &str,
+        method: &str,
+        specs: Option<&rvl_spec::SpecCache>,
+    ) -> String {
+        let sites = vec![rvl_core::Site {
+            file_path: "svc/http.py".into(),
+            line_number: 12,
+            client_type: client_type.into(),
+            method: method.into(),
+            ..Default::default()
+        }];
+        let verdicts = vec![(
+            sites[0].site_key(),
+            rvl_core::Verdict::Violates,
+            "no bound anywhere and the search was complete".to_string(),
+        )];
+        let items = rvl_triage::triage(&sites, &verdicts, &[]);
+        let findings = triage_to_findings(&items, specs);
+        assert_eq!(findings.len(), 1);
+        findings[0].description.clone()
+    }
+
+    #[test]
+    fn a_class_with_no_default_bound_data_never_claims_the_library_hangs() {
+        // po-av01j.175: the false claim. Both the no-cache path and a cache
+        // whose spec predates the field must stop at the verified half.
+        let no_cache = description_for("openai.OpenAI", "create", None);
+        assert!(
+            !no_cache.contains("hang indefinitely"),
+            "unevidenced library claim: {no_cache}"
+        );
+
+        let pre_175 = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"openai.OpenAI","method":"create","blocking":"yes",
+                 "confidence":0.9}],"configs":[]}"#,
+        )
+        .unwrap();
+        let old = description_for("openai.OpenAI", "create", Some(&pre_175));
+        assert!(
+            !old.contains("hang indefinitely"),
+            "a cache without the field must behave exactly like no data: {old}"
+        );
+        assert_eq!(no_cache, old, "existing caches keep the honest wording");
+        assert!(old.contains("nothing in this repository bounds how long it can run"));
+    }
+
+    #[test]
+    fn a_spec_declaring_no_default_still_produces_the_strong_claim() {
+        // `requests` genuinely has no default. Once the spec SAYS so, the
+        // serious finding must read exactly as seriously as it used to.
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"requests","method":"get","blocking":"yes",
+                 "confidence":0.9,"default_bound":{"kind":"none"}}],"configs":[]}"#,
+        )
+        .unwrap();
+        let d = description_for("requests", "get", Some(&specs));
+        assert!(d.contains("applies no default of its own"), "{d}");
+        assert!(d.contains("it can hang indefinitely"), "{d}");
+    }
+
+    #[test]
+    fn a_spec_declaring_a_default_names_the_sdk_fallback() {
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"apis":[{"type":"openai.OpenAI","method":"create","blocking":"yes",
+                 "confidence":0.9,"default_bound":{"kind":"seconds","seconds":600.0}}],
+               "configs":[]}"#,
+        )
+        .unwrap();
+        let d = description_for("openai.OpenAI", "create", Some(&specs));
+        assert!(
+            d.contains("falls back to the openai.OpenAI default of 600s"),
+            "{d}"
+        );
+        assert!(d.contains("far too long for a request path"), "{d}");
+        assert!(!d.contains("hang indefinitely"), "{d}");
+    }
+
+    // --- blocking by design, end to end (po-av01j.180) ---
+
+    /// The three published corpus rows the bug report names, verbatim, plus
+    /// the two genuine defects that must be untouched. The intents are spliced
+    /// in so the before/after pair differs in EXACTLY one field per row and
+    /// nothing else.
+    fn corpus(with_intent: bool) -> String {
+        let field = |role: &str| {
+            if with_intent {
+                format!(r#","blocking_intent":{{"kind":"by_design","role":"{role}"}}"#)
+            } else {
+                String::new()
+            }
+        };
+        format!(
+            r#"{{"apis":[
+                 {{"type":"uvicorn","method":"run","blocking":"yes","bounded_by":["none"],
+                   "confidence":1.0{server}}},
+                 {{"type":"sys.stdout","method":"write","blocking":"yes","bounded_by":["none"],
+                   "confidence":0.9{stream}}},
+                 {{"type":"sys.stderr","method":"write","blocking":"yes","bounded_by":["none"],
+                   "confidence":0.967{stream}}},
+                 {{"type":"requests","method":"post","blocking":"yes","bounded_by":["call_arg"],
+                   "confidence":1.0,"unbounded_sentinels":["None"],
+                   "default_bound":{{"kind":"none"}}}},
+                 {{"type":"subprocess","method":"run","blocking":"yes","bounded_by":["call_arg"],
+                   "confidence":1.0,"unbounded_sentinels":["None"],
+                   "default_bound":{{"kind":"none"}}}}
+               ],"configs":[]}}"#,
+            server = field("server_main_loop"),
+            stream = field("stream_write"),
+        )
+    }
+
+    /// Run the real pipeline — propagate, triage, ladder rows — over one site
+    /// per class, and return (finding descriptions, by-design coverage).
+    fn scan_classes(specs_json: &str) -> (Vec<String>, (usize, Vec<String>)) {
+        let specs = rvl_spec::SpecCache::load(specs_json).expect("corpus must parse");
+        let sites: Vec<rvl_core::Site> = [
+            ("uvicorn", "run"),
+            ("sys.stdout", "write"),
+            ("sys.stderr", "write"),
+            ("requests", "post"),
+            ("subprocess", "run"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (t, m))| rvl_core::Site {
+            file_path: "backend/app/main.py".into(),
+            line_number: i as u32 + 1,
+            client_type: (*t).into(),
+            method: (*m).into(),
+            ..Default::default()
+        })
+        .collect();
+        let findings = rvl_propagate::propagate_all(
+            &sites,
+            &specs,
+            &rvl_spec::ServedBound::None,
+            &std::collections::HashMap::new(),
+        );
+        let verdicts: Vec<_> = sites
+            .iter()
+            .zip(findings.iter())
+            .map(|(s, f)| (s.site_key(), f.verdict, f.reason.clone()))
+            .collect();
+        let items = rvl_triage::triage(&sites, &verdicts, &[]);
+        let rows: Vec<String> = triage_to_findings(&items, Some(&specs))
+            .into_iter()
+            .map(|f| f.description)
+            .collect();
+        (rows, by_design_coverage(&findings))
+    }
+
+    #[test]
+    fn by_design_classes_leave_the_ladder_and_the_defects_stay_byte_identical() {
+        let (before, before_cov) = scan_classes(&corpus(false));
+        let (after, _) = scan_classes(&corpus(true));
+
+        // BEFORE: the reported bug. All five classes ask for a timeout, and
+        // three of them are asking for something meaningless.
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().any(|d| d.starts_with("uvicorn.run")),
+            "{before:#?}"
+        );
+        assert!(before.iter().any(|d| d.starts_with("sys.stdout.write")));
+        assert!(before.iter().any(|d| d.starts_with("sys.stderr.write")));
+        assert_eq!(before_cov.0, 0, "nothing is by-design without the field");
+
+        // AFTER: the three by-design classes produce no remediation row.
+        assert_eq!(after.len(), 2, "{after:#?}");
+        for gone in ["uvicorn.run", "sys.stdout.write", "sys.stderr.write"] {
+            assert!(
+                !after.iter().any(|d| d.starts_with(gone)),
+                "{gone} must not ask for a deadline: {after:#?}"
+            );
+        }
+
+        // REGRESSION PROOF: the genuine defects are byte-identical, sentence
+        // for sentence, before and after.
+        let defect = |rows: &[String], class: &str| -> String {
+            rows.iter()
+                .find(|d| d.starts_with(class))
+                .unwrap_or_else(|| panic!("{class} must still be reported: {rows:#?}"))
+                .clone()
+        };
+        for class in ["requests.post", "subprocess.run"] {
+            assert_eq!(defect(&before, class), defect(&after, class), "{class}");
+            assert!(
+                defect(&after, class).contains("it can hang indefinitely"),
+                "the genuine defect keeps its full force"
+            );
+        }
+    }
+
+    #[test]
+    fn the_suppressed_classes_are_counted_and_named_in_coverage() {
+        // Suppression without accounting is indistinguishable from a scanner
+        // that stopped looking, so the count and the identities must survive
+        // into COVERAGE.
+        let (_, (count, classes)) = scan_classes(&corpus(true));
+        assert_eq!(count, 3);
+        assert_eq!(
+            classes,
+            vec![
+                "sys.stderr.write (stream write)",
+                "sys.stdout.write (stream write)",
+                "uvicorn.run (server main loop)",
+            ]
+        );
+        let cov = render::Coverage {
+            resolved: 5,
+            total: 5,
+            by_design: count,
+            by_design_classes: classes,
+            ..Default::default()
+        };
+        let out = render::render_ladder(&[], cov, None, "0.1s", false);
+        assert!(out.contains("3 sites block by design"), "{out}");
+        assert!(out.contains("uvicorn.run (server main loop)"), "{out}");
+        assert!(
+            out.contains("waiting is the contract"),
+            "the line must say why there is no finding: {out}"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_the_intent_field_renders_no_by_design_line() {
+        // Compatibility: today's fleet caches carry nothing, so the coverage
+        // block must look exactly as it does now.
+        let (_, (count, classes)) = scan_classes(&corpus(false));
+        assert_eq!(count, 0);
+        assert!(classes.is_empty());
+        let cov = render::Coverage {
+            resolved: 5,
+            total: 5,
+            ..Default::default()
+        };
+        let out = render::render_ladder(&[], cov, None, "0.1s", false);
+        assert!(!out.contains("by design"), "{out}");
+    }
+
+    #[test]
+    fn judgments_load_from_the_signed_cache_with_no_flag() {
+        // The bead's core defect: judgments were readable ONLY from
+        // --judgments, so a plain `rvl scan .` had nothing to grade with.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        assert_eq!(js.len(), 1, "the cache's corpus must load with no flag");
+        assert_eq!(js[0].api, "requests.get");
+        assert_eq!(js[0].scope, "runtime");
+        assert_eq!(js[0].severity, "high");
+        assert_eq!(js[0].control, "RC-019");
+    }
+
+    #[test]
+    fn cache_judgments_produce_a_blocking_finding() {
+        // The whole point. `blocking_count > 0` is verbatim the `blocked`
+        // predicate that becomes EXIT_BLOCKED (3) in run_scan; cli.rs asserts
+        // the process status itself.
+        let js = resolve_judgments(Some(&cache_judgments_json()), None, false).unwrap();
+        let findings = ladder_for(&js);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, "high");
+        assert_eq!(findings[0].control, "RC-019");
+        assert!(
+            render::blocking_count(&findings) > 0,
+            "a ratified high-severity judgment must produce a BLOCKING row: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_judgments_stays_advisory() {
+        // NEW BINARY / OLD CACHE, and any deployment that publishes no corpus:
+        // the finding still surfaces, it is simply ungraded. Advisory is the
+        // floor; nothing is ever dropped.
+        for source in [None, Some(serde_json::json!([]))] {
+            let js = resolve_judgments(source.as_ref(), None, false).unwrap();
+            assert!(js.is_empty());
+            let findings = ladder_for(&js);
+            assert_eq!(findings.len(), 1, "the finding must still surface");
+            assert!(
+                findings[0].severity.is_empty(),
+                "an unjudged class has no severity"
+            );
+            assert_eq!(
+                render::blocking_count(&findings),
+                0,
+                "unjudged must never block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judgments_flag_overrides_the_cache() {
+        // --judgments survives as a dev override only. When both are present
+        // the file wins outright: a half-merge would grade some classes from an
+        // unverified source and some from a signed one, with no way to tell
+        // which did what.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dev_judgments.json");
+        std::fs::write(
+            &p,
+            r#"[{"api":"requests.get","scope":"runtime","verdict":"surface","severity":"low","fix":"dev","control":"RC-000"}]"#,
+        )
+        .unwrap();
+
+        let js =
+            resolve_judgments(Some(&cache_judgments_json()), Some(p.as_path()), false).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(
+            js[0].severity, "low",
+            "the override must win over the cache"
+        );
+        assert_eq!(js[0].control, "RC-000");
+        // ...and the override demotes the class off the gate, which is exactly
+        // why it has to be announced.
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
+
+    #[test]
+    fn a_malformed_cache_judgments_section_degrades_to_advisory() {
+        // One bad publish must not stop every commit in the fleet. Degrade
+        // loudly (stderr) rather than failing the scan.
+        let bad = serde_json::json!([{"scope": "runtime", "verdict": "surface"}]);
+        let js = resolve_judgments(Some(&bad), None, false).unwrap();
+        assert!(js.is_empty(), "a malformed corpus grades nothing");
+        assert_eq!(render::blocking_count(&ladder_for(&js)), 0);
+    }
+
+    #[test]
+    fn a_language_present_only_as_testdata_is_incidental() {
+        // po-hjte8: a real backend repo carries one C# file, a skilleval fixture under
+        // testdata/, and it must not hard-fail the scan. A C# file in a
+        // production path is NOT incidental.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scripts/skilleval/testdata/matrix/csharp-pro")).unwrap();
+        std::fs::write(
+            root.join("scripts/skilleval/testdata/matrix/csharp-pro/csharp_pro.cs"),
+            "class C {}\n",
+        )
+        .unwrap();
+        assert!(
+            language_is_incidental(root, Lang::CSharp),
+            "a lone testdata .cs is incidental"
+        );
+
+        std::fs::create_dir_all(root.join("src/api")).unwrap();
+        std::fs::write(root.join("src/api/Handler.cs"), "class H {}\n").unwrap();
+        assert!(
+            !language_is_incidental(root, Lang::CSharp),
+            "a production-path .cs makes the language non-incidental"
+        );
+    }
+
+    // Serializes tests that mutate process-global env so they don't race.
+    // Shared with `embedded_helpers`' own tests: both move HOME and
+    // RVL_HELPER_DIR, and a second mutex over the same process-wide state
+    // is not a lock at all (see `embedded_helpers::env_lock`).
+    use crate::embedded_helpers::env_lock;
+
+    // --- Changed-only scoping (po-av01j.127) ---
+
+    #[test]
+    fn changed_only_keeps_sites_in_the_delta_and_drops_the_rest() {
+        // The reported gap: a one-file docs commit reported the same nine rows
+        // as a nine-file Java commit, because --incremental reuses the INDEX
+        // but still reports the whole repo.
+        let changed = changed_set(&["src/a.go".into(), "src/b.go".into()]);
+        assert!(site_is_changed("src/a.go", &changed));
+        assert!(site_is_changed("src/b.go", &changed));
+        assert!(!site_is_changed("src/untouched.go", &changed));
+    }
+
+    #[test]
+    fn changed_only_normalizes_leading_dot_slash() {
+        // Helpers emit repo-relative paths and the index computes its own; a
+        // "./" on one side must not silently drop every finding, which would
+        // be a vacuous gate (po-t8acf shipped exactly that class of bug).
+        let changed = changed_set(&["./src/a.go".into()]);
+        assert!(site_is_changed("src/a.go", &changed));
+        let changed = changed_set(&["src/a.go".into()]);
+        assert!(site_is_changed("./src/a.go", &changed));
+    }
+
+    #[test]
+    fn an_empty_delta_scopes_to_nothing_not_to_everything() {
+        // The failure direction that matters. If the changed set is empty and
+        // the filter fell open, a hook would report the entire repo while
+        // claiming to be change-scoped -- worse than not scoping at all,
+        // because it looks correct.
+        let changed = changed_set(&[]);
+        assert!(!site_is_changed("src/a.go", &changed));
+    }
+
+    // --- Retriever abstain vs error, and per-language degradation (po-av01j.102) ---
+
+    fn degraded(lang: Lang, kind: DegradeKind) -> LangDegradation {
+        LangDegradation {
+            lang,
+            kind,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn abstain_is_a_distinct_exit_code_from_error() {
+        // The helper contract's whole point: a deliberate decline must not be
+        // indistinguishable from a crash. rustindex exits 2 from its generic
+        // error arm and cindex exits 2 on usage, so 2 cannot mean "declined".
+        assert_eq!(
+            classify_helper_exit(Some(HELPER_EXIT_ABSTAIN)),
+            DegradeKind::Abstained
+        );
+        for code in [1, 2, 101, 127] {
+            assert_eq!(
+                classify_helper_exit(Some(code)),
+                DegradeKind::Failed,
+                "exit {code} is a failure, not a decline"
+            );
+        }
+        // Killed by a signal. Not a decline: the helper never got to decide.
+        assert_eq!(classify_helper_exit(None), DegradeKind::Failed);
+    }
+
+    #[test]
+    fn one_language_degrading_does_not_sink_the_scan() {
+        // The reported bug: 1660 .go files and ONE .rs fixture, and the Go scan
+        // is discarded because rustindex declines a repo with no Cargo.toml.
+        let d = vec![degraded(Lang::Rust, DegradeKind::Abstained)];
+        assert!(retrieval_verdict(2, &d, false).is_ok());
+    }
+
+    #[test]
+    fn a_helper_error_also_degrades_by_default() {
+        // --strict's help text promises this for errors too: "Fail CLOSED when
+        // ... a retriever errors (CI). Default is fail-open."
+        let d = vec![degraded(Lang::Rust, DegradeKind::Failed)];
+        assert!(retrieval_verdict(2, &d, false).is_ok());
+    }
+
+    #[test]
+    fn strict_makes_any_degradation_fatal() {
+        for kind in [DegradeKind::Abstained, DegradeKind::Failed] {
+            let d = vec![degraded(Lang::Rust, kind)];
+            assert!(
+                retrieval_verdict(2, &d, true).is_err(),
+                "--strict must refuse a partial answer"
+            );
+        }
+    }
+
+    #[test]
+    fn every_language_degrading_is_reported_but_no_longer_aborts() {
+        // The false-pass guard, RESHAPED by po-av01j.145. Degrading to zero
+        // languages must never be quiet -- a clean report over nothing scanned
+        // is the one outcome that must not happen -- but it must also not throw
+        // away the lanes that need no retriever at all. Measured with no
+        // helpers installed, the config lane alone resolves 217 of 320 settings
+        // and produces real findings; the old abort discarded every one.
+        //
+        // So it now returns the summary instead of an error, and COVERAGE
+        // renders it as "call-site lane INCOMPLETE".
+        let d = vec![
+            degraded(Lang::Rust, DegradeKind::Abstained),
+            degraded(Lang::Go, DegradeKind::Failed),
+        ];
+        let note = retrieval_verdict(2, &d, false)
+            .expect("total failure degrades, it does not abort")
+            .expect("and it must produce a note, never silence");
+        assert!(
+            note.contains("every detected language") && note.contains("Go"),
+            "the note must say nothing was scanned AND name the languages: {note}"
+        );
+    }
+
+    #[test]
+    fn strict_still_makes_total_retrieval_failure_fatal() {
+        // --strict is exactly the mode that wants the abort, and it keeps it.
+        let d = vec![degraded(Lang::Go, DegradeKind::Failed)];
+        let err = retrieval_verdict(1, &d, true).unwrap_err();
+        assert!(err.to_string().contains("every detected language"), "{err}");
+    }
+
+    #[test]
+    fn a_healthy_scan_produces_no_note_at_all() {
+        assert!(retrieval_verdict(2, &[], false).unwrap().is_none());
+        // Partial degradation is not total failure: some languages scanned, so
+        // the call-site lane is real and carries no INCOMPLETE banner.
+        let d = vec![degraded(Lang::Go, DegradeKind::Failed)];
+        assert!(retrieval_verdict(3, &d, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_clean_run_is_unaffected() {
+        assert!(retrieval_verdict(2, &[], false).is_ok());
+        assert!(retrieval_verdict(2, &[], true).is_ok());
+    }
+
+    #[test]
+    fn resolved_helper_provenance_is_named_in_the_coverage_block() {
+        // A stale helper shadowing via PATH is invisible without this: the
+        // 2026-08-10 dogfoods ran a six-day-old pyindex/tsindex fleet from
+        // ~/.local/bin for a full day, silently missing the LLM-SDK surface
+        // and reporting a type-degraded TS lane as normal sites (po-vd7ii).
+        // The scan must SAY which helper file ran and where it came from.
+        let cov = render::Coverage {
+            resolved: 10,
+            total: 12,
+            retrievers: vec![
+                render::RetrieverInfo {
+                    lang: "Python".into(),
+                    path: "/home/u/.local/bin/pyindex.py".into(),
+                    source: "PATH".into(),
+                },
+                render::RetrieverInfo {
+                    lang: "Go".into(),
+                    path: "/opt/rvl/goindex".into(),
+                    source: "bundled".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render::render_lang_status(&cov, false);
+        assert!(out.contains("retrievers:"), "got: {out}");
+        assert!(
+            out.contains("/home/u/.local/bin/pyindex.py (PATH)"),
+            "got: {out}"
+        );
+        assert!(out.contains("/opt/rvl/goindex (bundled)"), "got: {out}");
+    }
+
+    #[test]
+    fn degraded_languages_are_named_in_the_coverage_block() {
+        // Silence would trade a loud crash for a quiet false pass. The user has
+        // to be able to see that a language was skipped, and which kind of
+        // skip it was.
+        let cov = render::Coverage {
+            resolved: 10,
+            total: 12,
+            degraded: vec![
+                render::DegradedLang {
+                    lang: "Rust".into(),
+                    abstained: true,
+                    not_installed: false,
+                    reason: "no cargo workspace".into(),
+                },
+                render::DegradedLang {
+                    lang: "Java".into(),
+                    abstained: false,
+                    not_installed: false,
+                    reason: "exit 2".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render::render_coverage_degradations(&cov, false);
+        assert!(out.contains("Rust: abstained"), "got: {out}");
+        assert!(out.contains("no cargo workspace"), "got: {out}");
+        assert!(out.contains("Java: retriever failed"), "got: {out}");
+        // "abstained" and "failed" must not be rendered with the same word,
+        // or the distinction the exit code buys is thrown away at the last step.
+        assert!(!out.contains("Java: abstained"), "got: {out}");
+    }
+
+    #[test]
+    fn strip_detach_removes_only_the_detach_flag() {
+        let args = vec![
+            "index".to_string(),
+            "reindex".to_string(),
+            "--detach".to_string(),
+            "/some/repo".to_string(),
+            "--files".to_string(),
+            "a.go,b.go".to_string(),
+        ];
+        assert_eq!(
+            strip_detach_args(args),
+            vec!["index", "reindex", "/some/repo", "--files", "a.go,b.go"],
+            "everything except --detach must survive, or the child re-forks forever"
+        );
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn structure_violations_render_advisory_never_blocking() {
+        let violate = rvl_structure::StructureFinding {
+            control: "RC-033",
+            control_name: "unit test coverage",
+            verdict: rvl_core::Verdict::Violates,
+            reason: "no test files: go (40 source files)".into(),
+            evidence: vec![],
+            fix: "add unit tests".into(),
+            severity: "medium",
+            weak: false,
+        };
+        let satisfies = rvl_structure::StructureFinding {
+            control: "RC-006",
+            control_name: "incident runbooks",
+            verdict: rvl_core::Verdict::Satisfies,
+            reason: "runbook directory present".into(),
+            evidence: vec!["docs/runbooks".into()],
+            fix: String::new(),
+            severity: "",
+            weak: true,
+        };
+        let fs = structure_to_findings(&[violate, satisfies]);
+        assert_eq!(fs.len(), 1, "only violations surface in the ladder");
+        let f = &fs[0];
+        assert_eq!(f.control, "RC-033", "control code rides into the ladder");
+        assert_eq!(
+            f.class_rule, "repo_structure.RC-033",
+            "waiver key lets suppress/.revelara.yaml target it"
+        );
+        assert_eq!(
+            render::classify(f),
+            render::Section::Advisory,
+            "a structural shape must never block a commit"
+        );
+    }
+
+    #[test]
+    fn live_scan_structure_findings_inventory_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.go")),
+                "package x\nfunc F() {}\n",
+            )
+            .unwrap();
+        }
+        let fs = resolve_structure_findings(None, "", dir.path());
+        assert!(
+            fs.iter().any(|f| f.control == "RC-033"),
+            "an untested live tree must surface RC-033: {fs:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_stream_without_a_record_yields_no_structure_findings() {
+        // A prebuilt stream may predate the G7 retriever; no facts means no
+        // findings — never a fabricated inventory of the CURRENT directory,
+        // which is a different repo than the stream describes.
+        let fs = resolve_structure_findings(
+            Some(Path::new("prebuilt.jsonl")),
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+            Path::new("."),
+        );
+        assert!(fs.is_empty(), "no record, no findings: {fs:?}");
+    }
+
+    #[test]
+    fn detect_go_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("main.go"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go]);
+    }
+
+    #[test]
+    fn detect_python_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.py"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Python]);
+    }
+
+    #[test]
+    fn detect_both_is_go_then_python() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("main.go"));
+        touch(&dir.path().join("app.py"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::Python]);
+    }
+
+    // po-av01j.137. Identical code yielded 30 sites named .ts and 0 named .js,
+    // with no abstention and exit 0, because detection took only .ts/.tsx.
+    // Express/Node backends without TypeScript were entirely invisible.
+    #[test]
+    fn plain_javascript_detects_the_typescript_lane() {
+        for name in ["server.js", "app.jsx", "mod.mjs", "legacy.cjs"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), "const x = 1;\n").unwrap();
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::TypeScript],
+                "{name} must reach the lane that can read it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_project_with_no_tsconfig_still_detects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{\"name\":\"x\"}\n").unwrap();
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    // A declaration file is types-only and still maps to nothing.
+    #[test]
+    fn declaration_files_are_still_not_scannable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("types.d.ts"), "export {};\n").unwrap();
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_typescript_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    #[test]
+    fn detect_typescript_via_tsconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("tsconfig.json"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+    }
+
+    #[test]
+    fn detect_csharp_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_via_project_markers() {
+        // The marker's NAME varies per project (Svc.csproj, App.sln), so the
+        // root probe is extension-driven, unlike go.mod/tsconfig.json.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Svc.csproj"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CSharp]);
+
+        let sln = tempfile::tempdir().unwrap();
+        touch(&sln.path().join("App.sln"));
+        assert_eq!(detect_languages(sln.path()), vec![Lang::CSharp]);
+    }
+
+    #[test]
+    fn detect_csharp_orders_after_typescript() {
+        // Deterministic helper order: Go < Python < TypeScript < CSharp.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("Service.cs"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::CSharp]
+        );
+    }
+
+    #[test]
+    fn detect_tsx_counts_but_dts_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("component.tsx"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::TypeScript]);
+
+        // A directory whose only TS file is a `.d.ts` is types-only: no helper.
+        let dts_only = tempfile::tempdir().unwrap();
+        touch(&dts_only.path().join("types.d.ts"));
+        assert!(detect_languages(dts_only.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_java_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("App.java"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Java]);
+    }
+
+    #[test]
+    fn detect_java_via_marker_files() {
+        for marker in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(marker));
+            assert_eq!(
+                detect_languages(dir.path()),
+                vec![Lang::Java],
+                "{marker} must mark a Java repo"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_java_orders_after_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.ts"));
+        touch(&dir.path().join("App.java"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::TypeScript, Lang::Java]
+        );
+    }
+
+    #[test]
+    fn detect_rust_only() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("lib.rs"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_via_cargo_toml_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Cargo.toml"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Rust]);
+    }
+
+    #[test]
+    fn detect_rust_orders_between_python_and_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("app.py"));
+        touch(&dir.path().join("main.rs"));
+        touch(&dir.path().join("app.ts"));
+        assert_eq!(
+            detect_languages(dir.path()),
+            vec![Lang::Python, Lang::Rust, Lang::TypeScript]
+        );
+    }
+
+    #[test]
+    fn detect_rust_skips_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+        touch(&nested.join("build_script.rs"));
+        // The only .rs file is under target/, which is skipped.
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rust_helper_is_an_executable_and_rs_maps_to_rust() {
+        assert_eq!(
+            classify_helper(Lang::Rust, Path::new("/x/rustindex"), "test").kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::Rust.helper_base(), "rustindex");
+        assert_eq!(Lang::Rust.env_override(), "RVL_RUSTINDEX");
+        assert_eq!(lang_of_path(Path::new("src/lib.rs")), Some(Lang::Rust));
+    }
+
+    #[test]
+
+    fn detect_neither_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("README.md"));
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_c_cpp_via_compile_db_marker() {
+        // The compile db is the C/C++ marker even before any source is seen
+        // (and the tier gate: db-listed TUs parse with their exact flags).
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("compile_commands.json"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp]);
+
+        // The CMake build/ layout counts too.
+        let cmake = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cmake.path().join("build")).unwrap();
+        touch(&cmake.path().join("build").join("compile_commands.json"));
+        assert_eq!(detect_languages(cmake.path()), vec![Lang::CCpp]);
+    }
+
+    #[test]
+    fn detect_c_cpp_sources_without_a_db_still_detect() {
+        // Bare sources ride cindex's allowlist fallback tier; detection must
+        // not silently skip them. Headers alone do NOT detect: a header-only
+        // tree has no TU to parse.
+        for ext in ["c", "cc", "cpp", "cxx"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(&dir.path().join(format!("main.{ext}")));
+            assert_eq!(detect_languages(dir.path()), vec![Lang::CCpp], "{ext}");
+        }
+        let headers_only = tempfile::tempdir().unwrap();
+        touch(&headers_only.path().join("api.h"));
+        assert!(detect_languages(headers_only.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_order_puts_c_cpp_last() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("main.go"));
+        touch(&dir.path().join("native.c"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::CCpp]);
+    }
+
+    #[test]
+    fn detect_via_marker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("go.mod"));
+        touch(&dir.path().join("pyproject.toml"));
+        assert_eq!(detect_languages(dir.path()), vec![Lang::Go, Lang::Python]);
+    }
+
+    #[test]
+    fn detect_skips_vendored_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("node_modules").join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        touch(&nested.join("bundled.go"));
+        // The only .go file is under node_modules, which is skipped.
+        assert!(detect_languages(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn go_helper_argv_is_direct_invocation() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/goindex"),
+            kind: HelperKind::Executable,
+            source: "test".into(),
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/goindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn python_script_argv_runs_under_python3() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/pyindex.py"),
+            kind: HelperKind::PyScript,
+            source: "test".into(),
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "python3",
+                "/opt/pyindex.py",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn ts_node_script_argv_runs_under_node() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/tsindex.js"),
+            kind: HelperKind::NodeScript,
+            source: "test".into(),
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "node",
+                "/opt/tsindex.js",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn csharp_dll_argv_runs_under_dotnet() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/csindex.dll"),
+            kind: HelperKind::DotnetAssembly,
+            source: "test".into(),
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "dotnet",
+                "/opt/csindex.dll",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_cpp_helper_is_a_direct_executable() {
+        assert_eq!(
+            classify_helper(Lang::CCpp, Path::new("/x/cindex"), "test").kind,
+            HelperKind::Executable
+        );
+        assert_eq!(Lang::CCpp.helper_base(), "cindex");
+        assert_eq!(Lang::CCpp.env_override(), "RVL_CINDEX");
+        let argv = helper_argv(
+            &classify_helper(Lang::CCpp, Path::new("/opt/cindex"), "test"),
+            Path::new("/repo"),
+            "repo",
+            &[],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/cindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_csharp_dll_is_an_assembly_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex.dll"), "test").kind,
+            HelperKind::DotnetAssembly
+        );
+        assert_eq!(
+            classify_helper(Lang::CSharp, Path::new("/x/csindex"), "test").kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_cs() {
+        assert_eq!(
+            lang_of_path(Path::new("svc/Service.cs")),
+            Some(Lang::CSharp)
+        );
+        // A .csproj is a marker for detection, not a retrievable source file.
+        assert_eq!(lang_of_path(Path::new("svc/Svc.csproj")), None);
+    }
+
+    #[test]
+    fn lang_of_path_maps_c_cpp_sources_but_not_headers() {
+        assert_eq!(lang_of_path(Path::new("src/io.c")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cc")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cpp")), Some(Lang::CCpp));
+        assert_eq!(lang_of_path(Path::new("src/io.cxx")), Some(Lang::CCpp));
+        // Headers map to no helper: invalidating the right TUs needs the
+        // include graph (follow-up), so header edits take the full-rescan path.
+        assert_eq!(lang_of_path(Path::new("src/io.h")), None);
+        assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
+    }
+
+    #[test]
+    fn java_source_argv_runs_under_java() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/javaindex.java"),
+            kind: HelperKind::JavaSource,
+            source: "test".into(),
+        };
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        assert_eq!(
+            argv,
+            vec![
+                "java",
+                "/opt/javaindex.java",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_java_source_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex.java"), "test").kind,
+            HelperKind::JavaSource
+        );
+        assert_eq!(
+            classify_helper(Lang::Java, Path::new("/x/javaindex"), "test").kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_java() {
+        assert_eq!(lang_of_path(Path::new("svc/App.java")), Some(Lang::Java));
+    }
+
+    #[test]
+    fn classify_typescript_js_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex.js"), "test").kind,
+            HelperKind::NodeScript
+        );
+        assert_eq!(
+            classify_helper(Lang::TypeScript, Path::new("/x/tsindex"), "test").kind,
+            HelperKind::Executable
+        );
+    }
+
+    #[test]
+    fn lang_of_path_maps_ts_but_not_dts() {
+        assert_eq!(
+            lang_of_path(Path::new("svc/app.ts")),
+            Some(Lang::TypeScript)
+        );
+        assert_eq!(
+            lang_of_path(Path::new("svc/view.tsx")),
+            Some(Lang::TypeScript)
+        );
+        assert_eq!(lang_of_path(Path::new("svc/types.d.ts")), None);
+    }
+
+    // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
+    // independently of ARG_MAX. `--files` joins the whole changed set into one
+    // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
+    // before pyindex ran -- and because the incremental path is fail-open, the
+    // scan reported a degraded result rather than an error anyone would chase.
+    #[test]
+    fn chunk_files_keeps_every_batch_under_the_exec_limit() {
+        // Realistic monorepo path lengths, well past the cap in total.
+        let files: Vec<String> = (0..8000)
+            .map(|i| format!("providers/amazon/tests/unit/aws/module_{i:05}/handler_impl.py"))
+            .collect();
+        let total: usize = files.iter().map(|f| f.len() + 1).sum();
+        assert!(
+            total > MAX_FILES_ARG_BYTES,
+            "the fixture must actually exceed the cap ({total} bytes)"
+        );
+
+        let batches = chunk_files(&files, MAX_FILES_ARG_BYTES);
+        assert!(batches.len() > 1, "an oversized list must be split");
+        for b in &batches {
+            let joined = b.join(",").len();
+            assert!(
+                joined <= MAX_FILES_ARG_BYTES,
+                "batch of {joined} bytes exceeds the cap"
+            );
+        }
+        // NOTHING may be lost or duplicated: a dropped file is a silent
+        // coverage hole, which is the failure this epic keeps finding.
+        let flat: Vec<&String> = batches.iter().flatten().collect();
+        assert_eq!(flat.len(), files.len(), "every file must survive batching");
+        assert!(
+            flat.iter().zip(files.iter()).all(|(a, b)| *a == b),
+            "order and content must be preserved"
+        );
+    }
+
+    #[test]
+    fn chunk_files_handles_the_small_and_empty_cases() {
+        assert!(chunk_files(&[], MAX_FILES_ARG_BYTES).is_empty());
+        let one = vec!["a.go".to_string()];
+        assert_eq!(chunk_files(&one, MAX_FILES_ARG_BYTES), vec![one.clone()]);
+        // A single path longer than the cap is emitted ALONE rather than
+        // dropped: it then fails loudly at exec with the path in the error,
+        // instead of vanishing from the scan.
+        let huge = vec!["x".repeat(MAX_FILES_ARG_BYTES + 10)];
+        assert_eq!(chunk_files(&huge, MAX_FILES_ARG_BYTES).len(), 1);
+    }
+
+    #[test]
+    fn helper_argv_appends_files_for_changed_only() {
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/goindex"),
+            kind: HelperKind::Executable,
+            source: "test".into(),
+        };
+        let changed = vec!["svc/db.go".to_string(), "svc/http.go".to_string()];
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &changed);
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/goindex",
+                "--retrieve",
+                "--root",
+                "/repo",
+                "--name",
+                "repo",
+                "--files",
+                "svc/db.go,svc/http.go",
+            ],
+            "the incremental path passes only the changed files via --files"
+        );
+        // The full path (no --files) is unchanged.
+        assert!(
+            !helper_argv(&helper, Path::new("/repo"), "repo", &[]).contains(&"--files".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_relative_is_forward_slashed_under_root() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            repo_relative(root, Path::new("/repo/svc/db.go")),
+            "svc/db.go"
+        );
+        assert_eq!(repo_relative(root, Path::new("/repo/main.go")), "main.go");
+    }
+
+    fn site_at(path: &str, line: u32, client: &str, method: &str) -> rvl_core::Site {
+        rvl_core::Site {
+            file_path: path.into(),
+            line_number: line,
+            client_type: client.into(),
+            method: method.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_keeps_two_sites_sharing_a_location() {
+        // po-3t3oj.15: one file:line resolves to two sites with different client
+        // types. A file:line-keyed merge would drop one; site_key keeps both.
+        let a = site_at("svc/x.go", 306, "drive.Service", "Do");
+        let b = site_at("svc/x.go", 306, "http.Client", "Do");
+        let merged = merge_on_site_key(vec![a.clone()], vec![b.clone()]);
+        assert_eq!(merged.len(), 2, "colliding location must not drop a site");
+        // A genuine duplicate (same site_key) IS collapsed.
+        let dup = merge_on_site_key(vec![a.clone()], vec![a]);
+        assert_eq!(dup.len(), 1);
+    }
+
+    #[test]
+    fn site_key_collision_round_trips_through_index_and_reload() {
+        // Two sites at the SAME file:line, different client_type, must survive
+        // put -> get -> plan_reload without collision.
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let f = dir.path().join("x.go");
+        std::fs::write(&f, "package x\n").unwrap();
+        let h = rvl_index::hash_file(&f).unwrap();
+        let both = vec![
+            site_at("x.go", 306, "drive.Service", "Do"),
+            site_at("x.go", 306, "http.Client", "Do"),
+        ];
+        idx.put(&f, &h, &both).unwrap();
+
+        let got = idx.get(&f, &h).unwrap().expect("hash matches");
+        assert_eq!(got.len(), 2, "both colliding sites stored and returned");
+        let keys: std::collections::HashSet<_> = got.iter().map(rvl_index::site_key).collect();
+        assert_eq!(keys.len(), 2, "the two sites keep distinct site_keys");
+
+        // The unchanged file reloads from the index (reuse), not re-retrieval.
+        let plan = idx.plan_reload(std::slice::from_ref(&f));
+        assert_eq!(plan.unchanged, vec![f]);
+        assert!(plan.changed.is_empty());
+    }
+
+    #[test]
+    fn incremental_reuses_unchanged_and_retrieves_only_changed() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let warm = dir.path().join("warm.go");
+        let cold = dir.path().join("cold.go");
+        std::fs::write(&warm, "package warm\n").unwrap();
+        std::fs::write(&cold, "package cold\n").unwrap();
+        // Pre-index warm.go so it is reused.
+        idx.put(
+            &warm,
+            &rvl_index::hash_file(&warm).unwrap(),
+            &[site_at("warm.go", 9, "p.C", "Warm")],
+        )
+        .unwrap();
+
+        let calls = Cell::new(0usize);
+        // Fake retriever: echoes one site per changed file, repo-relative pathed.
+        let fake = |changed: &[PathBuf]| {
+            calls.set(calls.get() + 1);
+            let sites = changed
+                .iter()
+                .map(|c| site_at(&repo_relative(dir.path(), c), 1, "p.C", "Do"))
+                .collect();
+            Ok(RetrieveResult {
+                sites,
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: None,
+            })
+        };
+        let candidates = walk_source_files(dir.path());
+        let scan = incremental_sites(&idx, dir.path(), &candidates, fake).unwrap();
+        assert_eq!(scan.reused_files, 1);
+        assert_eq!(scan.retrieved_files, 1);
+        assert_eq!(scan.sites.len(), 2, "1 reused + 1 retrieved");
+        assert_eq!(
+            calls.get(),
+            1,
+            "retriever invoked once, for the changed file"
+        );
+
+        // Second pass: nothing changed, the retriever is not invoked at all.
+        let calls2 = Cell::new(0usize);
+        let fake2 = |changed: &[PathBuf]| {
+            calls2.set(calls2.get() + 1);
+            Ok(RetrieveResult {
+                sites: changed
+                    .iter()
+                    .map(|c| site_at(&repo_relative(dir.path(), c), 1, "p.C", "Do"))
+                    .collect(),
+                repo_cfg: rvl_core::RepoConfig::default(),
+                degraded_note: None,
+            })
+        };
+        let scan2 = incremental_sites(&idx, dir.path(), &candidates, fake2).unwrap();
+        assert_eq!(scan2.reused_files, 2, "both files now reused");
+        assert_eq!(scan2.retrieved_files, 0);
+        assert_eq!(calls2.get(), 0, "no helper run when nothing changed");
+    }
+
+    #[test]
+    fn budget_timeout_fails_open_but_strict_fails_closed() {
+        let cap = std::time::Duration::from_millis(10);
+        // Fail-open: a timeout degrades to the reused portion with a note.
+        let open = resolve_budgeted(Budgeted::TimedOut, false, 3, cap).unwrap();
+        assert!(open.sites.is_empty());
+        assert!(
+            open.degraded_note.is_some(),
+            "degradation must be explained"
+        );
+        // --strict: a timeout is an error naming the budget.
+        let err = resolve_budgeted(Budgeted::TimedOut, true, 3, cap).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("budget"));
+    }
+
+    #[test]
+    fn budget_retriever_error_fails_open_but_strict_propagates() {
+        let cap = std::time::Duration::from_secs(10);
+        let mk = || Budgeted::Failed(anyhow::anyhow!("helper missing"));
+        // Fail-open: an error degrades, keeping the scan alive.
+        let open = resolve_budgeted(mk(), false, 1, cap).unwrap();
+        assert!(open.sites.is_empty());
+        assert!(open.degraded_note.unwrap().contains("helper missing"));
+        // --strict: the error propagates.
+        let err = resolve_budgeted(mk(), true, 1, cap).unwrap_err();
+        assert!(err.to_string().contains("helper missing"));
+    }
+
+    #[test]
+    fn run_with_budget_returns_done_and_times_out() {
+        // Fast closure completes.
+        match run_with_budget(std::time::Duration::from_secs(5), || Ok(7u32)) {
+            Budgeted::Done(v) => assert_eq!(v, 7),
+            _ => panic!("a fast closure must complete within the cap"),
+        }
+        // Slow closure trips the (tiny, injected) cap.
+        let slow = run_with_budget(std::time::Duration::from_millis(10), || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(0u32)
+        });
+        assert!(matches!(slow, Budgeted::TimedOut), "the wall cap must fire");
+    }
+
+    #[test]
+    fn classify_python_py_is_a_script_but_bin_is_executable() {
+        assert_eq!(
+            classify_helper(Lang::Python, Path::new("/x/pyindex.py"), "test").kind,
+            HelperKind::PyScript
+        );
+        assert_eq!(
+            classify_helper(Lang::Python, Path::new("/x/pyindex"), "test").kind,
+            HelperKind::Executable
+        );
+        assert_eq!(
+            classify_helper(Lang::Go, Path::new("/x/goindex"), "test").kind,
+            HelperKind::Executable
+        );
+    }
+
+    // po-av01j.148. Decided: do not bundle the helpers, probe for them and
+    // error out when one is NEEDED and absent. A gate that cannot read a
+    // language the repo contains must not report "commit clean" -- that is a
+    // clean bill of health over a language nobody looked at, the failure this
+    // epic has found repeatedly.
+    #[test]
+    fn the_escape_hatch_is_explicit_and_opt_in() {
+        let _guard = env_lock();
+        std::env::remove_var("RVL_ALLOW_MISSING_HELPERS");
+        assert!(!allow_missing_helpers(), "silence must NOT permit a gap");
+        for v in ["1", "true"] {
+            std::env::set_var("RVL_ALLOW_MISSING_HELPERS", v);
+            assert!(allow_missing_helpers(), "{v} should opt in");
+        }
+        // Anything else is not consent: a typo must fail closed, not open.
+        for v in ["0", "false", "yes", ""] {
+            std::env::set_var("RVL_ALLOW_MISSING_HELPERS", v);
+            assert!(!allow_missing_helpers(), "{v:?} must not opt in");
+        }
+        std::env::remove_var("RVL_ALLOW_MISSING_HELPERS");
+    }
+
+    // A repository of pure infrastructure needs NO helper, so there is nothing
+    // to error about. This used to bail with "no supported source files",
+    // making a terraform- or workflows-only repo unscannable -- a shape the
+    // product meets constantly, and the same principle as po-av01j.145 at a
+    // third location.
+    #[test]
+    fn a_repo_with_no_source_still_scans_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("a.yml"),
+            "on: [push]\njobs:\n  b:\n    runs-on: x\n",
+        )
+        .unwrap();
+        assert!(
+            detect_languages(dir.path()).is_empty(),
+            "the fixture must genuinely have no source"
+        );
+        let stream = resolve_packet_stream(None, dir.path(), false)
+            .expect("no language is not an error: nothing was needed");
+        assert!(stream.text.is_empty());
+        assert!(
+            stream.total_failure.is_none(),
+            "nothing failed -- there was nothing to run"
+        );
+    }
+
+    // po-av01j.198: the SAME principle on the incremental path, which is the
+    // one `hook install` writes into .git/hooks. It used to bail here, so
+    // every commit in a docs/terraform/shell repo failed with a scanner error.
+    #[test]
+    fn an_incremental_pass_over_a_repo_with_no_source_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("README.md"), "# docs\n").unwrap();
+        std::fs::write(repo.join("config.yml"), "a: 1\n").unwrap();
+        assert!(
+            walk_source_files(&repo).is_empty(),
+            "the fixture must genuinely have no candidate source"
+        );
+
+        let scan = incremental_scan_pass(&dir.path().join("index"), &repo, false)
+            .expect("no supported source is not an error: nothing was needed");
+        assert!(scan.sites.is_empty());
+        assert!(
+            scan.no_supported_sources,
+            "the caller needs the flag to EXPLAIN the empty scope"
+        );
+        assert!(
+            scan.degraded_note.is_none() && scan.lang_degraded.is_empty(),
+            "nothing degraded -- there was nothing to run"
+        );
+        // po-av01j.199: and the policy must leave it alone. "Nothing to scan"
+        // is not "could not scan", so this pass keeps its clean verdict.
+        let mut scan = scan;
+        apply_retrieval_policy(&mut scan, 0, false).expect("nothing degraded, nothing to say");
+        assert!(
+            scan.degraded_note.is_none(),
+            "a source-free repo must not be told its scan was incomplete"
+        );
+    }
+
+    // --- po-av01j.199: the warm path applies the retrieval policy too ---
+
+    /// A warm pass that retrieved nothing, carrying exactly the degradations
+    /// under test.
+    fn warm_scan(lang_degraded: Vec<LangDegradation>) -> IncrementalScan {
+        IncrementalScan {
+            sites: Vec::new(),
+            repo_cfg: rvl_core::RepoConfig::default(),
+            reused_files: 0,
+            retrieved_files: 0,
+            degraded_note: None,
+            reparsed_files: Vec::new(),
+            lang_degraded,
+            no_supported_sources: false,
+        }
+    }
+
+    fn missing_python() -> LangDegradation {
+        LangDegradation {
+            lang: Lang::Python,
+            kind: DegradeKind::NotInstalled,
+            reason: "`python3` is not installed, so pyindex.py cannot run".into(),
+        }
+    }
+
+    // THE BEAD. Every language the pass tried failed, so no call site was
+    // read; the footer used to render "0 advisory - commit clean" over it.
+    #[test]
+    fn a_warm_pass_whose_every_language_degraded_is_marked_incomplete() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        apply_retrieval_policy(&mut scan, 1, false).expect("fail-open: this must not error");
+        let note = scan
+            .degraded_note
+            .expect("the pass scanned nothing and must say so");
+        assert!(
+            note.contains("every detected language failed to retrieve"),
+            "the warm path must reach the SAME verdict the full path renders: {note}"
+        );
+        assert!(
+            note.contains("python3"),
+            "and must name what to install: {note}"
+        );
+    }
+
+    // Fail-OPEN PER LANGUAGE is the documented default: one language of three
+    // is a normal report, not an incomplete scan. The reader still learns the
+    // language was skipped -- that is the per-language COVERAGE line, which is
+    // rendered from `lang_degraded` independently of this note.
+    #[test]
+    fn one_language_of_three_degrading_is_not_an_incomplete_scan() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        apply_retrieval_policy(&mut scan, 3, false).expect("fail-open per language");
+        assert!(
+            scan.degraded_note.is_none(),
+            "two of three languages were scanned; calling that incomplete is a false alarm"
+        );
+        assert_eq!(
+            scan.lang_degraded.len(),
+            1,
+            "the skipped language stays reportable"
+        );
+    }
+
+    // --strict was bypassed by the same gap: CI asked for a whole answer or
+    // none and was getting a partial one silently.
+    #[test]
+    fn strict_still_fails_closed_on_the_warm_path() {
+        for attempted in [1usize, 3] {
+            let mut scan = warm_scan(vec![missing_python()]);
+            let err = apply_retrieval_policy(&mut scan, attempted, true)
+                .expect_err("--strict refuses a partial answer");
+            assert!(
+                format!("{err:#}").contains("--strict"),
+                "the error must name the flag that caused it: {err:#}"
+            );
+        }
+    }
+
+    // The wall budget and a dead retriever are independent facts about one
+    // pass, so neither may overwrite the other's sentence.
+    #[test]
+    fn a_budget_degradation_and_a_total_retrieval_failure_are_both_reported() {
+        let mut scan = warm_scan(vec![missing_python()]);
+        scan.degraded_note = Some("retrieval capped at 10s".into());
+        apply_retrieval_policy(&mut scan, 1, false).unwrap();
+        let note = scan.degraded_note.unwrap();
+        assert!(note.contains("retrieval capped at 10s"), "{note}");
+        assert!(note.contains("every detected language failed"), "{note}");
+    }
+
+    // The denominator is the DELTA, not the repository: files that did not
+    // change were served from the index at their current content hash, which
+    // is a real scan and must not be counted as a language that failed.
+    #[test]
+    fn the_attempted_language_count_comes_from_the_changed_files() {
+        let files = vec![
+            PathBuf::from("/r/a.py"),
+            PathBuf::from("/r/b.py"),
+            PathBuf::from("/r/c.go"),
+            PathBuf::from("/r/README.md"),
+        ];
+        let langs = langs_of_paths(&files);
+        assert_eq!(langs.len(), 2, "two languages, four files: {langs:?}");
+        assert!(langs.contains(&Lang::Python) && langs.contains(&Lang::Go));
+        assert!(
+            langs_of_paths(&[PathBuf::from("/r/README.md")]).is_empty(),
+            "a docs-only delta asks no helper anything"
+        );
+    }
+
+    // The other side of that coin. An unreadable root walks to the identical
+    // empty candidate set, and `walk_source_files` swallows the `read_dir`
+    // error by design, so without this check the fix above would turn a
+    // scanner that never looked into a clean bill of health.
+    #[test]
+    fn an_unreadable_root_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ensure_scannable_root(&dir.path().join("nope")).is_err(),
+            "a target that does not exist cannot be scanned"
+        );
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            ensure_scannable_root(&file).is_err(),
+            "a file is not a repository root"
+        );
+        assert!(
+            ensure_scannable_root(dir.path()).is_ok(),
+            "an ordinary readable directory is fine"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Running as root defeats the permission bit; skip rather than
+            // assert something the environment cannot produce.
+            if std::fs::read_dir(&locked).is_err() {
+                assert!(
+                    ensure_scannable_root(&locked).is_err(),
+                    "a directory that cannot be opened is not an empty repo"
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_helper_env_override_wins() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("my-goindex");
+        touch(&fake);
+        std::env::set_var("RVL_GOINDEX", &fake);
+        let resolved = resolve_helper(Lang::Go);
+        std::env::remove_var("RVL_GOINDEX");
+        let resolved = resolved.expect("env override must resolve");
+        assert_eq!(resolved.path, fake);
+        assert_eq!(resolved.kind, HelperKind::Executable);
+    }
+
+    #[test]
+    fn resolve_helper_env_override_missing_file_errors() {
+        let _guard = env_lock();
+        std::env::set_var("RVL_GOINDEX", "/definitely/not/here/goindex");
+        let resolved = resolve_helper(Lang::Go);
+        std::env::remove_var("RVL_GOINDEX");
+        assert!(resolved.is_err(), "a missing override path must error");
+    }
+
+    #[test]
+    fn embedded_scripts_cover_exactly_the_platform_independent_helpers() {
+        // The split is the whole packaging decision (po-aml3h): text is
+        // carried, native code is shipped in the archive, and Roslyn is
+        // neither. A helper silently changing sides here is a helper that
+        // stops arriving on a fresh install.
+        for lang in [Lang::Python, Lang::TypeScript, Lang::Java] {
+            assert!(
+                embedded_for(lang).is_some(),
+                "{lang} is a scripted retriever and must be carried in the binary"
+            );
+        }
+        for lang in [Lang::Go, Lang::Rust, Lang::CCpp, Lang::CSharp] {
+            assert!(
+                embedded_for(lang).is_none(),
+                "{lang}'s helper is native and must ship in the archive, not be embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_lookup_covers_the_homebrew_pkgshare_dir() {
+        // Homebrew's generated formula `bin.install`s the archive's EXECUTABLES
+        // and files everything else under <prefix>/share/<app>. goindex rides
+        // the archive as a non-cargo file, so without this dir a brew install
+        // would carry it and never find it.
+        let dirs = packaged_helper_dirs(Path::new("/opt/homebrew/Cellar/rvl/1.0/bin"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvl/1.0/bin")));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/Cellar/rvl/1.0/share/rvl")));
+    }
+
+    #[test]
+    fn missing_helper_hints_name_a_command_to_run() {
+        // "Install the helper" is the message this bead exists to delete: a
+        // reader who hits a missing retriever must get the specific install.
+        for lang in [
+            Lang::Go,
+            Lang::Python,
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::CSharp,
+            Lang::Java,
+            Lang::CCpp,
+        ] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                hint.contains('`') || hint.contains(lang.env_override()),
+                "{lang}'s hint must name a command or the override var: {hint}"
+            );
+        }
+        let cs = missing_helper_hint(Lang::CSharp);
+        assert!(
+            cs.contains("dotnet build helpers/csindex -c Release -o ~/.revelara/helpers/csindex"),
+            "csindex is the one helper we deliberately do not ship, so its hint must be the \
+             most specific of all: {cs}"
+        );
+    }
+
+    #[test]
+    fn no_install_hint_asks_for_a_follow_up_env_var() {
+        // The inconsistency this guards against: naming a canonical location
+        // AND requiring an override that points at that same location. Every
+        // command in a hint must write somewhere resolution already searches,
+        // so the install is the whole fix.
+        for lang in [Lang::Go, Lang::Rust, Lang::CSharp, Lang::CCpp] {
+            let hint = missing_helper_hint(lang);
+            assert!(
+                !hint.contains(lang.env_override()),
+                "{lang}'s hint names a canonical path, so it must not also demand \
+                 {}: {hint}",
+                lang.env_override()
+            );
+            assert!(
+                hint.contains("~/.revelara/helpers/"),
+                "{lang}'s hint must install into a directory resolution searches: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canonical_helper_dirs_accept_both_build_output_shapes() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let dirs = embedded_helpers::install_dirs("csindex");
+        std::env::remove_var("HOME");
+        let helpers = dir.path().join(".revelara").join("helpers");
+        assert!(
+            dirs.contains(&helpers.join("csindex")),
+            "`dotnet build -o DIR` writes a directory of assemblies: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&helpers),
+            "`go build -o FILE` writes one file into the flat root: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_in_the_canonical_dir_is_found_and_the_env_override_still_wins() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(embedded_helpers::HELPER_DIR_ENV);
+        std::env::set_var("HOME", dir.path());
+        let canonical = dir.path().join(".revelara").join("helpers").join("csindex");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let dll = canonical.join("csindex.dll");
+        touch(&dll);
+
+        let found = resolve_helper(Lang::CSharp).expect("the canonical dir must be searched");
+        assert_eq!(found.path, dll);
+        assert_eq!(found.kind, HelperKind::DotnetAssembly);
+        assert_eq!(
+            found.source, "installed",
+            "the roll-call must say the user installed this one, not that we shipped it"
+        );
+
+        // An explicit override still outranks it: an operator debugging a
+        // patched retriever must not be silently served the canonical copy.
+        let other = dir.path().join("patched-csindex.dll");
+        touch(&other);
+        std::env::set_var("RVL_CSINDEX", &other);
+        let overridden = resolve_helper(Lang::CSharp);
+        std::env::remove_var("RVL_CSINDEX");
+        std::env::remove_var("HOME");
+        let overridden = overridden.expect("env override must resolve");
+        assert_eq!(overridden.path, other);
+        assert_eq!(overridden.source, "env:RVL_CSINDEX");
+    }
+
+    #[test]
+    fn node_path_points_at_the_scanned_repo_and_keeps_any_existing_entries() {
+        let _guard = env_lock();
+        std::env::remove_var("NODE_PATH");
+        let root = Path::new("/work/api");
+        assert_eq!(
+            node_path_for(root),
+            std::ffi::OsString::from("/work/api/node_modules"),
+            "a node helper must be able to load the SCANNED project's typescript"
+        );
+
+        std::env::set_var("NODE_PATH", "/opt/mods");
+        let combined = node_path_for(root);
+        std::env::remove_var("NODE_PATH");
+        let parts: Vec<PathBuf> = std::env::split_paths(&combined).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/opt/mods"),
+                PathBuf::from("/work/api/node_modules")
+            ],
+            "an operator's own NODE_PATH is preserved, and searched first"
+        );
+    }
+
+    fn ladder_finding(id: &str) -> render::Finding {
+        render::Finding {
+            id: id.to_string(),
+            site: "src/a.ts:12".into(),
+            description: "no bound anywhere".into(),
+            disposition: "unjudged".into(),
+            severity: String::new(),
+            incident_count: 0,
+            critical_count: 0,
+            control: String::new(),
+            fix: String::new(),
+            site_count: 3,
+            example_sites: vec!["src/a.ts:12".into()],
+            class_rule: "kysely.SelectQueryBuilder.execute".into(),
+            suppressed: false,
+            gate_exempt: false,
+        }
+    }
+
+    #[test]
+    fn explain_hint_resolves_from_the_persisted_last_scan() {
+        // Regression (po-3t3oj.38): the ladder prints `rvl explain <id>`;
+        // that verbatim command must find the id WITHOUT re-running the scan's
+        // inputs. Persist a ladder, then resolve the id from the state file.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        save_last_scan(&state, dir.path(), &[ladder_finding("qocr")]);
+
+        let (f, root) =
+            finding_from_last_scan(&state, "qocr", false).expect("id must resolve from state");
+        assert_eq!(f.class_rule, "kysely.SelectQueryBuilder.execute");
+        assert_eq!(
+            std::path::PathBuf::from(&root),
+            std::fs::canonicalize(dir.path()).unwrap(),
+            "suppress needs the recorded scan root for its waiver file"
+        );
+        assert!(
+            finding_from_last_scan(&state, "zzzz", false).is_none(),
+            "an id from a different scan must fall through to a live re-scan"
+        );
+    }
+
+    #[test]
+    fn explicit_dev_overrides_bypass_the_last_scan_state() {
+        // --retrieved/--specs-file/--judgments ask for a live re-scan of those
+        // exact inputs; stale state must not shadow them.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        save_last_scan(&state, dir.path(), &[ladder_finding("qocr")]);
+        assert!(finding_from_last_scan(&state, "qocr", true).is_none());
+    }
+
+    #[test]
+    fn missing_or_corrupt_state_is_just_no_last_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("last-scan.json");
+        assert!(load_last_scan(&state).is_none(), "missing file");
+        std::fs::write(&state, "not json").unwrap();
+        assert!(load_last_scan(&state).is_none(), "corrupt file");
+    }
+
+    // --- rvl-cli data-command surface (po-av01j.17): the ported commands
+    // parse with rvl-cli's subcommand/flag spelling, both --flag=value and
+    // --flag value forms, and unknown flags fail (clap exits 2). ---
+
+    #[test]
+    fn data_command_surface_parses_rvl_cli_spellings() {
+        for argv in [
+            vec!["rvl", "login"],
+            vec!["rvl", "logout"],
+            vec!["rvl", "status"],
+            vec![
+                "rvl",
+                "risk",
+                "list",
+                "--status=applicable",
+                "--service",
+                "checkout-api",
+                "--limit=50",
+            ],
+            vec![
+                "rvl",
+                "risk",
+                "ready",
+                "--limit",
+                "20",
+                "--category=change_management",
+            ],
+            vec!["rvl", "risk", "show", "R-001", "--format=json"],
+            vec!["rvl", "risk", "context", "CR-001", "--format", "json"],
+            vec!["rvl", "risk", "stale"],
+            vec![
+                "rvl",
+                "risk",
+                "resolve",
+                "R-001",
+                "--reason",
+                "Fixed by timeout",
+            ],
+            vec!["rvl", "risk", "accept", "R-001", "--reason=known cost"],
+            vec![
+                "rvl",
+                "control",
+                "list",
+                "--category=fault_tolerance",
+                "--format=json",
+            ],
+            vec!["rvl", "control", "show", "RC-018", "--format=json"],
+            vec![
+                "rvl",
+                "knowledge",
+                "search",
+                "circuit",
+                "breaker",
+                "--limit=5",
+                "--min-class=best",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "facts",
+                "--vertical=fault-tolerance",
+                "--technology=go",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "procedures",
+                "--control=RC-018",
+                "--format=json",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "patterns",
+                "--type=failure_mode",
+                "--min-occurrences=3",
+            ],
+            // The plugin scan.md Step 3C invocations, verbatim.
+            vec![
+                "rvl",
+                "knowledge",
+                "graph-search",
+                "timeout failures",
+                "--depth=2",
+                "--types=causes,depends_on",
+                "--limit=5",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "foresight",
+                "--entity-type=technology",
+                "--entity-id=redis",
+                "--depth=3",
+                "--include-mitigations",
+                "--format=json",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "enrich",
+                "--query=timeout failure",
+                "--limit=10",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "enrich",
+                "--vertical=fault-tolerance",
+                "--control=RC-018",
+                "--technology=go",
+            ],
+            // The rvl-cli knowledge usage examples, verbatim.
+            vec![
+                "rvl",
+                "knowledge",
+                "relationships",
+                "fact",
+                "fact_abc12",
+                "--format=json",
+            ],
+            vec![
+                "rvl",
+                "knowledge",
+                "graph",
+                "fact",
+                "fact_abc12",
+                "--depth=2",
+                "--min-strength=0.3",
+                "--type=causes,mitigates",
+            ],
+            vec!["rvl", "knowledge", "health"],
+            vec![
+                "rvl",
+                "evidence",
+                "submit",
+                "--control=RC-018",
+                "--type=code",
+                "--name=CB impl",
+                "--url=https://x",
+                "--git-hash=abc",
+            ],
+            vec![
+                "rvl",
+                "evidence",
+                "list",
+                "--status=configured",
+                "--limit=5",
+            ],
+            vec!["rvl", "evidence", "verify", "ev-123", "--format=json"],
+        ] {
+            let joined = argv.join(" ");
+            assert!(Cli::try_parse_from(&argv).is_ok(), "must parse: {joined}");
+        }
+    }
+
+    #[test]
+    fn data_command_unknown_flags_fail_like_rvl_cli() {
+        for argv in [
+            vec!["rvl", "risk", "list", "--bogus"],
+            vec!["rvl", "risk", "stale", "--anything"],
+            vec!["rvl", "control", "show"], // missing required code
+            vec!["rvl", "knowledge", "search"], // missing required query
+            vec!["rvl", "knowledge", "graph-search"], // missing required query
+            vec!["rvl", "knowledge", "graph-search", "q", "--depth=0"], // depth must be >= 1
+            vec!["rvl", "knowledge", "enrich", "--bogus"],
+            vec!["rvl", "knowledge", "foresight", "--min-strength=abc"], // not a number
+            vec!["rvl", "knowledge", "relationships", "fact"],           // missing entity id
+            vec!["rvl", "knowledge", "graph", "fact", "f1", "--depth=0"], // depth must be >= 1
+            vec!["rvl", "knowledge", "health", "--bogus"],
+        ] {
+            let joined = argv.join(" ");
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "must be a usage error: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_agent_alias_parses_and_stays_deterministic() {
+        // `rvl scan --agent` compat: the flag parses alongside normal scan
+        // inputs; run() prints a notice and takes the deterministic path.
+        let cli = Cli::try_parse_from(["rvl", "scan", "--agent", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { agent, path, .. }) => {
+                assert!(agent);
+                assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn scan_submission_flags_parse_like_rvl_cli() {
+        // The submission surface (po-av01j.153): flag names match rvl-cli
+        // exactly so existing skill content invoking
+        // `rvl scan --service X --target Y --scan-dir DIR` works verbatim.
+        let cli = Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--service",
+            "checkout-api",
+            "--target",
+            "/tmp/proj",
+            "--scan-dir",
+            ".revelara/scan-parts",
+            "--cleanup-on-success",
+            "--timeout",
+            "90s",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                service,
+                target,
+                scan_dir,
+                cleanup_on_success,
+                timeout,
+                format,
+                stdin,
+                file,
+                ..
+            }) => {
+                assert_eq!(service.as_deref(), Some("checkout-api"));
+                assert_eq!(target, Some(PathBuf::from("/tmp/proj")));
+                assert_eq!(scan_dir, Some(PathBuf::from(".revelara/scan-parts")));
+                assert!(cleanup_on_success);
+                assert_eq!(timeout.as_deref(), Some("90s"));
+                assert_eq!(format.as_deref(), Some("json"));
+                assert!(!stdin);
+                assert!(file.is_none());
+            }
+            _ => panic!("expected scan"),
+        }
+
+        // Short-flag spellings (-s/-t/-f) and --stdin.
+        let cli =
+            Cli::try_parse_from(["rvl", "scan", "-s", "svc", "-t", ".", "-f", "findings.json"])
+                .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { service, file, .. }) => {
+                assert_eq!(service.as_deref(), Some("svc"));
+                assert_eq!(file, Some(PathBuf::from("findings.json")));
+            }
+            _ => panic!("expected scan"),
+        }
+        let cli = Cli::try_parse_from(["rvl", "scan", "--service", "svc", "--stdin"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan { stdin, .. }) => assert!(stdin),
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn plain_scan_parses_without_submission_flags() {
+        // The deterministic scan surface is untouched: no submission flag,
+        // no submission routing inputs set.
+        let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                service,
+                scan_dir,
+                file,
+                stdin,
+                path,
+                ..
+            }) => {
+                assert!(service.is_none() && scan_dir.is_none() && file.is_none() && !stdin);
+                assert_eq!(path, Some(PathBuf::from("some/path")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn submission_only_flags_are_stray_on_a_deterministic_scan() {
+        // po-av01j.168: every one of these was accepted and silently dropped.
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                team: Some("backend-team"),
+                ..Default::default()
+            }),
+            vec!["--team"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                format: Some("json"),
+                ..Default::default()
+            }),
+            vec!["--format"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                timeout: Some("90s"),
+                ..Default::default()
+            }),
+            vec!["--timeout"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                cleanup_on_success: true,
+                ..Default::default()
+            }),
+            vec!["--cleanup-on-success"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                target: Some(Path::new("/tmp/p")),
+                ..Default::default()
+            }),
+            vec!["--target"]
+        );
+        // Every flag at once still names every flag: a reader who typed two
+        // must not have to run twice to learn about the second.
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                team: Some("t"),
+                target: Some(Path::new("/tmp/p")),
+                cleanup_on_success: true,
+                timeout: Some("90s"),
+                format: Some("json"),
+                ci: true,
+                review: true,
+                cs_file: Some(Path::new("/tmp/cs.json")),
+            }),
+            vec![
+                "--team",
+                "--target",
+                "--cleanup-on-success",
+                "--timeout",
+                "--format",
+                "--ci",
+                "--review",
+                "--cs-file"
+            ]
+        );
+        // `--ci` is stray for the same reason `--format` is: it IS
+        // `--format json`, so a deterministic scan would drop a requested
+        // output contract on the floor (po-av01j.185 item 2).
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                ci: true,
+                ..Default::default()
+            }),
+            vec!["--ci"]
+        );
+        // po-av01j.185 item 3: `--review` carries a scan_mode and
+        // `--cs-file` an entire control structure, so both DROP something on
+        // a deterministic scan — the `--ci` rule, not the `--auto-infer` one.
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                review: true,
+                ..Default::default()
+            }),
+            vec!["--review"]
+        );
+        assert_eq!(
+            stray_submission_flags(&SubmissionFlags {
+                cs_file: Some(Path::new("/tmp/cs.json")),
+                ..Default::default()
+            }),
+            vec!["--cs-file"]
+        );
+        // `--auto-infer` is NOT stray: it selects the mode submission
+        // already uses, so it drops nothing anywhere.
+        assert!(
+            Cli::try_parse_from(["rvl", "scan", ".", "--auto-infer"]).is_ok(),
+            "--auto-infer must parse on a deterministic scan"
+        );
+    }
+
+    // --- rvl-cli surface parity (po-av01j.185 / .188) ---
+
+    /// THE PREMISE THIS TEST USED TO PIN WAS FALSE (po-av01j.192). It read:
+    /// "`--control \"\"` is an explicit empty argument in both CLIs", and used
+    /// it to justify dropping only the `--control=` SHAPE from argv. rvl-cli
+    /// draws no such distinction: `cliutil.FlagValue` (cliutil.go:69-79)
+    /// returns `""` for `--control=` AND for `--control ''`, and the consumer
+    /// then decides — `evidence.go:304` guards `if controlCode != ""`, so
+    /// BOTH spellings mean "no filter". Dropping one shape at argv therefore
+    /// fixed half the divergence and created three new ones (empty numeric
+    /// flags silently defaulted, misspelled `--x=` flags silently ignored,
+    /// `--reason=` silently replaced by a default).
+    ///
+    /// What is true, and what this test now pins: clap hands the subcommand
+    /// `Some("")` for both spellings, identically, and the consumer applies
+    /// the rule recorded in `empty_flag::SEMANTICS`.
+    #[test]
+    fn both_empty_spellings_parse_identically_and_are_left_to_the_consumer() {
+        for (equals, space) in [
+            (
+                vec!["rvl", "evidence", "list", "--control="],
+                vec!["rvl", "evidence", "list", "--control", ""],
+            ),
+            (
+                vec!["rvl", "knowledge", "procedures", "--control="],
+                vec!["rvl", "knowledge", "procedures", "--control", ""],
+            ),
+            (
+                vec!["rvl", "risk", "list", "--service="],
+                vec!["rvl", "risk", "list", "--service", ""],
+            ),
+            (
+                vec!["rvl", "control", "list", "--category="],
+                vec!["rvl", "control", "list", "--category", ""],
+            ),
+        ] {
+            let a = Cli::try_parse_from(&equals).unwrap_or_else(|e| panic!("{equals:?}: {e}"));
+            let b = Cli::try_parse_from(&space).unwrap_or_else(|e| panic!("{space:?}: {e}"));
+            assert_eq!(
+                empty_string_flags(&a),
+                empty_string_flags(&b),
+                "{equals:?} and {space:?} must parse to the same thing"
+            );
+            assert_eq!(
+                empty_string_flags(&a),
+                1,
+                "{equals:?}: the empty value must reach the consumer, not be \
+                 deleted from argv"
+            );
+        }
+    }
+
+    /// How many of the parsed command's string flags carry an empty value.
+    /// Only the flags the cases above set are inspected, which is enough to
+    /// tell "reached the consumer as Some(\"\")" from "deleted at argv".
+    fn empty_string_flags(cli: &Cli) -> usize {
+        use rvl_data::{
+            control::ControlCmd, evidence::EvidenceCmd, knowledge::KnowledgeCmd, risk::RiskCmd,
+        };
+        let n = |v: &Option<String>| usize::from(v.as_deref() == Some(""));
+        match &cli.cmd {
+            Some(Cmd::Evidence {
+                cmd: EvidenceCmd::List { control, .. },
+            }) => n(control),
+            Some(Cmd::Knowledge {
+                cmd: KnowledgeCmd::Procedures { control, .. },
+            }) => n(control),
+            Some(Cmd::Risk {
+                cmd: RiskCmd::List { service, .. },
+            }) => n(service),
+            Some(Cmd::Control {
+                cmd: ControlCmd::List { category, .. },
+            }) => n(category),
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    /// The invocations from the parity diff still PARSE — the fix removed the
+    /// argv strip, it did not make empty values a parse error. What each one
+    /// then means is the consumer's decision, recorded per flag in
+    /// `empty_flag::SEMANTICS` and exercised end-to-end against a stub server
+    /// in `tests/empty_flag_parity.rs`.
+    #[test]
+    fn empty_valued_flags_still_parse_on_the_commands_that_regressed() {
+        for argv in [
+            vec!["rvl", "evidence", "list", "--control="],
+            vec!["rvl", "knowledge", "procedures", "--control="],
+            vec!["rvl", "knowledge", "enrich", "--technology=", "--query="],
+            vec!["rvl", "risk", "list", "--service="],
+            vec!["rvl", "control", "list", "--category="],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        // ...but the flags whose empty value rvl-cli REJECTS are still
+        // rejected, which the argv strip had disabled wholesale.
+        for argv in [
+            vec!["rvl", "risk", "list", "--limit="],
+            vec!["rvl", "evidence", "list", "--limit="],
+            vec!["rvl", "knowledge", "facts", "--offset="],
+            vec!["rvl", "risk", "list", "--serivce="],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must be a usage error"
+            );
+        }
+    }
+
+    /// rvl-cli spells this as a subcommand and has no `--version` flag; this
+    /// binary answers to both (po-av01j.185 item 3).
+    #[test]
+    fn version_is_accepted_as_a_subcommand_and_as_a_flag() {
+        assert!(matches!(
+            Cli::try_parse_from(["rvl", "version"]).unwrap().cmd,
+            Some(Cmd::Version)
+        ));
+        // clap intercepts `--version` before producing a Cmd.
+        let Err(err) = Cli::try_parse_from(["rvl", "--version"]) else {
+            panic!("--version must be intercepted by clap");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    /// `--ci` and `--auto-infer` are rvl-cli's documented public surface and
+    /// must parse rather than exit 2 (po-av01j.185 item 2).
+    #[test]
+    fn ci_and_auto_infer_parse_and_ci_selects_the_json_contract() {
+        match Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--service",
+            "api",
+            "--stdin",
+            "--ci",
+            "--auto-infer",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Some(Cmd::Scan {
+                ci,
+                auto_infer,
+                format,
+                ..
+            }) => {
+                assert!(ci);
+                assert!(auto_infer);
+                // --ci is the alias; the resolution to json happens at
+                // dispatch so an explicit --format can still win.
+                assert_eq!(format, None);
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    /// `--review` and `--cs-file` parse on a submission and reach
+    /// [`rvl_data::scan_submit::SubmitArgs`] (po-av01j.185 item 3).
+    #[test]
+    fn review_and_cs_file_parse_on_a_submission() {
+        match Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--service",
+            "api",
+            "--stdin",
+            "--review",
+            "--cs-file",
+            "cs.json",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Some(Cmd::Scan {
+                review,
+                cs_file,
+                auto_infer,
+                ..
+            }) => {
+                assert!(review);
+                assert!(!auto_infer);
+                assert_eq!(cs_file, Some(PathBuf::from("cs.json")));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+
+    /// rvl-cli resolves `--ci > --auto-infer > --review`, so `--auto-infer`
+    /// with `--review` sends "auto". The dispatch expresses that by
+    /// cancelling `review`; assert the cancellation rule itself.
+    #[test]
+    fn auto_infer_outranks_review_the_way_rvl_cli_does() {
+        for (auto_infer, review, want) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, false),
+            (true, false, false),
+        ] {
+            assert_eq!(
+                review && !auto_infer,
+                want,
+                "auto_infer={auto_infer} review={review}"
+            );
+        }
+    }
+
+    /// rvl-cli's `--all` is this binary's "omit the harness name"
+    /// (po-av01j.188).
+    #[test]
+    fn plugin_all_is_an_alias_for_the_whole_sweep() {
+        assert_eq!(resolve_all_alias(None, true).unwrap(), None);
+        assert_eq!(
+            resolve_all_alias(Some("claude".into()), false).unwrap(),
+            Some("claude".into())
+        );
+        // Naming a harness AND --all is contradictory; refuse rather than
+        // silently picking one.
+        let err = resolve_all_alias(Some("claude".into()), true).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        for argv in [
+            vec!["rvl", "plugin", "install", "--all"],
+            vec!["rvl", "plugin", "update", "--all"],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// `--no-context-files` is accepted wherever the managed blocks would be
+    /// written (po-av01j.163).
+    #[test]
+    fn no_context_files_is_accepted_on_init_and_the_plugin_commands() {
+        for argv in [
+            vec!["rvl", "init", "--no-context-files"],
+            vec!["rvl", "plugin", "install", "claude", "--no-context-files"],
+            vec!["rvl", "plugin", "update", "--no-context-files"],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// rvl-cli's `knowledge health` takes no arguments and ignores whatever
+    /// it is given, exiting 0 (po-av01j.185 item 8).
+    #[test]
+    fn knowledge_health_accepts_and_ignores_format() {
+        Cli::try_parse_from(["rvl", "knowledge", "health", "--format=json"]).unwrap();
+        Cli::try_parse_from(["rvl", "knowledge", "health"]).unwrap();
+    }
+
+    #[test]
+    fn an_unflagged_deterministic_scan_has_nothing_stray() {
+        // The defaults must never trip the check — that is the property that
+        // makes this a hard error rather than a warning. Clap gives these
+        // flags no default value, so absent is `None`/`false`.
+        assert!(stray_submission_flags(&SubmissionFlags::default()).is_empty());
+        let cli = Cli::try_parse_from(["rvl", "scan", "some/path"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                team,
+                target,
+                cleanup_on_success,
+                timeout,
+                format,
+                ci,
+                review,
+                cs_file,
+                ..
+            }) => assert!(stray_submission_flags(&SubmissionFlags {
+                team: team.as_deref(),
+                target: target.as_deref(),
+                cleanup_on_success,
+                timeout: timeout.as_deref(),
+                format: format.as_deref(),
+                ci,
+                review,
+                cs_file: cs_file.as_deref(),
+            })
+            .is_empty()),
+            _ => panic!("expected scan"),
+        }
+    }
+
+    #[test]
+    fn stray_flag_error_names_the_flag_and_what_it_requires() {
+        let msg = stray_submission_flag_error(&["--team"]);
+        assert!(msg.contains("--team"), "must name the flag: {msg}");
+        assert!(
+            msg.contains("--scan-dir") && msg.contains("--service"),
+            "must name what selects submission mode: {msg}"
+        );
+        let msg = stray_submission_flag_error(&["--team", "--format"]);
+        assert!(msg.contains("--team") && msg.contains("--format"), "{msg}");
+    }
+
+    #[test]
+    fn submission_selectors_are_exactly_the_documented_five() {
+        // The dispatch guard and the stray-flag check read the same rule from
+        // this function; if a sixth selector is added, it is added here.
+        assert!(selects_submission(true, None, None, None, false));
+        assert!(selects_submission(
+            false,
+            Some(Path::new("f.json")),
+            None,
+            None,
+            false
+        ));
+        assert!(selects_submission(
+            false,
+            None,
+            Some(Path::new("parts")),
+            None,
+            false
+        ));
+        assert!(selects_submission(false, None, None, Some("svc"), false));
+        assert!(selects_submission(false, None, None, None, true));
+        assert!(!selects_submission(false, None, None, None, false));
+    }
+
+    #[test]
+    fn scan_hook_flag_parses_with_incremental() {
+        // The hook-adjudication surface (po-av01j.15): `--hook <name>` rides
+        // the normal scan invocation a git hook makes.
+        let cli = Cli::try_parse_from([
+            "rvl",
+            "scan",
+            "--incremental",
+            "--hook",
+            "pre-commit",
+            "some/path",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Scan {
+                hook, incremental, ..
+            }) => {
+                assert!(incremental);
+                assert_eq!(hook.as_deref(), Some("pre-commit"));
+            }
+            _ => panic!("expected scan"),
+        }
+    }
+}

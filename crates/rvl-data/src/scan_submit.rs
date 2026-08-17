@@ -596,12 +596,63 @@ pub fn request_body(req: &ScanRequest, include_key: bool) -> String {
     compact(&request_g(req, include_key))
 }
 
+/// Metadata fields that describe *who submitted* a scan rather than *what
+/// was scanned*, and are therefore blanked before the idempotency key is
+/// derived (po-av01j.186).
+///
+/// - `scanner_id` names the binary (`rely-cli-<ver>` in v1, `rvl/<ver>` in
+///   v2). Its value is deliberately distinguishable so v1-vs-v2 adoption
+///   can be measured, which is exactly why it must not reach the key: the
+///   same scan of the same tree submitted by one binary and retried by the
+///   other has to land on the same server-side cache row.
+/// - `git_commit` / `git_branch` record where HEAD happened to be. They are
+///   provenance labels, not scan content: an amend, a rebase, or a branch
+///   rename moves them while the scanned tree and the findings are
+///   unchanged, and v1 never populated them at all. Leaving them in the key
+///   would void the "rerun after a client timeout replays the cached
+///   response" property this key exists to provide.
+///
+/// Everything else stays in the key. What identifies a scan is what was
+/// scanned and what was found: service, scan type/mode, findings, control
+/// structure, stack/components/dependencies/catalog, criticality,
+/// tolerance, team assignment, and the scanner-capability metadata
+/// (skill and matcher versions, excluded matchers, applied waivers) that
+/// determines what a rerun would produce.
+fn key_identity_request(req: &ScanRequest) -> ScanRequest {
+    let mut clone = req.clone();
+    clone.idempotency_key = String::new();
+    clone.metadata.scanner_id = String::new();
+    clone.metadata.git_commit = String::new();
+    clone.metadata.git_branch = String::new();
+    clone
+}
+
+/// The exact bytes hashed into the idempotency key: the Go-parity request
+/// marshal with the submitter-identifying fields blanked. Exposed so the Go
+/// v1 client and the Rust v2 client can be diffed byte-for-byte.
+pub fn idempotency_canonical_body(req: &ScanRequest) -> String {
+    request_body(&key_identity_request(req), false)
+}
+
 /// A stable 32-hex-char key derived from the request body with the
-/// idempotency key cleared. Two invocations against the same service with
-/// the same findings/metadata produce the same key, so the server-side
-/// cache recognizes the second submission as a retry.
+/// idempotency key and the submitter-identifying metadata cleared (see
+/// [`key_identity_request`]). Two invocations of THIS binary against the same
+/// service with the same findings/scan metadata produce the same key, so the
+/// server-side cache recognizes the second submission as a retry.
+///
+/// It does NOT agree with rvl-cli v1's key, and cannot: v1's
+/// `deriveIdempotencyKey` (scan.go:1039) clears only the key field, leaving
+/// `scanner_id` in the hash — and `scanner_id` differs by construction
+/// (`rely-cli-<v>` vs `rvl/<v>`). An earlier version of this comment claimed
+/// cross-binary agreement; that was never achievable, and the user ruled
+/// against patching v1 to make it so (po-av01j.186).
+///
+/// Cross-version dedup is handled SERVER-side instead: the API computes its
+/// own canonical key over the scan's content, ignoring submitter identity,
+/// so a v1 submission and a v2 retry collapse to one scan regardless of what
+/// either client sends here (backend migration 269).
 pub fn derive_idempotency_key(req: &ScanRequest) -> String {
-    let canonical = request_body(req, false);
+    let canonical = idempotency_canonical_body(req);
     let sum = Sha256::digest(canonical.as_bytes());
     hex::encode(&sum[..16])
 }
@@ -613,6 +664,39 @@ pub fn derive_idempotency_key(req: &ScanRequest) -> String {
 /// request. Array fields (findings, components, dependencies) concatenate;
 /// scalar/object fields use the last non-zero value, with a stderr warning
 /// when a later file overrides an earlier one.
+/// Merge `--cs-file` into a submission (po-av01j.185 item 3), mirroring
+/// rvl-cli `scan.go`.
+///
+/// Works with `--file` and `--scan-dir` alike. Both merges are FALLBACKS,
+/// never overrides: an in-band `control_structure` wins over the file's,
+/// and the file's `repo_url` fills in only when the submission has none.
+/// That ordering is what makes the flag safe to add to an existing
+/// invocation — it can only fill gaps.
+///
+/// This is NOT `stpa submit`: that POSTs a whole STPA model (losses, UCAs,
+/// loss scenarios) to `/control-structure/model`. This attaches the control
+/// structure to the scan payload and nothing else.
+pub fn merge_cs_file(path: &Path, req: &mut ScanRequest) -> Result<(), Failure> {
+    let data = std::fs::read(path)
+        .map_err(|e| Failure::runtime(format!("Error reading --cs-file: {e}")))?;
+    #[derive(serde::Deserialize)]
+    struct CsPayload {
+        #[serde(default)]
+        repo_url: String,
+        #[serde(default)]
+        control_structure: Option<ControlStructureData>,
+    }
+    let payload: CsPayload = serde_json::from_slice(&data)
+        .map_err(|e| Failure::runtime(format!("Error parsing --cs-file: {e}")))?;
+    if !payload.repo_url.is_empty() && req.repo_url.is_empty() {
+        req.repo_url = payload.repo_url;
+    }
+    if payload.control_structure.is_some() && req.control_structure.is_none() {
+        req.control_structure = payload.control_structure;
+    }
+    Ok(())
+}
+
 pub fn merge_scan_dir(dir: &Path, req: &mut ScanRequest) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("glob scan-dir: {e}"))?;
     let mut files: Vec<PathBuf> = entries
@@ -1149,11 +1233,42 @@ pub struct SubmitArgs {
     pub dry_run: bool,
     pub timeout: Option<String>,
     pub format: Option<String>,
+    /// rvl-cli `--review`: the wire value an INTERACTIVE rvl-cli run sends,
+    /// `scan_mode: "review"` (po-av01j.185 item 3). The flag carries the
+    /// mode and NOTHING else here — rvl-cli's interactive confirmation TUI
+    /// is deliberately not ported, and the server's canonical idempotency
+    /// key excludes `scan_mode`, so this cannot change dedup behavior.
+    /// rvl-cli's own precedence is `--ci > --auto-infer > --review`.
+    pub review: bool,
+    /// rvl-cli `--cs-file`: merge a control structure from a SEPARATE file
+    /// into this submission (po-av01j.185 item 3). Distinct from `stpa
+    /// submit`, which POSTs a full STPA model to
+    /// `/control-structure/model`; this only attaches `control_structure`
+    /// (and a `repo_url` fallback) to the scan payload.
+    pub cs_file: Option<PathBuf>,
 }
 
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// The `scan_mode` this submission puts on the wire.
+///
+/// Submission is non-interactive here, so the mode is a WIRE VALUE only:
+/// "ci" carries the JSON contract, "review" is what rvl-cli sends for an
+/// interactive run, "auto" is everything else. rvl-cli resolves
+/// `--ci > --auto-infer > --review > (TTY ? review : auto)`; here `--ci`
+/// folds into `--format json` and `--auto-infer` selects the default (the
+/// caller cancels `review` when both are typed), so checking json first
+/// reproduces the whole chain. rvl-cli's interactive confirmation TUI is
+/// deliberately not ported — `--review` carries the mode and nothing else.
+fn resolve_scan_mode(format: &OutputFormat, review: bool) -> &'static str {
+    match (format, review) {
+        (OutputFormat::Json, _) => "ci",
+        (OutputFormat::Text, true) => "review",
+        (OutputFormat::Text, false) => "auto",
+    }
 }
 
 fn fail(f: Failure) -> ExitCode {
@@ -1162,7 +1277,7 @@ fn fail(f: Failure) -> ExitCode {
 }
 
 /// Run the scan submission end to end. `version` feeds the
-/// `scanner_id: "rvlscan/<version>"` metadata field.
+/// `scanner_id: "rvl/<version>"` metadata field.
 pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     let format = match args.format.as_deref() {
         None | Some("text") => OutputFormat::Text,
@@ -1210,8 +1325,37 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         None => PathBuf::from("."),
     };
 
-    let Some(service) = args.service.filter(|s| !s.is_empty()) else {
-        eprintln!("Error: --service is required");
+    // `.revelara.yaml` is the submission-side view of the target repo: the
+    // service name, the criticality multiplier, the components each finding is
+    // attributed to, and the team ownership. Loaded ONCE, here, and threaded
+    // through the rest of the run.
+    let project_cfg = crate::project_config::load_project_config_from(&target);
+
+    // `--target` resolves the service from the TARGET's `project:`, overriding
+    // an explicit `--service` with a warning (rvl-cli scan.go). The target's
+    // own declaration is authoritative: a `--service` typed from muscle memory
+    // while scanning someone else's repo would otherwise file the findings
+    // under the wrong service, silently. This also makes `--service` optional
+    // for `scan --target <path> --file <f>`, which rvl-cli documents.
+    let mut service = args.service.filter(|s| !s.is_empty());
+    if args.target.is_some() {
+        if let Some(cfg) = project_cfg.as_ref().filter(|c| !c.project.is_empty()) {
+            if let Some(explicit) = service.as_deref() {
+                if explicit != cfg.project {
+                    eprintln!(
+                        "Warning: --service {explicit:?} overridden by target's .revelara.yaml project: {:?}",
+                        cfg.project
+                    );
+                }
+            }
+            service = Some(cfg.project.clone());
+        }
+    }
+
+    let Some(service) = service else {
+        eprintln!(
+            "Error: --service is required (or use --target with a project that has .revelara.yaml)"
+        );
         eprintln!(
             "Usage: {BIN} scan --service <name> [--stdin|--file <path>|--scan-dir <path>] [--target <path>]"
         );
@@ -1290,6 +1434,15 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     }
 
+    // Merge a control structure from a separate file, before normalization
+    // so a hand-written file gets the same field-name fixups (rvl-cli
+    // scan.go does the merge in the same position).
+    if let Some(path) = &args.cs_file {
+        if let Err(f) = merge_cs_file(path, &mut req) {
+            return fail(f);
+        }
+    }
+
     normalize_control_structure(&mut req.control_structure);
 
     req.service = service.clone();
@@ -1299,17 +1452,28 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     req.metadata.scanner_id = format!("{BIN}/{version}");
     populate_git_metadata(&mut req.metadata, &target);
 
-    // Submission is non-interactive here: "ci" carries the JSON contract,
-    // "auto" everything else (the interactive review prompt is not ported).
-    req.scan_mode = match format {
-        OutputFormat::Json => "ci".to_string(),
-        OutputFormat::Text => "auto".to_string(),
-    };
+    req.scan_mode = resolve_scan_mode(&format, args.review).to_string();
+
+    // `.revelara.yaml` attribution and scoring (rvl-cli scan.go, same order):
+    // per-finding `linked_services` from the components, then the criticality
+    // multiplier. Both are silent-degradation paths — omitting them submits
+    // successfully while the register attributes every finding to the bare
+    // service label and scores it below what rvl-cli scored.
+    if let Some(cfg) = project_cfg.as_ref() {
+        if !cfg.components.is_empty() {
+            if let Some(findings) = req.findings.as_mut() {
+                crate::project_mapping::map_findings_to_components(findings, cfg);
+            }
+        }
+        let crit = cfg.criticality_score();
+        if crit > 0.0 {
+            req.business_criticality = Some(crit);
+        }
+    }
 
     // po-77b6w.1: carry team ownership on the submission. --team overrides the
     // whole submission; otherwise `.revelara.yaml` `team:` (repo default) and
     // per-component `team:` entries apply.
-    let project_cfg = crate::project_config::load_project_config_from(&target);
     apply_team_assignments(&mut req, project_cfg.as_ref(), &team_flag);
 
     // Dry run (po-4g59y): machine-readable summary on stdout so the scan
@@ -1544,7 +1708,7 @@ mod tests {
             })]),
             ..Default::default()
         };
-        req.metadata.scanner_id = "rvlscan/0.1.0".into();
+        req.metadata.scanner_id = "rvl/0.1.0".into();
         req
     }
 
@@ -1586,6 +1750,89 @@ mod tests {
         assert!(!request_body(&b, false).contains("idempotency_key"));
     }
 
+    /// po-av01j.186: `scanner_id` names the submitting binary, not the scan.
+    /// The value stays on the wire (adoption telemetry for the v1->v2
+    /// cutover) but must not reach the key, or a scan submitted by
+    /// `rely-cli-<ver>` and retried by `rvl/<ver>` misses the server-side
+    /// dedup and creates a second scan.
+    #[test]
+    fn scanner_id_does_not_participate_in_the_key() {
+        let mut v1 = base_request();
+        v1.metadata.scanner_id = "rely-cli-0.8.13".into();
+        let mut v2 = base_request();
+        v2.metadata.scanner_id = "rvl/1.0.0".into();
+        assert_eq!(
+            derive_idempotency_key(&v1),
+            derive_idempotency_key(&v2),
+            "the same scan retried by the other binary must dedupe"
+        );
+        // ...while staying distinguishable on the wire.
+        assert!(request_body(&v1, true).contains(r#""scanner_id":"rely-cli-0.8.13""#));
+        assert!(request_body(&v2, true).contains(r#""scanner_id":"rvl/1.0.0""#));
+    }
+
+    /// po-av01j.186: git_commit/git_branch are provenance labels for where
+    /// HEAD happened to be, not scan content. v1 never populated them and v2
+    /// auto-detects them, so keeping them in the key both breaks cross-binary
+    /// dedup and voids "rerun after a timeout replays the cached response"
+    /// whenever an amend/rebase/branch-rename moves HEAD under an unchanged
+    /// tree.
+    #[test]
+    fn git_metadata_does_not_participate_in_the_key() {
+        let v1 = base_request(); // rvl-cli leaves these empty
+        let mut v2 = base_request();
+        v2.metadata.git_commit = "9f1c0e2a7b5d4c3e2f1a0b9c8d7e6f5a4b3c2d1e".into();
+        v2.metadata.git_branch = "feat/timeouts".into();
+        assert_eq!(derive_idempotency_key(&v1), derive_idempotency_key(&v2));
+        assert!(request_body(&v2, true).contains(r#""git_branch":"feat/timeouts""#));
+    }
+
+    /// Everything that genuinely describes the scan still moves the key.
+    #[test]
+    fn scan_identifying_metadata_still_moves_the_key() {
+        let base = base_request();
+        let mut matcher = base_request();
+        matcher.metadata.matcher_version = "2026.08.1".into();
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&matcher)
+        );
+
+        let mut skill = base_request();
+        skill.metadata.skill_version = "0.3.0".into();
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&skill)
+        );
+
+        let mut excluded = base_request();
+        excluded.metadata.excluded_matchers = vec!["no-timeout".into()];
+        assert_ne!(
+            derive_idempotency_key(&base),
+            derive_idempotency_key(&excluded)
+        );
+
+        let mut mode = base_request();
+        mode.scan_mode = "ci".into();
+        assert_ne!(derive_idempotency_key(&base), derive_idempotency_key(&mode));
+    }
+
+    /// The canonical bytes are the contract shared with the Go v1 client:
+    /// the submitter-identifying metadata is blanked, so `metadata` collapses
+    /// to `{}` for a request that carried nothing else.
+    #[test]
+    fn canonical_key_body_blanks_submitter_metadata() {
+        let mut req = base_request();
+        req.metadata.scanner_id = "rvl/1.0.0".into();
+        req.metadata.git_commit = "abc123".into();
+        req.metadata.git_branch = "main".into();
+        req.idempotency_key = "k".into();
+        assert_eq!(
+            idempotency_canonical_body(&req),
+            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{}}"#
+        );
+    }
+
     // --- request emission ---
 
     #[test]
@@ -1602,7 +1849,7 @@ mod tests {
         let body = request_body(&req, true);
         assert_eq!(
             body,
-            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{"git_commit":"abc123","scanner_id":"rvlscan/0.1.0"},"business_criticality":0.9,"service_tolerance":{"tolerance_target":25,"strict_enforcement":true},"idempotency_key":"k"}"#
+            r#"{"service":"checkout-api","scan_type":"full","scan_mode":"auto","findings":[{"category":"resilience","impact":"high","likelihood":"high","risk_score":61,"title":"Missing timeout"}],"metadata":{"git_commit":"abc123","scanner_id":"rvl/0.1.0"},"business_criticality":0.9,"service_tolerance":{"tolerance_target":25,"strict_enforcement":true},"idempotency_key":"k"}"#
         );
     }
 
@@ -1953,5 +2200,100 @@ mod tests {
         assert!(arr.is_err(), "bare array must not parse as a request");
         let findings: Vec<Value> = serde_json::from_str(r#"[{"title":"t"}]"#).unwrap();
         assert_eq!(findings.len(), 1);
+    }
+
+    // --- po-av01j.185 item 3: --review and --cs-file ---
+
+    #[test]
+    fn scan_mode_reproduces_rvl_clis_precedence() {
+        // Default: the non-interactive mode, unchanged by this item.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Text, false), "auto");
+        // --review carries the wire value an interactive rvl-cli run sends.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Text, true), "review");
+        // --ci / --format json outrank --review, exactly as rvl-cli does.
+        assert_eq!(resolve_scan_mode(&OutputFormat::Json, false), "ci");
+        assert_eq!(resolve_scan_mode(&OutputFormat::Json, true), "ci");
+    }
+
+    #[test]
+    fn scan_mode_moves_the_client_key_which_is_why_the_server_recomputes_one() {
+        // Honest statement of the mechanism, not a wish: scan_mode IS part
+        // of the request body, so it moves the CLIENT-derived key. That is
+        // exactly the poisoning the server-side canonical key (backend
+        // commit a40b6d8e, po-av01j.186/.189) exists to absorb: it re-derives a
+        // content identity with scanner_id, git_commit, git_branch,
+        // scan_mode and idempotency_key excluded, and looks up on that key
+        // first. So `--review` is safe to add to an existing invocation
+        // even though this local hash changes.
+        let mut auto = base_request();
+        auto.scan_mode = "auto".into();
+        let mut review = base_request();
+        review.scan_mode = "review".into();
+        assert_ne!(
+            derive_idempotency_key(&auto),
+            derive_idempotency_key(&review)
+        );
+        // ...and the only difference between the two bodies is that field,
+        // which is what makes the server's exclusion sufficient.
+        assert_eq!(
+            idempotency_canonical_body(&auto)
+                .replace(r#""scan_mode":"auto""#, r#""scan_mode":"review""#),
+            idempotency_canonical_body(&review)
+        );
+    }
+
+    fn write_cs(dir: &std::path::Path, body: &str) -> PathBuf {
+        let p = dir.join("cs.json");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn cs_file_supplies_the_control_structure_and_a_repo_url_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_cs(
+            tmp.path(),
+            r#"{"repo_url":"https://example.test/repo","control_structure":{"nodes":[{"id":"api"}],"scanned_files":12,"scanned_lines":3400}}"#,
+        );
+        let mut req = base_request();
+        req.repo_url = String::new();
+        req.control_structure = None;
+        merge_cs_file(&path, &mut req).unwrap();
+        assert_eq!(req.repo_url, "https://example.test/repo");
+        let cs = req.control_structure.as_ref().expect("merged");
+        assert_eq!(cs.scanned_files, 12);
+        assert_eq!(cs.scanned_lines, 3400);
+    }
+
+    #[test]
+    fn cs_file_never_overrides_what_the_submission_already_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_cs(
+            tmp.path(),
+            r#"{"repo_url":"https://example.test/from-file","control_structure":{"nodes":[{"id":"from-file"}],"scanned_files":1}}"#,
+        );
+        let mut req = base_request();
+        req.repo_url = "https://example.test/in-band".into();
+        req.control_structure = Some(ControlStructureData {
+            scanned_files: 99,
+            ..Default::default()
+        });
+        merge_cs_file(&path, &mut req).unwrap();
+        assert_eq!(req.repo_url, "https://example.test/in-band");
+        assert_eq!(req.control_structure.as_ref().unwrap().scanned_files, 99);
+    }
+
+    #[test]
+    fn cs_file_errors_name_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = base_request();
+        let missing = tmp.path().join("nope.json");
+        let e = merge_cs_file(&missing, &mut req).unwrap_err();
+        assert!(e.msg.starts_with("Error reading --cs-file:"), "{}", e.msg);
+        assert_eq!(e.code, 1);
+
+        let bad = write_cs(tmp.path(), "not json");
+        let e = merge_cs_file(&bad, &mut req).unwrap_err();
+        assert!(e.msg.starts_with("Error parsing --cs-file:"), "{}", e.msg);
     }
 }

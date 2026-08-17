@@ -3,13 +3,12 @@
 //! Same file (`~/.revelara/config.yaml`), same keys (`api_url`, `api_key`,
 //! `org_name`), same env override contract (`RVL_API_KEY` / `RVL_API_URL` /
 //! `RVL_ORG_NAME` beat the file; the CI use case has no config file at all).
-//! The rvlscan-specific `RVLSCAN_API_BASE` / `RVLSCAN_ORG_KEY` overrides used
-//! by the scan surface are honored at the top of the chain so one binary has
-//! one consistent story.
+//! There is exactly ONE env name per value across the whole binary: the scan
+//! surface reads these same variables, so one binary has one consistent story.
 //!
 //! SECURITY: this module reads/writes ONLY `api_url` / `api_key` /
 //! `org_name`. Signing-key material must never become a config field (see
-//! the shared-config security contract in the rvlscan crate).
+//! the shared-config security contract in the rvl crate).
 
 use crate::{CmdResult, Failure, BIN};
 use clap::Subcommand;
@@ -51,10 +50,10 @@ pub fn resolve_from(
         None => DataConfig::default(),
     };
     let env = |name: &str| get_env(name).filter(|v| !v.is_empty());
-    if let Some(v) = env("RVLSCAN_ORG_KEY").or_else(|| env("RVL_API_KEY")) {
+    if let Some(v) = env("RVL_API_KEY") {
         cfg.api_key = v;
     }
-    if let Some(v) = env("RVLSCAN_API_BASE").or_else(|| env("RVL_API_URL")) {
+    if let Some(v) = env("RVL_API_URL") {
         cfg.api_url = v;
     }
     if let Some(v) = env("RVL_ORG_NAME") {
@@ -114,7 +113,7 @@ fn write_config_text(path: &Path, data: &str) -> Result<(), String> {
 // --- `config` subcommand (show, set) — ported from rvl-cli
 // `internal/commands/config_cmd.go` (po-av01j.164). ---
 
-/// `rvlscan config`: view and edit CLI configuration.
+/// `rvl config`: view and edit CLI configuration.
 #[derive(Subcommand)]
 pub enum ConfigCmd {
     /// Show current configuration (API key masked)
@@ -333,15 +332,30 @@ mod tests {
     }
 
     #[test]
-    fn rvlscan_env_beats_rvl_env() {
+    fn legacy_rvlscan_env_names_have_no_effect() {
+        // The binary reads exactly ONE env name per value. The pre-1.0
+        // `RVLSCAN_ORG_KEY` / `RVLSCAN_API_BASE` names are not aliases and
+        // not a deprecation shim: they are simply not read. Setting them
+        // must leave resolution exactly where `RVL_*` and the defaults put
+        // it, so this asserts the RESOLVED values positively rather than
+        // asserting the absence of the old name.
         let env = |name: &str| match name {
-            "RVLSCAN_ORG_KEY" => Some("pk_scan".to_string()),
+            "RVLSCAN_ORG_KEY" => Some("pk_legacy".to_string()),
+            "RVLSCAN_API_BASE" => Some("https://legacy.test".to_string()),
             "RVL_API_KEY" => Some("pk_rvl".to_string()),
             _ => None,
         };
         let cfg = resolve_from(None, env).unwrap().unwrap();
-        assert_eq!(cfg.api_key, "pk_scan");
+        assert_eq!(cfg.api_key, "pk_rvl");
         assert_eq!(cfg.api_url, DEFAULT_API_URL);
+
+        // With ONLY the legacy names set, there is no key anywhere.
+        let legacy_only = |name: &str| match name {
+            "RVLSCAN_ORG_KEY" => Some("pk_legacy".to_string()),
+            "RVLSCAN_API_BASE" => Some("https://legacy.test".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_from(None, legacy_only).unwrap(), None);
     }
 
     #[test]
@@ -397,7 +411,7 @@ mod tests {
         let out = show_output(None);
         assert_eq!(
             out,
-            "No configuration found. Run 'rvlscan login' first, or set RVL_API_KEY for headless/CI use.\n"
+            "No configuration found. Run 'rvl login' first, or set RVL_API_KEY for headless/CI use.\n"
         );
     }
 

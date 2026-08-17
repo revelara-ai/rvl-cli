@@ -130,6 +130,72 @@ pub fn format_uca_type(uca_type: &str) -> String {
         .join(" ")
 }
 
+/// STPA markers parsed out of an enriched narrative.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StpaContext {
+    pub uca_type: String,
+    pub loss_scenario: String,
+    pub causal_factors: Vec<String>,
+    /// The narrative with the marker blocks removed.
+    pub clean_narrative: String,
+}
+
+const UCA_MARKER: &str = "**Unsafe Control Action:**";
+const LOSS_MARKER: &str = "**Loss Scenario:**";
+const FACTORS_MARKER: &str = "**Causal Factors:**";
+
+/// The marker's whole match (marker + leading whitespace + rest of that
+/// line) and the captured tail, mirroring Go's
+/// `\*\*Marker:\*\*\s*(.+)`: `\s*` is greedy and crosses newlines, `.`
+/// does not, so the capture is the first non-blank line after the marker.
+fn match_marker_line<'a>(text: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
+    let start = text.find(marker)?;
+    let after = start + marker.len();
+    let rest = &text[after..];
+    let ws = rest.len() - rest.trim_start().len();
+    let tail = &rest[ws..];
+    if tail.is_empty() {
+        return None;
+    }
+    let line_end = tail.find('\n').unwrap_or(tail.len());
+    let line = &tail[..line_end];
+    Some((&text[start..after + ws + line_end], line.trim()))
+}
+
+/// Extract STPA markers from an enriched narrative; `None` when the
+/// narrative carries none (rvl-cli `display.ParseSTPAContext`).
+pub fn parse_stpa_context(narrative: &str) -> Option<StpaContext> {
+    if narrative.is_empty() {
+        return None;
+    }
+    let mut ctx = StpaContext::default();
+    let mut clean = narrative.to_string();
+
+    if let Some((whole, captured)) = match_marker_line(narrative, UCA_MARKER) {
+        ctx.uca_type = captured.to_string();
+        clean = clean.replacen(whole, "", 1);
+    }
+    if let Some((whole, captured)) = match_marker_line(narrative, LOSS_MARKER) {
+        ctx.loss_scenario = captured.to_string();
+        clean = clean.replacen(whole, "", 1);
+    }
+    if let Some(at) = narrative.find(FACTORS_MARKER) {
+        let block = &narrative[at + FACTORS_MARKER.len()..];
+        clean = clean.replacen(&narrative[at..], "", 1);
+        for line in block.split('\n') {
+            if let Some(item) = line.trim().strip_prefix("- ") {
+                ctx.causal_factors.push(item.to_string());
+            }
+        }
+    }
+
+    if ctx.uca_type.is_empty() && ctx.loss_scenario.is_empty() && ctx.causal_factors.is_empty() {
+        return None;
+    }
+    ctx.clean_narrative = clean.trim().to_string();
+    Some(ctx)
+}
+
 /// The STPA causal question a UCA type answers.
 pub fn format_uca_category(uca_type: &str) -> &'static str {
     match uca_type.to_lowercase().replace(' ', "_").as_str() {
@@ -176,5 +242,50 @@ mod tests {
         assert_eq!(format_weight_tier(5), "Important");
         assert_eq!(format_weight_tier(3), "Recommended");
         assert_eq!(format_weight_tier(1), "Advisory");
+    }
+
+    #[test]
+    fn stpa_context_parses_all_three_markers() {
+        // The exact fixture rvl-cli's display tests use.
+        let narrative = "This service lacks circuit breakers on external API calls.\n\
+**Unsafe Control Action:** not_provided\n\
+**Loss Scenario:** Cascading failure when payment provider is unavailable\n\
+**Causal Factors:**\n\
+- inadequate feedback: no monitoring on retry rates\n\
+- incorrect process model: assumes external services are always available";
+        let ctx = parse_stpa_context(narrative).expect("markers present");
+        assert_eq!(ctx.uca_type, "not_provided");
+        assert_eq!(
+            ctx.loss_scenario,
+            "Cascading failure when payment provider is unavailable"
+        );
+        assert_eq!(
+            ctx.causal_factors,
+            vec![
+                "inadequate feedback: no monitoring on retry rates".to_string(),
+                "incorrect process model: assumes external services are always available"
+                    .to_string(),
+            ]
+        );
+        // The markers are stripped; the prose survives.
+        assert_eq!(
+            ctx.clean_narrative,
+            "This service lacks circuit breakers on external API calls."
+        );
+    }
+
+    #[test]
+    fn stpa_context_is_none_without_markers_or_content() {
+        assert!(parse_stpa_context("A plain narrative with no STPA markers.").is_none());
+        assert!(parse_stpa_context("").is_none());
+    }
+
+    #[test]
+    fn stpa_context_tolerates_a_single_marker() {
+        let ctx = parse_stpa_context("prose\n**Loss Scenario:** everything burns").unwrap();
+        assert_eq!(ctx.loss_scenario, "everything burns");
+        assert!(ctx.uca_type.is_empty());
+        assert!(ctx.causal_factors.is_empty());
+        assert_eq!(ctx.clean_narrative, "prose");
     }
 }

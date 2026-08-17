@@ -14,7 +14,9 @@
 use crate::client::Client;
 use crate::display;
 use crate::gojson::{compact, path_escape, pretty, query_encode, G};
+use crate::risk_context_render as render;
 use crate::{CmdResult, Failure, BIN};
+use rvl_core::flag::EmptyFlag;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -146,6 +148,53 @@ pub struct RiskDetail {
     pub mapped_controls: Vec<MappedControl>,
     #[serde(default)]
     pub narrative: String,
+
+    // Parity fields for the full `risk context` table (po-p3xur on the Go
+    // side, po-av01j.185 item 4 here). Additive and render-only: `show
+    // --format=json` still echoes the raw server body, so typing them here
+    // narrows nothing.
+    #[serde(default)]
+    pub likelihood: String,
+    #[serde(default)]
+    pub impact: String,
+    #[serde(default)]
+    pub trend: String,
+    #[serde(default)]
+    pub plain_summary: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub source_intelligence_tier: String,
+    #[serde(default)]
+    pub risk_class: String,
+    #[serde(default)]
+    pub resolution_reason: String,
+    #[serde(default)]
+    pub constraint_type: String,
+    #[serde(default)]
+    pub evidence_status: String,
+    #[serde(default)]
+    pub graph_multiplier: f64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub related_findings: Vec<render::RelatedFindingItem>,
+    /// Free-form on the wire (oneOf array/object): kept raw and decoded
+    /// only by the renderer, which tolerates a shape it cannot read.
+    #[serde(default)]
+    pub substantiation: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    pub corroborating_incidents: Vec<render::CorroboratingIncidentItem>,
+    #[serde(default)]
+    pub score_breakdown: Option<render::ScoreBreakdown>,
+    #[serde(default)]
+    pub latest_dismissal: Option<render::LatestDismissal>,
+    #[serde(default)]
+    pub stpa_provenance: Option<render::StpaProvenanceData>,
+    #[serde(default)]
+    pub generated_matcher: Option<render::GeneratedMatcherRef>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -246,6 +295,10 @@ pub struct CategoryCoverage {
     pub assessed: i64,
 }
 
+/// EMPTY-FLAG SEMANTICS (po-av01j.192): every field is destructured by name
+/// here — no `..` — so a flag added to `RiskCmd` later cannot reach the wire
+/// without its author deciding, at this site, what an empty value means. The
+/// decisions below are read off `internal/commands/risk.go`.
 pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
     let res = (|| -> CmdResult {
         match cmd {
@@ -256,14 +309,17 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 format,
                 limit,
             } => {
+                // risk.go:417/420/423 — each filter is guarded `!= ""`, so an
+                // empty one is simply not a filter. `--limit=` is rejected by
+                // clap's typed parse, as `strconv.Atoi("")` is at risk.go:351.
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(
                     &client,
-                    status.as_deref(),
-                    category.as_deref(),
-                    service.as_deref(),
+                    status.empty_is_absent(),
+                    category.empty_is_absent(),
+                    service.empty_is_absent(),
                     limit,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Ready {
@@ -272,22 +328,25 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 format,
                 limit,
             } => {
+                // risk.go:532/535.
                 let (_, client) = crate::client::load_and_resolve()?;
                 ready_output(
                     &client,
-                    category.as_deref(),
-                    service.as_deref(),
+                    category.empty_is_absent(),
+                    service.empty_is_absent(),
                     limit as usize,
-                    format.as_deref(),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Show { code, format } => {
+                // risk.go:751 only ever compares `format == "json"`.
                 let (_, client) = crate::client::load_and_resolve()?;
-                show_output(&client, &code, format.as_deref())
+                show_output(&client, &code, format.empty_is_absent())
             }
             RiskCmd::Context { code, format } => {
+                // risk.go:920, same comparison.
                 let (_, client) = crate::client::load_and_resolve()?;
-                context_output(&client, &code, format.as_deref())
+                context_output(&client, &code, format.empty_is_absent())
             }
             RiskCmd::Stale => {
                 let (_, client) = crate::client::load_and_resolve()?;
@@ -298,17 +357,22 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 reason,
                 format,
             } => {
+                // risk.go:1097/1152: `--reason=` OVERRIDES the "Resolved"
+                // default and is POSTed as {"reason":""}. Falling back to the
+                // default would write a sentence into the risk register that
+                // the operator did not type.
                 let (_, client) = crate::client::load_and_resolve()?;
                 resolve_output(
                     &client,
                     &code,
-                    reason.as_deref().unwrap_or("Resolved"),
-                    format.as_deref(),
+                    reason.empty_is_value().unwrap_or("Resolved"),
+                    format.empty_is_absent(),
                 )
             }
             RiskCmd::Accept { code, reason } => {
+                // risk.go:1205 — same, with "" as the default reason.
                 let (_, client) = crate::client::load_and_resolve()?;
-                accept_output(&client, &code, reason.as_deref().unwrap_or(""))
+                accept_output(&client, &code, reason.empty_is_value().unwrap_or(""))
             }
         }
     })();
@@ -658,13 +722,37 @@ pub fn context_output(client: &Client, code: &str, format: Option<&str>) -> CmdR
     }
 
     let base = format!("{}/api/v1/risks/{}", client.api_url, path_escape(code));
-    let detail_res = client.request("GET", &base, None);
-    let ctx_res = client.request("GET", &format!("{base}/context"), None);
-    let stats_res = client.request(
-        "GET",
-        &format!("{}/api/v1/risks/stats", client.api_url),
-        None,
-    );
+
+    // po-av01j.200: the three fetches run CONCURRENTLY, mirroring rvl-cli's
+    // sync.WaitGroup (internal/commands/risk.go). This is load-bearing, not a
+    // micro-optimization: `risk context` is the richest read in the CLI and the
+    // command `/rvl:fix` runs to ground a remediation, so serializing three
+    // round trips roughly triples the latency a developer waits on. Scoped
+    // threads rather than an async runtime because the HTTP client is blocking
+    // (ureq) and the workspace has no executor; three threads for one call site
+    // is a far smaller change than adopting one.
+    //
+    // Shape matches Go exactly: fire all three, wait for all three, then decide.
+    // No cancel-on-first-error, and no shared deadline — each request keeps its
+    // own per-request timeout. The decision below reads the three results in a
+    // fixed order, so the outcome cannot depend on which reply lands first.
+    fn join_fetch(
+        h: std::thread::ScopedJoinHandle<'_, Result<Vec<u8>, String>>,
+    ) -> Result<Vec<u8>, String> {
+        h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+    let (detail_res, ctx_res, stats_res) = std::thread::scope(|s| {
+        let detail = s.spawn(|| client.request("GET", &base, None));
+        let ctx = s.spawn(|| client.request("GET", &format!("{base}/context"), None));
+        let stats = s.spawn(|| {
+            client.request(
+                "GET",
+                &format!("{}/api/v1/risks/stats", client.api_url),
+                None,
+            )
+        });
+        (join_fetch(detail), join_fetch(ctx), join_fetch(stats))
+    });
 
     if let (Err(de), Err(_)) = (&detail_res, &ctx_res) {
         return Err(Failure::runtime(format!(
@@ -764,137 +852,21 @@ fn coverage_g(c: &CoverageStats) -> G {
     G::Obj(f)
 }
 
-/// Human context view. Simplified relative to rvl-cli's 700-line renderer
-/// (human output may improve during the port): header, score factors,
-/// control coverage with evidence gaps, knowledge counts, coverage gap.
+/// Human context view: the FULL rvl-cli render (po-av01j.185 item 4).
+///
+/// The first port shipped a 3-section summary here while `--format=json`
+/// stayed complete, so agents were unaffected and humans (and `/rvl:fix`)
+/// lost the evidence grounding. The section set, ordering and formatting
+/// now live in [`crate::risk_context_render`], one function per Go
+/// function, so the two files diff by eye.
 fn render_context_human(
     ctx_body: &[u8],
     detail_body: &[u8],
     coverage: Option<&CoverageStats>,
 ) -> CmdResult {
-    #[derive(Default, Deserialize)]
-    struct Ctx {
-        #[serde(default)]
-        risk: RiskDetail,
-        #[serde(default)]
-        controls: Vec<CtxControl>,
-        #[serde(default)]
-        knowledge: CtxKnowledge,
-        #[serde(default)]
-        score_factors: Vec<ScoreFactor>,
-        // pre-po-foyko alias
-        #[serde(default, rename = "score_breakdown")]
-        score_factors_old: Vec<ScoreFactor>,
-    }
-    #[derive(Default, Deserialize)]
-    struct CtxControl {
-        #[serde(default)]
-        control: MappedControl,
-        #[serde(default)]
-        existing_evidence: Vec<Value>,
-        #[serde(default)]
-        evidence_gaps: Vec<String>,
-    }
-    #[derive(Default, Deserialize)]
-    struct CtxKnowledge {
-        #[serde(default)]
-        patterns: Vec<Value>,
-        #[serde(default)]
-        procedures: Vec<Value>,
-        #[serde(default)]
-        facts: Vec<Value>,
-    }
-    #[derive(Default, Deserialize)]
-    struct ScoreFactor {
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        points: i64,
-        #[serde(default)]
-        source: String,
-    }
-
-    let ctx: Option<Ctx> = serde_json::from_slice(ctx_body).ok();
-    let detail: Option<RiskDetail> = serde_json::from_slice(detail_body).ok();
-    if ctx.is_none() && detail.is_none() {
-        return Err(Failure::runtime("Error parsing risk context response"));
-    }
-
-    let mut out = String::new();
-    {
-        let header: &RiskDetail = detail
-            .as_ref()
-            .or(ctx.as_ref().map(|c| &c.risk))
-            .expect("one of ctx/detail is present");
-        let r = &header.risk;
-        let _ = writeln!(out, "\nRisk Context: {}", r.risk_code);
-        let _ = writeln!(out, "{}", "=".repeat(80));
-        let _ = writeln!(out, "Title:    {}", r.title);
-        let _ = writeln!(out, "Status:   {}", display::format_status(&r.status));
-        let _ = writeln!(out, "Category: {}", r.category);
-        let _ = writeln!(out, "Score:    {}", r.score);
-        if let Some(services) = &r.linked_services {
-            if !services.is_empty() {
-                let _ = writeln!(out, "Services: {}", services.join(", "));
-            }
-        }
-        if !header.narrative.is_empty() {
-            let _ = writeln!(out, "\nNarrative:");
-            let _ = writeln!(out, "{}", "-".repeat(80));
-            let _ = writeln!(out, "{}", display::wrap_text(&header.narrative, 80, ""));
-        }
-    }
-
-    if let Some(ctx) = &ctx {
-        let factors = if ctx.score_factors.is_empty() {
-            &ctx.score_factors_old
-        } else {
-            &ctx.score_factors
-        };
-        if !factors.is_empty() {
-            let _ = writeln!(out, "\nScore Factors:");
-            let _ = writeln!(out, "{}", "-".repeat(80));
-            for f in factors {
-                let _ = writeln!(out, "  +{:<4} {} ({})", f.points, f.description, f.source);
-            }
-        }
-        if !ctx.controls.is_empty() {
-            let _ = writeln!(out, "\nControls:");
-            let _ = writeln!(out, "{}", "-".repeat(80));
-            for c in &ctx.controls {
-                let _ = writeln!(out, "  [{}] {}", c.control.control_code, c.control.name);
-                let _ = writeln!(
-                    out,
-                    "    Evidence: {} on file | Gaps: {}",
-                    c.existing_evidence.len(),
-                    if c.evidence_gaps.is_empty() {
-                        "none".to_string()
-                    } else {
-                        c.evidence_gaps.join(", ")
-                    }
-                );
-            }
-        }
-        let k = &ctx.knowledge;
-        if !(k.patterns.is_empty() && k.procedures.is_empty() && k.facts.is_empty()) {
-            let _ = writeln!(
-                out,
-                "\nKnowledge: {} pattern(s), {} procedure(s), {} fact(s)",
-                k.patterns.len(),
-                k.procedures.len(),
-                k.facts.len()
-            );
-        }
-    }
-
-    if let Some(c) = coverage {
-        let _ = writeln!(
-            out,
-            "\nControl Coverage: {}/{} assessed ({:.1}%)",
-            c.assessed_controls, c.total_controls, c.coverage_percentage
-        );
-    }
-    Ok(out)
+    let view = render::view_from_bodies(ctx_body, detail_body, coverage.cloned())
+        .ok_or_else(|| Failure::runtime("Error parsing risk context response"))?;
+    Ok(render::render_risk_context(&view))
 }
 
 // --- stale ---

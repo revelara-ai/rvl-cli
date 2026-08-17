@@ -8,6 +8,7 @@
 //! as they were. Network failure degrades to the verified cached copy with
 //! a warning; verification failure aborts with an actionable error.
 
+use rvl_core::BIN;
 use std::path::Path;
 
 use crate::fetch::Fetcher;
@@ -21,12 +22,12 @@ pub struct Env<'a> {
     pub store: &'a SkillsStore,
     pub fetcher: &'a dyn Fetcher,
     pub home: &'a Path,
-    /// RVLSCAN_OFFLINE=1: no fetch attempted, cache-only.
+    /// RVL_OFFLINE=1: no fetch attempted, cache-only.
     pub offline: bool,
-    /// RVLSCAN_ALLOW_UNSIGNED=1: accept content without a verifiable
+    /// RVL_ALLOW_UNSIGNED_PLUGIN=1: accept content without a verifiable
     /// integrity manifest (self-hosted servers without signing).
     pub allow_unsigned: bool,
-    /// RVLSCAN_ALLOW_MISSING_CHECKSUM=1: accept a download without the
+    /// RVL_ALLOW_MISSING_CHECKSUM=1: accept a download without the
     /// X-Checksum transport header.
     pub allow_missing_checksum: bool,
 }
@@ -41,6 +42,9 @@ pub struct InstallReport {
     /// cached version already matched the served version).
     pub from_cache: bool,
     pub warnings: Vec<String>,
+    /// Things a post-install hook actually changed, worth telling the user
+    /// about (e.g. Gemini's subagents being enabled).
+    pub notes: Vec<String>,
 }
 
 /// One verified tarball ready to install: bytes already checked, version
@@ -70,7 +74,7 @@ fn check_cached_signature(
             verify_tarball(bytes, &key).map_err(|e| {
                 anyhow::anyhow!(
                     "cached skills for {editor} fail integrity verification ({e}); \
-                     re-run 'rvlscan skills install' online to refetch"
+                     re-run '{BIN} skills install' online to refetch"
                 )
             })?;
             Ok(())
@@ -82,7 +86,7 @@ fn check_cached_signature(
             Ok(())
         }
         None => anyhow::bail!(
-            "cached skills for {editor} carry no signing key; set RVLSCAN_ALLOW_UNSIGNED=1 \
+            "cached skills for {editor} carry no signing key; set RVL_ALLOW_UNSIGNED_PLUGIN=1 \
              to install them anyway, or re-run online against a signing-enabled server"
         ),
     }
@@ -123,7 +127,7 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
             warnings.push("server did not send X-Checksum (allowed by env)".to_string());
         }
         None => anyhow::bail!(
-            "server did not send X-Checksum header; set RVLSCAN_ALLOW_MISSING_CHECKSUM=1 \
+            "server did not send X-Checksum header; set RVL_ALLOW_MISSING_CHECKSUM=1 \
              to install anyway"
         ),
     }
@@ -138,12 +142,12 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
         }
         Err(e) if env.allow_unsigned => {
             warnings.push(format!(
-                "installing without signature verification (RVLSCAN_ALLOW_UNSIGNED=1): {e}"
+                "installing without signature verification (RVL_ALLOW_UNSIGNED_PLUGIN=1): {e}"
             ));
         }
         Err(e) => anyhow::bail!(
             "could not fetch signing key for integrity verification: {e}; \
-             set RVLSCAN_ALLOW_UNSIGNED=1 to install unsigned content"
+             set RVL_ALLOW_UNSIGNED_PLUGIN=1 to install unsigned content"
         ),
     }
 
@@ -172,8 +176,8 @@ fn acquire(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
     if env.offline {
         return acquire_from_cache(env, editor)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "offline (RVLSCAN_OFFLINE=1) and no cached skills for {editor}; \
-                 unset RVLSCAN_OFFLINE and re-run once online to seed the cache"
+                "offline (RVL_OFFLINE=1) and no cached skills for {editor}; \
+                 unset RVL_OFFLINE and re-run once online to seed the cache"
             )
         });
     }
@@ -210,6 +214,16 @@ pub fn install_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<InstallRe
     let acquired = acquire(env, editor)?;
     let files = crate::verify::extract_tarball(&acquired.bytes)?;
     let receipt = harness.install(env.home, &files, &acquired.version)?;
+    // Post-install hooks configure the harness itself (Gemini's
+    // experimental.enableAgents). A failure is a warning, never a failed
+    // install: the skills are already on disk.
+    let mut warnings = acquired.warnings;
+    let mut notes = Vec::new();
+    match harness.post_install(env.home) {
+        Ok(Some(note)) => notes.push(note),
+        Ok(None) => {}
+        Err(e) => warnings.push(format!("post-install hook failed: {e}")),
+    }
     env.store.record_installed(
         harness.name(),
         InstalledInfo {
@@ -223,8 +237,130 @@ pub fn install_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<InstallRe
         version: acquired.version,
         receipt,
         from_cache: acquired.from_cache,
-        warnings: acquired.warnings,
+        warnings,
+        notes,
     })
+}
+
+/// The directory a `--project` install/remove operates on for `harness`,
+/// or an actionable refusal for harnesses with no project-local layout.
+pub fn project_dir(
+    harness: &dyn Harness,
+    project_root: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let Some(local) = harness.local_dir() else {
+        anyhow::bail!(
+            "--project is not supported for {}: its install is user-level, not \
+             project-local. Run '{BIN} plugin install {}' without --project.",
+            harness.name(),
+            harness.name()
+        );
+    };
+    Ok(project_root.join(local))
+}
+
+/// Install project-locally, into `<project_root>/<local_dir>` — the layout a
+/// repository can COMMIT so every contributor gets the same skills.
+///
+/// Deliberately unlike the global install in three ways, all rvl-cli parity:
+/// no post-install hook runs (those configure the user's own machine), no
+/// registration is returned (harness plugin systems are user-level), and
+/// nothing is recorded in the install store — the repo is the record.
+pub fn install_one_project(
+    env: &Env,
+    harness: &dyn Harness,
+    project_root: &Path,
+) -> anyhow::Result<InstallReport> {
+    let root = project_dir(harness, project_root)?;
+    let acquired = acquire(env, harness.editor_param())?;
+    let files = crate::verify::extract_tarball(&acquired.bytes)?;
+    let receipt = crate::harness::install_files_at(&root, &files, harness.note())?;
+    Ok(InstallReport {
+        harness: harness.name().to_string(),
+        version: acquired.version,
+        receipt,
+        from_cache: acquired.from_cache,
+        warnings: acquired.warnings,
+        notes: Vec::new(),
+    })
+}
+
+/// Remove a project-local install: exactly the files the tarball placed
+/// under `<project_root>/<local_dir>`, never the repo's own content.
+pub fn remove_one_project(
+    env: &Env,
+    harness: &dyn Harness,
+    project_root: &Path,
+) -> anyhow::Result<RemoveReport> {
+    let root = project_dir(harness, project_root)?;
+    let files = env
+        .store
+        .load(harness.editor_param())
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| crate::verify::extract_tarball(&bytes))
+        .transpose()?;
+    let receipt = crate::harness::remove_files_at(&root, files.as_ref(), harness.name())?;
+    Ok(RemoveReport {
+        harness: harness.name().to_string(),
+        receipt,
+    })
+}
+
+/// One project-local installation directory and the harnesses that read it.
+/// Grouped because several harnesses share `.agents/skills`: listing that
+/// one directory seven times would be noise, not information.
+pub struct ProjectInstall {
+    pub dir: std::path::PathBuf,
+    pub harnesses: Vec<String>,
+}
+
+/// Does `dir` contain Revelara skill content? Every file the tarball ships
+/// lives under an `rvl-`-prefixed directory or file, so a bounded look for
+/// that prefix (the dir itself and one level down, covering the
+/// `skills/`-and-`agents/`-nested layouts) is enough and never walks a repo.
+fn has_rvl_content(dir: &Path) -> bool {
+    fn any_rvl(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("rvl-"))
+                })
+            })
+            .unwrap_or(false)
+    }
+    if any_rvl(dir) {
+        return true;
+    }
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .any(|e| any_rvl(&e.path()))
+        })
+        .unwrap_or(false)
+}
+
+/// Project-local installations under `project_root`, for the
+/// "Project-local installations" section of `plugin list`.
+pub fn project_installs(project_root: &Path) -> Vec<ProjectInstall> {
+    let mut by_dir: std::collections::BTreeMap<std::path::PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for h in crate::harness::registry() {
+        let Some(local) = h.local_dir() else { continue };
+        let dir = project_root.join(local);
+        if !has_rvl_content(&dir) {
+            continue;
+        }
+        by_dir.entry(dir).or_default().push(h.name().to_string());
+    }
+    by_dir
+        .into_iter()
+        .map(|(dir, harnesses)| ProjectInstall { dir, harnesses })
+        .collect()
 }
 
 /// A completed removal for one harness.
@@ -261,7 +397,7 @@ pub fn remove_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<RemoveRepo
 pub fn editors(env: &Env) -> anyhow::Result<Vec<crate::fetch::EditorInfo>> {
     anyhow::ensure!(
         !env.offline,
-        "offline (RVLSCAN_OFFLINE=1): the editors listing is served by the Revelara API"
+        "offline (RVL_OFFLINE=1): the editors listing is served by the Revelara API"
     );
     env.fetcher.fetch_editors()
 }
@@ -283,7 +419,7 @@ pub struct CachedStatus {
 }
 
 /// One install recorded only by rvl-cli's v1 metadata (not yet adopted
-/// into rvlscan's own store).
+/// into rvl's own store).
 pub struct V1InstallStatus {
     pub harness: String,
     pub version: String,
@@ -298,7 +434,7 @@ pub struct StatusReport {
     pub server_note: Option<String>,
     pub harnesses: Vec<HarnessStatus>,
     /// Installs known only from rvl-cli's v1 records (read-only fallback);
-    /// harnesses rvlscan's own store already tracks are excluded.
+    /// harnesses rvl's own store already tracks are excluded.
     pub v1_installs: Vec<V1InstallStatus>,
     pub cached: Vec<CachedStatus>,
 }
@@ -307,7 +443,7 @@ pub struct StatusReport {
 /// installed/cached information plus a note.
 pub fn status(env: &Env) -> StatusReport {
     let (served_version, server_note) = if env.offline {
-        (None, Some("offline (RVLSCAN_OFFLINE=1)".to_string()))
+        (None, Some("offline (RVL_OFFLINE=1)".to_string()))
     } else {
         match env.fetcher.fetch_version() {
             Ok(v) => (Some(v), None),
@@ -624,7 +760,7 @@ mod tests {
         let env = fx.env(&store, &fetcher);
         let err = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
         assert!(
-            err.to_string().contains("RVLSCAN_ALLOW_UNSIGNED"),
+            err.to_string().contains("RVL_ALLOW_UNSIGNED_PLUGIN"),
             "got: {err}"
         );
 
@@ -695,6 +831,120 @@ mod tests {
         assert!(!fx.home.path().join(".revelara/marketplace").exists());
         assert!(report.receipt.register.is_some());
         assert!(store.read_installed().is_empty());
+    }
+
+    #[test]
+    fn project_install_writes_into_the_repo_not_home() {
+        let fx = Fixture::new();
+        let repo = tempfile::tempdir().unwrap();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("cursor").unwrap();
+
+        let report = install_one_project(&env, h.as_ref(), repo.path()).unwrap();
+        assert_eq!(report.receipt.location, repo.path().join(".cursor"));
+        assert!(repo.path().join(".cursor/rvl-scan/SKILL.md").exists());
+        // Home is untouched, and a project install is NOT a global record:
+        // the repository is the record.
+        assert!(!fx.home.path().join(".cursor").exists());
+        assert!(store.read_installed().is_empty());
+
+        let removed = remove_one_project(&env, h.as_ref(), repo.path()).unwrap();
+        assert_eq!(removed.receipt.files_removed, Some(2));
+        assert!(!repo.path().join(".cursor/rvl-scan").exists());
+    }
+
+    #[test]
+    fn project_install_refuses_a_harness_with_no_local_layout() {
+        let fx = Fixture::new();
+        let repo = tempfile::tempdir().unwrap();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+
+        let err = install_one_project(&env, by_name("claude").unwrap().as_ref(), repo.path())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--project is not supported"),
+            "{err}"
+        );
+        assert!(!repo.path().join(".revelara").exists(), "nothing written");
+    }
+
+    #[test]
+    fn project_installs_are_listed_grouped_by_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(project_installs(repo.path()).is_empty());
+
+        // `.agents/skills` is shared by several harnesses; `.cursor` is not.
+        std::fs::create_dir_all(repo.path().join(".agents/skills/rvl-scan")).unwrap();
+        std::fs::write(
+            repo.path().join(".agents/skills/rvl-scan/SKILL.md"),
+            b"scan",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".cursor/skills/rvl-scan")).unwrap();
+        std::fs::write(
+            repo.path().join(".cursor/skills/rvl-scan/SKILL.md"),
+            b"scan",
+        )
+        .unwrap();
+        // A directory with no Revelara content is not an install.
+        std::fs::create_dir_all(repo.path().join(".kiro/skills/other")).unwrap();
+
+        let found = project_installs(repo.path());
+        assert_eq!(found.len(), 2, "one row per directory, not per harness");
+        let agents = found
+            .iter()
+            .find(|p| p.dir == repo.path().join(".agents/skills"))
+            .expect(".agents/skills row");
+        assert!(agents.harnesses.contains(&"codex".to_string()));
+        assert!(agents.harnesses.contains(&"opencode".to_string()));
+        let cursor = found
+            .iter()
+            .find(|p| p.dir == repo.path().join(".cursor"))
+            .expect(".cursor row");
+        assert_eq!(cursor.harnesses, vec!["cursor"]);
+    }
+
+    /// A v1 rvl-cli record for a harness rvl now supports must SURVIVE into
+    /// the status report until an actual v2 install adopts it — dropping it
+    /// is how an upgraded user's install silently becomes unmanageable.
+    #[test]
+    fn v1_records_for_every_supported_harness_survive() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        std::fs::create_dir_all(fx.home.path().join(".revelara")).unwrap();
+        let records: String = crate::harness::supported_names()
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{"editor":"{n}","version":"0.9.0","installed":"2026-08-01T10:00:00Z","location":"/v1/{n}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            fx.home.path().join(".revelara/plugins.json"),
+            format!("[{records}]"),
+        )
+        .unwrap();
+
+        let dead = MockFetcher::down("timeout");
+        let report = status(&fx.env(&store, &dead));
+        assert_eq!(
+            report.v1_installs.len(),
+            crate::harness::supported_names().len(),
+            "every v1 record must survive, including the tier-3 harnesses"
+        );
+        assert!(report
+            .v1_installs
+            .iter()
+            .any(|p| p.harness == "goose" && p.version == "0.9.0"));
+        assert!(report.v1_installs.iter().any(|p| p.harness == "opencode"));
     }
 
     #[test]

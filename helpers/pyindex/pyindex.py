@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# pyindex -- Python retriever helper for rvlscan.
+# pyindex -- Python retriever helper for rvl.
 #
 # Retrieval mode: emit the SOURCE that bears on a call site, never a verdict.
 # This is the Python sibling of helpers/goindex. It emits the SAME versioned
-# packet stream rvlscan consumes, for Python source instead of Go.
+# packet stream rvl consumes, for Python source instead of Go.
 #
 # The split this enforces
 #
@@ -39,7 +39,7 @@ import json
 import os
 import sys
 
-# PACKET_SCHEMA is the version of the emitted packet contract. rvlscan absorbs
+# PACKET_SCHEMA is the version of the emitted packet contract. rvl absorbs
 # helper churn behind this number: a consumer that does not know a version
 # refuses the stream rather than guessing at its shape. It MUST agree with
 # goindex's PacketSchema, tsindex's PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
@@ -972,7 +972,7 @@ def run_retrieve(root, snapshot, files_arg):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pyindex",
-        description="Python retriever helper: emit rvlscan's versioned packet "
+        description="Python retriever helper: emit rvl's versioned packet "
                     "stream for Python source. Retrieval only, no verdicts.")
     p.add_argument("--packet-schema", action="store_true",
                    help="print the emitted packet schema version and exit")

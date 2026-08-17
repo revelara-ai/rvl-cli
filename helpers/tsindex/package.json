@@ -1,7 +1,7 @@
 {
   "name": "tsindex",
   "version": "0.1.0",
-  "description": "TypeScript retriever helper for rvlscan: emits the versioned packet stream rvlscan consumes. Retrieval only, no verdicts.",
+  "description": "TypeScript retriever helper for rvl: emits the versioned packet stream rvl consumes. Retrieval only, no verdicts.",
   "license": "MIT",
   "private": true,
   "bin": {

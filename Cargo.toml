@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rvlscan",
+    "crates/rvl",
     "crates/rvl-cache",
     "crates/rvl-content",
     "crates/rvl-triage",
@@ -25,7 +25,7 @@ members = [
 exclude = ["crates/rustindex/testdata/fixture"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/revelara-ai/rvlscan"
@@ -33,7 +33,10 @@ homepage = "https://revelara.ai"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: correctly-rounded float parsing, matching Go's
+# strconv.ParseFloat. Without it serde_json's fast path can land 1 ULP off and
+# silently rewrite numbers on any JSON round trip (po-av01j.184).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

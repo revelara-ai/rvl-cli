@@ -12,7 +12,11 @@ pub mod agents;
 pub mod fetch;
 pub mod flow;
 pub mod harness;
-pub mod semver;
+/// Re-export: the comparison moved to `rvl-core` when the `status` update
+/// nag (po-av01j.185 item 5) needed the same rule without this crate's
+/// download machinery. Kept as `rvl_skills::semver` so call sites here and
+/// in `rvl` are unchanged.
+pub use rvl_core::semver;
 pub mod store;
 pub mod v1;
 pub mod verify;

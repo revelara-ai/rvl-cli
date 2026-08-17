@@ -1,4 +1,4 @@
-//! cindex — the C/C++ retriever helper for rvlscan.
+//! cindex — the C/C++ retriever helper for rvl.
 //!
 //! Engine (DECIDED, po-ae75b.9): the libclang C API, runtime-loaded via
 //! `clang-sys`'s `runtime` feature. LibTooling is the pre-registered escape

@@ -8,6 +8,7 @@
 //! skill as the source of truth for available lenses:
 //! `{"agents":[{"id":"...","description":"..."}]}`
 
+use rvl_core::BIN;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +31,7 @@ pub struct AgentsOutput {
 /// Which install record anchored an agents-directory resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordSource {
-    /// rvlscan's own store (installed.json in the skills cache).
+    /// rvl's own store (installed.json in the skills cache).
     V2,
     /// rvl-cli's v1 metadata (~/.revelara/plugins.json), read-only fallback.
     V1,
@@ -39,7 +40,7 @@ pub enum RecordSource {
 /// Resolve the directory holding installed agent files for `editor`,
 /// anchored on the install record (rvl-cli `installedAgentsDir` parity):
 /// Claude Code keeps agents under its recorded install location; the other
-/// harnesses use their fixed agents directory under `home`. rvlscan's own
+/// harnesses use their fixed agents directory under `home`. rvl's own
 /// store wins; when it has no record, the v1 rvl-cli record is the
 /// fallback so upgraded users keep their lens listing on day one.
 pub fn installed_agents_dir(
@@ -74,7 +75,7 @@ pub fn installed_agents_dir(
         return resolve(&p.location, RecordSource::V1);
     }
     anyhow::bail!(
-        "no Revelara skills installed for harness {editor:?} (run: rvlscan plugin install {editor})"
+        "no Revelara skills installed for harness {editor:?} (run: {BIN} plugin install {editor})"
     )
 }
 

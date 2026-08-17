@@ -5,9 +5,9 @@
 //! the rustup component matching the toolchain. Identity is enforced in
 //! layers, all recorded into the stream's provenance record:
 //! - version: compared against [`PINNED_VERSION`]; a mismatch warns (or fails
-//!   under `RVLSCAN_RUSTINDEX_STRICT_PIN=1`) — the moniker fixture test is
+//!   under `RVL_RUSTINDEX_STRICT_PIN=1`) — the moniker fixture test is
 //!   the behavioral canary for an upgrade that changes moniker shapes.
-//! - checksum: when `RVLSCAN_RUST_ANALYZER_SHA256` is set, the binary's
+//! - checksum: when `RVL_RUST_ANALYZER_SHA256` is set, the binary's
 //!   sha256 MUST match it (fail closed). The actual sha256 is always
 //!   computed and recorded so any stream can be audited after the fact.
 
@@ -21,12 +21,12 @@ use std::process::Command;
 pub const PINNED_VERSION: &str = "1.96.0";
 
 /// Env var overriding rust-analyzer discovery.
-pub const ENV_RA_PATH: &str = "RVLSCAN_RUST_ANALYZER";
+pub const ENV_RA_PATH: &str = "RVL_RUST_ANALYZER";
 /// Env var carrying the expected sha256 of the rust-analyzer binary.
 /// When set, a mismatch is fatal (fail closed).
-pub const ENV_RA_SHA256: &str = "RVLSCAN_RUST_ANALYZER_SHA256";
+pub const ENV_RA_SHA256: &str = "RVL_RUST_ANALYZER_SHA256";
 /// Env var making a version-pin mismatch fatal instead of a warning.
-pub const ENV_STRICT_PIN: &str = "RVLSCAN_RUSTINDEX_STRICT_PIN";
+pub const ENV_STRICT_PIN: &str = "RVL_RUSTINDEX_STRICT_PIN";
 
 /// The discovered engine's identity, recorded into stream provenance.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
         }
         None => find_on_path("rust-analyzer").ok_or_else(|| {
             anyhow::Error::new(MissingPrereq(
-                "no rust-analyzer found: set RVLSCAN_RUST_ANALYZER to the binary, or install \
+                "no rust-analyzer found: set RVL_RUST_ANALYZER to the binary, or install \
                  the rustup component (`rustup component add rust-analyzer`)"
                     .to_string(),
             ))
@@ -122,7 +122,7 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
 /// rustindex ran correctly and is DECLINING to analyse this tree.
 ///
 /// Typed, rather than a plain error string, so `main` can exit with the
-/// ABSTAIN code instead of the generic error code. rvlscan degrades the Rust
+/// ABSTAIN code instead of the generic error code. rvl degrades the Rust
 /// language and scans the rest of the repo on the first, and reports a broken
 /// toolchain on the second — and it can only tell them apart if this
 /// distinction survives the process boundary (po-av01j.102).
@@ -250,7 +250,7 @@ mod tests {
         // The reported case (po-av01j.102): the dogfood repo holds 1660 .go files and a
         // single .rs test fixture, with no Cargo.toml anywhere. Declining is
         // correct; being INDISTINGUISHABLE from a broken toolchain is not,
-        // because rvlscan uses that difference to decide whether to keep
+        // because rvl uses that difference to decide whether to keep
         // scanning the other 1660 files.
         let dir = std::env::temp_dir().join(format!("rustindex-abstain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

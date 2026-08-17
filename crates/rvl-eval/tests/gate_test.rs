@@ -408,7 +408,7 @@ fn too_few_decided_is_refused() {
 // why both exist.
 
 /// The artifact's identity, as published: `spec_cache_artifacts.content_version`,
-/// the storage key, and what `rvlscan cache status` prints.
+/// the storage key, and what `rvl cache status` prints.
 const DEV_CACHE_CONTENT_VERSION: &str = "2026-08-05.3e263575";
 
 /// The repos that may have taught the surviving shared-library specs. All four

@@ -1,6 +1,6 @@
 # pyindex — Python retriever helper
 
-Emits the versioned packet stream rvlscan consumes, for Python source. The
+Emits the versioned packet stream rvl consumes, for Python source. The
 Python sibling of `goindex`. Retrieval only: this helper decides nothing about
 reliability, it only says what the code is.
 
@@ -18,7 +18,7 @@ One JSON object per line (JSONL) to stdout, one per detected call site. A site
 is a `receiver.method(...)` call whose method name is a plausible I/O verb.
 Every record carries:
 
-- `packet_schema` — the contract version (currently `2`). rvlscan absorbs
+- `packet_schema` — the contract version (currently `2`). rvl absorbs
   helper churn behind this number; a consumer that does not know a version
   refuses the stream rather than guessing at its shape. It agrees with
   goindex's `PacketSchema`, tsindex's `PACKET_SCHEMA`, and

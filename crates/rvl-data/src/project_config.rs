@@ -26,6 +26,26 @@ pub struct ProjectConfig {
     pub components: Vec<ProjectComponent>,
 }
 
+impl ProjectConfig {
+    /// Map the human-friendly `criticality:` label to the 0.0-1.0 multiplier
+    /// the risk register scores with (rvl-cli `ProjectConfig.CriticalityScore`).
+    /// Unknown or empty labels default to 0.0 — no boost — so a typo can never
+    /// silently inflate a repo's risk scores.
+    ///
+    /// The platform applies `1.0 + (business_criticality * 0.25)`, so a repo
+    /// that declares a criticality and does NOT send this scores every risk
+    /// LOWER than rvl-cli scored the same findings.
+    pub fn criticality_score(&self) -> f64 {
+        match self.criticality.as_str() {
+            "hobby" => 0.0,
+            "internal" => 0.25,
+            "customer-facing" => 0.6,
+            "critical" => 1.0,
+            _ => 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ProjectComponent {
@@ -115,6 +135,26 @@ mod tests {
         .expect("must parse");
         assert_eq!(cfg.project, "svc");
         assert_eq!(cfg.team, "");
+    }
+
+    /// Every documented label plus the two default-to-zero cases, exactly as
+    /// rvl-cli's `TestCriticalityScore` pins them.
+    #[test]
+    fn criticality_score_matches_rvl_cli() {
+        for (label, want) in [
+            ("hobby", 0.0),
+            ("internal", 0.25),
+            ("customer-facing", 0.6),
+            ("critical", 1.0),
+            ("", 0.0),
+            ("unknown", 0.0),
+        ] {
+            let cfg = ProjectConfig {
+                criticality: label.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.criticality_score(), want, "criticality: {label:?}");
+        }
     }
 
     #[test]

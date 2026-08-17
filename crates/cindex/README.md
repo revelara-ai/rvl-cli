@@ -1,6 +1,6 @@
 # cindex — C/C++ retriever helper
 
-Emits the versioned packet stream rvlscan consumes, for C and C++ source. The
+Emits the versioned packet stream rvl consumes, for C and C++ source. The
 C/C++ sibling of `goindex`/`pyindex`/`tsindex`. Retrieval only: this helper
 decides nothing about reliability, it only says what the code is.
 
@@ -10,7 +10,7 @@ decides nothing about reliability, it only says what the code is.
     cindex --engine-check                                  # does a libclang load? (prints its version)
 
 Unlike the other helpers this one lives IN the Rust workspace
-(`crates/cindex`): `cargo build` drops it next to the `rvlscan` binary, which
+(`crates/cindex`): `cargo build` drops it next to the `rvl` binary, which
 is the adjacent slot helper discovery already checks. It remains a separate
 subprocess speaking the same JSONL contract — the packet stream is the
 boundary that keeps retrieval honest, and in-process linking was considered
@@ -26,7 +26,7 @@ used.
 - The workspace builds on machines with no libclang installed; only running
   a retrieval loads the library. When none is found the helper fails CLOSED
   with actionable stderr (install `libclang-dev` or set `LIBCLANG_PATH`) —
-  rvlscan surfaces that error rather than silently under-reporting a detected
+  rvl surfaces that error rather than silently under-reporting a detected
   C/C++ repo.
 - **Pinning discipline:** a dev build uses the system libclang (floor:
   libclang 6.0, the `clang_6_0` API feature). RELEASE artifacts must vendor a
@@ -131,7 +131,7 @@ What is implemented now vs deliberately documented for later:
 
 - **Now:** per-TU parse with exact flags; deterministic TU order; site dedup;
   `--files` filtering re-parses only the named TUs (compile-db entries or
-  no-db `.c` files). Incremental scans ride rvlscan's existing hash-gate.
+  no-db `.c` files). Incremental scans ride rvl's existing hash-gate.
 - **Documented, follow-up beads:** per-TU index shards built at `index init`
   + preamble-cached re-parse (clang's preamble makes header-heavy TUs cheap
   on re-parse), background re-index via the existing detached-reindex

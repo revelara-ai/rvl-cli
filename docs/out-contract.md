@@ -1,4 +1,4 @@
-# `rvlscan scan --out`: the structured scan document (v1)
+# `rvl scan --out`: the structured scan document (v1)
 
 Status: IMPLEMENTED 2026-08-12 (this branch). Supersedes the eval-rows-only
 `--out` format. Validated end-to-end on a real backend repo (4078 sites) and
