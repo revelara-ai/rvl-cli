@@ -1,3 +1,15 @@
+# NOT A WORKFLOW. This is a fragment of STEPS spliced into dist's per-target
+# build job, named by `github-build-setup` in dist-workspace.toml.
+#
+# It lived in .github/workflows/ until 2026-08-16, which made GitHub Actions
+# try to run it as a workflow on every push. It has no `on:` and no `jobs:`,
+# so every one of those runs failed to parse — a permanently red entry in the
+# Actions tab that was never a real failure, and that made genuine failures
+# easy to miss. Moved here; `github-build-setup` resolves relative to
+# .github/workflows/, hence the `../`.
+#
+# Do NOT move it back under workflows/.
+#
 # Extra steps spliced into dist's per-target build job (dist `github-build-setup`).
 #
 # goindex is the one retriever cargo cannot build (po-aml3h). Without this it
