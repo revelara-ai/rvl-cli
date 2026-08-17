@@ -196,6 +196,12 @@ jq -e '.coverage.lang_status
 That fails the job on a lane that errored *and* on a lane that read zero
 sites, which is the gap `--strict` leaves open.
 
+A repository with no supported language — docs, Terraform, config — produces
+`lang_status: []`, and `all` over an empty array is `true`, so it passes
+rather than failing the job. That is deliberate: the check asks "did every
+lane rvl claimed to scan actually read something", not "does this repo have
+code". Do not "fix" it into a false alarm on your docs repos.
+
 ## How a scan finds your code
 
 With no `--retrieved`, `rvl` detects the languages under `PATH`, runs the
