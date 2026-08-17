@@ -199,6 +199,13 @@ impl CacheStore {
         self.root.join(name)
     }
 
+    /// A sibling store rooted in a subdirectory of this store's root — how
+    /// the OSS tier lives beside the commercial one (po-scnmv.13) without
+    /// touching the commercial layout.
+    pub fn subdir_store(&self, name: &str) -> anyhow::Result<CacheStore> {
+        CacheStore::open(&self.root.join(name))
+    }
+
     /// sha256 hex of the currently installed artifact bytes, if any.
     pub fn current_hash(&self) -> Option<String> {
         std::fs::read(self.dir("current").join(ARTIFACT))
@@ -500,7 +507,9 @@ impl Fetcher for HttpFetcher {
             self.base_url.trim_end_matches('/')
         );
         let auth = format!("Bearer {}", self.org_key);
-        let mut req = ureq::get(&url).set("Authorization", &auth);
+        let mut req = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .set("Authorization", &auth);
         if let Some(h) = current_hash {
             req = req.set("If-None-Match", &format!("\"{h}\""));
         }
@@ -520,10 +529,107 @@ impl Fetcher for HttpFetcher {
         let mut bytes = Vec::new();
         resp.into_reader().read_to_end(&mut bytes)?;
         let sig_b64 = ureq::get(&format!("{url}.sig"))
+            .timeout(std::time::Duration::from_secs(30))
             .set("Authorization", &auth)
             .call()?
             .into_string()?;
         Ok(Fetched::New { bytes, sig_b64 })
+    }
+}
+
+/// Subdirectory under the cache root holding the OSS ruleset tier's store
+/// (po-scnmv.13). Sibling of `current/`/`last-good/`/`rejected/`, so the
+/// commercial store's layout is untouched and existing installs keep working.
+pub const OSS_DIR: &str = "oss";
+
+/// Unauthenticated fetcher for the OSS ruleset tier: the vocabulary-lanes
+/// artifact (CDLA-Permissive-2.0, license embedded in the envelope) that the
+/// public binary syncs with no account. Same verification discipline as the
+/// commercial tier — the keyset does not care who paid.
+pub struct OssHttpFetcher {
+    pub base_url: String,
+}
+
+impl Fetcher for OssHttpFetcher {
+    fn fetch(&self, current_hash: Option<&str>) -> anyhow::Result<Fetched> {
+        let url = format!(
+            "{}/api/v1/scanner/spec-cache/oss",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(30));
+        if let Some(h) = current_hash {
+            req = req.set("If-None-Match", &format!("\"{h}\""));
+        }
+        let resp = match req.call() {
+            // Same 304-in-the-Ok-arm rule as the commercial fetcher
+            // (po-av01j.176): checking only an Err arm reads an empty body
+            // and fails verification with a tampering message.
+            Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
+            Ok(r) => r,
+            Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
+            Err(e) => return Err(e.into()),
+        };
+        let mut bytes = Vec::new();
+        resp.into_reader().read_to_end(&mut bytes)?;
+        let sig_b64 = ureq::get(&format!("{url}.sig"))
+            .timeout(std::time::Duration::from_secs(30))
+            .call()?
+            .into_string()?;
+        Ok(Fetched::New { bytes, sig_b64 })
+    }
+}
+
+/// The two tiers a scan may load (po-scnmv.13). Either may be absent — a
+/// no-key install has only the OSS tier, an old install only the commercial
+/// one. Both absent is the only fatal state, decided by the caller.
+pub struct TieredLoaded {
+    pub oss: Option<Loaded>,
+    pub commercial: Option<Loaded>,
+}
+
+impl TieredLoaded {
+    /// Whether any tier loaded.
+    pub fn any(&self) -> bool {
+        self.oss.is_some() || self.commercial.is_some()
+    }
+
+    /// The specs to feed the engine: a base payload plus an optional overlay
+    /// the engine merges over it (higher confidence wins). The OSS tier is
+    /// the base and the commercial tier the overlay, so a keyed install
+    /// layers judgment lanes over the public vocabulary baseline.
+    pub fn spec_texts(&self) -> anyhow::Result<Option<(String, Option<String>)>> {
+        match (&self.oss, &self.commercial) {
+            (None, None) => Ok(None),
+            (Some(o), None) => Ok(Some((serde_json::to_string(&o.envelope.specs)?, None))),
+            (None, Some(c)) => Ok(Some((serde_json::to_string(&c.envelope.specs)?, None))),
+            (Some(o), Some(c)) => Ok(Some((
+                serde_json::to_string(&o.envelope.specs)?,
+                Some(serde_json::to_string(&c.envelope.specs)?),
+            ))),
+        }
+    }
+
+    /// The judgments corpus rides ONLY in the commercial tier — the OSS
+    /// artifact is vocabulary and never grades anything.
+    pub fn judgments(&self) -> Option<serde_json::Value> {
+        self.commercial
+            .as_ref()
+            .and_then(|c| c.envelope.judgments.clone())
+    }
+}
+
+/// Load both tiers, tolerating either store being absent or unloadable.
+/// Each present tier is fully verified (signature at load, as always); a
+/// tier that fails verification is treated as absent, never as trusted.
+pub fn load_tiered(
+    commercial: &CacheStore,
+    oss: &CacheStore,
+    keyset: &Keyset,
+    today: &str,
+) -> TieredLoaded {
+    TieredLoaded {
+        oss: oss.load(keyset, today).ok(),
+        commercial: commercial.load(keyset, today).ok(),
     }
 }
 
@@ -544,5 +650,87 @@ mod tests {
     fn shipped_dev_keyset_parses() {
         // A malformed pinned key would brick every subcommand at startup.
         assert!(Keyset::from_hex(DEV_KEYSET_HEX).is_ok());
+    }
+
+    // --- tiered load (po-scnmv.13) ---
+    //
+    // Tests cannot produce signed artifacts (the pinned keyset has no private
+    // half in this repo, by design), so the matrix exercises the layering
+    // seam above the stores: TieredLoaded built from constructed envelopes.
+    // The store paths themselves are covered live by the flywheel acceptance
+    // harness (server-side repo, scripts/flywheel_acceptance.sh step 7).
+
+    fn loaded_with(specs: serde_json::Value, judgments: Option<serde_json::Value>) -> Loaded {
+        Loaded {
+            envelope: serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "content_version": "2026-08-17.test",
+                "specs": specs,
+                "judgments": judgments,
+            }))
+            .expect("test envelope"),
+            source: LoadSource::Current,
+            artifact_sha256: String::new(),
+            upgrade_hint: None,
+            staleness_note: None,
+        }
+    }
+
+    #[test]
+    fn tiered_neither_loadable_is_the_only_fatal_state() {
+        let t = TieredLoaded {
+            oss: None,
+            commercial: None,
+        };
+        assert!(!t.any());
+        assert!(t.spec_texts().unwrap().is_none());
+    }
+
+    #[test]
+    fn tiered_oss_only_scans_on_the_baseline() {
+        let t = TieredLoaded {
+            oss: Some(loaded_with(serde_json::json!({"server": [1]}), None)),
+            commercial: None,
+        };
+        let (base, overlay) = t.spec_texts().unwrap().unwrap();
+        assert!(base.contains("server"));
+        assert!(overlay.is_none());
+        assert!(t.judgments().is_none());
+    }
+
+    #[test]
+    fn tiered_commercial_only_keeps_old_installs_working() {
+        let t = TieredLoaded {
+            oss: None,
+            commercial: Some(loaded_with(
+                serde_json::json!({"apis": [1]}),
+                Some(serde_json::json!([{"api": "x"}])),
+            )),
+        };
+        let (base, overlay) = t.spec_texts().unwrap().unwrap();
+        assert!(base.contains("apis"));
+        assert!(overlay.is_none());
+        assert!(t.judgments().is_some());
+    }
+
+    #[test]
+    fn tiered_both_layers_commercial_over_oss() {
+        let t = TieredLoaded {
+            oss: Some(loaded_with(serde_json::json!({"server": [1]}), None)),
+            commercial: Some(loaded_with(
+                serde_json::json!({"apis": [1]}),
+                Some(serde_json::json!([{"api": "x"}])),
+            )),
+        };
+        let (base, overlay) = t.spec_texts().unwrap().unwrap();
+        assert!(base.contains("server"), "OSS tier is the base");
+        assert!(
+            overlay.expect("overlay").contains("apis"),
+            "commercial overlays"
+        );
+        assert!(
+            t.judgments().is_some(),
+            "judgments come from the commercial tier"
+        );
     }
 }
