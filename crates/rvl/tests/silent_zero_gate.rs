@@ -121,21 +121,31 @@ struct GoRepo {
 
 impl GoRepo {
     fn new() -> Self {
+        Self::with_seed(&[
+            ("go.mod", "module example.com/silentzero\n\ngo 1.21\n"),
+            ("seed.go", "package main\n\nfunc seed() int { return 1 }\n"),
+        ])
+    }
+
+    /// The same sandbox seeded as a PYTHON repo: the guard's newly covered
+    /// helper (pyindex emits site packets riding the same stream, plus its
+    /// unconditional `retrieval_stats` record since this bead's follow-up).
+    fn new_python() -> Self {
+        Self::with_seed(&[
+            ("pyproject.toml", "[project]\nname = \"silentzero\"\n"),
+            ("seed.py", "def seed():\n    return 1\n"),
+        ])
+    }
+
+    fn with_seed(files: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        // A module and a source file, so the repo's ONLY language is
-        // unambiguously Go and goindex has a module to load.
-        std::fs::write(
-            root.join("go.mod"),
-            "module example.com/silentzero\n\ngo 1.21\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("seed.go"),
-            "package main\n\nfunc seed() int { return 1 }\n",
-        )
-        .unwrap();
+        // A marker and a source file, so the repo's ONLY language is
+        // unambiguous and the helper has something to load.
+        for (name, body) in files {
+            std::fs::write(root.join(name), body).unwrap();
+        }
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.email", "t@example.com"]);
         git(&root, &["config", "user.name", "Test"]);
@@ -188,11 +198,22 @@ impl GoRepo {
         self
     }
 
-    /// Point `RVL_GOINDEX` at an arbitrary script. Used to prove the rvl-layer
-    /// guard fires on its own, with a "helper" that cannot possibly be exiting
-    /// non-zero.
-    fn with_goindex_stub(&self, body: &str) -> PathBuf {
-        let stub = self.dir.path().join("goindex-stub");
+    /// Make `python3` resolvable on the sandbox PATH, so the EMBEDDED pyindex
+    /// this binary carries can run against a closed PATH — the brew-install
+    /// shape, where the helper extracts and the interpreter is the machine's.
+    fn with_python3(self) -> Self {
+        let src = on_path("python3").expect("this test machine has no `python3`");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src, self.bin.join("python3")).unwrap();
+        self
+    }
+
+    /// Point a helper override at an arbitrary script. Used to prove the
+    /// rvl-layer guard fires on its own, with a "helper" that cannot possibly
+    /// be exiting non-zero. The name carries NO extension on purpose, so
+    /// resolution classifies it Executable and no interpreter is needed.
+    fn with_helper_stub(&self, name: &str, body: &str) -> PathBuf {
+        let stub = self.dir.path().join(name);
         std::fs::write(&stub, body).unwrap();
         #[cfg(unix)]
         {
@@ -200,6 +221,10 @@ impl GoRepo {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         stub
+    }
+
+    fn with_goindex_stub(&self, body: &str) -> PathBuf {
+        self.with_helper_stub("goindex-stub", body)
     }
 
     fn path(&self) -> std::ffi::OsString {
@@ -559,4 +584,69 @@ fn a_degraded_language_is_not_recorded_in_the_index_as_scanned() {
         second.contains("NOT CLEAN") && !second.contains("commit clean"),
         "the SECOND pass over identical content must not go quiet:\n{second}"
     );
+}
+
+/// THE GUARD NOW COVERS PYTHON. pyindex used to emit site packets only, so a
+/// pyindex that bailed early with zero output was recorded as `scanned, 0
+/// sites` — the exact po-av01j.209 bug, invisible for a whole language. The
+/// helper now writes an unconditional `retrieval_stats` record and the
+/// contract table says so; a stub that exits 0 with no output is a failed
+/// lane, exactly like the goindex stub above.
+#[test]
+fn a_python_helper_that_exits_zero_with_an_empty_stream_is_a_failed_lane() {
+    let f = GoRepo::new_python();
+    let stub = f.with_helper_stub("pyindex-stub", "#!/bin/sh\nexit 0\n");
+    f.stage(
+        "app.py",
+        "import requests\n\n\ndef f(u):\n    return requests.get(u)\n",
+    );
+
+    let out = f
+        .rvl()
+        .env("RVL_PYINDEX", &stub)
+        .args(["scan", ".", "--incremental", "--changed-only"])
+        .arg("--specs-file")
+        .arg(f.specs())
+        .output()
+        .unwrap();
+    let all = combined(&out);
+    assert!(
+        out.status.success(),
+        "the guard is fail-open like every other degradation:\n{all}"
+    );
+    assert!(
+        !all.contains("commit clean") && all.contains("NOT CLEAN"),
+        "a pyindex that emitted nothing has not scanned anything:\n{all}"
+    );
+    assert!(
+        all.contains("no packets at all"),
+        "the reason must say what the guard observed:\n{all}"
+    );
+    assert!(all.contains("Python"), "and name the language:\n{all}");
+}
+
+/// THE FALSE POSITIVE THE PYTHON GUARD MUST NOT HAVE, through the REAL
+/// embedded pyindex on a closed PATH — the brew-install shape: the helper
+/// extracts from the binary, `python3` is the machine's. A Python repo with
+/// no client calls is legitimate and common; the helper's `retrieval_stats`
+/// record proves it ran, and the repo still reads clean.
+#[test]
+fn a_python_repo_with_no_call_sites_still_reads_clean() {
+    let f = GoRepo::new_python().with_python3();
+    f.stage("app.py", "def add(a, b):\n    return a + b\n");
+
+    let out = f
+        .rvl()
+        .args(["scan", ".", "--incremental", "--changed-only"])
+        .arg("--specs-file")
+        .arg(f.specs())
+        .output()
+        .unwrap();
+    let all = combined(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(
+        all.contains("commit clean") && !all.contains("NOT CLEAN"),
+        "a language with no call sites is scanned, not degraded:\n{all}"
+    );
+    assert!(!all.contains("INCOMPLETE"), "{all}");
 }

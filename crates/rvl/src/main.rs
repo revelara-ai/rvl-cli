@@ -1773,32 +1773,42 @@ fn retrieval_verdict(
 /// not also fire on every Go service that happens to make no client calls.
 ///
 /// The distinction the stream can already carry is a REPO-SCOPED record: a
-/// per-run record that exists whether or not any site matched. Five of the
-/// seven helpers already emit one unconditionally, verified by reading each
-/// emit path:
+/// per-run record that exists whether or not any site matched. All seven
+/// helpers emit one unconditionally, verified by reading each emit path:
 ///
 ///   goindex     `repo_config`, emitted after every successful retrieve
 ///   tsindex     `repo_config`, "one repo-scoped record per run"
 ///   javaindex   `repo_config`, "emitted even when empty, like tsindex"
 ///   rustindex   `rust_workspace_provenance`, unconditional
 ///   cindex      `retrieval_stats`, unconditional
+///   pyindex     `retrieval_stats`, unconditional (this bead's follow-up)
+///   csindex     `retrieval_stats`, unconditional (same)
 ///
-/// For those, a stream with ZERO records rvl recognizes means the helper never
-/// reached its own emit path -- it gave up early and still exited 0, which is
-/// exactly the po-av01j.209 shape and is a defect no matter which helper does
-/// it. The guard therefore does not depend on any helper's exit-code hygiene.
+/// For all of them, a stream with ZERO records rvl recognizes means the helper
+/// never reached its own emit path -- it gave up early and still exited 0,
+/// which is exactly the po-av01j.209 shape and is a defect no matter which
+/// helper does it. The guard therefore does not depend on any helper's
+/// exit-code hygiene.
 ///
-/// pyindex and csindex emit SITE packets only, so an empty stream is their
-/// legitimate "no call sites here" answer and the guard cannot speak for them.
-/// That is a helper-contract gap, not a guard bug: giving them a repo-scoped
-/// record of their own would close it. It must be a NEW kind rather than an
-/// empty `repo_config`, because `rvl_core::parse_stream` lets the last
-/// `repo_config` on the concatenated multi-language stream win, so an empty one
-/// from pyindex would erase the Go construction facts.
+/// pyindex and csindex originally emitted SITE packets only, so the guard was
+/// blind for Python and C# -- a pyindex bailing early with zero output was
+/// recorded as `scanned, 0 sites`, the exact .209 bug. Both now emit a
+/// `retrieval_stats` record on every run (following cindex), deliberately NOT
+/// an empty `repo_config`: `rvl_core::parse_stream` folds every `repo_config`
+/// on the concatenated multi-language stream into one, so a helper with no
+/// construction facts must never put a construction-facts record on the wire.
+///
+/// The exhaustive match is the contract: a NEW language cannot be added
+/// without deciding, in writing, whether its helper honors this.
 fn helper_emits_repo_scoped_record(lang: Lang) -> bool {
     match lang {
-        Lang::Go | Lang::TypeScript | Lang::Java | Lang::Rust | Lang::CCpp => true,
-        Lang::Python | Lang::CSharp => false,
+        Lang::Go
+        | Lang::TypeScript
+        | Lang::Java
+        | Lang::Rust
+        | Lang::CCpp
+        | Lang::Python
+        | Lang::CSharp => true,
     }
 }
 
@@ -6516,28 +6526,34 @@ mod tests {
         assert!(!has_non_empty_kind(r#"{"kind": ""}"#));
     }
 
-    /// The guard may only speak for helpers whose contract it can rely on.
-    /// pyindex and csindex emit site packets ONLY, so an empty stream is their
-    /// legitimate "no call sites here" — firing there would call every Python
-    /// service with no outbound calls unscanned.
+    /// The guard may only speak for helpers whose contract it can rely on,
+    /// and since pyindex and csindex gained their unconditional
+    /// `retrieval_stats` record that is ALL SEVEN. Before that the guard was
+    /// blind for Python and C#: a pyindex bailing early with zero output was
+    /// recorded as `scanned, 0 sites` — the exact po-av01j.209 bug, invisible.
     #[test]
-    fn the_guard_stays_silent_for_helpers_with_no_repo_scoped_record() {
-        for lang in [Lang::Python, Lang::CSharp] {
-            assert!(
-                empty_stream_degradation(lang, "").is_none(),
-                "{lang} has no repo-scoped record to expect"
-            );
-            assert!(!helper_emits_repo_scoped_record(lang));
-        }
+    fn every_helper_is_contracted_to_emit_a_repo_scoped_record() {
         for lang in [
             Lang::Go,
             Lang::TypeScript,
             Lang::Java,
             Lang::Rust,
             Lang::CCpp,
+            Lang::Python,
+            Lang::CSharp,
         ] {
             assert!(helper_emits_repo_scoped_record(lang), "{lang}");
+            assert!(
+                empty_stream_degradation(lang, "").is_some(),
+                "an empty stream from {lang} must degrade the lane"
+            );
         }
+        // The honest zero for the two newly covered helpers: their stats
+        // record proves the run happened, and zero sites is a real answer.
+        let py = r#"{"packet_schema":2,"kind":"retrieval_stats","snapshot_id":"x","lang":"python","files_total":3,"files_parsed":3,"files_failed":0,"sites":0}"#;
+        assert!(empty_stream_degradation(Lang::Python, py).is_none());
+        let cs = r#"{"packet_schema":2,"kind":"retrieval_stats","snapshot_id":"x","lang":"csharp","files_total":1,"files_parsed":1,"files_failed":0,"sites":0}"#;
+        assert!(empty_stream_degradation(Lang::CSharp, cs).is_none());
     }
 
     #[test]

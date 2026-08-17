@@ -26,17 +26,25 @@ def _run(*args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _retrieve_records(*extra):
-    code, out, err = _run("--retrieve", "--root", FIXTURE_ROOT, *extra)
-    if code != 0:
-        raise AssertionError("retrieve failed ({}): {}".format(code, err))
-    records = []
+def _parse_stream(out):
+    """Split a JSONL stream into (site packets, repo-scoped kind records),
+    the same routing rvl_core::parse_stream applies."""
+    sites, kinds = [], []
     for line in out.splitlines():
         line = line.strip()
         if not line:
             continue
-        records.append(json.loads(line))  # raises if a line is not valid JSON
-    return records
+        rec = json.loads(line)  # raises if a line is not valid JSON
+        (kinds if rec.get("kind") else sites).append(rec)
+    return sites, kinds
+
+
+def _retrieve_records(*extra):
+    code, out, err = _run("--retrieve", "--root", FIXTURE_ROOT, *extra)
+    if code != 0:
+        raise AssertionError("retrieve failed ({}): {}".format(code, err))
+    sites, _ = _parse_stream(out)
+    return sites
 
 
 class TestPacketSchema(unittest.TestCase):
@@ -297,11 +305,70 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertTrue(records)
         for r in records:
             self.assertEqual(r["file_path"], "svc.py")
-        # a non-existent file yields nothing (not an error, not everything)
+        # a non-existent file is a loud failure (po-av01j.209): the caller
+        # asked for specific files and NONE of them exist here, which must
+        # never be recorded as a successful retrieval of zero sites.
         code, out, _ = _run("--retrieve", "--root", FIXTURE_ROOT,
                             "--files", "does_not_exist.py")
-        self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "")
+        self.assertEqual(code, 2)
+        sites, _ = _parse_stream(out)
+        self.assertEqual(sites, [], "no site may be invented for a missing file")
+
+
+class TestRetrievalStatsRecord(unittest.TestCase):
+    """The repo-scoped record (po-av01j.209): emitted on EVERY run so rvl's
+    silent-zero guard can tell 'ran and found nothing' from 'never ran'."""
+
+    def _stats(self, out):
+        _, kinds = _parse_stream(out)
+        stats = [r for r in kinds if r["kind"] == "retrieval_stats"]
+        self.assertEqual(len(stats), 1,
+                         "exactly one retrieval_stats record must ride the "
+                         "stream: {}".format(kinds))
+        return stats[0]
+
+    def test_stats_record_rides_every_successful_stream(self):
+        code, out, err = _run("--retrieve", "--root", FIXTURE_ROOT)
+        self.assertEqual(code, 0, err)
+        rec = self._stats(out)
+        self.assertEqual(rec["packet_schema"], 2)
+        self.assertEqual(rec["lang"], "python")
+        self.assertGreaterEqual(rec["files_parsed"], 1)
+        self.assertEqual(rec["files_total"],
+                         rec["files_parsed"] + rec["files_failed"])
+        self.assertNotIn("site_key", rec,
+                         "the stats record must not count as a site")
+
+    def test_a_tree_with_no_python_files_still_emits_the_record(self):
+        # A pyproject.toml-only repo is detected as Python by rvl, and "there
+        # is nothing to read" is a real answer -- exit 0, record present.
+        import tempfile
+        with tempfile.TemporaryDirectory() as empty:
+            code, out, err = _run("--retrieve", "--root", empty)
+            self.assertEqual(code, 0, err)
+            rec = self._stats(out)
+            self.assertEqual(rec["files_total"], 0)
+
+    def test_every_file_failing_to_parse_is_a_loud_failure(self):
+        # The pyindex twin of the goindex bug: a run that read NOTHING used
+        # to exit 0 with zero output, indistinguishable from an empty repo.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "broken.py"), "w") as fh:
+                fh.write("def broken(:\n")
+            code, out, _ = self._run_root(root)
+            self.assertEqual(code, 2)
+            rec = self._stats(out)
+            self.assertEqual(rec["files_failed"], 1)
+            self.assertEqual(rec["files_parsed"], 0)
+
+    def test_a_missing_root_is_an_error_not_an_empty_scan(self):
+        code, _, err = _run("--retrieve", "--root", "/does/not/exist/anywhere")
+        self.assertEqual(code, 2)
+        self.assertIn("not a directory", err)
+
+    def _run_root(self, root):
+        return _run("--retrieve", "--root", root)
 
 
 class TestEmissionPackets(unittest.TestCase):
