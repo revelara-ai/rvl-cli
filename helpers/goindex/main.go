@@ -523,7 +523,7 @@ func main() {
 		if snap == "" {
 			snap = filepath.Base(abs2)
 		}
-		sites, modules := runRetrieveAll(abs2, snap)
+		sites, modules, loadErr := runRetrieveAll(abs2, snap)
 		// ABSTAIN, never a silent zero (po-av01j.131). No module means goindex
 		// had nothing to load, which is a different claim from "loaded the code
 		// and found no client calls". Returning an empty stream with exit 0 for
@@ -539,6 +539,24 @@ func main() {
 					"each service's go.mod is discovered automatically -- none was found here.\n",
 				abs2)
 			os.Exit(3)
+		}
+		// FAILURE, NOT AN EMPTY SCAN (po-av01j.209). A module exists and the
+		// package graph could not be loaded -- the commonest cause by far being
+		// no `go` on PATH, which is the normal state of a lean CI image for a
+		// service whose own build happens in another stage. Exit 2 is the
+		// generic FAILED code rvl classifies as a degraded lane, which renders
+		// "NOT CLEAN" while leaving the commit's exit status at 0 (fail-open,
+		// ruled on po-av01j.199) and fails --strict for CI.
+		//
+		// Deliberately NOT the abstain code 3: abstaining says "I could have
+		// looked and chose not to, and that is working as intended". Here
+		// nothing could be looked at, and the fix is on the machine.
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"goindex: %v.\nNo Go source was analysed, so this is a FAILED lane, not an empty "+
+					"one. The usual cause is that the `go` tool is not on PATH (go/packages shells "+
+					"out to it); install Go, or point PATH at it, and re-run.\n", loadErr)
+			os.Exit(2)
 		}
 		if *files != "" {
 			sites = filterToFiles(sites, strings.Split(*files, ","))
@@ -562,7 +580,17 @@ func main() {
 	var sites []Site
 	var nfuncs, nctors int
 	if *typed {
-		sites = runTyped(abs, snapshot)
+		var terr error
+		sites, terr = runTyped(abs, snapshot)
+		// Same rule as the retrieve path (po-av01j.209): a load that failed
+		// must not leave the process at exit 0 with an empty stream, which a
+		// consumer cannot tell from a repo with no I/O in it.
+		if terr != nil {
+			fmt.Fprintf(os.Stderr,
+				"goindex: %v.\nNo Go source was analysed. The usual cause is that the `go` tool "+
+					"is not on PATH (go/packages shells out to it).\n", terr)
+			os.Exit(2)
+		}
 	} else {
 		ix := newIndexer(abs)
 		if err := ix.pass1(); err != nil {
