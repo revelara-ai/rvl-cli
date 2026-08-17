@@ -36,13 +36,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out this repo (for ci/render-cask.sh)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
           path: src
 
       - name: Check out the tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: revelara-ai/homebrew-tap
           path: tap
