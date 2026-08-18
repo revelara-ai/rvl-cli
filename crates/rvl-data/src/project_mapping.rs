@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 ///  1. A finding that already carries a non-empty `linked_services` is left
 ///     alone (the scanner or skill already attributed it).
 ///  2. An explicit `component: <name>` field wins outright:
-///     `linked_services = ["<project>/<name>"]`.
+///     `linked_services = ["<service>/<name>"]`.
 ///  3. Otherwise every `evidence[].path` is matched against the component
 ///     paths; unmatched paths contribute nothing, and a finding whose paths all
 ///     miss keeps NO `linked_services` key (the bare-service warning covers it).
@@ -29,7 +29,11 @@ use std::collections::BTreeSet;
 /// randomized, so a multi-component finding has no defined order there. This
 /// emits them sorted: deterministic, and identical to Go whenever a finding
 /// matches a single component (the overwhelmingly common case).
-pub fn map_findings_to_components(findings: &mut [Value], project_cfg: &ProjectConfig) {
+pub fn map_findings_to_components(
+    findings: &mut [Value],
+    project_cfg: &ProjectConfig,
+    service: &str,
+) {
     if project_cfg.components.is_empty() {
         return;
     }
@@ -42,7 +46,17 @@ pub fn map_findings_to_components(findings: &mut [Value], project_cfg: &ProjectC
         .collect();
     sorted.sort_by_key(|c| std::cmp::Reverse(c.1.len()));
 
-    let project = project_cfg.project.as_str();
+    // The prefix is the service this submission DECLARES, not the config's
+    // `project:`. They are the same whenever `--service` is omitted, but when
+    // it is passed the two disagree: the catalog upsert and the team bindings
+    // follow `--service` while the findings used to follow `project:`, so the
+    // submission filed risks into a different service's register than the one
+    // it created. The server now rejects that as a service_scope_mismatch.
+    let project = if service.trim().is_empty() {
+        project_cfg.project.as_str()
+    } else {
+        service.trim()
+    };
 
     for finding in findings.iter_mut() {
         let Some(obj) = finding.as_object_mut() else {
@@ -135,7 +149,7 @@ mod tests {
             "title": "Missing timeout",
             "evidence": [{"path": "cmd/api/handler.go", "line": 12}],
         })];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert_eq!(
             linked(&findings[0]),
             Some(vec!["audit-test/api".to_string()])
@@ -150,7 +164,7 @@ mod tests {
             "title": "Docs drift",
             "evidence": [{"path": "docs/readme.md"}],
         })];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert!(findings[0].get("linked_services").is_none());
     }
 
@@ -163,7 +177,7 @@ mod tests {
             json!({"title": "B", "evidence": [{"path": "vendor/x/b.go"}]}),
             json!({"title": "C", "evidence": [{"path": "cmd/worker/c.go"}]}),
         ];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert_eq!(
             linked(&findings[0]),
             Some(vec!["audit-test/api".to_string()])
@@ -198,7 +212,7 @@ mod tests {
         let mut findings = vec![json!({
             "evidence": [{"path": "services/x/frontend/app.ts"}],
         })];
-        map_findings_to_components(&mut findings, &nested);
+        map_findings_to_components(&mut findings, &nested, "");
         assert_eq!(
             linked(&findings[0]),
             Some(vec!["shop/frontend".to_string()])
@@ -212,7 +226,7 @@ mod tests {
             "component": "worker",
             "evidence": [{"path": "cmd/api/handler.go"}],
         })];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert_eq!(
             linked(&findings[0]),
             Some(vec!["audit-test/worker".to_string()])
@@ -226,8 +240,50 @@ mod tests {
             "linked_services": ["other/thing"],
             "evidence": [{"path": "cmd/api/handler.go"}],
         })];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert_eq!(linked(&findings[0]), Some(vec!["other/thing".to_string()]));
+    }
+
+    /// The 2026-08-17 register-corruption case: `--service` overrides the
+    /// config's `project:`, so the attribution prefix must follow the flag.
+    /// Prefixing with `project:` filed the risk under a real, unrelated
+    /// service while the catalog entry was created under the flag's name.
+    #[test]
+    fn explicit_service_overrides_config_project_for_component_prefix() {
+        let mut findings = vec![json!({"component": "src"})];
+        map_findings_to_components(&mut findings, &cfg(), "revelara-probe-doesnotexist");
+        assert_eq!(
+            findings[0]["linked_services"],
+            json!(["revelara-probe-doesnotexist/src"]),
+            "the prefix must be the declared service, not the config project"
+        );
+    }
+
+    /// Path matching takes the same prefix as the explicit component field.
+    #[test]
+    fn explicit_service_overrides_config_project_for_path_matches() {
+        let mut findings = vec![json!({"evidence": [{"path": "cmd/api/handler.go"}]})];
+        map_findings_to_components(&mut findings, &cfg(), "other-service");
+        let linked = findings[0]["linked_services"].as_array().unwrap();
+        assert!(
+            linked
+                .iter()
+                .all(|v| v.as_str().unwrap().starts_with("other-service/")),
+            "path matches must use the declared service too, got {linked:?}"
+        );
+    }
+
+    /// Omitting `--service` leaves the config's `project:` in charge, which
+    /// is the overwhelmingly common path and must not change.
+    #[test]
+    fn empty_service_falls_back_to_config_project() {
+        let mut findings = vec![json!({"component": "src"})];
+        map_findings_to_components(&mut findings, &cfg(), "   ");
+        let linked = findings[0]["linked_services"][0].as_str().unwrap();
+        assert!(
+            linked.starts_with(&format!("{}/", cfg().project)),
+            "expected the config project prefix, got {linked}"
+        );
     }
 
     /// A config with no components is a no-op: nothing to attribute to.
@@ -240,6 +296,7 @@ mod tests {
                 project: "svc".to_string(),
                 ..Default::default()
             },
+            "",
         );
         assert!(findings[0].get("linked_services").is_none());
     }
@@ -254,7 +311,7 @@ mod tests {
                 {"path": "cmd/api/a.go"},
             ],
         })];
-        map_findings_to_components(&mut findings, &cfg());
+        map_findings_to_components(&mut findings, &cfg(), "");
         assert_eq!(
             linked(&findings[0]),
             Some(vec![

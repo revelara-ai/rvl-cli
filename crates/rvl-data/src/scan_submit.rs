@@ -961,6 +961,59 @@ fn parse_retry_after(v: &str) -> Option<Duration> {
     v.parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// A failed submission. Derefs to the message, so callers that only want
+/// the text keep working unchanged.
+#[derive(Debug, Clone)]
+pub struct SubmitError {
+    pub message: String,
+    /// Set only for `service_scope_mismatch`: the service the submission
+    /// should have declared. Lets the caller print the literal resubmit
+    /// command instead of describing it, so a correctable failure costs a
+    /// resubmit rather than a rescan.
+    pub suggested_service: Option<String>,
+}
+
+impl SubmitError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            suggested_service: None,
+        }
+    }
+}
+
+impl std::ops::Deref for SubmitError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Pull `details.suggested_service` out of a `service_scope_mismatch` body.
+/// Absent or malformed details are not an error: the prose message already
+/// names the correction, this only enables printing the exact command.
+fn suggested_service_from_body(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Details {
+        suggested_service: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        details: Option<Details>,
+    }
+    let parsed = serde_json::from_slice::<Envelope>(body).ok()?;
+    parsed
+        .details?
+        .suggested_service
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Extract message + code from a JSON `{code,message}` error body, falling
 /// back to `{"error": ...}` and then to the raw body.
 fn decode_server_error(body: &[u8]) -> (String, String) {
@@ -995,7 +1048,7 @@ pub fn submit_scan(
     client: &Client,
     req: &mut ScanRequest,
     timeout: Duration,
-) -> Result<ScanResponse, String> {
+) -> Result<ScanResponse, SubmitError> {
     const MAX_RETRIES: u32 = 1;
     const MAX_BACKOFF: Duration = Duration::from_secs(120);
 
@@ -1025,14 +1078,15 @@ pub fn submit_scan(
                 let mut buf = Vec::new();
                 resp.into_reader()
                     .read_to_end(&mut buf)
-                    .map_err(|e| format!("read response body: {e}"))?;
-                return serde_json::from_slice(&buf).map_err(|e| format!("parse response: {e}"));
+                    .map_err(|e| SubmitError::new(format!("read response body: {e}")))?;
+                return serde_json::from_slice(&buf)
+                    .map_err(|e| SubmitError::new(format!("parse response: {e}")));
             }
             Err(ureq::Error::Status(code @ (401 | 403), _)) => {
-                return Err(format!(
+                return Err(SubmitError::new(format!(
                     "authentication failed against {} - run '{BIN} login' to reconfigure (status {code})",
                     client.api_url
-                ));
+                )));
             }
             Err(ureq::Error::Status(429, resp)) if attempt < MAX_RETRIES => {
                 let mut delay = parse_retry_after(resp.header("Retry-After").unwrap_or(""))
@@ -1051,12 +1105,18 @@ pub fn submit_scan(
                 let mut buf = Vec::new();
                 let _ = resp.into_reader().read_to_end(&mut buf);
                 let (msg, ecode) = decode_server_error(&buf);
-                return Err(format!(
+                let mut err = SubmitError::new(format!(
                     "server error ({code} {ecode}) from {}: {msg}",
                     client.api_url
                 ));
+                if ecode == "service_scope_mismatch" {
+                    err.suggested_service = suggested_service_from_body(&buf);
+                }
+                return Err(err);
             }
-            Err(ureq::Error::Transport(t)) => return Err(format!("request failed: {t}")),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(SubmitError::new(format!("request failed: {t}")))
+            }
         }
     }
 }
@@ -1461,8 +1521,15 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     // service label and scores it below what rvl-cli scored.
     if let Some(cfg) = project_cfg.as_ref() {
         if !cfg.components.is_empty() {
+            // The attribution prefix is the service this submission declares.
+            // Cloned because `req.findings` is borrowed mutably below.
+            let declared_service = req.service.clone();
             if let Some(findings) = req.findings.as_mut() {
-                crate::project_mapping::map_findings_to_components(findings, cfg);
+                crate::project_mapping::map_findings_to_components(
+                    findings,
+                    cfg,
+                    &declared_service,
+                );
             }
         }
         let crit = cfg.criticality_score();
@@ -1552,17 +1619,22 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     let response = match submit_scan(&client, &mut req, timeout) {
         Ok(r) => r,
         Err(e) => {
-            // On submit failure, remind the user the scan-parts directory
-            // is intact and can be re-submitted as-is.
+            // On submit failure the findings are unchanged and still on
+            // disk, so the recovery is a resubmit, not a rescan. When the
+            // server named the service the submission should have declared
+            // (service_scope_mismatch), the printed command carries the
+            // correction already applied rather than repeating the flag that
+            // just failed.
             if let Some(dir) = &scan_dir {
+                let resubmit_service = e.suggested_service.as_deref().unwrap_or(&service);
                 eprintln!(
-                    "Scan parts preserved at {dir}; re-run after resolving the error with:\n  {BIN} scan --service {service} --scan-dir {dir}",
+                    "Scan parts preserved at {dir}. The findings are unchanged, so no rescan is needed; resubmit with:\n  {BIN} scan --service {resubmit_service} --scan-dir {dir}",
                     dir = dir.display()
                 );
             }
             if matches!(format, OutputFormat::Json) {
                 let out = compact(&G::Obj(vec![
-                    ("error".to_string(), G::Str(e)),
+                    ("error".to_string(), G::Str(e.message.clone())),
                     ("service".to_string(), G::Str(service)),
                 ]));
                 println!("{out}");
