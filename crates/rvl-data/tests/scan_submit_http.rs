@@ -242,7 +242,7 @@ fn auth_failure_names_the_api_url_and_login_hint() {
     let mut req = request_fixture();
     let err = submit_scan(&server.client(), &mut req, Duration::from_secs(5)).unwrap_err();
     assert_eq!(
-        err,
+        err.message,
         format!(
             "authentication failed against {} - run 'rvl login' to reconfigure (status 401)",
             server.base_url
@@ -260,10 +260,55 @@ fn server_error_envelope_is_surfaced_verbatim() {
     let mut req = request_fixture();
     let err = submit_scan(&server.client(), &mut req, Duration::from_secs(5)).unwrap_err();
     assert_eq!(
-        err,
+        err.message,
         format!(
             "server error (400 validation_failed) from {}: scan_type must be one of full|incremental|targeted",
             server.base_url
         )
     );
+}
+
+/// po-9odxe: a submission that declares one service while its findings
+/// reference another is rejected with `service_scope_mismatch`. The error
+/// must carry the service the submission should have declared, so the
+/// caller can print a resubmit command with the correction already applied
+/// instead of repeating the flag that just failed.
+#[test]
+fn service_scope_mismatch_carries_the_suggested_service() {
+    let server = MockServer::start(vec![(
+        400,
+        vec![],
+        r#"{"code":"service_scope_mismatch",
+            "message":"submission declares service \"probe\" but 1 finding references \"app-configuration-service\"",
+            "details":{"declared_service":"probe",
+                       "referenced_services":["app-configuration-service"],
+                       "suggested_service":"app-configuration-service",
+                       "total_mismatched":1}}"#,
+    )]);
+    let mut req = request_fixture();
+    let err = submit_scan(&server.client(), &mut req, Duration::from_secs(5)).unwrap_err();
+
+    assert_eq!(
+        err.suggested_service.as_deref(),
+        Some("app-configuration-service"),
+        "the resubmit command needs the corrected service; got {err:?}"
+    );
+    assert!(
+        err.contains("service_scope_mismatch"),
+        "the prose message is still surfaced verbatim: {err}"
+    );
+}
+
+/// Any other failure leaves the suggestion unset, so the caller falls back
+/// to the service the user actually passed.
+#[test]
+fn other_errors_carry_no_service_suggestion() {
+    let server = MockServer::start(vec![(
+        400,
+        vec![],
+        r#"{"code":"validation_failed","message":"bad findings"}"#,
+    )]);
+    let mut req = request_fixture();
+    let err = submit_scan(&server.client(), &mut req, Duration::from_secs(5)).unwrap_err();
+    assert!(err.suggested_service.is_none(), "got {err:?}");
 }
