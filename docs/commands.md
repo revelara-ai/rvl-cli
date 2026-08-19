@@ -11,7 +11,7 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl scan force-next [--target <dir>]` | Arm a one-shot gate bypass for the next hook run (for GUI git clients that cannot set `RVL_FORCE=1`). Audited in `.git/rvl-audit.jsonl`. |
 | `rvl explain <ID> [PATH]` | Explain one finding as an evidence block: the sites it covers, the control, and the fix. |
 | `rvl suppress <ID> [PATH] [--reason …] [--expires YYYY-MM-DD]` | Waive a finding: append a rule waiver to `./.revelara.yaml` under `scanner.waivers`. |
-| `rvl report [PATH]` | Show EXACTLY what a scan would report about unknown API surfaces — shape only. See [Privacy](privacy.md). |
+| `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
 | `rvl index <init\|reindex\|status>` | Incremental-scan packet index (content-hash keyed). `reindex --detach` rebuilds in the background. |
 | `rvl sync` | Refresh the spec cache from the Revelara API (async-safe, never blocks a scan). With no key, syncs the OSS vocabulary tier; with a key, both tiers. |
 | `rvl cache <import\|status>` | Spec-cache maintenance, including air-gapped import of a signed artifact. |
@@ -24,7 +24,7 @@ cache's judgment corpus).
 
 ### Submission mode
 
-`rvl scan` doubles as the rvl-cli-compatible **submission** command: when
+`rvl scan` doubles as the rvl-cli-compatible submission command: when
 `--service`, `--scan-dir`, `--file`, or `--stdin` is present, it submits risk
 findings to your organization's risk register instead of running the local
 deterministic scan (see [Privacy](privacy.md) for what that sends). The flag
@@ -41,7 +41,7 @@ set is rvl-cli parity:
 | `--dry-run` | Validate, normalize, and print the submit summary without submitting. |
 | `--cleanup-on-success` | Remove `--scan-dir` contents after a successful submit. |
 | `--timeout <dur>` | HTTP submission timeout (e.g. `90`, `90s`, `2m`; default 60s or `RVL_SCAN_TIMEOUT`). |
-| `--format <text\|json>` | `json` is the CI contract: response JSON on stdout, and **exit 1 when the server reports critical or high findings**. `--ci` is a compatibility alias for `--format json`. |
+| `--format <text\|json>` | `json` is the CI contract: response JSON on stdout, and exit 1 when the server reports critical or high findings. `--ci` is a compatibility alias for `--format json`. |
 | `--review` | Send rvl-cli's interactive-run wire value (`scan_mode: "review"`); `--ci`/`--auto-infer` win over it. |
 | `--cs-file <path>` | Attach a control structure from a separate JSON file to the submission (not `stpa submit`, which ingests a full STPA model). |
 
@@ -50,7 +50,7 @@ set is rvl-cli parity:
 | Command | What it does |
 | --- | --- |
 | `rvl init` | Initialize Revelara for this repository: write `.revelara.yaml`, install the plugin skills, check credentials. |
-| `rvl doctor [PATH]` | Diagnose (and with `--fix`, repair) this machine's ability to scan THIS repository. |
+| `rvl doctor [PATH]` | Diagnose (and with `--fix`, repair) this machine's ability to scan this repository. |
 | `rvl hook <install\|doctor>` | Install or check the git-hook scan gate. |
 | `rvl skills <install\|update\|status>` | Install the Revelara workflow skills and lenses into your coding-agent harness. |
 | `rvl plugin <install\|update\|list\|remove\|editors\|agents>` | The same machinery under rvl-cli's plugin vocabulary, per harness. |
@@ -77,7 +77,7 @@ These talk to the Revelara API and need credentials.
 
 ## See also
 
-- [Scanning your repo with rvl](scanning.md) — the user guide these commands serve
-- [Gating commits and CI](gating.md) — `rvl hook`, exit codes, CI usage
-- [Configuration](configuration.md) — `.revelara.yaml`, environment variables
-- [How a scan finds your code](retrievers.md) — retriever resolution
+- [Scanning your repo with rvl](scanning.md): the user guide these commands serve
+- [Gating commits and CI](gating.md): `rvl hook`, exit codes, CI usage
+- [Configuration](configuration.md): `.revelara.yaml`, environment variables
+- [How a scan finds your code](retrievers.md): retriever resolution

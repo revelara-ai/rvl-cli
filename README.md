@@ -16,9 +16,9 @@ Customer code never leaves the machine. See [Privacy](docs/privacy.md).
 brew install --cask revelara-ai/tap/rvl
 ```
 
-That is the whole install: `rvl` ships as a Homebrew cask carrying the
-`goindex`, `cindex` and `rustindex` retriever helpers beside the binary, and
-the remaining helpers are carried inside the binary itself.
+The cask installs `rvl` plus the `goindex`, `cindex` and `rustindex`
+retriever helpers beside the binary; the remaining helpers are embedded in
+the binary itself, so no further install step is needed.
 
 Or download a release archive for your platform from the
 [releases page](https://github.com/revelara-ai/rvl-cli/releases) and put its
@@ -60,7 +60,7 @@ setting on one laptop.
 
 | Document | What is in it |
 | --- | --- |
-| [Scanning your repo with rvl](docs/scanning.md) | **The user guide**: install, the free no-key tier, reading the output, hooks, waivers, the agent loop. |
+| [Scanning your repo with rvl](docs/scanning.md) | The user guide: install, the free no-key tier, reading the output, hooks, waivers, the agent loop. |
 | [Command reference](docs/commands.md) | Every command, grouped by what it is for. |
 | [Gating commits and CI](docs/gating.md) | Git hooks, the exit-code contract, `--strict`, and asserting on coverage in CI. |
 | [How a scan finds your code](docs/retrievers.md) | Per-language retrievers, their toolchain prerequisites, and the five resolution slots. |
@@ -97,7 +97,7 @@ still works for anything the Makefile does not wrap.
 
 A locally built `rvl scan <path>` already resolves the scripted retrievers
 from the copies embedded in the binary, so `make helpers` is only needed for
-`goindex` (which cargo cannot build) and when **developing** a scripted
+`goindex` (which cargo cannot build) and when developing a scripted
 helper: it copies `pyindex.py` / `javaindex.java` next to the binary, and the
 adjacent slot outranks the embedded one, so an edit takes effect without
 re-embedding. On a gvm box with a mismatched `GOROOT`, override the Go
@@ -105,9 +105,9 @@ invocation: `make helpers GO='env -u GOROOT go'`.
 
 ### The rule the workspace is built around
 
-**Retrievers report facts; specs carry judgment; propagation combines them
-mechanically.** A retriever says what the code *is* — this call site, this
-client type, this method — and never whether it is a problem. What a matched
+Retrievers report facts; specs carry judgment; propagation combines them
+mechanically. A retriever says what the code is (this call site, this
+client type, this method) and never whether it is a problem. What a matched
 surface *means* is spec knowledge, authored elsewhere and consumed here as
 data. That split is why adding a language costs compiler-frontend work and no
 reliability judgment, and why the scanner can ship as a binary plus a JSON
@@ -124,7 +124,7 @@ not Rust.
 | --- | --- |
 | `rvl` | The CLI: command surface, scan orchestration, `doctor`, `hook`, `init`, rendering. Also declares the `cindex` and `rustindex` bin targets (`src/bin/`) so release packaging can pack them beside `rvl`. |
 | `rvl-core` | Shared types, mirroring the JSON packet contract the retrievers emit, field for field. |
-| `rvl-spec` | The spec cache: a spec answers a question about an API, not about a call site, so it is earned once and paid forever. |
+| `rvl-spec` | The spec cache: a spec answers a question about an API, not about a call site, so it is written once and reused at every site. |
 | `rvl-cache` | Spec-cache distribution: versioning, signing, sync, quarantine of artifacts that fail verification. |
 | `rvl-propagate` | Deterministic propagation: apply specs to every call site, no inference, no model calls. |
 | `rvl-triage` | Collapse per-site findings into the handful of items a developer would actually read. |

@@ -15,7 +15,7 @@ The keys this binary reads are:
 | `scanner.waivers` | Rule waivers, written by `rvl suppress`. |
 | `scanner.bounds` | Declared whole-call bound assertions (`client_type`, `bounds: whole_call`, `reason`, `expires`); each closes an `unresolved bounds` abstain. |
 | `scanner.base_ref` | Fallback base ref for `--changed-only`. |
-| `scanner.use_agent` | `allow` opts the repo into hook-mode agent adjudication. Absent means deny: consent is a committed act, never a default. |
+| `scanner.use_agent` | `allow` opts the repo into hook-mode agent adjudication. Absent means deny; opting in requires committing this key. |
 | `scanner.agent_hooks.<hook>.enabled` | Per-hook opt-in for that lane. |
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
 
@@ -59,8 +59,8 @@ relocates it. Under that root live two independent stores:
 - the **commercial tier** in the root itself (`current/`, `last-good/`,
   `rejected/`), synced only with an API key;
 - the **OSS vocabulary tier** in the `oss/` subdirectory, which `rvl sync`
-  fetches with **no credentials at all** — a keyless `rvl sync` is not an
-  error, it is the OSS-only install.
+  fetches with no credentials. A keyless `rvl sync` is not an error; it
+  installs this tier alone.
 
 Both artifacts are signature-verified against the same pinned keyset at fetch
 and at load. At scan time the two layer: the OSS tier is the base payload and
@@ -68,7 +68,7 @@ the commercial tier the overlay, so a keyed install adds the judgment lanes
 on top of the public vocabulary baseline, and removing the key falls back to
 the baseline. The judgments corpus (what grades a finding) rides only in the
 commercial tier. See [Scanning your repo with rvl](scanning.md) for the
-user-facing story.
+user-facing guide.
 
 ## Compatibility flags
 
@@ -87,11 +87,11 @@ notice naming the repair:
 | `--auto-infer` | No-op: submission is always non-interactive. |
 
 `rvl hook install` repairs a hook shim written by the old CLI in place,
-without `--force`, so a repo takes this path once and never again.
+without `--force`, so a repo takes this path only once.
 
 ## See also
 
-- [Gating commits and CI](gating.md) — where `scanner.base_ref`, `RVL_FORCE`
+- [Gating commits and CI](gating.md): where `scanner.base_ref`, `RVL_FORCE`
   and `--strict` come into play
-- [How a scan finds your code](retrievers.md) — what the `RVL_*INDEX`
+- [How a scan finds your code](retrievers.md): what the `RVL_*INDEX`
   overrides displace

@@ -1,7 +1,7 @@
 # rvl documentation
 
-**Start here if you want to scan a repo:
-[Scanning your repo with rvl](scanning.md)** — install, the free no-key
+Start here if you want to scan a repo:
+[Scanning your repo with rvl](scanning.md) covers install, the free no-key
 tier, reading the output, hooks, waivers, and the coding-agent loop, end to
 end.
 
@@ -9,7 +9,7 @@ end.
 
 | Document | What is in it |
 | --- | --- |
-| [Scanning your repo with rvl](scanning.md) | The end-to-end user guide. Install (cask + release archives), the free OSS tier and its license, reading the ladder and COVERAGE honestly, exit codes, hooks, suppress/bounds/waivers, the audited force escape hatch, the agent loop, privacy. |
+| [Scanning your repo with rvl](scanning.md) | The end-to-end user guide. Install (cask + release archives), the free OSS tier and its license, reading the ladder and COVERAGE, exit codes, hooks, suppress/bounds/waivers, the audited force escape hatch, the agent loop, privacy. |
 | [Command reference](commands.md) | Every command, grouped by what it is for, including submission mode's full flag set. |
 | [Gating commits and CI](gating.md) | Git hooks, the exit-code contract, `--strict`, the empty-lane guard, and asserting on coverage in CI. |
 | [Configuration](configuration.md) | `.revelara.yaml` keys, environment variables, the tiered spec cache, compatibility flags. |

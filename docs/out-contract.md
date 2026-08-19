@@ -19,8 +19,8 @@ ladder); the document is serialization work, not new analysis.
 
 The orchestrator uses it to:
 
-1. Scope the semantic (lens) pass AWAY from what the engine resolved: no
-   double-scan, no crowd-out.
+1. Scope the semantic (lens) pass away from what the engine resolved, so
+   nothing is scanned twice and engine results are not crowded out.
 2. Hand undecided sites to lens adjudication (report-only verdicts, same
    asymmetry rules as the hook lane: an agent verdict never mutates engine
    state).
@@ -81,9 +81,9 @@ The orchestrator uses it to:
 
 ## Field semantics
 
-- `findings` is the LADDER, post-waiver: every row the human sees, including
+- `findings` is the ladder, post-waiver: every row the human sees, including
   suppressed and gate-exempt rows (flagged, never dropped). `severity` is the
-  SECTION the row renders in (`blocking` | `advisory` | `suppressed`),
+  section the row renders in (`blocking` | `advisory` | `suppressed`),
   derived by the same `classify` the exit code uses; `base_severity` carries
   the judgment's raw grade (`high` | `medium` | `low` | `""` for a
   not-yet-graded class). `description` is the human one-liner from the
@@ -99,21 +99,21 @@ The orchestrator uses it to:
 - `coverage` mirrors the COVERAGE block one-to-one, abstains broken out by
   the lever that closes each (no-spec = mint, bounds = retrieval
   depth/declared bounds, judge = per-site judge). The roll-calls are included
-  so a consumer can render the silence-is-never-ambiguous story without
-  stdout parsing:
-  - `lang_status[]` — one row per detected language: `state` is `scanned` |
-    `abstained` | `failed` | `unsupported` | `not_installed`, `detail`
+  so a consumer can report which lanes ran, failed, or read nothing without
+  parsing stdout:
+  - `lang_status[]`: one row per detected language. `state` is `scanned` |
+    `abstained` | `failed` | `unsupported` | `not_installed`; `detail`
     carries the site count on a scanned lane or the reason otherwise.
-  - `retrievers[]` — which helper served each lane and from which resolution
+  - `retrievers[]`: which helper served each lane and from which resolution
     slot.
-  - `degraded[]` — one row per degraded lane (`lang`, `abstained`,
+  - `degraded[]`: one row per degraded lane (`lang`, `abstained`,
     `not_installed`, `reason`); empty on a fully healthy scan.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime
   abstains above test scaffolding without re-deriving path heuristics: on the
   first real dogfood, 2761 undecided read as alarming until scope showed most
-  were test_support (playwright/msw). This plus `covered_classes` IS the
+  were test_support (playwright/msw). This plus `covered_classes` is the
   abstain manifest: an orchestrator points semantic lenses at runtime-scoped
   `undecided` rows and away from `covered_classes`.
 - `covered_classes` is the class-key list the loaded spec cache judges in
@@ -133,9 +133,9 @@ The orchestrator uses it to:
   migrate by indexing one level deeper.
 - Additive evolution only within v1: new fields may appear, existing fields
   never change meaning. Breaking changes bump `schema`.
-- `findings[].class` is a CONTRACT field with lane-dependent meaning: for
+- `findings[].class` is a contract field with lane-dependent meaning: for
   spec-lane findings it is the producing spec's identity
-  (`client_type.method`, the waiver key — e.g. `net/http.Client.Do`); for
+  (`client_type.method`, the waiver key, e.g. `net/http.Client.Do`); for
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
   `emission.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
