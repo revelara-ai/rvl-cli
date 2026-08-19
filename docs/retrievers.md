@@ -4,8 +4,9 @@ With no `--retrieved`, `rvl` detects the languages under `PATH`, runs the
 matching retriever helper itself, and feeds the packets into the pipeline.
 Multiple detected languages run each helper and concatenate their packets.
 
-`brew install revelara-ai/tap/rvl` gives you a working scan for six of the
-seven supported languages with no further setup:
+`brew install --cask revelara-ai/tap/rvl` (the tap ships `rvl` as a cask)
+gives you a working scan for six of the seven supported languages with no
+further setup:
 
 | Retriever | How it arrives | Runtime prerequisite |
 | --- | --- | --- |
@@ -52,9 +53,13 @@ three compiled helpers (`goindex`, `cindex`, `rustindex`) as
 `native — no runtime prereq`, because it checks that the helper itself is
 resolvable and does not probe the toolchain that helper drives. So a machine
 with no `go`, no `libclang` or no `rust-analyzer` still shows `PASS` on that
-lane. `cindex --engine-check` prints the libclang it resolved, and the scan's
-own `COVERAGE` block is the authority on whether a lane actually read
-anything.
+lane. This bites hardest on fresh CI runners and new build images, where the
+helper arrived with the archive but the toolchain never did — a green
+`doctor` there is not proof the lane can read code. `cindex --engine-check`
+prints the libclang it resolved, and the scan's own `COVERAGE` block is the
+authority on whether a lane actually read anything (see
+[Gating commits and CI](gating.md) for the coverage assertion that catches
+this in CI).
 
 ## Resolution slots
 

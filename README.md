@@ -13,12 +13,12 @@ Customer code never leaves the machine. See [Privacy](docs/privacy.md).
 ## Install
 
 ```sh
-brew install revelara-ai/tap/rvl
+brew install --cask revelara-ai/tap/rvl
 ```
 
-That is the whole install: the cask ships `rvl` plus the `goindex`, `cindex`
-and `rustindex` retriever helpers, and the remaining helpers are carried
-inside the binary.
+That is the whole install: `rvl` ships as a Homebrew cask carrying the
+`goindex`, `cindex` and `rustindex` retriever helpers beside the binary, and
+the remaining helpers are carried inside the binary itself.
 
 Or download a release archive for your platform from the
 [releases page](https://github.com/revelara-ai/rvl-cli/releases) and put its
@@ -60,6 +60,7 @@ setting on one laptop.
 
 | Document | What is in it |
 | --- | --- |
+| [Scanning your repo with rvl](docs/scanning.md) | **The user guide**: install, the free no-key tier, reading the output, hooks, waivers, the agent loop. |
 | [Command reference](docs/commands.md) | Every command, grouped by what it is for. |
 | [Gating commits and CI](docs/gating.md) | Git hooks, the exit-code contract, `--strict`, and asserting on coverage in CI. |
 | [How a scan finds your code](docs/retrievers.md) | Per-language retrievers, their toolchain prerequisites, and the five resolution slots. |
@@ -69,12 +70,13 @@ setting on one laptop.
 | [Releasing](docs/releasing.md) | Cutting a release, and how each retriever helper is packaged. |
 | [The `--out` document contract](docs/out-contract.md) | The machine-readable scan document consumed by orchestrators. |
 
-End-user guides are hosted, not in this repo:
+[docs/README.md](docs/README.md) maps which pages are for users and which for
+contributors; [docs/scanning.md](docs/scanning.md) is the user entry point.
+Hosted companions:
 [local scanning](https://app.revelara.ai/help/local-scanning) covers hooks and
 per-language setup in depth, and the
 [project configuration guide](https://app.revelara.ai/help/revelara-config)
-covers `.revelara.yaml`. The docs in this repository are for people working
-*on* `rvl`.
+covers `.revelara.yaml`.
 
 ## Development
 

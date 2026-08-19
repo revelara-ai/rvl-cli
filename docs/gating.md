@@ -70,16 +70,22 @@ a laptop and the wrong one on a build runner, where an image missing a
 language toolchain would otherwise produce a green gate forever. `--strict`
 turns that case into exit `1`.
 
-`--strict` is not a complete backstop, because it only catches a retriever
-that **errors**. A retriever that exits cleanly having read nothing is not an
-error, so it is reported as a genuine empty result and `--strict` passes it.
-The Go lane does exactly this when the `go` tool is absent: `goindex` exits
-`0` with zero packets, the scan prints `languages: Go 0 sites` and
-`✓ commit clean`, and both plain and `--strict` runs exit `0`. Until that is
-fixed, a CI job that must not silently pass over unread code should assert on
-coverage as well as on the exit code. `--out` writes a
-`coverage.lang_status` array (`state`, and `detail` carrying the site count on
-a scanned lane or the error on a failed one), which makes that one command:
+A retriever that **errors** is not the only way a lane can read nothing. A
+helper can also exit `0` having emitted no packets at all — the Go lane did
+exactly this when the `go` tool was absent, and the scan printed
+`✓ commit clean` over unread code. That hole is now guarded structurally: a
+language that was detected, whose helper exited `0`, and whose stream carried
+nothing rvl recognizes (not even the repo-scoped record every helper writes
+on a successful run) is degraded as a **failed** lane, whatever the exit code
+claimed. The guard lives at the one place every helper's output passes
+through, so it does not depend on any individual helper's exit-code hygiene.
+A degraded lane renders `NOT CLEAN — nothing was scanned (see COVERAGE)`
+under the default fail-open policy and turns into exit `1` under `--strict`.
+
+A CI job that wants belt and braces can still assert on coverage as well as
+on the exit code. `--out` writes a `coverage.lang_status` array (`state`, and
+`detail` carrying the site count on a scanned lane or the reason otherwise),
+which makes that one command:
 
 ```sh
 rvl scan . --strict --out findings.json
@@ -89,13 +95,20 @@ jq -e '.coverage.lang_status
 ```
 
 That fails the job on a lane that errored *and* on a lane that read zero
-sites, which is the gap `--strict` leaves open.
+sites.
 
-A repository with no supported language — docs, Terraform, config — produces
-`lang_status: []`, and `all` over an empty array is `true`, so it passes
-rather than failing the job. That is deliberate: the check asks "did every
-lane rvl claimed to scan actually read something", not "does this repo have
-code". Do not "fix" it into a false alarm on your docs repos.
+Two shapes produce `lang_status: []`, and `all` over an empty array is
+`true`, so both pass the assertion rather than failing the job:
+
+- A repository with no supported language — docs, Terraform, config. That is
+  deliberate: the check asks "did every lane rvl claimed to scan actually
+  read something", not "does this repo have code". Do not "fix" it into a
+  false alarm on your docs repos.
+- An `--incremental` scan that reused the index: the incremental path runs no
+  helper roll-call, so it emits an empty `lang_status` (except in the
+  no-supported-sources case). The coverage assertion above only bites on
+  **full** scans — run it against a plain `rvl scan . --strict --out …`, not
+  against the hook's incremental invocation.
 
 ## See also
 
