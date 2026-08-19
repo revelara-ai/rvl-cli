@@ -79,7 +79,10 @@ pub struct Keyset {
     keys: Vec<ed25519_dalek::VerifyingKey>,
 }
 
-/// The pinned keyset, in additive-rotation order:
+/// The pinned keyset, in additive-rotation order. Rotation is ADDITIVE: a new
+/// key appends to this list, and an old key stays pinned until every signed
+/// artifact in the field has rolled to a newer one — so the constant carries
+/// the production verifying key alongside the dev key, not "dev keys" alone.
 ///
 /// 1. The dev key: public half of the ed25519 keypair the spec factory signs
 ///    dev caches with (minted 2026-08-02; private half held out of band in
@@ -90,7 +93,7 @@ pub struct Keyset {
 ///    the production spec-factory worker via the revelara-prod-spec-signing
 ///    ExternalSecret. Everything api.revelara.ai publishes is signed with
 ///    this key.
-pub const DEV_KEYSET_HEX: &[&str] = &[
+pub const PINNED_KEYSET_HEX: &[&str] = &[
     "aebac9ca1b7bf75b4848320858eceb1ce421ff152870f01fcdcb8e6be8514e9a",
     "93a81234519c962485e71c82e2cf20b7ad9eed55983cab62ae4461af425c5967",
 ];
@@ -649,7 +652,7 @@ mod tests {
     #[test]
     fn shipped_dev_keyset_parses() {
         // A malformed pinned key would brick every subcommand at startup.
-        assert!(Keyset::from_hex(DEV_KEYSET_HEX).is_ok());
+        assert!(Keyset::from_hex(PINNED_KEYSET_HEX).is_ok());
     }
 
     // --- tiered load (po-scnmv.13) ---

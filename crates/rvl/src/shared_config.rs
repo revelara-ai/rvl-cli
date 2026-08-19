@@ -9,7 +9,7 @@
 //!
 //! ============================ SECURITY CONTRACT ============================
 //! The signing KEYSET MUST NEVER become a config field. It is compiled into the
-//! binary on purpose (`DEV_KEYSET_HEX`); a config-file keyset would be exactly
+//! binary on purpose (`PINNED_KEYSET_HEX`); a config-file keyset would be exactly
 //! the verification bypass the distribution contract forbids. This module reads
 //! ONLY `api_url` / `api_key`. Do NOT add, read, or plumb any key material
 //! (signing keys, verification keys, keyset hex) from the config file — not
