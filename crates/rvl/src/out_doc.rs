@@ -1,10 +1,13 @@
 //! The `--out` structured scan document, schema `rvl-scan/v1`.
 //!
-//! PROTOTYPE (design vetting): replaces the per-site eval rows with a full
-//! machine contract mirroring what the human ladder and COVERAGE block say:
-//! the post-waiver findings, coverage with abstains by lever, the undecided
-//! sites, and the classes the loaded cache judges in this repo. All of it is
-//! serialization of existing internals; nothing here re-analyzes.
+//! The SHIPPED machine contract between the binary and any orchestrator
+//! (`docs/out-contract.md` is the external spec; update it in the same change
+//! as any edit here). It mirrors what the human ladder and COVERAGE block
+//! say: the post-waiver findings, coverage with abstains by lever, the
+//! per-site eval rows, the undecided sites, and the classes the loaded cache
+//! judges in this repo. All of it is serialization of existing internals;
+//! nothing here re-analyzes. Evolution within v1 is additive only; breaking
+//! changes bump `schema`.
 //!
 //! Deterministic-engine truth ONLY: agent/lens findings never enter this
 //! document. An orchestrator merges them downstream, provenance-tagged, with

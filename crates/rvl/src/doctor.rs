@@ -535,7 +535,7 @@ fn spec_cache_checks() -> Vec<Check> {
                 .detail(format!("{}: {e}", cfg.cache_dir.display()))];
         }
     };
-    let keyset = match rvl_cache::Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX) {
+    let keyset = match rvl_cache::Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX) {
         Ok(k) => k,
         Err(e) => {
             return vec![Check::new("spec cache", Status::Fail, "keyset").detail(format!("{e}"))];
@@ -698,7 +698,7 @@ fn apply_fixes(root: &Path) {
         };
         if let (Ok(store), Ok(keyset)) = (
             rvl_cache::CacheStore::open(&cfg.cache_dir),
-            rvl_cache::Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX),
+            rvl_cache::Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX),
         ) {
             let outcome = rvl_cache::sync(&store, &fetcher, &keyset, cfg.offline);
             eprintln!("doctor --fix: spec cache: {outcome:?}");
@@ -715,7 +715,7 @@ fn spec_cache_is_installed(cfg: &Config) -> bool {
     let Ok(store) = rvl_cache::CacheStore::open(&cfg.cache_dir) else {
         return false;
     };
-    let Ok(keyset) = rvl_cache::Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX) else {
+    let Ok(keyset) = rvl_cache::Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX) else {
         return false;
     };
     store.load(&keyset, &rvl_cache::today_utc()).is_ok()

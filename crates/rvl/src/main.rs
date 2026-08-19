@@ -5730,7 +5730,7 @@ fn run() -> anyhow::Result<ExitCode> {
     }
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
-    let keyset = Keyset::from_hex(rvl_cache::DEV_KEYSET_HEX)?;
+    let keyset = Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX)?;
     let state_path = last_scan_path(&cfg.cache_dir);
     match cmd {
         Cmd::Scan {
