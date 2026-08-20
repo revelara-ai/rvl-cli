@@ -119,7 +119,7 @@ tier.
 A scan report is a ladder with three printed sections and a footer:
 
 ```
-■ BLOCKING   (base severity elevated by incident evidence)
+■ BLOCKING
 ■ ADVISORY
 ■ COVERAGE
 ✗ blocked — fix or suppress 1 blocking finding to commit
@@ -142,9 +142,11 @@ Three things about severity:
 
 - Severity is a property of the ruleset's judgment about the API, not a
   guess about your code, which is why it is consistent across languages.
-  Findings can be elevated by incident evidence from the public corpus: a
-  row carrying `evidence: N corpus incidents, M critical` is blocking even
-  when its base severity alone would not be.
+  The rules themselves are authored against a corpus of public incident
+  disclosures, so a rule exists because the failure mode has taken down
+  real systems. (The renderer can also show per-finding incident counts
+  and elevate on them, but nothing populates those counts today, so you
+  will not see them.)
 - A finding marked `severity: not yet graded (advisory)` means the surface
   is recognized but not yet judged. It ranks by exposure (site count, the
   one signal available without a judge) and never blocks. Un-triaged never
