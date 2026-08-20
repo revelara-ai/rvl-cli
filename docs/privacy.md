@@ -1,6 +1,6 @@
 # Privacy
 
-Customer code never leaves the machine. `rvl` is open source, so this claim
+Code never leaves the machine. `rvl` is open source, so this claim
 can be verified in the code. This page covers the two channels that exist
 and what each can carry: the shape-only report attached to the deterministic
 scan, and the explicitly separate, flag-gated
