@@ -409,7 +409,7 @@ function stableTypeName(typeName, pkgInfo, declFileName) {
   if (!looksLikePath) return typeName;
 
   if (!pkgInfo || !pkgInfo.dir || !declFileName) return '';
-  const dir = pkgInfo.dir.replace(/\\/g, '/').replace(/\/+$/, '');
+  const dir = pkgInfo.dir.replace(/\\/g, '/').replace(/(?<!\/)\/+$/, '');
   const decl = declFileName.replace(/\\/g, '/');
   if (!decl.startsWith(dir + '/')) return '';
 
