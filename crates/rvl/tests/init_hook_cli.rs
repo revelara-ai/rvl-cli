@@ -62,16 +62,15 @@ fn init_cmd(dir: &Path) -> Command {
     c
 }
 
-/// The exact `.revelara.yaml` rvl-cli writes for a repo with no detected
-/// components: its comment header plus Go yaml.v3's marshal shape.
+/// The exact `.revelara.yaml` rvl writes for a repo with no detected
+/// components (po-7p45k.19): the project itself is the service, so no
+/// root-component fallback is emitted.
 fn expected_yaml(name: &str) -> String {
     format!(
         "# Revelara project configuration\n\
          # Used by /rvl:scan and reliability-review skills for consistent service naming\n\
          project: {name}\n\
-         components:\n\
-         \x20   - name: {name}\n\
-         \x20     path: .\n"
+         components: []\n"
     )
 }
 
