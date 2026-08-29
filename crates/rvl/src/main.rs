@@ -377,16 +377,6 @@ enum Cmd {
         #[arg(long)]
         no_context_files: bool,
     },
-    /// Diagnose (and with `--fix`, repair) this machine's ability to scan
-    /// THIS repository: the retriever for every language actually present,
-    /// which slot it resolved from and whether its runtime exists, plus
-    /// credentials, spec cache and git-hook wiring.
-    ///
-    /// Repo-aware by design: it reports only on languages this tree contains,
-    /// so a Go shop is never told about .NET.
-    ///
-    /// Exit codes: 0 = everything this repo needs is in place, 1 = a gap
-    /// remains, 2 = usage error.
     /// Catalog v2 migration report for THIS repository (po-7p45k.21):
     /// legacy compound identities the server still sees for this project,
     /// contested (quarantined) services touching this repo, locally
@@ -402,6 +392,16 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Diagnose (and with `--fix`, repair) this machine's ability to scan
+    /// THIS repository: the retriever for every language actually present,
+    /// which slot it resolved from and whether its runtime exists, plus
+    /// credentials, spec cache and git-hook wiring.
+    ///
+    /// Repo-aware by design: it reports only on languages this tree contains,
+    /// so a Go shop is never told about .NET.
+    ///
+    /// Exit codes: 0 = everything this repo needs is in place, 1 = a gap
+    /// remains, 2 = usage error.
     Doctor {
         /// Repo/dir to diagnose (default: current directory).
         path: Option<PathBuf>,
