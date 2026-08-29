@@ -96,16 +96,25 @@ pub fn run(args: InitArgs, install_plugin: impl FnOnce() -> anyhow::Result<bool>
     }
 
     let (project, components) = if write_config {
-        let (project, components) = build_project_config(&git_root, args.project, args.yes);
-        if let Err(e) = std::fs::write(&config_path, render_config_yaml(&project, &components)) {
+        let (project, declared, candidates) = build_project_config(&git_root, args.project, args.yes);
+        if let Err(e) = std::fs::write(
+            &config_path,
+            render_config_yaml(&project, &declared, &candidates),
+        ) {
             eprintln!("Error writing .revelara.yaml: {e}");
             return ExitCode::FAILURE;
         }
-        println!(
-            "Created .revelara.yaml (project: {project}, {} candidate components commented out - uncomment to declare)",
-            components.len()
-        );
-        (project, components)
+        match (declared.len(), candidates.len()) {
+            (0, 0) => println!("Created .revelara.yaml (project: {project}, no components)"),
+            (d, 0) => println!("Created .revelara.yaml (project: {project}, {d} declared components)"),
+            (0, c) => println!(
+                "Created .revelara.yaml (project: {project}, {c} candidate components commented out - uncomment to declare)"
+            ),
+            (d, c) => println!(
+                "Created .revelara.yaml (project: {project}, {d} declared components, {c} candidates commented out)"
+            ),
+        }
+        (project, declared)
     } else {
         load_existing(&config_path)
     };
@@ -333,17 +342,18 @@ fn build_project_config(
     git_root: &Path,
     project_flag: Option<String>,
     yes: bool,
-) -> (String, Vec<Component>) {
+) -> (String, Vec<Component>, Vec<Component>) {
     let mut name = match project_flag {
         Some(p) if !p.is_empty() => p,
         _ => detect_project_name(git_root),
     };
-    let mut components = detect_components(git_root);
+    let components = detect_components(git_root);
 
     if yes {
-        // po-7p45k.19: no root-component fallback. The project itself is
-        // the service in catalog v2; a component duplicating it is noise.
-        return (name, components);
+        // po-7p45k.19/.23: unattended runs declare NOTHING - detections
+        // are written as commented candidates. No root-component fallback:
+        // the project itself is the service.
+        return (name, Vec::new(), components);
     }
 
     let input = prompt(&format!("Project name [{name}]: "));
@@ -354,26 +364,45 @@ fn build_project_config(
     if components.is_empty() {
         println!("No components auto-detected.");
         println!();
-        println!("A component is a subdirectory Revelara analyzes as a separate service (e.g., api/, worker/).");
+        println!("A component is a separately deployable service living in this repository (e.g., api/, worker/).");
         println!(
-            "For a single-service repository, choose 'No' to treat the whole repo as one project."
+            "For a single-service repository, choose 'No' to treat the whole repo as one service."
         );
         println!();
-        if crate::confirm("Add components manually?") {
-            components = prompt_components();
-        }
-    } else {
-        println!("Detected components:");
-        for (i, c) in components.iter().enumerate() {
-            println!("  {}. {:<20} {}", i + 1, c.name, c.path);
-        }
-        println!();
-        if !crate::confirm("Accept detected components?") {
-            components = prompt_components();
-        }
+        let declared = if crate::confirm("Add components manually?") {
+            prompt_components()
+        } else {
+            Vec::new()
+        };
+        return (name, declared, Vec::new());
     }
 
-    (name, components)
+    println!("Detected component candidates (separately runnable):");
+    for (i, c) in components.iter().enumerate() {
+        println!("  {}. {:<20} {}", i + 1, c.name, c.path);
+    }
+    println!();
+    println!("Declaring a component makes it a service in the catalog under exactly");
+    println!("that name, unique across your organization. Decline to keep them as");
+    println!("commented candidates in .revelara.yaml instead.");
+    println!();
+    if crate::confirm("Declare these components as services?") {
+        // po-7p45k.23: explicit acceptance IS the act of declaration.
+        (name, components, Vec::new())
+    } else {
+        let declared = if crate::confirm("Add components manually instead?") {
+            prompt_components()
+        } else {
+            Vec::new()
+        };
+        // Detections survive as commented candidates either way; drop any
+        // name the user just declared manually.
+        let candidates: Vec<Component> = components
+            .into_iter()
+            .filter(|c| !declared.iter().any(|d| d.name == c.name))
+            .collect();
+        (name, declared, candidates)
+    }
 }
 
 /// rvl-cli `promptComponents`: collect name/path pairs until an empty entry.
@@ -445,24 +474,38 @@ fn load_existing(path: &Path) -> (String, Vec<Component>) {
 /// plus Go yaml.v3's marshal shape — 4-space-indented `- name:` items with
 /// `path:` aligned under `name:`. serde_yaml's emitter uses a different
 /// indent style, so this is hand-rolled for byte parity.
-fn render_config_yaml(project: &str, components: &[Component]) -> String {
+fn render_config_yaml(project: &str, declared: &[Component], candidates: &[Component]) -> String {
     let mut out = String::from(CONFIG_HEADER);
     out.push_str(&format!("project: {}\n", yaml_scalar(project)));
-    if components.is_empty() {
+    // po-7p45k.23: declared components (an explicit human act - interactive
+    // acceptance or manual entry) render ACTIVE in the Go yaml.v3 marshal
+    // shape. Unvetted detections render as commented candidates
+    // (po-7p45k.19): each uncommented entry becomes a first-class
+    // org-unique service, so unattended runs never declare silently.
+    if declared.is_empty() && candidates.is_empty() {
         out.push_str("components: []\n");
-    } else {
-        // po-7p45k.19: detected components are CANDIDATES, not
-        // declarations. Each uncommented entry becomes a first-class
-        // service in the catalog under exactly that name (org-unique),
-        // so declaring is a deliberate act: uncomment the block.
+    }
+    if !declared.is_empty() {
+        out.push_str("components:\n");
+        for c in declared {
+            out.push_str(&format!(
+                "    - name: {}\n      path: {}\n",
+                yaml_scalar(&c.name),
+                yaml_scalar(&c.path)
+            ));
+        }
+    }
+    if !candidates.is_empty() {
         out.push_str(
             "# Detected component candidates. Uncommenting declares them: each\n\
              # entry becomes a service in the catalog under exactly that name,\n\
              # unique across your organization (name it like a dashboard\n\
              # service: payments-api, not api). See /help/services.\n",
         );
-        out.push_str("# components:\n");
-        for c in components {
+        if declared.is_empty() {
+            out.push_str("# components:\n");
+        }
+        for c in candidates {
             out.push_str(&format!(
                 "#     - name: {}\n#       path: {}\n",
                 yaml_scalar(&c.name),
@@ -624,6 +667,32 @@ fn is_dir_entry(entry: &std::fs::DirEntry) -> bool {
 /// `project.DetectComponents`: workspace declarations, build-file scanning
 /// under common layout dirs, `cmd/*/main.go`, root Flutter apps, and
 /// directories with Dockerfiles.
+/// po-7p45k.23: a workspace member is a service CANDIDATE only when it is
+/// separately runnable. A library crate/module is internal structure; its
+/// findings belong to the project service, and proposing it would mint an
+/// org-unique service for something that never deploys.
+fn rust_member_has_binary(member: &Path) -> bool {
+    if member.join("src/main.rs").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(member.join("src/bin")) {
+        for e in entries.flatten() {
+            if e.path().extension().is_some_and(|x| x == "rs") {
+                return true;
+            }
+        }
+    }
+    std::fs::read_to_string(member.join("Cargo.toml"))
+        .map(|t| t.contains("[[bin]]"))
+        .unwrap_or(false)
+}
+
+/// Same gate for go.work members: `main.go` at the member root or a `cmd/`
+/// tree marks a runnable module; anything else is a shared library.
+fn go_member_has_binary(member: &Path) -> bool {
+    member.join("main.go").exists() || member.join("cmd").is_dir()
+}
+
 pub(crate) fn detect_components(root: &Path) -> Vec<Component> {
     let mut col = Collector {
         components: Vec::new(),
@@ -639,7 +708,7 @@ pub(crate) fn detect_components(root: &Path) -> Vec<Component> {
             if line.starts_with("use ") || (line.starts_with("./") && !line.starts_with("//")) {
                 let dir = line.strip_prefix("use ").unwrap_or(line).trim();
                 let dir = dir.trim_matches(|c| c == '.' || c == '/');
-                if !dir.is_empty() && dir != "." {
+                if !dir.is_empty() && dir != "." && go_member_has_binary(&root.join(dir)) {
                     col.add(base_name(dir), format!("{dir}/"));
                 }
             }
@@ -659,6 +728,7 @@ pub(crate) fn detect_components(root: &Path) -> Vec<Component> {
                         if !part.is_empty()
                             && !part.chars().any(|c| "[]=#,".contains(c))
                             && root.join(part).exists()
+                            && rust_member_has_binary(&root.join(part))
                         {
                             col.add(base_name(part), format!("{part}/"));
                         }
@@ -909,6 +979,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rust_workspace_library_members_are_not_candidates() {
+        // po-7p45k.23: a workspace member without a binary target is an
+        // internal library, not a service candidate. Only the member with
+        // src/main.rs survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/app\",\n    \"crates/lib-a\",\n]\n",
+        )
+        .unwrap();
+        for (m, bin) in [("crates/app", true), ("crates/lib-a", false)] {
+            std::fs::create_dir_all(root.join(m).join("src")).unwrap();
+            std::fs::write(root.join(m).join("Cargo.toml"), "[package]\n").unwrap();
+            if bin {
+                std::fs::write(root.join(m).join("src/main.rs"), "fn main() {}\n").unwrap();
+            } else {
+                std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
+            }
+        }
+        let got = detect_components(root);
+        let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["app"], "{got:?}");
+    }
+
+    #[test]
+    fn go_work_library_members_are_not_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.work"), "use ./svc\nuse ./sharedlib\n").unwrap();
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        std::fs::write(root.join("svc/main.go"), "package main\n").unwrap();
+        std::fs::create_dir_all(root.join("sharedlib")).unwrap();
+        std::fs::write(root.join("sharedlib/util.go"), "package sharedlib\n").unwrap();
+        let got = detect_components(root);
+        let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["svc"], "{got:?}");
+    }
+
+    #[test]
+    fn declared_components_render_active_candidates_commented() {
+        // po-7p45k.23: interactive acceptance IS a declaration - declared
+        // components render active (the Go yaml.v3 marshal shape),
+        // candidates stay commented.
+        let got = render_config_yaml(
+            "myproj",
+            &[Component {
+                name: "api".into(),
+                path: "api/".into(),
+            }],
+            &[Component {
+                name: "maybe".into(),
+                path: "maybe/".into(),
+            }],
+        );
+        assert!(
+            got.contains("components:\n    - name: api\n      path: api/\n"),
+            "declared block wrong: {got}"
+        );
+        assert!(
+            got.contains("#     - name: maybe\n#       path: maybe/\n"),
+            "candidate block wrong: {got}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&got).unwrap();
+        assert_eq!(
+            parsed["components"].as_sequence().map(|s| s.len()),
+            Some(1),
+            "only the declared component parses: {got}"
+        );
+    }
+
+    #[test]
     fn init_candidates_commented() {
         // po-7p45k.19: detected components are CANDIDATES. They are
         // emitted commented out; uncommenting is the act of declaration.
@@ -917,6 +1059,7 @@ mod tests {
         // components.
         let got = render_config_yaml(
             "myproj",
+            &[],
             &[Component {
                 name: "api".into(),
                 path: "api/".into(),
@@ -935,6 +1078,7 @@ mod tests {
     fn yaml_matches_rvl_cli_marshal_shape() {
         let got = render_config_yaml(
             "myproj",
+            &[],
             &[
                 Component {
                     name: "api".into(),
@@ -956,6 +1100,7 @@ mod tests {
     fn yaml_single_component_dot_path_stays_plain() {
         let got = render_config_yaml(
             "solo",
+            &[],
             &[Component {
                 name: "solo".into(),
                 path: ".".into(),
@@ -1013,6 +1158,11 @@ mod tests {
             "go 1.22\n\nuse ./svc-a\nuse ./svc-b\n",
         )
         .unwrap();
+        // po-7p45k.23: go.work members pass the gate only when runnable.
+        std::fs::create_dir_all(root.join("svc-a")).unwrap();
+        std::fs::write(root.join("svc-a/main.go"), "package main\n").unwrap();
+        std::fs::create_dir_all(root.join("svc-b")).unwrap();
+        std::fs::write(root.join("svc-b/lib.go"), "package svcb\n").unwrap();
         std::fs::create_dir_all(root.join("pkgs/web")).unwrap();
         std::fs::write(root.join("package.json"), r#"{"workspaces": ["pkgs/*"]}"#).unwrap();
 
@@ -1021,10 +1171,13 @@ mod tests {
             name: "svc-a".into(),
             path: "svc-a/".into()
         }));
-        assert!(got.contains(&Component {
-            name: "svc-b".into(),
-            path: "svc-b/".into()
-        }));
+        assert!(
+            !got.contains(&Component {
+                name: "svc-b".into(),
+                path: "svc-b/".into()
+            }),
+            "library go.work member must not be a candidate: {got:?}"
+        );
         assert!(got.contains(&Component {
             name: "web".into(),
             path: "pkgs/web/".into()
