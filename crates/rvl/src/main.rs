@@ -12,7 +12,7 @@ mod empty_flag;
 mod force;
 mod hook;
 mod init;
-mod migrate;
+mod service_check;
 mod out_doc;
 mod render;
 mod report;
@@ -377,20 +377,19 @@ enum Cmd {
         #[arg(long)]
         no_context_files: bool,
     },
-    /// Catalog v2 migration report for THIS repository (po-7p45k.21):
+    /// Service catalog operations for THIS repository. `service check`
+    /// reports how the repo's identity aligns with the org catalog:
     /// legacy compound identities the server still sees for this project,
     /// contested (quarantined) services touching this repo, locally
     /// detected components not yet declared, and names the server would
     /// canonicalize - each with the concrete .revelara.yaml edit. Read-only
-    /// by default; --apply performs only the additive comment-only edit
+    /// by default; --fix performs only the additive comment-only edit
     /// (appending undeclared candidates, commented out).
     ///
     /// Exit codes: 0 = no findings, 1 = findings reported, 2 = usage error.
-    Migrate {
-        /// Append the commented candidate declarations for undeclared
-        /// components to .revelara.yaml. Never edits existing lines.
-        #[arg(long)]
-        apply: bool,
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Diagnose (and with `--fix`, repair) this machine's ability to scan
     /// THIS repository: the retriever for every language actually present,
@@ -5681,10 +5680,12 @@ fn run() -> anyhow::Result<ExitCode> {
         Cmd::Doctor { path, fix, format } => {
             return Ok(doctor::run(doctor::DoctorArgs { path, fix, format }))
         }
-        // Catalog migration report (po-7p45k.21): dispatches before the
+        // Catalog alignment report (po-7p45k.21): dispatches before the
         // store opens for the same reason doctor does - it must run in a
         // repo whose local setup is incomplete.
-        Cmd::Migrate { apply } => return Ok(migrate::run(migrate::MigrateArgs { apply })),
+        Cmd::Service {
+            cmd: ServiceCmd::Check { fix },
+        } => return Ok(service_check::run(service_check::CheckArgs { fix })),
         Cmd::Login => return Ok(rvl_data::auth::run_login()),
         Cmd::Logout => return Ok(rvl_data::auth::run_logout()),
         // The plugin section is a closure so it runs only AFTER the
@@ -6053,7 +6054,7 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Hook { .. }
         | Cmd::Version
         | Cmd::Doctor { .. }
-        | Cmd::Migrate { .. }
+        | Cmd::Service { .. }
         | Cmd::Login
         | Cmd::Logout
         | Cmd::Status
@@ -6088,6 +6089,18 @@ fn restore_default_sigpipe() {
 
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
+
+#[derive(clap::Subcommand)]
+enum ServiceCmd {
+    /// Check this repo's service identity against the org catalog
+    /// (read-only; --fix appends commented candidates only).
+    Check {
+        /// Append the commented candidate declarations for undeclared
+        /// components to .revelara.yaml. Never edits existing lines.
+        #[arg(long)]
+        fix: bool,
+    },
+}
 
 fn main() -> ExitCode {
     restore_default_sigpipe();

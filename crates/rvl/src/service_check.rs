@@ -1,5 +1,5 @@
-//! `rvl migrate` (po-7p45k.21): the user-side companion to the server's
-//! catalog v2 migration. Read-only by default: it inspects the repo's
+//! `rvl service check` (po-7p45k.21): the repo-side catalog alignment
+//! report. Read-only by default: it inspects the repo's
 //! `.revelara.yaml` and the org's service catalog and reports, per
 //! finding, the concrete YAML edit that fixes it. `--apply` performs only
 //! the one additive, comment-only edit (appending undeclared component
@@ -23,8 +23,8 @@ use std::process::ExitCode;
 use crate::init::{detect_components, Component};
 use rvl_data::project_config::load_project_config_from;
 
-pub struct MigrateArgs {
-    pub apply: bool,
+pub struct CheckArgs {
+    pub fix: bool,
 }
 
 /// One catalog row, as much of the list response as migrate needs.
@@ -238,11 +238,11 @@ fn fetch_catalog() -> Result<Vec<CatalogRow>, String> {
     Ok(rows)
 }
 
-/// The comment-only candidates block `--apply` appends for undeclared
+/// The comment-only candidates block `--fix` appends for undeclared
 /// components: same shape init writes, so uncommenting declares.
 fn candidates_block(undeclared: &[&Finding]) -> String {
     let mut out = String::from(
-        "\n# rvl migrate: detected component candidates. Uncommenting declares\n\
+        "\n# rvl service check: detected component candidates. Uncommenting declares\n\
          # them as org-unique services in the catalog. See /help/services.\n\
          # components:\n",
     );
@@ -262,7 +262,7 @@ fn candidates_block(undeclared: &[&Finding]) -> String {
     out
 }
 
-pub fn run(args: MigrateArgs) -> ExitCode {
+pub fn run(args: CheckArgs) -> ExitCode {
     let root = Path::new(".");
     let Some(cfg) = load_project_config_from(root) else {
         eprintln!("Error: no .revelara.yaml found (run `rvl init` first).");
@@ -283,7 +283,7 @@ pub fn run(args: MigrateArgs) -> ExitCode {
         catalog.as_deref().unwrap_or(&[]),
     );
 
-    println!("rvl migrate report for project {:?}", cfg.project);
+    println!("service check report for project {:?}", cfg.project);
     if let Err(reason) = &catalog {
         println!(
             "  (server checks skipped - legacy-compound and contested not evaluated: {reason})"
@@ -309,9 +309,9 @@ pub fn run(args: MigrateArgs) -> ExitCode {
         .iter()
         .filter(|f| f.class == FindingClass::Undeclared)
         .collect();
-    if args.apply {
+    if args.fix {
         if undeclared.is_empty() {
-            println!("--apply: nothing to apply (only report-only findings).");
+            println!("--fix: nothing to fix automatically (only report-only findings).");
         } else {
             let block = candidates_block(&undeclared);
             match std::fs::OpenOptions::new()
@@ -320,18 +320,18 @@ pub fn run(args: MigrateArgs) -> ExitCode {
                 .and_then(|mut fh| std::io::Write::write_all(&mut fh, block.as_bytes()))
             {
                 Ok(()) => println!(
-                    "--apply: appended {} commented candidate(s) to .revelara.yaml (uncomment to declare).",
+                    "--fix: appended {} commented candidate(s) to .revelara.yaml (uncomment to declare).",
                     undeclared.len()
                 ),
                 Err(e) => {
-                    eprintln!("--apply failed: {e}");
+                    eprintln!("--fix failed: {e}");
                     return ExitCode::from(2);
                 }
             }
         }
     } else if !undeclared.is_empty() {
         println!(
-            "Run `rvl migrate --apply` to append the {} candidate declaration(s) above, commented out.",
+            "Run `rvl service check --fix` to append the {} candidate declaration(s) above, commented out.",
             undeclared.len()
         );
     }
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_report() {
+    fn service_check_report() {
         // Fixture repo + mocked server: every finding class appears once,
         // each with its suggested YAML edit.
         let declared = vec![("Checkout API".to_string(), "services/checkout/".to_string())];
@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_report_clean_repo_zero_findings() {
+    fn service_check_clean_repo_zero_findings() {
         let declared = vec![("checkout-api".to_string(), "services/checkout/".to_string())];
         let detected = vec![Component {
             name: "checkout-api".into(),
