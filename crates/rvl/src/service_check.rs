@@ -173,16 +173,16 @@ pub fn classify(
             findings.push(Finding {
                 class: FindingClass::SlugViolation,
                 subject: name.to_string(),
-                detail: format!("{kind} name {name:?} slugifies to nothing and the server will reject it"),
+                detail: format!(
+                    "{kind} name {name:?} slugifies to nothing and the server will reject it"
+                ),
                 edit: format!("rename the {kind} to a descriptive [a-z0-9-] name"),
             });
         } else if slug != name {
             findings.push(Finding {
                 class: FindingClass::SlugViolation,
                 subject: name.to_string(),
-                detail: format!(
-                    "{kind} name {name:?} is canonicalized to {slug:?} by the server"
-                ),
+                detail: format!("{kind} name {name:?} is canonicalized to {slug:?} by the server"),
                 edit: format!("use the canonical form in .revelara.yaml: {slug}"),
             });
         }
@@ -247,12 +247,7 @@ fn candidates_block(undeclared: &[&Finding]) -> String {
          # components:\n",
     );
     for f in undeclared {
-        let path = f
-            .detail
-            .split('"')
-            .nth(1)
-            .unwrap_or("")
-            .to_string();
+        let path = f.detail.split('"').nth(1).unwrap_or("").to_string();
         out.push_str(&format!(
             "#     - name: {}\n#       path: {}\n",
             slugify(&f.subject),
@@ -367,7 +362,7 @@ mod tests {
             },
         ];
         let catalog = vec![
-            row("shop/payments", None, false), // legacy compound
+            row("shop/payments", None, false),               // legacy compound
             row("checkout-api", Some("checkout-api"), true), // contested
             row("unrelated-svc", Some("unrelated-svc"), true), // contested but foreign
         ];
@@ -381,9 +376,7 @@ mod tests {
 
         // The foreign contested service is NOT reported.
         assert!(
-            !findings
-                .iter()
-                .any(|f| f.subject == "unrelated-svc"),
+            !findings.iter().any(|f| f.subject == "unrelated-svc"),
             "foreign contested service leaked into the report"
         );
         // Every finding carries a concrete edit.
@@ -393,7 +386,11 @@ mod tests {
             .iter()
             .find(|f| f.class == FindingClass::LegacyCompound)
             .unwrap();
-        assert!(compound.edit.contains("name: payments"), "{}", compound.edit);
+        assert!(
+            compound.edit.contains("name: payments"),
+            "{}",
+            compound.edit
+        );
         // The slug violation names the canonical form.
         let slugv = findings
             .iter()

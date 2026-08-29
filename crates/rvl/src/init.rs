@@ -96,7 +96,8 @@ pub fn run(args: InitArgs, install_plugin: impl FnOnce() -> anyhow::Result<bool>
     }
 
     let (project, components) = if write_config {
-        let (project, declared, candidates) = build_project_config(&git_root, args.project, args.yes);
+        let (project, declared, candidates) =
+            build_project_config(&git_root, args.project, args.yes);
         if let Err(e) = std::fs::write(
             &config_path,
             render_config_yaml(&project, &declared, &candidates),
@@ -1065,13 +1066,28 @@ mod tests {
                 path: "api/".into(),
             }],
         );
-        assert!(got.contains("# components:\n"), "candidates block missing: {got}");
-        assert!(got.contains("#     - name: api\n"), "candidate entry missing: {got}");
-        assert!(got.contains("#       path: api/\n"), "candidate path missing: {got}");
+        assert!(
+            got.contains("# components:\n"),
+            "candidates block missing: {got}"
+        );
+        assert!(
+            got.contains("#     - name: api\n"),
+            "candidate entry missing: {got}"
+        );
+        assert!(
+            got.contains("#       path: api/\n"),
+            "candidate path missing: {got}"
+        );
         // The only `components:` occurrence is the commented one.
-        assert!(!got.contains("\ncomponents:"), "active components key must not be written: {got}");
+        assert!(
+            !got.contains("\ncomponents:"),
+            "active components key must not be written: {got}"
+        );
         let parsed: serde_yaml::Value = serde_yaml::from_str(&got).expect("generated yaml parses");
-        assert!(parsed.get("components").is_none(), "parse must see components as undeclared");
+        assert!(
+            parsed.get("components").is_none(),
+            "parse must see components as undeclared"
+        );
     }
 
     #[test]
@@ -1106,7 +1122,10 @@ mod tests {
                 path: ".".into(),
             }],
         );
-        assert!(got.contains("# components:\n#     - name: solo\n#       path: .\n"), "unexpected shape: {got}");
+        assert!(
+            got.contains("# components:\n#     - name: solo\n#       path: .\n"),
+            "unexpected shape: {got}"
+        );
     }
 
     #[test]

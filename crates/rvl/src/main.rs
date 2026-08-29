@@ -12,10 +12,10 @@ mod empty_flag;
 mod force;
 mod hook;
 mod init;
-mod service_check;
 mod out_doc;
 mod render;
 mod report;
+mod service_check;
 mod shared_config;
 mod waiver;
 
