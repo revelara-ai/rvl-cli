@@ -624,7 +624,7 @@ fn is_dir_entry(entry: &std::fs::DirEntry) -> bool {
 /// `project.DetectComponents`: workspace declarations, build-file scanning
 /// under common layout dirs, `cmd/*/main.go`, root Flutter apps, and
 /// directories with Dockerfiles.
-fn detect_components(root: &Path) -> Vec<Component> {
+pub(crate) fn detect_components(root: &Path) -> Vec<Component> {
     let mut col = Collector {
         components: Vec::new(),
         seen: HashSet::new(),
