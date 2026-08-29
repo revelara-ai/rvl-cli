@@ -102,7 +102,7 @@ pub fn run(args: InitArgs, install_plugin: impl FnOnce() -> anyhow::Result<bool>
             return ExitCode::FAILURE;
         }
         println!(
-            "Created .revelara.yaml (project: {project}, {} components)",
+            "Created .revelara.yaml (project: {project}, {} candidate components commented out - uncomment to declare)",
             components.len()
         );
         (project, components)
@@ -341,12 +341,8 @@ fn build_project_config(
     let mut components = detect_components(git_root);
 
     if yes {
-        if components.is_empty() {
-            components = vec![Component {
-                name: name.clone(),
-                path: ".".to_string(),
-            }];
-        }
+        // po-7p45k.19: no root-component fallback. The project itself is
+        // the service in catalog v2; a component duplicating it is noise.
         return (name, components);
     }
 
@@ -365,11 +361,6 @@ fn build_project_config(
         println!();
         if crate::confirm("Add components manually?") {
             components = prompt_components();
-        } else {
-            components = vec![Component {
-                name: name.clone(),
-                path: ".".to_string(),
-            }];
         }
     } else {
         println!("Detected components:");
@@ -460,10 +451,20 @@ fn render_config_yaml(project: &str, components: &[Component]) -> String {
     if components.is_empty() {
         out.push_str("components: []\n");
     } else {
-        out.push_str("components:\n");
+        // po-7p45k.19: detected components are CANDIDATES, not
+        // declarations. Each uncommented entry becomes a first-class
+        // service in the catalog under exactly that name (org-unique),
+        // so declaring is a deliberate act: uncomment the block.
+        out.push_str(
+            "# Detected component candidates. Uncommenting declares them: each\n\
+             # entry becomes a service in the catalog under exactly that name,\n\
+             # unique across your organization (name it like a dashboard\n\
+             # service: payments-api, not api). See /help/services.\n",
+        );
+        out.push_str("# components:\n");
         for c in components {
             out.push_str(&format!(
-                "    - name: {}\n      path: {}\n",
+                "#     - name: {}\n#       path: {}\n",
                 yaml_scalar(&c.name),
                 yaml_scalar(&c.path)
             ));
@@ -908,6 +909,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn init_candidates_commented() {
+        // po-7p45k.19: detected components are CANDIDATES. They are
+        // emitted commented out; uncommenting is the act of declaration.
+        // No active `components:` key is written when candidates exist,
+        // so a parse of the generated file yields zero declared
+        // components.
+        let got = render_config_yaml(
+            "myproj",
+            &[Component {
+                name: "api".into(),
+                path: "api/".into(),
+            }],
+        );
+        assert!(got.contains("# components:\n"), "candidates block missing: {got}");
+        assert!(got.contains("#     - name: api\n"), "candidate entry missing: {got}");
+        assert!(got.contains("#       path: api/\n"), "candidate path missing: {got}");
+        // The only `components:` occurrence is the commented one.
+        assert!(!got.contains("\ncomponents:"), "active components key must not be written: {got}");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&got).expect("generated yaml parses");
+        assert!(parsed.get("components").is_none(), "parse must see components as undeclared");
+    }
+
+    #[test]
     fn yaml_matches_rvl_cli_marshal_shape() {
         let got = render_config_yaml(
             "myproj",
@@ -922,17 +946,10 @@ mod tests {
                 },
             ],
         );
-        // Byte-for-byte the shape Go yaml.v3 marshals for rvl-cli's
-        // ProjectConfig (verified against gopkg.in/yaml.v3 v3.0.1).
-        let want = "# Revelara project configuration\n\
-             # Used by /rvl:scan and reliability-review skills for consistent service naming\n\
-             project: myproj\n\
-             components:\n\
-             \x20   - name: api\n\
-             \x20     path: api/\n\
-             \x20   - name: worker\n\
-             \x20     path: worker/\n";
-        assert_eq!(got, want);
+        // Candidate entries keep the Go yaml.v3 marshal shape behind the
+        // comment marker, so uncommenting yields exactly the byte shape
+        // rvl-cli always wrote (verified against gopkg.in/yaml.v3 v3.0.1).
+        assert!(got.contains("# components:\n#     - name: api\n#       path: api/\n#     - name: worker\n#       path: worker/\n"), "unexpected shape: {got}");
     }
 
     #[test]
@@ -944,7 +961,7 @@ mod tests {
                 path: ".".into(),
             }],
         );
-        assert!(got.ends_with("project: solo\ncomponents:\n    - name: solo\n      path: .\n"));
+        assert!(got.contains("# components:\n#     - name: solo\n#       path: .\n"), "unexpected shape: {got}");
     }
 
     #[test]

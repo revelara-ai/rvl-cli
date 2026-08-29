@@ -1750,16 +1750,39 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
     print_scan_findings(&mut std::io::stdout(), &mut std::io::stderr(), response);
 
     if !response.warnings.is_empty() {
-        eprintln!("Warnings:");
-        for w in &response.warnings {
-            eprintln!("  \u{26a0} {w}");
+        // po-7p45k.19: a quarantined service-name collision is the one
+        // warning that needs the user to act (confirm or rename), so it
+        // gets its own banner instead of drowning in the generic list.
+        // Still non-blocking: the scan succeeded and the exit code stays 0.
+        let (collisions, rest) = split_collision_warnings(&response.warnings);
+        if !collisions.is_empty() {
+            eprintln!("SERVICE NAME COLLISION (scan succeeded; action needed):");
+            for w in &collisions {
+                eprintln!("  \u{26a0} {w}");
+            }
+            eprintln!();
         }
-        eprintln!();
+        if !rest.is_empty() {
+            eprintln!("Warnings:");
+            for w in &rest {
+                eprintln!("  \u{26a0} {w}");
+            }
+            eprintln!();
+        }
     }
 
     print_stpa_loss_banner(norm_report);
 
     println!("View results: {api_url}/risks");
+}
+
+/// Route server warnings for display (po-7p45k.19): quarantined
+/// service-name collisions get their own banner; everything else stays in
+/// the generic warning list. Matching is on the server's stable phrase.
+fn split_collision_warnings(warnings: &[String]) -> (Vec<&String>, Vec<&String>) {
+    warnings
+        .iter()
+        .partition(|w| w.contains("quarantined pending confirmation"))
 }
 
 #[cfg(test)]
@@ -1785,6 +1808,24 @@ mod tests {
     }
 
     // --- idempotency ---
+
+    #[test]
+    fn scan_collision_warns_but_succeeds() {
+        // The quarantine warning is display-routing only: it must land in
+        // the collision banner bucket, leave other warnings in the generic
+        // bucket, and nothing about it turns the submit into a failure
+        // (run() derives its exit from the HTTP response alone; warnings
+        // are printed after success).
+        let warnings = vec![
+            "service \"checkout-api\" is already claimed by another repo; this scan's claim from \"shop\" is quarantined pending confirmation, and its findings are recorded unattributed (resolve on the Services page, or rename the component in .revelara.yaml)".to_string(),
+            "R-abc123: unknown control code \"RC-999\" not found in catalog".to_string(),
+        ];
+        let (collisions, rest) = split_collision_warnings(&warnings);
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0].contains("checkout-api"));
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].contains("RC-999"));
+    }
 
     #[test]
     fn idempotency_key_is_stable_32_hex() {
