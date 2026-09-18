@@ -2443,14 +2443,39 @@ fn resolve_packet_stream(
 /// findings and triaged items, the G1 sites they are index-aligned with
 /// (server-entry sites are partitioned out), the loaded spec cache so callers
 /// can run the G6 config lane against the same specs, and the G2 server-entry
-/// lane's control findings (po-av01j.3).
+/// lane's control findings (po-av01j.3), and whether the commercial tier
+/// loaded with an empty API corpus over real call sites (po-pqpry).
 type ResolvedScan = (
     Vec<rvl_propagate::Finding>,
     Vec<rvl_triage::TriagedItem>,
     Vec<rvl_core::Site>,
     rvl_spec::SpecCache,
     Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+    bool,
 );
+
+/// Did the commercial spec cache load with ZERO API specs while there were
+/// call sites to judge (po-pqpry)? Three conditions, each load-bearing:
+///
+/// * `commercial_loaded`: the OSS tier ships `apis: []` BY DESIGN (it is
+///   vocabulary, never judgment), so an OSS-only install is not this
+///   condition and must not be told its cache is broken.
+/// * `api_count == 0` on the MERGED cache: what the G1 lane actually runs on.
+/// * `call_sites > 0`: with nothing in scope nothing abstained, and a warning
+///   over a docs-only commit is noise that teaches people to skip warnings.
+fn empty_api_corpus(commercial_loaded: bool, api_count: usize, call_sites: usize) -> bool {
+    commercial_loaded && api_count == 0 && call_sites > 0
+}
+
+/// The stderr line for [`empty_api_corpus`], in the staleness-note style:
+/// what is wrong, what it does to this scan, the lever, and the escalation.
+fn empty_api_corpus_warning() -> String {
+    format!(
+        "warning: the commercial spec cache carries 0 API specs; every API surface will \
+         abstain as no_spec. Run `{BIN} sync`; if it persists, the published artifact is \
+         empty (report it)."
+    )
+}
 
 /// The scan: packets + verified specs -> propagation -> triage.
 /// Deterministic, no model calls. Undecided outcomes are reported in the
@@ -2568,7 +2593,7 @@ fn findings_from_sites(
     // decide whether a call is bounded, and the judgments that decide what an
     // unbounded one means (po-av01j.106). They are loaded together because they
     // arrive together, inside one signature.
-    let (specs_text, overlay_text, cache_judgments) = match specs_file {
+    let (specs_text, overlay_text, cache_judgments, commercial_loaded) = match specs_file {
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
             // spec cache must never load quietly.
@@ -2579,7 +2604,9 @@ fn findings_from_sites(
             );
             // No envelope was opened, so there are no cache judgments to carry.
             // A dev spec file plus `--judgments` is the full offline pairing.
-            (std::fs::read_to_string(p)?, None, None)
+            // No tier loaded either, so an empty dev file is the author's
+            // choice, not an empty publish (po-pqpry).
+            (std::fs::read_to_string(p)?, None, None, false)
         }
         None => {
             // Tiered load (po-scnmv.13): the OSS vocabulary baseline plus the
@@ -2605,8 +2632,9 @@ fn findings_from_sites(
                 }
             }
             let judgments = tiers.judgments();
+            let commercial_loaded = tiers.commercial.is_some();
             match tiers.spec_texts()? {
-                Some((base, overlay)) => (base, overlay, judgments),
+                Some((base, overlay)) => (base, overlay, judgments, commercial_loaded),
                 None => anyhow::bail!(
                     "no spec cache tier loadable: run '{BIN} sync' \
                      (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
@@ -2672,6 +2700,20 @@ fn findings_from_sites(
     // only exist in the overlay, so an upgrade is a config change.
     if let Some(overlay) = &overlay_text {
         cache.merge(rvl_spec::SpecCache::load(overlay)?);
+    }
+    // AN EMPTY COMMERCIAL API CORPUS IS NEVER QUIET (po-pqpry). On 2026-08-19
+    // a vocabulary-only artifact superseded a populated one and served for
+    // four weeks: every API surface abstained as no_spec and every scan
+    // printed "commit clean" over code nothing had judged. The signature
+    // verified, the schema matched, the staleness note stayed silent (the
+    // artifact was fresh) -- nothing on this path counted the one section the
+    // G1 lane runs on. Judged on the merged cache, after the overlay and
+    // before the declared bounds (those add ConfigSpecs, never apis).
+    // Advisory: the exit code is unchanged, the stderr line is unmissable,
+    // and COVERAGE names it below.
+    let empty_api_corpus = empty_api_corpus(commercial_loaded, cache.api_count(), sites.len());
+    if empty_api_corpus {
+        eprintln!("{}", empty_api_corpus_warning());
     }
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
@@ -2749,7 +2791,14 @@ fn findings_from_sites(
         &emission_sites,
         cache.emission_specs(),
     ));
-    Ok((findings, items, sites, cache, server_findings))
+    Ok((
+        findings,
+        items,
+        sites,
+        cache,
+        server_findings,
+        empty_api_corpus,
+    ))
 }
 
 /// Map emission-lane violations into triage items. The class key is
@@ -2945,10 +2994,11 @@ fn run_scan(
             Vec::new(),
             None,
             0,
+            false,
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict)?;
-    let (findings, mut items, sites, specs, server) = resolve_findings(
+    let (findings, mut items, sites, specs, server, empty_api_corpus) = resolve_findings(
         store,
         keyset,
         &stream.text,
@@ -2985,6 +3035,7 @@ fn run_scan(
         // below still report.
         stream.total_failure.clone(),
         stream.generated_skipped,
+        empty_api_corpus,
     )
 }
 
@@ -3103,6 +3154,9 @@ fn render_scan_output(
     degraded_note: Option<String>,
     // Machine-generated files dropped before evaluation (po-av01j.133.7).
     generated_skipped: usize,
+    // The commercial tier loaded with zero API specs over real call sites
+    // (po-pqpry): threaded into COVERAGE beside the stderr warning.
+    empty_api_corpus: bool,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -3113,6 +3167,7 @@ fn render_scan_output(
         resolved,
         total: sites.len(),
         generated_skipped,
+        empty_api_corpus,
         degraded_note,
         lang_status,
         retrievers,
@@ -4090,7 +4145,7 @@ fn run_scan_incremental(
     } else {
         scan.sites
     };
-    let (findings, mut items, sites, specs, server) = findings_from_sites(
+    let (findings, mut items, sites, specs, server, empty_api_corpus) = findings_from_sites(
         store,
         keyset,
         scan_sites,
@@ -4186,6 +4241,7 @@ fn run_scan_incremental(
         // The incremental path reuses indexed packets, which were already
         // filtered when they were first retrieved.
         0,
+        empty_api_corpus,
     )
 }
 
@@ -4233,7 +4289,7 @@ fn run_explain(
     // a degraded language must not stop it printing the finding the user asked
     // about. Strictness belongs to `scan`, which is what gates.
     let stream = resolve_packet_stream(retrieved, path, false)?;
-    let (_findings, mut items, _sites, specs, server) = resolve_findings(
+    let (_findings, mut items, _sites, specs, server, _empty_api_corpus) = resolve_findings(
         store,
         keyset,
         &stream.text,
@@ -4298,15 +4354,16 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path, false)?;
-                let (_findings, mut items, _sites, specs, server) = resolve_findings(
-                    store,
-                    keyset,
-                    &stream.text,
-                    specs_file,
-                    judgments,
-                    Some(scan_path),
-                    false,
-                )?;
+                let (_findings, mut items, _sites, specs, server, _empty_api_corpus) =
+                    resolve_findings(
+                        store,
+                        keyset,
+                        &stream.text,
+                        specs_file,
+                        judgments,
+                        Some(scan_path),
+                        false,
+                    )?;
                 // Same content-lane mirror as explain's live fallback.
                 if retrieved.is_none() {
                     items.extend(content_items(scan_path));
@@ -4391,7 +4448,7 @@ fn run_report(
         // Server-entry sites were partitioned out of `sites` inside the
         // pipeline: they are control-level spec questions, never candidates
         // for the shape-only API-surface report.
-        let (findings, _items, sites, _specs, _server) = findings_from_sites(
+        let (findings, _items, sites, _specs, _server, _empty_api_corpus) = findings_from_sites(
             store,
             keyset,
             scan.sites,
@@ -4405,7 +4462,7 @@ fn run_report(
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path, false)?;
-        let (findings, _items, sites, _specs, _server) = resolve_findings(
+        let (findings, _items, sites, _specs, _server, _empty_api_corpus) = resolve_findings(
             store,
             keyset,
             &stream.text,
@@ -6116,6 +6173,47 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- an empty commercial API corpus is never quiet (po-pqpry) ---
+
+    /// The 2026-08-19 supersession: a vocabulary-only commercial artifact
+    /// replaced a populated one, every API surface abstained as no_spec, and
+    /// every scan for four weeks printed "commit clean" over unjudged code.
+    #[test]
+    fn a_commercial_tier_with_no_api_specs_over_real_sites_is_flagged() {
+        assert!(empty_api_corpus(true, 0, 12));
+    }
+
+    /// The OSS tier legitimately ships apis: [] (it is vocabulary, never
+    /// judgment), so an OSS-only install must not be told its cache is broken.
+    #[test]
+    fn the_oss_only_install_is_not_flagged() {
+        assert!(!empty_api_corpus(false, 0, 12));
+    }
+
+    /// Nothing to abstain on, nothing to warn about: a docs-only commit under
+    /// --changed-only has no call sites, and a warning there is noise.
+    #[test]
+    fn no_call_sites_means_nothing_abstained() {
+        assert!(!empty_api_corpus(true, 0, 0));
+    }
+
+    #[test]
+    fn a_populated_commercial_tier_is_not_flagged() {
+        assert!(!empty_api_corpus(true, 1, 12));
+    }
+
+    #[test]
+    fn the_warning_names_the_tier_the_lever_and_the_escalation() {
+        let w = empty_api_corpus_warning();
+        assert!(
+            w.starts_with("warning: the commercial spec cache carries 0 API specs"),
+            "{w}"
+        );
+        assert!(w.contains("abstain as no_spec"), "{w}");
+        assert!(w.contains("sync"), "{w}");
+        assert!(w.contains("report it"), "{w}");
+    }
 
     // --- judgments ship in the signed cache (po-av01j.106 / po-axk44) ---
 
