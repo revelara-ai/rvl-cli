@@ -448,5 +448,101 @@ class TestEmissionPackets(unittest.TestCase):
                              "G1 packets must not grow a site_kind: {}".format(r))
 
 
+
+TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")
+
+# Every test-convention file in the fixture; each carries one requests.get
+# call, so a file that is scanned is a file that produces a site.
+FIXTURE_TEST_FILES = [
+    "conftest.py",
+    "fixtures/data.py",
+    "svc/app_test.py",
+    "svc/conftest.py",
+    "svc/test_app.py",
+    "test/unit.py",
+    "testing/helpers.py",
+    "tests/test_app.py",
+]
+FIXTURE_PRODUCTION_FILES = [
+    "contest/handler.py",
+    "svc/app.py",
+    "svc/attestation.py",
+]
+
+
+class TestTestPathSkip(unittest.TestCase):
+    """Test code is not scanned for API surfaces, the way goindex
+    has always skipped _test.go. The skip is COUNTED on the retrieval_stats
+    record, never silent, and --include-tests turns it off."""
+
+    def _retrieve(self, *extra):
+        code, out, err = _run("--retrieve", "--root", TESTS_FIXTURE_ROOT, *extra)
+        self.assertEqual(code, 0, err)
+        sites, kinds = _parse_stream(out)
+        stats = [r for r in kinds if r["kind"] == "retrieval_stats"]
+        self.assertEqual(len(stats), 1, kinds)
+        return sites, stats[0]
+
+    def test_is_test_path_matches_the_documented_conventions(self):
+        sys.path.insert(0, HERE)
+        try:
+            import pyindex
+        finally:
+            sys.path.pop(0)
+        for p in FIXTURE_TEST_FILES:
+            self.assertTrue(pyindex.is_test_path(p), p)
+        # Exact segments and exact basename shapes; a substring is not a
+        # convention, so these production names must all be scanned.
+        for p in FIXTURE_PRODUCTION_FILES + [
+            "src/latest.py",
+            "src/protest_handler.py",
+            "src/testing_utils.py",
+            "src/test_utils/helpers.py",
+            "pytest_plugin.py",
+        ]:
+            self.assertFalse(pyindex.is_test_path(p), p)
+
+    def test_test_paths_are_skipped_counted_and_reported(self):
+        sites, stats = self._retrieve()
+        self.assertEqual(sorted({r["file_path"] for r in sites}),
+                         FIXTURE_PRODUCTION_FILES)
+        self.assertEqual(stats["test_files_skipped"], len(FIXTURE_TEST_FILES),
+                         "the skip must be counted, never silent: {}".format(stats))
+        # NAMED as well as counted: rvl's packet index flags each skipped
+        # file so a warm scan can report the repository-wide number from
+        # reused entries, not just the files one invocation re-parsed.
+        self.assertEqual(sorted(stats["test_files_skipped_paths"]),
+                         FIXTURE_TEST_FILES)
+        # A skipped file was never attempted, so it is not in files_total:
+        # otherwise a tests-only tree reads as "every file failed to parse".
+        self.assertEqual(stats["files_total"], len(FIXTURE_PRODUCTION_FILES))
+
+    def test_include_tests_restores_test_paths(self):
+        sites, stats = self._retrieve("--include-tests")
+        self.assertEqual(sorted({r["file_path"] for r in sites}),
+                         sorted(FIXTURE_PRODUCTION_FILES + FIXTURE_TEST_FILES))
+        self.assertEqual(stats["test_files_skipped"], 0)
+        self.assertEqual(stats["test_files_skipped_paths"], [])
+        self.assertEqual(stats["files_total"],
+                         len(FIXTURE_PRODUCTION_FILES) + len(FIXTURE_TEST_FILES))
+
+    def test_files_naming_only_a_test_file_is_a_counted_skip_not_an_error(self):
+        # The incremental path asks for exactly the changed files. A commit
+        # that touches only a test must emit no test sites -- and must NOT
+        # trip the "none of the requested --files exist" exit 2, because the
+        # file exists; it was skipped on purpose and the record says so.
+        sites, stats = self._retrieve("--files", "tests/test_app.py")
+        self.assertEqual(sites, [])
+        self.assertEqual(stats["test_files_skipped"], 1)
+        self.assertEqual(stats["test_files_skipped_paths"], ["tests/test_app.py"])
+        sites, stats = self._retrieve("--files", "tests/test_app.py",
+                                      "--include-tests")
+        self.assertEqual({r["file_path"] for r in sites}, {"tests/test_app.py"})
+        self.assertEqual(stats["test_files_skipped"], 0)
+
+
+# Last statement in the module: `python3 test_pyindex.py` is a documented
+# way to run this suite, and unittest.main() only collects classes defined
+# ABOVE it.
 if __name__ == "__main__":
     unittest.main()

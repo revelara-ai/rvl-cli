@@ -133,6 +133,53 @@ module to every site using it, so one `Timeout`-bearing literal is evidence
 for every `http.Client` call in the repo. The reason names the file and line
 it came from.
 
+## What a retriever skips
+
+A retriever reads production code. Two kinds of file are left out, and
+both are counted in COVERAGE rather than dropped in silence, because a file
+excluded without saying so reads as a file that was scanned:
+
+- **Machine-generated files**, decided by the banner in the file (`Code
+  generated ... DO NOT EDIT`), never by the path. `rvl` drops their packets
+  after retrieval and prints `N machine-generated files excluded`; `--out`
+  carries `coverage.generated_skipped`.
+- **Test files**, decided by path convention inside the helper. `goindex`
+  has always skipped `_test.go` and `vendor/`. `pyindex` and `tsindex` skip
+  the conventions below, count what they skipped, and report the count on
+  the repo-scoped record every helper writes (`test_files_skipped`, with
+  the paths beside it as `test_files_skipped_paths`, on tsindex's
+  `repo_config` and pyindex's `retrieval_stats`). `rvl` prints one
+  COVERAGE line per language, `TypeScript: 12 test files skipped (tests are
+  not scanned for API surfaces)`, and `--out` carries the total as
+  `coverage.test_files_skipped`. A zero prints nothing. The packet index
+  flags each named file, so a warm scan reports the repository-wide count
+  from reused entries rather than the files it happened to re-parse.
+
+| Retriever | Skipped by default |
+| --- | --- |
+| `goindex` | `*_test.go`, anything under `vendor/` |
+| `pyindex` | a path segment named `tests`, `test`, `testing` or `fixtures`; `conftest.py`; `test_*.py`; `*_test.py` |
+| `tsindex` | a path segment named `tests`, `test`, `__tests__`, `__mocks__`, `e2e`, `spec`, `fixtures`, `testdata` or `cypress`; `*.test.*`, `*.spec.*`, `*.cy.*`; `playwright.config.*`, `cypress.config.*`, `vitest.config.*`, `vitest.workspace.*`, `vitest.setup.*`, `jest.config.*`, `jest.setup.*`, `setupTests.*` |
+
+Segments and basenames match exactly, never as substrings: `attestation.ts`,
+`lib/contest/`, `packages/test-utils/` and `src/latest.py` are production
+code. The segment rule has one known false positive: a directory literally
+named `spec` is treated as test material, so an `openapi/spec/` tree of
+TypeScript is skipped and counted. `--include-tests` is the escape hatch.
+
+A deliberate change to bound crediting rides along in tsindex: a test
+file's client constructions are left out of the repo-scoped construction
+facts too, so a timeout set in test scaffolding cannot credit a bound to a
+production call. A repo whose only `new Pool({ connectionTimeoutMillis })`
+lives under `tests/` used to have its production `pool.query` calls
+credited as bounded; it now abstains on them, which is the honest answer.
+
+`rvl scan --include-tests` lifts the skip for the Python and TypeScript
+lanes on a full scan (`goindex` is unchanged). It is refused together with
+`--incremental`: the packet index is built with the skip in place, so a warm
+scan could only honor the flag for the files it re-parsed and would report
+that partial answer as the repository's.
+
 ## Scanning a prebuilt packet stream
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape

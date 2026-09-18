@@ -109,6 +109,16 @@ enum Cmd {
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+        /// Also scan test code for API surfaces. By default the
+        /// Python and TypeScript retrievers skip test paths (`tests/`,
+        /// `e2e/`, `*.test.ts`, `conftest.py`, the Playwright/Jest/Vitest
+        /// configs, ...) the way the Go retriever has always skipped
+        /// `_test.go`, and COVERAGE reports how many files that was. Full
+        /// scans only: the incremental index is built with the skip in place,
+        /// so `--incremental` refuses this flag rather than honoring it for the
+        /// re-parsed files alone.
+        #[arg(long)]
+        include_tests: bool,
         /// Report and gate ONLY on findings in the files this change touched
         /// (po-av01j.127). The changed set comes from GIT, never from the
         /// packet index (po-sg7jb): staged paths under `--hook pre-commit`,
@@ -1021,6 +1031,13 @@ impl Lang {
             Lang::CCpp => "cindex",
         }
     }
+    /// Whether this language's helper implements the test-path skip and so
+    /// accepts `--include-tests`. goindex does not: its `_test.go`
+    /// skip is unconditional, and the Go `flag` package rejects an unknown
+    /// flag outright, so sending it one fails the whole Go lane.
+    fn helper_skips_tests(self) -> bool {
+        matches!(self, Lang::Python | Lang::TypeScript)
+    }
     /// The env var that overrides helper discovery for this language.
     fn env_override(self) -> &'static str {
         match self {
@@ -1615,7 +1632,13 @@ fn chunk_files(files: &[String], cap: usize) -> Vec<Vec<String>> {
     out
 }
 
-fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String]) -> Vec<String> {
+fn helper_argv(
+    helper: &ResolvedHelper,
+    root: &Path,
+    name: &str,
+    files: &[String],
+    include_tests: bool,
+) -> Vec<String> {
     let root = root.display().to_string();
     let helper_path = helper.path.display().to_string();
     let mut tail = vec![
@@ -1628,6 +1651,9 @@ fn helper_argv(helper: &ResolvedHelper, root: &Path, name: &str, files: &[String
     if !files.is_empty() {
         tail.push("--files".to_string());
         tail.push(files.join(","));
+    }
+    if include_tests {
+        tail.push("--include-tests".to_string());
     }
     match helper.kind {
         HelperKind::Executable => std::iter::once(helper_path).chain(tail).collect(),
@@ -1898,7 +1924,11 @@ fn run_helper(
     root: &Path,
     name: &str,
     files: &[String],
+    include_tests: bool,
 ) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
+    // Only the helpers that implement the skip are told to lift it; the rest
+    // would reject the flag (see `Lang::helper_skips_tests`).
+    let include_tests = include_tests && lang.helper_skips_tests();
     // BATCHED so the `--files` payload cannot exceed the per-argument exec
     // limit (po-av01j.141). A whole-repo changed set on a large repository is
     // megabytes of paths in one argv entry, and the spawn fails before the
@@ -1915,7 +1945,7 @@ fn run_helper(
     };
     let mut merged = String::new();
     for batch in &batches {
-        let argv = helper_argv(helper, root, name, batch);
+        let argv = helper_argv(helper, root, name, batch, include_tests);
         let (program, args) = argv.split_first().expect("argv always has a program");
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
@@ -2228,6 +2258,9 @@ struct RetrievedStream {
     /// Distinct machine-generated files whose packets were dropped. Reported in
     /// COVERAGE: excluding them silently would read as having scanned them.
     generated_skipped: usize,
+    /// Test files each helper declined to read, per language. The
+    /// same rule as `generated_skipped`: reported, never silent.
+    test_files_skipped: Vec<render::TestFilesSkipped>,
     /// Set when EVERY detected language failed, so the call-site lane is empty
     /// for a reason the reader must be told (po-av01j.145). Rendered by the
     /// COVERAGE block, never swallowed.
@@ -2257,15 +2290,28 @@ fn resolve_packet_stream(
     retrieved: Option<&Path>,
     path: &Path,
     strict: bool,
+    include_tests: bool,
 ) -> anyhow::Result<RetrievedStream> {
     if let Some(p) = retrieved {
         let text = std::fs::read_to_string(p)
             .with_context(|| format!("reading --retrieved {}", p.display()))?;
+        // The stream's repo-scoped record carries the helper's own count, and
+        // a captured stream that skipped files must not scan as a false
+        // zero. One language per stream is not guaranteed here, so the lane
+        // is named for what it is.
+        let test_files_skipped = match rvl_core::parse_stream(&text).1.test_files_skipped {
+            0 => Vec::new(),
+            count => vec![render::TestFilesSkipped {
+                lang: "retrieved stream".to_string(),
+                count,
+            }],
+        };
         return Ok(RetrievedStream {
             text,
             // A prebuilt stream is scanned as given: PATH is ignored on this
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
+            test_files_skipped,
             total_failure: None,
             degraded: Vec::new(),
             // A prebuilt stream says nothing about which helpers ran, so the
@@ -2290,6 +2336,7 @@ fn resolve_packet_stream(
         return Ok(RetrievedStream {
             text: String::new(),
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             total_failure: None,
             retrievers: Vec::new(),
             status: detect_unsupported(path)
@@ -2353,6 +2400,7 @@ fn resolve_packet_stream(
     let detected = langs.len();
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
+    let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
     let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
@@ -2385,7 +2433,7 @@ fn resolve_packet_stream(
             path: helper.path.display().to_string(),
             source: helper.source.clone(),
         });
-        match run_helper(lang, &helper, path, &name, &[])? {
+        match run_helper(lang, &helper, path, &name, &[], include_tests)? {
             Ok(out) => {
                 // Drop machine-generated files BEFORE counting. Filtering after
                 // the roll-call was built left "Java 33744 sites" printed above
@@ -2393,6 +2441,17 @@ fn resolve_packet_stream(
                 // which is the same defect shape as the RC-057 false negative.
                 let (out, gen) = strip_generated_packets(&out, path);
                 generated_skipped += gen;
+                // The helper says how many test files it declined to read, on
+                // its repo-scoped record. Read per language HERE,
+                // where the stream is still one language's, so COVERAGE can
+                // name the lane; the merged stream only knows the total.
+                let skipped = rvl_core::parse_stream(&out).1.test_files_skipped;
+                if skipped > 0 {
+                    test_files_skipped.push(render::TestFilesSkipped {
+                        lang: lang.to_string(),
+                        count: skipped,
+                    });
+                }
                 // A ZERO here is a real answer, not an absence: the helper ran
                 // and found nothing. Counting site packets rather than lines
                 // keeps repo_config/retrieval_stats records out of the number.
@@ -2432,6 +2491,7 @@ fn resolve_packet_stream(
     Ok(RetrievedStream {
         text: combined,
         generated_skipped,
+        test_files_skipped,
         total_failure,
         status,
         degraded,
@@ -2945,6 +3005,7 @@ fn run_scan(
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
+    include_tests: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // The full path treats "no language detected" as a clean pass too
@@ -2998,9 +3059,10 @@ fn run_scan(
             None,
             0,
             false,
+            Vec::new(),
         );
     }
-    let stream = resolve_packet_stream(retrieved, path, strict)?;
+    let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
     let (findings, mut items, sites, specs, server, empty_api_corpus) = resolve_findings(
         store,
         keyset,
@@ -3039,6 +3101,7 @@ fn run_scan(
         stream.total_failure.clone(),
         stream.generated_skipped,
         empty_api_corpus,
+        stream.test_files_skipped.clone(),
     )
 }
 
@@ -3158,8 +3221,10 @@ fn render_scan_output(
     // Machine-generated files dropped before evaluation (po-av01j.133.7).
     generated_skipped: usize,
     // The commercial tier loaded with zero API specs over real call sites
-    // (po-pqpry): threaded into COVERAGE beside the stderr warning.
+    // is threaded into COVERAGE beside the stderr warning.
     empty_api_corpus: bool,
+    // Test files the retrievers declined to read, per language.
+    test_files_skipped: Vec<render::TestFilesSkipped>,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -3171,6 +3236,7 @@ fn render_scan_output(
         total: sites.len(),
         generated_skipped,
         empty_api_corpus,
+        test_files_skipped,
         degraded_note,
         lang_status,
         retrievers,
@@ -3385,7 +3451,12 @@ impl HelperRetriever {
                     continue;
                 }
             };
-            let stream = match run_helper(lang, &helper, &self.root, &self.name, &files)? {
+            // The index is built with the test-path skip in place, so the
+            // warm path never lifts it (the `scan` dispatch refuses the
+            // combination); an index half built each way would make the
+            // reused portion and the re-parsed portion answer different
+            // questions.
+            let stream = match run_helper(lang, &helper, &self.root, &self.name, &files, false)? {
                 Ok(s) => s,
                 Err((kind, reason)) => {
                     self.push_degradation(LangDegradation { lang, kind, reason });
@@ -3394,6 +3465,9 @@ impl HelperRetriever {
             };
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
+            // The test files the helper declined to read ride `cfg` too
+            // (`test_files_skipped_paths`), and `absorb` concatenates them,
+            // so the caller can flag each one in the index.
             // MERGED across languages (RepoConfig::absorb): helpers emit
             // whole-repo constructions regardless of `--files`, and one
             // language's facts must never erase another's. The old
@@ -3562,6 +3636,13 @@ struct IncrementalScan {
     /// (po-av01j.102). Distinct from `degraded_note`, which is about the wall
     /// budget: this is about a language contributing nothing at all.
     lang_degraded: Vec<LangDegradation>,
+    /// Test files the helpers declined to read, per language, REPOSITORY-WIDE
+    ///: reused entries the index flagged when they were first
+    /// retrieved plus the ones this pass re-parsed. A per-pass delta here
+    /// would print nothing on every warm scan after the first, and a skip
+    /// nobody is told about is the silent exclusion the line exists to
+    /// prevent.
+    test_files_skipped: Vec<render::TestFilesSkipped>,
     /// The candidate set was EMPTY: this tree holds no file any retriever
     /// reads (po-av01j.198). Not a degradation and not an error — there was
     /// nothing to retrieve — but the caller must SAY so, because a gate that
@@ -3581,6 +3662,7 @@ impl IncrementalScan {
             degraded_note: None,
             reparsed_files: Vec::new(),
             lang_degraded: Vec::new(),
+            test_files_skipped: Vec::new(),
             no_supported_sources: true,
         }
     }
@@ -3605,12 +3687,23 @@ where
         .map(|f| repo_relative(root, f))
         .collect();
 
-    // Reuse indexed packets for the unchanged files.
+    // Reuse indexed packets for the unchanged files. An entry flagged as a
+    // skipped test file is reused like any other (it has no packets) and
+    // counted, so the COVERAGE line describes the repository, not the delta.
     let mut reused = Vec::new();
+    let mut test_skips: std::collections::BTreeMap<Lang, usize> = Default::default();
+    let mut count_skip = |f: &Path| {
+        if let Some(lang) = lang_of_path(f) {
+            *test_skips.entry(lang).or_default() += 1;
+        }
+    };
     for f in &plan.unchanged {
         let h = rvl_index::hash_file(f)?;
-        if let Some(cached) = index.get(f, &h)? {
-            reused.extend(cached);
+        if let Some(cached) = index.lookup(f, &h)? {
+            if cached.test_skipped {
+                count_skip(f);
+            }
+            reused.extend(cached.sites);
         }
     }
     let reused_files = plan.unchanged.len();
@@ -3621,6 +3714,21 @@ where
     } else {
         retrieve(&plan.changed)?
     };
+
+    // The changed files the helpers declined to read as test material, by
+    // the repo-relative path they emit. Counted whether or not this pass
+    // re-indexes: the helper did say so.
+    let skipped_now: std::collections::BTreeSet<&str> = rr
+        .repo_cfg
+        .test_files_skipped_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for f in &plan.changed {
+        if skipped_now.contains(repo_relative(root, f).as_str()) {
+            count_skip(f);
+        }
+    }
 
     // Re-index the freshly retrieved files so the next pass reuses them. Only
     // when NOT degraded: recording a file we did not actually retrieve would
@@ -3637,6 +3745,15 @@ where
                 continue;
             }
             let rel = repo_relative(root, f);
+            // A skipped test file is recorded AS skipped, not as scanned with
+            // zero packets: the two are the same to `get`, and the next pass
+            // has to count this one.
+            if skipped_now.contains(rel.as_str()) {
+                let h = rvl_index::hash_file(f)?;
+                index.put_test_skipped(f, &h)?;
+                indexed += 1;
+                continue;
+            }
             let for_file: Vec<rvl_core::Site> = rr
                 .sites
                 .iter()
@@ -3661,6 +3778,13 @@ where
         // Filled in by the caller that owns the retriever handle; this function
         // is retriever-agnostic so a fake can drive it in tests.
         lang_degraded: Vec::new(),
+        test_files_skipped: test_skips
+            .into_iter()
+            .map(|(lang, count)| render::TestFilesSkipped {
+                lang: lang.to_string(),
+                count,
+            })
+            .collect(),
         // This function is only reached with a candidate set in hand; the
         // no-source case short-circuits in `incremental_scan_pass`.
         no_supported_sources: false,
@@ -3888,7 +4012,7 @@ fn run_index_build(
 
     if let Some(retrieved) = retrieved {
         let stream = std::fs::read_to_string(&retrieved)?;
-        let (sites, _, skipped) = rvl_core::parse_stream(&stream);
+        let (sites, cfg, skipped) = rvl_core::parse_stream(&stream);
         // Group by originating file so each entry is keyed by that
         // file's current content hash.
         let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
@@ -3909,7 +4033,23 @@ fn run_index_build(
                 Err(_) => missing += 1,
             }
         }
-        println!("indexed {indexed} file(s) | unreadable {missing} | unparseable lines {skipped}");
+        // The files the helper declined to read are flagged, not dropped, so
+        // the warm scan reading this index can count them.
+        let mut test_skipped = 0usize;
+        for file in &cfg.test_files_skipped_paths {
+            let path = PathBuf::from(file);
+            match rvl_index::hash_file(&path) {
+                Ok(h) => {
+                    idx.put_test_skipped(&path, &h)?;
+                    test_skipped += 1;
+                }
+                Err(_) => missing += 1,
+            }
+        }
+        println!(
+            "indexed {indexed} file(s) | test files skipped {test_skipped} | \
+             unreadable {missing} | unparseable lines {skipped}"
+        );
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -3955,9 +4095,21 @@ fn run_index_build(
             degraded_langs,
         })
     })?;
+    // The skipped test files are flagged in the index for the warm scan to
+    // count; this line is the only place a background warm can say so.
+    let skipped: usize = scan.test_files_skipped.iter().map(|t| t.count).sum();
     println!(
-        "reindexed: reused {} unchanged, retrieved {} changed",
-        scan.reused_files, scan.retrieved_files
+        "reindexed: reused {} unchanged, retrieved {} changed{}",
+        scan.reused_files,
+        scan.retrieved_files,
+        if skipped == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {skipped} test file{} skipped (tests are not scanned for API surfaces)",
+                if skipped == 1 { "" } else { "s" }
+            )
+        }
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -4247,6 +4399,7 @@ fn run_scan_incremental(
         // filtered when they were first retrieved.
         0,
         empty_api_corpus,
+        scan.test_files_skipped.clone(),
     )
 }
 
@@ -4293,7 +4446,7 @@ fn run_explain(
     // `explain` is lenient on purpose: it exists to resolve one finding id, so
     // a degraded language must not stop it printing the finding the user asked
     // about. Strictness belongs to `scan`, which is what gates.
-    let stream = resolve_packet_stream(retrieved, path, false)?;
+    let stream = resolve_packet_stream(retrieved, path, false, false)?;
     let (_findings, mut items, _sites, specs, server, _empty_api_corpus) = resolve_findings(
         store,
         keyset,
@@ -4358,7 +4511,7 @@ fn run_suppress(
             }
             None => {
                 let scan_path = path.unwrap_or(&cwd);
-                let stream = resolve_packet_stream(retrieved, scan_path, false)?;
+                let stream = resolve_packet_stream(retrieved, scan_path, false, false)?;
                 let (_findings, mut items, _sites, specs, server, _empty_api_corpus) =
                     resolve_findings(
                         store,
@@ -4466,7 +4619,7 @@ fn run_report(
         )?;
         (findings, sites)
     } else {
-        let stream = resolve_packet_stream(retrieved, path, false)?;
+        let stream = resolve_packet_stream(retrieved, path, false, false)?;
         let (findings, _items, sites, _specs, _server, _empty_api_corpus) = resolve_findings(
             store,
             keyset,
@@ -5825,6 +5978,7 @@ fn run() -> anyhow::Result<ExitCode> {
             color,
             incremental,
             strict,
+            include_tests,
             changed_only,
             base,
             agent,
@@ -5884,6 +6038,17 @@ fn run() -> anyhow::Result<ExitCode> {
                  change scoping is implemented on the incremental path only, so there is \
                  nothing to scope to without it"
             );
+            // The packet index caches what a helper returned, and it is built
+            // with the test-path skip in place. Honoring the flag on
+            // a warm scan would lift the skip for the re-parsed files only and
+            // report that partial answer as the repo's, so refuse rather than
+            // mislead, the same shape as the --changed-only guard above.
+            anyhow::ensure!(
+                !include_tests || !(incremental && retrieved.is_none()),
+                "--include-tests applies to a full scan only: the incremental packet index is \
+                 built with test paths skipped, so a warm scan cannot honor it for the whole \
+                 repository. Re-run without --incremental to scan test code."
+            );
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
             if incremental && retrieved.is_none() {
@@ -5923,6 +6088,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     out.as_deref(),
                     color.as_deref(),
                     strict,
+                    include_tests,
                 )
             }
         }
@@ -7243,7 +7409,7 @@ mod tests {
             kind: HelperKind::Executable,
             source: "test".into(),
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
         assert_eq!(
             argv,
             vec![
@@ -7257,6 +7423,31 @@ mod tests {
         );
     }
 
+    /// `--include-tests` reaches ONLY the helpers that implement the skip
+    ///. goindex parses its flags with the Go `flag` package, which
+    /// rejects an unknown flag outright, and its `_test.go` skip is
+    /// unconditional by design; sending it the flag would turn every
+    /// `--include-tests` scan of a Go repo into a failed Go lane.
+    #[test]
+    fn include_tests_reaches_only_the_helpers_that_own_the_skip() {
+        assert!(Lang::Python.helper_skips_tests());
+        assert!(Lang::TypeScript.helper_skips_tests());
+        assert!(!Lang::Go.helper_skips_tests());
+        assert!(!Lang::Rust.helper_skips_tests());
+        assert!(!Lang::Java.helper_skips_tests());
+        assert!(!Lang::CSharp.helper_skips_tests());
+        assert!(!Lang::CCpp.helper_skips_tests());
+        let helper = ResolvedHelper {
+            path: PathBuf::from("/opt/pyindex.py"),
+            kind: HelperKind::PyScript,
+            source: "test".into(),
+        };
+        let with = helper_argv(&helper, Path::new("/repo"), "repo", &[], true);
+        assert_eq!(with.last().map(String::as_str), Some("--include-tests"));
+        let without = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
+        assert!(!without.contains(&"--include-tests".to_string()));
+    }
+
     #[test]
     fn python_script_argv_runs_under_python3() {
         let helper = ResolvedHelper {
@@ -7264,7 +7455,7 @@ mod tests {
             kind: HelperKind::PyScript,
             source: "test".into(),
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
         assert_eq!(
             argv,
             vec![
@@ -7286,7 +7477,7 @@ mod tests {
             kind: HelperKind::NodeScript,
             source: "test".into(),
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
         assert_eq!(
             argv,
             vec![
@@ -7308,7 +7499,7 @@ mod tests {
             kind: HelperKind::DotnetAssembly,
             source: "test".into(),
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
         assert_eq!(
             argv,
             vec![
@@ -7336,6 +7527,7 @@ mod tests {
             Path::new("/repo"),
             "repo",
             &[],
+            false,
         );
         assert_eq!(
             argv,
@@ -7391,7 +7583,7 @@ mod tests {
             kind: HelperKind::JavaSource,
             source: "test".into(),
         };
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[]);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &[], false);
         assert_eq!(
             argv,
             vec![
@@ -7504,7 +7696,7 @@ mod tests {
             source: "test".into(),
         };
         let changed = vec!["svc/db.go".to_string(), "svc/http.go".to_string()];
-        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &changed);
+        let argv = helper_argv(&helper, Path::new("/repo"), "repo", &changed, false);
         assert_eq!(
             argv,
             vec![
@@ -7521,7 +7713,8 @@ mod tests {
         );
         // The full path (no --files) is unchanged.
         assert!(
-            !helper_argv(&helper, Path::new("/repo"), "repo", &[]).contains(&"--files".to_string())
+            !helper_argv(&helper, Path::new("/repo"), "repo", &[], false)
+                .contains(&"--files".to_string())
         );
     }
 
@@ -7747,7 +7940,7 @@ mod tests {
             detect_languages(dir.path()).is_empty(),
             "the fixture must genuinely have no source"
         );
-        let stream = resolve_packet_stream(None, dir.path(), false)
+        let stream = resolve_packet_stream(None, dir.path(), false, false)
             .expect("no language is not an error: nothing was needed");
         assert!(stream.text.is_empty());
         assert!(
@@ -7805,6 +7998,7 @@ mod tests {
             degraded_note: None,
             reparsed_files: Vec::new(),
             lang_degraded,
+            test_files_skipped: Vec::new(),
             no_supported_sources: false,
         }
     }

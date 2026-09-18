@@ -937,6 +937,27 @@ def _rel(root, abs_path):
     return os.path.relpath(abs_path, root).replace(os.sep, "/")
 
 
+# TEST CODE IS NOT SCANNED FOR API SURFACES, the way goindex has
+# always skipped _test.go. The skip is by PATH CONVENTION -- exact directory
+# segments and exact basename shapes, never a substring, so `contest/` and
+# `attestation.py` are production code. It is counted and reported on the
+# retrieval_stats record (`test_files_skipped`), and --include-tests turns it
+# off for a caller who wants test code scanned.
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test", "testing", "fixtures"})
+
+
+def is_test_path(rel):
+    """True when a root-relative, forward-slashed path is test material."""
+    parts = rel.split("/")
+    base = parts[-1]
+    if any(seg in _TEST_DIR_SEGMENTS for seg in parts[:-1]):
+        return True
+    if base == "conftest.py":
+        return True
+    return ((base.startswith("test_") or base.endswith("_test.py"))
+            and base.endswith(".py"))
+
+
 def discover(root, files_arg):
     """Yield (abs_path, emit_relative_path) for the files to index.
 
@@ -963,13 +984,22 @@ def discover(root, files_arg):
                 yield abs_path, _rel(root, abs_path)
 
 
-def run_retrieve(root, snapshot, files_arg):
+def run_retrieve(root, snapshot, files_arg, include_tests=False):
     """Retrieve every discovered file. Returns (records, stats) where stats
-    counts what was attempted: {"files_total", "files_parsed", "files_failed"}.
+    counts what was attempted: {"files_total", "files_parsed", "files_failed"}
+    plus "test_files_skipped", which is NOT in files_total: a skipped file was
+    never attempted, and counting it would make a tests-only tree read as
+    "every file failed to parse".
     """
     records = []
     total = parsed = failed = 0
+    # NAMED, not just counted: rvl's packet index flags each skipped file so
+    # a warm scan can report the repository-wide number from reused entries.
+    skipped = []
     for abs_path, file_path in discover(root, files_arg):
+        if not include_tests and is_test_path(file_path):
+            skipped.append(file_path)
+            continue
         total += 1
         got = retrieve_file(abs_path, file_path, snapshot)
         if got is None:
@@ -981,6 +1011,8 @@ def run_retrieve(root, snapshot, files_arg):
         "files_total": total,
         "files_parsed": parsed,
         "files_failed": failed,
+        "test_files_skipped": len(skipped),
+        "test_files_skipped_paths": skipped,
     }
 
 
@@ -1008,6 +1040,8 @@ def emit_stats(snapshot, stats, n_sites, out=sys.stdout):
         "files_parsed": stats["files_parsed"],
         "files_failed": stats["files_failed"],
         "sites": n_sites,
+        "test_files_skipped": stats["test_files_skipped"],
+        "test_files_skipped_paths": stats["test_files_skipped_paths"],
     }))
     out.write("\n")
 
@@ -1032,6 +1066,10 @@ def build_parser():
     p.add_argument("--files", default="",
                    help="comma-separated repo-relative .py files; emit packets "
                         "only for these (incremental reload path)")
+    p.add_argument("--include-tests", action="store_true",
+                   help="also retrieve test paths (tests/, test/, testing/, "
+                        "fixtures/, conftest.py, test_*.py, *_test.py), "
+                        "which are skipped and counted by default")
     return p
 
 
@@ -1053,20 +1091,25 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
         snapshot = args.name or os.path.basename(root.rstrip(os.sep)) or root
-        records, stats = run_retrieve(root, snapshot, args.files)
+        records, stats = run_retrieve(root, snapshot, args.files,
+                                      args.include_tests)
         emit(records)
         emit_stats(snapshot, stats, len(records))
-        print("{}: {} retrieved sites ({} files, {} failed)".format(
-            snapshot, len(records), stats["files_total"],
-            stats["files_failed"]), file=sys.stderr)
+        print("{}: {} retrieved sites ({} files, {} failed, {} test files "
+              "skipped)".format(snapshot, len(records), stats["files_total"],
+                                stats["files_failed"],
+                                stats["test_files_skipped"]), file=sys.stderr)
         # Exit non-zero when NOTHING was read, so the lane degrades loudly
         # instead of recording a successful retrieval of zero sites:
         #   - --files named files that do not exist here (all filtered out);
         #   - every discovered file failed to read or parse.
         # A tree with genuinely zero .py files (a pyproject.toml-only repo)
         # stays exit 0: the stats record proves the helper ran and read the
-        # tree, and "nothing to read" is a real answer.
-        if args.files.strip(",").strip() and stats["files_total"] == 0:
+        # tree, and "nothing to read" is a real answer. So is a --files set
+        # made only of test paths: the files exist, they were skipped on
+        # purpose, and the stats record says so.
+        if (args.files.strip(",").strip() and stats["files_total"] == 0
+                and stats["test_files_skipped"] == 0):
             print("pyindex: none of the requested --files exist under {}"
                   .format(root), file=sys.stderr)
             return 2

@@ -52,6 +52,7 @@ The orchestrator uses it to:
     "total": 1780,
     "abstain": { "no_spec": 90, "bounds": 40, "judge": 30, "other": 6 },
     "generated_skipped": 3,
+    "test_files_skipped": 12,
     "degraded_note": null,
     "lang_status": [ { "lang": "go", "state": "scanned", "detail": "1240" } ],
     "retrievers": [ { "lang": "go", "path": "...", "source": "bundled" } ],
@@ -108,6 +109,16 @@ The orchestrator uses it to:
     slot.
   - `degraded[]`: one row per degraded lane (`lang`, `abstained`,
     `not_installed`, `reason`); empty on a fully healthy scan.
+  - `generated_skipped` and `test_files_skipped`: files the scan declined to
+    read, so a consumer can tell "no sites in tests" from "tests were not
+    looked at". The first counts banner-declared machine-generated files
+    dropped after retrieval; the second counts test files the Python and
+    TypeScript retrievers skipped by path convention, summed across
+    languages (the per-language split is printed in COVERAGE). Both are
+    repository-wide on every path: a warm (`--incremental`) scan counts the
+    test files its packet index flagged when they were first retrieved as
+    well as the ones it re-parsed this pass. `rvl scan --include-tests`
+    makes the second zero by scanning them.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime

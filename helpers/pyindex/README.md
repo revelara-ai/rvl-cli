@@ -6,6 +6,7 @@ reliability, it only says what the code is.
 
     pyindex --retrieve --root <repo> --name <snapshot>     # full load
     pyindex --retrieve --root <repo> --files a.py,b.py     # incremental reload
+    pyindex --retrieve --root <repo> --include-tests       # also read test paths
     pyindex --packet-schema                                # negotiate before loading
 
 Standard library only (`ast`, `argparse`, `json`, `os`, `sys`). No pyright, no
@@ -57,6 +58,31 @@ Every record carries:
   for C/C++ retrievers.
 - `callers`, `callees` — **empty arrays** (see below).
 - `lang` — `"python"`.
+
+## The `retrieval_stats` record (one per run)
+
+After the site packets, pyindex writes exactly one repo-scoped line,
+`{"packet_schema":2,"kind":"retrieval_stats","lang":"python","files_total":…,
+"files_parsed":…,"files_failed":…,"sites":…,"test_files_skipped":…,
+"test_files_skipped_paths":[…]}`, on every successful run, even one that
+found no sites: rvl's silent-zero guard keys on it to tell "ran and found
+nothing" from "never ran". `test_files_skipped` (v2, additive) is how many
+test files the run declined to read, and `test_files_skipped_paths` names
+them (repo-relative, in discovery order) so rvl's packet index can flag
+each one and a warm scan can report the repository-wide count; those files
+are not in `files_total`, because they were never attempted.
+
+## What it skips
+
+Test code is not scanned for API surfaces, the way goindex has always
+skipped `_test.go`. A file is test material when, relative to `--root`,
+any directory segment is exactly `tests`, `test`, `testing` or `fixtures`,
+or its basename is `conftest.py`, `test_*.py` or `*_test.py`. Exact matches
+only, never substrings: `contest/handler.py`, `attestation.py` and
+`latest.py` are production code. A `--files` set made only of test paths is
+a counted skip, not the "requested files do not exist" error.
+`--include-tests` turns the skip off; `rvl scan --include-tests` passes it
+through.
 
 ## Resolution engine: stdlib `ast`, and its confidence tradeoff
 
@@ -125,3 +151,6 @@ callees) is out of scope for v1.
 tests assert the two properties every consumer depends on — schema stamped and
 site_key unique + well-formed — plus that a known client resolves, that a
 construction/timeout is retrievable, and that noise calls are not emitted.
+`testdata/fixture_tests/` holds one file per test-path convention beside
+three production files, for the tests that pin what is skipped, what is
+counted and named, and what `--include-tests` restores.

@@ -818,6 +818,33 @@ const SKIP_DIRS = new Set([
   '.git', 'node_modules', 'dist', 'build', 'out', 'coverage',
 ]);
 
+// TEST CODE IS NOT SCANNED FOR API SURFACES, the way goindex has
+// always skipped _test.go. On one real repo 700+ of 889 violates were
+// Playwright/msw calls inside E2E tests -- a wall of advisory rows about the
+// tests, not the product. The skip is by PATH CONVENTION, exact segments and
+// exact basename shapes, never a substring: `attestation.ts` and
+// `lib/contest/` are production code. It is counted and reported on the
+// repo_config record (`test_files_skipped`), and `--include-tests` turns it
+// off for a caller who wants test code scanned.
+const TEST_DIR_SEGMENTS = new Set([
+  'tests', 'test', '__tests__', '__mocks__', 'e2e', 'spec', 'fixtures',
+  'testdata', 'cypress',
+]);
+// service.test.ts, service.spec.tsx, login.cy.ts (Cypress).
+const TEST_BASENAME = /\.(test|spec|cy)\./;
+// The standard Playwright / Cypress / Vitest / Jest config and setup files.
+const TEST_CONFIG_BASENAME =
+  /^(?:(?:playwright|cypress|vitest|jest)\.config|(?:vitest|jest)\.setup|vitest\.workspace|setupTests)\.[cm]?[jt]sx?$/;
+
+// isTestPath reports whether a root-relative, forward-slashed path is test
+// material by the conventions above.
+function isTestPath(rel) {
+  const parts = rel.split('/');
+  const base = parts[parts.length - 1];
+  if (parts.slice(0, -1).some((seg) => TEST_DIR_SEGMENTS.has(seg))) return true;
+  return TEST_BASENAME.test(base) || TEST_CONFIG_BASENAME.test(base);
+}
+
 // buildProgram creates a type-checked Program over `root`. If a tsconfig.json
 // is present it is honored (files + compilerOptions); otherwise every non-.d.ts
 // source under root (skipping vendored/build dirs) is a root file with
@@ -907,7 +934,7 @@ function siteKey(rec) {
 // Retrieval
 // ---------------------------------------------------------------------------
 
-function runRetrieve(root, snapshot, filesArg) {
+function runRetrieve(root, snapshot, filesArg, includeTests) {
   const program = buildProgram(root);
   const checker = program.getTypeChecker();
   const rootReal = fs.realpathSync(root);
@@ -940,11 +967,22 @@ function runRetrieve(root, snapshot, filesArg) {
     );
   }
 
+  // Test material is skipped AFTER the --files filter, so the count says
+  // what THIS invocation declined to read: the whole tree on a full load,
+  // the changed files on an incremental one. A Set, because a file is
+  // counted once however many times it is visited.
+  const skippedTests = new Set();
+  const isProduction = (relPath) => includeTests || !isTestPath(relPath);
+
   const records = [];
   for (const sf of program.getSourceFiles()) {
     if (!isScanned(sf)) continue;
     const relPath = relPathOf(sf.fileName);
     if (wanted && !wanted.has(relPath)) continue;
+    if (!isProduction(relPath)) {
+      skippedTests.add(relPath);
+      continue;
+    }
 
     // Per-file G4 emission state: aggregates keyed (function, framework,
     // category), plus the catch clauses seen and which of them emit.
@@ -1021,7 +1059,18 @@ function runRetrieve(root, snapshot, filesArg) {
     }
   }
 
-  const repoConfig = collectRepoConfig(program, checker, snapshot, isScanned);
+  // A construction inside a test file is not a repo-wide fact: a timeout
+  // set in test scaffolding must not credit a bound to production calls.
+  const repoConfig = collectRepoConfig(
+    program,
+    checker,
+    snapshot,
+    (sf) => isScanned(sf) && isProduction(relPathOf(sf.fileName)),
+  );
+  repoConfig.test_files_skipped = skippedTests.size;
+  // NAMED, not just counted: rvl's packet index flags each skipped file so a
+  // warm scan can report the repository-wide number from reused entries.
+  repoConfig.test_files_skipped_paths = [...skippedTests].sort();
   return { records, repoConfig };
 }
 
@@ -1453,6 +1502,7 @@ function parseArgs(argv) {
     root: '.',
     name: null,
     files: '',
+    includeTests: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -1471,6 +1521,9 @@ function parseArgs(argv) {
         break;
       case '--files':
         args.files = argv[++i] || '';
+        break;
+      case '--include-tests':
+        args.includeTests = true;
         break;
       default:
         // ignore unknown flags for forward-compat with the sibling helpers
@@ -1591,20 +1644,27 @@ function main(argv) {
       return 3;
     }
 
-    const { records, repoConfig } = runRetrieve(root, snapshot, args.files);
+    const { records, repoConfig } = runRetrieve(
+      root,
+      snapshot,
+      args.files,
+      args.includeTests,
+    );
     emit(records);
     // One repo-scoped record per run, after the site packets. rvl_core's
     // parse_stream keys on kind:"repo_config" to route it away from sites.
     writeStdoutSync(JSON.stringify(repoConfig) + '\n');
     process.stderr.write(
       `${snapshot}: ${records.length} retrieved sites, ` +
-        `${repoConfig.constructions.length} config constructions\n`,
+        `${repoConfig.constructions.length} config constructions, ` +
+        `${repoConfig.test_files_skipped} test files skipped\n`,
     );
     return 0;
   }
 
   process.stderr.write(
-    'usage: tsindex --packet-schema | --retrieve --root <dir> [--name <snap>] [--files a.ts,b.ts]\n',
+    'usage: tsindex --packet-schema | --retrieve --root <dir> [--name <snap>] ' +
+      '[--files a.ts,b.ts] [--include-tests]\n',
   );
   return 2;
 }
@@ -1622,6 +1682,7 @@ module.exports = {
   isTimeoutish,
   collectTimeoutFields,
   stableTypeName,
+  isTestPath,
 };
 
 if (require.main === module) {

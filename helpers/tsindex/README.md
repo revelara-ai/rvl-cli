@@ -6,6 +6,7 @@ decides nothing about reliability, it only says what the code is.
 
     node tsindex.js --retrieve --root <repo> --name <snapshot>     # full load
     node tsindex.js --retrieve --root <repo> --files a.ts,b.ts     # incremental reload
+    node tsindex.js --retrieve --root <repo> --include-tests       # also read test paths
     node tsindex.js --packet-schema                                # negotiate before loading
 
 Install once with `npm install` (its only dependency is `typescript`). rvl
@@ -70,7 +71,8 @@ In addition to the per-site packets, tsindex emits **exactly one** repo-scoped
 line, mirroring goindex's `RepoConfig`:
 
     {"packet_schema":2,"kind":"repo_config","snapshot_id":"<name>",
-     "constructions":[{"type":"typeorm.DataSource","fields":["query_timeout"]}]}
+     "constructions":[{"type":"typeorm.DataSource","fields":["query_timeout"]}],
+     "test_files_skipped":12,"test_files_skipped_paths":["e2e/login.ts", ...]}
 
 Its `kind` is the literal `"repo_config"`; `rvl_core::parse_stream` keys on that
 to route it away from the site stream. `constructions` is a **deduped** list of
@@ -100,6 +102,13 @@ constructed type resolves to `<pkg>.<TypeName>` (`typeorm.DataSource`, `pg.Pool`
 constructor/factory identifier text (`GlobalWorkspaceDataSource`,
 `axios.create`).
 
+`test_files_skipped` (v2, additive) is how many test files this run declined
+to read, and `test_files_skipped_paths` names them (repo-relative, sorted)
+so rvl's packet index can flag each one and a warm scan can report the
+repository-wide count; see "What it skips" below. They are retrieval
+statistics, not construction facts, and ride this record because this is
+the one line the helper writes on every run.
+
 This is **retrieval only**: the record reports *which* type set *which* timeout
 fields — never whether that field actually bounds anything, and never the
 field's value. Detection is on field-name PRESENCE, so a dynamic
@@ -113,6 +122,29 @@ traced back to that variable, so its fields are missed. (In twenty, the
 `core.datasource.ts` `new DataSource(typeORMCoreModuleOptions as ...)` is missed
 for this reason, but the same `query_timeout` fact is still retrieved from the
 inline-literal `new GlobalWorkspaceDataSource({... extra: { query_timeout }})`.)
+
+## What it skips
+
+Test code is not scanned for API surfaces, the way goindex has always
+skipped `_test.go`. On one real repo 700+ of 889 violates were Playwright
+and msw calls inside E2E tests. A file is test material when, relative to
+`--root`:
+
+- any directory segment is exactly `tests`, `test`, `__tests__`,
+  `__mocks__`, `e2e`, `spec`, `fixtures`, `testdata` or `cypress`;
+- the basename contains `.test.`, `.spec.` or `.cy.`;
+- the basename is a standard Playwright / Cypress / Vitest / Jest config or
+  setup file: `playwright.config.*`, `cypress.config.*`, `vitest.config.*`,
+  `vitest.workspace.*`, `vitest.setup.*`, `jest.config.*`, `jest.setup.*`,
+  `setupTests.*`.
+
+Exact matches only, never substrings: `attestation.ts`, `lib/contest/`,
+`packages/test-utils/` and `vite.config.ts` are production code. Skipped
+files are counted after the `--files` filter, so the count describes what
+THIS invocation declined to read, and their constructions are left out of
+`repo_config` too (a timeout set in test scaffolding must not credit a bound
+to production). `--include-tests` turns the skip off; `rvl scan
+--include-tests` passes it through.
 
 ## Resolution engine: the TypeScript compiler API + TypeChecker
 
@@ -217,3 +249,6 @@ ioredis) resolves at tier `high` with a package-qualified `client_type`, that a
 construction is retrievable, that two calls on one line with different client
 types keep distinct keys, that an unresolved strong-verb call still emits at
 `low`, and that noise (`.push`/`.map`/`.toString`) is not emitted.
+`testdata/fixture-tests/` holds one file per test-path convention beside
+three production files, for the tests that pin what is skipped, what is
+counted, and what `--include-tests` restores.

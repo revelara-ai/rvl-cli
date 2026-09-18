@@ -138,6 +138,9 @@ pub struct OutCoverage {
     pub total: usize,
     pub abstain: OutAbstain,
     pub generated_skipped: usize,
+    /// Test files the retrievers skipped, summed across languages
+    ///; the per-language split is in the COVERAGE block.
+    pub test_files_skipped: usize,
     pub degraded_note: Option<String>,
     pub lang_status: Vec<OutLang>,
     pub retrievers: Vec<OutRetriever>,
@@ -241,6 +244,7 @@ pub fn build(
                 other: coverage.abstain_other,
             },
             generated_skipped: coverage.generated_skipped,
+            test_files_skipped: coverage.test_files_skipped.iter().map(|t| t.count).sum(),
             degraded_note: coverage.degraded_note.clone(),
             lang_status: coverage
                 .lang_status

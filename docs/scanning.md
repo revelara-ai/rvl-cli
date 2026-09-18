@@ -181,6 +181,29 @@ difference shows up. Each abstain names what would close it:
 Sites that resolved correctly to no finding, like a server main loop that
 blocks by design, are named so you can challenge the call if you disagree.
 
+Test code is not scanned for API surfaces. The Python and TypeScript
+retrievers skip test paths (`tests/`, `e2e/`, `*.test.ts`, `conftest.py`,
+the Playwright, Cypress, Vitest and Jest config files, and the rest of the
+list in [How a scan finds your code](retrievers.md#what-a-retriever-skips))
+the way the Go retriever has always skipped `_test.go`, because a
+Playwright `page.goto` inside an E2E test is not a production call and a
+wall of advisory rows about your tests hides the rows about your product.
+The skip is never silent: COVERAGE prints one line per language,
+
+```
+  TypeScript: 12 test files skipped (tests are not scanned for API surfaces)
+```
+
+and `--out` carries the total as `coverage.test_files_skipped`. The count
+is repository-wide on a warm scan too: the packet index remembers which
+files were skipped, so a hook scan that re-parses nothing still reports
+them. To scan test code anyway, run a full scan with `rvl scan
+--include-tests`. The flag is refused together with `--incremental`
+(which the git hooks use), because the packet index is built with the
+skip in place and a warm scan could only honor it for the files it
+re-parsed. Hook scans therefore never include test code; there is no
+`--include-tests` on `rvl index reindex` either.
+
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly
 having emitted nothing is reported as a failed lane, the report prints
@@ -386,6 +409,7 @@ channels precisely.
 |---|---|
 | `rvl scan [path]` | Full deterministic scan |
 | `rvl scan --incremental` | Warm re-scan from the packet index |
+| `rvl scan --include-tests` | Full scan that also reads test code |
 | `rvl explain <id>` | Expand one finding: sites, control, fix |
 | `rvl suppress <id>` | Waive a finding into `.revelara.yaml` |
 | `rvl report [--json]` | Privacy preview: the exact shape-only payload |
