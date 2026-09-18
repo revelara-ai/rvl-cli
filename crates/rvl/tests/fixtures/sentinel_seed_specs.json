@@ -1,5 +1,5 @@
 {
-  "__comment": "SEED / test-grade G1 spec corpus carrying UNBOUNDED SENTINELS (po-av01j.25). The call-arg mechanism is value-aware: `unbounded_sentinels` lists the values of an API's own timeout argument that mean NO bound, so a resolved sentinel violates (citing the value and how it was resolved) instead of crediting a bound. Which values carry that meaning is library knowledge and therefore lives here, never in propagation. PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e test exercises real verdicts at identities pyindex actually emits, nothing more.",
+  "__comment": "SEED / test-grade G1 spec corpus carrying UNBOUNDED SENTINELS. The call-arg mechanism is value-aware: `unbounded_sentinels` lists the values of an API's own timeout argument that mean NO bound, so a resolved sentinel violates (citing the value and how it was resolved) instead of crediting a bound. Which values carry that meaning is library knowledge and therefore lives here, never in propagation. PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e test exercises real verdicts at identities pyindex actually emits, nothing more.",
   "apis": [
     {
       "type": "requests",

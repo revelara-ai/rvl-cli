@@ -12,7 +12,7 @@ the packet contract is identical to every other helper.
     rustindex --retrieve --root <repo> --files a.rs,b.rs   # incremental (filtered full run)
     rustindex --packet-schema                              # negotiate before loading
 
-## Engine (wayfinder po-ae75b.8, binding)
+## Engine (wayfinder a tracked follow-up, binding)
 
 The engine is the **rust-analyzer `scip` CLI**, pinned (`ra::PINNED_VERSION`,
 currently 1.96.0, the rustup component of the pinned toolchain). SCIP protobuf
@@ -88,7 +88,7 @@ moniker) — that is what propagation's `call_arg` mechanism credits.
 
 ## Gate protocol (scaffolding)
 
-Rust gate floors follow the expansion gate protocol (po-ae75b.2): RELATIVE
+Rust gate floors follow the expansion gate protocol: RELATIVE
 formula — decided% >= Go comparator − 10 on the pinned backend corpus;
 precision Wilson LB >= 0.90 on n >= 50 quarantined gate-grade sites; gate
 sets are single-use, minted at first gate and re-verified at cutover. The

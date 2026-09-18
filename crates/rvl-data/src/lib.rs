@@ -1,4 +1,4 @@
-//! Ported rvl-cli data commands (po-av01j.17).
+//! Ported rvl-cli data commands.
 //!
 //! rvl-cli (Go) is the contract source of truth: same subcommands, same
 //! flags, byte-identical JSON output on the `--format=json` paths.
@@ -13,7 +13,7 @@
 //!      already exit 2; validation failures use [`Failure::usage`].
 //!
 //! The binary is named `rvl` (renamed from `rvlscan` at the v1.0.0 cutover,
-//! po-av01j.154); every user-facing hint routes through [`BIN`] (defined in
+//! a tracked follow-up); every user-facing hint routes through [`BIN`] (defined in
 //! `rvl-core`, re-exported here), which is why the rename was one constant.
 
 pub mod auth;

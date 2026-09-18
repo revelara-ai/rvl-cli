@@ -1,6 +1,6 @@
 //! The REVELARA MANAGED BLOCK in `AGENTS.md` / `CLAUDE.md`, ported from
 //! rvl-cli `internal/plugin/agentsmd.go` + `internal/plugin/claudemd.go`
-//! (po-av01j.163).
+//!.
 //!
 //! This block is how an agent harness with NO slash commands discovers `rvl`
 //! at all: it is plain markdown that every AGENTS.md-reading runtime picks up
@@ -16,7 +16,7 @@
 //!
 //! Content is GENERATED, not static: the served copy under
 //! `~/.revelara/marketplace/plugins/revelara/<name>` wins when present, so
-//! context wording ships with plugin updates (rvl-cli po-pw4p6). The embedded
+//! context wording ships with plugin updates (rvl-cli a tracked follow-up). The embedded
 //! templates are the offline fallback and are byte-identical copies of
 //! rvl-cli's.
 //!

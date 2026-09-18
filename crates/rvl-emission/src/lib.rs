@@ -1,4 +1,4 @@
-//! G4 emission-point lane (po-av01j.5): evaluate the emission inventory —
+//! G4 emission-point lane: evaluate the emission inventory —
 //! log statements, span/trace instrumentation, error-handling sites — against
 //! the observability controls RC-027 (centralized error monitoring), RC-046
 //! (distributed tracing), and RC-061 (LLM observability, the emission half;

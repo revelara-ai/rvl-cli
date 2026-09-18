@@ -1,4 +1,4 @@
-//! G4 emission-lane evaluator tests (po-av01j.5). Sites are built the way the
+//! G4 emission-lane evaluator tests. Sites are built the way the
 //! per-language emitters build them: aggregates per (function, framework,
 //! category) with the category and count riding const_args.
 

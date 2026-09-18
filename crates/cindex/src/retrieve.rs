@@ -1,6 +1,6 @@
 //! The libclang retrieval walk.
 //!
-//! Engine pin (po-ae75b.9): the libclang C API, runtime-loaded. Compile-db
+//! Engine pin: the libclang C API, runtime-loaded. Compile-db
 //! native paths ONLY — `compile_commands.json` at the repo root or under
 //! `build/`; no shipped build interception (Bear / CMake's
 //! `CMAKE_EXPORT_COMPILE_COMMANDS` are documented as user-run). A TU that
@@ -28,7 +28,7 @@ pub fn load_engine() -> Result<String, String> {
     if !clang_sys::is_loaded() {
         clang_sys::load().map_err(|e| {
             format!(
-                "cindex requires libclang (engine pin po-ae75b.9) and none could be loaded: {e}. \
+                "cindex requires libclang (engine pin a tracked follow-up) and none could be loaded: {e}. \
                  Install one (e.g. `apt install libclang-dev`) or point LIBCLANG_PATH at it."
             )
         })?;

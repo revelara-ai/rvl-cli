@@ -1,4 +1,4 @@
-//! EMPTY FLAG VALUES, END TO END (po-av01j.192).
+//! EMPTY FLAG VALUES, END TO END.
 //!
 //! The unit tests in `empty_flag` prove the argv reaches the consumer intact
 //! and that every flag has a declared rule. These prove what the user and the

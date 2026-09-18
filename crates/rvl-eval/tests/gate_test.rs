@@ -1,4 +1,4 @@
-//! Destination-gate acceptance tests (po-3t3oj.1).
+//! Destination-gate acceptance tests.
 //!
 //! Criterion 1: per-language precision as Wilson 95% LB (target >= 0.90,
 //! n >= 50 violates), with fail-closed provenance enforcement: seed-set
@@ -123,10 +123,10 @@ fn valid_set_passes_and_reports_registry_version() {
     assert_eq!(v, 1);
 }
 
-/// C# gate-set scaffolding (po-av01j.10): the gate machinery is
+/// C# gate-set scaffolding: the gate machinery is
 /// language-generic, and this pins that a `language: csharp` manifest flows
 /// through provenance validation under the same terms as Go — the mint
-/// workflow (HITL, per the po-ae75b.2 relative-formula protocol) relies on
+/// workflow (HITL, per the a tracked follow-up relative-formula protocol) relies on
 /// this path existing before any eval-csharp-v1 set is minted.
 #[test]
 fn csharp_manifest_validates_under_the_same_terms() {
@@ -161,7 +161,7 @@ fn consumed_set_is_refused() {
     assert_eq!(err, Refusal::Consumed("eval-go-v1".into()));
 }
 
-// --- Withdrawal (po-av01j.119) ---
+// --- Withdrawal ---
 
 /// A withdrawal block appended to an otherwise valid manifest.
 fn withdrawn(yaml: &str) -> String {
@@ -173,7 +173,7 @@ withdrawn:
   reason: >
     Minted against spec cache 2026-08-06.3ee53dec, whose own provenance stamp
     reads NEVER valid as gate evidence, as a precision claim, or as a
-    comparator baseline. See po-av01j.119.
+    comparator baseline. See a tracked follow-up.
 "
     )
 }
@@ -392,10 +392,10 @@ fn too_few_decided_is_refused() {
     );
 }
 
-// --- The minikube DEV/DOGFOOD spec cache (po-av01j.80) ---
+// --- The minikube DEV/DOGFOOD spec cache ---
 //
 // A spec corpus can be usable and still be worthless as evidence. This one is:
-// the 2026-08-03 mint (po-av01j.68) authored specs from packet streams over
+// the 2026-08-03 mint authored specs from packet streams over
 // four repos reserved for minting gate sets, then hardcoded
 // repo='seed/minikube-test' on every surface, so quarantine enforcement passed
 // by MISLABELLING rather than by the data being clean. Withdrawing the specs
@@ -496,7 +496,7 @@ fn dev_cache_grounding_refuses_every_qualified_go_gate_set() {
 }
 
 /// The fence must not be so wide it refuses the recovery path. Re-authoring
-/// from a signed-off corpus (po-av01j.78 -> .69) yields a cache whose grounding
+/// from a signed-off corpus (a tracked follow-up -> .69) yields a cache whose grounding
 /// does NOT include the gate pool, and a gate set pinned to a quarantined repo
 /// must then validate normally. A check that refuses everything proves nothing.
 #[test]
@@ -509,7 +509,7 @@ fn a_clean_grounding_corpus_still_validates() {
 
 // ---------------------------------------------------------------------------
 // TypeScript gate sets need lockfile provenance, not just a frozen SHA
-// (po-av01j.117).
+//.
 //
 // Go and Python retrieval work on a bare checkout. TypeScript does not: tsindex
 // resolves client types through the TS compiler, which needs node_modules, and

@@ -5,7 +5,7 @@
 //! constant arguments, macro-invocation spans, and the dyn-receiver check
 //! that separates the mid tier from abstention.
 //!
-//! Confidence tiers (charter, po-ae75b.8):
+//! Confidence tiers (charter, a tracked follow-up):
 //! - high: the moniker resolves to a concrete impl (`impl#[Type]…`) — the
 //!   concrete type IS the client_type.
 //! - mid: trait-level dispatch whose receiver is visibly `dyn Trait` in the

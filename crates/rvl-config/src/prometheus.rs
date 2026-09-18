@@ -11,7 +11,7 @@
 //!     CRD form (`apiVersion: sloth.slok.dev/...`).
 //!
 //! Anything Helm/Go-templated is DECLINED (no rendering on the scan path —
-//! wayfinder po-ae75b.1): a whole-file template falls through to the
+//! wayfinder a tracked follow-up): a whole-file template falls through to the
 //! `prometheus-rules-templated` sighting; a templated VALUE inside otherwise
 //! literal YAML becomes an [`Resolution::Unresolvable`] packet, so the
 //! verification lane abstains instead of judging an unrendered string.

@@ -1,4 +1,4 @@
-//! The gate must measure the ENGINE, not a static file (po-av01j.95).
+//! The gate must measure the ENGINE, not a static file.
 //!
 //! `score_gate` computes confirmed/decided straight off verdicts.jsonl. That is
 //! the panel's confirmation rate on a file: correct for whatever engine

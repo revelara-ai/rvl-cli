@@ -1,7 +1,7 @@
 //! `rvl doctor [--fix]` — diagnose (and where it is safe, repair) this
-//! machine's ability to scan THIS repository (po-av01j.169).
+//! machine's ability to scan THIS repository.
 //!
-//! po-aml3h removed most first-run friction: the scripted retrievers ride
+//! a tracked follow-up removed most first-run friction: the scripted retrievers ride
 //! inside the binary, cindex/rustindex/goindex ride the release archive, and a
 //! hand-built helper is found at the canonical dir with no env var. Two manual
 //! steps survive BY DESIGN, and both are exactly what a doctor should own:
@@ -177,7 +177,7 @@ fn repo_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
     if langs.is_empty() {
         // Not an error, and the scan agrees: a pure-infrastructure repo has no
         // source any retriever reads, and the config/secret/structure lanes
-        // read the tree directly (po-av01j.148).
+        // read the tree directly.
         out.push(Check::new("repo", Status::Pass, "languages").detail(
             "none detected; the config, secret and structure lanes read the tree directly",
         ));
@@ -189,7 +189,7 @@ fn repo_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
     if !unsupported.is_empty() {
         // Reported, and deliberately only a WARN with no remedy: nothing the
         // reader can install makes these readable today. Staying silent about
-        // them is the failure mode (po-av01j.128) — silence is
+        // them is the failure mode — silence is
         // indistinguishable from "scanned and clean".
         let list: Vec<String> = unsupported
             .iter()
@@ -208,7 +208,7 @@ fn repo_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
 /// The interpreter a resolved helper is driven by, when it needs one. `None`
 /// means "not driven by an interpreter", NOT "needs nothing at runtime": the
 /// native helpers have runtime prerequisites of their own, probed by
-/// [`native_lane_checks`] (po-av01j.206).
+/// [`native_lane_checks`].
 fn runtime_for(kind: HelperKind) -> Option<&'static str> {
     match kind {
         HelperKind::Executable => None,
@@ -220,7 +220,7 @@ fn runtime_for(kind: HelperKind) -> Option<&'static str> {
 }
 
 /// Probe what the scan will ACTUALLY need to run a native helper's lane
-/// (po-av01j.206).
+///.
 ///
 /// "The helper is a native binary we shipped" is not "the helper can run":
 /// goindex shells the `go` tool, cindex dlopens libclang at process start
@@ -241,7 +241,7 @@ fn native_lane_checks(
 ) -> Vec<Check> {
     match lang {
         // goindex shells the `go` tool for its package-graph load; without it
-        // the helper exits 2 and the lane fails (po-av01j.209).
+        // the helper exits 2 and the lane fails.
         Lang::Go => match find_on_path("go") {
             Some(p) => vec![Check::new("retrievers", Status::Pass, label)
                 .detail(format!("{where_from}, drives `go` at {}", p.display()))],
@@ -358,7 +358,7 @@ fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
     for &lang in langs {
         // A language present only as a fixture or testdata must not be
         // reported as a hard gap: the scan itself degrades that lane rather
-        // than failing (po-hjte8), so the doctor must agree or it would send
+        // than failing, so the doctor must agree or it would send
         // someone to install a .NET SDK for one vendored sample.
         let incidental = language_is_incidental(root, lang);
         let gap = if incidental {
@@ -401,7 +401,7 @@ fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
                 let where_from = format!("{} ({})", h.path.display(), h.source);
                 match runtime_for(h.kind) {
                     // Native: no interpreter, but NOT "no runtime prereq" —
-                    // probe what the scan will actually need (po-av01j.206).
+                    // probe what the scan will actually need.
                     None => out.extend(native_lane_checks(lang, &h, gap, label, &where_from)),
                     Some(rt) if find_on_path(rt).is_none() => out.push(
                         Check::new("retrievers", gap, label)
@@ -556,12 +556,12 @@ fn spec_cache_checks() -> Vec<Check> {
                         .remedy(format!("run `{BIN} sync`")),
                 );
             }
-            // Installed and fresh is not the same as populated (po-pqpry):
+            // Installed and fresh is not the same as populated:
             // the artifact that served empty for four weeks passed both.
             out.extend(api_spec_checks(&loaded.envelope));
         }
         Err(_) => {
-            // No commercial tier. An OSS-only install (po-scnmv.13) still
+            // No commercial tier. An OSS-only install still
             // scans on the vocabulary baseline, and the doctor has to agree
             // with the scan: that is a keyless install, not a broken one.
             // `is_dir` first: `subdir_store` opens with `create_dir_all`, and
@@ -634,7 +634,7 @@ fn commercial_tier_missing_check(has_key: bool) -> Check {
     }
 }
 
-/// Installed, verified and fresh is not the same as POPULATED (po-pqpry).
+/// Installed, verified and fresh is not the same as POPULATED.
 /// The commercial artifact that served from 2026-08-19 passed every check
 /// above and carried zero API specs, so every scan abstained on every API
 /// surface and read clean. Counted on the same parse the scan runs, so the
@@ -669,7 +669,7 @@ fn api_spec_checks(env: &rvl_cache::Envelope) -> Vec<Check> {
     }
 }
 
-/// Delegated wholesale to `hook doctor` (po-av01j.163), which already answers
+/// Delegated wholesale to `hook doctor`, which already answers
 /// this question. Folding it in rather than reimplementing it is the point:
 /// the day the hook shim's marker changes, one file changes.
 fn hook_checks(root: &Path) -> Vec<Check> {
@@ -849,7 +849,7 @@ fn csindex_build_command(project: &Path) -> String {
 }
 
 /// Where a built csindex must land: the canonical per-helper dir resolution
-/// already searches, so the build IS the install (po-aml3h).
+/// already searches, so the build IS the install.
 fn csindex_install_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -965,7 +965,7 @@ fn render_json(root: &Path, checks: &[Check], worst: Status) -> String {
 mod tests {
     use super::*;
 
-    // --- an empty commercial API corpus is a doctor finding (po-pqpry) ---
+    // --- an empty commercial API corpus is a doctor finding ---
 
     fn envelope_with(specs: serde_json::Value) -> rvl_cache::Envelope {
         serde_json::from_value(serde_json::json!({
@@ -1075,7 +1075,7 @@ mod tests {
         assert_eq!(runtime_for(HelperKind::DotnetAssembly), Some("dotnet"));
         assert_eq!(runtime_for(HelperKind::JavaSource), Some("java"));
 
-        // ...but `None` no longer short-circuits to a PASS (po-av01j.206):
+        // ...but `None` no longer short-circuits to a PASS:
         // the old row said "native — no runtime prereq", which was false for
         // all three native lanes (goindex shells `go`, cindex dlopens
         // libclang, rustindex needs rust-analyzer + a cargo workspace), so
@@ -1141,7 +1141,7 @@ mod tests {
 
     #[test]
     fn the_csindex_build_lands_where_resolution_already_looks() {
-        // The whole point of po-aml3h's fourth slot: the build IS the install,
+        // The whole point of a tracked follow-up's fourth slot: the build IS the install,
         // so the command must target the canonical dir and never end in "now
         // export RVL_CSINDEX=...".
         let cmd = csindex_build_command(Path::new("/src/helpers/csindex"));

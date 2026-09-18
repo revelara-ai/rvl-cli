@@ -124,7 +124,7 @@ of the **stable** compiler API over the pre-release native port (typescript-go):
 proven and dependable, at the cost of dragging a **Node runtime** into the
 toolchain. That tradeoff is why the helper is a `.js` run under `node` rather
 than a self-contained binary; packaging/bundling for release is tracked
-separately (po-3t3oj.26) and out of scope here.
+separately and out of scope here.
 
 A `Program` is built over `--root`: if a `tsconfig.json` is present it is
 honored (its file list and compiler options); otherwise every non-`.d.ts`

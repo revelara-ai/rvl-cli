@@ -1,5 +1,5 @@
 {
-  "_comment": "SEED/test-grade server-entry spec corpus for the G2 lane (po-av01j.3). Hand-authored, sufficient for e2e tests only. The PRODUCTION corpus is authored through the LLM spec factory with human review; these seeds are deliberately small and conservative.",
+  "_comment": "SEED/test-grade server-entry spec corpus for the G2 lane. Hand-authored, sufficient for e2e tests only. The PRODUCTION corpus is authored through the LLM spec factory with human review; these seeds are deliberately small and conservative.",
   "apis": [],
   "configs": [],
   "server": [

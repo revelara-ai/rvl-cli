@@ -1,4 +1,4 @@
-//! `rvl doctor [--fix]` end to end (po-av01j.169).
+//! `rvl doctor [--fix]` end to end.
 //!
 //! Every test runs a COPY of the binary in an otherwise empty directory with
 //! HOME pointed at a tempdir, for the same reason `fresh_install.rs` does: the
@@ -278,7 +278,7 @@ fn fix_under<'a>(stdout: &'a str, needle: &str) -> &'a str {
 
 /// A lane whose runtime prereq is genuinely absent degrades THAT lane and
 /// says why. The others are untouched — a polyglot repo missing one toolchain
-/// still has the rest worth reading. Since po-av01j.206 the Go lane is probed
+/// still has the rest worth reading. Since a tracked follow-up the Go lane is probed
 /// too (goindex shells the `go` tool), so the sandbox PATH carries `go` and
 /// nothing else: Go survives on its own merits, Python fails on its own.
 #[test]
@@ -330,7 +330,7 @@ fn which(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("this test machine has no `{name}`"))
 }
 
-/// po-av01j.209's doctor half: `runtime_for(Executable) → None` used to
+/// a tracked follow-up's doctor half: `runtime_for(Executable) → None` used to
 /// short-circuit the Go lane to "PASS ... native — no runtime prereq" while
 /// the scan's goindex exited 2 for want of the `go` tool. The doctor verdict
 /// must AGREE with what a scan does: no `go`, no PASS — and the gap carries
@@ -360,11 +360,11 @@ fn a_go_repo_without_the_go_tool_is_a_gap_not_a_pass() {
     );
     assert!(
         !stdout.contains("no runtime prereq"),
-        "the false claim po-av01j.206 deletes must be gone everywhere:\n{stdout}"
+        "the false claim a tracked follow-up deletes must be gone everywhere:\n{stdout}"
     );
 }
 
-/// po-av01j.206, the Rust lane: rustindex needs rust-analyzer AND a loadable
+/// a tracked follow-up, the Rust lane: rustindex needs rust-analyzer AND a loadable
 /// cargo workspace, and doctor never probed either. Absent both, the lane
 /// reports two named gaps with their commands; with both present (presence is
 /// the probe — a full `cargo metadata` load per repo is too expensive), the
@@ -420,7 +420,7 @@ fn the_rust_lane_probes_rust_analyzer_and_cargo() {
     );
 }
 
-/// po-av01j.206, the C/C++ lane: cindex dlopens libclang at process start
+/// a tracked follow-up, the C/C++ lane: cindex dlopens libclang at process start
 /// (clang-sys `runtime` feature — libclang is NOT linked), so "native binary
 /// present" proves nothing. The probe shells the helper's own
 /// `--engine-check` rather than reimplementing libclang discovery; a failing
@@ -442,7 +442,7 @@ fn the_c_lane_probes_libclang_through_engine_check() {
     write_exec(
         &bin_dir.join("cindex"),
         "#!/bin/sh\nif [ \"$1\" = \"--engine-check\" ]; then\n\
-         echo 'cindex requires libclang (engine pin po-ae75b.9) and none could be loaded' >&2\n\
+         echo 'cindex requires libclang (engine pin a tracked follow-up) and none could be loaded' >&2\n\
          exit 1\nfi\nexit 0\n",
     );
     let stdout = String::from_utf8(doctor_with_path(&bin, &repo, &home, &empty).stdout).unwrap();

@@ -170,7 +170,7 @@ pub fn run(cmd: ControlCmd) -> std::process::ExitCode {
     crate::finish(res)
 }
 
-/// rvl-cli validates control --format as table|json (po-i24do.11).
+/// rvl-cli validates control --format as table|json.
 fn validate_format(format: &Option<String>) -> Result<(), Failure> {
     match format.as_deref() {
         None | Some("table") | Some("json") => Ok(()),

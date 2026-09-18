@@ -80,7 +80,7 @@ internal static class Program
             var absRoot = Path.GetFullPath(root);
             // A root that is not a directory is a caller error, not an empty
             // repo. The old walk silently yielded nothing here, which read as
-            // "scanned, zero sites" -- the po-av01j.209 shape.
+            // "scanned, zero sites" -- the a tracked follow-up shape.
             if (!Directory.Exists(absRoot))
             {
                 Console.Error.WriteLine($"csindex: --root {absRoot} is not a directory");
@@ -96,7 +96,7 @@ internal static class Program
                 $"({result.FilesTotal} files, {result.FilesFailed} failed)");
             // Exit non-zero when NOTHING was read, so the lane degrades
             // loudly instead of recording a successful retrieval of zero
-            // sites (po-av01j.209). A tree with genuinely zero .cs files
+            // sites. A tree with genuinely zero .cs files
             // stays exit 0: the stats record proves the helper ran.
             if (result.RequestedFilesMatched == 0 && result.FilesRequested > 0)
             {
@@ -132,7 +132,7 @@ internal static class Program
     /// Stamp schema + site_key on every record and write one JSON object per
     /// line. One choke point: a record that reaches a consumer unstamped is a
     /// record no index can key. Written synchronously so process exit can
-    /// never truncate the stream (the tsindex stdout lesson, po-3t3oj.37).
+    /// never truncate the stream (the tsindex stdout lesson, a tracked follow-up).
     private static void Emit(List<Packet> records)
     {
         var opts = new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.Never };
@@ -151,7 +151,7 @@ internal static class Program
     }
 
     /// The repo-scoped record this helper writes on EVERY run, whether or not
-    /// any site matched (po-av01j.209). rvl's silent-zero guard keys on it: a
+    /// any site matched. rvl's silent-zero guard keys on it: a
     /// stream carrying no record rvl recognizes means the helper bailed before
     /// reaching its own emit path -- exactly the shape that gave a repo whose
     /// toolchain was broken a permanently green gate. The kind follows
@@ -175,7 +175,7 @@ internal static class Program
     }
 }
 
-/// The unconditional repo-scoped record (po-av01j.209): what this run
+/// The unconditional repo-scoped record: what this run
 /// attempted, whether or not any site matched.
 internal sealed class StatsOut
 {
@@ -439,7 +439,7 @@ internal static class Retriever
             catch (Exception err)
             {
                 // Counted, never silently collapsed into "parsed and empty"
-                // (po-av01j.209): a run where EVERY file lands here read
+                //: a run where EVERY file lands here read
                 // nothing, and exits 2 rather than reporting a clean zero.
                 Console.Error.WriteLine($"skip {rel}: {err.Message}");
                 result.FilesFailed++;

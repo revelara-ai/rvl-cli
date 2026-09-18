@@ -1,4 +1,4 @@
-// G4 emission-point inventory (po-av01j.5): log statements, span/trace
+// G4 emission-point inventory: log statements, span/trace
 // instrumentation, and error-handling sites, emitted on the SAME packet
 // stream as call sites, distinguished by site_kind: "emission_point".
 //
@@ -39,7 +39,7 @@ const siteKindEmission = "emission_point"
 // The framework list is the candidate extractor (like ioMethods for G1): it
 // decides what gets inventoried, never what a match means.
 // COVERAGE HERE IS A FALSE-POSITIVE SURFACE, not just missing inventory
-// (po-av01j.142). The recover_block swallow fact is "recovers and emits
+//. The recover_block swallow fact is "recovers and emits
 // NOTHING RECOGNIZED", so a logger this list does not know turns correct code
 // into a finding: consul logs every recovered panic through
 // hashicorp/go-hclog and was reported as swallowing them. The standard `log`
@@ -188,7 +188,7 @@ func collectEmissions(pkgs []*packages.Package, src *srcIndex, root, snapshot st
 // recovered panic can be handed BACK to the caller: a pointer to an error, or
 // a pointer to a slice of them.
 //
-// Found on nats-server (po-av01j.142): the first version of this check only
+// Found on nats-server: the first version of this check only
 // understood named RESULTS, so it still flagged
 //
 //	// use in defer to recover from panic and turn it into an error
@@ -253,7 +253,7 @@ func namedResults(ft *ast.FuncType) map[string]bool {
 }
 
 // recoverPropagates reports whether a recovered panic LEAVES the function
-// rather than being discarded (po-av01j.142).
+// rather than being discarded.
 //
 // WHY THIS EXISTS. The swallow fact used to be "calls recover() and logs
 // nothing", which flags the standard Go idiom for not panicking across an API
@@ -392,7 +392,7 @@ func recoverPropagates(info *types.Info, fd *ast.FuncDecl) bool {
 // no capture — the combined mechanical fact RC-027's capture-vs-swallow
 // question needs. A function that recovers AND emits is instrumented; one that
 // recovers and RETURNS the failure is propagating, which is not a swallow
-// either (po-av01j.142).
+// either.
 func functionEmissions(
 	p *packages.Package,
 	info *types.Info,

@@ -1,4 +1,4 @@
-//! THE INSTALLED GATE IN A REPO WITH NO SUPPORTED LANGUAGE (po-av01j.198).
+//! THE INSTALLED GATE IN A REPO WITH NO SUPPORTED LANGUAGE.
 //!
 //! `rvl hook install` writes `rvl scan . --incremental --changed-only --hook
 //! pre-commit` into `.git/hooks/pre-commit`. The incremental path used to bail

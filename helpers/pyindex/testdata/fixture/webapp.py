@@ -1,4 +1,4 @@
-"""G2 server-entry fixture (po-av01j.3): flask + fastapi registration
+"""G2 server-entry fixture: flask + fastapi registration
 surfaces. Only the AST is parsed -- neither framework needs to be installed."""
 
 from flask import Flask, Blueprint

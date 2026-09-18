@@ -16,11 +16,11 @@ fn version_flag_reports_name_and_semver() {
     );
 }
 
-// --- spec-cache distribution surface (po-3t3oj.13) ---
+// --- spec-cache distribution surface ---
 
 fn bin() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_rvl"));
-    // THE SUITE MUST NOT INHERIT CI'S OWN BASE REF (po-av01j.194). These very
+    // THE SUITE MUST NOT INHERIT CI'S OWN BASE REF. These very
     // tests run inside GitHub Actions, where a `pull_request` event exports
     // `GITHUB_BASE_REF` — which the scanner now READS. Left inherited, a
     // `--changed-only` test would silently change question between a laptop
@@ -98,7 +98,7 @@ fn cache_import_refuses_missing_signature() {
     );
 }
 
-// --- scan engine surface (po-3t3oj.15) ---
+// --- scan engine surface ---
 
 fn write_scan_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // Packets name real files: the index hashes file CONTENT, so a fixture
@@ -191,7 +191,7 @@ fn scan_without_cache_or_override_fails_closed_with_guidance() {
     );
 }
 
-// --- the audited emergency gate bypass (po-av01j.182) ---
+// --- the audited emergency gate bypass ---
 
 /// A git repo to arm and force through, plus the path of its audit log.
 fn init_force_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -405,7 +405,7 @@ fn force_next_outside_a_repo_is_refused() {
         .contains("is not inside a git repository"));
 }
 
-// --- single-command scan: helper orchestration (po-3t3oj.25) ---
+// --- single-command scan: helper orchestration ---
 
 /// End-to-end: `rvl scan <dir>` with NO `--retrieved` must detect the Go
 /// source, run goindex itself, and feed the packets into the pipeline. Requires
@@ -434,7 +434,7 @@ fn scan_without_retrieved_runs_the_go_helper() {
         Ok(out) => {
             // A toolchain we do not have is a skip; OUR code failing to build
             // is a defect. Swallowing this as a skip is how a helper that
-            // could not compile shipped once already (po-av01j.47).
+            // could not compile shipped once already.
             panic!(
                 "goindex failed to build: {}",
                 String::from_utf8_lossy(&out.stderr)
@@ -482,7 +482,7 @@ fn scan_without_retrieved_runs_the_go_helper() {
 /// with guidance toward the escape hatch.
 #[test]
 fn scan_errors_with_guidance_when_a_needed_retriever_is_absent() {
-    // po-av01j.148, the decided rule: do not bundle the helpers, probe for them
+    // a tracked follow-up, the decided rule: do not bundle the helpers, probe for them
     // and error out when one is NEEDED and absent. A gate that cannot read a
     // language the repo contains must not pass -- reporting "commit clean"
     // there is a clean bill of health over a language nobody looked at.
@@ -536,12 +536,12 @@ fn an_empty_dir_no_longer_fails_for_having_no_source() {
     );
 }
 
-// --- G5 content lane: secrets, RC-043 (po-av01j.6) ---
+// --- G5 content lane: secrets, RC-043 ---
 
 /// End-to-end: a repo with NO Go/Py/TS source but a planted (fake) token gets
 /// a content-lane scan: the ladder names the `secret.<rule>` class, maps it to
 /// RC-043, never prints the raw token, and blocks. A `.revelara.yaml` waiver
-/// with the class matcher (the po-3t3oj.27 engine, unchanged) suppresses it.
+/// with the class matcher (the a tracked follow-up engine, unchanged) suppresses it.
 #[test]
 fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -561,7 +561,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     // The scan RAN (it is not a scanner error), and it BLOCKED. Asserting
     // `success()` here is what let the gate ship broken for months: the
-    // footer said "blocked" while the shell said 0 (po-av01j.94).
+    // footer said "blocked" while the shell said 0.
     assert_eq!(
         out.status.code(),
         Some(EXIT_BLOCKED),
@@ -614,7 +614,7 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
-// --- exit-code contract (po-av01j.94) ---
+// --- exit-code contract ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
 // IS the gate. The contract, in one place:
@@ -708,7 +708,7 @@ fn advisory_only_scan_exits_zero() {
     );
 }
 
-// --- G2 server-entry lane (po-av01j.3) ---
+// --- G2 server-entry lane ---
 
 /// The hand-authored SEED server-spec corpus (RC-020/RC-069/RC-018); the
 /// production corpus rides the LLM factory.
@@ -844,7 +844,7 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
     );
 }
 
-// --- incremental index surface (po-3t3oj.14) ---
+// --- incremental index surface ---
 
 #[test]
 fn index_status_reports_empty_then_populated() {
@@ -896,7 +896,7 @@ fn index_init_indexes_packets_from_a_stream() {
     );
 }
 
-// --- SIGPIPE (po-3t3oj.23) ---
+// --- SIGPIPE ---
 
 #[test]
 #[cfg(unix)]
@@ -931,7 +931,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
     );
 }
 
-// --- background re-index: live mode + --detach (po-3t3oj.14 slice C) ---
+// --- background re-index: live mode + --detach (a tracked follow-up slice C) ---
 
 /// Build goindex from source, or None when no Go toolchain is available (the
 /// test is then skipped with a log line, matching the scan e2e convention).
@@ -1076,7 +1076,7 @@ fn index_reindex_detach_returns_immediately_and_child_indexes() {
 /// redb's exclusive lock, status cannot open the index at all: it exits
 /// non-zero and prints nothing on stdout. Treating that empty stdout as
 /// "populated" is exactly what made the original detach test vacuous
-/// (po-l3jo5), so only a SUCCESSFUL status with a non-zero count ends the
+///, so only a SUCCESSFUL status with a non-zero count ends the
 /// wait; busy is a reason to keep waiting.
 fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, secs: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
@@ -1117,7 +1117,7 @@ fn reindex_log(cache_dir: &std::path::Path) -> String {
 /// already holds the index.
 ///
 /// redb grants one process an exclusive lock on the database. Before
-/// po-l3jo5 the detached child called `PacketIndex::open` once, hit
+/// a tracked follow-up the detached child called `PacketIndex::open` once, hit
 /// `DatabaseAlreadyOpen`, and died — invisibly, because the child's stdout
 /// AND stderr were `Stdio::null()` while the parent had already printed
 /// "detached ... continues in the background" and exited 0. The background
@@ -1167,7 +1167,7 @@ fn detached_reindex_waits_out_a_busy_index_and_leaves_a_log() {
     );
 }
 
-// --- G6 config lane (po-av01j.2) ---
+// --- G6 config lane ---
 
 /// A repo with one Go call site, one GitHub Actions workflow, and one
 /// unsupported-format config file; specs cover the call AND two config keys.
@@ -1279,7 +1279,7 @@ fn config_findings_are_waivable_by_format_key_rule() {
     );
 }
 
-// --- G6 dep-manifests family (po-av01j.22) ---
+// --- G6 dep-manifests family ---
 
 /// A repo with a floating base image and a toolchain-less go.mod; SEED
 /// test-grade ConfigKeySpecs judge both (the production corpus is a factory
@@ -1341,7 +1341,7 @@ fn scan_runs_the_dep_manifests_family_with_seed_specs() {
     );
 }
 
-// --- G6 Prometheus/sloth family (po-av01j.21) ---
+// --- G6 Prometheus/sloth family ---
 
 /// A repo with a literal Prometheus rules file (one alert missing `for:` and
 /// severity, one carrying both), a sloth SLO file, and an alertmanager
@@ -1429,7 +1429,7 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
     );
 }
 
-// --- G6 Terraform family (po-av01j.23) ---
+// --- G6 Terraform family ---
 
 /// A repo whose Terraform has one violation of each seed spec (an unpinned
 /// provider, no state backend) and one satisfied key (an exactly-pinned
@@ -1520,7 +1520,7 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
     );
 }
 
-// --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
+// --- declared bounds: out-of-code bound evidence via .revelara.yaml ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
 /// bound channel: prod-level settings (statement_timeout, infra deadlines)
@@ -1655,7 +1655,7 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
     );
 }
 
-// --- G3 background-job lane (po-av01j.4) ---
+// --- G3 background-job lane ---
 
 /// The SEED spec fixture for the background-job lane (RC-060 + job-altitude
 /// timeout re-application). Production specs ride the LLM factory; this file
@@ -1757,7 +1757,7 @@ fn scan_decides_go_background_job_sites_end_to_end() {
     );
 }
 
-// --- G4 emission lane (po-av01j.5) ---
+// --- G4 emission lane ---
 
 /// A `--retrieved` stream carrying emission-point aggregates surfaces the
 /// emission-lane findings (RC-027 swallow gap, RC-046 tracing gap) as
@@ -1850,7 +1850,7 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
 }
 
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
-/// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
+/// corpus rides the LLM factory, HITL — follow-up bead under a tracked follow-up).
 fn g4_seed_specs() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1867,7 +1867,7 @@ fn helpers_dir() -> std::path::PathBuf {
         .join("helpers")
 }
 
-/// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
+/// The SEED corpus declaring UNBOUNDED SENTINELS: the values of
 /// an API's own timeout argument that mean no bound.
 fn sentinel_seed_specs() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2028,7 +2028,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
     );
 }
 
-// --- C/C++ G1 lane (po-av01j.12) ---
+// --- C/C++ G1 lane ---
 
 /// Locate the cindex helper (a workspace bin built alongside rvl) and
 /// verify its libclang engine loads. None (with a SKIP log line) when the
@@ -2262,7 +2262,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
     );
 }
 
-// --- Java lane (po-av01j.9) ---
+// --- Java lane ---
 
 /// The hand-authored SEED Java spec corpus (test-grade; RC-019 timeouts,
 /// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
@@ -2380,7 +2380,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
     );
 }
 
-// --- Rust G1 lane (po-av01j.11) ---
+// --- Rust G1 lane ---
 
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
 /// sqlx identities — the production corpus rides the LLM factory, HITL).
@@ -2470,7 +2470,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
     );
 }
 
-// --- G7 repo-structure lane (po-av01j.7) ---
+// --- G7 repo-structure lane ---
 
 /// A `--retrieved` stream carrying a `repo_structure` record surfaces its
 /// violations in the ladder as ADVISORY findings with the control code, and
@@ -2515,7 +2515,7 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
     );
 }
 
-// --- hook-mode agent adjudication (po-av01j.15) ---
+// --- hook-mode agent adjudication ---
 
 /// Copy the goindex fixture into a writable temp repo so the test can commit
 /// consent into `.revelara.yaml` without touching the shared fixture tree.
@@ -2659,7 +2659,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
     );
 }
 
-// --- G6 Argo/Flux family (po-av01j.24) ---
+// --- G6 Argo/Flux family ---
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
@@ -2760,7 +2760,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
     );
 }
 
-// --- G6 config lane, Kubernetes family (po-av01j.20) ---
+// --- G6 config lane, Kubernetes family ---
 
 /// A repo with a kustomize base+overlay pair and SEED (test-grade)
 /// Kubernetes config-key specs for three representative controls: probe
@@ -2830,7 +2830,7 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     // The `:latest` retag below is a high-severity config violation, so this
-    // lane BLOCKS: exit EXIT_BLOCKED, not 0. (It exited 0 before po-av01j.94 —
+    // lane BLOCKS: exit EXIT_BLOCKED, not 0. (It exited 0 before a tracked follow-up —
     // proof the config lane's gate was decorative too.)
     assert_eq!(
         out.status.code(),
@@ -2866,12 +2866,12 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
     );
 }
 
-// --- C# lane (po-av01j.10) ---
+// --- C# lane ---
 
 /// The hand-authored SEED C# spec corpus (test-grade): RC-019 timeout and
 /// RC-022 retry judgments at C# identities, plus the C# emission identities
 /// for the G4 lane. The production corpus rides the LLM factory, HITL — see
-/// the gate-set mint bead under po-av01j.
+/// the gate-set mint bead under a tracked follow-up.
 fn csharp_seed_specs() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -3025,7 +3025,7 @@ fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if !out.status.success() {
         // The SDK being absent is a skip (handled above); the SDK being
         // present while OUR helper fails to compile is a defect. This exact
-        // branch hid four CS0103 errors through an entire epic (po-av01j.47),
+        // branch hid four CS0103 errors through an entire epic,
         // because a green skip reads identically to a green pass.
         panic!(
             "csindex failed to build: {}",
@@ -3093,7 +3093,7 @@ fn scan_decides_csharp_sites_end_to_end() {
     );
 }
 
-// --- the shape-only report on the wire (po-av01j.63) ---
+// --- the shape-only report on the wire ---
 
 /// End to end through the real binary: the report payload names the language
 /// each surface was written in, and a shape seen in TWO languages names
@@ -3176,7 +3176,7 @@ fn report_payload_names_each_surface_language_and_never_carries_source() {
     );
 }
 
-// --- generated-code exclusion (po-av01j.133.7) ---
+// --- generated-code exclusion (a tracked follow-up.7) ---
 
 /// A Go mini-repo: one hand-written file and one that declares itself generated.
 fn repo_with_a_generated_file(root: &std::path::Path) {
@@ -3251,7 +3251,7 @@ fn a_generated_banner_is_matched_by_evidence_not_by_path() {
     );
 }
 
-// --- scan submission mode (po-av01j.153, rvl-cli parity) ---
+// --- scan submission mode (a tracked follow-up, rvl-cli parity) ---
 
 mod submit_mock {
     //! Just enough HTTP/1.1 for ureq: serves scripted responses in order and
@@ -3370,7 +3370,7 @@ const SUBMIT_RESPONSE: &str = r#"{
 }"#;
 
 /// The same body the server replays when an identical submission lands inside
-/// the idempotency-key dedup window (po-av01j.165).
+/// the idempotency-key dedup window.
 const CACHED_SUBMIT_RESPONSE: &str = r#"{
   "scan_id": "scan-cli-1",
   "service": "checkout-api",
@@ -3447,7 +3447,7 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
         stdout.contains("[NEW] R-102: No circuit breaker"),
         "{stdout}"
     );
-    // A fresh scan says nothing about the cache (po-av01j.165): the server
+    // A fresh scan says nothing about the cache: the server
     // omits `cached` and the render is byte-for-byte what it always was.
     assert!(!stdout.contains("cached"), "{stdout}");
     assert!(!stderr.contains("cached scan replay"), "{stderr}");
@@ -3496,7 +3496,7 @@ fn scan_submission_merges_parts_and_posts_to_the_risk_register() {
 /// The server deduplicates submissions by `idempotency_key` and replays the
 /// first submission's stored response with `cached: true`. Nothing was created
 /// or updated by the command that just ran, so the render must not reprint
-/// `[NEW]` (po-av01j.165).
+/// `[NEW]`.
 #[test]
 fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
     let dir = tempfile::tempdir().unwrap();
@@ -3549,7 +3549,7 @@ fn scan_submission_labels_a_cached_replay_instead_of_reprinting_new() {
 
 /// Team ownership declared in `.revelara.yaml` rides the submission, and
 /// `--team` overrides the whole thing (repo default AND component teams)
-/// [po-av01j.166].
+///.
 #[test]
 fn scan_submission_carries_team_ownership_and_honors_the_override() {
     let dir = tempfile::tempdir().unwrap();
@@ -3631,7 +3631,7 @@ fn scan_submission_carries_team_ownership_and_honors_the_override() {
 }
 
 /// A `--team` value that slugifies to nothing is a usage error: the server
-/// would silently drop it (po-av01j.166).
+/// would silently drop it.
 #[test]
 fn scan_submission_rejects_an_unusable_team_slug() {
     let dir = tempfile::tempdir().unwrap();
@@ -3667,7 +3667,7 @@ fn scan_submission_rejects_an_unusable_team_slug() {
     );
 }
 
-/// `--dry-run` validates and normalizes without submitting (po-4g59y):
+/// `--dry-run` validates and normalizes without submitting:
 /// machine-readable JSON summary on stdout, human framing on stderr, no
 /// HTTP request at all. The API URL points at an unroutable port to prove
 /// nothing is sent.
@@ -3704,7 +3704,7 @@ fn scan_submission_dry_run_prints_summary_and_never_posts() {
     assert_eq!(summary["service"], "checkout-api");
     assert_eq!(summary["findings"], 2);
     assert_eq!(summary["scan_type"], "full");
-    // po-gli2z counts ride the summary so CI can assert no STPA loss.
+    // a tracked follow-up counts ride the summary so CI can assert no STPA loss.
     assert_eq!(summary["findings_with_stpa"], 1);
     assert_eq!(summary["findings_coerced"], 2);
     assert_eq!(summary["findings_with_dropped"], 0);
@@ -3791,7 +3791,7 @@ fn scan_service_without_input_source_is_an_error() {
     );
 }
 
-// --- .revelara.yaml on the submission wire (po-av01j.181) ---
+// --- .revelara.yaml on the submission wire ---
 
 /// A target repo declaring `project:`, `criticality:`, and `components:`, plus
 /// a findings file whose evidence paths hit one component, miss both, and name
@@ -4029,7 +4029,7 @@ fn plain_scan_stays_deterministic_and_never_submits() {
     );
 }
 
-// --- plugin command surface over the skills machinery (po-av01j.162) ---
+// --- plugin command surface over the skills machinery ---
 
 /// The `plugin agents --json` OUTPUT CONTRACT: the scan skill parses this
 /// as the source of truth for available lenses, so the shape is exactly
@@ -4199,7 +4199,7 @@ fn put_executable(dir: &std::path::Path, name: &str) {
     }
 }
 
-/// END TO END, BOTH HALVES OF THE INVERSION (po-av01j.193). rvl-cli detects
+/// END TO END, BOTH HALVES OF THE INVERSION. rvl-cli detects
 /// a harness by binary on PATH **OR** config directory. Probing only the
 /// config directory made the two tools disagree on the same machine, in both
 /// directions — `codex` on PATH installed NOTHING, with no error. Driven
@@ -4244,7 +4244,7 @@ fn plugin_install_sweep_detects_by_path_and_by_config_dir() {
     assert!(!stdout.contains("skipped"), "nothing to explain: {stdout}");
 
     // Evidence that was passed over is NAMED: a user who expects Codex and
-    // gets nothing had no signal at all before (po-av01j.193).
+    // gets nothing had no signal at all before.
     let home = dir.path().join("home-codex-dir");
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     let stdout = detect_sweep(&home, &empty, &cache);
@@ -4258,7 +4258,7 @@ fn plugin_install_sweep_detects_by_path_and_by_config_dir() {
     );
 }
 
-/// `--all` is an alias for the bare sweep (po-av01j.188). That equivalence
+/// `--all` is an alias for the bare sweep. That equivalence
 /// is only meaningful once both spellings compute the SAME set the way
 /// rvl-cli does, so it is pinned against a machine where detection comes
 /// from PATH, from a config dir, and from a binary whose name is not the
@@ -4428,7 +4428,7 @@ fn plugin_update_targets_v1_recorded_installs_for_adoption() {
 }
 
 // --- rvl-cli parity: `config show` / `config set` + `completion`
-// (po-av01j.164) ---
+// ---
 
 /// A command with a tempdir HOME and every credential env override
 /// removed, so config commands see ONLY the file under test.
@@ -4553,7 +4553,7 @@ fn completion_generates_a_script_for_each_shell() {
     }
 }
 
-// --- submission-only flags on the deterministic path (po-av01j.168) ---
+// --- submission-only flags on the deterministic path ---
 
 /// Every one of these used to be accepted and silently dropped: the scan ran
 /// normally, the flag went nowhere, and the user believed it had taken
@@ -4672,7 +4672,7 @@ fn submission_mode_still_accepts_the_same_flags() {
         "the dry-run summary must describe the submission: {stdout} {stderr}"
     );
 }
-// --- judgments and the gate (po-av01j.106) ---
+// --- judgments and the gate ---
 
 /// A production-path `requests.get` with no timeout: one violating site, the
 /// class the ratified corpus promotes to blocking.
@@ -4810,7 +4810,7 @@ fn the_judgments_override_is_loudly_announced() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// --- build/dev scope from repo evidence (po-av01j.173) ---
+// --- build/dev scope from repo evidence ---
 
 /// A Python project shaped like open-webui's root: product code in a package,
 /// a hatchling build hook and a maintenance script at the top level, both
@@ -4914,7 +4914,7 @@ fn scan_fixture(
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// The bug (po-av01j.173): on open-webui 3 of 6 blocking findings were build
+/// The bug: on open-webui 3 of 6 blocking findings were build
 /// tooling, so the gate failed a commit over a build hook and a contributor
 /// stats script. Declared tooling must not block; product code must.
 #[test]
@@ -4985,7 +4985,7 @@ fn a_referenced_root_script_still_blocks() {
     );
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
-// --- the changed set comes from GIT, not from the packet index (po-sg7jb) ---
+// --- the changed set comes from GIT, not from the packet index ---
 
 /// A real git repo carrying a pre-existing BLOCKING finding (a hardcoded AWS
 /// key in a committed file) that the author is not touching. The content lane
@@ -5067,7 +5067,7 @@ fn the_fixtures_pre_existing_finding_really_blocks_an_unscoped_scan() {
     );
 }
 
-/// THE REGRESSION THAT MATTERS MOST (po-sg7jb): a COLD packet index plus one
+/// THE REGRESSION THAT MATTERS MOST: a COLD packet index plus one
 /// trivial staged file must gate on that file alone. Before this fix the
 /// changed set came from `plan_reload`, which on a cold index has no stored
 /// hash to compare against and therefore called every file changed — so the
@@ -5371,7 +5371,7 @@ fn a_full_scan_outside_a_git_repo_still_works() {
     );
 }
 
-// --- the CI base-ref chain: `--changed-only` in a PR checkout (po-av01j.194) ---
+// --- the CI base-ref chain: `--changed-only` in a PR checkout ---
 
 /// THE SHAPE THE GATE EXISTS FOR, synthesized exactly as CI produces it: a
 /// base branch, a feature branch whose commits carry the offending code, a
@@ -5745,7 +5745,7 @@ fn an_empty_base_value_falls_through_to_the_next_link() {
     }
 }
 
-// --- an empty API corpus is a commercial-tier condition (po-pqpry) ---
+// --- an empty API corpus is a commercial-tier condition ---
 
 /// The empty-corpus warning names the COMMERCIAL tier, so it must never fire
 /// on a scan that loaded no such tier. `--specs-file` is the only spec source

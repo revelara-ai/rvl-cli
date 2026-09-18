@@ -154,7 +154,7 @@ impl GroupAcc {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Report {
     /// Sites whose client type never resolved, so no spec could ever be keyed
-    /// on them (po-av01j.146). Kept as a COUNT rather than dropped silently:
+    /// on them. Kept as a COUNT rather than dropped silently:
     /// it is the signal that retrieval is failing to resolve receivers, and a
     /// silent drop would hide it. Carries no identity, so the privacy contract
     /// is unchanged.
@@ -189,7 +189,7 @@ fn is_unknown(reason: &str) -> bool {
 /// Sorted deterministically: highest `site_count` first, ties broken by
 /// `client_type` then `method`, so the payload (and its audit) is reproducible.
 /// Is this client type UNMINTABLE -- an identity a spec could never be keyed on
-/// (po-av01j.146)?
+///?
 ///
 /// Measured across five repositories, 15 surfaces and 270 sites carried an
 /// EMPTY client_type or the literal "invalid type": ".post", "invalid
@@ -520,7 +520,7 @@ mod tests {
     fn empty_or_all_decided_scan_yields_no_surfaces() {
         assert!(build_report(&[], &[], "1.0.0").surfaces.is_empty());
     }
-    // po-av01j.146. Measured across five repositories: 15 surfaces and 270
+    // a tracked follow-up. Measured across five repositories: 15 surfaces and 270
     // sites carried an empty client_type or the literal "invalid type". They
     // cannot be minted -- there is nothing to key a spec on -- and a factory
     // that consumed them would author against an identity no scan can match.

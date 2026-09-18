@@ -62,7 +62,7 @@ fn has_session_bound(src: &str) -> bool {
 /// is unchanged -- same keys, same order, same hit -- but `timeout=0` is
 /// textual evidence of a VALUE, and a spec that declares `0` unbounded has to
 /// be able to see it. Without this the fallback path kept the exact false pass
-/// the const-args path was fixed for (po-av01j.25).
+/// the const-args path was fixed for.
 ///
 /// The value is the token after the separator, up to whitespace or an
 /// argument/call delimiter; empty when the text shows nothing parseable, which
@@ -259,10 +259,10 @@ enum ConfigEvidence {
     Phase(String),
     /// A named field set to a spec-declared unbounded sentinel: positive
     /// evidence the bound was switched off, the CallArg lane's
-    /// `unbounded_sentinels` read against a construction (po-av01j.25).
+    /// `unbounded_sentinels` read against a construction.
     Unbounded(String),
     /// The spec was found for this client and cannot be checked here, so it
-    /// must be credited neither as a pass nor as a violation (po-m2ill).
+    /// must be credited neither as a pass nor as a violation.
     Unresolved(String),
     None,
 }
@@ -384,17 +384,17 @@ pub fn propagate(
     specs: &SpecCache,
     served: &ServedBound,
     // Repo-level client bounds, resolved per I/O family. A call is broadened
-    // only by its OWN family's bound (po-3t3oj.34), so one client's timeout can
+    // only by its OWN family's bound, so one client's timeout can
     // never mask another family's unbounded calls.
     client: &HashMap<Family, ServedBound>,
 ) -> Finding {
     let id = site.id();
     // Site kinds with their OWN lane are never a client-call question: a
-    // server-entry registration (po-av01j.3) is judged by the server-entry
+    // server-entry registration is judged by the server-entry
     // lane even when a G1 spec is keyed to the same (type, method) — scoring
     // a route registration as an unbounded call would be a category error.
     // Kinds that RIDE this lane's judgment machinery (background_job,
-    // po-av01j.4) fall through to the applicability gate below instead.
+    // a tracked follow-up) fall through to the applicability gate below instead.
     if site.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY {
         return Finding {
             site_id: id,
@@ -405,7 +405,7 @@ pub fn propagate(
             ),
         };
     }
-    // Same for G4 emission points (po-av01j.5): an API spec judges CALLS. An
+    // Same for G4 emission points: an API spec judges CALLS. An
     // emission-point aggregate is routed to the emission lane by the scan
     // pipeline; if one reaches here anyway (eval harness, a stream fed
     // straight in), it is out of this control's scope by construction —
@@ -438,7 +438,7 @@ pub fn propagate(
         };
     }
 
-    // Applicability by site kind (G3, po-av01j.4). A spec governs only the
+    // Applicability by site kind (G3, a tracked follow-up). A spec governs only the
     // site kinds it declares (empty = the classic G1 call site), so a
     // call-site judgment is never silently re-applied at job altitude, nor a
     // job-altitude spec to classic calls. Wrong-altitude specs ABSTAIN — the
@@ -487,12 +487,12 @@ pub fn propagate(
     let mut whole: Vec<String> = Vec::new();
     let mut phase: Vec<String> = Vec::new();
     // Positive evidence that the call is UNBOUNDED: a resolved argument value
-    // the spec declares as an unbounded sentinel (po-av01j.25).
+    // the spec declares as an unbounded sentinel.
     let mut unbounded: Vec<String> = Vec::new();
     let mut served_unresolved = false;
     let mut client_unresolved = false;
     // An exact-type config spec for this client that names no bounding
-    // field, so the site could not check it (po-m2ill).
+    // field, so the site could not check it.
     let mut config_unresolved: Option<String> = None;
     // A timeout argument whose value the retriever could not resolve, on an API
     // whose spec says SOME values of it mean no bound.
@@ -567,7 +567,7 @@ pub fn propagate(
                 // is auditable back to what the retriever actually saw. The
                 // snippet-text heuristic remains the v1 fallback.
                 //
-                // VALUE-AWARE (po-av01j.25): the name of the argument is not
+                // VALUE-AWARE: the name of the argument is not
                 // the question, its value is. Many libraries spell "no
                 // timeout" as a value of the timeout argument itself --
                 // requests' `timeout=None` blocks forever, `CURLOPT_TIMEOUT 0`
@@ -614,7 +614,7 @@ pub fn propagate(
                     // credits a bound here, as it always has. Whether it should
                     // abstain instead under a sentinel-declaring spec is a
                     // large population and a measurable precision swing, so it
-                    // is gated on the eval set rather than assumed: po-av01j.59.
+                    // is gated on the eval set rather than assumed: a tracked follow-up.
                     if !value.is_empty() && spec.is_unbounded_sentinel(&value) {
                         unbounded.push(format!(
                             "the timeout argument at the call is the spec-declared unbounded sentinel {key}={value} (snippet text)"
@@ -646,7 +646,7 @@ pub fn propagate(
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
-                // (po-m2ill), see `config_evidence`.
+                //, see `config_evidence`.
                 //
                 // EXACT (a): the client is constructed at this site with a
                 // config the specs recognise.
@@ -674,7 +674,7 @@ pub fn propagate(
                         );
                     }
                 }
-                // FAMILY-SCOPED GUARDED BROADENING (po-3t3oj.34): only when no
+                // FAMILY-SCOPED GUARDED BROADENING: only when no
                 // exact bound was found, and only from the call's OWN I/O
                 // family's repo-level config. A DB query is broadened by a DB
                 // pool's whole-call timeout, never by an image tool's timeout
@@ -683,7 +683,7 @@ pub fn propagate(
                 // stays a finding. Conflicting configs within the family abstain
                 // to a human — never a guess. An exact spec the lane could not
                 // check is not "no exact config": broadening past it would let
-                // the same bare spec back in through the family (po-m2ill).
+                // the same bare spec back in through the family.
                 // Nor is an exact field switched off: the repo-level family
                 // bound counts that same literal as "sets Timeout" without
                 // reading the value, so broadening would re-credit it.
@@ -740,7 +740,7 @@ pub fn propagate(
             reason: "conflicting client-config specs in this family".into(),
         };
     }
-    // An exact-type config spec that names no bounding field (po-m2ill): the
+    // An exact-type config spec that names no bounding field: the
     // lane found the spec for this client and could not check it against the
     // construction, so neither a pass nor a violation is supported. Same
     // class as the conflicts above, and it routes the same way -- to the spec
@@ -822,7 +822,7 @@ mod tests {
     }
 
     /// The same cache, with the API declaring which argument values mean "no
-    /// bound" (po-av01j.25). `vec![]` is every spec authored before the field
+    /// bound". `vec![]` is every spec authored before the field
     /// existed, which is what makes the declared/undeclared pairs below a
     /// parity test rather than two unrelated cases.
     fn cache_with_sentinels(
@@ -862,7 +862,7 @@ mod tests {
         }
     }
 
-    // --- G3 background-job sites: spec applicability by site_kind (po-av01j.4) ---
+    // --- G3 background-job sites: spec applicability by site_kind ---
 
     /// A job-altitude spec: the same timeout-judgment machinery, declared
     /// applicable to background_job sites (RC-060 / job-altitude re-application).
@@ -900,7 +900,7 @@ mod tests {
         }
     }
 
-    // --- blocking by design (po-av01j.180) ---
+    // --- blocking by design ---
 
     /// A cache whose one spec is the class under test, with the intent the
     /// caller names. Built from the real corpus rows so the parity below is
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn a_server_entry_site_is_never_judged_by_the_client_call_lane() {
-        // G2 (po-av01j.3): even with a G1 spec keyed to the same (type,
+        // G2: even with a G1 spec keyed to the same (type,
         // method), a server-entry registration is not a blocking-call
         // question. It reports NotApplicable here and is judged by the
         // server-entry lane instead.
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn emission_point_sites_are_never_judged_by_g1_specs() {
-        // G4 (po-av01j.5): spec applicability filters on site_kind. An
+        // G4: spec applicability filters on site_kind. An
         // emission aggregate whose (client_type, method) happens to collide
         // with a G1 API spec must NOT be judged as a blocking call — the G1
         // control does not govern emission points. The scan pipeline also
@@ -1212,7 +1212,7 @@ mod tests {
     fn client_config_exact_bare_type_abstains_instead_of_satisfying() {
         // The call's own client_type carries a whole-call this_client config
         // and there is no per-site construction. This used to SATISFY on the
-        // exact type match alone, which is the po-m2ill false negative: the
+        // exact type match alone, which is the a tracked follow-up false negative: the
         // spec names no field, so nothing at the site can show whether the
         // bound the spec has in mind was ever set. It now abstains, naming
         // what the spec is missing, so the site routes to a spec author
@@ -1234,7 +1234,7 @@ mod tests {
         );
     }
 
-    // --- field evidence for client configs (po-m2ill) ---
+    // --- field evidence for client configs ---
 
     /// The API half of the repro: `net/http.Client.Do`, bounded by client
     /// config, over whatever config specs the caller names.
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn an_empty_client_literal_never_satisfies_a_bare_type_config() {
-        // THE po-m2ill repro: `&http.Client{}` blocks forever, and the served
+        // THE a tracked follow-up repro: `&http.Client{}` blocks forever, and the served
         // spec keyed on the bare type credited it whole-call twice over
         // ("client config net/http.Client; client config net/http.Client").
         let f = propagate(
@@ -1605,7 +1605,7 @@ mod tests {
     fn a_field_set_to_a_declared_unbounded_sentinel_violates_instead_of_satisfying() {
         // `http.Client{Timeout: 0}` is Go for "no timeout": the author wrote
         // the value that turns the bound off. Same principle as the CallArg
-        // lane (po-av01j.25): a resolved sentinel is positive evidence of
+        // lane: a resolved sentinel is positive evidence of
         // unboundedness, decided as a violation with the value cited.
         let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
         spec.unbounded_sentinels = vec!["0".into()];
@@ -1920,7 +1920,7 @@ mod tests {
 
     #[test]
     fn a_resolved_unbounded_sentinel_violates_instead_of_satisfying() {
-        // po-av01j.25, THE false-pass this issue exists for: requests'
+        // a tracked follow-up, THE false-pass this issue exists for: requests'
         // timeout=None blocks forever, so a resolved sentinel value must not
         // credit a bound. It VIOLATES rather than abstains because a resolved
         // sentinel is positive evidence of unboundedness -- the author

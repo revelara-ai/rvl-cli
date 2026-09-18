@@ -1,4 +1,4 @@
-//! Single-use enforcement (po-av01j.89).
+//! Single-use enforcement.
 //!
 //! The property under test is the one the old `consumed: bool` claimed and
 //! never had: a gate set cannot be scored twice, and the second attempt is

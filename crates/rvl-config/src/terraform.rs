@@ -1,5 +1,5 @@
 //! Terraform retriever (`*.tf` plus auto-loaded tfvars): family (5) of the G6
-//! config lane (po-av01j.23, wayfinder po-ae75b.1).
+//! config lane (a tracked follow-up, wayfinder a tracked follow-up).
 //!
 //! Parses an honest, bounded SUBSET of HCL — exactly the keys the G6 control
 //! set inventories — with a minimal in-module parser (no HCL crate; the repo
@@ -23,7 +23,7 @@
 //!   * `module.source` / `module.source-class` — per module call, the raw
 //!     source identity and its mechanical class (`registry`|`git`|`local`|
 //!     `other`). A REMOTE REGISTRY module resolves BY REGISTRY IDENTITY (the
-//!     po-av01j.2 resolution): the source string is the packet value and no
+//!     a tracked follow-up resolution): the source string is the packet value and no
 //!     network fetch ever happens.
 //!   * `module.version-pin` / `module.pin-class` — registry modules: the
 //!     `version` constraint (`exact`|`range`|`floating`); git modules: the

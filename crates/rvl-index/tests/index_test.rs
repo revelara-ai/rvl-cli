@@ -1,4 +1,4 @@
-//! Incremental-scan acceptance tests (po-3t3oj.14): content-hash gate,
+//! Incremental-scan acceptance tests: content-hash gate,
 //! collision-safe site keys, reuse/retrieve split, budget fail-open vs strict.
 
 use rvl_core::Site;
@@ -65,7 +65,7 @@ fn content_hash_tracks_content_not_path() {
 
 #[test]
 fn site_key_disambiguates_a_shared_location() {
-    // The finding from po-3t3oj.15: one file:line can resolve to two sites.
+    // The finding from a tracked follow-up: one file:line can resolve to two sites.
     let one = site("svc/x.go", 306, "drive.Service", "Do");
     let two = site("svc/x.go", 306, "http.Client", "Do");
     assert_ne!(
@@ -218,7 +218,7 @@ fn strict_budget_fails_closed() {
     );
 }
 
-// --- concurrent access (po-l3jo5) ---
+// --- concurrent access ---
 //
 // redb allows exactly one process to hold the database. Opening therefore has
 // to distinguish "someone else is using it right now" from "it is broken",

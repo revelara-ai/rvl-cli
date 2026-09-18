@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// po-av01j.131: goindex loaded packages from the scan root and assumed a module
+// a tracked follow-up: goindex loaded packages from the scan root and assumed a module
 // lived there. On a monorepo whose services each carry their own go.mod it
 // found none, returned an empty stream, and exited 0 -- so the scan reported
 // "Go was scanned and is clean" when Go had never been looked at. Measured on

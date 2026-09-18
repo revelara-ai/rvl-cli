@@ -1,5 +1,5 @@
 //! Two-condition retriever comparison (skilleval contract, wayfinder
-//! po-ipkfg.15): baseline vs treatment retriever with the downstream engine
+//! a tracked follow-up): baseline vs treatment retriever with the downstream engine
 //! frozen. Emits a per-repo x per-class table, an explicit regression list,
 //! and a seeded disagreement sample. Never a lone scalar verdict.
 

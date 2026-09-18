@@ -1,4 +1,4 @@
-// Golden fixture generator for the rvl-data crate (po-av01j.17).
+// Golden fixture generator for the rvl-data crate.
 //
 // Mirrors the EXACT structs and marshal calls rvl-cli uses on its
 // re-marshal JSON paths, so the Rust port can be tested byte-for-byte

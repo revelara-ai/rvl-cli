@@ -1,6 +1,6 @@
 //! GitHub Actions workflow retriever (`.github/workflows/*.yml`): the first
 //! format of family (1), and the format that proves the lane machinery on the
-//! cleanest case (wayfinder po-ae75b.1 item 2).
+//! cleanest case (wayfinder a tracked follow-up item 2).
 //!
 //! Emits FACTS about the keys the G6 control set cares about (change
 //! management RC-013/014, supply chain RC-045, least privilege RC-044):
@@ -40,7 +40,7 @@ impl ConfigRetriever for GithubActions {
         if let Some(name) = rel_path.strip_prefix(".github/workflows/") {
             return !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"));
         }
-        // COMPOSITE ACTION DEFINITIONS (po-av01j round 11). An agent lens found
+        // COMPOSITE ACTION DEFINITIONS (a tracked follow-up round 11). An agent lens found
         // two unpinned third-party actions in .github/actions/*/action.yaml that
         // this retriever could not see at all: the workflows/ prefix excluded
         // every composite action in existence, and those files pull the same
@@ -272,7 +272,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         }
 
         // job.uses.ref: a job that CALLS A REUSABLE WORKFLOW has `uses:` at
-        // job level and no steps at all (po-av01j round 11). This was invisible
+        // job level and no steps at all (a tracked follow-up round 11). This was invisible
         // -- the retriever only ever looked inside `steps` -- and it is the more
         // dangerous of the two, because a reusable workflow executes with the
         // CALLING repository's secrets. The instance found by the agent lens
@@ -347,7 +347,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no packet {unit}:{key} in {:?}", got.packets))
     }
 
-    // po-av01j round 11, found by the agent-lens diff. Both shapes below were
+    // a tracked follow-up round 11, found by the agent-lens diff. Both shapes below were
     // invisible to this retriever, and both pull third-party code into the same
     // jobs with the same credentials as a step action.
     #[test]

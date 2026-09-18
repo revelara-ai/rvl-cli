@@ -1,4 +1,4 @@
-//! A FRESH INSTALL SCANS (po-aml3h).
+//! A FRESH INSTALL SCANS.
 //!
 //! The regression these tests exist for: `brew install rvl` delivered the
 //! binary and none of the seven retriever helpers, so the first scan of any

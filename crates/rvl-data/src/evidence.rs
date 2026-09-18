@@ -160,7 +160,7 @@ pub fn run(cmd: EvidenceCmd) -> std::process::ExitCode {
                 service,
                 format,
             } => {
-                // EMPTY-FLAG SEMANTICS (po-av01j.192), read off evidence.go:
+                // EMPTY-FLAG SEMANTICS, read off evidence.go:
                 //  * --control/--type/--name: :142/:146/:150 reject an empty
                 //    value with "is required" (exit 2) — `require` below
                 //    already treats Some("") as missing, so `--control=` and
@@ -254,7 +254,7 @@ fn require(v: Option<String>, msg: &str) -> Result<String, Failure> {
     }
 }
 
-/// rvl-cli validates evidence --format as json-only (po-i24do.11).
+/// rvl-cli validates evidence --format as json-only.
 fn validate_format(format: &Option<String>) -> Result<(), Failure> {
     match format.as_deref() {
         None | Some("json") => Ok(()),

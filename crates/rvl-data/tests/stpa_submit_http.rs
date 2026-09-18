@@ -1,6 +1,6 @@
 //! Hermetic proof that `rvl stpa submit` hits the SAME six endpoints as
 //! rvl-cli's Go implementation, in the same order, with ids from earlier
-//! responses feeding the later calls (po-av01j.183). No live API calls.
+//! responses feeding the later calls. No live API calls.
 //!
 //! The mock speaks just enough HTTP/1.1 for ureq and serves a scripted
 //! sequence of responses (one per connection), recording every request.

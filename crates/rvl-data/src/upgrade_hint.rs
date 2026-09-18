@@ -1,6 +1,6 @@
 //! Install-method detection for the `status` CLI update nag, ported from
-//! rvl-cli `internal/commands/upgrade_hint.go` (po-t1mu7) and re-based on
-//! how THIS binary is actually distributed (po-av01j.185 item 1).
+//! rvl-cli `internal/commands/upgrade_hint.go` and re-based on
+//! how THIS binary is actually distributed (a tracked follow-up item 1).
 //!
 //! rvl-cli shipped two ways: a Homebrew CASK and `go install`. The Rust
 //! binary drops `go install` — a v2 user who ran it would be handed a v1

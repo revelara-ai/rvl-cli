@@ -77,7 +77,7 @@ func TestEveryEmittedPacketNamesItsLanguage(t *testing.T) {
 	}
 }
 
-// Schema v2 (po-av01j.19): constant-valued arguments at the call site are
+// Schema v2: constant-valued arguments at the call site are
 // evidence — the libcurl/POSIX discrimination lives in enum constants, and the
 // TS pool-timeout precision fix needed this same shape — and every site
 // carries the macro flag (mechanical for C/C++, always false for Go).
@@ -123,7 +123,7 @@ func TestRetrievedSitesCarryConstArgsAndMacroFlag(t *testing.T) {
 	}
 }
 
-// G3 (po-av01j.4): background-job registrations ride the SAME packet stream,
+// G3: background-job registrations ride the SAME packet stream,
 // marked by site_kind. Detection is TYPE-driven — the callee must resolve into
 // the scheduler/queue framework's package — so a same-named local method is
 // never guessed at, and ordinary client calls stay classic (empty site_kind).
@@ -186,7 +186,7 @@ func findConstArg(args []ConstArg, index int) *ConstArg {
 	return nil
 }
 
-// The incremental path (po-3t3oj.14) asks for packets from a subset of files.
+// The incremental path asks for packets from a subset of files.
 // Filtering must be exact-path, never prefix or substring, or a shallow
 // reload silently pulls in unrelated sites.
 func TestFilterToFilesIsExactPath(t *testing.T) {

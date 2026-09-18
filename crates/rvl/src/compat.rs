@@ -1,5 +1,5 @@
 //! rvl-cli v1 compatibility for invocations we cannot reach: git hook files
-//! ALREADY ON DISK (po-av01j.191).
+//! ALREADY ON DISK.
 //!
 //! WHY THIS EXISTS, AND WHY IT DOES NOT CONTRADICT DECISION 5.
 //!
@@ -36,10 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The banner rvl-cli v1's `hook install` wrote verbatim into every shim it
 /// created. One commit in rvl-cli's entire history ever wrote a shim
-/// (`b34173b`, po-66evv.8), so this literal identifies a v1 hook exactly,
+/// (`b34173b`, a tracked follow-up), so this literal identifies a v1 hook exactly,
 /// with no heuristics and no false positives.
-pub const V1_HOOK_BANNER: &str =
-    "Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.";
+pub const V1_HOOK_BANNER: &str = "Installed by `rvl hook install`: agent-scan git gate.";
 
 /// v1's agent-scan invocation, as it appears in a shim body or a lefthook
 /// `run:` line. Required IN ADDITION to the banner so a v2 shim (whose own
@@ -112,9 +111,9 @@ pub struct Scoping {
 ///   rvl-cli's `--changed-only` resolves a base ref (`--base`, `RVL_BASE_REF`,
 ///   `GITHUB_BASE_REF`, `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`,
 ///   `.revelara.yaml scanner.base_ref`) and diffs `base...HEAD`. When
-///   po-av01j.191 wrote this mapping, v2 had NO such chain, so pre-push was
+///   a tracked follow-up wrote this mapping, v2 had NO such chain, so pre-push was
 ///   the closest available question (`@{upstream}..HEAD`, the same shape with
-///   the base read from git). po-av01j.194 ported the chain, so the alias now
+///   the base read from git). a tracked follow-up ported the chain, so the alias now
 ///   resolves v1's question the way v1 resolved it — including v1's loud
 ///   refusal when a configured base ref is not reachable.
 ///
@@ -292,13 +291,13 @@ pub const EVAL_MODE_NOTE: &str =
 /// (rvl-cli `internal/commands/hook.go`, `writeHookShim` + `selectedHooks`).
 #[cfg(test)]
 pub(crate) const V1_PRE_COMMIT_SHIM: &str = "#!/bin/sh\n\
-     # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+     # Installed by `rvl hook install`: agent-scan git gate.\n\
      exec rvl scan --agent --staged --mode enforce\n";
 #[cfg(test)]
 pub(crate) const V1_PRE_PUSH_SHIM: &str = "#!/bin/sh\n\
-     # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+     # Installed by `rvl hook install`: agent-scan git gate.\n\
      # WARNING: pre-push stopgap. The real stdin ref protocol lands in\n\
-     # po-66evv.9 as `rvl scan --agent --pre-push`; swap it in when available.\n\
+     # a tracked follow-up as `rvl scan --agent --pre-push`; swap it in when available.\n\
      exec rvl scan --agent --changed-only\n";
 
 #[cfg(test)]
@@ -368,7 +367,7 @@ mod tests {
         }
     }
 
-    /// po-av01j.194 REVISITS po-av01j.191's compromise. v1's `--changed-only`
+    /// a tracked follow-up REVISITS a tracked follow-up's compromise. v1's `--changed-only`
     /// resolved a base ref and diffed `base...HEAD`; .191 mapped it to
     /// pre-push only because v2 had no chain to resolve against. Now that it
     /// does, the alias resolves v1's question v1's way: no `--hook`, so
@@ -407,7 +406,7 @@ mod tests {
     }
 
     /// `--staged` is the INDEX question and is never a base-ref one, so a
-    /// configured base ref leaves it alone (po-av01j.194: the chain must not
+    /// configured base ref leaves it alone (a tracked follow-up: the chain must not
     /// touch the pre-commit path).
     #[test]
     fn a_configured_base_ref_does_not_disturb_the_staged_alias() {

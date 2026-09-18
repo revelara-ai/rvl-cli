@@ -1,6 +1,6 @@
 //! Hermetic proof that `rvl risk context` issues its three fetches
 //! CONCURRENTLY, the way rvl-cli's Go implementation does with a
-//! sync.WaitGroup (po-av01j.200), and that concurrency changes nothing about
+//! sync.WaitGroup, and that concurrency changes nothing about
 //! the result: the same composed body, and the same partial-failure behaviour
 //! no matter which reply lands first.
 //!

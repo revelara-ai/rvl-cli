@@ -1,4 +1,4 @@
-//! Spec-cache distribution acceptance tests (po-3t3oj.13): signing,
+//! Spec-cache distribution acceptance tests: signing,
 //! versioning, atomic install with last-good, quarantine, schema range,
 //! offline kill switch, hash-conditional sync, air-gapped import.
 
@@ -343,7 +343,7 @@ fn rejected_dir_is_pruned() {
     );
 }
 
-// --- judgments inside the signed envelope (po-av01j.106) ---
+// --- judgments inside the signed envelope ---
 
 /// An envelope carrying the ratified judgments corpus beside the specs.
 fn envelope_with_judgments(content_version: &str, severity: &str) -> Vec<u8> {
@@ -364,7 +364,7 @@ fn envelope_with_judgments(content_version: &str, severity: &str) -> Vec<u8> {
 }
 
 /// The corpus survives the real install + verify + load round trip. Before
-/// po-av01j.106 there was nowhere in the envelope for it to ride, so a scan had
+/// a tracked follow-up there was nowhere in the envelope for it to ride, so a scan had
 /// nothing to grade findings with and every one came out advisory.
 #[test]
 fn judgments_ride_inside_the_verified_envelope() {
@@ -463,7 +463,7 @@ fn an_unknown_envelope_section_is_ignored_not_rejected() {
     assert_eq!(loaded.envelope.content_version, "2026-08-13.future");
 }
 
-/// po-av01j.176: a conditional GET that the server answers 304 must resolve to
+/// a tracked follow-up: a conditional GET that the server answers 304 must resolve to
 /// NotModified, never to a signature failure.
 ///
 /// The regression this pins is subtle and was live for as long as sync existed.

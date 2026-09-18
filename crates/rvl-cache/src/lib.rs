@@ -1,4 +1,4 @@
-//! Spec-cache distribution: versioning, signing, sync (wayfinder po-ipkfg.13).
+//! Spec-cache distribution: versioning, signing, sync (wayfinder a tracked follow-up).
 //!
 //! The cache artifact is a signed envelope. Verification happens at fetch AND
 //! at load; a missing signature is a failed signature; there is no bypass
@@ -53,7 +53,7 @@ pub struct Envelope {
     /// opaque JSON here so this crate never depends on spec internals).
     pub specs: serde_json::Value,
     /// The ratified judgments corpus: what a resolved, violating finding MEANS
-    /// — its severity, its control, its fix (po-av01j.106).
+    /// — its severity, its control, its fix.
     ///
     /// A spec answers only "is this call bounded". Grading is a separate layer,
     /// and until the factory published it here the scanner could read it only
@@ -88,7 +88,7 @@ pub struct Keyset {
 ///    dev caches with (minted 2026-08-02; private half held out of band in
 ///    the minikube secret spec-signing-dev). Stays pinned for local/dev
 ///    caches.
-/// 2. The PRODUCTION key (minted 2026-08-17, po-av01j.79): private half lives
+/// 2. The PRODUCTION key (minted 2026-08-17, a tracked follow-up): private half lives
 ///    only in GCP Secret Manager (revelara-prod-spec-signing-key) and reaches
 ///    the production spec-factory worker via the revelara-prod-spec-signing
 ///    ExternalSecret. Everything api.revelara.ai publishes is signed with
@@ -203,7 +203,7 @@ impl CacheStore {
     }
 
     /// A sibling store rooted in a subdirectory of this store's root — how
-    /// the OSS tier lives beside the commercial one (po-scnmv.13) without
+    /// the OSS tier lives beside the commercial one without
     /// touching the commercial layout.
     pub fn subdir_store(&self, name: &str) -> anyhow::Result<CacheStore> {
         CacheStore::open(&self.root.join(name))
@@ -519,7 +519,7 @@ impl Fetcher for HttpFetcher {
         let resp = match req.call() {
             // 304 arrives as Ok, NOT as Err: ureq reserves `Error::Status` for
             // 4xx/5xx. Checking the status here rather than in an Err arm is
-            // the whole fix (po-av01j.176) — the Err arm below never fired, so
+            // the whole fix — the Err arm below never fired, so
             // every conditional hit fell through, read an EMPTY body, and then
             // failed signature verification against it. That surfaced to users
             // as "signature does not verify against any pinned key": a
@@ -541,7 +541,7 @@ impl Fetcher for HttpFetcher {
 }
 
 /// Subdirectory under the cache root holding the OSS ruleset tier's store
-/// (po-scnmv.13). Sibling of `current/`/`last-good/`/`rejected/`, so the
+///. Sibling of `current/`/`last-good/`/`rejected/`, so the
 /// commercial store's layout is untouched and existing installs keep working.
 pub const OSS_DIR: &str = "oss";
 
@@ -565,7 +565,7 @@ impl Fetcher for OssHttpFetcher {
         }
         let resp = match req.call() {
             // Same 304-in-the-Ok-arm rule as the commercial fetcher
-            // (po-av01j.176): checking only an Err arm reads an empty body
+            //: checking only an Err arm reads an empty body
             // and fails verification with a tampering message.
             Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
@@ -582,7 +582,7 @@ impl Fetcher for OssHttpFetcher {
     }
 }
 
-/// The two tiers a scan may load (po-scnmv.13). Either may be absent — a
+/// The two tiers a scan may load. Either may be absent — a
 /// no-key install has only the OSS tier, an old install only the commercial
 /// one. Both absent is the only fatal state, decided by the caller.
 pub struct TieredLoaded {
@@ -655,7 +655,7 @@ mod tests {
         assert!(Keyset::from_hex(PINNED_KEYSET_HEX).is_ok());
     }
 
-    // --- tiered load (po-scnmv.13) ---
+    // --- tiered load ---
     //
     // Tests cannot produce signed artifacts (the pinned keyset has no private
     // half in this repo, by design), so the matrix exercises the layering

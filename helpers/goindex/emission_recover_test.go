@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// po-av01j.142: a recover() that hands the failure back to the caller is NOT a
+// a tracked follow-up: a recover() that hands the failure back to the caller is NOT a
 // swallow. Measured on hashicorp/consul, every site the old rule reported was
 // this shape -- idiomatic "don't panic across an API boundary" code, told to
 // add logging it does not need.
@@ -145,7 +145,7 @@ func Middleware2() handler2 {
 	}
 }
 
-// po-av01j.142, third shape. A recover that LOGS through a framework the
+// a tracked follow-up, third shape. A recover that LOGS through a framework the
 // extractor did not know was reported as emitting nothing. Consul logs every
 // recovered panic through hashicorp/go-hclog; the standard `log` package was
 // missing too, which is the most common logging call in Go. A missing
@@ -197,7 +197,7 @@ func TestStandardLogIsRecognisedButLogSubpackagesAreNotDoubleCounted(t *testing.
 	}
 }
 
-// po-av01j.142, fourth shape, found on nats-server AFTER the first fix shipped.
+// a tracked follow-up, fourth shape, found on nats-server AFTER the first fix shipped.
 // The same panic-to-error idiom one indirection over: the failure goes back
 // through a POINTER OUT-PARAMETER rather than a named result. A
 // `defer convertPanicToError(&tok, &err)` helper is the ordinary Go way to

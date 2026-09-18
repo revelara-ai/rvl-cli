@@ -1,4 +1,4 @@
-//! Human-facing scan output (po-3t3oj.9): the severity-ladder hook default and
+//! Human-facing scan output: the severity-ladder hook default and
 //! the per-finding explain view. The raw verdict-count dump was correct but
 //! unreadable; this groups findings by effective severity, says WHY each one
 //! rises to blocking, and reserves the noisy detail for `rvl explain`.
@@ -78,7 +78,7 @@ pub struct Finding {
     /// Set when a `.revelara.yaml` waiver suppresses this finding. Folded into
     /// the Suppressed section like `low_value`, kept out of BLOCKING/ADVISORY.
     pub suppressed: bool,
-    /// VISIBLE BUT NEVER BLOCKING (po-av01j.140). Under `--changed-only`, a
+    /// VISIBLE BUT NEVER BLOCKING. Under `--changed-only`, a
     /// repo-wide config finding in a file this change did not touch stays in
     /// the report -- the whole-tree view is what makes the config lane worth
     /// having -- but must not fail a commit that did not introduce it. That is
@@ -102,7 +102,7 @@ pub struct Finding {
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
     /// Distinct machine-generated files whose packets were dropped before
-    /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
+    /// evaluation (a tracked follow-up.7). Reported, never silent: excluding files
     /// without saying so reads as having scanned them, and it moves every
     /// number above it.
     pub generated_skipped: usize,
@@ -118,7 +118,7 @@ pub struct Coverage {
     pub abstain_judge: usize,
     /// Any other undecided outcome.
     pub abstain_other: usize,
-    /// Sites the specs resolved as BLOCKING BY DESIGN (po-av01j.180): a
+    /// Sites the specs resolved as BLOCKING BY DESIGN: a
     /// server main loop, an event loop, a blocking queue wait, a stream
     /// write. Counted inside `resolved` — the scanner reached a conclusion
     /// about them, and the conclusion is "waiting is the contract".
@@ -133,7 +133,7 @@ pub struct Coverage {
     pub by_design_classes: Vec<String>,
     /// A whole-pass degradation: the incremental path retrieved only part of
     /// the tree because a helper failed, so `total` describes the reused
-    /// portion and NOT the repo (po-av01j.139). Distinct from `degraded`
+    /// portion and NOT the repo. Distinct from `degraded`
     /// below, which names individual languages during a full retrieval.
     ///
     /// Load-bearing when the lane is EMPTY: "no call sites in scope" and "the
@@ -141,18 +141,18 @@ pub struct Coverage {
     /// first one printed over the second is the exact confusion this bead
     /// exists to remove.
     pub degraded_note: Option<String>,
-    /// Languages that contributed no packets at all (po-av01j.102). Distinct
+    /// Languages that contributed no packets at all. Distinct
     /// from the abstain buckets above, which count SITES the scanner reached
     /// and could not decide. These are languages it never got to look at, so
     /// the resolved/total ratio says nothing about them.
     pub degraded: Vec<DegradedLang>,
     /// Per-language outcome for every language SEEN, including the ones that
-    /// ran cleanly and the ones nothing can read (po-av01j.128 / .132).
+    /// ran cleanly and the ones nothing can read (a tracked follow-up / .132).
     pub lang_status: Vec<LangStatus>,
-    /// Which helper file ran per language, and how it was found (po-vd7ii).
+    /// Which helper file ran per language, and how it was found.
     pub retrievers: Vec<RetrieverInfo>,
     /// The commercial spec cache loaded and carried ZERO API specs while call
-    /// sites were in scope (po-pqpry). Every one of them abstained as
+    /// sites were in scope. Every one of them abstained as
     /// no_spec, so the resolved line above counts a corpus that judged
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
@@ -195,7 +195,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
     // Name the helper FILE that ran and where resolution found it. A stale
     // helper shadowing via PATH is invisible in every other line of output —
     // the numbers above simply describe an older scanner than the one the
-    // user thinks they ran (po-vd7ii).
+    // user thinks they ran.
     if !cov.retrievers.is_empty() {
         let parts: Vec<String> = cov
             .retrievers
@@ -217,7 +217,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
 }
 
 /// The COVERAGE lines naming languages that contributed no packets
-/// (po-av01j.102). Split out as a pure function so the abstained/failed
+///. Split out as a pure function so the abstained/failed
 /// distinction is testable without building a whole ladder.
 ///
 /// Rendered in yellow, not the dim grey the abstain buckets use: an abstain
@@ -241,7 +241,7 @@ pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
 
 /// What happened to one language in this scan, as rendered to the user.
 ///
-/// The point is that SILENCE IS NEVER AMBIGUOUS (po-av01j.128 / po-av01j.132).
+/// The point is that SILENCE IS NEVER AMBIGUOUS (a tracked follow-up / a tracked follow-up).
 /// Before this, a language that ran and found nothing, a language whose helper
 /// declined, and a language nothing here can read all produced the same output:
 /// none. On a Rust repo with four C files, cindex parsed all four, found no I/O
@@ -259,7 +259,7 @@ pub struct LangStatus {
 /// it (env override, bundled next to the binary, or PATH). Printed with the
 /// coverage block because its absence is undiagnosable any other way: a stale
 /// helper shadowing via PATH ran the 2026-08-10 dogfoods on a six-day-old
-/// fleet with nothing in the output to show it (po-vd7ii).
+/// fleet with nothing in the output to show it.
 #[derive(Debug, Clone)]
 pub struct RetrieverInfo {
     pub lang: String,
@@ -280,7 +280,7 @@ pub enum LangState {
     /// which used to be reported as nothing at all.
     Unsupported,
     /// The helper, or the toolchain it drives, is not installed
-    /// (po-av01j.147). Asks the reader for an install command, not a bug
+    ///. Asks the reader for an install command, not a bug
     /// report, so it must not read like a failure.
     NotInstalled,
 }
@@ -293,7 +293,7 @@ pub struct DegradedLang {
     /// rather than folded into `reason` because the two must not read alike:
     /// an abstention is the tool working correctly, a failure is not.
     pub abstained: bool,
-    /// The helper or its toolchain is absent (po-av01j.147). A third flag
+    /// The helper or its toolchain is absent. A third flag
     /// rather than a second meaning for `abstained`, because this line and the
     /// per-language roll-call must AGREE -- saying "not installed" in one and
     /// "retriever failed" in the other is worse than either alone.
@@ -322,7 +322,7 @@ pub struct ConfigCoverage {
     /// alone says the lever exists but not where to pull it: these are keys a
     /// retriever already emits and no spec judges, so each is a spec authorable
     /// with no retriever work. Identities only, never values — a key is shape,
-    /// a value is content (po-av01j.133.4).
+    /// a value is content (a tracked follow-up.4).
     pub no_spec_keys: std::collections::BTreeSet<String>,
     /// The effective value lives outside the repo (org/project setting).
     pub abstain_outside_repo: usize,
@@ -332,7 +332,7 @@ pub struct ConfigCoverage {
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format
     /// exists). The last field separates the authoring queue from files a
-    /// supported retriever simply had nothing to take (po-av01j.136).
+    /// supported retriever simply had nothing to take.
     pub sightings: Vec<(String, usize, bool)>,
 }
 
@@ -371,7 +371,7 @@ pub fn finding_id(class_key: &str) -> String {
 /// blocking — an un-triaged finding must not block a commit).
 pub fn classify(f: &Finding) -> Section {
     // Gate-exempt findings are shown but can never reach BLOCKING, so the
-    // printed verdict and the exit code stay in agreement (po-av01j.94).
+    // printed verdict and the exit code stay in agreement.
     if f.gate_exempt && !f.suppressed {
         return Section::Advisory;
     }
@@ -390,7 +390,7 @@ pub fn classify(f: &Finding) -> Section {
 /// How many findings land in BLOCKING after waivers/dispositions — i.e.
 /// whether the ladder's footer says "blocked". The scan's exit code is derived
 /// from this same function the footer uses, so the printed verdict and the
-/// process status can never disagree (po-av01j.94: they did, for months).
+/// process status can never disagree (a tracked follow-up: they did, for months).
 pub fn blocking_count(findings: &[Finding]) -> usize {
     findings
         .iter()
@@ -456,7 +456,7 @@ pub fn render_ladder(
     }
 
     let _ = writeln!(o, "{}", paint("\u{25a0} COVERAGE", "32", color));
-    // No call sites in scope at all (po-av01j.139). "0/0 API surfaces resolved
+    // No call sites in scope at all. "0/0 API surfaces resolved
     // (0%)" is arithmetically fine and tells the reader nothing; under
     // --changed-only this is the ordinary case and the useful statement is that
     // the scan RAN and had nothing to look at. Said plainly so a developer
@@ -502,7 +502,7 @@ pub fn render_ladder(
             let aline = format!("  {} abstain \u{2014} {}", ab, parts.join(" \u{00b7} "));
             let _ = writeln!(o, "{}", paint(&aline, "2", color));
         }
-        // Blocking by design (po-av01j.180). These sites resolved, and they
+        // Blocking by design. These sites resolved, and they
         // produce no finding because no deadline belongs on them — so this
         // line is where their count stays visible. Naming the classes is the
         // point: it is what lets a reader who disagrees with the call see it
@@ -541,7 +541,7 @@ pub fn render_ladder(
             let _ = writeln!(o, "{}", paint(&line, "33", color));
         }
     }
-    // An empty commercial API corpus (po-pqpry). Yellow like a degradation,
+    // An empty commercial API corpus. Yellow like a degradation,
     // because it is one: with zero API specs the resolved line describes a
     // corpus that judged nothing, not a repo that is clean.
     if cov.empty_api_corpus {
@@ -612,7 +612,7 @@ pub fn render_ladder(
         }
         // Identity-only telemetry: format id + count, never content. Split by
         // whether a retriever for the format exists, because one line saying
-        // "unsupported" for both was actively misleading (po-av01j.136 defect
+        // "unsupported" for both was actively misleading (a tracked follow-up defect
         // 2): it reported 109 Gatekeeper policies as unsupported Kubernetes in
         // a run where the Kubernetes lane resolved 288 settings.
         let render_list = |v: &[(String, usize, bool)]| -> String {
@@ -660,13 +660,13 @@ pub fn render_ladder(
         .count();
 
     // THE VERDICT LINE MUST NOT SAY "CLEAN" OVER A SCAN THAT NEVER RAN
-    // (po-av01j.199). The COVERAGE block above already distinguishes "I found
+    //. The COVERAGE block above already distinguishes "I found
     // nothing" from "I could not look", but the FOOTER -- the one line a
     // committer actually reads -- said "commit clean" for both, so a machine
     // with no `python3` passed an unbounded `requests.get` under a green
     // checkmark. Same condition as the INCOMPLETE coverage line on purpose:
     // one predicate drives both, so the two sentences can never disagree
-    // (po-av01j.94's invariant, applied to the prose instead of the exit code).
+    // (a tracked follow-up's invariant, applied to the prose instead of the exit code).
     //
     // Deliberately NOT extended to a PARTIAL pass (total > 0 with a note).
     // Fail-open per language is the documented policy: some sites really were
@@ -689,7 +689,7 @@ pub fn render_ladder(
         }
         if nothing_scanned {
             // The exit code stays 0: a broken retriever is OUR defect and must
-            // not block someone's commit (ruled po-av01j.199, and what
+            // not block someone's commit (ruled a tracked follow-up, and what
             // `--strict`'s help has always promised). So the verdict line is
             // the whole signal, and it has to carry the fact and the reason.
             let _ = writeln!(
@@ -748,7 +748,7 @@ fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
     // (blast radius) and says plainly the severity is unrated -- honest about
     // what the scanner knows vs. what a human review still owes it.
     // Both branches lead with "severity:" so a judged and an unjudged finding
-    // read as the same kind of row (po-lht6p). An unjudged reliability finding
+    // read as the same kind of row. An unjudged reliability finding
     // is ADVISORY BY POLICY (un-triaged never blocks), so it is labelled that
     // way — "not yet graded (advisory)" — rather than as "unrated", which read
     // as a defect. The real fix for the frequency of ungraded rows is authoring
@@ -863,7 +863,7 @@ fn trim_float(v: f64) -> String {
 }
 
 /// Turn a propagation reason into a sentence a human can act on, keyed on the
-/// call class and the raw reason (po-68mlb). The propagation layer's reason
+/// call class and the raw reason. The propagation layer's reason
 /// strings are a load-bearing CONTRACT — coverage bucketing string-matches
 /// "no spec" / "truncated" / "depends" on the finding's own `reason` field —
 /// so this rewrite happens ONLY at display assembly and never mutates that
@@ -872,7 +872,7 @@ fn trim_float(v: f64) -> String {
 /// such rather than as an abstract "bound".
 ///
 /// The sentence must never assert more than the evidence supports
-/// (po-av01j.175). The search establishes facts about the USER'S CODE; what
+///. The search establishes facts about the USER'S CODE; what
 /// the library does with no explicit bound is a fact about the LIBRARY, and
 /// the only place that fact can live is the spec. So `default_bound` is an
 /// input here and the wording is a FUNCTION of it rather than a fixed string:
@@ -950,7 +950,7 @@ mod by_design_coverage_tests {
         }
     }
 
-    /// po-av01j.180: a suppressed class must still be ACCOUNTED FOR. The
+    /// a tracked follow-up: a suppressed class must still be ACCOUNTED FOR. The
     /// coverage line is where the count and the identities live, so a reader
     /// who disagrees with the by-design call can see it and say so.
     #[test]
@@ -1012,7 +1012,7 @@ mod by_design_coverage_tests {
 mod empty_api_corpus_tests {
     use super::*;
 
-    /// po-pqpry: the COVERAGE block must NAME an empty commercial API corpus,
+    /// a tracked follow-up: the COVERAGE block must NAME an empty commercial API corpus,
     /// not leave "0/N API surfaces resolved" to speak for itself. That line
     /// looked like an ordinary low-coverage scan for four weeks.
     #[test]
@@ -1075,7 +1075,7 @@ mod humanize_tests {
         assert_eq!(u, "x.Y.z — some novel reason");
     }
 
-    /// The bug (po-av01j.175): the tool asserted a LIBRARY fact it never
+    /// The bug: the tool asserted a LIBRARY fact it never
     /// checked. With no default-bound data the sentence must stop at what the
     /// search verified about the user's code.
     #[test]

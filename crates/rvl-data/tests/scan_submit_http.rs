@@ -268,7 +268,7 @@ fn server_error_envelope_is_surfaced_verbatim() {
     );
 }
 
-/// po-9odxe: a submission that declares one service while its findings
+/// a tracked follow-up: a submission that declares one service while its findings
 /// reference another is rejected with `service_scope_mismatch`. The error
 /// must carry the service the submission should have declared, so the
 /// caller can print a resubmit command with the correction already applied

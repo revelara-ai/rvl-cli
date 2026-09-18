@@ -51,7 +51,7 @@ pub struct ScanRequest {
     pub service_tolerance: Option<ServiceToleranceConfig>,
     pub idempotency_key: String,
 
-    /// In-repo team ownership (po-77b6w.1, org-ownership spec Decision 1).
+    /// In-repo team ownership (a tracked follow-up, org-ownership spec Decision 1).
     /// Wire contract shared with the server's `ScanRequest`: `team` is the
     /// repo-level owning team from `.revelara.yaml` `team:` or the `--team`
     /// override; `team_source` is `"override"` when `--team` was used (the
@@ -181,7 +181,7 @@ pub struct ScanResponse {
     /// this submission's `idempotency_key` matched a recent scan. Nothing in
     /// `findings` was created or updated by this run, so the output must not
     /// re-announce those risks as `[NEW]`. Servers that predate the field omit
-    /// it; `false` is the pre-existing behavior (po-72d5d).
+    /// it; `false` is the pre-existing behavior.
     pub cached: bool,
 }
 
@@ -245,7 +245,7 @@ pub struct EffectiveTolerance {
 
 /// The typed finding the `--scan-dir` dedup pass round-trips through.
 /// Carries the STPA and graph-evidence fields so the round-trip cannot
-/// strip them from the request (po-gli2z).
+/// strip them from the request.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanFinding {
@@ -279,7 +279,7 @@ pub struct ScanFinding {
     pub corroborated_by_agents: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub priority: String,
-    // STPA fields (po-gli2z): before they existed on the wire type, any
+    // STPA fields: before they existed on the wire type, any
     // dedup round-trip silently stripped them from the whole request.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub uca_type: String,
@@ -573,7 +573,7 @@ fn request_g(req: &ScanRequest, include_key: bool) -> G {
             G::Str(req.idempotency_key.clone()),
         ));
     }
-    // po-77b6w.1 team ownership: struct order puts these last, and all three
+    // a tracked follow-up team ownership: struct order puts these last, and all three
     // stay off the wire when empty so older servers see no change.
     push_str_opt(&mut f, "team", &req.team);
     push_str_opt(&mut f, "team_source", &req.team_source);
@@ -598,7 +598,7 @@ pub fn request_body(req: &ScanRequest, include_key: bool) -> String {
 
 /// Metadata fields that describe *who submitted* a scan rather than *what
 /// was scanned*, and are therefore blanked before the idempotency key is
-/// derived (po-av01j.186).
+/// derived.
 ///
 /// - `scanner_id` names the binary (`rely-cli-<ver>` in v1, `rvl/<ver>` in
 ///   v2). Its value is deliberately distinguishable so v1-vs-v2 adoption
@@ -645,7 +645,7 @@ pub fn idempotency_canonical_body(req: &ScanRequest) -> String {
 /// `scanner_id` in the hash — and `scanner_id` differs by construction
 /// (`rely-cli-<v>` vs `rvl/<v>`). An earlier version of this comment claimed
 /// cross-binary agreement; that was never achievable, and the user ruled
-/// against patching v1 to make it so (po-av01j.186).
+/// against patching v1 to make it so.
 ///
 /// Cross-version dedup is handled SERVER-side instead: the API computes its
 /// own canonical key over the scan's content, ignoring submitter identity,
@@ -664,7 +664,7 @@ pub fn derive_idempotency_key(req: &ScanRequest) -> String {
 /// request. Array fields (findings, components, dependencies) concatenate;
 /// scalar/object fields use the last non-zero value, with a stderr warning
 /// when a later file overrides an earlier one.
-/// Merge `--cs-file` into a submission (po-av01j.185 item 3), mirroring
+/// Merge `--cs-file` into a submission (a tracked follow-up item 3), mirroring
 /// rvl-cli `scan.go`.
 ///
 /// Works with `--file` and `--scan-dir` alike. Both merges are FALLBACKS,
@@ -1210,7 +1210,7 @@ fn response_g(r: &ScanResponse) -> G {
         f.push(("effective_tolerance".to_string(), G::Obj(tf)));
     }
     // omitempty, so a fresh scan's JSON is byte-identical to before
-    // (po-72d5d).
+    //.
     if r.cached {
         f.push(("cached".to_string(), G::Bool(true)));
     }
@@ -1221,7 +1221,7 @@ fn response_g(r: &ScanResponse) -> G {
 
 /// How many findings lack both a `component` field and `linked_services`:
 /// they fall back to the bare service label and split Reliability Budget
-/// rows (po-6u5yx).
+/// rows.
 fn count_findings_without_component(findings: &[Value]) -> usize {
     findings
         .iter()
@@ -1281,7 +1281,7 @@ fn populate_git_metadata(meta: &mut ScanMetadata, target: &Path) {
 pub struct SubmitArgs {
     pub service: Option<String>,
     /// Owning team for the WHOLE submission, overriding every `.revelara.yaml`
-    /// `team:` value (po-77b6w.1).
+    /// `team:` value.
     pub team: Option<String>,
     pub target: Option<PathBuf>,
     pub stdin: bool,
@@ -1289,19 +1289,19 @@ pub struct SubmitArgs {
     pub scan_dir: Option<PathBuf>,
     pub cleanup_on_success: bool,
     /// Validate, normalize, and print the submit summary without
-    /// submitting (po-4g59y contract: JSON on stdout, framing on stderr).
+    /// submitting (a tracked follow-up contract: JSON on stdout, framing on stderr).
     pub dry_run: bool,
     pub timeout: Option<String>,
     pub format: Option<String>,
     /// rvl-cli `--review`: the wire value an INTERACTIVE rvl-cli run sends,
-    /// `scan_mode: "review"` (po-av01j.185 item 3). The flag carries the
+    /// `scan_mode: "review"` (a tracked follow-up item 3). The flag carries the
     /// mode and NOTHING else here — rvl-cli's interactive confirmation TUI
     /// is deliberately not ported, and the server's canonical idempotency
     /// key excludes `scan_mode`, so this cannot change dedup behavior.
     /// rvl-cli's own precedence is `--ci > --auto-infer > --review`.
     pub review: bool,
     /// rvl-cli `--cs-file`: merge a control structure from a SEPARATE file
-    /// into this submission (po-av01j.185 item 3). Distinct from `stpa
+    /// into this submission (a tracked follow-up item 3). Distinct from `stpa
     /// submit`, which POSTs a full STPA model to
     /// `/control-structure/model`; this only attaches `control_structure`
     /// (and a `repo_url` fallback) to the scan payload.
@@ -1349,7 +1349,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     };
 
-    // po-77b6w.1: validate the override early; a value that slugifies to
+    // a tracked follow-up: validate the override early; a value that slugifies to
     // nothing usable would be silently dropped server-side.
     let team_flag = args.team.clone().unwrap_or_default();
     if !team_flag.is_empty() && slugify_team_preview(&team_flag).is_empty() {
@@ -1461,7 +1461,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     }
 
-    // Validate and coerce finding fields client-side (po-gli2z): runs
+    // Validate and coerce finding fields client-side: runs
     // BEFORE dedup so the typed round-trip never sees uncoercible shapes.
     let norm_report = match req.findings.as_mut() {
         Some(f) => normalize_findings(f),
@@ -1538,12 +1538,12 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     }
 
-    // po-77b6w.1: carry team ownership on the submission. --team overrides the
+    // a tracked follow-up: carry team ownership on the submission. --team overrides the
     // whole submission; otherwise `.revelara.yaml` `team:` (repo default) and
     // per-component `team:` entries apply.
     apply_team_assignments(&mut req, project_cfg.as_ref(), &team_flag);
 
-    // Dry run (po-4g59y): machine-readable summary on stdout so the scan
+    // Dry run: machine-readable summary on stdout so the scan
     // skill and CI can parse it, human framing on stderr, no submit.
     // serde_json's default Map is sorted, matching Go's map-key encoding,
     // so the two CLIs emit byte-comparable summaries.
@@ -1559,7 +1559,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
             "findings".into(),
             Value::from(req.findings.as_ref().map(Vec::len).unwrap_or(0)),
         );
-        // po-gli2z: normalization counts so CI can assert no STPA loss.
+        // a tracked follow-up: normalization counts so CI can assert no STPA loss.
         summary.insert(
             "findings_with_stpa".into(),
             Value::from(norm_report.with_stpa),
@@ -1592,7 +1592,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
 
     // Warn (don't block) when findings have no component and no
     // linked_services: they land at the bare project label and split
-    // Reliability Budget rows (po-6u5yx).
+    // Reliability Budget rows.
     let total_findings = req.findings.as_ref().map(Vec::len).unwrap_or(0);
     if let Some(findings) = &req.findings {
         let missing = count_findings_without_component(findings);
@@ -1604,7 +1604,7 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
         }
     }
 
-    // po-77b6w.1: pre-submit did-you-mean against the org's known team slugs.
+    // a tracked follow-up: pre-submit did-you-mean against the org's known team slugs.
     // Loud, never blocking: a fetch failure skips the check and an unknown
     // team still submits (create-on-first-sight).
     if !req.team.is_empty() || !req.component_teams.is_empty() {
@@ -1750,7 +1750,7 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
     print_scan_findings(&mut std::io::stdout(), &mut std::io::stderr(), response);
 
     if !response.warnings.is_empty() {
-        // po-7p45k.19: a quarantined service-name collision is the one
+        // a tracked follow-up: a quarantined service-name collision is the one
         // warning that needs the user to act (confirm or rename), so it
         // gets its own banner instead of drowning in the generic list.
         // Still non-blocking: the scan succeeded and the exit code stays 0.
@@ -1776,7 +1776,7 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
     println!("View results: {api_url}/risks");
 }
 
-/// Route server warnings for display (po-7p45k.19): quarantined
+/// Route server warnings for display: quarantined
 /// service-name collisions get their own banner; everything else stays in
 /// the generic warning list. Matching is on the server's stable phrase.
 fn split_collision_warnings(warnings: &[String]) -> (Vec<&String>, Vec<&String>) {
@@ -1863,7 +1863,7 @@ mod tests {
         assert!(!request_body(&b, false).contains("idempotency_key"));
     }
 
-    /// po-av01j.186: `scanner_id` names the submitting binary, not the scan.
+    /// a tracked follow-up: `scanner_id` names the submitting binary, not the scan.
     /// The value stays on the wire (adoption telemetry for the v1->v2
     /// cutover) but must not reach the key, or a scan submitted by
     /// `rely-cli-<ver>` and retried by `rvl/<ver>` misses the server-side
@@ -1884,7 +1884,7 @@ mod tests {
         assert!(request_body(&v2, true).contains(r#""scanner_id":"rvl/1.0.0""#));
     }
 
-    /// po-av01j.186: git_commit/git_branch are provenance labels for where
+    /// a tracked follow-up: git_commit/git_branch are provenance labels for where
     /// HEAD happened to be, not scan content. v1 never populated them and v2
     /// auto-detects them, so keeping them in the key both breaks cross-binary
     /// dedup and voids "rerun after a timeout replays the cached response"
@@ -1969,7 +1969,7 @@ mod tests {
     /// The team wire contract shared with the server's `ScanRequest`: field
     /// names `team`, `team_source`, `component_teams`, marshalled last (Go
     /// struct order) with sorted component keys, and all three omitted when
-    /// empty so older servers see no change (po-77b6w.1).
+    /// empty so older servers see no change.
     #[test]
     fn team_fields_ride_last_and_stay_off_the_wire_when_empty() {
         let mut req = base_request();
@@ -2315,7 +2315,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
     }
 
-    // --- po-av01j.185 item 3: --review and --cs-file ---
+    // --- a tracked follow-up item 3: --review and --cs-file ---
 
     #[test]
     fn scan_mode_reproduces_rvl_clis_precedence() {
@@ -2333,7 +2333,7 @@ mod tests {
         // Honest statement of the mechanism, not a wish: scan_mode IS part
         // of the request body, so it moves the CLIENT-derived key. That is
         // exactly the poisoning the server-side canonical key (backend
-        // commit a40b6d8e, po-av01j.186/.189) exists to absorb: it re-derives a
+        // commit a40b6d8e, a tracked follow-up/.189) exists to absorb: it re-derives a
         // content identity with scanner_id, git_commit, git_branch,
         // scan_mode and idempotency_key excluded, and looks up on that key
         // first. So `--review` is safe to add to an existing invocation

@@ -31,7 +31,7 @@ rvl-index = { path = "../rvl-index" }
 rvl-structure = { path = "../rvl-structure" }
 rvl-emission = { path = "../rvl-emission" }
 serde = { workspace = true }
-# Repo-evidence scope classification (po-av01j.173): `toml` reads the hatch
+# Repo-evidence scope classification: `toml` reads the hatch
 # build-hook declaration out of pyproject.toml, `ignore` walks the tree the
 # way the config and content lanes do (gitignore-aware). Both already ship in
 # the workspace via rvl-config, so neither adds to the dependency surface.
@@ -39,7 +39,7 @@ toml = "0.8"
 ignore = "0.4"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-# Content-addressing for the embedded scripted retrievers (po-aml3h): the
+# Content-addressing for the embedded scripted retrievers: the
 # extracted copy is rewritten when its hash differs from the embedded text, so
 # a truncated or hand-edited helper heals instead of silently scanning wrong.
 sha2 = { workspace = true }
@@ -53,10 +53,10 @@ tempfile = "3"
 serde_json = { workspace = true }
 # Lets the CLI tests hold redb's exclusive index lock directly, so the
 # "index is busy" path is exercised deterministically instead of by racing
-# two processes (po-l3jo5).
+# two processes.
 rvl-index = { path = "../rvl-index" }
 
-# RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
+# RELEASE PACKAGING. A scan needs its retriever helpers, and before
 # this each of cindex/rustindex was its own dist "app" — its own archive, its
 # own Homebrew formula — so `brew install rvl` delivered the scanner and
 # none of the retrievers, and the first scan of a polyglot repo hard-failed.
@@ -64,7 +64,7 @@ rvl-index = { path = "../rvl-index" }
 # `binaries` names the bins THIS PACKAGE builds, and they all go in the same
 # archive — which is where resolution looks first (adjacent to the binary).
 #
-# WHY cindex/rustindex ARE BIN TARGETS OF *THIS* PACKAGE (po-av01j.154). This
+# WHY cindex/rustindex ARE BIN TARGETS OF *THIS* PACKAGE. This
 # key is a filter over the package's own bin targets, not a way to borrow
 # another package's. Listing helpers that lived in `crates/cindex` and
 # `crates/rustindex` let `dist plan` resolve and print an archive containing

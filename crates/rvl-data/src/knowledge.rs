@@ -1,7 +1,7 @@
 //! Slice (c): `knowledge` read commands ported from rvl-cli
 //! `internal/commands/knowledge.go`: `search`, `facts`, `procedures`,
-//! `patterns`, plus (po-av01j.160) `graph-search`, `foresight`, and
-//! `enrich`, plus (po-av01j.161) `relationships`, `graph`, and `health` —
+//! `patterns`, plus `graph-search`, `foresight`, and
+//! `enrich`, plus `relationships`, `graph`, and `health` —
 //! the full read surface is now ported.
 //!
 //! JSON parity: search/facts/patterns print the server body verbatim, as
@@ -194,7 +194,7 @@ pub enum KnowledgeCmd {
         /// health` takes no arguments at all and prints its fixed table, so
         /// `--format=json` there is silently ignored and exits 0. Rejecting
         /// it here would turn a working (if pointless) rvl-cli invocation
-        /// into exit 2 (po-av01j.185 item 8). There is no JSON rendering to
+        /// into exit 2 (a tracked follow-up item 8). There is no JSON rendering to
         /// select — rvl-cli has none either.
         #[arg(long)]
         format: Option<String>,
@@ -502,7 +502,7 @@ pub fn run(cmd: KnowledgeCmd) -> std::process::ExitCode {
                 min_class,
                 format,
             } => {
-                // EMPTY-FLAG SEMANTICS (po-av01j.192), from knowledge.go:
+                // EMPTY-FLAG SEMANTICS, from knowledge.go:
                 //  * --format: :413 guards ValidateFormat with `!= ""`, so
                 //    `--format=` renders the table (normalized below).
                 //  * --min-class: :372 switches on the raw value with no
@@ -918,7 +918,7 @@ pub fn procedures_output(
         .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
 
     // Raw-body short-circuit only when no client-side --control filter
-    // applies (po-x7pk0): the filter must run before the JSON is emitted.
+    // applies: the filter must run before the JSON is emitted.
     if format == Some("json") && control.is_none() {
         return Ok(format!("{}\n", String::from_utf8_lossy(&resp)));
     }
@@ -1156,7 +1156,7 @@ pub fn relationships_output(
     entity_id: &str,
     format: Option<&str>,
 ) -> CmdResult {
-    // po-4xrz5 (carried from rvl-cli): URL-encode the path segments so
+    // a tracked follow-up (carried from rvl-cli): URL-encode the path segments so
     // entity ids with /, ?, # don't smuggle.
     let url = format!(
         "{}/api/knowledge/entities/{}/{}/relationships",
@@ -1230,7 +1230,7 @@ pub fn graph_output(
     relation_type: Option<&str>,
 ) -> CmdResult {
     // rvl-cli builds this URL with fmt.Sprintf and — unlike relationships
-    // (po-4xrz5) — does NOT path-escape the entity segments or the
+    // — does NOT path-escape the entity segments or the
     // min_strength/relation_type values. Mirror that byte-for-byte.
     let mut url = format!(
         "{}/api/knowledge/entities/{entity_type}/{entity_id}/graph?max_depth={depth}&min_strength={min_strength}",
@@ -1378,7 +1378,7 @@ pub fn foresight_output(
         include_mitigations,
         relation_types,
     );
-    // po-8eld4 (carried from rvl-cli): foresight at depth>=3 walks a
+    // a tracked follow-up (carried from rvl-cli): foresight at depth>=3 walks a
     // meaningful slice of the knowledge graph and can take well beyond
     // the default 30s timeout on a populated KB. Give it a 5-minute
     // budget; the server itself caps depth at 7.
@@ -1474,7 +1474,7 @@ fn render_foresight(resp: &ForesightResponse, entity_type: &str, entity_id: &str
 /// parallel goroutines; sequential here keeps the same output and error
 /// semantics with a deterministic stderr order. Total fetch failure (e.g.
 /// expired API key) is a runtime error (exit 1); partial failure degrades
-/// to stderr warnings (po-cj4s7).
+/// to stderr warnings.
 pub fn enrich_output(
     client: &Client,
     vertical: &str,

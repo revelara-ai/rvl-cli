@@ -1,5 +1,5 @@
 //! Argo CD / Flux retriever: the GitOps family (6) of the G6 config lane
-//! (po-av01j.24), covering the deployment-excellence / GitOps-rollback slice
+//!, covering the deployment-excellence / GitOps-rollback slice
 //! of the G6 control set (RC-014/015/036/050 — granularity map §2 G6).
 //!
 //! Custom resources have no canonical path — an Application or HelmRelease
@@ -7,7 +7,7 @@
 //! [`ConfigRetriever::matches_head`] hook routes a YAML file here iff its
 //! head shows an apiVersion in the `argoproj.io` or `*.fluxcd.io` groups AND
 //! a kind this retriever parses. Generic Kubernetes manifests are NEVER
-//! claimed (they belong to the Kubernetes family, po-av01j.20); argo/flux
+//! claimed (they belong to the Kubernetes family, a tracked follow-up); argo/flux
 //! CRs of other kinds (Rollouts, Workflows, image automation, ...) are
 //! sighted identity-only by [`sight_unrecognized`] instead.
 //!
@@ -87,7 +87,7 @@ impl ConfigRetriever for ArgoFlux {
     /// Claim a YAML file iff its head shows an argo/flux apiVersion group
     /// paired with a kind this retriever parses. Generic Kubernetes
     /// manifests (any other group) are never claimed — the family boundary
-    /// with po-av01j.20.
+    /// with a tracked follow-up.
     fn matches_head(&self, rel_path: &str, head: &str) -> bool {
         if !(rel_path.ends_with(".yml") || rel_path.ends_with(".yaml")) {
             return false;
@@ -158,7 +158,7 @@ fn head_scan(head: &str) -> Vec<(String, String)> {
 /// Classify an argo/flux CR head as a product-identity sighting. Called by
 /// the walk's `sight_format` BEFORE the generic-kubernetes sniff, so an
 /// unrecognized Rollout or ImagePolicy is recorded under its product, never
-/// absorbed into the `kubernetes` bucket (the po-av01j.20 boundary works in
+/// absorbed into the `kubernetes` bucket (the a tracked follow-up boundary works in
 /// both directions). Returns `None` for anything outside the argo/flux
 /// apiVersion groups.
 pub(crate) fn sight_unrecognized(head: &str) -> Option<&'static str> {
@@ -621,7 +621,7 @@ mod tests {
         let r = ArgoFlux;
         assert!(r.matches_head("deploy/app.yaml", APP_HEAD));
         assert!(r.matches_head("clusters/prod/apps.yml", FLUX_KS_HEAD));
-        // The po-av01j.20 boundary: a generic Kubernetes manifest is NEVER
+        // The a tracked follow-up boundary: a generic Kubernetes manifest is NEVER
         // claimed, whatever its kind is called.
         assert!(!r.matches_head("k8s/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\n"));
         // A kustomize overlay is not a Flux Kustomization.

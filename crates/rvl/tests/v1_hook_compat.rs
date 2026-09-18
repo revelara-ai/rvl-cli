@@ -1,4 +1,4 @@
-//! THE UPGRADE PATH (po-av01j.191), end to end through git.
+//! THE UPGRADE PATH, end to end through git.
 //!
 //! rvl-cli v1's `hook install` wrote two shims into `.git/hooks`. The brew
 //! cask keeps the binary name `rvl`, so `brew upgrade` swaps the binary
@@ -29,14 +29,14 @@ fn combined(out: &std::process::Output) -> String {
 
 /// rvl-cli v1's pre-commit shim, verbatim.
 const V1_PRE_COMMIT: &str = "#!/bin/sh\n\
-     # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+     # Installed by `rvl hook install`: agent-scan git gate.\n\
      exec rvl scan --agent --staged --mode enforce\n";
 
 /// rvl-cli v1's pre-push shim, verbatim (including its stopgap warning).
 const V1_PRE_PUSH: &str = "#!/bin/sh\n\
-     # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+     # Installed by `rvl hook install`: agent-scan git gate.\n\
      # WARNING: pre-push stopgap. The real stdin ref protocol lands in\n\
-     # po-66evv.9 as `rvl scan --agent --pre-push`; swap it in when available.\n\
+     # a tracked follow-up as `rvl scan --agent --pre-push`; swap it in when available.\n\
      exec rvl scan --agent --changed-only\n";
 
 /// A fake AWS key, assembled so no key-shaped literal sits in this source.
@@ -46,7 +46,7 @@ fn planted_secret() -> String {
     format!("AWS_KEY = \"{}\"\n", ["AKIA", "ZZ3RVLQ7SG7JBX2Q"].concat())
 }
 
-/// Drop CI's OWN base-ref env from a child (po-av01j.194). This suite runs in
+/// Drop CI's OWN base-ref env from a child. This suite runs in
 /// GitHub Actions, where a `pull_request` event exports `GITHUB_BASE_REF`, and
 /// the v1 `--changed-only` alias now READS that chain — inherited, it would
 /// change which question these hooks ask between a laptop and CI. Hooks
@@ -302,7 +302,7 @@ fn a_v1_pre_push_shim_gates_the_pushed_range() {
     );
 }
 
-/// po-av01j.194 REVISITS THE .191 MAPPING. v1's bare `--changed-only`
+/// a tracked follow-up REVISITS THE .191 MAPPING. v1's bare `--changed-only`
 /// resolved a base ref and diffed `base...HEAD`; .191 could only map it to
 /// `--hook pre-push` because v2 had no chain to resolve against. Now it does,
 /// so in CI — where the chain IS populated — the same shim asks v1's actual
@@ -366,7 +366,7 @@ fn v1_mode_eval_reports_without_blocking() {
     f.install_v1_hook(
         "pre-commit",
         "#!/bin/sh\n\
-         # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+         # Installed by `rvl hook install`: agent-scan git gate.\n\
          exec rvl scan --agent --staged --mode eval\n",
     );
     let before = f.head();
@@ -404,7 +404,7 @@ fn bare_changed_only_without_the_v1_marker_keeps_its_error() {
 // --- install / doctor over a v1 shim ---
 
 /// `hook install` repairs OUR OWN PREDECESSOR's shim without `--force`, and
-/// keeps the replaced file. Refusing it (po-av01j.185 item 10) left the user
+/// keeps the replaced file. Refusing it (a tracked follow-up item 10) left the user
 /// with a repo they could not commit to and no way to fix it that the tool
 /// suggested.
 #[test]

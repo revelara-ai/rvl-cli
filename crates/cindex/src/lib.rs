@@ -1,6 +1,6 @@
 //! cindex — the C/C++ retriever helper for rvl.
 //!
-//! Engine (DECIDED, po-ae75b.9): the libclang C API, runtime-loaded via
+//! Engine (DECIDED, a tracked follow-up): the libclang C API, runtime-loaded via
 //! `clang-sys`'s `runtime` feature. LibTooling is the pre-registered escape
 //! valve and is NOT used. Release packaging vendors a pinned, checksummed
 //! LLVM; a dev build finds the system libclang (LIBCLANG_PATH overrides).
@@ -9,7 +9,7 @@
 //! says what the code is. See README.md for the packet contract, the
 //! compile-db rules, and the C/C++ typing tiers.
 //!
-//! WHY THIS IS A LIBRARY AND NOT A BINARY (po-av01j.154 release fix): the
+//! WHY THIS IS A LIBRARY AND NOT A BINARY (a tracked follow-up release fix): the
 //! `cindex` executable is a bin target of the `rvl` PACKAGE
 //! (`crates/rvl/src/bin/cindex.rs`), which is a one-line shim over [`run`].
 //! It has to live there because cargo-dist builds one app from one cargo

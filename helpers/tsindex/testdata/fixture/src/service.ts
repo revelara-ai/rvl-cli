@@ -30,7 +30,7 @@ export async function fetchProfile(id: number): Promise<any> {
 export async function cachedProfile(key: string): Promise<any> {
   // TWO client calls on ONE line, SAME method `get`, DIFFERENT client_type
   // (ioredis.Redis vs axios.AxiosStatic). site_key must keep both distinct by
-  // client_type. This is the po-3t3oj.15 uniqueness case.
+  // client_type. This is the a tracked follow-up uniqueness case.
   const combo = (await redis.get(key)) ?? (await axios.get(`/refresh/${key}`)).data;
   // axios instance (AxiosInstance) via axios.create() -- resolved external.
   const viaInstance = await api.get(`/profile/${key}`);

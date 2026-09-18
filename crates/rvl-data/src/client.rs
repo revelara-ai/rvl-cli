@@ -61,7 +61,7 @@ fn read_body(resp: ureq::Response) -> std::io::Result<Vec<u8>> {
 }
 
 /// The user-facing message for a non-2xx status, mirroring rvl-cli's
-/// `MakeAPIRequestWithTimeout` (po-l5nfr / po-cj4s7 / po-ug34g).
+/// `MakeAPIRequestWithTimeout` (a tracked follow-up / a tracked follow-up / a tracked follow-up).
 fn status_error(code: u16, body: &[u8]) -> String {
     match code {
         401 => format!(
@@ -181,7 +181,7 @@ pub fn validate_credentials(client: &Client) -> Result<(), String> {
     }
 }
 
-/// The org's known team slugs from `GET /api/v1/teams/slugs` (po-77b6w.1),
+/// The org's known team slugs from `GET /api/v1/teams/slugs`,
 /// consumed by the pre-submit did-you-mean. Best-effort by design: `None` on
 /// any failure (unreachable server, old server without the endpoint, auth
 /// problem) so callers skip the check instead of blocking a submission —

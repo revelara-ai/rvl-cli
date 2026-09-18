@@ -111,7 +111,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
     // abstain before the expectation is consulted and none of them can guess.
     //
     // `Present` IS THE EXCEPTION, and it is not a special case so much as the
-    // definition of the variant (po-av01j.143). It asks about AUTHORSHIP, not
+    // definition of the variant. It asks about AUTHORSHIP, not
     // about the effective value: "an EXPLICIT setting must be present in the
     // repo ... the control asks for an authored bound, and 'the platform picked
     // one for you' is the finding". Not knowing the external default is
@@ -352,7 +352,7 @@ mod tests {
         p
     }
 
-    // po-av01j.143. `Present` asks about AUTHORSHIP, so an out-of-repo default
+    // a tracked follow-up. `Present` asks about AUTHORSHIP, so an out-of-repo default
     // is not an obstacle to deciding -- it is the finding. Without this the
     // ratified job.permissions spec was inert: it abstained on precisely the
     // case it exists to catch and never fired once in six rounds.
@@ -393,10 +393,10 @@ mod tests {
     // An Unresolvable packet that DOES carry an authoring step keeps abstaining
     // even for `Present`: something in the repo set it, and what it resolves to
     // is genuinely unknown.
-    // po-av01j.129. "replicas >= 2" was unstatable: equals("1") is backwards
+    // a tracked follow-up. "replicas >= 2" was unstatable: equals("1") is backwards
     // because an expectation flags what does NOT match, and one_of enumerating
     // counts breaks outside the list. Authoring the class anyway produced the
-    // po-av01j.44 inversion, where a PodDisruptionBudget presence check PASSED
+    // a tracked follow-up inversion, where a PodDisruptionBudget presence check PASSED
     // the configuration that pins disruptionsAllowed at 0 forever.
     #[test]
     fn at_least_decides_both_ways_on_a_numeric_value() {

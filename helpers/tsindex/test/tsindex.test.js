@@ -57,7 +57,7 @@ test('retrieval emits records, each with schema and site_key', () => {
 });
 
 test('const_args carry literal and named-constant evidence; macro flag false', () => {
-  // Schema v2 (po-av01j.19): constant-valued arguments are evidence (the TS
+  // Schema v2: constant-valued arguments are evidence (the TS
   // pool-timeout precision fix was exactly this shape), and every site
   // carries the macro flag (false: TypeScript has no macros).
   const records = retrieveRecords();
@@ -137,7 +137,7 @@ test('axios and ioredis clients resolve high', () => {
 });
 
 test('two calls on one line with different client types get distinct keys', () => {
-  // po-3t3oj.15: file:line is NOT unique. The fixture puts redis.get and
+  // a tracked follow-up: file:line is NOT unique. The fixture puts redis.get and
   // axios.get on the SAME line, same method `get`, different client_type.
   const records = retrieveRecords();
   const byLine = {};
@@ -201,7 +201,7 @@ test('a repo with no node_modules anywhere still abstains', () => {
 });
 
 test('a chained LLM SDK call on a constructed client resolves and emits', () => {
-  // po-av01j.133.8: `const client = new OpenAI()` then
+  // a tracked follow-up.8: `const client = new OpenAI()` then
   // `client.chat.completions.create(...)`. The checker resolves the chained
   // receiver; the site was invisible because "create" was in neither method
   // allowlist. It rides the weak set, so only a RESOLVED receiver emits it.
@@ -239,7 +239,7 @@ test('construction of a resolved client is retrievable', () => {
 });
 
 test('background-job registrations carry site_kind', () => {
-  // G3 (po-av01j.4): scheduler/queue registrations ride the same packet
+  // G3: scheduler/queue registrations ride the same packet
   // stream marked site_kind="background_job"; classic call sites keep an
   // empty site_kind. Detection is type-driven through the checker.
   const records = retrieveRecords();
@@ -297,7 +297,7 @@ test('non-client noise is not emitted', () => {
 });
 
 test('server-entry registrations are inventoried and never leak into G1', () => {
-  // G2 (po-av01j.3): express route/middleware registrations and NestJS route
+  // G2: express route/middleware registrations and NestJS route
   // decorators emit as site_kind "server_entry" with the framework identity
   // as client_type and the route path riding const_args.
   const records = retrieveRecords();
@@ -359,7 +359,7 @@ test('--files restricts output to the listed file (exact path)', () => {
   assert.strictEqual(sites.length, 0);
 });
 
-// --- G4 emission packets (po-av01j.5) ---
+// --- G4 emission packets ---
 //
 // Emission points ride the same stream as AGGREGATES — one packet per
 // (enclosing function, framework, category), never one per log line — stamped
@@ -487,7 +487,7 @@ test('repo_config records timeout-ish constructions and skips no-timeout ones', 
 });
 
 // ---------------------------------------------------------------------------
-// client_type must never carry a filesystem path (po-av01j.115).
+// client_type must never carry a filesystem path.
 //
 // site_key is `file:line:client_type:method`, so anything machine-dependent in
 // client_type makes the key machine-dependent too: the same repo checked out at
@@ -560,7 +560,7 @@ test('no emitted client_type contains a filesystem path', () => {
 
 // ---------------------------------------------------------------------------
 // Resolving to an external package does not make a call a CLIENT call
-// (po-av01j.116).
+//.
 //
 // The old rule was "a resolved external client emits regardless of method
 // name". That holds for pg/axios/ioredis, and fails for pure-computation
@@ -593,7 +593,7 @@ test('awaitable client calls are still emitted', () => {
   }
 });
 
-// po-av01j.137: identical code yielded 30 sites named .ts and 0 named .js, with
+// a tracked follow-up: identical code yielded 30 sites named .ts and 0 named .js, with
 // no abstention and exit 0. Express/Node backends without TypeScript were
 // entirely invisible. Client types survive the rename because they come from
 // the DEPENDENCY's type declarations, not from annotations in the file.

@@ -2,7 +2,7 @@
 //! (fail-closed), and per-language precision as a Wilson 95% lower bound.
 //!
 //! Contract sources: rvlscan-eval gate-sets/README.md and
-//! docs/POPULATION_TEMPLATE.md (po-3t3oj.10), wayfinder po-ipkfg.1 / po-ipkfg.11.
+//! docs/POPULATION_TEMPLATE.md, wayfinder a tracked follow-up / a tracked follow-up.
 
 use crate::stats::wilson_lower_bound;
 use serde::Deserialize;
@@ -56,7 +56,7 @@ pub struct AdjudicationMeta {
     pub date: String,
 }
 
-/// A gate set retracted after minting (po-av01j.119).
+/// A gate set retracted after minting.
 ///
 /// A set can be mechanically well-formed and still not be evidence. eval-go-v1
 /// parsed, pinned four quarantined repos at frozen SHAs, and carried a properly
@@ -75,7 +75,7 @@ pub struct AdjudicationMeta {
 /// in the opposite direction. It can only ever refuse a set, never admit one,
 /// so forging it achieves nothing and forgetting it changes nothing that was
 /// previously true. That asymmetry is the whole reason it is safe here and the
-/// reason `gate_eligible` must NOT be added alongside it (po-av01j.120).
+/// reason `gate_eligible` must NOT be added alongside it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Withdrawal {
@@ -136,7 +136,7 @@ pub struct GoldRow {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The set carries a `withdrawn:` block: retracted after minting by a
-    /// human decision (po-av01j.119). Checked before everything else, because
+    /// human decision. Checked before everything else, because
     /// a withdrawn set is usually also wrong mechanically and the mechanical
     /// complaint invites fixing the symptom and re-running.
     Withdrawn { set_id: String, reason: String },
@@ -145,11 +145,11 @@ pub enum Refusal {
     /// `consumed: true` — single-use per version, never reset.
     Consumed(String),
     /// The consumption ledger already records this set, or this exact gold
-    /// under another name (po-av01j.89). Distinct from `Consumed`, which is
+    /// under another name. Distinct from `Consumed`, which is
     /// the manifest's self-declaration; this one is a fact the gate process
     /// wrote itself and therefore the one that can actually be trusted.
     AlreadyConsumed { set_id: String, reason: String },
-    /// sample_size below the n>=50 bar (po-ipkfg.1).
+    /// sample_size below the n>=50 bar.
     SampleTooSmall(usize),
     /// Quarantine registry missing or unreadable.
     RegistryUnavailable(String),
@@ -161,7 +161,7 @@ pub enum Refusal {
     /// A gate-set repo appears in the engine's grounding corpus.
     GroundingOverlap(String),
     /// The artifact under test declares a grounding manifest and the run was
-    /// handed a different one (po-av01j.90).
+    /// handed a different one.
     GroundingManifestMismatch {
         artifact: String,
         declared: String,
@@ -170,7 +170,7 @@ pub enum Refusal {
     /// Fewer decided adjudications than the manifest's sample_size claims.
     GoldTooSmall { decided: usize, required: usize },
     /// A gate set in a language whose retrieval depends on installed packages
-    /// pinned a commit but no dependency tree (po-av01j.117). The SHA alone
+    /// pinned a commit but no dependency tree. The SHA alone
     /// does not determine the packet stream, so the set is not reproducible.
     MissingDepsProvenance { repo: String, language: String },
 }
@@ -237,7 +237,7 @@ impl std::fmt::Display for Refusal {
 /// `getsentry/sentry`. The gate compared raw strings with exact byte equality,
 /// so a real pipeline manifest matched NOTHING and the overlap refusal --
 /// the fence that stops a gate repo that taught the engine -- silently found
-/// zero every time (po-av01j.90).
+/// zero every time.
 ///
 /// Keep this in step with the Python. Two normalizers that drift are worse
 /// than one that is wrong, because the drift is invisible until it admits
@@ -249,7 +249,7 @@ pub fn normalize_repo_id(s: &str) -> String {
 /// Parse a grounding manifest in either shape the ecosystem actually produces.
 ///
 /// `.txt`: one `owner/name` per line, `#` comments allowed. This is the
-/// hand-written form po-av01j.80 shipped.
+/// hand-written form a tracked follow-up shipped.
 ///
 /// `.json`: the collection pipeline's own manifest, an array of objects each
 /// carrying a `label`. This is the form an operator would honestly reach for,
@@ -270,7 +270,7 @@ pub fn parse_grounding_manifest(text: &str) -> Vec<String> {
         // `{ this is not json` into a junk "identity", which is non-empty,
         // which means the empty-manifest refusal never fires and the run
         // passes on a manifest nobody could read. That is fail-open path (b)
-        // from po-av01j.90 wearing a different hat.
+        // from a tracked follow-up wearing a different hat.
         return Vec::new();
     }
     text.lines()
@@ -320,7 +320,7 @@ pub fn parse_manifest(yaml: &str) -> anyhow::Result<GateManifest> {
 struct SeedSetEntry {
     name: String,
     /// Per-artifact grounding manifest (registry/seed_sets.yaml). Parsed away
-    /// and never read before po-av01j.90, so NOTHING bound the manifest an
+    /// and never read before a tracked follow-up, so NOTHING bound the manifest an
     /// operator passed on the command line to the artifact actually under
     /// test: you could hand the gate any manifest and it would be believed.
     #[serde(default)]
@@ -358,7 +358,7 @@ pub fn parse_seed_sets(yaml: &str) -> anyhow::Result<Vec<SeedSet>> {
 }
 
 /// Refuse when a designated artifact declares a grounding manifest and the run
-/// was handed a different one (po-av01j.90).
+/// was handed a different one.
 ///
 /// Without this the CLI-supplied manifest is unbound: the registry can say
 /// "artifact X was grounded by manifest Y" and the gate will happily check
@@ -461,7 +461,7 @@ pub fn load_gate_inputs(
     let grounding_repos: Vec<String> = parse_grounding_manifest(&read(grounding_manifest)?);
     // A manifest that yields NO identities is not "no overlap", it is no
     // evidence. Empty files, comment-only files, and JSON the reader could not
-    // understand all landed here as a silent pass before po-av01j.90; the
+    // understand all landed here as a silent pass before a tracked follow-up; the
     // overlap check is the fence that stops a gate repo which taught the
     // engine, so an unusable manifest must refuse.
     if grounding_repos.is_empty() {
@@ -591,7 +591,7 @@ pub struct GateScore {
 
 /// Score adjudicated gold rows straight off the file.
 ///
-/// DO NOT USE THIS AS A GATE (po-av01j.95). It computes the PANEL's
+/// DO NOT USE THIS AS A GATE. It computes the PANEL's
 /// confirmation rate on a static verdicts.jsonl: a correct number about
 /// whatever engine produced that file, and completely unchanged by any engine
 /// change afterwards. Wiring it to a gate meant the engine could regress and a
@@ -654,7 +654,7 @@ pub struct JoinedRow {
     pub engine: EngineSaid,
 }
 
-/// Engine-measured gate score (po-av01j.95).
+/// Engine-measured gate score.
 #[derive(Debug)]
 pub struct EngineGateScore {
     /// Gold rows the engine still flags AND the panel decided. The precision

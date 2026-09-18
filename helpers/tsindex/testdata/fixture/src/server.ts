@@ -1,4 +1,4 @@
-// G2 server-entry fixture (po-av01j.3): express route/middleware
+// G2 server-entry fixture: express route/middleware
 // registrations and NestJS route decorators. Registrations must emit as
 // site_kind "server_entry" and never as G1 client calls.
 import express from 'express';

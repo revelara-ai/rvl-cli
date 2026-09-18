@@ -11,7 +11,7 @@
 //!
 //!   * retrievers emit FACTS (config packets), never verdicts. A packet is a
 //!     RESOLVED VALUE plus the PROVENANCE CHAIN that produced it — which
-//!     file/overlay/default made the setting effective (wayfinder po-ae75b.1
+//!     file/overlay/default made the setting effective (wayfinder a tracked follow-up
 //!     design principle: "ship evidence, don't conclude").
 //!   * specs judge (format, key) identities once and apply everywhere
 //!     ([`rvl_spec::ConfigKeySpec`]); the verification lane in [`eval`]
@@ -24,7 +24,7 @@
 //!     machine, so a sighting is structurally incapable of carrying it.
 //!
 //! New formats (Kubernetes, Prometheus/sloth, dependency manifests,
-//! Terraform, Argo/Flux — po-av01j.20-.24) plug in by implementing
+//! Terraform, Argo/Flux — a tracked follow-up-.24) plug in by implementing
 //! [`ConfigRetriever`] and joining [`registry`].
 
 use serde::{Deserialize, Serialize};
@@ -41,14 +41,14 @@ pub mod terraform;
 
 /// The canonical rendering of a decidable authored ABSENCE: a key the
 /// committed file decidably lacks, where no platform default fills in
-/// (wayfinder po-av01j.24: an Application with automated sync but no retry).
+/// (wayfinder a tracked follow-up: an Application with automated sync but no retry).
 /// Such packets are `Resolution::AsAuthored` with this value, and the
 /// `configured` spec pattern judges them.
 pub const ABSENT_RENDERING: &str = "absent";
 
 /// How the effective value of a config key was produced, ordered by
 /// decreasing evidentiary strength. This is the packet's confidence marker
-/// (wayfinder po-ae75b.1 item 4: Helm renders stamp `rendered`; unresolvable
+/// (wayfinder a tracked follow-up item 4: Helm renders stamp `rendered`; unresolvable
 /// settings are an abstention class, never a guess).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,7 +232,7 @@ pub struct FormatSighting {
     pub file_count: usize,
     /// Whether a retriever for this format EXISTS. Both cases are "no retriever
     /// claimed these files", and they are very different statements to a reader
-    /// (po-av01j.136 defect 2).
+    /// (a tracked follow-up defect 2).
     ///
     /// false: nothing here handles the format at all. This is the AUTHORING
     /// QUEUE, prevalence-ranked -- the number means missing coverage.
@@ -402,7 +402,7 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
         return Some("kustomize");
     }
     // Dependency-manifest variants the dep-manifests retriever does not parse
-    // yet (family po-av01j.22): identity-only, pure basename, no read.
+    // yet (family a tracked follow-up): identity-only, pure basename, no read.
     match name {
         "pom.xml" => return Some("maven"),
         "build.gradle" | "build.gradle.kts" => return Some("gradle"),
@@ -419,7 +419,7 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
         // Argo/Flux CRs first: the recognized kinds route to the ArgoFlux
         // retriever via matches_head before sighting is ever consulted; the
         // rest classify by product here so the generic-kubernetes sniff
-        // below never absorbs them (the po-av01j.20 family boundary).
+        // below never absorbs them (the a tracked follow-up family boundary).
         if let Some(fmt) = argo_flux::sight_unrecognized(head) {
             return Some(fmt);
         }
@@ -428,7 +428,7 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
             // apiVersion + kind is NOT enough to call a file Kubernetes. Other
             // tools borrowed the convention wholesale, and on the dogfood repo
             // this labelled skaffold.yaml (apiVersion: skaffold/v3) as a
-            // Kubernetes manifest (po-av01j.136). Sightings are the authoring
+            // Kubernetes manifest. Sightings are the authoring
             // queue -- prevalence ranks which format to build vocabulary for
             // next -- so a miscounted identity misdirects real work.
             let api = api_version_value(head);
@@ -447,7 +447,7 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
             // The literal-YAML variants are claimed by the retriever before
             // sighting; what reaches here is a variant it declined. Helm/Go
             // templating is the known one (no rendering on the scan path —
-            // wayfinder po-ae75b.1), sighted under its own identity so
+            // wayfinder a tracked follow-up), sighted under its own identity so
             // prevalence can rank a future render lane.
             if prometheus::helm_templated(head) {
                 return Some("prometheus-rules-templated");
@@ -494,14 +494,14 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         }
     }
 
-    // Honor .gitignore (po-90lwe): the config lane was walking the whole tree
+    // Honor .gitignore: the config lane was walking the whole tree
     // and reporting findings from a gitignored nested worktree in a backend repo's
     // pre-commit output. The `ignore` walker applies .gitignore /
     // .git/info/exclude / parent ignores and treats a nested .git as its own
     // boundary. hidden(false) keeps .github and other non-ignored dotdirs in
     // scope; git_global(false) keeps output independent of whose machine ran
     // it. SKIP_DIRS stays as a belt-and-suspenders filter (vendor/.terraform
-    // are not always gitignored). Mirrors rvl-content::scan_root (po-lqbh2).
+    // are not always gitignored). Mirrors rvl-content::scan_root.
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
@@ -575,7 +575,7 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         );
     }
 
-    // Which sighted identities have a retriever behind them (po-av01j.136
+    // Which sighted identities have a retriever behind them (a tracked follow-up
     // defect 2). Three sources, in decreasing order of certainty: emitted BY a
     // retriever (recorded above, cannot be wrong), names a registered
     // format_id exactly, or is a known variant of a registered family.
@@ -661,7 +661,7 @@ mod tests {
         // retriever claimed. Adding a path/content-bearing field breaks this
         // test on purpose (same contract as ReportSurface).
         //
-        // `retriever_exists` was added by po-av01j.136 and is deliberately
+        // `retriever_exists` was added by a tracked follow-up and is deliberately
         // allowed: it is a boolean derived from THIS BINARY's retriever
         // registry, not from the scanned repo, so it cannot carry a path, a
         // file name, or any content. Anything carrying repo-derived text still
@@ -741,7 +741,7 @@ mod tests {
         assert_eq!(sight_format(".circleci/config.yml", ""), Some("circleci"));
         assert_eq!(sight_format(".travis.yml", ""), Some("travis-ci"));
         // Terraform graduated from a sighting to a supported format
-        // (po-av01j.23): .tf files route to the retriever, never here.
+        //: .tf files route to the retriever, never here.
         assert_eq!(sight_format("infra/main.tf", ""), None);
         assert_eq!(sight_format("deploy/chart/Chart.yaml", ""), Some("helm"));
         assert_eq!(
@@ -782,7 +782,7 @@ mod tests {
         );
         assert_eq!(sight_format("docs/notes.yaml", "a: b\n"), None);
         assert_eq!(sight_format("src/main.go", ""), None);
-        // po-av01j.136: apiVersion + kind is not enough. skaffold.yaml carries
+        // a tracked follow-up: apiVersion + kind is not enough. skaffold.yaml carries
         // both and is not a Kubernetes manifest; on the dogfood repo it was
         // counted as one, and sightings are the authoring queue.
         assert_eq!(
@@ -803,10 +803,10 @@ mod tests {
 
     #[test]
     fn retrieve_repo_skips_gitignored_config_files() {
-        // po-90lwe: the config lane walked the whole tree and reported findings
+        // a tracked follow-up: the config lane walked the whole tree and reported findings
         // from a gitignored nested worktree (.claude/worktrees/…) in a backend repo's
         // pre-commit hook output. It must honor .gitignore like the content
-        // lane (po-lqbh2), while still scanning non-ignored dotdirs (.github).
+        // lane, while still scanning non-ignored dotdirs (.github).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join(".git")).unwrap();
@@ -954,7 +954,7 @@ mod tests {
         )
         .unwrap();
         // A generic Kubernetes manifest: claimed by the kubernetes family
-        // (po-av01j.20) — packets, not a sighting.
+        // — packets, not a sighting.
         std::fs::write(
             root.join("deploy/web.yaml"),
             "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers: []\n",

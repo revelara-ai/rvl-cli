@@ -1,4 +1,4 @@
-//! End-to-end tests for `init` and `hook` (po-av01j.163), driven through
+//! End-to-end tests for `init` and `hook`, driven through
 //! the real binary. Only non-interactive paths (`-y`, flags) are
 //! exercised; interactive prompts are untested by design.
 
@@ -11,7 +11,7 @@ fn bin() -> Command {
 
 /// A PATH holding `git` and NOTHING else, shared by every test in this file.
 ///
-/// Harness detection reads PATH as well as HOME (po-av01j.193), so leaving
+/// Harness detection reads PATH as well as HOME, so leaving
 /// the developer's PATH in place makes these tests detect whichever coding
 /// agents that particular machine has installed — the suite would pass or
 /// fail by accident of the laptop. It cannot simply be empty either: `init`
@@ -63,7 +63,7 @@ fn init_cmd(dir: &Path) -> Command {
 }
 
 /// The exact `.revelara.yaml` rvl writes for a repo with no detected
-/// components (po-7p45k.19): the project itself is the service, so no
+/// components: the project itself is the service, so no
 /// root-component fallback is emitted.
 fn expected_yaml(name: &str) -> String {
     format!(
@@ -217,7 +217,7 @@ fn init_skip_plugin_skips_the_install_step() {
     );
 }
 
-// --- the REVELARA MANAGED BLOCK context files (po-av01j.163) ---
+// --- the REVELARA MANAGED BLOCK context files ---
 
 const BLOCK_START: &str = "<!-- BEGIN REVELARA MANAGED BLOCK - DO NOT EDIT -->";
 
@@ -480,7 +480,7 @@ fn init_writes_both_managed_blocks_once_skills_install() {
 
 /// `plugin install --no-context-files` says so and writes neither file
 /// (rvl-cli parity), and rvl-cli's `--all` spelling reaches the same sweep
-/// this binary spells by omitting the harness name (po-av01j.188).
+/// this binary spells by omitting the harness name.
 #[test]
 fn plugin_install_all_sweeps_and_no_context_files_suppresses_the_blocks() {
     let tmp = tempfile::tempdir().unwrap();
@@ -558,8 +558,8 @@ fn hook_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// An rvl-cli v1 shim is OUR OWN PREDECESSOR's gate, and after the cutover we
-/// know it is stale, so install REPAIRS it without `--force` (po-av01j.191);
-/// the replaced file is still backed up. po-av01j.185 item 10 refused it,
+/// know it is stale, so install REPAIRS it without `--force`;
+/// the replaced file is still backed up. a tracked follow-up item 10 refused it,
 /// reasoning that a v1 shim runs a different (coding-agent) gate — true of a
 /// v1 binary, void of this one, where `--agent` is a documented no-op.
 ///
@@ -570,7 +570,7 @@ fn hook_install_repairs_a_v1_agent_scan_hook_without_force() {
     git_init(tmp.path());
     let path = hook_path(tmp.path(), "pre-commit");
     let v1 = "#!/bin/sh\n\
-              # Installed by `rvl hook install` (po-66evv.8): agent-scan git gate.\n\
+              # Installed by `rvl hook install`: agent-scan git gate.\n\
               exec rvl scan --agent --staged --mode enforce\n";
     std::fs::write(&path, v1).unwrap();
 

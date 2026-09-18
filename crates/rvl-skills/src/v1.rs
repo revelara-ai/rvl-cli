@@ -28,7 +28,7 @@ pub struct V1PluginInfo {
 /// only that.
 ///
 /// rvl-cli also fell back to a pre-rename config directory. That fallback is
-/// NOT ported (user ruling 2026-08-15, po-av01j.185 item 9): pre-rename
+/// NOT ported (user ruling 2026-08-15, a tracked follow-up item 9): pre-rename
 /// config directories, project config files, and the pre-rename API URL
 /// self-heal are all dropped together, so a user still on one of them looks
 /// unauthenticated and re-runs login — a visible failure at the auth

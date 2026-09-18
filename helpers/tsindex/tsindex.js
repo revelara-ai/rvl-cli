@@ -36,7 +36,7 @@ const path = require('path');
 // The `typescript` package is this helper's PREREQUISITE, not part of it: the
 // script is embedded in the rvl binary and extracted to
 // ~/.revelara/helpers/<version>/, and the compiler is 9 MB that would have to
-// be carried for every target (po-aml3h). rvl points NODE_PATH at the
+// be carried for every target. rvl points NODE_PATH at the
 // scanned repository, so a project with its own `node_modules` needs nothing;
 // anything else gets ONE command rather than a raw module-resolution stack.
 //
@@ -147,7 +147,7 @@ const WEAK_IO_METHODS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// G3 background-job registration surfaces (po-av01j.4).
+// G3 background-job registration surfaces.
 //
 // Schedulers, cron registrations, dispatchers, and worker handler
 // registrations ride the SAME packet stream, marked
@@ -193,7 +193,7 @@ function isJobCtor(clientType) {
   return JOB_CTOR_TYPES.some((e) => clientType === e.pkg + '.' + e.type);
 }
 
-// G2 server-entry detection (po-av01j.3).
+// G2 server-entry detection.
 //
 // Server-entry sites (HTTP handler registrations, route definitions,
 // middleware attachments) ride the SAME packet stream, distinguished by the
@@ -677,7 +677,7 @@ function constructionFor(receiver, checker, root, relPathOf, isScanned) {
 }
 
 // ---------------------------------------------------------------------------
-// G4 emission-point inventory (po-av01j.5).
+// G4 emission-point inventory.
 //
 // Log statements, span/trace instrumentation, and error-handling sites ride
 // the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
@@ -823,7 +823,7 @@ const SKIP_DIRS = new Set([
 // source under root (skipping vendored/build dirs) is a root file with
 // conservative default options.
 //
-// JAVASCRIPT IS INCLUDED (po-av01j.137). It used to be excluded at two layers
+// JAVASCRIPT IS INCLUDED. It used to be excluded at two layers
 // at once -- discoverSources took only *.ts/*.tsx and allowJs was explicitly
 // false -- so identical code yielded 30 sites named .ts and 0 named .js, with
 // no abstention and exit 0. Express/Node backends without TypeScript were
@@ -890,7 +890,7 @@ function discoverSources(root) {
         if (!SKIP_DIRS.has(e.name)) stack.push(full);
       } else if (e.isFile()) {
         if (e.name.endsWith('.d.ts')) continue;
-        // JavaScript included (po-av01j.137): .js is the majority of the Node
+        // JavaScript included: .js is the majority of the Node
         // ecosystem, and excluding it made those repos silently unscanned.
         if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(e.name)) out.push(full);
       }
@@ -977,7 +977,7 @@ function runRetrieve(root, snapshot, filesArg) {
         ts.isCallExpression(node) &&
         ts.isPropertyAccessExpression(node.expression)
       ) {
-        // G4 (po-av01j.5): emission calls are aggregated per (function,
+        // G4: emission calls are aggregated per (function,
         // framework, category) and routed OUT of the G1 site list; anything
         // else falls through to the ordinary call-site retrieval.
         const prop = node.expression;
@@ -1406,7 +1406,7 @@ function nestRouteRecords(node, sf, relPath, snapshot, checker) {
 // discards whatever process.stdout.write() has buffered, and on a PIPE (how
 // rvl captures the helper via std::process .output()) large writes buffer
 // heavily -- so an async write + process.exit truncates the tail
-// nondeterministically (po-3t3oj.37: identical scans returned 14k/5k/2k/463
+// nondeterministically (a tracked follow-up: identical scans returned 14k/5k/2k/463
 // sites). A blocking fd write with an EAGAIN retry loop cannot be truncated:
 // it does not return until the pipe has taken every byte.
 function writeStdoutSync(str) {
@@ -1480,7 +1480,7 @@ function parseArgs(argv) {
   return args;
 }
 
-// Workspaces that DECLARE dependencies but have none installed (po-av01j.132).
+// Workspaces that DECLARE dependencies but have none installed.
 //
 // Per workspace, not per repo: monorepos install per package, and the gate-set
 // contract already records that infisical has six workspaces where its layout
@@ -1559,7 +1559,7 @@ function main(argv) {
     const root = path.resolve(args.root);
     const snapshot = args.name || path.basename(root) || root;
 
-    // ABSTAIN ON AN UNINSTALLED DEPENDENCY TREE (po-av01j.132).
+    // ABSTAIN ON AN UNINSTALLED DEPENDENCY TREE.
     //
     // tsindex resolves client types through the TypeScript compiler, which
     // reads node_modules. Without it, resolution fails SILENTLY rather than
@@ -1576,7 +1576,7 @@ function main(argv) {
     //
     // Same charter as rustindex on an unloadable cargo workspace and goindex
     // with no module: abstain rather than guess. Exit 3 is the helper ABSTAIN
-    // code rvl reads (po-av01j.102), so it surfaces as a COVERAGE line.
+    // code rvl reads, so it surfaces as a COVERAGE line.
     const missing = missingDependencyTrees(root);
     if (missing.length > 0) {
       process.stderr.write(

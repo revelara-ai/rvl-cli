@@ -116,14 +116,14 @@ enum Cmd {
         /// Wilson-LB precision target.
         #[arg(long, default_value_t = 0.90)]
         target: f64,
-        /// Append-only single-use ledger (po-av01j.89). Defaults to
+        /// Append-only single-use ledger. Defaults to
         /// `consumed.jsonl` beside the gate-set directories, so one committed
         /// file covers every set. COMMIT IT: a ledger that lives only on the
         /// machine that ran the gate does not stop the next machine.
         #[arg(long)]
         ledger: Option<PathBuf>,
         /// Retriever packet stream for the pinned repos, retrieved AT the
-        /// manifest's frozen_sha (po-av01j.95). With this the gate measures the
+        /// manifest's frozen_sha. With this the gate measures the
         /// ENGINE; without it, it can only re-read the panel's static file.
         #[arg(long)]
         retrieved: Option<PathBuf>,
@@ -699,7 +699,7 @@ specs borrowed by method for {borrowed} rows",
                 manifest.adjudication.date
             );
 
-            // SINGLE-USE, ENFORCED (po-av01j.89). Recorded BEFORE scoring, on
+            // SINGLE-USE, ENFORCED. Recorded BEFORE scoring, on
             // purpose: consumption is the act of LOOKING at the gold, not the
             // act of liking what it says. Writing after would leave a failing
             // run unconsumed, which is the tune-and-retry loop that made the
@@ -736,7 +736,7 @@ specs borrowed by method for {borrowed} rows",
             }
             println!("  consumed: recorded in {}", ledger_path.display());
 
-            // MEASURE THE ENGINE, not the file (po-av01j.95). Without
+            // MEASURE THE ENGINE, not the file. Without
             // --retrieved/--specs the only thing available is the panel's
             // static confirmation rate, which is correct for whatever engine
             // produced verdicts.jsonl and unchanged by any engine change since.

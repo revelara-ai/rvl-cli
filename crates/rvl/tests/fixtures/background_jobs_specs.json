@@ -1,5 +1,5 @@
 {
-  "__comment": "SEED / test-grade spec fixtures for the G3 background-job lane (po-av01j.4): RC-060 background-process safety plus the job-altitude re-application of the existing timeout judgment (same machinery, new sites, declared via site_kinds). PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e tests exercise real verdicts, nothing more. The rq.Queue entry deliberately declares NO site_kinds: it is the classic-call-site control proving a G1 spec never decides a background_job site.",
+  "__comment": "SEED / test-grade spec fixtures for the G3 background-job lane: RC-060 background-process safety plus the job-altitude re-application of the existing timeout judgment (same machinery, new sites, declared via site_kinds). PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e tests exercise real verdicts, nothing more. The rq.Queue entry deliberately declares NO site_kinds: it is the classic-call-site control proving a G1 spec never decides a background_job site.",
   "apis": [
     {
       "type": "github.com/robfig/cron/v3.Cron",

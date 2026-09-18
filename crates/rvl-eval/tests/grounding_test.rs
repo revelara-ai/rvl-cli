@@ -1,4 +1,4 @@
-//! The grounding-overlap fence (po-av01j.90).
+//! The grounding-overlap fence.
 //!
 //! This refusal is what stops a gate set being scored against an engine that
 //! was TAUGHT by the same repos. It compared raw strings with exact byte
@@ -39,7 +39,7 @@ fn the_pipeline_json_manifest_is_understood() {
 
 #[test]
 fn the_hand_written_txt_manifest_still_works_and_is_normalized() {
-    // The form po-av01j.80 shipped must keep working, and must now normalize so
+    // The form a tracked follow-up shipped must keep working, and must now normalize so
     // it compares equal to the pin regardless of spelling.
     let txt = "# grounding corpus\ngo-gitea/gitea\n\nGetSentry/Sentry\n";
     let got = parse_grounding_manifest(txt);

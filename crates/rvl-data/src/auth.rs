@@ -7,7 +7,7 @@
 //! fails, then report CLI-update and installed-plugin drift.
 //!
 //! The update nag and the plugin section were briefly dropped in the port
-//! and restored in po-av01j.185: the v1 -> v2 cutover's P4 step relies on
+//! and restored in a tracked follow-up: the v1 -> v2 cutover's P4 step relies on
 //! the nag to move stragglers, and it is the ONLY signal a v1 holdout
 //! gets. The plugin section is rendered by the caller (`rvl`), which owns
 //! the skills machinery this crate deliberately does not depend on.

@@ -22,7 +22,7 @@ use crate::verify::safe_rel_path;
 /// `isEditorDetected`). Probing only the config directory misses every
 /// PATH-only harness — Codex has no config directory in rvl-cli's registry
 /// at all, so a machine with `codex` installed detected as *nothing*
-/// (po-av01j.193). PATH lives in the struct rather than being read at the
+///. PATH lives in the struct rather than being read at the
 /// probe site so tests can pin a synthetic PATH without mutating
 /// process-global environment state that parallel tests share.
 #[derive(Debug, Clone)]
@@ -940,7 +940,7 @@ pub struct Detection {
 
 impl Detection {
     /// A harness that left evidence on the machine and was still passed
-    /// over, with the reason. This silence is what made po-av01j.193
+    /// over, with the reason. This silence is what made a tracked follow-up
     /// invisible: the user sees "installed nothing" and no explanation.
     pub fn near_miss(&self) -> Option<String> {
         if self.detected || !(self.binary_on_path || self.config_dir_present) {
@@ -1038,7 +1038,7 @@ mod tests {
         );
     }
 
-    /// THE INVERSION, HALF ONE (po-av01j.193): rvl-cli detects Codex by its
+    /// THE INVERSION, HALF ONE: rvl-cli detects Codex by its
     /// binary alone (no `ConfigDir` in its registry), so a machine with
     /// `codex` on PATH and no `~/.codex` must install Codex. Probing only
     /// the config directory installed NOTHING here, with no error.
@@ -1226,7 +1226,7 @@ mod tests {
         assert!(env.has_binary("trae"));
     }
 
-    /// `--all` is an alias for the bare sweep (po-av01j.188), so both must
+    /// `--all` is an alias for the bare sweep, so both must
     /// resolve to the SAME set — which is only meaningful now that the set
     /// is computed the way rvl-cli computes it. One detection function
     /// backs both paths; this pins that there is no second code path to
@@ -1411,7 +1411,7 @@ mod tests {
 
     /// The registry must cover exactly rvl-cli's 22 editors: `plugin
     /// editors` prints the server's list, so any name missing here is a
-    /// target the CLI advertises and then refuses to install (po-av01j.162).
+    /// target the CLI advertises and then refuses to install.
     #[test]
     fn registry_covers_every_rvl_cli_editor() {
         let mut names = supported_names();

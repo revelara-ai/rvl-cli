@@ -1,5 +1,5 @@
-//! Two-condition comparison mode acceptance tests (po-3t3oj.1, skilleval
-//! contract from wayfinder po-ipkfg.15): per-repo x per-class table, explicit
+//! Two-condition comparison mode acceptance tests (a tracked follow-up, skilleval
+//! contract from wayfinder a tracked follow-up): per-repo x per-class table, explicit
 //! regression list, disagreement-site sampling, no lone scalar.
 
 use rvl_eval::compare::*;

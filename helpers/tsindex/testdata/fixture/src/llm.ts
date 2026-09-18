@@ -1,4 +1,4 @@
-// The po-av01j.133.8 shape: an SDK client in a module binding, invoked
+// The a tracked follow-up.8 shape: an SDK client in a module binding, invoked
 // through a CHAINED attribute path. The TypeChecker resolves the receiver
 // fine; the site was invisible because "create" was in neither method
 // allowlist, so the single most valuable surface (the LLM invocation) never

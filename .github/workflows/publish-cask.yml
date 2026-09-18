@@ -15,7 +15,7 @@ name: Publish Homebrew cask
 # cask urls carry.
 #
 # EXACTLY ONE REPO MAY PUBLISH THIS FILE. The Go rvl-cli repo published it via
-# goreleaser `homebrew_casks:` until po-av01j.154 removed that block. If it ever
+# goreleaser `homebrew_casks:` until a tracked follow-up removed that block. If it ever
 # comes back, the two repos race for the same path and the later release wins,
 # which is how a v1 security patch ends up downgrading everyone off v2.
 

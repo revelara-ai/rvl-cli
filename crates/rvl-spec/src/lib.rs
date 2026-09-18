@@ -52,7 +52,7 @@ pub enum Mechanism {
 }
 
 /// What the LIBRARY itself does when the caller passes no explicit bound
-/// (po-av01j.175).
+///.
 ///
 /// This is the one fact the engine can never derive from the user's code, and
 /// without it the scanner was asserting it anyway: every completed search with
@@ -87,7 +87,7 @@ pub enum DefaultBound {
 }
 
 /// WHY a call blocks: because bounding it was forgotten, or because waiting
-/// IS the job (po-av01j.180).
+/// IS the job.
 ///
 /// `blocking = yes` plus `bounded_by = [none]` conflates two situations a
 /// reader needs kept apart, and the corpus proves it: `requests.post` (an
@@ -236,7 +236,7 @@ pub struct ApiSpec {
     pub rationale: String,
     #[serde(default)]
     pub site_count: u32,
-    /// Which site kinds this spec governs (G3, po-av01j.4). Empty — every
+    /// Which site kinds this spec governs (G3, a tracked follow-up). Empty — every
     /// spec authored before site kinds existed — means the classic G1 client
     /// call site only (`Site::site_kind == ""`), so no existing spec silently
     /// widens onto job-registration sites. A spec that re-applies timeout/
@@ -245,7 +245,7 @@ pub struct ApiSpec {
     #[serde(default)]
     pub site_kinds: Vec<String>,
     /// Values of THIS API's call-argument timeout that mean "no bound"
-    /// (po-av01j.25). Library knowledge, so it lives in the spec and never in
+    ///. Library knowledge, so it lives in the spec and never in
     /// propagation: `requests.get(timeout=None)` blocks forever,
     /// `socket.settimeout(0)` is non-blocking rather than bounded,
     /// `CURLOPT_TIMEOUT 0` never times out, JDBC's `setQueryTimeout(0)` means
@@ -264,7 +264,7 @@ pub struct ApiSpec {
     #[serde(default)]
     pub unbounded_sentinels: Vec<String>,
     /// What this API does with NO explicit bound from the caller
-    /// (po-av01j.175). Serde-defaulted to [`DefaultBound::Unknown`]: every
+    ///. Serde-defaulted to [`DefaultBound::Unknown`]: every
     /// cache predating the field parses unchanged, and a cache carrying the
     /// field loads in a pre-.175 binary with the field ignored — additive in
     /// both directions, so the envelope schema version does not move.
@@ -275,7 +275,7 @@ pub struct ApiSpec {
     /// library behaviour nobody verified.
     #[serde(default)]
     pub default_bound: DefaultBound,
-    /// Whether blocking here is the POINT of the call (po-av01j.180).
+    /// Whether blocking here is the POINT of the call.
     /// Serde-defaulted to [`BlockingIntent::Incidental`]: every cache
     /// predating the field parses unchanged and keeps reporting exactly what
     /// it reports today, and a cache carrying the field loads in a pre-.180
@@ -351,7 +351,7 @@ pub enum Scope {
 /// unrecognised type returns `None` and never borrows another family's bound —
 /// a finding is left for a human rather than risk a cross-family false pass.
 /// (The more general design is an authorer-assigned family tag on the spec;
-/// this keyword classifier is the sound interim — see po-3t3oj.34.)
+/// this keyword classifier is the sound interim — see a tracked follow-up.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
     Database,
@@ -419,7 +419,7 @@ pub fn client_family(type_name: &str) -> Option<Family> {
     None
 }
 
-/// A G4 emission spec (po-av01j.5): what a matched emission aggregate MEANS
+/// A G4 emission spec: what a matched emission aggregate MEANS
 /// for an observability control. Like every spec, this is library/judgment
 /// knowledge kept out of the retrievers: the emitter reports "17 slog.Logger
 /// log calls in this function" and only a spec says that counts as error
@@ -466,7 +466,7 @@ pub struct EmissionSpec {
 /// `Timeout`, and an `http.Client{}` with no `Timeout` blocks forever. A spec
 /// that names the type and not the field therefore cannot be checked against a
 /// construction, and crediting it anyway is exactly how an empty client
-/// literal satisfied the timeout control (po-m2ill). Two fields close that
+/// literal satisfied the timeout control. Two fields close that
 /// gap, one per honest answer: `fields` names the field the bound lives in,
 /// and `default_bound` records that the library bounds the type on its own
 /// (`System.Net.Http.HttpClient` at 100s), so the bare type is the evidence.
@@ -586,13 +586,13 @@ pub enum ConfigExpect {
     /// 40-hex-char commit SHA, the action-pinning control).
     Pattern { name: String },
     /// The resolved value, parsed as a number, must be >= `value`
-    /// (po-av01j.129).
+    ///.
     ///
     /// WHY THIS EXISTS RATHER THAN one_of. "replicas >= 2" was previously
     /// unstatable: `equals("1")` is backwards, since an expectation flags what
     /// does NOT match and would fire on every correctly-sized workload, and
     /// `one_of(["2","3",...])` breaks at any count outside the list. Authoring
-    /// the class anyway produced the po-av01j.44 inversion, where a presence
+    /// the class anyway produced the a tracked follow-up inversion, where a presence
     /// check on a PodDisruptionBudget PASSED the exact configuration that pins
     /// disruptionsAllowed at 0 and blocks node drain forever.
     ///
@@ -645,7 +645,7 @@ pub const SERVER_KIND_RATE_LIMIT: &str = "rate_limit_middleware";
 /// a degraded-response path (RC-018, the G2 half).
 pub const SERVER_KIND_DEGRADED_RESPONSE: &str = "degraded_response";
 
-/// A spec for a control that rides the G2 server-entry lane (po-av01j.3).
+/// A spec for a control that rides the G2 server-entry lane.
 ///
 /// Unlike an [`ApiSpec`] (a question about one API), a server spec carries the
 /// JUDGEMENT patterns the server-entry evaluator matches against the
@@ -783,7 +783,7 @@ impl SpecCache {
     /// The apis section alone. `len()` sums every section, so a
     /// vocabulary-only artifact (scopes, config keys, emissions, no apis)
     /// reads as populated by it; the G1 call-site lane abstains on every
-    /// surface when THIS is zero (po-pqpry).
+    /// surface when THIS is zero.
     pub fn api_count(&self) -> usize {
         self.apis.len()
     }
@@ -821,7 +821,7 @@ impl SpecCache {
         // never displaces it. Under the plain confidence rule the shipped
         // `net/http.Client` spec at confidence 1 silently dropped an equal-
         // confidence declaration, so the operator's claim never reached the
-        // propagator (po-m2ill).
+        // propagator.
         for (k, v) in other.configs {
             match self.configs.get(&k) {
                 Some(existing) if existing.declared => {}
@@ -899,7 +899,7 @@ impl SpecCache {
     /// construction is nowhere near the call site, so per-site retrieval can
     /// never see it. This is the repo-level fact that closes the gap.
     ///
-    /// Deliberately conservative (soundness pin, po-3t3oj.30): `Agreed` only
+    /// Deliberately conservative (soundness pin, a tracked follow-up): `Agreed` only
     /// when every `this_client` whole/phase config in the repo agrees. If they
     /// conflict, this returns `Conflict` and the caller abstains rather than
     /// guessing which config governs a call — a false pass on a reliability
@@ -929,7 +929,7 @@ impl SpecCache {
             // A whole-call spec that names no bounding field cannot be
             // corroborated by any construction, so it is no basis for
             // broadening either; one that names fields is corroborated only
-            // by a construction that sets one of them (po-m2ill). A literal
+            // by a construction that sets one of them. A literal
             // that set only `Transport` is not a whole-call timeout.
             if spec.names_no_bounding_field()
                 || (!spec.fields.is_empty() && !c.fields.iter().any(|f| spec.fields.contains(f)))
@@ -983,7 +983,7 @@ pub fn spec_gate(spec: Option<&ApiSpec>) -> Option<(Verdict, String)> {
             Verdict::Abstain,
             format!("spec confidence {:.2} below {MIN_CONFIDENCE}", s.confidence),
         )),
-        // The call blocks, and blocking is the POINT of it (po-av01j.180).
+        // The call blocks, and blocking is the POINT of it.
         // Resolved as NotApplicable for the same reason `Blocking::No` is:
         // there is no bound to look for, so searching for one and then
         // reporting its absence describes nothing the reader can act on.
@@ -1137,7 +1137,7 @@ mod tests {
         );
     }
 
-    // --- config specs name their bounding fields (po-m2ill) ---
+    // --- config specs name their bounding fields ---
 
     #[test]
     fn config_spec_fields_default_to_empty_and_round_trip_when_set() {
@@ -1324,7 +1324,7 @@ mod tests {
         // plain higher-confidence rule the existing entry stays and the
         // declaration is silently dropped, so the operator's claim never
         // reaches the propagator and the site abstains on the bare spec it
-        // was declared to close (po-m2ill). A declaration is a policy
+        // was declared to close. A declaration is a policy
         // decision about the type as deployed, so it wins the merge outright.
         let mut base = cache_of(vec![cfg(Bounds::WholeCall, Scope::ThisClient, &[], false)]);
         let mut declared = cfg(Bounds::WholeCall, Scope::ThisClient, &[], true);
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn a_pre_sentinel_cache_parses_and_declares_nothing() {
-        // Compatibility (po-av01j.25): every cache in production predates the
+        // Compatibility: every cache in production predates the
         // field. It must parse, and the resulting spec must match NO value --
         // not "match leniently", not "match zero" -- so propagation's call-arg
         // mechanism is bit-for-bit what it was.
@@ -1439,7 +1439,7 @@ mod tests {
         }
     }
 
-    // --- default bounds: the library's own fallback (po-av01j.175) ---
+    // --- default bounds: the library's own fallback ---
 
     #[test]
     fn a_cache_without_the_default_bound_field_reads_as_unknown() {
@@ -1539,7 +1539,7 @@ mod tests {
         );
     }
 
-    // --- blocking intent: waiting as the contract (po-av01j.180) ---
+    // --- blocking intent: waiting as the contract ---
 
     /// Compatibility, direction one. Every cache in the fleet predates this
     /// field; each must parse and behave EXACTLY as it does today, which for
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn spec_applicability_defaults_to_classic_call_sites_only() {
-        // G3 (po-av01j.4): every existing spec was authored against G1 client
+        // G3: every existing spec was authored against G1 client
         // call sites. An undeclared site_kinds list must therefore keep the
         // spec scoped to classic sites — silently re-applying a call-site spec
         // to a background-job registration would multiply an unreviewed
@@ -1876,7 +1876,7 @@ mod tests {
 
     #[test]
     fn emission_specs_load_from_the_spec_file() {
-        // G4 (po-av01j.5): the spec file gains an additive `emissions` list.
+        // G4: the spec file gains an additive `emissions` list.
         // Old caches (no field) load with an empty list; a cache carrying
         // entries exposes them through the accessor and counts them in len().
         let text = r#"{
@@ -1950,7 +1950,7 @@ mod tests {
 
     #[test]
     fn server_specs_ride_the_spec_file_and_low_confidence_ones_are_ignored() {
-        // G2 (po-av01j.3): the controls that ride the server-entry lane
+        // G2: the controls that ride the server-entry lane
         // (RC-020 health checks, RC-069 rate limiting, RC-018 degraded
         // response) are spec-driven like everything else. A spec below the
         // confidence floor decides nothing — spec error is multiplied.
@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!(client_family("ioredis.Redis"), Some(Family::Cache));
     }
 
-    // --- section counts (po-pqpry) ---
+    // --- section counts ---
 
     /// `len()` sums every section, so a vocabulary-only artifact (scopes,
     /// config keys, emissions, and NO apis) reads as populated. The G1 lane

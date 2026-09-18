@@ -1,4 +1,4 @@
-//! G5 content-pattern retriever tests (po-av01j.6).
+//! G5 content-pattern retriever tests.
 //!
 //! Every planted token below is FAKE and assembled by string concatenation so
 //! no token-shaped literal ever sits whole in this source file (keeps secret
@@ -268,7 +268,7 @@ fn scan_root_is_deterministic_and_repo_relative() {
     );
 }
 
-// --- weak / default credentials (po-av01j.133.9) ---
+// --- weak / default credentials (a tracked follow-up.9) ---
 
 #[test]
 fn weak_shipped_credentials_are_found_despite_low_entropy() {
@@ -288,7 +288,7 @@ fn weak_shipped_credentials_are_found_despite_low_entropy() {
     }
 }
 
-// --- names are not credentials; expressions are not literals (po-av01j.172) --
+// --- names are not credentials; expressions are not literals --
 //
 // All six lines below are verbatim open-webui source that the lane reported as
 // secret findings. Every one of them is a NAME or an EXPRESSION.

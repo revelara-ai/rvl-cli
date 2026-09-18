@@ -69,7 +69,7 @@ pub fn run(cmd: IncidentCmd) -> std::process::ExitCode {
                 limit,
                 format,
             } => {
-                // EMPTY-FLAG SEMANTICS (po-av01j.192): incident.go:163 calls
+                // EMPTY-FLAG SEMANTICS: incident.go:163 calls
                 // ValidateFormat UNGUARDED — unlike control/evidence/knowledge,
                 // which wrap it in `if format != ""` — so `incident search
                 // --format=` is a usage error in rvl-cli. No normalization

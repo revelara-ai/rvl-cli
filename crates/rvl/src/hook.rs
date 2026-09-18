@@ -1,5 +1,5 @@
 //! `hook install` / `hook doctor` ported from rvl-cli
-//! `internal/commands/hook.go` (po-av01j.163): install the git-hook scan
+//! `internal/commands/hook.go`: install the git-hook scan
 //! gate and preflight it.
 //!
 //! The v2 hook invokes the NATIVE deterministic gate — `rvl scan .
@@ -7,7 +7,7 @@
 //! command. The binary name written into the script is [`rvl_data::BIN`],
 //! the same constant every other surface uses; it was hard-coded to the
 //! post-rename name while this installer waited on the cutover, and folded
-//! back into BIN when the cutover landed (po-av01j.154).
+//! back into BIN when the cutover landed.
 //!
 //! Install is lefthook-aware, like rvl-cli's: when a lefthook config is
 //! present it prints a ready-to-paste snippet instead of writing
@@ -38,14 +38,14 @@ const SHIM_MARKER: &str = "rvl scan";
 /// except a file we can prove WE wrote, which keeps re-running `hook install`
 /// idempotent without ever stomping a hook someone else authored.
 ///
-/// Three states, not two (po-av01j.191):
+/// Three states, not two:
 ///
 /// 1. this marker present — our CURRENT gate, refreshed in place;
 /// 2. [`compat::is_v1_shim`] — our OWN PREDECESSOR's gate, which we know is
 ///    stale, repaired in place, backed up, no `--force`;
 /// 3. anything else — foreign, refused without `--force`.
 ///
-/// po-av01j.185 item 10 put (2) in the foreign bucket, reasoning that a v1
+/// a tracked follow-up item 10 put (2) in the foreign bucket, reasoning that a v1
 /// shim runs `rvl scan --agent`, a coding-agent review, so rewriting it swaps
 /// one gate for a different one behind the user's back. That reasoning was
 /// right for a v1 binary and is void for this one: `--agent` here is a
@@ -220,7 +220,7 @@ fn write_hook_shim(hooks_dir: &Path, hook: &str, force: bool) -> anyhow::Result<
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         if !existing.contains(NATIVE_GATE_MARKER) {
             // Our own predecessor: known stale, and we authored it. Repair
-            // without demanding --force (po-av01j.191).
+            // without demanding --force.
             repaired_v1 = compat::is_v1_shim(&existing);
             let what = if existing.contains(SHIM_MARKER) {
                 " (it invokes a scan, but neither this binary's deterministic gate \
@@ -275,7 +275,7 @@ pub(crate) fn git_toplevel(dir: &Path) -> anyhow::Result<PathBuf> {
 /// A doctor check outcome (rvl-cli `checkStatus`).
 ///
 /// `pub(crate)` so `rvl doctor` can FOLD IN these checks rather than
-/// growing a second implementation of them (po-av01j.169): the hook state a
+/// growing a second implementation of them: the hook state a
 /// user needs is the same state whether they asked `hook doctor` or `doctor`,
 /// and two copies would disagree the first time one of them was edited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -416,7 +416,7 @@ pub(crate) fn doctor_checks(root: &Path, path_env: &str) -> Vec<Check> {
                             format!("installed but not executable; run chmod +x {}", p.display()),
                         ));
                     } else if compat::is_v1_shim(&body) {
-                        // NEVER PASS on a v1 shim (po-av01j.191). Before the
+                        // NEVER PASS on a v1 shim. Before the
                         // compatibility aliases landed this file could not run
                         // at all, and doctor called it healthy because
                         // SHIM_MARKER matched the bare literal `rvl scan`. It
@@ -536,7 +536,7 @@ mod tests {
     }
 
     /// A v1 rvl-cli shim is OUR OWN PREDECESSOR's gate, and we know it is
-    /// stale, so install repairs it WITHOUT `--force` (po-av01j.191). The old
+    /// stale, so install repairs it WITHOUT `--force`. The old
     /// file is still backed up, so nothing is destroyed.
     #[test]
     fn a_v1_shim_is_repaired_in_place_without_force() {
@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// doctor must never call a v1 shim healthy: that PASS is half of what
-    /// made po-av01j.191 severe rather than merely broken.
+    /// made a tracked follow-up severe rather than merely broken.
     #[test]
     fn doctor_names_a_v1_shim_instead_of_passing_it() {
         let tmp = git_repo();

@@ -1,5 +1,5 @@
 //! rust-analyzer discovery, pin verification, the workspace-load gate, and
-//! the `scip` invocation (wayfinder po-ae75b.8, binding).
+//! the `scip` invocation (wayfinder a tracked follow-up, binding).
 //!
 //! Pinning: the engine is a PINNED release of rust-analyzer, distributed as
 //! the rustup component matching the toolchain. Identity is enforced in
@@ -125,12 +125,12 @@ pub fn discover() -> anyhow::Result<RaIdentity> {
 /// ABSTAIN code instead of the generic error code. rvl degrades the Rust
 /// language and scans the rest of the repo on the first, and reports a broken
 /// toolchain on the second — and it can only tell them apart if this
-/// distinction survives the process boundary (po-av01j.102).
+/// distinction survives the process boundary.
 #[derive(Debug)]
 pub struct Abstain(pub String);
 
 /// A PREREQUISITE is missing: the tool rustindex drives is not installed
-/// (po-av01j.147). Distinct from an abstention -- there is nothing wrong with
+///. Distinct from an abstention -- there is nothing wrong with
 /// the tree, the machine simply is not set up -- and distinct from a failure,
 /// because the fix is an install command rather than a bug report. Shipping
 /// rustindex is necessary and not sufficient: it needs rust-analyzer, a rustup
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn a_tree_with_no_cargo_manifest_abstains_rather_than_erroring() {
-        // The reported case (po-av01j.102): the dogfood repo holds 1660 .go files and a
+        // The reported case: the dogfood repo holds 1660 .go files and a
         // single .rs test fixture, with no Cargo.toml anywhere. Declining is
         // correct; being INDISTINGUISHABLE from a broken toolchain is not,
         // because rvl uses that difference to decide whether to keep

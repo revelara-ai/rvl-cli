@@ -1,7 +1,7 @@
 //! `rvl stpa submit`, ported from rvl-cli `internal/commands/stpa.go`.
 //!
 //! This is the SOLE ingestion path for the shipped `stpa-review` skill
-//! (po-av01j.183): the skill writes a findings JSON file and runs
+//!: the skill writes a findings JSON file and runs
 //! `rvl stpa submit --file findings.json`. It is NOT substitutable by
 //! `scan --cs-file`, which carries only `control_structure` — losses, UCAs
 //! and loss scenarios have no other way in.
@@ -21,7 +21,7 @@
 //! the process still exits 0. Only a missing/unreadable/unparseable file or
 //! a config failure aborts.
 //!
-//! `stpa list-ucas` is ALSO ported (po-av01j.202), reversing the part of
+//! `stpa list-ucas` is ALSO ported, reversing the part of
 //! cutover decision 2 that had retired it. Decision 2 called it redundant
 //! because "STPA fields ride `risk context`"; measured against the live API
 //! that premise is false. `list-ucas` returns 137 UCAs with id, type, source,
@@ -343,7 +343,7 @@ fn goq(s: &str) -> String {
 
 pub fn run(cmd: StpaCmd) -> ExitCode {
     match cmd {
-        // EMPTY-FLAG SEMANTICS (po-av01j.192): stpa.go:152 rejects an empty
+        // EMPTY-FLAG SEMANTICS: stpa.go:152 rejects an empty
         // --file with "is required" (exit 2) — `submit` re-checks below, so
         // both spellings fail as in Go; stpa.go:194 guards --service with
         // `!= ""` and prints the same "[skip]" notice as omitting it.
@@ -356,7 +356,7 @@ pub fn run(cmd: StpaCmd) -> ExitCode {
                 }
             }
         }
-        // EMPTY-FLAG SEMANTICS (po-av01j.192): stpa.go:540/543/562 guard each
+        // EMPTY-FLAG SEMANTICS: stpa.go:540/543/562 guard each
         // filter with `!= ""`, so an empty value is the flag not being given;
         // stpa.go:524-530 runs `strconv.Atoi` on --limit and exits 2 when it
         // fails, which clap's typed range parse produces for free.

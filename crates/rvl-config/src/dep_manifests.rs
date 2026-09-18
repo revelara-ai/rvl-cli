@@ -1,5 +1,5 @@
 //! Dependency-manifest retriever: family (4) of the G6 config lane
-//! (po-av01j.22). One retriever, several manifest dialects — package.json,
+//!. One retriever, several manifest dialects — package.json,
 //! go.mod, Cargo.toml, pyproject.toml, requirements*.txt, Dockerfile — all
 //! emitting packets under the single format id `dep-manifests`, with the
 //! dialect embedded in the KEY (`package_json.engines.node`,
@@ -7,7 +7,7 @@
 //! key identity everywhere.
 //!
 //! ALTITUDE BOUNDARY (do not blur it): the G7 repo-structure lane
-//! (`rvl-structure`, po-av01j.7) owns STRUCTURAL dependency hygiene —
+//! (`rvl-structure`, a tracked follow-up) owns STRUCTURAL dependency hygiene —
 //! lockfile presence/consistency per manifest and the aggregate pin counts
 //! that feed its single RC-070 finding. This module emits NO
 //! lockfile-presence packets. It works at the config-SPEC altitude: per-KEY

@@ -1,4 +1,4 @@
-// Background-job surfaces (G3, po-av01j.4): scheduler registrations and a
+// Background-job surfaces (G3, a tracked follow-up): scheduler registrations and a
 // ticker-driven worker loop. One cron registration is bare (no bound
 // anywhere), one derives its own deadline inside the registered closure —
 // the pair the job-altitude timeout judgment must tell apart. They live in

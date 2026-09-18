@@ -531,7 +531,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// (file, line, rule) so output is deterministic.
 pub fn scan_root(root: &Path) -> Vec<ContentFinding> {
     let mut out = Vec::new();
-    // Honor .gitignore (po-lqbh2): a full-tree secret scan was blocking commits
+    // Honor .gitignore: a full-tree secret scan was blocking commits
     // on gitignored .env / debug material, which git never commits — a false
     // gate that reads as a scary leak on the first run. The `ignore` walker
     // applies .gitignore / .git/info/exclude / parent ignores and treats a
@@ -636,7 +636,7 @@ mod gitignore_tests {
 
     #[test]
     fn scan_root_skips_gitignored_files() {
-        // po-lqbh2: a full-tree scan was blocking on .env / debug secrets that
+        // a tracked follow-up: a full-tree scan was blocking on .env / debug secrets that
         // git deliberately ignores. scan_root must honor .gitignore so a
         // gitignored secret is not a false gate, while a TRACKED secret still
         // fires.

@@ -1,4 +1,4 @@
-//! G7 repo-structure retriever + evaluator (po-av01j.7).
+//! G7 repo-structure retriever + evaluator.
 //!
 //! Language-agnostic inventory of what a repository's SHAPE says about its
 //! testing and dependency hygiene: test-file conventions per ecosystem,

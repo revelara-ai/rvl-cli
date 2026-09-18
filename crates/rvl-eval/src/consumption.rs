@@ -1,4 +1,4 @@
-//! Single-use enforcement for gate sets (po-av01j.89).
+//! Single-use enforcement for gate sets.
 //!
 //! The gate manifest carries `consumed: bool`, documented "single-use per
 //! version, never reset", and the loader refuses on it. Nothing ever wrote it.

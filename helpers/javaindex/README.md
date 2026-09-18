@@ -10,7 +10,7 @@ decides nothing about reliability, it only says what the code is.
 
 ## Engine: the JDK's own javac Compiler Tree API, in source-file mode
 
-The deliberate, on-record engine choice (po-av01j.9): **javac's Compiler Tree
+The deliberate, on-record engine choice: **javac's Compiler Tree
 API** (`com.sun.source.*`, exported by the `jdk.compiler` module) driven
 through `ToolProvider.getSystemJavaCompiler()` — `JavacTask.parse()` +
 `analyze()`, `Trees` for positions and type mirrors. The helper is a single

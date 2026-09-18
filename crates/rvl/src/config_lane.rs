@@ -192,7 +192,7 @@ mod tests {
     // THE INVARIANT rule_phrase EXISTS FOR, pinned. A class is grouped by the
     // text before the first colon, so any VALUE appearing there fragments one
     // reader-facing class into one class per distinct value. Introduced by
-    // po-av01j.129's numeric bounds ("workload.replicas = 1 is below the
+    // a tracked follow-up's numeric bounds ("workload.replicas = 1 is below the
     // minimum of 2" has no colon at all) and caught by reading the ladder on a
     // real repo, not by any test.
     #[test]
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(f.disposition, "surface");
         assert_eq!(f.severity, "high");
         // Coverage: timeout resolved (violates IS a conclusion), and since
-        // po-av01j.143 the permissions packet resolves too -- `Present` asks
+        // a tracked follow-up the permissions packet resolves too -- `Present` asks
         // about authorship, so an unauthored key decides rather than abstaining
         // on an out-of-repo default it never needed. The unspecced packets
         // (concurrency, continue-on-error) still abstain by their lever.

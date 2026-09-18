@@ -335,7 +335,7 @@ mod tests {
         );
     }
 
-    /// CONTRACT LOCK (po-scnmv.16): for spec-lane findings, `class` IS the
+    /// CONTRACT LOCK: for spec-lane findings, `class` IS the
     /// producing spec's identity — `class_rule` = `client_type.method`, the
     /// same key waivers use. The server's precision arm attributes
     /// adjudicated false positives to specs through this field, so renaming

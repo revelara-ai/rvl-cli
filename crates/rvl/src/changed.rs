@@ -1,4 +1,4 @@
-//! WHERE THE CHANGED SET COMES FROM (po-sg7jb): git, and only git.
+//! WHERE THE CHANGED SET COMES FROM: git, and only git.
 //!
 //! `--changed-only` narrows the gate to "what this change touched". Until this
 //! module, that set was read off the scanner's own packet index — the files
@@ -37,7 +37,7 @@ pub enum Mode {
     /// `--hook pre-commit`: the staged paths. What is being committed.
     ///
     /// THE INDEX, NOT A BASE REF. This mode is deliberately untouched by the
-    /// base-ref chain (po-av01j.194): a pre-commit gate judges the content of
+    /// base-ref chain: a pre-commit gate judges the content of
     /// the commit being created, which exists nowhere but the index. Diffing
     /// it against a CI base branch would both miss staged work already on that
     /// branch's tip and drag in every commit made since branching — neither of
@@ -53,7 +53,7 @@ pub enum Mode {
     /// work on this branch since it diverged. rvl-cli's `--changed-only`
     /// question, and the ONLY one that answers correctly in a CI pull-request
     /// checkout, where the tree is clean and HEAD is the PR head
-    /// (po-av01j.194).
+    ///.
     BaseRange { base: String, source: String },
     /// `--changed-only` with no hook and no base ref anywhere: the working
     /// tree against HEAD. The honest answer to "what did this change touch" at
@@ -225,7 +225,7 @@ fn untracked(root: &Path) -> anyhow::Result<Vec<String>> {
 ///
 /// `--` terminates the revision arguments: placed the other way round git
 /// reads the range as a pathspec and the diff comes back SILENTLY EMPTY
-/// (rvl-cli po-t8acf). A leading dash is refused rather than handed to git.
+/// (rvl-cli a tracked follow-up). A leading dash is refused rather than handed to git.
 fn range_paths(root: &Path, base: &str, head: &str) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(
         !base.starts_with('-') && !head.starts_with('-'),
@@ -603,7 +603,7 @@ mod tests {
         assert!(err.contains("no upstream"), "got: {err}");
     }
 
-    // --- the CI base-ref range (po-av01j.194) ---
+    // --- the CI base-ref range ---
 
     /// The PR-checkout shape, synthesized exactly: a base branch, a feature
     /// branch with committed work, a CLEAN tree, and HEAD parked on the
@@ -626,7 +626,7 @@ mod tests {
         root
     }
 
-    /// THE BUG (po-av01j.194). In the environment the gate exists for — a CI
+    /// THE BUG. In the environment the gate exists for — a CI
     /// pull-request checkout — the working-tree question answers "nothing",
     /// because the tree is clean and HEAD is the PR head. Same repo, same
     /// commit, with a base ref: the PR's own files. One of these two answers

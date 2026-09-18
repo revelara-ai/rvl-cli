@@ -2,7 +2,7 @@ package main
 
 import "testing"
 
-// G2 (po-av01j.3): server-entry registrations are inventoried as sites
+// G2: server-entry registrations are inventoried as sites
 // stamped site_kind "server_entry", with the framework identity as
 // client_type and the literal route path riding const_args. They must never
 // leak into the G1 client-call lane, and G1 sites must never carry the kind.

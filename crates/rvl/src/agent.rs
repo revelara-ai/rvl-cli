@@ -1,7 +1,7 @@
-//! Hook-mode agent adjudication (po-av01j.15).
+//! Hook-mode agent adjudication.
 //!
-//! Amends the po-ipkfg.20 escape-hatch decision's "manual scans only" clause
-//! per its 2026-08-04 forward-amendment note and wayfinder po-ae75b.3 clause 2:
+//! Amends the a tracked follow-up escape-hatch decision's "manual scans only" clause
+//! per its 2026-08-04 forward-amendment note and wayfinder a tracked follow-up clause 2:
 //! a git hook run may delegate its DELTA-SCOPED UNDECIDED sites (median 0 /
 //! p95 <=3 per run) to the user's already-approved coding agent, under strict
 //! bounds. Everything else from the original decision stays in force:
@@ -121,7 +121,7 @@ struct RepoFile {
 #[serde(default)]
 struct ScannerAgentSection {
     /// "allow" | "deny" | absent. Absent is DENY: consent is a committed,
-    /// reviewable act, never a default (po-ipkfg.20 clause 6).
+    /// reviewable act, never a default (a tracked follow-up clause 6).
     use_agent: String,
     /// "gate" opts agent `violates` verdicts into the BLOCKING section.
     /// Absent/anything else = advisory (blocking stays deterministic-only).
@@ -204,7 +204,7 @@ pub fn load_org_force_deny() -> bool {
 
 /// The user's agent selection from `~/.revelara/config.yaml` (`agent:` key):
 /// "claude" | "copilot" | "auto" | absent (= auto). Names an INSTALLED agent
-/// only — no keys, no endpoints, ever (po-ipkfg.20 clause 6). Read with its
+/// only — no keys, no endpoints, ever (a tracked follow-up clause 6). Read with its
 /// own tolerant view so `shared_config`'s api_url/api_key security contract
 /// stays untouched.
 pub fn user_agent_selection() -> String {

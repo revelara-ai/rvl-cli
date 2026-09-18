@@ -1,5 +1,5 @@
 //! `compliance report`: the compliance readiness scorecard, ported from
-//! rvl-cli `internal/commands/report.go` (po-av01j.185 item 2).
+//! rvl-cli `internal/commands/report.go` (a tracked follow-up item 2).
 //!
 //! NAME COLLISION, RULED: rvl-cli spells this `rvl report`. This binary
 //! already uses `report` for the scan privacy-payload preview — a

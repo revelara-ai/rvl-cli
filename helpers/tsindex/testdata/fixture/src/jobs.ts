@@ -1,4 +1,4 @@
-// Background-job registration surfaces (G3, po-av01j.4): bullmq dispatches
+// Background-job registration surfaces (G3, a tracked follow-up): bullmq dispatches
 // (one bounded by a per-job timeout option, one bare), a bullmq Worker
 // handler registration, and a node-cron schedule. The untyped lookalike at
 // the bottom must NOT be kinded: detection is type-driven, abstain rather

@@ -1,4 +1,4 @@
-"""Background-job registration surfaces (G3, po-av01j.4).
+"""Background-job registration surfaces (G3, a tracked follow-up).
 
 Celery tasks (decorator idiom), an apscheduler cron registration, and an rq
 dispatcher + worker loop. One celery task carries a time_limit (bounded), one

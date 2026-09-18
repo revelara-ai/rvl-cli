@@ -162,7 +162,7 @@ class JavaIndex {
             "iterator", "stream", "forEach", "wait", "notify", "notifyAll"));
 
     // -----------------------------------------------------------------------
-    // G2 server-entry surfaces (po-av01j.3 conventions).
+    // G2 server-entry surfaces (a tracked follow-up conventions).
     // Call-form registrations, keyed on the resolved/attributed receiver FQN.
     // -----------------------------------------------------------------------
     static final Map<String, Set<String>> SERVER_ENTRY_CALLS = new HashMap<>();
@@ -195,7 +195,7 @@ class JavaIndex {
     }
 
     // -----------------------------------------------------------------------
-    // G3 background-job surfaces (po-av01j.4 conventions).
+    // G3 background-job surfaces (a tracked follow-up conventions).
     // -----------------------------------------------------------------------
     static final Map<String, Set<String>> JOB_CALLS = new HashMap<>();
     static {
@@ -216,7 +216,7 @@ class JavaIndex {
     }
 
     // -----------------------------------------------------------------------
-    // G4 emission-point surfaces (po-av01j.5 conventions). Aggregates, one
+    // G4 emission-point surfaces (a tracked follow-up conventions). Aggregates, one
     // per (enclosing function, framework identity, category); a log emission
     // on an error path recategorizes to error_capture (the pyindex rule); a
     // catch clause with no recognized emission and no throw aggregates under

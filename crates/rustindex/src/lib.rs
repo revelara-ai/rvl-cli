@@ -1,6 +1,6 @@
-//! rustindex — the Rust retriever helper (po-av01j.11).
+//! rustindex — the Rust retriever helper.
 //!
-//! Wraps the pinned rust-analyzer `scip` CLI (wayfinder po-ae75b.8, binding):
+//! Wraps the pinned rust-analyzer `scip` CLI (wayfinder a tracked follow-up, binding):
 //! SCIP protobuf in, versioned Site packets out, with source re-read for
 //! snippets. Retrieval only: this helper decides nothing about reliability.
 //!

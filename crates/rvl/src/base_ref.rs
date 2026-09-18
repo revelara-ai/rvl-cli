@@ -1,4 +1,4 @@
-//! THE CI BASE-REF CHAIN (po-av01j.194), ported from rvl-cli
+//! THE CI BASE-REF CHAIN, ported from rvl-cli
 //! `internal/scanner/wire.go` (`ResolveBaseRef`, `FormatNoBaseRefDiagnostic`).
 //!
 //! WHAT WAS BROKEN. `--changed-only` outside a hook asked the working-tree
@@ -10,7 +10,7 @@
 //! never had that hole because it never asked that question: it resolved a
 //! BASE REF from flags, env and repo config, diffed `base...HEAD`, and REFUSED
 //! LOUDLY when no base ref was reachable. A loud failure had become a silent
-//! pass — the same shape as po-av01j.182's force-next no-op.
+//! pass — the same shape as a tracked follow-up's force-next no-op.
 //!
 //! THE CHAIN, in rvl-cli's actual precedence order (read off wire.go, not
 //! inferred from the help text):
@@ -280,7 +280,7 @@ fn in_work_tree(root: &Path) -> bool {
 
 /// Does `git_ref` name a commit in this clone? `^{commit}` so a tag or a tree
 /// cannot pass for one, and a leading dash is refused outright rather than
-/// handed to git as an option (rvl-cli's po-t8acf argument-injection guard).
+/// handed to git as an option (rvl-cli's a tracked follow-up argument-injection guard).
 fn ref_reachable(root: &Path, git_ref: &str) -> bool {
     if git_ref.starts_with('-') {
         return false;
@@ -454,7 +454,7 @@ mod tests {
     }
 
     /// Argument injection: a value that begins with a dash is never handed to
-    /// git as an option (rvl-cli po-t8acf).
+    /// git as an option (rvl-cli a tracked follow-up).
     #[test]
     fn a_leading_dash_is_refused_rather_than_passed_to_git() {
         let dir = tempfile::tempdir().unwrap();

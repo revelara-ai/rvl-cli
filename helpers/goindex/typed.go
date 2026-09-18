@@ -93,7 +93,7 @@ func loadTyped(root string) (*typedIndex, error) {
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	// Load failure, no packages, and packages with no type information are the
-	// same fact at three depths: nothing was analysed (po-av01j.209). Reporting
+	// same fact at three depths: nothing was analysed. Reporting
 	// any of them as an empty index would let the caller emit an empty stream
 	// and exit 0.
 	if err != nil {
@@ -280,7 +280,7 @@ func runTyped(root, name string) ([]Site, error) {
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	// This arm returned nil with no message at all -- an even quieter version
-	// of the same defect (po-av01j.209).
+	// of the same defect.
 	if err != nil {
 		return nil, fmt.Errorf("go/packages could not re-load %s: %w", root, err)
 	}

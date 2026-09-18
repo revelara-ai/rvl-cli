@@ -1,5 +1,5 @@
 //! `feedback` / `bugreport`, ported from rvl-cli
-//! `internal/commands/feedback.go` (po-nmkeg): users AND coding agents can
+//! `internal/commands/feedback.go`: users AND coding agents can
 //! file feedback or bug reports from the CLI, with a shape-only diagnostic
 //! bundle attached.
 //!
@@ -133,7 +133,7 @@ fn usage_failure(err: &str, help_cmd: &str) -> Failure {
 /// Resolve clap-parsed flags to options, mirroring `parseFeedbackArgs`:
 /// same defaults, same invalid `--attach-diagnostics` error.
 ///
-/// EMPTY-FLAG SEMANTICS (po-av01j.192): every flag here is `Empty::Error`,
+/// EMPTY-FLAG SEMANTICS: every flag here is `Empty::Error`,
 /// so NOTHING is normalized away — the empty string has to reach the checks
 /// below. feedback.go:195 requires a non-blank `--message`; :198 rejects a
 /// `--category` outside {feedback,bug}, and an empty value REPLACES the

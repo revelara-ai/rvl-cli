@@ -97,7 +97,7 @@ STRONG_IO_METHODS = frozenset({
 WEAK_IO_METHODS = frozenset({
     # ambiguous with builtin containers -- require a resolved receiver
     "get", "send", "connect", "call", "run", "query", "invoke", "read", "write",
-    # LLM SDK verbs (po-av01j.133.8). All ambiguous in isolation ("create" is
+    # LLM SDK verbs (a tracked follow-up.8). All ambiguous in isolation ("create" is
     # every ORM and factory), so they ride the weak set: only a receiver that
     # RESOLVED to a constructed client emits. openai/anthropic
     # (...completions.create / messages.create), google.genai
@@ -117,7 +117,7 @@ def _is_io_method(method, resolved):
 
 
 # ---------------------------------------------------------------------------
-# G3 background-job registration surfaces (po-av01j.4).
+# G3 background-job registration surfaces.
 #
 # Schedulers, cron registrations, dispatchers, and worker loops ride the SAME
 # packet stream, marked site_kind="background_job". Like the I/O-method
@@ -182,7 +182,7 @@ def _job_decorator(idx, dec):
         if dotted in JOB_DECORATOR_IMPORTS:
             return JOB_DECORATOR_IMPORTS[dotted]
     return None
-# G2 server-entry detection (po-av01j.3).
+# G2 server-entry detection.
 #
 # Server-entry sites (HTTP handler registrations, route definitions,
 # middleware attachments) ride the SAME packet stream, distinguished by the
@@ -465,7 +465,7 @@ class FileIndex:
             # A chain hanging off a constructed LOCAL: `client.chat.completions`
             # where `client = OpenAI(...)`. This is the shape every modern LLM
             # SDK call takes (openai, anthropic, boto3, google.genai), and it
-            # was invisible (po-av01j.133.8): the root is a variable, not an
+            # was invisible (a tracked follow-up.8): the root is a variable, not an
             # import, so the imports lookup below never matched and ambiguous
             # methods like `create` were then dropped for being unresolved.
             # Same precedence as the bare-Name branch above: a local
@@ -533,7 +533,7 @@ def _const_args(call, idx):
 
 
 # ---------------------------------------------------------------------------
-# G4 emission-point inventory (po-av01j.5).
+# G4 emission-point inventory.
 #
 # Log statements, span/trace instrumentation, and error-handling sites ride
 # the SAME packet stream, stamped site_kind: "emission_point". VOLUME CONTROL
@@ -719,7 +719,7 @@ def retrieve_file(abs_path, file_path, snapshot):
     None when the file could not be read or parsed.
 
     None vs [] is the distinction the retrieval_stats record carries
-    downstream (po-av01j.209): a file that FAILED is counted, never silently
+    downstream: a file that FAILED is counted, never silently
     collapsed into "parsed and empty"."""
     try:
         with open(abs_path, "r", encoding="utf-8") as fh:
@@ -842,7 +842,7 @@ def retrieve_file(abs_path, file_path, snapshot):
         }
         out.append(record)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
-    # G4 emission inventory rides the same stream (po-av01j.5).
+    # G4 emission inventory rides the same stream.
     out.extend(collect_emissions(tree, source, idx, enclosing, file_path, snapshot))
     return out
 
@@ -986,7 +986,7 @@ def run_retrieve(root, snapshot, files_arg):
 
 def emit_stats(snapshot, stats, n_sites, out=sys.stdout):
     """The repo-scoped record this helper writes on EVERY run, whether or not
-    any site matched (po-av01j.209).
+    any site matched.
 
     rvl's silent-zero guard keys on it: a stream with no record rvl recognizes
     means the helper never reached its own emit path -- it bailed early and
@@ -1047,7 +1047,7 @@ def main(argv=None):
         root = os.path.abspath(args.root)
         # A root that is not a directory is a caller error, not an empty repo.
         # os.walk on a missing path silently yields nothing, which used to
-        # read as "scanned, zero sites" -- the po-av01j.209 shape.
+        # read as "scanned, zero sites" -- the a tracked follow-up shape.
         if not os.path.isdir(root):
             print("pyindex: --root {} is not a directory".format(root),
                   file=sys.stderr)

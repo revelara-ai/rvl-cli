@@ -1,5 +1,5 @@
 {
-  "__comment": "SEED / test-grade C# spec corpus (po-av01j.10): RC-019 Network Timeout Enforcement and RC-022 Retry with Backoff at C# identities, plus the C# emission identities for the G4 lane and one job-altitude entry for G3. PRODUCTION corpus authoring rides the LLM factory and is HITL (gate-set mint bead under po-av01j) - these entries exist so the contract and e2e tests exercise real verdicts, nothing more. Identity convention: fully-qualified .NET type (namespace.Type), matching csindex's client_type emission.",
+  "__comment": "SEED / test-grade C# spec corpus: RC-019 Network Timeout Enforcement and RC-022 Retry with Backoff at C# identities, plus the C# emission identities for the G4 lane and one job-altitude entry for G3. PRODUCTION corpus authoring rides the LLM factory and is HITL (gate-set mint bead under a tracked follow-up) - these entries exist so the contract and e2e tests exercise real verdicts, nothing more. Identity convention: fully-qualified .NET type (namespace.Type), matching csindex's client_type emission.",
   "apis": [
     {
       "type": "System.Net.Http.HttpClient",
@@ -62,7 +62,7 @@
       "blocking": "yes",
       "bounded_by": ["call_arg"],
       "confidence": 0.9,
-      "rationale": "SEED RC-019: a gRPC call has NO default deadline and waits forever; the bound is a deadline in CallOptions at the call. DateTime.MaxValue is gRPC's spelling of 'no deadline', so a deadline argument set to it is the unbounded case wearing a bound's name (po-av01j.25)",
+      "rationale": "SEED RC-019: a gRPC call has NO default deadline and waits forever; the bound is a deadline in CallOptions at the call. DateTime.MaxValue is gRPC's spelling of 'no deadline', so a deadline argument set to it is the unbounded case wearing a bound's name",
       "unbounded_sentinels": ["DateTime.MaxValue"]
     },
     {

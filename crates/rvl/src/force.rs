@@ -16,7 +16,7 @@
 //! hook and leaves NO record: a force-through is written to the local audit
 //! trail.
 //!
-//! Why this file exists at all (po-av01j.182): v2 had neither mechanism, and
+//! Why this file exists at all: v2 had neither mechanism, and
 //! because `force-next` parsed as a PATH, `rvl scan force-next` scanned a
 //! directory of that name and printed "0 advisory - commit clean", exit 0. The
 //! documented safety valve reported success without bypassing anything — the

@@ -1,5 +1,5 @@
 {
-  "_comment": "G4 SEED emission-spec corpus (po-av01j.5): test-grade, hand-authored, sufficient for the per-language e2e tests. Covers RC-027 (centralized error monitoring: error paths that capture vs swallow), RC-046 (distributed tracing at I/O boundaries), and the emission half of RC-061 (LLM observability; the call-site half rides G1). PRODUCTION corpus authoring rides the LLM factory with human review - see the follow-up bead under po-av01j.",
+  "_comment": "G4 SEED emission-spec corpus: test-grade, hand-authored, sufficient for the per-language e2e tests. Covers RC-027 (centralized error monitoring: error paths that capture vs swallow), RC-046 (distributed tracing at I/O boundaries), and the emission half of RC-061 (LLM observability; the call-site half rides G1). PRODUCTION corpus authoring rides the LLM factory with human review - see the follow-up bead under a tracked follow-up.",
   "apis": [],
   "configs": [],
   "emissions": [

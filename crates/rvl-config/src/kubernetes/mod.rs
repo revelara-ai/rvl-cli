@@ -1,5 +1,5 @@
 //! Kubernetes manifests retriever: family (2) of the G6 config lane
-//! (wayfinder po-ae75b.1 format order, split out as po-av01j.20).
+//! (wayfinder a tracked follow-up format order, split out as a tracked follow-up).
 //!
 //! Three variants of one format, dispatched by what the walk hands us:
 //!
@@ -67,7 +67,7 @@ impl ConfigRetriever for Kubernetes {
     /// argo-flux retriever ahead of this one in the registry, and everything
     /// else falls back to `sight_format`, which classifies argo/flux
     /// products by group and the rest as a "kubernetes" sighting (the
-    /// po-av01j.24 family boundary, seen from this side).
+    /// a tracked follow-up family boundary, seen from this side).
     fn matches_head(&self, rel_path: &str, head: &str) -> bool {
         let is_yaml = rel_path.ends_with(".yml") || rel_path.ends_with(".yaml");
         let col0 = |k: &str| head.lines().any(|l| l.starts_with(k));
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn matches_head_declines_foreign_cr_groups_whole_file() {
-        // The po-av01j.24 boundary: argo/flux (and any third-party) CRs are
+        // The a tracked follow-up boundary: argo/flux (and any third-party) CRs are
         // never absorbed by the generic manifest sniff — declined files fall
         // to the walk's sight_format, which classifies them by product.
         let r = Kubernetes;

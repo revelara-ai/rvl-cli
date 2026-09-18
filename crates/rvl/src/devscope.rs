@@ -1,4 +1,4 @@
-//! What the REPOSITORY ITSELF says is build/dev tooling (po-av01j.173).
+//! What the REPOSITORY ITSELF says is build/dev tooling.
 //!
 //! `rvl_core::scope_of` classifies from the path and nothing else, so build
 //! tooling parked at the repo root reads as Runtime and the runtime-scoped

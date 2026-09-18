@@ -1,4 +1,4 @@
-//! Client-side finding normalization for scan submission (po-gli2z),
+//! Client-side finding normalization for scan submission,
 //! ported from rvl-cli `internal/commands/scan_normalize.go`.
 //!
 //! The STPA fields on scan findings (uca_type, causal_factors,

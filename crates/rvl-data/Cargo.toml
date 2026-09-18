@@ -13,7 +13,7 @@ rvl-core = { path = "../rvl-core" }
 clap = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
-# float_roundtrip (po-av01j.184): serde_json's default float parser is a
+# float_roundtrip: serde_json's default float parser is a
 # fast approximation that can land 1 ULP off the correctly-rounded value, so
 # `--format=json` rewrote 0.9500000000000003 as ...04 and scan submissions
 # shipped the corrupted number. Go's map[string]any decode uses

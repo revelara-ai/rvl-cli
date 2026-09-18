@@ -524,12 +524,12 @@ func main() {
 			snap = filepath.Base(abs2)
 		}
 		sites, modules, loadErr := runRetrieveAll(abs2, snap)
-		// ABSTAIN, never a silent zero (po-av01j.131). No module means goindex
+		// ABSTAIN, never a silent zero. No module means goindex
 		// had nothing to load, which is a different claim from "loaded the code
 		// and found no client calls". Returning an empty stream with exit 0 for
 		// both made a monorepo scan report Go as scanned and clean when Go was
 		// never looked at. Exit 3 is the helper ABSTAIN code rvl reads
-		// (po-av01j.102); rustindex already does this for an unloadable cargo
+		//; rustindex already does this for an unloadable cargo
 		// workspace and this is the same charter: no heuristic tier, abstain
 		// rather than guess.
 		if modules == 0 {
@@ -540,13 +540,13 @@ func main() {
 				abs2)
 			os.Exit(3)
 		}
-		// FAILURE, NOT AN EMPTY SCAN (po-av01j.209). A module exists and the
+		// FAILURE, NOT AN EMPTY SCAN. A module exists and the
 		// package graph could not be loaded -- the commonest cause by far being
 		// no `go` on PATH, which is the normal state of a lean CI image for a
 		// service whose own build happens in another stage. Exit 2 is the
 		// generic FAILED code rvl classifies as a degraded lane, which renders
 		// "NOT CLEAN" while leaving the commit's exit status at 0 (fail-open,
-		// ruled on po-av01j.199) and fails --strict for CI.
+		// ruled on a tracked follow-up) and fails --strict for CI.
 		//
 		// Deliberately NOT the abstain code 3: abstaining says "I could have
 		// looked and chose not to, and that is working as intended". Here
@@ -582,7 +582,7 @@ func main() {
 	if *typed {
 		var terr error
 		sites, terr = runTyped(abs, snapshot)
-		// Same rule as the retrieve path (po-av01j.209): a load that failed
+		// Same rule as the retrieve path: a load that failed
 		// must not leave the process at exit 0 with an empty stream, which a
 		// consumer cannot tell from a repo with no I/O in it.
 		if terr != nil {

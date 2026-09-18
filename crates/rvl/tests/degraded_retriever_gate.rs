@@ -1,4 +1,4 @@
-//! THE COMMIT GATE OVER A RETRIEVER THAT CANNOT RUN (po-av01j.199).
+//! THE COMMIT GATE OVER A RETRIEVER THAT CANNOT RUN.
 //!
 //! `rvl hook install` writes `rvl scan . --incremental --changed-only --hook
 //! pre-commit` into `.git/hooks/pre-commit`. On a machine with no `python3`,
@@ -235,7 +235,7 @@ fn a_commit_whose_only_retriever_cannot_run_is_never_called_clean() {
         "the verdict line must state that nothing was scanned:\n{all}"
     );
     // The incremental path must be at least as loud as the full path, which
-    // has rendered this since po-av01j.139.
+    // has rendered this since a tracked follow-up.
     assert!(
         all.contains("INCOMPLETE"),
         "the coverage block must say the call-site lane never ran:\n{all}"
@@ -330,7 +330,7 @@ fn strict_still_fails_closed_on_the_incremental_path() {
     );
 }
 
-/// po-av01j.198 MUST NOT REGRESS. A repo with no supported source at all is a
+/// a tracked follow-up MUST NOT REGRESS. A repo with no supported source at all is a
 /// different fact from a repo whose retriever is broken: there was nothing to
 /// scan, so "clean" is the honest word. Same fixture family, same hook, only
 /// the presence of source differs -- which is the whole distinction these two
@@ -398,7 +398,7 @@ fn a_repo_with_no_supported_source_still_reads_clean() {
     assert!(out.status.success(), "{all}");
     assert!(
         all.contains("commit clean"),
-        "nothing to scan is not the same as could not scan (po-av01j.198):\n{all}"
+        "nothing to scan is not the same as could not scan:\n{all}"
     );
     assert!(!all.contains("NOT CLEAN"), "{all}");
     assert!(!all.contains("INCOMPLETE"), "{all}");

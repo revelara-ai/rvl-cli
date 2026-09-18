@@ -1,4 +1,4 @@
-//! `.revelara.yaml` waiver/suppression engine (po-3t3oj.27).
+//! `.revelara.yaml` waiver/suppression engine.
 //!
 //! A faithful Rust port of rvl-cli's `internal/agentscan/waiver.go` matching
 //! and expiry engine, reading and writing the SAME on-disk file rvl-cli reads,
@@ -59,7 +59,7 @@ struct ScannerSection {
     bounds: Vec<DeclaredBound>,
 }
 
-/// One out-of-code bound declaration (po-3t3oj.30): a human assertion that a
+/// One out-of-code bound declaration: a human assertion that a
 /// client type's calls are bounded by something no retrieval can see
 /// (statement_timeout on the prod database, an infra-level deadline). Narrow
 /// by design: exact `client_type` only, `whole_call` only — a declaration is

@@ -18,7 +18,7 @@ and rejected for that reason.
 
 ## Engine: the libclang C API (pinned decision)
 
-Per the wayfinder engine decision (po-ae75b.9): the **libclang C API**,
+Per the wayfinder engine decision: the **libclang C API**,
 loaded at RUNTIME via `clang-sys`'s `runtime` feature. LibTooling is the
 pre-registered escape valve with a migration protocol and is deliberately NOT
 used.
@@ -55,7 +55,7 @@ generating the db is user-run tooling (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
   `retrieval_stats` record carries `tus_total` / `tus_parsed` / `tus_failed`,
   and coverage claims stop at what actually parsed.
 - Files not listed in the db are not scanned: the gate population for C/C++
-  is compile-db repos (expansion gate protocol, po-ae75b.2).
+  is compile-db repos (expansion gate protocol, a tracked follow-up).
 
 ### No-db fallback: the curated extern-C allowlist (low tier)
 

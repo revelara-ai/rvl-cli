@@ -1,5 +1,5 @@
 //! G2 server-entry lane: evaluate the server-entry inventory against the
-//! controls that ride it (po-av01j.3).
+//! controls that ride it.
 //!
 //! The typed retrievers inventory HTTP handler registrations, route
 //! definitions, and middleware-chain attachments as `Site` records stamped

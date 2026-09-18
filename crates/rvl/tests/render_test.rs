@@ -1,4 +1,4 @@
-//! Severity-ladder output acceptance tests (po-3t3oj.9).
+//! Severity-ladder output acceptance tests.
 
 // The render module is compiled into the binary crate; the integration test
 // exercises it through a thin re-export path is not available, so these unit
@@ -92,7 +92,7 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
     assert_eq!(classify(&u), Section::Advisory);
 }
 
-// --- the exit-code predicate (po-av01j.94) ---
+// --- the exit-code predicate ---
 
 /// Coverage is orthogonal to the blocking verdict; these tests don't assert on
 /// it, so one fully-resolved value serves.
@@ -545,7 +545,7 @@ fn explain_shows_named_incidents_control_and_fix() {
     );
 }
 
-// po-av01j.136 defect 2. One line saying "unsupported config formats" for both
+// a tracked follow-up defect 2. One line saying "unsupported config formats" for both
 // cases was actively misleading: on a Terraform repo it reported 109 Gatekeeper
 // policies as unsupported Kubernetes, in a run where the Kubernetes lane
 // resolved 288 settings. A supported format with nothing to retrieve is not a
@@ -617,7 +617,7 @@ fn a_category_with_no_sightings_prints_no_line() {
     );
 }
 
-// po-av01j.139. An empty G1 lane used to abort the whole scan with exit 1,
+// a tracked follow-up. An empty G1 lane used to abort the whole scan with exit 1,
 // "the scan could not complete". In hook mode that is the ORDINARY case: a
 // commit whose changed files carry no retrievable call site. The scan ran
 // fine; it had nothing to look at, and it must say so rather than either
@@ -676,7 +676,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
     );
 }
 
-// po-av01j.139, second half. Found on apache/airflow: the incremental pass
+// a tracked follow-up, second half. Found on apache/airflow: the incremental pass
 // degraded (pyindex failed on a 7690-file Python repo) and the coverage line
 // still read "no API call sites in scope -- nothing to resolve". There WERE
 // call sites; the retriever never got to them. Printing the two alike is the
@@ -709,7 +709,7 @@ fn an_empty_lane_with_no_degradation_still_reads_as_nothing_to_scan() {
     assert!(!out.contains("INCOMPLETE"), "{out}");
 }
 
-// po-av01j.199. The COVERAGE line above was fixed by .139; the FOOTER was not,
+// a tracked follow-up. The COVERAGE line above was fixed by .139; the FOOTER was not,
 // and the footer is the line a committer reads. A machine with no `python3`
 // got "call-site lane INCOMPLETE" three lines above a green
 // "0 advisory - commit clean", and passed an unbounded `requests.get`.
@@ -734,7 +734,7 @@ fn an_empty_lane_after_a_degraded_pass_does_not_render_the_clean_verdict() {
     );
 }
 
-// The genuinely empty scope (po-av01j.198) keeps its clean verdict: "nothing
+// The genuinely empty scope keeps its clean verdict: "nothing
 // to scan" and "could not scan" are opposite statements and this is the first.
 #[test]
 fn an_empty_lane_with_nothing_to_scan_keeps_the_clean_verdict() {
@@ -793,7 +793,7 @@ fn a_partial_pass_flags_that_coverage_describes_less_than_the_repo() {
     );
 }
 
-// po-av01j.128 / po-av01j.132. Silence must never be ambiguous. Before this, a
+// a tracked follow-up / a tracked follow-up. Silence must never be ambiguous. Before this, a
 // language that ran and found nothing, one whose helper declined, and one
 // nothing here can read all produced the same output: none. On a Rust repo with
 // four C files, cindex parsed all four and correctly found no I/O, and the
@@ -879,7 +879,7 @@ fn no_languages_seen_prints_no_roll_call() {
     assert!(!out.contains("languages:"), "{out}");
 }
 
-// po-av01j.140. Under --changed-only a repo-wide config finding in a file the
+// a tracked follow-up. Under --changed-only a repo-wide config finding in a file the
 // change never touched stays VISIBLE -- the whole-tree view is what makes the
 // config lane worth having -- but must not fail a commit that did not introduce
 // it. Scope the gate, not the report.
@@ -915,7 +915,7 @@ fn a_normal_high_severity_finding_still_blocks() {
     assert_eq!(blocking_count(&[f]), 1);
 }
 
-// po-av01j.147. A missing helper or toolchain is neither a failure nor an
+// a tracked follow-up. A missing helper or toolchain is neither a failure nor an
 // abstention: nothing crashed and nothing was declined, the machine is simply
 // not set up. The two ask opposite things of the reader -- a failure is a
 // defect to report, a missing prerequisite is a command to run -- so they must

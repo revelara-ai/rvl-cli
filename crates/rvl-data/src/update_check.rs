@@ -1,5 +1,5 @@
 //! The `status` CLI update check, ported from rvl-cli
-//! `internal/api.FetchLatestCLIVersion` (po-av01j.185 item 1).
+//! `internal/api.FetchLatestCLIVersion` (a tracked follow-up item 1).
 //!
 //! WHY THIS IS LOAD-BEARING: the v1 -> v2 cutover plan's P4 step chases
 //! stragglers off the Go CLI with exactly this nag, and the server-side
@@ -7,7 +7,7 @@
 //! the nag is the only thing that tells a holdout to move at all.
 //!
 //! Same release feed as rvl-cli, deliberately: after the repo-rename dance
-//! ruled on po-av01j.154 the Rust workspace IS `revelara-ai/rvl-cli`, so
+//! ruled on a tracked follow-up the Rust workspace IS `revelara-ai/rvl-cli`, so
 //! the URL, the cask URLs, and the git remotes all keep pointing at one
 //! place. Failure is always silent (`None`): an update hint is never worth
 //! failing `status` over.

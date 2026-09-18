@@ -1,4 +1,4 @@
-//! The scripted retrievers, carried INSIDE the rvl binary (po-aml3h).
+//! The scripted retrievers, carried INSIDE the rvl binary.
 //!
 //! `pyindex.py`, `tsindex.js` and `javaindex.java` are platform-independent
 //! TEXT — one build of rvl can carry them for every target it ships to —
@@ -80,7 +80,7 @@ pub fn cache_root() -> Option<PathBuf> {
 }
 
 /// Where a user's OWN build of a helper this binary does not carry is looked
-/// for, in order (po-aml3h follow-up).
+/// for, in order (a tracked follow-up follow-up).
 ///
 /// Naming a canonical location and then still demanding an env var pointing at
 /// it is two steps where one will do: if we tell someone to build csindex into

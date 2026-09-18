@@ -592,7 +592,7 @@ fn knowledge_facts_builds_sorted_query_and_passes_json_through() {
     assert_eq!(out, format!("{raw}\n"));
 }
 
-// --- slice (d): feedback / bugreport (po-av01j.158) ---
+// --- slice (d): feedback / bugreport ---
 
 fn sample_submission(category: &str) -> rvl_data::feedback::Submission {
     rvl_data::feedback::Submission {
@@ -934,7 +934,7 @@ fn knowledge_enrich_fetches_all_sections_with_go_shaped_urls() {
 #[test]
 fn knowledge_enrich_total_fetch_failure_is_a_runtime_error() {
     // Everything 404s: all three attempted fetches fail, so enrich must
-    // exit 1 with one Error line per fetch (po-cj4s7 parity).
+    // exit 1 with one Error line per fetch (a tracked follow-up parity).
     let server = MockServer::start(vec![]);
     let f = rvl_data::knowledge::enrich_output(
         &server.client(),
@@ -953,7 +953,7 @@ fn knowledge_enrich_total_fetch_failure_is_a_runtime_error() {
     assert!(lines[2].starts_with("Error: health:"), "{}", f.msg);
 }
 
-// --- slice (b/c) po-av01j.167: evidence + control scoping ---
+// --- slice (b/c) a tracked follow-up: evidence + control scoping ---
 
 #[test]
 fn evidence_submit_sends_team_and_service_and_renders_scope() {
@@ -1322,13 +1322,13 @@ fn control_show_scope_status_surfaces_the_server_hint_verbatim() {
         f.msg
     );
 }
-// --- slice (e): knowledge relationships / graph / health (po-av01j.161) ---
+// --- slice (e): knowledge relationships / graph / health ---
 
 #[test]
 fn knowledge_relationships_path_escapes_entities_and_renders_table() {
     let raw = r#"{"relationships":[{"id":"rel_1","relation_type":"causes","source_type":"fact","source_id":"fact a/b","source_label":"Redis timeout","target_type":"pattern","target_id":"pat_b2","target_label":"Retry storm","strength":0.8,"direction":"outbound","evidence":["INC-1234"],"observation_count":3}],"total":1}"#;
     let server = MockServer::start(vec![(
-        // Go url.PathEscape parity (po-4xrz5): space -> %20, slash -> %2F.
+        // Go url.PathEscape parity: space -> %20, slash -> %2F.
         "GET /api/knowledge/entities/fact/fact%20a%2Fb/relationships",
         200,
         raw,

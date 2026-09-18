@@ -134,7 +134,7 @@ const PacketSchema = 2
 // indistinguishable on the wire from a site whose language could not be
 // resolved — and a consumer that cannot tell those apart has to treat both as
 // unknown, so the language of every Go surface was silently unavailable
-// downstream (po-av01j.63).
+// downstream.
 const Lang = "go"
 
 // ConstArg is a constant-valued argument observed at the call site (schema
@@ -202,14 +202,14 @@ type RetrievedSite struct {
 	MacroExpansion bool `json:"macro_expansion"`
 	// SiteKind distinguishes what this record inventories. Empty = classic G1
 	// client-call site; "server_entry" = an HTTP handler/route/middleware
-	// registration (G2, po-av01j.3); "background_job" = a G3 scheduler/queue
-	// registration or worker-loop entry (po-av01j.4); "emission_point" = a G4
-	// emission aggregate (po-av01j.5). Additive default-carrying field within
+	// registration (G2, a tracked follow-up); "background_job" = a G3 scheduler/queue
+	// registration or worker-loop entry; "emission_point" = a G4
+	// emission aggregate. Additive default-carrying field within
 	// the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
 }
 
-// --- G3 background-job registration surfaces (po-av01j.4) ---
+// --- G3 background-job registration surfaces ---
 //
 // jobFrameworks lists the scheduler/queue surfaces whose registration calls
 // (and worker-loop entries) are emitted as background_job sites. Like
@@ -519,7 +519,7 @@ func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
 		Dir: moduleDir, Tests: false,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
-	// A LOAD THAT FAILED IS NOT A SCAN THAT FOUND NOTHING (po-av01j.209).
+	// A LOAD THAT FAILED IS NOT A SCAN THAT FOUND NOTHING.
 	// This arm used to print "load failed:" and return nil, and main then
 	// exited 0 -- so on a machine with no Go toolchain rvl recorded a
 	// SUCCESSFUL retrieval of zero sites, byte-identical to a genuinely empty
@@ -962,7 +962,7 @@ func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
 			}
 		}
 	}
-	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
+	// G4 emission inventory: aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)
 	return out, nil
@@ -1037,7 +1037,7 @@ func emitRepoConfig(rc RepoConfig) {
 	_ = json.NewEncoder(os.Stdout).Encode(rc)
 }
 
-// discoverModules returns the module roots to load under `root` (po-av01j.131).
+// discoverModules returns the module roots to load under `root`.
 //
 // goindex used to assume a module lived AT the scan root and load "./..." from
 // there. On a monorepo whose services each carry their own go.mod that finds
@@ -1081,7 +1081,7 @@ func discoverModules(root string) []string {
 }
 
 // runRetrieve loads every module under `root` and concatenates their sites
-// (po-av01j.131).
+//.
 //
 // Returns the module count alongside the sites so the caller can tell an
 // HONEST ZERO ("modules loaded, no client calls found") from an ABSTENTION
@@ -1097,7 +1097,7 @@ func runRetrieve(root, name string) []RetrievedSite {
 // failure encountered.
 //
 // One failing module of several is fatal to the whole run rather than dropped
-// (po-av01j.209). Emitting the modules that did load, as a success, would
+//. Emitting the modules that did load, as a success, would
 // report the failed module's code as scanned and clean -- the same
 // "nothing was scanned looks like nothing was wrong" collapse this returns an
 // error to prevent, just at monorepo granularity. Failing the LANE is not

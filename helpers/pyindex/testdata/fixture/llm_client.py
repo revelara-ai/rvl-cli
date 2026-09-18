@@ -1,4 +1,4 @@
-"""The po-av01j.133.8 shape: an SDK client held in a local variable, invoked
+"""The a tracked follow-up.8 shape: an SDK client held in a local variable, invoked
 through a CHAINED attribute path. mlflow's openai plugin emitted no site at
 all for exactly this — the receiver of `.create` is `client.chat.completions`,
 whose root is a local variable, not an import."""

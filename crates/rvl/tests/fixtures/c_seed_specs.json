@@ -1,5 +1,5 @@
 {
-  "_comment": "SEED / test-grade C/C++ G1 spec corpus (po-av01j.12): RC-019 timeout judgments at the C identities cindex emits. Hand-authored, sufficient for the e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review, and the C/C++ gate set (compile-db gate population) is minted HITL - see the gate-set bead under po-av01j. The CURLOPT_TIMEOUT-class enum discrimination rides schema-v2 const_args as retrieval evidence; consuming it in judgment (a setopt-with-CURLOPT_TIMEOUT bounding the handle's perform) is spec-factory work, deliberately not hand-coded here.",
+  "_comment": "SEED / test-grade C/C++ G1 spec corpus: RC-019 timeout judgments at the C identities cindex emits. Hand-authored, sufficient for the e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review, and the C/C++ gate set (compile-db gate population) is minted HITL - see the gate-set bead under a tracked follow-up. The CURLOPT_TIMEOUT-class enum discrimination rides schema-v2 const_args as retrieval evidence; consuming it in judgment (a setopt-with-CURLOPT_TIMEOUT bounding the handle's perform) is spec-factory work, deliberately not hand-coded here.",
   "apis": [
     {
       "type": "libcurl.CURL",

@@ -176,7 +176,7 @@ fn write_obj(out: &mut String, fields: &[(String, G)], depth: usize, indent: boo
 ///
 /// The coercion Go incurs is the *only* one allowed: `strconv.ParseFloat`
 /// is correctly rounded, so a literal that already round-trips comes back
-/// out unchanged. po-av01j.184: serde_json's default parser is a fast
+/// out unchanged. a tracked follow-up: serde_json's default parser is a fast
 /// approximation that can land 1 ULP off, which silently rewrote
 /// `0.9500000000000003` to `...04` on 23 of 54 risks. The crate enables
 /// serde_json's `float_roundtrip` feature to put the parse on the
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(fmt_go_f64(1e-6), "0.000001");
     }
 
-    /// po-av01j.184: `--format=json` is the scripted/agent surface, so a
+    /// a tracked follow-up: `--format=json` is the scripted/agent surface, so a
     /// float has to survive the server body -> serde_json -> Go-parity
     /// emitter round trip bit-for-bit.
     ///

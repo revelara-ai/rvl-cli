@@ -149,8 +149,8 @@ pub struct RiskDetail {
     #[serde(default)]
     pub narrative: String,
 
-    // Parity fields for the full `risk context` table (po-p3xur on the Go
-    // side, po-av01j.185 item 4 here). Additive and render-only: `show
+    // Parity fields for the full `risk context` table (a tracked follow-up on the Go
+    // side, a tracked follow-up item 4 here). Additive and render-only: `show
     // --format=json` still echoes the raw server body, so typing them here
     // narrows nothing.
     #[serde(default)]
@@ -295,7 +295,7 @@ pub struct CategoryCoverage {
     pub assessed: i64,
 }
 
-/// EMPTY-FLAG SEMANTICS (po-av01j.192): every field is destructured by name
+/// EMPTY-FLAG SEMANTICS: every field is destructured by name
 /// here — no `..` — so a flag added to `RiskCmd` later cannot reach the wire
 /// without its author deciding, at this site, what an empty value means. The
 /// decisions below are read off `internal/commands/risk.go`.
@@ -534,7 +534,7 @@ pub fn ready_output(
 }
 
 /// The `risk ready --format=json` body: the wrapped `{risks, total, page,
-/// limit}` shape rvl-cli emits (po-9a07e), byte-identical to Go's
+/// limit}` shape rvl-cli emits, byte-identical to Go's
 /// `json.MarshalIndent` — including the nil-slice-as-null behavior when no
 /// risk is applicable.
 pub fn ready_json(ready: &[&Risk], limit: usize) -> String {
@@ -723,7 +723,7 @@ pub fn context_output(client: &Client, code: &str, format: Option<&str>) -> CmdR
 
     let base = format!("{}/api/v1/risks/{}", client.api_url, path_escape(code));
 
-    // po-av01j.200: the three fetches run CONCURRENTLY, mirroring rvl-cli's
+    // a tracked follow-up: the three fetches run CONCURRENTLY, mirroring rvl-cli's
     // sync.WaitGroup (internal/commands/risk.go). This is load-bearing, not a
     // micro-optimization: `risk context` is the richest read in the CLI and the
     // command `/rvl:fix` runs to ground a remediation, so serializing three
@@ -852,7 +852,7 @@ fn coverage_g(c: &CoverageStats) -> G {
     G::Obj(f)
 }
 
-/// Human context view: the FULL rvl-cli render (po-av01j.185 item 4).
+/// Human context view: the FULL rvl-cli render (a tracked follow-up item 4).
 ///
 /// The first port shipped a 3-section summary here while `--format=json`
 /// stayed complete, so agents were unaffected and humans (and `/rvl:fix`)

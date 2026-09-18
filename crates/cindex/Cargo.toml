@@ -11,7 +11,7 @@ description = "C/C++ retriever helper for rvl (libclang C API, runtime-loaded)"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The engine pin (po-ae75b.9): the libclang C API, never LibTooling. The
+# The engine pin: the libclang C API, never LibTooling. The
 # `runtime` feature dlopens libclang at process start, so the WORKSPACE builds
 # on machines with no libclang installed; only running a retrieval needs the
 # library, and the helper fails closed with actionable guidance when it is
@@ -22,8 +22,8 @@ clang-sys = { version = "1.8", features = ["runtime", "clang_6_0"] }
 [dev-dependencies]
 tempfile = "3"
 
-# Not its own release app: cindex rides the rvl archive (po-aml3h). Since
-# po-av01j.154 this crate is a LIBRARY and the executable is a bin target of
+# Not its own release app: cindex rides the rvl archive. Since
+# a tracked follow-up this crate is a LIBRARY and the executable is a bin target of
 # the rvl package (crates/rvl/src/bin/cindex.rs) — dist can only pack a
 # package's own bins, so that is the only placement that puts the helper
 # beside `rvl` in the archive. Kept explicit anyway: a bin re-added here would

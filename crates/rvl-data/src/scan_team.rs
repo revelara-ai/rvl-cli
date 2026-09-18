@@ -1,5 +1,5 @@
 //! The team side of `scan`, ported from rvl-cli
-//! `internal/commands/scan_team.go` (po-77b6w.1, org-ownership spec
+//! `internal/commands/scan_team.go` (a tracked follow-up, org-ownership spec
 //! Decisions 1-2):
 //!
 //!   * [`apply_team_assignments`] carries `.revelara.yaml` `team:` values (repo

@@ -1,4 +1,4 @@
-// G4 emission fixture (po-av01j.5): log statements, span instrumentation,
+// G4 emission fixture: log statements, span instrumentation,
 // error-capture sites, and catch clauses that log, swallow, or re-throw.
 import { createLogger } from 'winston';
 import { trace } from '@opentelemetry/api';

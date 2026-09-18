@@ -1,6 +1,6 @@
 //! Incremental scan: a persistent per-repo packet index keyed by content
 //! hash, so a warm pre-commit scan re-retrieves only what actually changed
-//! (wayfinder po-ipkfg.14).
+//! (wayfinder a tracked follow-up).
 //!
 //! Two invariants shape this crate:
 //!
@@ -50,7 +50,7 @@ pub struct ReloadPlan {
 }
 
 /// Retrieval of packets for changed files. Implemented by the per-language
-/// helper binaries (po-3t3oj.16/.6/.17); the in-memory fake in tests keeps
+/// helper binaries (a tracked follow-up/.6/.17); the in-memory fake in tests keeps
 /// this crate honest until they exist.
 pub trait Retriever {
     fn retrieve(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<Site>>;
@@ -115,7 +115,7 @@ impl PacketIndex {
     /// Waiting matters most for the background warm: it is a batch job with
     /// nobody watching, and failing instantly because a status check held
     /// the lock for a few milliseconds throws away the whole reindex
-    /// (po-l3jo5).
+    ///.
     ///
     /// Only `DatabaseAlreadyOpen` is retried. A storage error or a required
     /// format upgrade will not resolve itself, and retrying one for a minute

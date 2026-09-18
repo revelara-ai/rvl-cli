@@ -1,4 +1,4 @@
-//! WHAT AN EMPTY FLAG VALUE MEANS, PER FLAG (po-av01j.192).
+//! WHAT AN EMPTY FLAG VALUE MEANS, PER FLAG.
 //!
 //! rvl-cli parses flags by hand. `--flag=` and (where the space form is
 //! accepted at all) `--flag ''` both hand the consumer an empty string, and
@@ -13,7 +13,7 @@
 //! * an unknown flag exits 2 whatever its spelling, so a TYPO written with a
 //!   trailing `=` (`--serivce=`) is still a usage error.
 //!
-//! po-av01j.185 tried to satisfy the first bullet for everyone at once by
+//! a tracked follow-up tried to satisfy the first bullet for everyone at once by
 //! stripping any `--x=` token from argv before clap saw it. That is the wrong
 //! layer: argv only knows the SHAPE of a token, so the strip also swallowed
 //! the numeric errors, the typos, and the values that were supposed to reach
@@ -68,7 +68,7 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("scan", "specs-file", Empty::Error),
     ("scan", "judgments", Empty::Error),
     ("scan", "out", Empty::Error),
-    // Added when po-av01j.185 and .191 merged in alongside .192; this table is
+    // Added when a tracked follow-up and .191 merged in alongside .192; this table is
     // what caught them. Each read off rvl-cli origin/main, not inferred:
     //
     // scan.go:667 `if csFile != ""` guards the read, so empty == not given.
@@ -89,7 +89,7 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("compliance report", "format", Empty::Absent),
     ("scan", "color", Empty::Absent),
     ("scan", "hook", Empty::Absent),
-    // po-av01j.194's `--base`. rvl-cli parses it two ways and BOTH end at
+    // a tracked follow-up's `--base`. rvl-cli parses it two ways and BOTH end at
     // `ResolveBaseRef`, whose first act is `strings.TrimSpace(cfg.FlagBaseRef)`
     // and whose chain treats `""` as "this link is unset" and walks on to
     // RVL_BASE_REF (wire.go:148/155-158). So `--base=` is not a request to
@@ -263,7 +263,7 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // stpa.go:194: an empty --service prints the same "[skip]" notice as
     // omitting it.
     ("stpa submit", "service", Empty::Absent),
-    // list-ucas, un-retired by po-av01j.202. All three string filters are
+    // list-ucas, un-retired by a tracked follow-up. All three string filters are
     // guarded before they reach the query or the client-side filter, so an
     // empty value is the flag not being given:
     //   stpa.go:540 `if source != ""`
@@ -273,7 +273,7 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("stpa list-ucas", "uca-type", Empty::Absent),
     ("stpa list-ucas", "control-code", Empty::Absent),
     // stpa.go:524-530 Atoi("") fails and exits 2 BEFORE any network call
-    // (po-cj4s7), which clap's typed range parse reproduces.
+    //, which clap's typed range parse reproduces.
     ("stpa list-ucas", "limit", Empty::Error),
 ];
 
@@ -446,7 +446,7 @@ mod tests {
     use crate::{Cli, Cmd};
     use clap::{CommandFactory, Parser};
 
-    /// THE GUARD AGAINST THIS CLASS COMING BACK (po-av01j.192): every
+    /// THE GUARD AGAINST THIS CLASS COMING BACK: every
     /// value-taking long flag in the whole command tree must have a declared
     /// empty-value rule. Adding `--foo` to any subcommand fails this test
     /// until its author reads the matching rvl-cli parser and writes the row
@@ -604,7 +604,7 @@ mod tests {
     }
 
     /// `risk list --limit=` must NOT quietly become the default (regression
-    /// (a) of po-av01j.192): rvl-cli exits 2 on Atoi("").
+    /// (a) of a tracked follow-up): rvl-cli exits 2 on Atoi("").
     #[test]
     fn empty_limit_is_rejected_rather_than_defaulted() {
         assert!(Cli::try_parse_from(["rvl", "risk", "list", "--limit="]).is_err());

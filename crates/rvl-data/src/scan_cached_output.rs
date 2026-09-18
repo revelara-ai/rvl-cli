@@ -1,5 +1,5 @@
 //! Cache-replay rendering for scan submissions, ported from rvl-cli
-//! `internal/commands/scan_cached_output.go` (po-72d5d).
+//! `internal/commands/scan_cached_output.go`.
 //!
 //! The Revelara API deduplicates scan submissions by `idempotency_key`. When
 //! the same scan parts and metadata are submitted twice inside the dedup

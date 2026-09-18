@@ -1,4 +1,4 @@
-//! Latency replay + triage-count gate metrics (po-3t3oj.1).
+//! Latency replay + triage-count gate metrics.
 //! Warm staged-diff p95 < 2s; hook delta-scoped triage counts median 0 / p95 <= 3.
 
 use rvl_eval::latency::*;

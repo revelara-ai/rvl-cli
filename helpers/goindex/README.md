@@ -21,7 +21,7 @@ Every emitted record carries:
 - `lang` — always `"go"`. Named the same way the sibling helpers name theirs
   (`"python"`, `"typescript"`, `"csharp"`, `"java"`, `"rust"`, `"c_cpp"`), and
   stamped in `encodeRetrieved` next to `packet_schema` and `site_key` so every
-  record kind carries it. Go emitted nothing here until po-av01j.63, which made
+  record kind carries it. Go emitted nothing here until a tracked follow-up, which made
   a Go site indistinguishable from one whose language could not be resolved —
   and a consumer that cannot tell those apart has to treat both as unknown.
 - `const_args` (v2) — constant-valued arguments at the call site, as

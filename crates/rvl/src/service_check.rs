@@ -1,4 +1,4 @@
-//! `rvl service check` (po-7p45k.21): the repo-side catalog alignment
+//! `rvl service check`: the repo-side catalog alignment
 //! report. Read-only by default: it inspects the repo's
 //! `.revelara.yaml` and the org's service catalog and reports, per
 //! finding, the concrete YAML edit that fixes it. `--apply` performs only

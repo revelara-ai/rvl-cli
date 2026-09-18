@@ -12,7 +12,7 @@
 #
 # Extra steps spliced into dist's per-target build job (dist `github-build-setup`).
 #
-# goindex is the one retriever cargo cannot build (po-aml3h). Without this it
+# goindex is the one retriever cargo cannot build. Without this it
 # is absent from the release archive, and a fresh `brew install rvl`
 # followed by a scan of any Go repository hard-fails with "no goindex helper
 # found" — the exact class of first-run failure this bead removes.

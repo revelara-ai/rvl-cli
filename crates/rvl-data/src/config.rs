@@ -111,7 +111,7 @@ fn write_config_text(path: &Path, data: &str) -> Result<(), String> {
 }
 
 // --- `config` subcommand (show, set) — ported from rvl-cli
-// `internal/commands/config_cmd.go` (po-av01j.164). ---
+// `internal/commands/config_cmd.go`. ---
 
 /// `rvl config`: view and edit CLI configuration.
 #[derive(Subcommand)]

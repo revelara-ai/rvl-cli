@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// G4 (po-av01j.5): the retriever inventories emission points — log
+// G4: the retriever inventories emission points — log
 // statements, span/trace instrumentation, error-handling sites — as
 // AGGREGATE packets: one per (enclosing function, framework, category),
 // never one per log line. The category and count ride const_args.

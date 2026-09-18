@@ -50,7 +50,7 @@ pub fn class_of(site: &Site, reason: &str) -> ClassKey {
         // the class. What remains is a fixed phrase from the propagation
         // layer's vocabulary, so it is stored and displayed WHOLE -- a length
         // cap here once cut "no bound anywhere and the search was complete"
-        // to "...the search was com" in every ladder row (po-3t3oj.39).
+        // to "...the search was com" in every ladder row.
         reason: reason
             .split(';')
             .next()
@@ -118,7 +118,7 @@ fn judgment_client_type<'a>(api: &'a str, method: &str) -> Option<&'a str> {
 }
 
 /// How specifically `j` matches class `k`: higher is more specific, None is no
-/// match. EXACT comparison throughout (po-av01j.96).
+/// match. EXACT comparison throughout.
 ///
 /// The old guard tested `j.api.contains(&k.method)` and friends, which meant
 /// `"db.RLSPool.QueryRow".contains("Query")` silenced the whole `Query` class —
@@ -164,7 +164,7 @@ pub fn triage(
 ) -> Vec<TriagedItem> {
     // Keyed on site_key (file:line:client_type:method), NOT id() (file:line):
     // chained calls share a line, so id() collides and a violate on `.execute`
-    // would be rematched to the `.select` site and mislabeled (po-3t3oj.35).
+    // would be rematched to the `.select` site and mislabeled.
     // The `verdicts` ids MUST therefore be site_keys, supplied by the caller.
     let by_key: BTreeMap<&str, &Site> = sites
         .iter()
@@ -183,7 +183,7 @@ pub fn triage(
     }
 
     let judge = |k: &ClassKey| -> Option<&ClassJudgment> {
-        // Most specific wins, never file order (po-av01j.96). A wrong match
+        // Most specific wins, never file order. A wrong match
         // does not just suppress: it also stamps the class with another
         // judgment's severity, fix text and RC control code.
         judgments
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn chained_line_labels_the_violating_call_not_a_sibling() {
-        // Regression (po-3t3oj.35): `db.selectFrom(...).select(...).execute()`
+        // Regression: `db.selectFrom(...).select(...).execute()`
         // puts a not_applicable `.select` and a violating `.execute` on ONE
         // line. Keyed on file:line the violate would be mislabeled `.select`;
         // keyed on site_key it is correctly the `.execute`.
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn low_value_classes_are_suppressed_only_when_judged_so() {
-        // po-av01j.97: this test used to key the verdict on `id()` ("file:line")
+        // a tracked follow-up: this test used to key the verdict on `id()` ("file:line")
         // while triage keys `by_key` on `site_key()`
         // ("file:line:client_type:method"). The verdict never rematched, so NO
         // class was ever formed and the function returned empty for reasons
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(bare[0].control, "");
     }
 
-    // --- Judgment matching is EXACT, never substring (po-av01j.96) ---
+    // --- Judgment matching is EXACT, never substring ---
 
     fn judgment(api: &str, verdict: &str) -> ClassJudgment {
         ClassJudgment {
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn class_reason_is_the_whole_rule_name_never_cut_mid_word() {
-        // Regression (po-3t3oj.39): a 40-char cap displayed every ladder row as
+        // Regression: a 40-char cap displayed every ladder row as
         // "no bound anywhere and the search was com". The rule name is a fixed
         // phrase and must survive whole.
         let s = site("a/f.ts", 1, "kysely.RawBuilder", "execute");

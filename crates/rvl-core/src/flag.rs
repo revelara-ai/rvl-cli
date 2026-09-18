@@ -1,4 +1,4 @@
-//! Empty flag VALUES, decided per consumer (po-av01j.192).
+//! Empty flag VALUES, decided per consumer.
 //!
 //! rvl-cli hands every consumer a plain string. `--flag=` and `--flag ''`
 //! both produce `""` (`cliutil.FlagValue` returns the same thing for the two
@@ -11,7 +11,7 @@
 //!
 //! clap gives us `Some("")` for both spellings too, which is the same
 //! starting point — so parity is a per-consumer decision, exactly as in Go.
-//! po-av01j.185 tried to make that decision once for everyone by deleting
+//! a tracked follow-up tried to make that decision once for everyone by deleting
 //! `--x=` tokens from argv before clap parsed them; argv knows a token's
 //! SHAPE and nothing about the flag, so it also deleted the numeric usage
 //! errors, the misspelled flags, and the values meant for the wire.

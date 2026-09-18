@@ -114,7 +114,7 @@ class TestRetrievedPackets(unittest.TestCase):
             "construction of the session client must be retrievable")
 
     def test_chained_attribute_on_constructed_local_resolves(self):
-        # po-av01j.133.8: `client = OpenAI(...)` then
+        # a tracked follow-up.8: `client = OpenAI(...)` then
         # `client.chat.completions.create(...)`. The receiver's ROOT is a
         # local variable whose type comes from a constructor assignment; the
         # chain must resolve by appending the attribute path to the
@@ -160,7 +160,7 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertNotIn("join", methods)
 
     def test_const_args_and_macro_flag(self):
-        """Schema v2 (po-av01j.19): constant-valued arguments are evidence,
+        """Schema v2: constant-valued arguments are evidence,
         and every site carries the macro flag (false: Python has no macros)."""
         records = _retrieve_records()
         for rec in records:
@@ -200,7 +200,7 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertEqual(cached["const_args"], [])
 
     def test_background_job_registrations_carry_site_kind(self):
-        """G3 (po-av01j.4): scheduler/queue registrations ride the same packet
+        """G3: scheduler/queue registrations ride the same packet
         stream marked site_kind="background_job"; classic call sites keep an
         empty site_kind. Detection is import-resolution-driven."""
         records = _retrieve_records()
@@ -241,7 +241,7 @@ class TestRetrievedPackets(unittest.TestCase):
             [r for r in records if r["symbol"] == "not_a_job"],
             "an unresolved enqueue lookalike must not become a site")
     def test_server_entry_registrations_are_inventoried(self):
-        """G2 (po-av01j.3): flask/fastapi/django registrations emit as sites
+        """G2: flask/fastapi/django registrations emit as sites
         stamped site_kind server_entry, with the framework identity as
         client_type and the route path riding const_args. They never ALSO
         emit as G1 client calls."""
@@ -305,7 +305,7 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertTrue(records)
         for r in records:
             self.assertEqual(r["file_path"], "svc.py")
-        # a non-existent file is a loud failure (po-av01j.209): the caller
+        # a non-existent file is a loud failure: the caller
         # asked for specific files and NONE of them exist here, which must
         # never be recorded as a successful retrieval of zero sites.
         code, out, _ = _run("--retrieve", "--root", FIXTURE_ROOT,
@@ -316,7 +316,7 @@ class TestRetrievedPackets(unittest.TestCase):
 
 
 class TestRetrievalStatsRecord(unittest.TestCase):
-    """The repo-scoped record (po-av01j.209): emitted on EVERY run so rvl's
+    """The repo-scoped record: emitted on EVERY run so rvl's
     silent-zero guard can tell 'ran and found nothing' from 'never ran'."""
 
     def _stats(self, out):
@@ -372,7 +372,7 @@ class TestRetrievalStatsRecord(unittest.TestCase):
 
 
 class TestEmissionPackets(unittest.TestCase):
-    """G4 (po-av01j.5): emission points ride the same stream as AGGREGATES —
+    """G4: emission points ride the same stream as AGGREGATES —
     one packet per (enclosing function, framework, category), never one per
     log line — stamped site_kind: "emission_point" with category and count
     riding const_args."""

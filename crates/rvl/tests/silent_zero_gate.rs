@@ -1,8 +1,8 @@
 //! THE GATE OVER A RETRIEVER THAT REPORTED SUCCESS AND READ NOTHING
-//! (po-av01j.209).
+//!.
 //!
-//! Third in the family after po-av01j.198 ("nothing to scan" wrongly blocked)
-//! and po-av01j.199 ("could not scan" wrongly read clean), and the only one
+//! Third in the family after a tracked follow-up ("nothing to scan" wrongly blocked)
+//! and a tracked follow-up ("could not scan" wrongly read clean), and the only one
 //! `--strict` did not catch. `goindex` printed `load failed: ... go command
 //! required, not found` to stderr, emitted
 //! `{"kind":"","snapshot_id":"","constructions":null}`, and EXITED 0 — so rvl
@@ -588,7 +588,7 @@ fn a_degraded_language_is_not_recorded_in_the_index_as_scanned() {
 
 /// THE GUARD NOW COVERS PYTHON. pyindex used to emit site packets only, so a
 /// pyindex that bailed early with zero output was recorded as `scanned, 0
-/// sites` — the exact po-av01j.209 bug, invisible for a whole language. The
+/// sites` — the exact a tracked follow-up bug, invisible for a whole language. The
 /// helper now writes an unconditional `retrieval_stats` record and the
 /// contract table says so; a stub that exits 0 with no output is a failed
 /// lane, exactly like the goindex stub above.

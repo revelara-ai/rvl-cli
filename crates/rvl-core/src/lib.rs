@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub mod semver;
 
 /// The binary name used in user-facing hints ("run 'rvl login'").
-/// Flipped from "rvlscan" to "rvl" at the v1.0.0 cutover (po-av01j.154).
+/// Flipped from "rvlscan" to "rvl" at the v1.0.0 cutover.
 ///
 /// It lives in this leaf crate, not in `rvl-data`, so that every crate that
 /// prints a hint can reach it without taking a dependency on the data
@@ -39,7 +39,7 @@ pub const BIN: &str = "rvl";
 /// false/absent). v2 is a strict superset of v1: every v1 record parses as v2
 /// with the new fields defaulted, so v1 streams remain readable.
 ///
-/// `site_kind` (G4, po-av01j.5) rides the v2 train WITHOUT a version bump: v2
+/// `site_kind` (G4, a tracked follow-up) rides the v2 train WITHOUT a version bump: v2
 /// is unreleased, and the field is additive with a carrying default (absent =
 /// classic G1 call site), so every existing stream parses unchanged.
 pub const PACKET_SCHEMA: u32 = 2;
@@ -333,10 +333,10 @@ pub struct Site {
     /// G1 streams parse unchanged — an additive default-carrying field within
     /// the v2 train, deliberately NOT a schema bump. G2+ emitters stamp their
     /// own kind: [`SITE_KIND_SERVER_ENTRY`] for HTTP handler/route/middleware
-    /// registrations (po-av01j.3), `"background_job"` for G3 scheduler/cron
+    /// registrations, `"background_job"` for G3 scheduler/cron
     /// registrations, queue worker handlers, and dispatcher/worker-loop sites
-    /// (po-av01j.4), [`SITE_KIND_EMISSION`] for G4 emission points
-    /// (po-av01j.5). Retrieval only: the retriever reports WHERE the site is;
+    ///, [`SITE_KIND_EMISSION`] for G4 emission points
+    ///. Retrieval only: the retriever reports WHERE the site is;
     /// whether a control governs that kind is spec knowledge
     /// (`ApiSpec::site_kinds`), and each kind is judged by its own lane so G1
     /// specs never fire on a server-entry site or vice versa.
@@ -350,7 +350,7 @@ pub struct Site {
     /// the path decides" and is the only state a retriever ever emits.
     ///
     /// Read through [`Site::scope`], never directly: every consumer must get
-    /// the same answer, and half of them only hold a `Site` (po-av01j.173).
+    /// the same answer, and half of them only hold a `Site`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_override: Option<ScopeClass>,
 }
@@ -496,7 +496,7 @@ pub fn scope_of(path: &str) -> ScopeClass {
         || p.contains("test_")
         || p.ends_with("conftest.py")
         // Test-support packages that carry "test" mid-token, so the "/test"
-        // and "test_" guards above miss them (po-x1bla sibling, found when a
+        // and "test_" guards above miss them (a tracked follow-up sibling, found when a
         // judgment promoted `_openmetadata_testutils/…` to BLOCKING). Distinct
         // enough not to collide with "latest"/"greatest"/"attestation".
         || p.contains("testutils")
@@ -506,7 +506,7 @@ pub fn scope_of(path: &str) -> ScopeClass {
         || p.contains("/testing/")
         || p.starts_with("testing/")
         // Non-production support material, same severity class as test trees
-        // (po-x1bla): example/sample configs, fixtures, testdata and docs ship
+        //: example/sample configs, fixtures, testdata and docs ship
         // deliberate dummy credentials, so a secret finding in one is advisory,
         // never a blocking gate. Matched broadly — `examples/`, `sample_*`,
         // `/samples/`, `fixtures/`, `testdata/`, `docs/` — because the false
@@ -567,7 +567,7 @@ impl RepoConfig {
     ///
     /// The concatenated multi-language stream carries one `repo_config` per
     /// helper RUN: each of goindex/tsindex/javaindex emits one, and a batched
-    /// `--files` invocation emits one PER BATCH. Until po-av01j.209's
+    /// `--files` invocation emits one PER BATCH. Until a tracked follow-up's
     /// follow-up, [`parse_stream`] let the LAST one win unconditionally, so a
     /// later language's EMPTY `repo_config` erased an earlier language's
     /// construction facts — on a Go+Java repo, javaindex's "emitted even when
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn non_production_material_is_not_runtime_scoped() {
-        // po-x1bla: a secret in examples/sample_configs fired HIGH + BLOCKING
+        // a tracked follow-up: a secret in examples/sample_configs fired HIGH + BLOCKING
         // on OpenMetadata while the identical class in tests/ was demoted to
         // medium — the classifier knew test trees but not example/sample/doc/
         // fixture material, which is equally non-production. All of it routes
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn specified_dev_tool_entry_points_are_dev_only() {
-        // po-av01j.173. `setup.py` and `noxfile.py` are names a TOOL defines:
+        // a tracked follow-up. `setup.py` and `noxfile.py` are names a TOOL defines:
         // the packaging frontend runs one, the nox runner reads the other, and
         // neither is imported by product code. An unbounded call in them
         // blocks a build, not a request.
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn repo_evidence_overrides_the_path_class() {
-        // po-av01j.173: the scan pipeline stamps what the repo DECLARES, and
+        // a tracked follow-up: the scan pipeline stamps what the repo DECLARES, and
         // every consumer reads it through `Site::scope`.
         let mut s = Site {
             file_path: "hatch_build.py".into(),
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(sites[0].id(), "a.go:7");
     }
 
-    /// THE POLYGLOT ERASURE HAZARD (po-av01j.209 follow-up). The concatenated
+    /// THE POLYGLOT ERASURE HAZARD (a tracked follow-up follow-up). The concatenated
     /// multi-language stream carries one `repo_config` per helper run —
     /// goindex, tsindex and javaindex each emit one, javaindex "even when
     /// empty" — and last-wins meant whichever language ran LAST decided
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn site_kind_rides_the_stream_and_defaults_to_classic_call_site() {
-        // G3 (po-av01j.4): background-job sites ride the SAME Site stream,
+        // G3: background-job sites ride the SAME Site stream,
         // distinguished by an additive `site_kind` field. Absent means the
         // classic G1 call site, so every existing stream parses unchanged;
         // a "background_job" stamp must survive parse -> serialize intact.
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn site_kind_survives_a_parse_serialize_round_trip() {
-        // G2 (po-av01j.3): server-entry sites ride the SAME Site stream,
+        // G2: server-entry sites ride the SAME Site stream,
         // distinguished by the additive `site_kind` field. Losing it in
         // transit (parse -> index -> reload) would silently demote a
         // server-entry record back to a G1 call site.
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn emission_site_kind_survives_the_round_trip() {
-        // G4 (po-av01j.5): emission-point sites ride the SAME Site stream,
+        // G4: emission-point sites ride the SAME Site stream,
         // distinguished by the additive `site_kind` field. Absent = classic G1
         // call site. The field must survive parse -> serialize, or an
         // emission packet silently becomes a call site in the next pass.

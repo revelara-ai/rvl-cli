@@ -1,4 +1,4 @@
-//! Fixture tests against the PINNED rust-analyzer (charter po-ae75b.8).
+//! Fixture tests against the PINNED rust-analyzer (charter a tracked follow-up).
 //!
 //! Two layers:
 //! 1. The trait-vs-impl MONIKER test — the behavioral canary for the pin.

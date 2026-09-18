@@ -1,5 +1,5 @@
 //! The full `risk context` table, ported from rvl-cli
-//! `internal/commands/risk_context_render.go` (po-av01j.185 item 4).
+//! `internal/commands/risk_context_render.go` (a tracked follow-up item 4).
 //!
 //! WHY THE DEPTH MATTERS: `--format=json` was always complete, so agents
 //! never lost anything — but the human table and `/rvl:fix` read THIS, and
@@ -303,7 +303,7 @@ pub struct RiskContextResponse {
     pub service_context: Option<ServiceContextResp>,
     #[serde(default)]
     pub score_factors: Vec<ScoreFactorResp>,
-    /// pre-po-foyko alias for `score_factors`.
+    /// pre-a tracked follow-up alias for `score_factors`.
     #[serde(default, rename = "score_breakdown")]
     pub score_factors_old: Vec<ScoreFactorResp>,
     #[serde(default)]
