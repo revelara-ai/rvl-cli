@@ -171,8 +171,9 @@ difference shows up. Each abstain names what would close it:
   spec factory mints next (see [Privacy](#privacy) for what a shape-only
   report is).
 - `unresolved bounds`: the call may be bounded in a way no retrieval can
-  see. [Declare the bound](#suppressing-bounding-waiving) in
-  `.revelara.yaml`.
+  see, or its client's config spec names no field the scan can check
+  (see [Client constructions and config specs](retrievers.md#client-constructions-and-config-specs)).
+  [Declare the bound](#suppressing-bounding-waiving) in `.revelara.yaml`.
 - `need per-site judge`: the API sometimes blocks and only the call site
   settles it. Closable by the
   [hook-time agent lane](#hook-time-agent-adjudication-opt-in).

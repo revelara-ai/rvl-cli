@@ -2700,6 +2700,8 @@ fn findings_from_sites(
                         scope: rvl_spec::Scope::ThisClient,
                         confidence: 1.0,
                         rationale: format!("declared in .revelara.yaml: {}", d.reason),
+                        fields: vec![],
+                        default_bound: rvl_spec::DefaultBound::Unknown,
                         declared: true,
                     })
                     .collect(),
@@ -3134,7 +3136,9 @@ fn render_scan_output(
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
-        } else if f.reason.contains("truncated") {
+        } else if f.reason.contains("truncated") || f.reason.contains("names no bounding field") {
+            // Both are "spec present, bound not establishable here", and both
+            // close the same way: a declared bound in .revelara.yaml.
             coverage.abstain_bounds += 1;
         } else if f.reason.contains("depends") || f.reason.contains("per-site") {
             coverage.abstain_judge += 1;

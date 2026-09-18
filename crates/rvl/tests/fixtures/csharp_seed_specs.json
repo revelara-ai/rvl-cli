@@ -100,13 +100,15 @@
       "bounds": "whole_call",
       "scope": "this_client",
       "confidence": 0.9,
-      "rationale": "HttpClient enforces a 100-second whole-call Timeout by default; the property must be explicitly set to InfiniteTimeSpan to remove it, so the type carries a whole-call bound"
+      "default_bound": { "kind": "seconds", "seconds": 100 },
+      "rationale": "HttpClient enforces a 100-second whole-call Timeout by default; the property must be explicitly set to InfiniteTimeSpan to remove it, so the type carries a whole-call bound (default_bound is what the scan reads; the prose is for people)"
     },
     {
       "type": "Microsoft.Data.SqlClient.SqlCommand",
       "bounds": "whole_call",
       "scope": "this_client",
       "confidence": 0.9,
+      "default_bound": { "kind": "seconds", "seconds": 30 },
       "rationale": "SqlCommand enforces a 30-second CommandTimeout by default; 0 (infinite) must be set explicitly"
     }
   ],

@@ -86,6 +86,35 @@ silently scanning wrong. `RVL_HELPER_DIR` relocates that directory.
 Per-language toolchain setup and the full hook workflow are covered in
 [Local scanning](https://app.revelara.ai/help/local-scanning).
 
+## Client constructions and config specs
+
+Every call-site packet carries `client_construction`: the snippets where the
+receiver was built, as `{file, line, symbol, source}`. `symbol` is the
+constructed TYPE (`net/http.Client`) and `source` is the literal or statement
+that built it (`http.Client{Timeout: 10 * time.Second}`), so a
+construction-time timeout is visible to the scan without the retriever
+judging it.
+
+A `client_config` spec keys on that type and says where the bound comes
+from: `fields` names the fields whose being set carries it (`["Timeout"]` for
+`net/http.Client`), and `default_bound` records a bound the library applies on
+its own (`{"kind": "seconds", "seconds": 100}` for .NET's `HttpClient`). The
+scan credits a whole-call `this_client` spec on one of those two grounds: the
+type bounds by default, or a construction attached to the site sets one of
+the named fields, in `symbol` or in `source`. An `http.Client{}` with no
+`Timeout` is the classic hang and never passes on the type match alone. A
+spec that says neither cannot be checked against any construction, so the
+site abstains with `client config <type> names no bounding field or default`
+(counted under `unresolved bounds` in COVERAGE) until the spec is re-authored
+or a bound is [declared](scanning.md#suppressing-bounding-waiving) in
+`.revelara.yaml`. Declared bounds are exempt: they are an operator's claim
+about the type as deployed, not about a field.
+
+One limit to know: goindex attaches every construction of a type in the
+module to every site using it, so one `Timeout`-bearing literal is evidence
+for every `http.Client` call in the repo. The reason names the file and line
+it came from.
+
 ## Scanning a prebuilt packet stream
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape
