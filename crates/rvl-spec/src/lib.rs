@@ -497,6 +497,15 @@ pub struct ConfigSpec {
     /// the honest wording -- nobody checked, so the bare type proves nothing.
     #[serde(default)]
     pub default_bound: DefaultBound,
+    /// Values of a field in `fields` that mean NO bound, the same idea as
+    /// [`ApiSpec::unbounded_sentinels`] for arguments: `http.Client{Timeout: 0}`
+    /// blocks forever, `Timeout=None` and `.timeout(Duration.ZERO)` likewise.
+    /// A construction that sets a named field to one of these is positive
+    /// evidence of unboundedness, not evidence of a bound. Library knowledge,
+    /// so it is read off the spec and never guessed; a spec that declares
+    /// none credits any set value, as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unbounded_sentinels: Vec<String>,
     /// True when this spec is a repo-local `.revelara.yaml` bound declaration
     /// rather than a factory-authored spec. Runtime-only overlay state: never
     /// emitted by the factory, skipped on serialization, and used to carry the
@@ -520,6 +529,17 @@ impl ConfigSpec {
             && !self.declared
             && self.fields.is_empty()
             && !matches!(self.default_bound, DefaultBound::Seconds { .. })
+    }
+
+    /// Whether `value` is a declared unbounded sentinel for a field of this
+    /// type. Same trimmed, ASCII-case-insensitive comparison as
+    /// [`ApiSpec::is_unbounded_sentinel`], and for the same reason: a loose
+    /// match errs toward NOT crediting a bound.
+    pub fn is_unbounded_sentinel(&self, value: &str) -> bool {
+        let v = value.trim();
+        self.unbounded_sentinels
+            .iter()
+            .any(|s| s.trim().eq_ignore_ascii_case(v))
     }
 }
 
@@ -784,9 +804,17 @@ impl SpecCache {
                 }
             }
         }
+        // A declared (.revelara.yaml) config is a policy decision about the
+        // type as deployed, not a competing estimate: it wins the merge
+        // outright, whatever the served spec's confidence, and a served spec
+        // never displaces it. Under the plain confidence rule the shipped
+        // `net/http.Client` spec at confidence 1 silently dropped an equal-
+        // confidence declaration, so the operator's claim never reached the
+        // propagator (po-m2ill).
         for (k, v) in other.configs {
             match self.configs.get(&k) {
-                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) if existing.declared => {}
+                Some(existing) if existing.confidence >= v.confidence && !v.declared => {}
                 _ => {
                     self.configs.insert(k, v);
                 }
@@ -1037,6 +1065,7 @@ mod tests {
                     rationale: String::new(),
                     fields: vec![],
                     default_bound: DefaultBound::Unknown,
+                    unbounded_sentinels: vec![],
                     declared: false,
                 })
                 .collect(),
@@ -1137,6 +1166,7 @@ mod tests {
             rationale: String::new(),
             fields: fields.iter().map(|f| f.to_string()).collect(),
             default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
             declared,
         }
     }
@@ -1276,6 +1306,35 @@ mod tests {
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");
     }
+    #[test]
+    fn a_declared_config_wins_the_merge_whatever_the_served_confidence() {
+        // The served corpus carries `net/http.Client` at confidence 1 and a
+        // `.revelara.yaml` declaration arrives at confidence 1 too. Under the
+        // plain higher-confidence rule the existing entry stays and the
+        // declaration is silently dropped, so the operator's claim never
+        // reaches the propagator and the site abstains on the bare spec it
+        // was declared to close (po-m2ill). A declaration is a policy
+        // decision about the type as deployed, so it wins the merge outright.
+        let mut base = cache_of(vec![cfg(Bounds::WholeCall, Scope::ThisClient, &[], false)]);
+        let mut declared = cfg(Bounds::WholeCall, Scope::ThisClient, &[], true);
+        declared.rationale = "declared in .revelara.yaml: egress proxy enforces 30s".into();
+        base.merge(cache_of(vec![declared]));
+        let got = base.config("net/http.Client").unwrap();
+        assert!(
+            got.declared,
+            "the declaration must displace the served spec"
+        );
+        assert!(got.rationale.contains("declared in .revelara.yaml"));
+        // And nothing served later displaces it, however confident.
+        let mut served = cfg(Bounds::WholeCall, Scope::ThisClient, &["Timeout"], false);
+        served.confidence = 1.0;
+        base.merge(cache_of(vec![served]));
+        assert!(
+            base.config("net/http.Client").unwrap().declared,
+            "a served spec must not displace a declaration"
+        );
+    }
+
     #[test]
     fn config_key_specs_parse_from_a_spec_file_and_are_looked_up() {
         // The G6 lane's spec kind rides the SAME SpecFile the signed cache

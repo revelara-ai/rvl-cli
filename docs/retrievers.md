@@ -108,7 +108,25 @@ site abstains with `client config <type> names no bounding field or default`
 (counted under `unresolved bounds` in COVERAGE) until the spec is re-authored
 or a bound is [declared](scanning.md#suppressing-bounding-waiving) in
 `.revelara.yaml`. Declared bounds are exempt: they are an operator's claim
-about the type as deployed, not about a field.
+about the type as deployed, not about a field, and a declaration replaces
+the served spec for that type whatever the served spec's confidence.
+
+Only the construction's own fields count. A field is read at most one
+literal deep and one argument list deep in `source`, which is where every
+retriever puts the client's fields (the literal itself, the whole assignment
+or declaration statement, or the options object inside the constructor
+call). A field of a nested literal belongs to the nested type:
+`http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout:
+30 * time.Second}).DialContext}}` bounds only the dial, and the scan does
+not read the dialer's `Timeout` as the client's.
+
+A spec can also list `unbounded_sentinels`, the values of a named field that
+mean no bound (`"0"` for `net/http.Client`'s `Timeout`, `"None"` for a
+Python keyword, `"Duration.ZERO"` for a Java builder), the same idea as the
+call-argument sentinels. A construction that sets the field to one of them
+is positive evidence the bound was switched off, so the site violates with
+the value cited, unless another construction of the type sets a real value.
+A spec that lists none credits any set value.
 
 One limit to know: goindex attaches every construction of a type in the
 module to every site using it, so one `Timeout`-bearing literal is evidence

@@ -2702,6 +2702,7 @@ fn findings_from_sites(
                         rationale: format!("declared in .revelara.yaml: {}", d.reason),
                         fields: vec![],
                         default_bound: rvl_spec::DefaultBound::Unknown,
+                        unbounded_sentinels: vec![],
                         declared: true,
                     })
                     .collect(),

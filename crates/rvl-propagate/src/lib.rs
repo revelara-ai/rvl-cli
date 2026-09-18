@@ -117,19 +117,29 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Whether a construction snippet shows `field` being SET.
+/// The value a construction snippet gives `field`, when it sets it.
 ///
 /// Two shapes count. A retriever that emits the field itself as a snippet
-/// puts its name in `symbol`. goindex does not: its construction snippets
-/// carry the TYPE in `symbol` and the literal's text in `source`
-/// (`http.Client{Timeout: 10 * time.Second}`), so the evidence is the field
-/// name followed by `:`, `=` or `(` in that text -- a struct-literal key, an
-/// assignment, a keyword argument, an object-literal key, or a builder call.
-/// `:=`, `::` and `==` are excluded: a local named `timeout`, a path, and a
-/// comparison set nothing.
-fn construction_sets_field(c: &Snippet, field: &str) -> bool {
+/// puts its name in `symbol` (the value is unknown, returned empty). goindex
+/// does not: its construction snippets carry the TYPE in `symbol` and the
+/// literal's text in `source` (`http.Client{Timeout: 10 * time.Second}`), so
+/// the evidence is the field name followed by `:`, `=` or `(` in that text --
+/// a struct-literal key, an assignment, a keyword argument, an object-literal
+/// key, or a builder call. `:=`, `::` and `==` are excluded: a local named
+/// `timeout`, a path, and a comparison set nothing.
+///
+/// Only the construction's OWN fields count: a match is accepted at most one
+/// literal deep and one argument list deep. The retrievers emit the literal
+/// itself, the whole assignment or declaration statement, or the options
+/// object inside the constructor call, and each of those puts the client's
+/// fields at that depth; anything deeper belongs to a nested type.
+/// `http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout:
+/// 30 * time.Second}).DialContext}}` bounds only the dial and blocks forever
+/// on a slow body read, and crediting the dialer's `Timeout` as the client's
+/// is the false negative this lane exists to close.
+fn field_set_value(c: &Snippet, field: &str) -> Option<String> {
     if c.symbol == field {
-        return true;
+        return Some(String::new());
     }
     let src = c.source.as_str();
     let mut from = 0;
@@ -144,28 +154,94 @@ fn construction_sets_field(c: &Snippet, field: &str) -> bool {
         if rest.starts_with(|ch: char| is_ident_char(ch)) {
             continue;
         }
+        let (literals, args) = nesting(&src[..start]);
+        if literals > 1 || args > 1 {
+            continue;
+        }
+        let call = rest.starts_with('(');
         let sets = (rest.starts_with(':') && !rest.starts_with("::") && !rest.starts_with(":="))
             || (rest.starts_with('=') && !rest.starts_with("=="))
-            || rest.starts_with('(');
+            || call;
         if sets {
-            return true;
+            return Some(value_after(&rest[1..], call));
         }
     }
-    false
+    None
 }
 
-/// The first of the spec's fields that a construction at the site sets, with
-/// the construction that sets it.
+/// Whether a construction snippet shows `field` being SET, to any value.
+#[cfg(test)]
+fn construction_sets_field(c: &Snippet, field: &str) -> bool {
+    field_set_value(c, field).is_some()
+}
+
+/// How many literals (`{`, `[`) and argument lists (`(`) are still open at
+/// the end of `prefix`.
+fn nesting(prefix: &str) -> (i32, i32) {
+    let (mut literals, mut args) = (0, 0);
+    for ch in prefix.chars() {
+        match ch {
+            '{' | '[' => literals += 1,
+            '}' | ']' => literals -= 1,
+            '(' => args += 1,
+            ')' => args -= 1,
+            _ => {}
+        }
+    }
+    (literals, args)
+}
+
+/// The value text after a setter token: the argument list of a builder
+/// `call`, or a key's or assignment's right-hand side up to the next `,`,
+/// `;`, newline or closer at the same depth. Brackets inside the value are
+/// balanced, so `time.Duration(0)` comes back whole.
+fn value_after(rest: &str, call: bool) -> String {
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' | ';' | '\n' if depth == 0 && !call => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    rest[..end].trim().to_string()
+}
+
+/// What the spec's fields say about the constructions at the site: the first
+/// field a construction sets, with the construction, and the value when that
+/// value is a spec-declared unbounded sentinel. A construction that sets the
+/// field to a real value outweighs one that sets it to a sentinel, on
+/// purpose: goindex attaches every construction of the type to the site, and
+/// a whole-call bound found anywhere wins over a sentinel elsewhere, as it
+/// does for every other mechanism.
 fn field_evidence<'a>(
     s: &'a ConfigSpec,
     constructions: &'a [Snippet],
-) -> Option<(&'a str, &'a Snippet)> {
-    s.fields.iter().find_map(|f| {
-        constructions
-            .iter()
-            .find(|c| construction_sets_field(c, f))
-            .map(|c| (f.as_str(), c))
-    })
+) -> Option<(&'a str, &'a Snippet, Option<String>)> {
+    let mut sentinel = None;
+    for f in &s.fields {
+        for c in constructions {
+            if let Some(v) = field_set_value(c, f) {
+                if !v.is_empty() && s.is_unbounded_sentinel(&v) {
+                    sentinel.get_or_insert((f.as_str(), c, Some(v)));
+                } else {
+                    return Some((f.as_str(), c, None));
+                }
+            }
+        }
+    }
+    sentinel
 }
 
 fn cite(c: &Snippet) -> String {
@@ -181,6 +257,10 @@ fn cite(c: &Snippet) -> String {
 enum ConfigEvidence {
     Whole(String),
     Phase(String),
+    /// A named field set to a spec-declared unbounded sentinel: positive
+    /// evidence the bound was switched off, the CallArg lane's
+    /// `unbounded_sentinels` read against a construction (po-av01j.25).
+    Unbounded(String),
     /// The spec was found for this client and cannot be checked here, so it
     /// must be credited neither as a pass nor as a violation (po-m2ill).
     Unresolved(String),
@@ -217,10 +297,16 @@ fn config_evidence(s: &ConfigSpec, key: &str, constructions: &[Snippet]) -> Conf
     let set = field_evidence(s, constructions);
     match s.bounds {
         Bounds::WholeCall => match (default, set) {
+            // A sentinel beats the library default too: the author wrote the
+            // value that turns it off.
+            (_, Some((field, at, Some(value)))) => ConfigEvidence::Unbounded(format!(
+                "client config {key} sets {field} to the spec-declared unbounded sentinel {value}{}",
+                cite(at)
+            )),
             (Some(seconds), _) => ConfigEvidence::Whole(format!(
                 "client config {key} bounds by default ({seconds}s)"
             )),
-            (None, Some((field, at))) => {
+            (None, Some((field, at, None))) => {
                 ConfigEvidence::Whole(format!("client config {key} sets {field}{}", cite(at)))
             }
             // A bare whole-call spec outside the this_client shape reached
@@ -234,10 +320,12 @@ fn config_evidence(s: &ConfigSpec, key: &str, constructions: &[Snippet]) -> Conf
         // reporting its (partial) bound; a field-naming one reports it only
         // when the field is actually set.
         Bounds::PhaseOnly => match (default, set) {
+            // A phase field switched off bounds nothing, not even a phase.
+            (_, Some((_, _, Some(_)))) => ConfigEvidence::None,
             (Some(seconds), _) => ConfigEvidence::Phase(format!(
                 "client config {key} bounds only a phase by default ({seconds}s)"
             )),
-            (None, Some((field, at))) => ConfigEvidence::Phase(format!(
+            (None, Some((field, at, None))) => ConfigEvidence::Phase(format!(
                 "client config {key} bounds only a phase (sets {field}{})",
                 cite(at)
             )),
@@ -257,6 +345,7 @@ fn record(
     ev: ConfigEvidence,
     whole: &mut Vec<String>,
     phase: &mut Vec<String>,
+    unbounded: &mut Vec<String>,
     unresolved: &mut Option<String>,
 ) {
     match ev {
@@ -268,6 +357,11 @@ fn record(
         ConfigEvidence::Phase(r) => {
             if !phase.contains(&r) {
                 phase.push(r)
+            }
+        }
+        ConfigEvidence::Unbounded(r) => {
+            if !unbounded.contains(&r) {
+                unbounded.push(r)
             }
         }
         ConfigEvidence::Unresolved(r) => {
@@ -548,7 +642,7 @@ pub fn propagate(
                 _ => {}
             },
             Mechanism::ClientConfig => {
-                let before = whole.len() + phase.len();
+                let before = whole.len() + phase.len() + unbounded.len();
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
@@ -562,6 +656,7 @@ pub fn propagate(
                             config_evidence(s, &c.symbol, &site.client_construction),
                             &mut whole,
                             &mut phase,
+                            &mut unbounded,
                             &mut config_unresolved,
                         );
                     }
@@ -574,6 +669,7 @@ pub fn propagate(
                             config_evidence(s, &site.client_type, &site.client_construction),
                             &mut whole,
                             &mut phase,
+                            &mut unbounded,
                             &mut config_unresolved,
                         );
                     }
@@ -588,7 +684,12 @@ pub fn propagate(
                 // to a human — never a guess. An exact spec the lane could not
                 // check is not "no exact config": broadening past it would let
                 // the same bare spec back in through the family (po-m2ill).
-                if whole.len() + phase.len() == before && config_unresolved.is_none() {
+                // Nor is an exact field switched off: the repo-level family
+                // bound counts that same literal as "sets Timeout" without
+                // reading the value, so broadening would re-credit it.
+                if whole.len() + phase.len() + unbounded.len() == before
+                    && config_unresolved.is_none()
+                {
                     if let Some(bound) =
                         client_family(&site.client_type).and_then(|f| client.get(&f))
                     {
@@ -1102,6 +1203,7 @@ mod tests {
             rationale: String::new(),
             fields: vec![],
             default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
             declared: false,
         }
     }
@@ -1173,6 +1275,7 @@ mod tests {
                     .into(),
             fields: fields.iter().map(|f| f.to_string()).collect(),
             default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
             declared: false,
         }
     }
@@ -1346,6 +1449,7 @@ mod tests {
                     rationale: String::new(),
                     fields: vec!["ResponseHeaderTimeout".into()],
                     default_bound: DefaultBound::Unknown,
+                    unbounded_sentinels: vec![],
                     declared: false,
                 },
             ]),
@@ -1428,6 +1532,23 @@ mod tests {
         ] {
             assert!(!construction_sets_field(&src(s), "Timeout"), "{s}");
         }
+        // Not set: a field of a NESTED literal or argument list belongs to
+        // the nested type. The Go dialer idiom sets only a dial timeout and
+        // blocks forever on a slow body read; crediting it as the client's
+        // `Timeout` is the false negative this lane exists to close.
+        for s in [
+            "http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: 30 * time.Second}).DialContext}}",
+            "http.Client{\n\tTransport: &http.Transport{\n\t\tDial: (&net.Dialer{\n\t\t\tTimeout: 30 * time.Second,\n\t\t}).Dial,\n\t},\n}",
+            "axios.create({ httpsAgent: new Agent({ Timeout: 1 }) })",
+            "httpx.Client(transport=Transport(Timeout=5))",
+        ] {
+            assert!(!construction_sets_field(&src(s), "Timeout"), "{s}");
+        }
+        // Still set: the client's own field beside a nested literal.
+        assert!(construction_sets_field(
+            &src("http.Client{Transport: &http.Transport{DialContext: d.DialContext}, Timeout: 10 * time.Second}"),
+            "Timeout"
+        ));
         // A field-level snippet names the field in its symbol.
         assert!(construction_sets_field(
             &Snippet {
@@ -1436,6 +1557,128 @@ mod tests {
             },
             "Timeout"
         ));
+    }
+
+    #[test]
+    fn field_set_value_reads_the_value_a_construction_gives_the_field() {
+        let src = |s: &str| Snippet {
+            source: s.into(),
+            ..Default::default()
+        };
+        for (s, want) in [
+            ("http.Client{Timeout: 0}", "0"),
+            ("http.Client{Timeout: time.Duration(0)}", "time.Duration(0)"),
+            (
+                "http.Client{\n\tTransport: tr,\n\tTimeout:   5 * time.Second,\n}",
+                "5 * time.Second",
+            ),
+            ("c.Timeout = 5 * time.Second", "5 * time.Second"),
+            ("requests.Session(Timeout=None)", "None"),
+            ("axios.create({ Timeout: 5000 })", "5000"),
+            (
+                "HttpClient.newBuilder().Timeout(Duration.ZERO)",
+                "Duration.ZERO",
+            ),
+        ] {
+            assert_eq!(
+                field_set_value(&src(s), "Timeout").as_deref(),
+                Some(want),
+                "{s}"
+            );
+        }
+        assert_eq!(field_set_value(&src("http.Client{}"), "Timeout"), None);
+        // A field-level snippet sets the field but carries no value.
+        assert_eq!(
+            field_set_value(
+                &Snippet {
+                    symbol: "Timeout".into(),
+                    ..Default::default()
+                },
+                "Timeout"
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_field_set_to_a_declared_unbounded_sentinel_violates_instead_of_satisfying() {
+        // `http.Client{Timeout: 0}` is Go for "no timeout": the author wrote
+        // the value that turns the bound off. Same principle as the CallArg
+        // lane (po-av01j.25): a resolved sentinel is positive evidence of
+        // unboundedness, decided as a violation with the value cited.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(
+            f.reason.contains("Timeout")
+                && f.reason.contains("sentinel")
+                && f.reason.contains("main.go:6"),
+            "the reason must cite the field, the sentinel and where it was set: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_sentinel_valued_field_is_outweighed_by_a_bounded_construction_of_the_same_type() {
+        // goindex attaches every construction of the type to the site. One
+        // literal turning the bound off beside one setting it is read the way
+        // every other mechanism is: a whole-call bound found anywhere wins.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let mut s = http_do_site("http.Client{Timeout: 0}");
+        s.client_construction.push(Snippet {
+            file: "other.go".into(),
+            line: 3,
+            symbol: "net/http.Client".into(),
+            source: "http.Client{Timeout: 10 * time.Second}".into(),
+        });
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(f.reason.contains("other.go:3"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_sentinel_valued_field_is_not_rescued_by_family_broadening() {
+        // The repo-level family bound is built from which fields a literal
+        // sets, not their values, so the same `Timeout: 0` literal reads as
+        // "sets Timeout" there. An exact field switched off is an exact
+        // answer, and broadening past it would re-credit the literal.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn an_undeclared_config_sentinel_still_credits_the_set_field() {
+        // The parity half: a spec that declares no sentinels credits any set
+        // value, exactly as it did before the field existed. The gap is the
+        // spec author's to close, never guessed here.
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
     }
 
     #[test]
@@ -1937,6 +2180,7 @@ mod tests {
                 rationale: String::new(),
                 fields: vec![],
                 default_bound: DefaultBound::Unknown,
+                unbounded_sentinels: vec![],
                 declared: false,
             }],
         );

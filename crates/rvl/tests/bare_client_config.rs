@@ -17,8 +17,11 @@
 //!   - the same two outcomes hold against packets the goindex built from THIS
 //!     tree emits, so the wire shape the fix reads is the one that ships.
 //!
-//! A declared bound in `.revelara.yaml` keeps satisfying; that is pinned in
-//! `cli.rs::declared_bound_converts_finding_to_satisfies_with_provenance`.
+//! A declared bound in `.revelara.yaml` keeps satisfying, and it does so
+//! OVER the shipped bare-type spec: the two meet in the spec-cache merge at
+//! equal confidence, and the declaration must win there or it never reaches
+//! the propagator (`cli.rs::declared_bound_converts_finding_to_satisfies_with_provenance`
+//! covers the declaration with no served config at all).
 //!
 //! The hand-written packets below are shaped the way goindex emits them: a
 //! construction's `symbol` is the TYPE, never a field name, and the field
@@ -46,9 +49,13 @@ fn bin() -> Command {
 /// The one-function repro as Go source. `literal` is the client construction.
 fn go_source(literal: &str) -> String {
     format!(
-        "package main\n\nimport (\n\t\"net/http\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\nfunc fetch(req *http.Request) (*http.Response, error) {{\n\tc := &{literal}\n\treturn c.Do(req)\n}}\n"
+        "package main\n\nimport (\n\t\"net\"\n\t\"net/http\"\n\t\"time\"\n)\n\nvar _ = time.Second\nvar _ net.Dialer\n\nfunc fetch(req *http.Request) (*http.Response, error) {{\n\tc := &{literal}\n\treturn c.Do(req)\n}}\n"
     )
 }
+
+/// The standard dialer idiom: a `Timeout` that bounds only the dial, nested
+/// two literals deep. A slow body read still blocks forever.
+const NESTED_DIAL_TIMEOUT: &str = "http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: 30 * time.Second}).DialContext}}";
 
 /// A packet for the repro, shaped as goindex emits it (the index hashes file
 /// content, so the file it names must exist).
@@ -142,9 +149,34 @@ fn a_spec_naming_the_field_tells_the_empty_literal_from_the_bounded_one() {
     );
 }
 
+#[test]
+fn a_declared_bound_closes_the_bare_type_abstain_over_the_shipped_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let packets = write_packet(dir.path(), "http.Client{}");
+    std::fs::write(
+        dir.path().join(".revelara.yaml"),
+        "scanner:\n  bounds:\n    - client_type: net/http.Client\n      bounds: whole_call\n      reason: egress proxy enforces a 30s deadline on every outbound call\n",
+    )
+    .unwrap();
+    let rows = scan_packets(dir.path(), &packets, BARE_SPEC);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (verdict, reason) = &rows[0];
+    assert_eq!(
+        verdict, "satisfies",
+        "the declaration must win the merge against the served bare spec: {reason}"
+    );
+    assert!(
+        reason.contains("declared in .revelara.yaml"),
+        "the reason must carry the policy provenance: {reason}"
+    );
+}
+
 /// The goindex FROM THIS TREE, so the assertion is about the wire shape that
 /// ships and not about whatever `goindex` is on PATH. Skips loudly when there
-/// is no Go toolchain to build it with; a build FAILURE is a defect.
+/// is no Go toolchain to build it with. A build FAILURE is a defect where the
+/// toolchain is guaranteed (CI), and a skip on a developer machine whose Go
+/// install is broken (a stale GOROOT, say): the other tests in this file do
+/// not need Go, and one dead toolchain must not read as a propagator bug.
 fn goindex_binary(dir: &Path) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../helpers/goindex");
     let bin = dir.join("goindex");
@@ -156,10 +188,14 @@ fn goindex_binary(dir: &Path) -> Option<PathBuf> {
         .output()
     {
         Ok(out) if out.status.success() => Some(bin),
-        Ok(out) => panic!(
-            "goindex failed to build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if std::env::var_os("CI").is_some() {
+                panic!("goindex failed to build: {stderr}");
+            }
+            eprintln!("SKIP: goindex failed to build (set CI=1 to make this fatal): {stderr}");
+            None
+        }
         Err(e) => {
             eprintln!("SKIP: `go` not available: {e}");
             None
@@ -235,5 +271,18 @@ fn the_live_goindex_repro_never_satisfies_and_a_timeout_still_does() {
         rows.iter()
             .any(|(v, r)| v == "satisfies" && r.contains("Timeout")),
         "a Timeout-bearing client still satisfies, citing the field: {rows:?}"
+    );
+
+    // goindex emits the whole nested literal as the construction's source,
+    // so the dialer's Timeout sits in that text. It is not the client's.
+    let nested = tempfile::tempdir().unwrap();
+    let rows = scan_module(nested.path(), &goindex, NESTED_DIAL_TIMEOUT, FIELDS_SPEC);
+    assert!(
+        rows.iter().all(|(v, _)| v != "satisfies"),
+        "a dial-only timeout nested in the transport must not read as the client's Timeout: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(v, _)| v == "violates"),
+        "the nested literal leaves the call unbounded: {rows:?}"
     );
 }
