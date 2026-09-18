@@ -10,9 +10,10 @@
 //! and combines them mechanically. Every rule below traces to a measurement or
 //! to a human adjudication, not to intuition.
 
-use rvl_core::{ConstArg, CtxEvidence, Site, Verdict};
+use rvl_core::{ConstArg, CtxEvidence, Site, Snippet, Verdict};
 use rvl_spec::{
-    client_family, spec_gate, Bounds, Family, Mechanism, Scope, ServedBound, SpecCache,
+    client_family, spec_gate, Bounds, ConfigSpec, DefaultBound, Family, Mechanism, Scope,
+    ServedBound, SpecCache,
 };
 use std::collections::HashMap;
 
@@ -110,6 +111,264 @@ fn has_bounding_decorator(site: &Site) -> bool {
             .lines()
             .take_while(|l| l.trim_start().starts_with('@') || l.trim().is_empty())
             .any(|l| KEYS.iter().any(|k| l.contains(k)))
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The value a construction snippet gives `field`, when it sets it.
+///
+/// Two shapes count. A retriever that emits the field itself as a snippet
+/// puts its name in `symbol` (the value is unknown, returned empty). goindex
+/// does not: its construction snippets carry the TYPE in `symbol` and the
+/// literal's text in `source` (`http.Client{Timeout: 10 * time.Second}`), so
+/// the evidence is the field name followed by `:`, `=` or `(` in that text --
+/// a struct-literal key, an assignment, a keyword argument, an object-literal
+/// key, or a builder call. `:=`, `::` and `==` are excluded: a local named
+/// `timeout`, a path, and a comparison set nothing.
+///
+/// Only the construction's OWN fields count: a match is accepted at most one
+/// literal deep and one argument list deep. The retrievers emit the literal
+/// itself, the whole assignment or declaration statement, or the options
+/// object inside the constructor call, and each of those puts the client's
+/// fields at that depth; anything deeper belongs to a nested type.
+/// `http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout:
+/// 30 * time.Second}).DialContext}}` bounds only the dial and blocks forever
+/// on a slow body read, and crediting the dialer's `Timeout` as the client's
+/// is the false negative this lane exists to close.
+fn field_set_value(c: &Snippet, field: &str) -> Option<String> {
+    if c.symbol == field {
+        return Some(String::new());
+    }
+    let src = c.source.as_str();
+    let mut from = 0;
+    while let Some(at) = src[from..].find(field) {
+        let start = from + at;
+        let end = start + field.len();
+        from = end;
+        if src[..start].chars().next_back().is_some_and(is_ident_char) {
+            continue;
+        }
+        let rest = src[end..].trim_start();
+        if rest.starts_with(|ch: char| is_ident_char(ch)) {
+            continue;
+        }
+        let (literals, args) = nesting(&src[..start]);
+        if literals > 1 || args > 1 {
+            continue;
+        }
+        let call = rest.starts_with('(');
+        let sets = (rest.starts_with(':') && !rest.starts_with("::") && !rest.starts_with(":="))
+            || (rest.starts_with('=') && !rest.starts_with("=="))
+            || call;
+        if sets {
+            return Some(value_after(&rest[1..], call));
+        }
+    }
+    None
+}
+
+/// Whether a construction snippet shows `field` being SET, to any value.
+#[cfg(test)]
+fn construction_sets_field(c: &Snippet, field: &str) -> bool {
+    field_set_value(c, field).is_some()
+}
+
+/// How many literals (`{`, `[`) and argument lists (`(`) are still open at
+/// the end of `prefix`.
+fn nesting(prefix: &str) -> (i32, i32) {
+    let (mut literals, mut args) = (0, 0);
+    for ch in prefix.chars() {
+        match ch {
+            '{' | '[' => literals += 1,
+            '}' | ']' => literals -= 1,
+            '(' => args += 1,
+            ')' => args -= 1,
+            _ => {}
+        }
+    }
+    (literals, args)
+}
+
+/// The value text after a setter token: the argument list of a builder
+/// `call`, or a key's or assignment's right-hand side up to the next `,`,
+/// `;`, newline or closer at the same depth. Brackets inside the value are
+/// balanced, so `time.Duration(0)` comes back whole.
+fn value_after(rest: &str, call: bool) -> String {
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' | ';' | '\n' if depth == 0 && !call => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    rest[..end].trim().to_string()
+}
+
+/// What the spec's fields say about the constructions at the site: the first
+/// field a construction sets, with the construction, and the value when that
+/// value is a spec-declared unbounded sentinel. A construction that sets the
+/// field to a real value outweighs one that sets it to a sentinel, on
+/// purpose: goindex attaches every construction of the type to the site, and
+/// a whole-call bound found anywhere wins over a sentinel elsewhere, as it
+/// does for every other mechanism.
+fn field_evidence<'a>(
+    s: &'a ConfigSpec,
+    constructions: &'a [Snippet],
+) -> Option<(&'a str, &'a Snippet, Option<String>)> {
+    let mut sentinel = None;
+    for f in &s.fields {
+        for c in constructions {
+            if let Some(v) = field_set_value(c, f) {
+                if !v.is_empty() && s.is_unbounded_sentinel(&v) {
+                    sentinel.get_or_insert((f.as_str(), c, Some(v)));
+                } else {
+                    return Some((f.as_str(), c, None));
+                }
+            }
+        }
+    }
+    sentinel
+}
+
+fn cite(c: &Snippet) -> String {
+    if c.file.is_empty() {
+        String::new()
+    } else {
+        format!(" at {}:{}", c.file, c.line)
+    }
+}
+
+/// What one config spec proves at one site, given the constructions the
+/// retriever attached to it.
+enum ConfigEvidence {
+    Whole(String),
+    Phase(String),
+    /// A named field set to a spec-declared unbounded sentinel: positive
+    /// evidence the bound was switched off, the CallArg lane's
+    /// `unbounded_sentinels` read against a construction (po-av01j.25).
+    Unbounded(String),
+    /// The spec was found for this client and cannot be checked here, so it
+    /// must be credited neither as a pass nor as a violation (po-m2ill).
+    Unresolved(String),
+    None,
+}
+
+/// Read a config spec against the site's constructions.
+///
+/// The key is a type; the bound lives in a field of it. `net/http.Client` is
+/// bounded end to end by `Timeout` and `http.Client{}` blocks forever, and the
+/// served spec keyed on the bare type satisfied both: it never looked. A
+/// whole-call `this_client` spec is now credited on one of two grounds: the
+/// library bounds the type by default (`default_bound`), so constructing it
+/// is the evidence; or a construction sets one of the fields the spec names.
+/// A spec that says neither is reported as unresolved rather than credited,
+/// because nothing at the site can corroborate or refute it. A declared bound
+/// is exempt: an operator's claim about the type as deployed, not about a
+/// field.
+fn config_evidence(s: &ConfigSpec, key: &str, constructions: &[Snippet]) -> ConfigEvidence {
+    // A declared (.revelara.yaml) bound carries its policy provenance into
+    // the reason: the finding must be auditable back to the declaration.
+    if s.declared {
+        return ConfigEvidence::Whole(format!("bound {}", s.rationale));
+    }
+    if s.names_no_bounding_field() {
+        return ConfigEvidence::Unresolved(format!(
+            "client config {key} names no bounding field or default"
+        ));
+    }
+    let default = match s.default_bound {
+        DefaultBound::Seconds { seconds } => Some(seconds),
+        _ => None,
+    };
+    let set = field_evidence(s, constructions);
+    match s.bounds {
+        Bounds::WholeCall => match (default, set) {
+            // A sentinel beats the library default too: the author wrote the
+            // value that turns it off.
+            (_, Some((field, at, Some(value)))) => ConfigEvidence::Unbounded(format!(
+                "client config {key} sets {field} to the spec-declared unbounded sentinel {value}{}",
+                cite(at)
+            )),
+            (Some(seconds), _) => ConfigEvidence::Whole(format!(
+                "client config {key} bounds by default ({seconds}s)"
+            )),
+            (None, Some((field, at, None))) => {
+                ConfigEvidence::Whole(format!("client config {key} sets {field}{}", cite(at)))
+            }
+            // A bare whole-call spec outside the this_client shape reached
+            // through a construction's symbol: read as it always was.
+            (None, None) if s.fields.is_empty() => {
+                ConfigEvidence::Whole(format!("client config {key}"))
+            }
+            (None, None) => ConfigEvidence::None,
+        },
+        // Phase-only never satisfies, so a bare phase-only spec keeps
+        // reporting its (partial) bound; a field-naming one reports it only
+        // when the field is actually set.
+        Bounds::PhaseOnly => match (default, set) {
+            // A phase field switched off bounds nothing, not even a phase.
+            (_, Some((_, _, Some(_)))) => ConfigEvidence::None,
+            (Some(seconds), _) => ConfigEvidence::Phase(format!(
+                "client config {key} bounds only a phase by default ({seconds}s)"
+            )),
+            (None, Some((field, at, None))) => ConfigEvidence::Phase(format!(
+                "client config {key} bounds only a phase (sets {field}{})",
+                cite(at)
+            )),
+            (None, None) if s.fields.is_empty() => {
+                ConfigEvidence::Phase(format!("client config {key} bounds only a phase"))
+            }
+            (None, None) => ConfigEvidence::None,
+        },
+        _ => ConfigEvidence::None,
+    }
+}
+
+/// File one config spec's evidence into the site's tallies. Reasons are
+/// deduplicated: the same spec is commonly reached both through a
+/// construction's symbol and through the call's client_type.
+fn record(
+    ev: ConfigEvidence,
+    whole: &mut Vec<String>,
+    phase: &mut Vec<String>,
+    unbounded: &mut Vec<String>,
+    unresolved: &mut Option<String>,
+) {
+    match ev {
+        ConfigEvidence::Whole(r) => {
+            if !whole.contains(&r) {
+                whole.push(r)
+            }
+        }
+        ConfigEvidence::Phase(r) => {
+            if !phase.contains(&r) {
+                phase.push(r)
+            }
+        }
+        ConfigEvidence::Unbounded(r) => {
+            if !unbounded.contains(&r) {
+                unbounded.push(r)
+            }
+        }
+        ConfigEvidence::Unresolved(r) => {
+            unresolved.get_or_insert(r);
+        }
+        ConfigEvidence::None => {}
+    }
 }
 
 fn is_served_request_root(site: &Site) -> bool {
@@ -232,6 +491,9 @@ pub fn propagate(
     let mut unbounded: Vec<String> = Vec::new();
     let mut served_unresolved = false;
     let mut client_unresolved = false;
+    // An exact-type config spec for this client that names no bounding
+    // field, so the site could not check it (po-m2ill).
+    let mut config_unresolved: Option<String> = None;
     // A timeout argument whose value the retriever could not resolve, on an API
     // whose spec says SOME values of it mean no bound.
     let mut value_unresolved = false;
@@ -380,40 +642,36 @@ pub fn propagate(
                 _ => {}
             },
             Mechanism::ClientConfig => {
-                let before = whole.len() + phase.len();
+                let before = whole.len() + phase.len() + unbounded.len();
+                // Both exact paths read the spec against the constructions
+                // the retriever attached to the site: the type match alone
+                // proved nothing when the bound is an optional field
+                // (po-m2ill), see `config_evidence`.
+                //
                 // EXACT (a): the client is constructed at this site with a
                 // config the specs recognise.
                 for c in &site.client_construction {
-                    match specs.config(&c.symbol).map(|s| s.bounds) {
-                        Some(Bounds::WholeCall) => {
-                            whole.push(format!("client config {}", c.symbol))
-                        }
-                        Some(Bounds::PhaseOnly) => {
-                            phase.push(format!("client config {} bounds only a phase", c.symbol))
-                        }
-                        _ => {}
+                    if let Some(s) = specs.config(&c.symbol) {
+                        record(
+                            config_evidence(s, &c.symbol, &site.client_construction),
+                            &mut whole,
+                            &mut phase,
+                            &mut unbounded,
+                            &mut config_unresolved,
+                        );
                     }
                 }
                 // EXACT (b): the call's own client_type carries a this_client
                 // config, even when the construction is not at this site.
                 if let Some(s) = specs.config(&site.client_type) {
                     if s.scope == Scope::ThisClient && s.confidence >= rvl_spec::MIN_CONFIDENCE {
-                        match s.bounds {
-                            // A declared (.revelara.yaml) bound carries its
-                            // policy provenance into the reason: the finding
-                            // must be auditable back to the declaration.
-                            Bounds::WholeCall if s.declared => {
-                                whole.push(format!("bound {}", s.rationale))
-                            }
-                            Bounds::WholeCall => {
-                                whole.push(format!("client config {}", site.client_type))
-                            }
-                            Bounds::PhaseOnly => phase.push(format!(
-                                "client config {} bounds only a phase",
-                                site.client_type
-                            )),
-                            _ => {}
-                        }
+                        record(
+                            config_evidence(s, &site.client_type, &site.client_construction),
+                            &mut whole,
+                            &mut phase,
+                            &mut unbounded,
+                            &mut config_unresolved,
+                        );
                     }
                 }
                 // FAMILY-SCOPED GUARDED BROADENING (po-3t3oj.34): only when no
@@ -423,8 +681,15 @@ pub fn propagate(
                 // (immich: ExifTool vs an unbounded Kysely pool). A call whose
                 // type has no recognised family, or whose family has no config,
                 // stays a finding. Conflicting configs within the family abstain
-                // to a human — never a guess.
-                if whole.len() + phase.len() == before {
+                // to a human — never a guess. An exact spec the lane could not
+                // check is not "no exact config": broadening past it would let
+                // the same bare spec back in through the family (po-m2ill).
+                // Nor is an exact field switched off: the repo-level family
+                // bound counts that same literal as "sets Timeout" without
+                // reading the value, so broadening would re-credit it.
+                if whole.len() + phase.len() + unbounded.len() == before
+                    && config_unresolved.is_none()
+                {
                     if let Some(bound) =
                         client_family(&site.client_type).and_then(|f| client.get(&f))
                     {
@@ -473,6 +738,19 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting client-config specs in this family".into(),
+        };
+    }
+    // An exact-type config spec that names no bounding field (po-m2ill): the
+    // lane found the spec for this client and could not check it against the
+    // construction, so neither a pass nor a violation is supported. Same
+    // class as the conflicts above, and it routes the same way -- to the spec
+    // author, who fixes it once for every site using the type. A declared
+    // bound in .revelara.yaml closes it per repo in the meantime.
+    if let Some(reason) = config_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason,
         };
     }
     // Resolved sentinel with nothing else bounding the call: decided, and
@@ -923,14 +1201,22 @@ mod tests {
             scope: Scope::ThisClient,
             confidence: 0.9,
             rationale: String::new(),
+            fields: vec![],
+            default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
             declared: false,
         }
     }
 
     #[test]
-    fn client_config_exact_type_satisfies() {
-        // The call's own client_type carries a whole-call this_client config,
-        // even without a per-site construction. Exact match needs no broadening.
+    fn client_config_exact_bare_type_abstains_instead_of_satisfying() {
+        // The call's own client_type carries a whole-call this_client config
+        // and there is no per-site construction. This used to SATISFY on the
+        // exact type match alone, which is the po-m2ill false negative: the
+        // spec names no field, so nothing at the site can show whether the
+        // bound the spec has in mind was ever set. It now abstains, naming
+        // what the spec is missing, so the site routes to a spec author
+        // instead of passing on a claim nothing can check.
         let f = propagate(
             &site(),
             &cache(
@@ -940,7 +1226,481 @@ mod tests {
             &ServedBound::None,
             &HashMap::new(),
         );
-        assert_eq!(f.verdict, Verdict::Satisfies);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(
+            f.reason.contains("names no bounding field"),
+            "the reason must say what the spec is missing: {}",
+            f.reason
+        );
+    }
+
+    // --- field evidence for client configs (po-m2ill) ---
+
+    /// The API half of the repro: `net/http.Client.Do`, bounded by client
+    /// config, over whatever config specs the caller names.
+    fn http_do_cache(configs: Vec<ConfigSpec>) -> SpecCache {
+        SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "net/http.Client".into(),
+                method: "Do".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::ClientConfig],
+                confidence: 0.95,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+            }],
+            configs,
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+        })
+    }
+
+    /// The served corpus's `net/http.Client` config spec, with the fields the
+    /// caller names. `&[]` is the shape that shipped: the rationale talks
+    /// about `Timeout`, the key is the bare type.
+    fn http_client_cfg(bounds: Bounds, fields: &[&str]) -> ConfigSpec {
+        ConfigSpec {
+            type_name: "net/http.Client".into(),
+            bounds,
+            scope: Scope::ThisClient,
+            confidence: 1.0,
+            rationale:
+                "net/http.Client has a Timeout field that bounds the entire HTTP request end-to-end"
+                    .into(),
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
+            declared: false,
+        }
+    }
+
+    /// A `c.Do(req)` site whose only construction is the literal `source`,
+    /// exactly as goindex puts it on the wire: the construction's symbol is
+    /// the TYPE, never a field name, and the field evidence, if any, is the
+    /// literal's text.
+    fn http_do_site(source: &str) -> Site {
+        Site {
+            file_path: "main.go".into(),
+            line_number: 7,
+            method: "Do".into(),
+            client_type: "net/http.Client".into(),
+            snippet: "c.Do(req)".into(),
+            client_construction: vec![Snippet {
+                file: "main.go".into(),
+                line: 6,
+                symbol: "net/http.Client".into(),
+                source: source.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_empty_client_literal_never_satisfies_a_bare_type_config() {
+        // THE po-m2ill repro: `&http.Client{}` blocks forever, and the served
+        // spec keyed on the bare type credited it whole-call twice over
+        // ("client config net/http.Client; client config net/http.Client").
+        let f = propagate(
+            &http_do_site("http.Client{}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &[])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_ne!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert_eq!(
+            f.reason,
+            "client config net/http.Client names no bounding field or default"
+        );
+    }
+
+    #[test]
+    fn a_type_bounded_by_default_satisfies_on_the_bare_type() {
+        // System.Net.Http.HttpClient enforces a 100s Timeout unless it is
+        // explicitly disabled: constructing the type is the evidence, and
+        // the spec says so in `default_bound` rather than in prose.
+        let mut by_default = http_client_cfg(Bounds::WholeCall, &[]);
+        by_default.type_name = "System.Net.Http.HttpClient".into();
+        by_default.default_bound = DefaultBound::Seconds { seconds: 100.0 };
+        let mut s = http_do_site("new HttpClient()");
+        s.client_type = "System.Net.Http.HttpClient".into();
+        s.client_construction[0].symbol = "System.Net.Http.HttpClient".into();
+        let mut cache = http_do_cache(vec![by_default]);
+        cache.merge(SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "System.Net.Http.HttpClient".into(),
+                method: "Do".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::ClientConfig],
+                confidence: 0.95,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+        }));
+        let f = propagate(&s, &cache, &ServedBound::None, &HashMap::new());
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert_eq!(
+            f.reason,
+            "client config System.Net.Http.HttpClient bounds by default (100s)"
+        );
+    }
+
+    #[test]
+    fn a_bare_type_config_abstains_even_when_the_literal_sets_the_field() {
+        // Without the spec naming its field, the propagator has no way to
+        // know that `Timeout` is the bound and `Transport` is not: that is
+        // library knowledge and it stays in the spec. The site abstains until
+        // the spec is re-authored with `fields`; it never guesses from text.
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 10 * time.Second}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &[])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_config_naming_the_field_satisfies_when_a_construction_sets_it() {
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 10 * time.Second}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(
+            f.reason.contains("Timeout") && f.reason.contains("main.go:6"),
+            "the reason must cite the field and where it was set: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_field_level_construction_symbol_is_field_evidence() {
+        // A retriever that emits the field itself as a construction snippet
+        // (symbol = field name) is read the same way as one that emits the
+        // literal's text.
+        let mut s = http_do_site("http.Client{}");
+        s.client_construction.push(Snippet {
+            file: "main.go".into(),
+            line: 6,
+            symbol: "Timeout".into(),
+            source: "10 * time.Second".into(),
+        });
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_config_naming_the_field_violates_when_no_construction_sets_it() {
+        // With the spec naming `Timeout`, an empty literal is the absence the
+        // search was complete enough to assert: the field is not there.
+        let f = propagate(
+            &http_do_site("http.Client{}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_phase_only_field_bounds_only_a_phase() {
+        // The transport's ResponseHeaderTimeout is set and the client's
+        // Timeout is not: the response body read is unbounded, so this is
+        // the phase-only violation, not a whole-call pass.
+        let mut s = http_do_site("http.Client{Transport: tr}");
+        s.client_construction.push(Snippet {
+            file: "main.go".into(),
+            line: 5,
+            symbol: "net/http.Transport".into(),
+            source: "http.Transport{ResponseHeaderTimeout: 5 * time.Second}".into(),
+        });
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![
+                http_client_cfg(Bounds::WholeCall, &["Timeout"]),
+                ConfigSpec {
+                    type_name: "net/http.Transport".into(),
+                    bounds: Bounds::PhaseOnly,
+                    scope: Scope::ThisClient,
+                    confidence: 0.9,
+                    rationale: String::new(),
+                    fields: vec!["ResponseHeaderTimeout".into()],
+                    default_bound: DefaultBound::Unknown,
+                    unbounded_sentinels: vec![],
+                    declared: false,
+                },
+            ]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(
+            f.reason.contains("only phase") && f.reason.contains("ResponseHeaderTimeout"),
+            "{}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_declared_bound_still_satisfies_without_field_evidence() {
+        // A `.revelara.yaml` declaration is an operator's claim about the
+        // type as deployed, not about a field. It keeps satisfying unchanged
+        // and its reason keeps the policy provenance.
+        let mut declared = http_client_cfg(Bounds::WholeCall, &[]);
+        declared.declared = true;
+        declared.rationale = "declared in .revelara.yaml: egress proxy enforces 30s".into();
+        let f = propagate(
+            &http_do_site("http.Client{}"),
+            &http_do_cache(vec![declared]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(
+            f.reason.contains("declared in .revelara.yaml"),
+            "{}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_bare_type_config_is_not_rescued_by_family_broadening() {
+        // An exact-type spec the lane cannot check is not "no exact bound
+        // found": broadening from the family would let the same bare spec
+        // back in through the side door.
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &http_do_site("http.Client{}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &[])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+    }
+
+    #[test]
+    fn construction_sets_field_reads_the_shapes_the_retrievers_emit() {
+        let src = |s: &str| Snippet {
+            source: s.into(),
+            ..Default::default()
+        };
+        // Set: a Go struct-literal key, a Go assignment, a Python keyword
+        // argument, a TS object-literal key, a Java builder call.
+        for s in [
+            "http.Client{Timeout: 10 * time.Second}",
+            "http.Client{\n\tTransport: tr,\n\tTimeout:   5 * time.Second,\n}",
+            "c.Timeout = 5 * time.Second",
+            "requests.Session(Timeout=5)",
+            "axios.create({ Timeout: 5000 })",
+            "HttpClient.newBuilder().Timeout(Duration.ofSeconds(5))",
+        ] {
+            assert!(construction_sets_field(&src(s), "Timeout"), "{s}");
+        }
+        // Not set: a different field with the name inside it, a comparison, a
+        // local `:=`, a path, a bare mention, and an empty literal.
+        for s in [
+            "http.Client{ReadTimeout: 5 * time.Second}",
+            "http.Client{Timeouts: cfg}",
+            "if c.Timeout == 0 { return }",
+            "Timeout := 5 * time.Second",
+            "Timeout::Default",
+            "// Timeout is configured elsewhere",
+            "http.Client{}",
+        ] {
+            assert!(!construction_sets_field(&src(s), "Timeout"), "{s}");
+        }
+        // Not set: a field of a NESTED literal or argument list belongs to
+        // the nested type. The Go dialer idiom sets only a dial timeout and
+        // blocks forever on a slow body read; crediting it as the client's
+        // `Timeout` is the false negative this lane exists to close.
+        for s in [
+            "http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: 30 * time.Second}).DialContext}}",
+            "http.Client{\n\tTransport: &http.Transport{\n\t\tDial: (&net.Dialer{\n\t\t\tTimeout: 30 * time.Second,\n\t\t}).Dial,\n\t},\n}",
+            "axios.create({ httpsAgent: new Agent({ Timeout: 1 }) })",
+            "httpx.Client(transport=Transport(Timeout=5))",
+        ] {
+            assert!(!construction_sets_field(&src(s), "Timeout"), "{s}");
+        }
+        // Still set: the client's own field beside a nested literal.
+        assert!(construction_sets_field(
+            &src("http.Client{Transport: &http.Transport{DialContext: d.DialContext}, Timeout: 10 * time.Second}"),
+            "Timeout"
+        ));
+        // A field-level snippet names the field in its symbol.
+        assert!(construction_sets_field(
+            &Snippet {
+                symbol: "Timeout".into(),
+                ..Default::default()
+            },
+            "Timeout"
+        ));
+    }
+
+    #[test]
+    fn field_set_value_reads_the_value_a_construction_gives_the_field() {
+        let src = |s: &str| Snippet {
+            source: s.into(),
+            ..Default::default()
+        };
+        for (s, want) in [
+            ("http.Client{Timeout: 0}", "0"),
+            ("http.Client{Timeout: time.Duration(0)}", "time.Duration(0)"),
+            (
+                "http.Client{\n\tTransport: tr,\n\tTimeout:   5 * time.Second,\n}",
+                "5 * time.Second",
+            ),
+            ("c.Timeout = 5 * time.Second", "5 * time.Second"),
+            ("requests.Session(Timeout=None)", "None"),
+            ("axios.create({ Timeout: 5000 })", "5000"),
+            (
+                "HttpClient.newBuilder().Timeout(Duration.ZERO)",
+                "Duration.ZERO",
+            ),
+        ] {
+            assert_eq!(
+                field_set_value(&src(s), "Timeout").as_deref(),
+                Some(want),
+                "{s}"
+            );
+        }
+        assert_eq!(field_set_value(&src("http.Client{}"), "Timeout"), None);
+        // A field-level snippet sets the field but carries no value.
+        assert_eq!(
+            field_set_value(
+                &Snippet {
+                    symbol: "Timeout".into(),
+                    ..Default::default()
+                },
+                "Timeout"
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_field_set_to_a_declared_unbounded_sentinel_violates_instead_of_satisfying() {
+        // `http.Client{Timeout: 0}` is Go for "no timeout": the author wrote
+        // the value that turns the bound off. Same principle as the CallArg
+        // lane (po-av01j.25): a resolved sentinel is positive evidence of
+        // unboundedness, decided as a violation with the value cited.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(
+            f.reason.contains("Timeout")
+                && f.reason.contains("sentinel")
+                && f.reason.contains("main.go:6"),
+            "the reason must cite the field, the sentinel and where it was set: {}",
+            f.reason
+        );
+    }
+
+    #[test]
+    fn a_sentinel_valued_field_is_outweighed_by_a_bounded_construction_of_the_same_type() {
+        // goindex attaches every construction of the type to the site. One
+        // literal turning the bound off beside one setting it is read the way
+        // every other mechanism is: a whole-call bound found anywhere wins.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let mut s = http_do_site("http.Client{Timeout: 0}");
+        s.client_construction.push(Snippet {
+            file: "other.go".into(),
+            line: 3,
+            symbol: "net/http.Client".into(),
+            source: "http.Client{Timeout: 10 * time.Second}".into(),
+        });
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(f.reason.contains("other.go:3"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_sentinel_valued_field_is_not_rescued_by_family_broadening() {
+        // The repo-level family bound is built from which fields a literal
+        // sets, not their values, so the same `Timeout: 0` literal reads as
+        // "sets Timeout" there. An exact field switched off is an exact
+        // answer, and broadening past it would re-credit the literal.
+        let mut spec = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        spec.unbounded_sentinels = vec!["0".into()];
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![spec]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn an_undeclared_config_sentinel_still_credits_the_set_field() {
+        // The parity half: a spec that declares no sentinels credits any set
+        // value, exactly as it did before the field existed. The gap is the
+        // spec author's to close, never guessed here.
+        let f = propagate(
+            &http_do_site("http.Client{Timeout: 0}"),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_bare_type_config_matched_through_a_construction_abstains_too() {
+        // Path (a): the spec is reached through the construction's symbol,
+        // not the call's client_type. Same shape, same answer.
+        let mut s = site();
+        s.client_construction = vec![Snippet {
+            symbol: "net/http.Client".into(),
+            source: "http.Client{}".into(),
+            ..Default::default()
+        }];
+        let f = propagate(
+            &s,
+            &cache(
+                vec![Mechanism::ClientConfig],
+                vec![http_client_cfg(Bounds::WholeCall, &[])],
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
     }
 
     // A ClientConfig-bounded call on a recognised DB client type, no exact config.
@@ -1418,6 +2178,9 @@ mod tests {
                 scope: Scope::ThisClient,
                 confidence: 0.9,
                 rationale: String::new(),
+                fields: vec![],
+                default_bound: DefaultBound::Unknown,
+                unbounded_sentinels: vec![],
                 declared: false,
             }],
         );

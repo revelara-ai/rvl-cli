@@ -459,6 +459,18 @@ pub struct EmissionSpec {
     pub rationale: String,
 }
 
+/// What a client's configuration TYPE proves about the calls made through it.
+///
+/// The key is a type, but the bound almost always lives in a FIELD of it that
+/// is optional at construction: `net/http.Client` is bounded end to end by
+/// `Timeout`, and an `http.Client{}` with no `Timeout` blocks forever. A spec
+/// that names the type and not the field therefore cannot be checked against a
+/// construction, and crediting it anyway is exactly how an empty client
+/// literal satisfied the timeout control (po-m2ill). Two fields close that
+/// gap, one per honest answer: `fields` names the field the bound lives in,
+/// and `default_bound` records that the library bounds the type on its own
+/// (`System.Net.Http.HttpClient` at 100s), so the bare type is the evidence.
+/// A whole-call `this_client` spec that says neither is credited for nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSpec {
     #[serde(rename = "type")]
@@ -469,12 +481,66 @@ pub struct ConfigSpec {
     pub confidence: f64,
     #[serde(default)]
     pub rationale: String,
+    /// The fields of `type` whose being SET at construction carries `bounds`
+    /// (`["Timeout"]` for `net/http.Client`). Empty for specs authored before
+    /// the field existed and for types bounded by default; see
+    /// [`ConfigSpec::names_no_bounding_field`] for what that costs a
+    /// whole-call `this_client` spec. Skipped on serialization when empty so
+    /// a legacy spec round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// What the type does with NO field set, in the same three states as
+    /// [`ApiSpec::default_bound`]: `Seconds` means the library bounds every
+    /// call through the type on its own, so constructing it IS the evidence;
+    /// `None` means it applies no default and the bound lives in `fields`;
+    /// `Unknown` is every spec authored before the field existed, which keeps
+    /// the honest wording -- nobody checked, so the bare type proves nothing.
+    #[serde(default)]
+    pub default_bound: DefaultBound,
+    /// Values of a field in `fields` that mean NO bound, the same idea as
+    /// [`ApiSpec::unbounded_sentinels`] for arguments: `http.Client{Timeout: 0}`
+    /// blocks forever, `Timeout=None` and `.timeout(Duration.ZERO)` likewise.
+    /// A construction that sets a named field to one of these is positive
+    /// evidence of unboundedness, not evidence of a bound. Library knowledge,
+    /// so it is read off the spec and never guessed; a spec that declares
+    /// none credits any set value, as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unbounded_sentinels: Vec<String>,
     /// True when this spec is a repo-local `.revelara.yaml` bound declaration
     /// rather than a factory-authored spec. Runtime-only overlay state: never
     /// emitted by the factory, skipped on serialization, and used to carry the
     /// policy provenance into the finding's reason.
     #[serde(default, skip_serializing)]
     pub declared: bool,
+}
+
+impl ConfigSpec {
+    /// A whole-call `this_client` spec keyed on a bare type: it asserts that
+    /// constructing the type bounds every call through it, without saying
+    /// which field carries the bound or that the library bounds it by
+    /// default. No construction can corroborate or refute such a spec, so the
+    /// consumer must not credit it: an `http.Client{}` with no `Timeout`
+    /// satisfied under exactly this shape. A declared (`.revelara.yaml`) bound
+    /// is exempt: it is an explicit operator claim about the type as deployed,
+    /// not a claim about a field.
+    pub fn names_no_bounding_field(&self) -> bool {
+        self.bounds == Bounds::WholeCall
+            && self.scope == Scope::ThisClient
+            && !self.declared
+            && self.fields.is_empty()
+            && !matches!(self.default_bound, DefaultBound::Seconds { .. })
+    }
+
+    /// Whether `value` is a declared unbounded sentinel for a field of this
+    /// type. Same trimmed, ASCII-case-insensitive comparison as
+    /// [`ApiSpec::is_unbounded_sentinel`], and for the same reason: a loose
+    /// match errs toward NOT crediting a bound.
+    pub fn is_unbounded_sentinel(&self, value: &str) -> bool {
+        let v = value.trim();
+        self.unbounded_sentinels
+            .iter()
+            .any(|s| s.trim().eq_ignore_ascii_case(v))
+    }
 }
 
 /// Whether the control governs a scope at all. Judged once per scope class,
@@ -749,9 +815,17 @@ impl SpecCache {
                 }
             }
         }
+        // A declared (.revelara.yaml) config is a policy decision about the
+        // type as deployed, not a competing estimate: it wins the merge
+        // outright, whatever the served spec's confidence, and a served spec
+        // never displaces it. Under the plain confidence rule the shipped
+        // `net/http.Client` spec at confidence 1 silently dropped an equal-
+        // confidence declaration, so the operator's claim never reached the
+        // propagator (po-m2ill).
         for (k, v) in other.configs {
             match self.configs.get(&k) {
-                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) if existing.declared => {}
+                Some(existing) if existing.confidence >= v.confidence && !v.declared => {}
                 _ => {
                     self.configs.insert(k, v);
                 }
@@ -850,6 +924,16 @@ impl SpecCache {
                 continue;
             }
             if !matches!(spec.bounds, Bounds::WholeCall | Bounds::PhaseOnly) {
+                continue;
+            }
+            // A whole-call spec that names no bounding field cannot be
+            // corroborated by any construction, so it is no basis for
+            // broadening either; one that names fields is corroborated only
+            // by a construction that sets one of them (po-m2ill). A literal
+            // that set only `Transport` is not a whole-call timeout.
+            if spec.names_no_bounding_field()
+                || (!spec.fields.is_empty() && !c.fields.iter().any(|f| spec.fields.contains(f)))
+            {
                 continue;
             }
             let Some(fam) = client_family(&c.type_name) else {
@@ -990,6 +1074,9 @@ mod tests {
                     scope: s,
                     confidence: c,
                     rationale: String::new(),
+                    fields: vec![],
+                    default_bound: DefaultBound::Unknown,
+                    unbounded_sentinels: vec![],
                     declared: false,
                 })
                 .collect(),
@@ -1050,6 +1137,148 @@ mod tests {
         );
     }
 
+    // --- config specs name their bounding fields (po-m2ill) ---
+
+    #[test]
+    fn config_spec_fields_default_to_empty_and_round_trip_when_set() {
+        let legacy: ConfigSpec = serde_json::from_str(
+            r#"{"type":"net/http.Client","bounds":"whole_call","scope":"this_client","confidence":1}"#,
+        )
+        .unwrap();
+        assert!(legacy.fields.is_empty());
+        assert_eq!(legacy.default_bound, DefaultBound::Unknown);
+        // A legacy spec re-serializes without the key: byte for byte what it was.
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("fields"));
+        let named: ConfigSpec = serde_json::from_str(
+            r#"{"type":"net/http.Client","bounds":"whole_call","scope":"this_client","confidence":1,"fields":["Timeout"],"default_bound":{"kind":"none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(named.fields, vec!["Timeout".to_string()]);
+        assert_eq!(named.default_bound, DefaultBound::None);
+        assert!(serde_json::to_string(&named)
+            .unwrap()
+            .contains(r#""fields":["Timeout"]"#));
+        let by_default: ConfigSpec = serde_json::from_str(
+            r#"{"type":"System.Net.Http.HttpClient","bounds":"whole_call","scope":"this_client","confidence":0.9,"default_bound":{"kind":"seconds","seconds":100}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_default.default_bound,
+            DefaultBound::Seconds { seconds: 100.0 }
+        );
+    }
+
+    fn cfg(bounds: Bounds, scope: Scope, fields: &[&str], declared: bool) -> ConfigSpec {
+        ConfigSpec {
+            type_name: "net/http.Client".into(),
+            bounds,
+            scope,
+            confidence: 1.0,
+            rationale: String::new(),
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            default_bound: DefaultBound::Unknown,
+            unbounded_sentinels: vec![],
+            declared,
+        }
+    }
+
+    fn cache_of(configs: Vec<ConfigSpec>) -> SpecCache {
+        SpecCache::from_file(SpecFile {
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+            apis: vec![],
+            configs,
+        })
+    }
+
+    fn repo_with(constructions: &[(&str, &[&str])]) -> RepoConfig {
+        RepoConfig {
+            snapshot_id: "r".into(),
+            constructions: constructions
+                .iter()
+                .map(|(t, fields)| ConfigFact {
+                    type_name: (*t).into(),
+                    fields: fields.iter().map(|f| f.to_string()).collect(),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn names_no_bounding_field_is_exactly_the_bare_whole_call_this_client_shape() {
+        assert!(cfg(Bounds::WholeCall, Scope::ThisClient, &[], false).names_no_bounding_field());
+        assert!(
+            !cfg(Bounds::WholeCall, Scope::ThisClient, &["Timeout"], false)
+                .names_no_bounding_field()
+        );
+        assert!(
+            !cfg(Bounds::WholeCall, Scope::ThisClient, &[], true).names_no_bounding_field(),
+            "a declared bound is an operator claim, not a field claim"
+        );
+        assert!(
+            !cfg(Bounds::PhaseOnly, Scope::ThisClient, &[], false).names_no_bounding_field(),
+            "phase-only never satisfies, so there is nothing to guard"
+        );
+        assert!(
+            !cfg(Bounds::WholeCall, Scope::ServedRequests, &[], false).names_no_bounding_field()
+        );
+        // A library default IS a named bound: constructing the type is the
+        // evidence (System.Net.Http.HttpClient's 100s).
+        let mut by_default = cfg(Bounds::WholeCall, Scope::ThisClient, &[], false);
+        by_default.default_bound = DefaultBound::Seconds { seconds: 100.0 };
+        assert!(!by_default.names_no_bounding_field());
+        // "Applies no default" without a field is still nothing to check.
+        let mut no_default = cfg(Bounds::WholeCall, Scope::ThisClient, &[], false);
+        no_default.default_bound = DefaultBound::None;
+        assert!(no_default.names_no_bounding_field());
+    }
+
+    #[test]
+    fn family_broadening_needs_a_construction_setting_the_named_field() {
+        let c = cache_of(vec![cfg(
+            Bounds::WholeCall,
+            Scope::ThisClient,
+            &["Timeout"],
+            false,
+        )]);
+        // A literal that sets only Transport carries no whole-call timeout.
+        assert_eq!(
+            c.client_bound_by_family(&repo_with(&[("net/http.Client", &["Transport"])]))
+                .get(&Family::Http),
+            None
+        );
+        assert_eq!(
+            c.client_bound_by_family(&repo_with(&[("net/http.Client", &["Timeout"])]))
+                .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+    }
+
+    #[test]
+    fn a_bare_whole_call_spec_is_not_a_basis_for_family_broadening() {
+        // The same spec the exact-type path refuses to credit must not
+        // broaden its neighbours either: nothing in a construction can
+        // corroborate a bound the spec never located.
+        let bare = cache_of(vec![cfg(Bounds::WholeCall, Scope::ThisClient, &[], false)]);
+        assert_eq!(
+            bare.client_bound_by_family(&repo_with(&[("net/http.Client", &["Timeout"])]))
+                .get(&Family::Http),
+            None
+        );
+        // The conservative direction is untouched: a bare phase-only spec
+        // still reports its phase-only bound, a violation downstream.
+        let phase = cache_of(vec![cfg(Bounds::PhaseOnly, Scope::ThisClient, &[], false)]);
+        assert_eq!(
+            phase
+                .client_bound_by_family(&repo_with(&[("net/http.Client", &["DialTimeout"])]))
+                .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::PhaseOnly))
+        );
+    }
+
     #[test]
     fn low_confidence_config_specs_are_ignored_entirely() {
         let c = cache(vec![(
@@ -1088,6 +1317,35 @@ mod tests {
         assert_eq!(got.blocking, Blocking::No);
         assert_eq!(got.rationale, "local");
     }
+    #[test]
+    fn a_declared_config_wins_the_merge_whatever_the_served_confidence() {
+        // The served corpus carries `net/http.Client` at confidence 1 and a
+        // `.revelara.yaml` declaration arrives at confidence 1 too. Under the
+        // plain higher-confidence rule the existing entry stays and the
+        // declaration is silently dropped, so the operator's claim never
+        // reaches the propagator and the site abstains on the bare spec it
+        // was declared to close (po-m2ill). A declaration is a policy
+        // decision about the type as deployed, so it wins the merge outright.
+        let mut base = cache_of(vec![cfg(Bounds::WholeCall, Scope::ThisClient, &[], false)]);
+        let mut declared = cfg(Bounds::WholeCall, Scope::ThisClient, &[], true);
+        declared.rationale = "declared in .revelara.yaml: egress proxy enforces 30s".into();
+        base.merge(cache_of(vec![declared]));
+        let got = base.config("net/http.Client").unwrap();
+        assert!(
+            got.declared,
+            "the declaration must displace the served spec"
+        );
+        assert!(got.rationale.contains("declared in .revelara.yaml"));
+        // And nothing served later displaces it, however confident.
+        let mut served = cfg(Bounds::WholeCall, Scope::ThisClient, &["Timeout"], false);
+        served.confidence = 1.0;
+        base.merge(cache_of(vec![served]));
+        assert!(
+            base.config("net/http.Client").unwrap().declared,
+            "a served spec must not displace a declaration"
+        );
+    }
+
     #[test]
     fn config_key_specs_parse_from_a_spec_file_and_are_looked_up() {
         // The G6 lane's spec kind rides the SAME SpecFile the signed cache

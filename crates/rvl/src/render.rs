@@ -110,8 +110,9 @@ pub struct Coverage {
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
     pub abstain_no_spec: usize,
-    /// Spec present but boundedness couldn't be established (search truncated)
-    /// — the retrieval-depth / out-of-code-bound lever.
+    /// Spec present but boundedness couldn't be established (search truncated,
+    /// or the client's config spec names no field to check) — the
+    /// retrieval-depth / out-of-code-bound lever.
     pub abstain_bounds: usize,
     /// Spec says blocking "depends" per call site — the per-site-judge lever.
     pub abstain_judge: usize,
