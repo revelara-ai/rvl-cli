@@ -5744,3 +5744,40 @@ fn an_empty_base_value_falls_through_to_the_next_link() {
         assert!(stderr.contains("GITHUB_BASE_REF"), "{empty:?}: {stderr}");
     }
 }
+
+// --- an empty API corpus is a commercial-tier condition (po-pqpry) ---
+
+/// The empty-corpus warning names the COMMERCIAL tier, so it must never fire
+/// on a scan that loaded no such tier. `--specs-file` is the only spec source
+/// a test can supply (the signed tiers need a private key this repo does not
+/// hold), and an empty dev spec file is exactly what the hook-path suites scan
+/// with on purpose: their stderr, their COVERAGE and their exit code must stay
+/// as they are.
+#[test]
+fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
+    let (root, packets, _) = write_runtime_python_fixture("empty-corpus");
+    let specs = root.join("empty_specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("0/1 API surfaces resolved"),
+        "the one site must abstain as no_spec: {stdout}"
+    );
+    assert!(
+        !stderr.contains("commercial spec cache carries 0 API specs"),
+        "no commercial tier was loaded, so the warning must not fire: {stderr}"
+    );
+    assert!(!stdout.contains("0 API specs"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}

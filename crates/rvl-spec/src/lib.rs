@@ -714,6 +714,17 @@ impl SpecCache {
     pub fn emission_specs(&self) -> &[EmissionSpec] {
         &self.emissions
     }
+    /// The apis section alone. `len()` sums every section, so a
+    /// vocabulary-only artifact (scopes, config keys, emissions, no apis)
+    /// reads as populated by it; the G1 call-site lane abstains on every
+    /// surface when THIS is zero (po-pqpry).
+    pub fn api_count(&self) -> usize {
+        self.apis.len()
+    }
+    /// The configs section alone (the construction-lane counterpart).
+    pub fn config_count(&self) -> usize {
+        self.configs.len()
+    }
     pub fn len(&self) -> usize {
         self.apis.len()
             + self.configs.len()
@@ -1740,5 +1751,30 @@ mod tests {
         }
         assert_eq!(client_family("axios.AxiosInstance"), Some(Family::Http));
         assert_eq!(client_family("ioredis.Redis"), Some(Family::Cache));
+    }
+
+    // --- section counts (po-pqpry) ---
+
+    /// `len()` sums every section, so a vocabulary-only artifact (scopes,
+    /// config keys, emissions, and NO apis) reads as populated. The G1 lane
+    /// needs the apis section counted alone: that is the number that was
+    /// zero for four weeks while every scan printed "commit clean".
+    #[test]
+    fn api_count_counts_the_apis_section_alone() {
+        let mut c = cache(vec![("t", Bounds::WholeCall, Scope::ThisClient, 0.9)]);
+        assert_eq!(c.api_count(), 0);
+        assert_eq!(c.config_count(), 1);
+        assert_eq!(c.len(), 1, "len() is the sum of every section");
+
+        c.merge(SpecCache::from_file(SpecFile {
+            apis: vec![api(Blocking::Yes, 0.9)],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+        }));
+        assert_eq!(c.api_count(), 1);
+        assert_eq!(c.config_count(), 1);
     }
 }

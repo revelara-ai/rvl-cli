@@ -150,6 +150,12 @@ pub struct Coverage {
     pub lang_status: Vec<LangStatus>,
     /// Which helper file ran per language, and how it was found (po-vd7ii).
     pub retrievers: Vec<RetrieverInfo>,
+    /// The commercial spec cache loaded and carried ZERO API specs while call
+    /// sites were in scope (po-pqpry). Every one of them abstained as
+    /// no_spec, so the resolved line above counts a corpus that judged
+    /// nothing, and it has to say so: "0/N resolved" read as an ordinary
+    /// low-coverage scan for four weeks.
+    pub empty_api_corpus: bool,
 }
 
 /// The one-line per-language roll-call. Rendered whenever anything was seen, so
@@ -533,6 +539,17 @@ pub fn render_ladder(
             let line = format!("  coverage is PARTIAL \u{2014} {note}");
             let _ = writeln!(o, "{}", paint(&line, "33", color));
         }
+    }
+    // An empty commercial API corpus (po-pqpry). Yellow like a degradation,
+    // because it is one: with zero API specs the resolved line describes a
+    // corpus that judged nothing, not a repo that is clean.
+    if cov.empty_api_corpus {
+        let line = format!(
+            "  0 API specs in the commercial spec cache \u{2014} every API surface abstained as \
+             no_spec; run `{BIN} sync`, and if it persists the published artifact is empty \
+             (report it)"
+        );
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
     }
     o.push_str(&render_lang_status(&cov, color));
     o.push_str(&render_coverage_degradations(&cov, color));
@@ -987,6 +1004,44 @@ mod by_design_coverage_tests {
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let out = render_ladder(&[], cov(30, &refs), None, "0.1s", false);
         assert!(out.contains("(+4 more)"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod empty_api_corpus_tests {
+    use super::*;
+
+    /// po-pqpry: the COVERAGE block must NAME an empty commercial API corpus,
+    /// not leave "0/N API surfaces resolved" to speak for itself. That line
+    /// looked like an ordinary low-coverage scan for four weeks.
+    #[test]
+    fn the_coverage_block_names_the_empty_corpus() {
+        let cov = Coverage {
+            resolved: 0,
+            total: 7,
+            abstain_no_spec: 7,
+            empty_api_corpus: true,
+            ..Default::default()
+        };
+        let out = render_ladder(&[], cov, None, "0.1s", false);
+        assert!(out.contains("0/7 API surfaces resolved"), "{out}");
+        assert!(out.contains("0 API specs"), "{out}");
+        assert!(out.contains("commercial"), "{out}");
+        assert!(out.contains("sync"), "{out}");
+    }
+
+    /// Every populated cache, and every OSS-only install, renders exactly as
+    /// before: no line, nothing.
+    #[test]
+    fn a_populated_corpus_prints_nothing_extra() {
+        let cov = Coverage {
+            resolved: 5,
+            total: 7,
+            abstain_no_spec: 2,
+            ..Default::default()
+        };
+        let out = render_ladder(&[], cov, None, "0.1s", false);
+        assert!(!out.contains("0 API specs"), "{out}");
     }
 }
 

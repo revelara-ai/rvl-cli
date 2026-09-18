@@ -556,19 +556,117 @@ fn spec_cache_checks() -> Vec<Check> {
                         .remedy(format!("run `{BIN} sync`")),
                 );
             }
+            // Installed and fresh is not the same as populated (po-pqpry):
+            // the artifact that served empty for four weeks passed both.
+            out.extend(api_spec_checks(&loaded.envelope));
         }
-        Err(_) => out.push(
-            // FAIL, not WARN: without a verifiable cache the deterministic
-            // scan exits 1 rather than degrading. That is a gap in exactly the
-            // sense this command's exit code reports.
-            Check::new("spec cache", Status::Fail, "installed")
-                .detail("no verifiable spec cache; a deterministic scan cannot run")
-                .remedy(format!(
-                    "run `{BIN} sync` (or `{BIN} cache import` for an air-gapped install)"
-                )),
-        ),
+        Err(_) => {
+            // No commercial tier. An OSS-only install (po-scnmv.13) still
+            // scans on the vocabulary baseline, and the doctor has to agree
+            // with the scan: that is a keyless install, not a broken one.
+            // `is_dir` first: `subdir_store` opens with `create_dir_all`, and
+            // a read-only diagnostic must not leave an `oss/` behind.
+            let today = rvl_cache::today_utc();
+            let oss = if cfg.cache_dir.join(rvl_cache::OSS_DIR).is_dir() {
+                store
+                    .subdir_store(rvl_cache::OSS_DIR)
+                    .and_then(|s| s.load(&keyset, &today))
+            } else {
+                Err(anyhow::anyhow!("no OSS tier"))
+            };
+            match oss {
+                Ok(loaded) => {
+                    out.push(
+                        Check::new("spec cache", Status::Pass, "installed").detail(format!(
+                            "OSS tier {} (schema {}, {:?}); no commercial tier",
+                            loaded.envelope.content_version, loaded.envelope.schema, loaded.source
+                        )),
+                    );
+                    if let Some(note) = loaded.staleness_note {
+                        out.push(
+                            Check::new("spec cache", Status::Warn, "freshness")
+                                .detail(note)
+                                .remedy(format!("run `{BIN} sync`")),
+                        );
+                    }
+                    out.push(commercial_tier_missing_check(!cfg.org_key.is_empty()));
+                }
+                Err(_) => out.push(
+                    // FAIL, not WARN: without a verifiable cache the
+                    // deterministic scan exits 1 rather than degrading. That
+                    // is a gap in exactly the sense this command's exit code
+                    // reports.
+                    Check::new("spec cache", Status::Fail, "installed")
+                        .detail("no verifiable spec cache; a deterministic scan cannot run")
+                        .remedy(format!(
+                            "run `{BIN} sync` (or `{BIN} cache import` for an air-gapped install)"
+                        )),
+                ),
+            }
+        }
     }
     out
+}
+
+/// The OSS tier loaded and the commercial one did not. Which of the two
+/// causes applies is decided by the same field `sync` gates on: no key
+/// means the lanes were never fetched, by design; a key with no verifiable
+/// commercial tier means `sync` never ran, failed, or the artifact was
+/// quarantined by the signature or schema check, which is exactly the class
+/// of corpus fault this command exists to surface, never a Pass.
+fn commercial_tier_missing_check(has_key: bool) -> Check {
+    if has_key {
+        Check::new("spec cache", Status::Warn, "commercial tier")
+            .detail(
+                "API key configured but no verifiable commercial tier loaded (never synced, \
+                 or the artifact was quarantined)",
+            )
+            .remedy(format!("run `{BIN} sync`"))
+    } else {
+        // The judgment lanes ride only in the commercial tier. The note
+        // `sync` prints, restated where a reader who wonders why nothing
+        // ever blocks will look.
+        Check::new("spec cache", Status::Pass, "judgment lanes").detail(
+            "not layered: no API key, so the commercial judgment lanes were \
+             not synced. Set RVL_API_KEY (or `api_key` in \
+             ~/.revelara/config.yaml) to layer them",
+        )
+    }
+}
+
+/// Installed, verified and fresh is not the same as POPULATED (po-pqpry).
+/// The commercial artifact that served from 2026-08-19 passed every check
+/// above and carried zero API specs, so every scan abstained on every API
+/// surface and read clean. Counted on the same parse the scan runs, so the
+/// doctor and the COVERAGE block cannot disagree about what the artifact
+/// holds. A WARN, never a FAIL: the scan still runs, it just judges nothing.
+fn api_spec_checks(env: &rvl_cache::Envelope) -> Vec<Check> {
+    let parsed = serde_json::to_string(&env.specs)
+        .map_err(anyhow::Error::from)
+        .and_then(|t| rvl_spec::SpecCache::load(&t));
+    match parsed {
+        Ok(cache) if cache.api_count() == 0 => vec![Check::new(
+            "spec cache",
+            Status::Warn,
+            "spec cache carries 0 API specs (commercial tier)",
+        )
+        .detail("every API surface abstains as no_spec, so a scan reads clean over unjudged code")
+        .remedy(format!(
+            "run `{BIN} sync`; if it persists, the published artifact is empty (report it)"
+        ))],
+        Ok(cache) => vec![
+            Check::new("spec cache", Status::Pass, "API specs").detail(format!(
+                "{} API spec(s), {} config spec(s)",
+                cache.api_count(),
+                cache.config_count()
+            )),
+        ],
+        Err(e) => vec![
+            Check::new("spec cache", Status::Warn, "spec payload").detail(format!(
+                "did not parse: {e}; a scan will fail to load this tier"
+            )),
+        ],
+    }
 }
 
 /// Delegated wholesale to `hook doctor` (po-av01j.163), which already answers
@@ -866,6 +964,83 @@ fn render_json(root: &Path, checks: &[Check], worst: Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- an empty commercial API corpus is a doctor finding (po-pqpry) ---
+
+    fn envelope_with(specs: serde_json::Value) -> rvl_cache::Envelope {
+        serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "content_version": "2026-09-17.1",
+            "specs": specs,
+        }))
+        .expect("test envelope")
+    }
+
+    /// A signed, current, verifiable artifact whose apis section is empty
+    /// passed the "installed" check for four weeks. The doctor has to say
+    /// what the scan's COVERAGE block now says: zero API specs, every
+    /// surface abstains.
+    #[test]
+    fn zero_api_specs_in_the_commercial_tier_is_a_warn() {
+        let checks = api_spec_checks(&envelope_with(serde_json::json!({
+            "apis": [],
+            "configs": []
+        })));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert_eq!(
+            checks[0].label,
+            "spec cache carries 0 API specs (commercial tier)"
+        );
+        assert!(
+            checks[0].remedy.as_deref().unwrap_or("").contains("sync"),
+            "{:?}",
+            checks[0].remedy
+        );
+    }
+
+    /// The root store not loading has two causes and only one of them is
+    /// "keyless install". With a key configured, a missing commercial tier
+    /// means `sync` never ran or the artifact was quarantined, and the
+    /// doctor must not read that as a healthy OSS-only install.
+    #[test]
+    fn a_configured_key_with_no_commercial_tier_is_a_warn() {
+        let check = commercial_tier_missing_check(true);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.label, "commercial tier");
+        assert!(check.detail.contains("quarantined"), "{}", check.detail);
+        assert!(
+            check.remedy.as_deref().unwrap_or("").contains("sync"),
+            "{:?}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn a_keyless_install_with_no_commercial_tier_passes_with_the_lanes_note() {
+        let check = commercial_tier_missing_check(false);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.label, "judgment lanes");
+        assert!(check.detail.contains("RVL_API_KEY"), "{}", check.detail);
+        assert!(check.remedy.is_none(), "{:?}", check.remedy);
+    }
+
+    #[test]
+    fn a_populated_api_section_passes_with_its_count() {
+        let checks = api_spec_checks(&envelope_with(serde_json::json!({
+            "apis": [{"type": "requests", "method": "get", "site_count": 1,
+                      "blocking": "yes", "bounded_by": ["call_arg"],
+                      "confidence": 0.95, "rationale": ""}],
+            "configs": []
+        })));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Pass);
+        assert!(
+            checks[0].detail.contains("1 API spec"),
+            "{}",
+            checks[0].detail
+        );
+    }
 
     #[test]
     fn the_typescript_pin_is_read_from_the_helper_not_restated() {
