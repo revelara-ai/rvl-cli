@@ -3251,6 +3251,332 @@ fn a_generated_banner_is_matched_by_evidence_not_by_path() {
     );
 }
 
+// --- test-path exclusion ---
+
+/// A Python mini-repo: one production file and one test file making the same
+/// unbounded `requests.get` call, so each is a violating site if scanned.
+fn repo_with_a_test_file(root: &std::path::Path) {
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    w(
+        "svc/app.py",
+        "import requests\n\n\ndef fetch():\n    return requests.get(\"https://x\", timeout=None)\n",
+    );
+    w(
+        "tests/test_app.py",
+        "import requests\n\n\ndef test_fetch():\n    return requests.get(\"https://y\", timeout=None)\n",
+    );
+}
+
+/// Scan `root` on the live Python lane with the seed specs, returning the
+/// ladder text and the `--out` document. `None` when python3 is absent.
+fn scan_python_repo(
+    root: &std::path::Path,
+    extra: &[&str],
+) -> Option<(String, String, serde_json::Value)> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: no python3");
+        return None;
+    }
+    let out_path = root.join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .args(extra)
+        .arg("--specs-file")
+        .arg(sentinel_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        scan_reached_a_verdict(&out),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    Some((stdout, stderr, doc))
+}
+
+fn site_paths(doc: &serde_json::Value) -> Vec<String> {
+    doc["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["site_id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn test_files_are_skipped_by_default_and_the_skip_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    repo_with_a_test_file(dir.path());
+    let Some((stdout, _, doc)) = scan_python_repo(dir.path(), &[]) else {
+        return;
+    };
+    let sites = site_paths(&doc);
+    assert!(
+        sites.iter().any(|s| s.contains("svc/app.py")),
+        "the production site must still be scanned: {sites:?}"
+    );
+    assert!(
+        !sites.iter().any(|s| s.contains("tests/test_app.py")),
+        "a test file must not produce API-surface sites by default: {sites:?}"
+    );
+    assert_eq!(doc["coverage"]["total"], 1, "{}", doc["coverage"]);
+    // Reported, never silent -- in COVERAGE and in the document, beside the
+    // machine-generated count it is modelled on.
+    assert!(
+        stdout.contains("Python: 1 test file skipped (tests are not scanned for API surfaces)"),
+        "the skip must be visible in COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["test_files_skipped"], 1,
+        "{}",
+        doc["coverage"]
+    );
+    assert_eq!(doc["coverage"]["generated_skipped"], 0);
+}
+
+#[test]
+fn include_tests_scans_test_files_and_reports_nothing_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    repo_with_a_test_file(dir.path());
+    let Some((stdout, _, doc)) = scan_python_repo(dir.path(), &["--include-tests"]) else {
+        return;
+    };
+    let sites = site_paths(&doc);
+    assert!(
+        sites.iter().any(|s| s.contains("tests/test_app.py")),
+        "--include-tests must restore the test file's sites: {sites:?}"
+    );
+    assert_eq!(doc["coverage"]["total"], 2, "{}", doc["coverage"]);
+    assert_eq!(
+        doc["coverage"]["test_files_skipped"], 0,
+        "{}",
+        doc["coverage"]
+    );
+    assert!(
+        !stdout.contains("test file"),
+        "nothing was skipped, so nothing is reported: {stdout}"
+    );
+}
+
+#[test]
+fn include_tests_is_refused_on_the_incremental_path() {
+    // The packet index caches what a helper returned, and the index is built
+    // with test paths skipped; honoring the flag on a warm scan would apply it
+    // to the re-parsed files only and report a partial answer as a whole one.
+    let dir = tempfile::tempdir().unwrap();
+    repo_with_a_test_file(dir.path());
+    let out = bin()
+        .args(["scan", dir.path().to_str().unwrap()])
+        .args(["--incremental", "--include-tests"])
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(!out.status.success(), "the combination must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--include-tests") && stderr.contains("--incremental"),
+        "the refusal must name both flags: {stderr}"
+    );
+}
+
+/// The environment a warm (`--incremental`) scan of the Python mini-repo
+/// needs: its own index, cache and home, and the in-tree pyindex.
+fn warm_python_scan(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    pass: usize,
+) -> Option<(String, String, serde_json::Value)> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: no python3");
+        return None;
+    }
+    let out_path = dir.join(format!("findings{pass}.json"));
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .args(["--incremental", "--specs-file"])
+        .arg(sentinel_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .env("RVL_INDEX_DIR", dir.join("index"))
+        .env("HOME", dir.join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        scan_reached_a_verdict(&out),
+        "warm scan errored: {stdout}\n{stderr}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    Some((stdout, stderr, doc))
+}
+
+/// A warm scan reports the REPOSITORY-WIDE count, not the files this pass
+/// re-parsed. The index flags each skipped test file when it is first
+/// retrieved, so a second run that reuses every entry still prints the line
+/// and writes the field. Without that, every hook scan after the first
+/// reported zero, and the exclusion the line exists to announce was silent
+/// on exactly the path the hooks use.
+#[test]
+fn a_warm_scan_reports_the_repo_wide_test_file_skip_from_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo_with_a_test_file(&root);
+    for pass in 0..2 {
+        let Some((stdout, stderr, doc)) = warm_python_scan(dir.path(), &root, pass) else {
+            return;
+        };
+        let sites = site_paths(&doc);
+        assert!(
+            !sites.iter().any(|s| s.contains("tests/test_app.py")),
+            "pass {pass}: a test file must not produce sites: {sites:?}"
+        );
+        assert!(
+            stdout.contains("Python: 1 test file skipped (tests are not scanned for API surfaces)"),
+            "pass {pass}: the skip must be visible in COVERAGE: {stdout}\n{stderr}"
+        );
+        assert_eq!(
+            doc["coverage"]["test_files_skipped"], 1,
+            "pass {pass}: {}",
+            doc["coverage"]
+        );
+        if pass == 1 {
+            assert!(
+                stderr.contains("re-parsed 0 stale"),
+                "the second pass must have reused the whole index, or this test \
+                 proves nothing about reuse: {stderr}"
+            );
+        }
+    }
+}
+
+/// `rvl index reindex` builds the index the warm scan reads, so it must
+/// flag skipped test files the same way, or a repo indexed by the
+/// post-commit warm rather than by a scan reports zero forever.
+#[test]
+fn index_reindex_flags_skipped_test_files_for_the_warm_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo_with_a_test_file(&root);
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: no python3");
+        return;
+    }
+    let out = bin()
+        .args(["index", "reindex"])
+        .arg(&root)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "reindex failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 test file skipped"),
+        "the warm must say what it declined to read: {stdout}"
+    );
+    let Some((stdout, stderr, doc)) = warm_python_scan(dir.path(), &root, 0) else {
+        return;
+    };
+    assert!(
+        stderr.contains("re-parsed 0 stale"),
+        "the scan must run entirely off the reindexed entries: {stderr}"
+    );
+    assert!(
+        stdout.contains("Python: 1 test file skipped (tests are not scanned for API surfaces)"),
+        "the reindexed skip must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["test_files_skipped"], 1,
+        "{}",
+        doc["coverage"]
+    );
+}
+
+/// A prebuilt stream's repo-scoped record carries the count too, and
+/// `--retrieved` must not turn it into a false zero: a stream captured from
+/// a helper that skipped 2 files scans as 2 skipped, not as nothing skipped.
+#[test]
+fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets).unwrap();
+    stream.push_str(
+        r#"{"packet_schema":2,"kind":"retrieval_stats","snapshot_id":"fixture","lang":"python","files_total":1,"files_parsed":1,"files_failed":0,"sites":0,"test_files_skipped":2,"test_files_skipped_paths":["tests/test_a.py","conftest.py"]}"#,
+    );
+    stream.push('\n');
+    std::fs::write(&packets, stream).unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        scan_reached_a_verdict(&out),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 test files skipped (tests are not scanned for API surfaces)"
+        ),
+        "the stream's own count must reach COVERAGE: {stdout}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(
+        doc["coverage"]["test_files_skipped"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
 // --- scan submission mode (po-av01j.153, rvl-cli parity) ---
 
 mod submit_mock {

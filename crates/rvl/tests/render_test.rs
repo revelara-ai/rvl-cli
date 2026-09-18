@@ -104,6 +104,7 @@ fn cov() -> Coverage {
         total: 1,
         abstain_no_spec: 0,
         generated_skipped: 0,
+        test_files_skipped: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -157,6 +158,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         total: 59,
         abstain_no_spec: 1,
         generated_skipped: 0,
+        test_files_skipped: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -215,6 +217,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             total: 5,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -256,6 +259,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -288,6 +292,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             total: 10,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -316,6 +321,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -343,6 +349,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -375,6 +382,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -454,6 +462,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            test_files_skipped: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -492,6 +501,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 total: 1,
                 abstain_no_spec: 0,
                 generated_skipped: 0,
+                test_files_skipped: Vec::new(),
                 abstain_bounds: 0,
                 abstain_judge: 0,
                 abstain_other: 0,
@@ -946,5 +956,42 @@ fn a_missing_helper_reads_as_not_installed_not_as_a_failure() {
     assert!(
         !out.contains("Go FAILED"),
         "an absent tool must not read as a broken one: {out}"
+    );
+}
+
+// --- test files skipped ---
+
+#[test]
+fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
+    // Excluding files without saying so reads as having scanned them, so
+    // the count is printed per language, in the same dim register as the
+    // machine-generated line. A zero prints nothing: an absent line means
+    // nothing was skipped, not that nothing was looked at.
+    let mut c = cov();
+    c.test_files_skipped = vec![
+        TestFilesSkipped {
+            lang: "TypeScript".into(),
+            count: 12,
+        },
+        TestFilesSkipped {
+            lang: "Python".into(),
+            count: 1,
+        },
+    ];
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains(
+            "  TypeScript: 12 test files skipped (tests are not scanned for API surfaces)"
+        ),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("  Python: 1 test file skipped (tests are not scanned for API surfaces)"),
+        "singular for one: {out}"
+    );
+    let quiet = render_lang_status(&cov(), false);
+    assert!(
+        !quiet.contains("test file"),
+        "zero must print nothing: {quiet}"
     );
 }

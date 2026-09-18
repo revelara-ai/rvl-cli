@@ -68,6 +68,13 @@ const ENTRIES: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("e
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Entry {
     hash: String,
+    /// The helper declined to read this file as test material.
+    /// Indistinguishable from scanned-with-zero-packets without the flag,
+    /// and a warm scan needs the distinction to report the repository-wide
+    /// skip count from reused entries. Defaults to false so an entry written
+    /// before the flag existed still decodes.
+    #[serde(default)]
+    test_skipped: bool,
     sites: Vec<Site>,
 }
 
@@ -156,10 +163,31 @@ impl PacketIndex {
 
     /// Record the packets retrieved from `file` at content hash `hash`.
     pub fn put(&self, file: &Path, hash: &str, sites: &[Site]) -> anyhow::Result<()> {
-        let entry = Entry {
-            hash: hash.to_string(),
-            sites: sites.to_vec(),
-        };
+        self.put_entry(
+            file,
+            Entry {
+                hash: hash.to_string(),
+                test_skipped: false,
+                sites: sites.to_vec(),
+            },
+        )
+    }
+
+    /// Record that the helper declined to read `file` (test material) at
+    /// content hash `hash`. Reused on the next pass like any entry, carrying
+    /// no packets, but counted as a skip rather than as a scan.
+    pub fn put_test_skipped(&self, file: &Path, hash: &str) -> anyhow::Result<()> {
+        self.put_entry(
+            file,
+            Entry {
+                hash: hash.to_string(),
+                test_skipped: true,
+                sites: Vec::new(),
+            },
+        )
+    }
+
+    fn put_entry(&self, file: &Path, entry: Entry) -> anyhow::Result<()> {
         let encoded = serde_json::to_string(&entry)?;
         let tx = self.db.begin_write()?;
         {
@@ -181,10 +209,19 @@ impl PacketIndex {
 
     /// Packets stored for `file`, if the stored hash matches `hash`.
     pub fn get(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Vec<Site>>> {
+        Ok(self.lookup(file, hash)?.map(|e| e.sites))
+    }
+
+    /// What the index holds for `file` at `hash`: its packets and whether it
+    /// was skipped as test material rather than scanned.
+    pub fn lookup(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
         Ok(self
             .entry(file)?
             .filter(|e| e.hash == hash)
-            .map(|e| e.sites))
+            .map(|e| Indexed {
+                sites: e.sites,
+                test_skipped: e.test_skipped,
+            }))
     }
 
     /// Number of indexed files.
@@ -293,6 +330,15 @@ impl PacketIndex {
             note: String::new(),
         })
     }
+}
+
+/// One indexed file, as [`PacketIndex::lookup`] returns it.
+#[derive(Debug, Clone)]
+pub struct Indexed {
+    pub sites: Vec<Site>,
+    /// The helper declined to read the file as test material; `sites` is
+    /// empty because nothing was retrieved, not because nothing was found.
+    pub test_skipped: bool,
 }
 
 /// Index key for a path. Absolute where possible so the same file is not

@@ -265,3 +265,31 @@ fn open_succeeds_when_the_holder_releases_during_the_wait() {
     PacketIndex::open_with_timeout(&path, Duration::from_secs(10))
         .expect("open must wait out a transient holder rather than fail");
 }
+
+/// A test file the helper declined to read is recorded as SKIPPED, not as
+/// scanned-with-zero-packets: the two look the same to `get`, and
+/// a warm scan has to tell them apart to report the repository-wide count
+/// from reused entries rather than from the files it happened to re-parse.
+#[test]
+fn a_skipped_test_file_is_flagged_and_reused_like_any_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("index.redb")).unwrap();
+    let t = write(dir.path(), "test_a.py", "def test(): pass\n");
+    let p = write(dir.path(), "a.py", "x = 1\n");
+    let h_t = hash_file(&t).unwrap();
+    let h_p = hash_file(&p).unwrap();
+    idx.put_test_skipped(&t, &h_t).unwrap();
+    idx.put(&p, &h_p, &[]).unwrap();
+    // Reusable on the next pass like any other entry, carrying no packets.
+    assert_eq!(idx.get(&t, &h_t).unwrap().map(|v| v.len()), Some(0));
+    let plan = idx.plan_reload(&[t.clone(), p.clone()]);
+    assert_eq!(plan.unchanged, vec![t.clone(), p.clone()]);
+    assert!(idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
+    assert!(!idx.lookup(&p, &h_p).unwrap().unwrap().test_skipped);
+    // A stale hash reads as absent, flag or no flag.
+    assert!(idx.lookup(&t, "stale").unwrap().is_none());
+    // Re-recording the file as scanned clears the flag: the entry describes
+    // the LAST retrieval, not the union of every retrieval.
+    idx.put(&t, &h_t, &[]).unwrap();
+    assert!(!idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
+}

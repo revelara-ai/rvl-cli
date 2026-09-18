@@ -1094,6 +1094,8 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            test_files_skipped: 0,
+            test_files_skipped_paths: Vec::new(),
         }
     }
 
@@ -1204,6 +1206,8 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            test_files_skipped: 0,
+            test_files_skipped_paths: Vec::new(),
         }
     }
 

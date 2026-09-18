@@ -560,6 +560,24 @@ pub struct RepoConfig {
     pub snapshot_id: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub constructions: Vec<ConfigFact>,
+    /// Test files the helper declined to read. Not a construction
+    /// fact: a retrieval statistic that rides the repo-scoped record because
+    /// that record is the one line every helper writes. Additive within v2
+    /// (defaults to zero on a stream from a helper that predates it), and
+    /// carried by whichever record kind the helper emits -- tsindex's
+    /// `repo_config`, pyindex's `retrieval_stats` -- so [`parse_stream`]
+    /// reads it off both. SUMMED by [`RepoConfig::absorb`]: each helper
+    /// reports the files it skipped in one invocation, and a polyglot or
+    /// batched stream carries several.
+    #[serde(default)]
+    pub test_files_skipped: usize,
+    /// The repo-relative paths behind that count. The count alone cannot be
+    /// attributed to files, and the packet index needs to flag each skipped
+    /// file so a warm scan reports the repository-wide number from reused
+    /// entries instead of the delta it happened to re-parse. Concatenated
+    /// by [`RepoConfig::absorb`] alongside the count.
+    #[serde(default)]
+    pub test_files_skipped_paths: Vec<String>,
 }
 
 impl RepoConfig {
@@ -595,6 +613,9 @@ impl RepoConfig {
                 self.constructions.push(fact);
             }
         }
+        self.test_files_skipped += other.test_files_skipped;
+        self.test_files_skipped_paths
+            .extend(other.test_files_skipped_paths);
     }
 }
 
@@ -639,6 +660,19 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                     // a polyglot stream a later language's empty repo_config
                     // must not erase an earlier language's construction facts.
                     cfg.absorb(rc);
+                }
+            } else if kind == "retrieval_stats" {
+                // A helper with no construction facts to report (pyindex)
+                // carries the count on its own repo-scoped record instead.
+                // Only this documented carrier is read: a future record of
+                // another kind with a same-named field must not be summed
+                // into the count without anyone deciding it should be.
+                if let Some(n) = v.get("test_files_skipped").and_then(|n| n.as_u64()) {
+                    cfg.test_files_skipped += usize::try_from(n).unwrap_or(usize::MAX);
+                }
+                if let Some(paths) = v.get("test_files_skipped_paths").and_then(|p| p.as_array()) {
+                    cfg.test_files_skipped_paths
+                        .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
                 }
             }
             continue;
@@ -874,6 +908,61 @@ mod tests {
         let (_, cfg, _) = parse_stream(&format!("{go}\n{zero}\n"));
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(cfg.snapshot_id, "x");
+    }
+
+    /// The test-file skip count rides whichever repo-scoped
+    /// record a helper writes: tsindex's `repo_config`, pyindex's
+    /// `retrieval_stats`. Both are consumed, and a polyglot stream SUMS
+    /// them, because a count that only one record kind could carry would be
+    /// a count only one language could report.
+    #[test]
+    fn test_files_skipped_rides_the_repo_scoped_record_of_either_kind() {
+        let ts = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"test_files_skipped":3}"#;
+        let py = r#"{"packet_schema":2,"kind":"retrieval_stats","snapshot_id":"x","lang":"python","files_total":1,"files_parsed":1,"files_failed":0,"sites":0,"test_files_skipped":2}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!("{ts}\n{py}\n"));
+        assert!(sites.is_empty(), "a stats record is never a site");
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.test_files_skipped, 5);
+    }
+
+    /// The skipped files are NAMED beside the count, and the names are
+    /// merged across records like the count is: the packet index flags each
+    /// one so a warm scan can report the repository-wide number.
+    #[test]
+    fn skipped_test_paths_are_carried_and_merged_across_records() {
+        let ts = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"test_files_skipped":1,"test_files_skipped_paths":["e2e/login.ts"]}"#;
+        let py = r#"{"packet_schema":2,"kind":"retrieval_stats","snapshot_id":"x","lang":"python","files_total":1,"files_parsed":1,"files_failed":0,"sites":0,"test_files_skipped":2,"test_files_skipped_paths":["tests/test_a.py","conftest.py"]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{ts}\n{py}\n"));
+        assert_eq!(cfg.test_files_skipped, 3);
+        assert_eq!(
+            cfg.test_files_skipped_paths,
+            vec!["e2e/login.ts", "tests/test_a.py", "conftest.py"]
+        );
+    }
+
+    /// Only the two documented carriers are read. A future repo-scoped
+    /// record of another kind that happens to carry a same-named field must
+    /// not be summed into the count without anyone deciding it should be.
+    #[test]
+    fn the_count_is_read_off_the_documented_record_kinds_only() {
+        let other = r#"{"packet_schema":2,"kind":"repo_structure","snapshot_id":"x","test_files_skipped":7,"test_files_skipped_paths":["x.py"]}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!("{other}\n"));
+        assert!(sites.is_empty());
+        assert_eq!(skipped, 0, "an unknown kind is routed away, not dropped");
+        assert_eq!(cfg.test_files_skipped, 0);
+        assert!(cfg.test_files_skipped_paths.is_empty());
+    }
+
+    /// A helper that predates the field (goindex, an older pyindex) stamps
+    /// no count, and the absence must read as zero, not as a parse failure
+    /// that drops the construction facts riding the same record.
+    #[test]
+    fn a_record_without_the_count_is_zero_skipped() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[{"type":"net/http.Server","fields":["WriteTimeout"]}]}"#;
+        let (_, cfg, skipped) = parse_stream(&format!("{go}\n"));
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.test_files_skipped, 0);
+        assert_eq!(cfg.constructions.len(), 1);
     }
 
     #[test]

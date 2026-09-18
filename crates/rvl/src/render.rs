@@ -106,6 +106,10 @@ pub struct Coverage {
     /// without saying so reads as having scanned them, and it moves every
     /// number above it.
     pub generated_skipped: usize,
+    /// Test files each helper declined to read, per language.
+    /// Same rule as `generated_skipped`: reported, never silent. Only
+    /// languages with a non-zero count are listed.
+    pub test_files_skipped: Vec<TestFilesSkipped>,
     pub resolved: usize,
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
@@ -163,7 +167,14 @@ pub struct Coverage {
 /// a lane that ran is visibly a lane that ran.
 pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
     use std::fmt::Write as _;
-    if cov.lang_status.is_empty() && cov.retrievers.is_empty() {
+    // Nothing to say only when NOTHING was seen or skipped. The incremental
+    // path has no roll-call (it reuses the index rather than running every
+    // helper), and its skipped-test count must not vanish with it.
+    if cov.lang_status.is_empty()
+        && cov.retrievers.is_empty()
+        && cov.generated_skipped == 0
+        && cov.test_files_skipped.is_empty()
+    {
         return String::new();
     }
     let mut o = String::new();
@@ -213,7 +224,26 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         );
         let _ = writeln!(o, "{}", paint(&g, "2", color));
     }
+    // Test paths a helper skipped: one line per language, in the
+    // same dim register as the generated-file line above. A zero prints
+    // nothing, so an absent line means nothing was skipped.
+    for t in cov.test_files_skipped.iter().filter(|t| t.count > 0) {
+        let line = format!(
+            "  {}: {} test file{} skipped (tests are not scanned for API surfaces)",
+            t.lang,
+            t.count,
+            if t.count == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
     o
+}
+
+/// How many test files one language's helper declined to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestFilesSkipped {
+    pub lang: String,
+    pub count: usize,
 }
 
 /// The COVERAGE lines naming languages that contributed no packets

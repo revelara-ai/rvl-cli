@@ -859,6 +859,10 @@ pub fn derive(
         repo_config: RepoConfig {
             snapshot_id: snapshot.to_string(),
             constructions: facts,
+            // rustindex reads every crate target the workspace declares;
+            // it has no test-path skip to count.
+            test_files_skipped: 0,
+            test_files_skipped_paths: Vec::new(),
         },
     }
 }

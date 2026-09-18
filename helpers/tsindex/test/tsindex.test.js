@@ -625,3 +625,127 @@ test('plain JavaScript is retrieved, with client types resolved', (t) => {
     'the client type must still resolve from the dependency types: ' + JSON.stringify(sites.map((s) => s.client_type)),
   );
 });
+
+// --- test-path skip ---
+//
+// Test code is not scanned for API surfaces: on one real repo 700+ of 889
+// violates were Playwright/msw calls inside E2E tests, and goindex has
+// always skipped _test.go the same way. The skip is COUNTED and reported on
+// the repo-scoped record, never silent, and --include-tests turns it off.
+
+const TESTS_FIXTURE_ROOT = path.join(HERE, '..', 'testdata', 'fixture-tests');
+
+// Every test-convention file in the fixture; each carries one strong-verb
+// call, so a file that is scanned is a file that produces a site.
+const FIXTURE_TEST_FILES = [
+  'src/service.test.ts',
+  'src/service.spec.ts',
+  'src/login.cy.ts',
+  'tests/helpers.ts',
+  'test/unit.ts',
+  '__tests__/a.ts',
+  '__mocks__/client.ts',
+  'e2e/login.ts',
+  'spec/b.ts',
+  'fixtures/c.ts',
+  'testdata/d.ts',
+  'cypress/support/e.ts',
+  'playwright.config.ts',
+  'jest.config.js',
+  'vitest.setup.ts',
+  'setupTests.ts',
+];
+const FIXTURE_PRODUCTION_FILES = [
+  'lib/contest/index.ts',
+  'src/attestation.ts',
+  'src/service.ts',
+];
+
+function retrieveFrom(root, ...extra) {
+  const out = run('--retrieve', '--root', root, ...extra);
+  const all = out
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const cfgs = all.filter((r) => r.kind === 'repo_config');
+  assert.strictEqual(cfgs.length, 1, 'exactly one repo_config record per run');
+  return { sites: all.filter((r) => r.kind !== 'repo_config'), cfg: cfgs[0] };
+}
+
+function scannedFiles(sites) {
+  return [...new Set(sites.map((r) => r.file_path))].sort();
+}
+
+test('isTestPath matches the documented conventions and nothing else', () => {
+  const { isTestPath } = require('../tsindex.js');
+  for (const p of FIXTURE_TEST_FILES) {
+    assert.strictEqual(isTestPath(p), true, `${p} is test material`);
+  }
+  // Exact path segments and exact basename shapes: a substring is not a
+  // convention. These are the false positives a looser rule would produce.
+  for (const p of [
+    ...FIXTURE_PRODUCTION_FILES,
+    'src/latest.ts',
+    'src/spectrum.ts',
+    'src/testify.ts',
+    'packages/test-utils/index.ts',
+    'vite.config.ts',
+    'src/e2e-client.ts',
+  ]) {
+    assert.strictEqual(isTestPath(p), false, `${p} is production code`);
+  }
+});
+
+test('test paths are skipped by default, counted, and reported on repo_config', () => {
+  const { sites, cfg } = retrieveFrom(TESTS_FIXTURE_ROOT);
+  assert.deepStrictEqual(scannedFiles(sites), FIXTURE_PRODUCTION_FILES);
+  assert.strictEqual(
+    cfg.test_files_skipped,
+    FIXTURE_TEST_FILES.length,
+    `the skip must be counted, never silent: ${JSON.stringify(cfg)}`,
+  );
+  // NAMED as well as counted: rvl's packet index flags each skipped file so
+  // a warm scan can report the repository-wide number from reused entries,
+  // not just the files one invocation re-parsed.
+  assert.deepStrictEqual(
+    [...cfg.test_files_skipped_paths].sort(),
+    [...FIXTURE_TEST_FILES].sort(),
+  );
+  // A construction inside a test file is not a repo-wide fact either: a
+  // timeout set in test scaffolding must not credit a bound to production.
+  assert.deepStrictEqual(cfg.constructions, []);
+});
+
+test('--include-tests scans test paths and reports zero skipped', () => {
+  const { sites, cfg } = retrieveFrom(TESTS_FIXTURE_ROOT, '--include-tests');
+  assert.deepStrictEqual(
+    scannedFiles(sites),
+    [...FIXTURE_PRODUCTION_FILES, ...FIXTURE_TEST_FILES].sort(),
+  );
+  assert.strictEqual(cfg.test_files_skipped, 0);
+  assert.deepStrictEqual(cfg.test_files_skipped_paths, []);
+  // With tests in scope the test-file construction IS visible.
+  assert.ok(
+    cfg.constructions.some((c) => c.fields.includes('connectionTimeoutMillis')),
+    JSON.stringify(cfg.constructions),
+  );
+});
+
+test('--files naming only a test file emits no sites and still counts the skip', () => {
+  // The incremental path asks for exactly the changed files; a commit that
+  // touches only a test must not produce test sites, and must not read as a
+  // helper that silently dropped a requested file.
+  const { sites, cfg } = retrieveFrom(TESTS_FIXTURE_ROOT, '--files', 'src/service.test.ts');
+  assert.strictEqual(sites.length, 0);
+  assert.strictEqual(cfg.test_files_skipped, 1);
+  assert.deepStrictEqual(cfg.test_files_skipped_paths, ['src/service.test.ts']);
+  const included = retrieveFrom(
+    TESTS_FIXTURE_ROOT,
+    '--files',
+    'src/service.test.ts',
+    '--include-tests',
+  );
+  assert.deepStrictEqual(scannedFiles(included.sites), ['src/service.test.ts']);
+  assert.strictEqual(included.cfg.test_files_skipped, 0);
+});

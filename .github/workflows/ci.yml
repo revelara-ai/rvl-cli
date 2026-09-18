@@ -68,7 +68,7 @@ jobs:
         run: cargo test --workspace
 
   helpers:
-    name: go helper (vet + test)
+    name: helpers (go vet + test, pyindex, tsindex)
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Reclaim workspace ownership (self-hosted runner hygiene)
@@ -103,6 +103,24 @@ jobs:
           # A consumer negotiates on this number before paying for a load;
           # it must always be printable without loading anything.
           test -n "$(go run . -packet-schema)"
+
+      # The Python and TypeScript helpers ship with their own suites, and
+      # the test-path skip is pinned there and nowhere else: the
+      # rvl cli tests drive the Python lane live but never the TypeScript
+      # one. A suite CI never runs is a contract nothing enforces.
+      - name: pyindex tests
+        working-directory: helpers/pyindex
+        run: python3 -m unittest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: helpers/tsindex/package.json
+
+      - name: tsindex tests
+        working-directory: helpers/tsindex
+        run: |
+          npm ci
+          node --test
 
       - name: No internal codenames
         run: |
