@@ -564,10 +564,16 @@ fn spec_cache_checks() -> Vec<Check> {
             // No commercial tier. An OSS-only install (po-scnmv.13) still
             // scans on the vocabulary baseline, and the doctor has to agree
             // with the scan: that is a keyless install, not a broken one.
+            // `is_dir` first: `subdir_store` opens with `create_dir_all`, and
+            // a read-only diagnostic must not leave an `oss/` behind.
             let today = rvl_cache::today_utc();
-            let oss = store
-                .subdir_store(rvl_cache::OSS_DIR)
-                .and_then(|s| s.load(&keyset, &today));
+            let oss = if cfg.cache_dir.join(rvl_cache::OSS_DIR).is_dir() {
+                store
+                    .subdir_store(rvl_cache::OSS_DIR)
+                    .and_then(|s| s.load(&keyset, &today))
+            } else {
+                Err(anyhow::anyhow!("no OSS tier"))
+            };
             match oss {
                 Ok(loaded) => {
                     out.push(
@@ -583,16 +589,7 @@ fn spec_cache_checks() -> Vec<Check> {
                                 .remedy(format!("run `{BIN} sync`")),
                         );
                     }
-                    // The judgment lanes ride only in the commercial tier.
-                    // The note `sync` prints, restated where a reader who
-                    // wonders why nothing ever blocks will look.
-                    out.push(
-                        Check::new("spec cache", Status::Pass, "judgment lanes").detail(
-                            "not layered: no API key, so the commercial judgment lanes were \
-                             not synced. Set RVL_API_KEY (or `api_key` in \
-                             ~/.revelara/config.yaml) to layer them",
-                        ),
-                    );
+                    out.push(commercial_tier_missing_check(!cfg.org_key.is_empty()));
                 }
                 Err(_) => out.push(
                     // FAIL, not WARN: without a verifiable cache the
@@ -609,6 +606,32 @@ fn spec_cache_checks() -> Vec<Check> {
         }
     }
     out
+}
+
+/// The OSS tier loaded and the commercial one did not. Which of the two
+/// causes applies is decided by the same field `sync` gates on: no key
+/// means the lanes were never fetched, by design; a key with no verifiable
+/// commercial tier means `sync` never ran, failed, or the artifact was
+/// quarantined by the signature or schema check, which is exactly the class
+/// of corpus fault this command exists to surface, never a Pass.
+fn commercial_tier_missing_check(has_key: bool) -> Check {
+    if has_key {
+        Check::new("spec cache", Status::Warn, "commercial tier")
+            .detail(
+                "API key configured but no verifiable commercial tier loaded (never synced, \
+                 or the artifact was quarantined)",
+            )
+            .remedy(format!("run `{BIN} sync`"))
+    } else {
+        // The judgment lanes ride only in the commercial tier. The note
+        // `sync` prints, restated where a reader who wonders why nothing
+        // ever blocks will look.
+        Check::new("spec cache", Status::Pass, "judgment lanes").detail(
+            "not layered: no API key, so the commercial judgment lanes were \
+             not synced. Set RVL_API_KEY (or `api_key` in \
+             ~/.revelara/config.yaml) to layer them",
+        )
+    }
 }
 
 /// Installed, verified and fresh is not the same as POPULATED (po-pqpry).
@@ -638,8 +661,11 @@ fn api_spec_checks(env: &rvl_cache::Envelope) -> Vec<Check> {
                 cache.config_count()
             )),
         ],
-        Err(e) => vec![Check::new("spec cache", Status::Warn, "spec payload")
-            .detail(format!("did not parse: {e}; the scan will report the same"))],
+        Err(e) => vec![
+            Check::new("spec cache", Status::Warn, "spec payload").detail(format!(
+                "did not parse: {e}; a scan will fail to load this tier"
+            )),
+        ],
     }
 }
 
@@ -971,6 +997,32 @@ mod tests {
             "{:?}",
             checks[0].remedy
         );
+    }
+
+    /// The root store not loading has two causes and only one of them is
+    /// "keyless install". With a key configured, a missing commercial tier
+    /// means `sync` never ran or the artifact was quarantined, and the
+    /// doctor must not read that as a healthy OSS-only install.
+    #[test]
+    fn a_configured_key_with_no_commercial_tier_is_a_warn() {
+        let check = commercial_tier_missing_check(true);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.label, "commercial tier");
+        assert!(check.detail.contains("quarantined"), "{}", check.detail);
+        assert!(
+            check.remedy.as_deref().unwrap_or("").contains("sync"),
+            "{:?}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn a_keyless_install_with_no_commercial_tier_passes_with_the_lanes_note() {
+        let check = commercial_tier_missing_check(false);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.label, "judgment lanes");
+        assert!(check.detail.contains("RVL_API_KEY"), "{}", check.detail);
+        assert!(check.remedy.is_none(), "{:?}", check.remedy);
     }
 
     #[test]
