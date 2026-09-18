@@ -556,7 +556,7 @@ fn spec_cache_checks() -> Vec<Check> {
                         .remedy(format!("run `{BIN} sync`")),
                 );
             }
-            // Installed and fresh is not the same as populated (po-pqpry):
+            // Installed and fresh is not the same as populated:
             // the artifact that served empty for four weeks passed both.
             out.extend(api_spec_checks(&loaded.envelope));
         }
@@ -634,7 +634,7 @@ fn commercial_tier_missing_check(has_key: bool) -> Check {
     }
 }
 
-/// Installed, verified and fresh is not the same as POPULATED (po-pqpry).
+/// Installed, verified and fresh is not the same as POPULATED.
 /// The commercial artifact that served from 2026-08-19 passed every check
 /// above and carried zero API specs, so every scan abstained on every API
 /// surface and read clean. Counted on the same parse the scan runs, so the
@@ -965,7 +965,7 @@ fn render_json(root: &Path, checks: &[Check], worst: Status) -> String {
 mod tests {
     use super::*;
 
-    // --- an empty commercial API corpus is a doctor finding (po-pqpry) ---
+    // --- an empty commercial API corpus is a doctor finding ---
 
     fn envelope_with(specs: serde_json::Value) -> rvl_cache::Envelope {
         serde_json::from_value(serde_json::json!({

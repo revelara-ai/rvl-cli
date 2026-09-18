@@ -1,4 +1,4 @@
-//! THE BARE-TYPE CLIENT-CONFIG GATE (po-m2ill).
+//! THE BARE-TYPE CLIENT-CONFIG GATE.
 //!
 //! One function, one `&http.Client{}` with no `Timeout`, one `c.Do(req)`: the
 //! classic Go hang. The served corpus carried a config spec keyed on the bare
