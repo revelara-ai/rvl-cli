@@ -466,7 +466,7 @@ pub struct EmissionSpec {
 /// `Timeout`, and an `http.Client{}` with no `Timeout` blocks forever. A spec
 /// that names the type and not the field therefore cannot be checked against a
 /// construction, and crediting it anyway is exactly how an empty client
-/// literal satisfied the timeout control (po-m2ill). Two fields close that
+/// literal satisfied the timeout control. Two fields close that
 /// gap, one per honest answer: `fields` names the field the bound lives in,
 /// and `default_bound` records that the library bounds the type on its own
 /// (`System.Net.Http.HttpClient` at 100s), so the bare type is the evidence.
@@ -783,7 +783,7 @@ impl SpecCache {
     /// The apis section alone. `len()` sums every section, so a
     /// vocabulary-only artifact (scopes, config keys, emissions, no apis)
     /// reads as populated by it; the G1 call-site lane abstains on every
-    /// surface when THIS is zero (po-pqpry).
+    /// surface when THIS is zero.
     pub fn api_count(&self) -> usize {
         self.apis.len()
     }
@@ -821,7 +821,7 @@ impl SpecCache {
         // never displaces it. Under the plain confidence rule the shipped
         // `net/http.Client` spec at confidence 1 silently dropped an equal-
         // confidence declaration, so the operator's claim never reached the
-        // propagator (po-m2ill).
+        // propagator.
         for (k, v) in other.configs {
             match self.configs.get(&k) {
                 Some(existing) if existing.declared => {}
@@ -929,7 +929,7 @@ impl SpecCache {
             // A whole-call spec that names no bounding field cannot be
             // corroborated by any construction, so it is no basis for
             // broadening either; one that names fields is corroborated only
-            // by a construction that sets one of them (po-m2ill). A literal
+            // by a construction that sets one of them. A literal
             // that set only `Transport` is not a whole-call timeout.
             if spec.names_no_bounding_field()
                 || (!spec.fields.is_empty() && !c.fields.iter().any(|f| spec.fields.contains(f)))
@@ -1139,7 +1139,7 @@ mod tests {
         );
     }
 
-    // --- config specs name their bounding fields (po-m2ill) ---
+    // --- config specs name their bounding fields ---
 
     #[test]
     fn config_spec_fields_default_to_empty_and_round_trip_when_set() {
@@ -1328,7 +1328,7 @@ mod tests {
         // plain higher-confidence rule the existing entry stays and the
         // declaration is silently dropped, so the operator's claim never
         // reaches the propagator and the site abstains on the bare spec it
-        // was declared to close (po-m2ill). A declaration is a policy
+        // was declared to close. A declaration is a policy
         // decision about the type as deployed, so it wins the merge outright.
         let mut base = cache_of(vec![cfg(Bounds::WholeCall, Scope::ThisClient, &[], false)]);
         let mut declared = cfg(Bounds::WholeCall, Scope::ThisClient, &[], true);
@@ -2015,7 +2015,7 @@ mod tests {
         assert_eq!(client_family("ioredis.Redis"), Some(Family::Cache));
     }
 
-    // --- section counts (po-pqpry) ---
+    // --- section counts ---
 
     /// `len()` sums every section, so a vocabulary-only artifact (scopes,
     /// config keys, emissions, and NO apis) reads as populated. The G1 lane

@@ -2504,7 +2504,7 @@ fn resolve_packet_stream(
 /// (server-entry sites are partitioned out), the loaded spec cache so callers
 /// can run the G6 config lane against the same specs, and the G2 server-entry
 /// lane's control findings (po-av01j.3), and whether the commercial tier
-/// loaded with an empty API corpus over real call sites (po-pqpry).
+/// loaded with an empty API corpus over real call sites.
 type ResolvedScan = (
     Vec<rvl_propagate::Finding>,
     Vec<rvl_triage::TriagedItem>,
@@ -2515,7 +2515,7 @@ type ResolvedScan = (
 );
 
 /// Did the commercial spec cache load with ZERO API specs while there were
-/// call sites to judge (po-pqpry)? Three conditions, each load-bearing:
+/// call sites to judge? Three conditions, each load-bearing:
 ///
 /// * `commercial_loaded`: the OSS tier ships `apis: []` BY DESIGN (it is
 ///   vocabulary, never judgment), so an OSS-only install is not this
@@ -2665,7 +2665,7 @@ fn findings_from_sites(
             // No envelope was opened, so there are no cache judgments to carry.
             // A dev spec file plus `--judgments` is the full offline pairing.
             // No tier loaded either, so an empty dev file is the author's
-            // choice, not an empty publish (po-pqpry).
+            // choice, not an empty publish.
             (std::fs::read_to_string(p)?, None, None, false)
         }
         None => {
@@ -2761,7 +2761,7 @@ fn findings_from_sites(
     if let Some(overlay) = &overlay_text {
         cache.merge(rvl_spec::SpecCache::load(overlay)?);
     }
-    // AN EMPTY COMMERCIAL API CORPUS IS NEVER QUIET (po-pqpry). On 2026-08-19
+    // AN EMPTY COMMERCIAL API CORPUS IS NEVER QUIET. On 2026-08-19
     // a vocabulary-only artifact superseded a populated one and served for
     // four weeks: every API surface abstained as no_spec and every scan
     // printed "commit clean" over code nothing had judged. The signature
@@ -6345,7 +6345,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    // --- an empty commercial API corpus is never quiet (po-pqpry) ---
+    // --- an empty commercial API corpus is never quiet ---
 
     /// The 2026-08-19 supersession: a vocabulary-only commercial artifact
     /// replaced a populated one, every API surface abstained as no_spec, and

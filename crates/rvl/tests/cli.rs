@@ -6071,7 +6071,7 @@ fn an_empty_base_value_falls_through_to_the_next_link() {
     }
 }
 
-// --- an empty API corpus is a commercial-tier condition (po-pqpry) ---
+// --- an empty API corpus is a commercial-tier condition ---
 
 /// The empty-corpus warning names the COMMERCIAL tier, so it must never fire
 /// on a scan that loaded no such tier. `--specs-file` is the only spec source

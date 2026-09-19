@@ -156,7 +156,7 @@ pub struct Coverage {
     /// Which helper file ran per language, and how it was found (po-vd7ii).
     pub retrievers: Vec<RetrieverInfo>,
     /// The commercial spec cache loaded and carried ZERO API specs while call
-    /// sites were in scope (po-pqpry). Every one of them abstained as
+    /// sites were in scope. Every one of them abstained as
     /// no_spec, so the resolved line above counts a corpus that judged
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
@@ -571,7 +571,7 @@ pub fn render_ladder(
             let _ = writeln!(o, "{}", paint(&line, "33", color));
         }
     }
-    // An empty commercial API corpus (po-pqpry). Yellow like a degradation,
+    // An empty commercial API corpus. Yellow like a degradation,
     // because it is one: with zero API specs the resolved line describes a
     // corpus that judged nothing, not a repo that is clean.
     if cov.empty_api_corpus {
@@ -1042,7 +1042,7 @@ mod by_design_coverage_tests {
 mod empty_api_corpus_tests {
     use super::*;
 
-    /// po-pqpry: the COVERAGE block must NAME an empty commercial API corpus,
+    /// this change: the COVERAGE block must NAME an empty commercial API corpus,
     /// not leave "0/N API surfaces resolved" to speak for itself. That line
     /// looked like an ordinary low-coverage scan for four weeks.
     #[test]

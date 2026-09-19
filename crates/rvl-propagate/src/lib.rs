@@ -262,7 +262,7 @@ enum ConfigEvidence {
     /// `unbounded_sentinels` read against a construction (po-av01j.25).
     Unbounded(String),
     /// The spec was found for this client and cannot be checked here, so it
-    /// must be credited neither as a pass nor as a violation (po-m2ill).
+    /// must be credited neither as a pass nor as a violation.
     Unresolved(String),
     None,
 }
@@ -492,7 +492,7 @@ pub fn propagate(
     let mut served_unresolved = false;
     let mut client_unresolved = false;
     // An exact-type config spec for this client that names no bounding
-    // field, so the site could not check it (po-m2ill).
+    // field, so the site could not check it.
     let mut config_unresolved: Option<String> = None;
     // A timeout argument whose value the retriever could not resolve, on an API
     // whose spec says SOME values of it mean no bound.
@@ -646,7 +646,7 @@ pub fn propagate(
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
-                // (po-m2ill), see `config_evidence`.
+                //, see `config_evidence`.
                 //
                 // EXACT (a): the client is constructed at this site with a
                 // config the specs recognise.
@@ -683,7 +683,7 @@ pub fn propagate(
                 // stays a finding. Conflicting configs within the family abstain
                 // to a human — never a guess. An exact spec the lane could not
                 // check is not "no exact config": broadening past it would let
-                // the same bare spec back in through the family (po-m2ill).
+                // the same bare spec back in through the family.
                 // Nor is an exact field switched off: the repo-level family
                 // bound counts that same literal as "sets Timeout" without
                 // reading the value, so broadening would re-credit it.
@@ -740,7 +740,7 @@ pub fn propagate(
             reason: "conflicting client-config specs in this family".into(),
         };
     }
-    // An exact-type config spec that names no bounding field (po-m2ill): the
+    // An exact-type config spec that names no bounding field: the
     // lane found the spec for this client and could not check it against the
     // construction, so neither a pass nor a violation is supported. Same
     // class as the conflicts above, and it routes the same way -- to the spec
@@ -1212,7 +1212,7 @@ mod tests {
     fn client_config_exact_bare_type_abstains_instead_of_satisfying() {
         // The call's own client_type carries a whole-call this_client config
         // and there is no per-site construction. This used to SATISFY on the
-        // exact type match alone, which is the po-m2ill false negative: the
+        // exact type match alone, which is the this change false negative: the
         // spec names no field, so nothing at the site can show whether the
         // bound the spec has in mind was ever set. It now abstains, naming
         // what the spec is missing, so the site routes to a spec author
@@ -1234,7 +1234,7 @@ mod tests {
         );
     }
 
-    // --- field evidence for client configs (po-m2ill) ---
+    // --- field evidence for client configs ---
 
     /// The API half of the repro: `net/http.Client.Do`, bounded by client
     /// config, over whatever config specs the caller names.
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn an_empty_client_literal_never_satisfies_a_bare_type_config() {
-        // THE po-m2ill repro: `&http.Client{}` blocks forever, and the served
+        // THE this change repro: `&http.Client{}` blocks forever, and the served
         // spec keyed on the bare type credited it whole-call twice over
         // ("client config net/http.Client; client config net/http.Client").
         let f = propagate(
