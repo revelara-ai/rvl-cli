@@ -172,14 +172,25 @@ const JOB_REGISTRATIONS = [
 // bullmq the handler, so the new-expression is the registration site.
 const JOB_CTOR_TYPES = [{ pkg: 'bullmq', type: 'Worker' }];
 
+// clientPackage splits the package off a client type: `bullmq` from
+// `bullmq.Queue`, and `express` from the bare `express` a syntactically
+// resolved module object carries (po-pk3fp.2). The framework tables below key
+// on the PACKAGE, so both spellings have to reach them.
+function clientPackage(clientType) {
+  if (!clientType) return '';
+  const i = clientType.lastIndexOf('.');
+  return i < 0 ? clientType : clientType.slice(0, i);
+}
+
 // isJobRegistration reports whether a RESOLVED client method call registers
 // background work: `<pkg>.<Type>` must match an entry's package (and type,
-// when the entry pins one) and the method its set.
+// when the entry pins one) and the method its set. An entry with `type: null`
+// also accepts the bare package, since the package identity is its signal.
 function isJobRegistration(clientType, method) {
   for (const entry of JOB_REGISTRATIONS) {
     if (!entry.methods.has(method)) continue;
     if (entry.type === null) {
-      if (clientType.startsWith(entry.pkg + '.')) return true;
+      if (clientType === entry.pkg || clientType.startsWith(entry.pkg + '.')) return true;
     } else if (clientType === entry.pkg + '.' + entry.type) {
       return true;
     }
@@ -229,10 +240,7 @@ const NEST_ROUTE_DECORATORS = new Set([
 // isServerFrameworkType reports whether a resolved `<pkg>.<Type>` client type
 // belongs to a known server framework package.
 function isServerFrameworkType(clientType) {
-  const i = clientType.lastIndexOf('.');
-  if (i < 0) return false;
-  return SERVER_PACKAGES.has(clientType.slice(0, i));
-
+  return SERVER_PACKAGES.has(clientPackage(clientType));
 }
 
 const NOISE_METHODS = new Set([
@@ -474,6 +482,261 @@ function packageFromImport(symbol) {
 }
 
 // ---------------------------------------------------------------------------
+// Syntactic package attribution: resolution WITHOUT an installed node_modules
+// (po-pk3fp.2).
+//
+// The TypeChecker needs the package on disk. A SPEC KEY does not. An import
+// statement names the package, and the source names the type:
+//
+//     import { Pool } from 'pg';          //          -> package `pg`
+//     const pool = new Pool({ ... });     // pool     -> pg.Pool
+//     constructor(private db: Pool) {}    // this.db  -> pg.Pool
+//     import axios from 'axios';          // axios    -> axios
+//
+// The first three reproduce the checker's key EXACTLY, which is the whole
+// point: the ratified TypeScript judgments are keyed on `pg.Pool`,
+// `ioredis.Redis`, `typeorm.DataSource`, so an approximate key would resolve
+// nothing. The fourth cannot -- a module object's type name (`AxiosStatic`)
+// is declared inside the package -- so it falls back to the bare import path,
+// which names the same thing at lower resolution and still classifies through
+// `rvl_spec::client_family`.
+//
+// This runs ONLY after the checker has failed, so an installed tree behaves
+// exactly as it did. Local symbol lookup still goes through the checker: what
+// is missing is node_modules, not the program, so `getSymbolAtLocation` finds
+// locals, parameters and class members as usual.
+// ---------------------------------------------------------------------------
+
+// Node's own modules are the module system's default lib, the analogue of the
+// TypeScript lib types `resolveClientType` already refuses: `node:fs` is not
+// an npm package and no package identity can be claimed for it. Read from the
+// runtime rather than hardcoded, so the list cannot drift.
+const NODE_BUILTINS = new Set(require('module').builtinModules);
+
+// tsconfig `compilerOptions.paths` patterns for THIS run. A path alias points
+// at a workspace directory, so attributing `@app/db` to a package named
+// `@app/db` would invent one. Reset per run (runRetrieve), because the test
+// harness drives several roots in one process.
+let _pathAliases = [];
+// Alias-shaped specifiers this run declined to attribute, for the abstain.
+let _unmappableSpecifiers = new Set();
+// Specifiers this run DID attribute to a package. The two together are what
+// says whether syntax could see anything at all.
+let _mappedSpecifiers = new Set();
+
+function resetSyntacticState(options) {
+  _pathAliases = options && options.paths ? Object.keys(options.paths) : [];
+  _unmappableSpecifiers = new Set();
+  _mappedSpecifiers = new Set();
+}
+
+// A tsconfig path pattern holds at most one `*`, per the TypeScript contract.
+function matchesPathAlias(spec) {
+  for (const pat of _pathAliases) {
+    const star = pat.indexOf('*');
+    if (star < 0) {
+      if (spec === pat) return true;
+      continue;
+    }
+    const head = pat.slice(0, star);
+    const tail = pat.slice(star + 1);
+    if (
+      spec.length >= head.length + tail.length &&
+      spec.startsWith(head) &&
+      spec.endsWith(tail)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// externalPackageOf maps a module specifier to the npm package it names, or
+// null when it names something else: a relative/absolute path, a Node builtin,
+// a `#` subpath import, or a tsconfig path alias. Subpaths are stripped the
+// same way `packageFromImport` strips them, so the two agree on the key.
+function externalPackageOf(spec) {
+  if (!spec) return null;
+  if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) return null;
+  const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
+  if (NODE_BUILTINS.has(bare) || NODE_BUILTINS.has(bare.split('/')[0])) return null;
+  if (matchesPathAlias(spec)) {
+    _unmappableSpecifiers.add(spec);
+    return null;
+  }
+  const parts = spec.split('/');
+  let pkg;
+  if (spec.startsWith('@')) {
+    if (parts.length < 2) return null;
+    pkg = parts[0] + '/' + parts[1];
+  } else {
+    pkg = parts[0];
+  }
+  if (!pkg) return null;
+  _mappedSpecifiers.add(pkg);
+  return pkg;
+}
+
+// importBindingOf reports how a symbol was bound by an import of an external
+// package: `{pkg, name, kind}` with kind `named` | `default` | `namespace`.
+// `name` is the EXPORTED name for a named import (`{ Pool as P }` is still
+// `Pool`, which is what the checker would have reported) and the local name
+// otherwise, because a default export's own name is not written anywhere else.
+function importBindingOf(sym) {
+  if (!sym || !sym.declarations) return null;
+  for (const decl of sym.declarations) {
+    let kind = null;
+    let name = '';
+    let spec = null;
+    if (ts.isImportSpecifier(decl)) {
+      kind = 'named';
+      name = (decl.propertyName || decl.name).text;
+    } else if (ts.isImportClause(decl)) {
+      kind = 'default';
+      name = decl.name ? decl.name.text : '';
+    } else if (ts.isNamespaceImport(decl)) {
+      kind = 'namespace';
+      name = decl.name.text;
+    } else if (
+      ts.isImportEqualsDeclaration(decl) &&
+      ts.isExternalModuleReference(decl.moduleReference) &&
+      ts.isStringLiteral(decl.moduleReference.expression)
+    ) {
+      // `import fsx = require('fs-extra')`, the TS form of a CommonJS import.
+      kind = 'namespace';
+      name = decl.name.text;
+      spec = decl.moduleReference.expression.text;
+    } else {
+      continue;
+    }
+    if (spec === null) {
+      let imp = decl;
+      while (imp && !ts.isImportDeclaration(imp)) imp = imp.parent;
+      if (!imp || !ts.isStringLiteral(imp.moduleSpecifier)) continue;
+      spec = imp.moduleSpecifier.text;
+    }
+    const pkg = externalPackageOf(spec);
+    if (!pkg) continue;
+    return { pkg, name, kind };
+  }
+  return null;
+}
+
+function symbolAt(node, checker) {
+  try {
+    return checker.getSymbolAtLocation(node);
+  } catch (_e) {
+    return undefined;
+  }
+}
+
+// syntacticQualifiedName resolves a TYPE reference or a constructor expression
+// -- `Pool`, `pg.Pool`, `Redis` -- to `<pkg>.<TypeName>`, following the root
+// identifier's import binding. Returns '' when the root is not imported from an
+// external package (a local class, an alias, an unresolvable name).
+function syntacticQualifiedName(entity, checker) {
+  const trail = [];
+  let root = entity;
+  for (;;) {
+    if (ts.isQualifiedName(root)) {
+      trail.unshift(root.right.text);
+      root = root.left;
+    } else if (ts.isPropertyAccessExpression(root)) {
+      trail.unshift(root.name.text);
+      root = root.expression;
+    } else {
+      break;
+    }
+  }
+  if (!ts.isIdentifier(root)) return '';
+  const bind = importBindingOf(symbolAt(root, checker));
+  if (!bind) return '';
+  // `pg.Pool` through a namespace import: the package comes from the import,
+  // the type name from what was written after it.
+  if (trail.length > 0) return bind.pkg + '.' + trail.join('.');
+  // A named import carries the exported name; a default import's local name IS
+  // the only name the class has here, and by convention it is the class name
+  // (`import Redis from 'ioredis'` -> ioredis.Redis).
+  return bind.name ? bind.pkg + '.' + bind.name : '';
+}
+
+// The declaration a receiver resolves to, when it is one that can carry a type:
+// a variable, a parameter (including a constructor parameter property), or a
+// class property/signature.
+function typedDeclarationOf(sym) {
+  if (!sym || !sym.declarations) return null;
+  for (const d of sym.declarations) {
+    if (
+      ts.isVariableDeclaration(d) ||
+      ts.isParameter(d) ||
+      ts.isPropertyDeclaration(d) ||
+      ts.isPropertySignature(d)
+    ) {
+      return d;
+    }
+  }
+  return null;
+}
+
+// syntacticClientType is the fallback resolver: `<pkg>.<Type>` when the source
+// names the type, the bare `<pkg>` when only the module object is in hand, and
+// '' when neither. `depth` bounds the chase -- through declarations, callee
+// chains and property chains -- and also breaks the cycle a pair of
+// mutually-initialised declarations would otherwise make.
+function syntacticClientType(node, checker, depth) {
+  if (!node || depth > 6) return '';
+  if (ts.isParenthesizedExpression(node) || ts.isAwaitExpression(node)) {
+    return syntacticClientType(node.expression, checker, depth);
+  }
+  if (ts.isNewExpression(node)) {
+    return node.expression ? syntacticQualifiedName(node.expression, checker) : '';
+  }
+  if (ts.isCallExpression(node)) {
+    // The RESULT of a call on a module object: `express()`, `axios.create()`,
+    // `mysql.createPool()`, `express.Router()`. The returned type is declared
+    // inside the package, so the package is what syntax can name. Noise is
+    // not this function's job -- a call on an imported root is attributed
+    // whether or not it produces a client, and the I/O-verb allowlist in
+    // siteFromCall is what decides whether a call on the result is a site.
+    return clientPackage(syntacticClientType(node.expression, checker, depth + 1));
+  }
+  if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return '';
+
+  // A property access usually has NO symbol here: resolving `axios.create` or
+  // `client.chat.completions` means reading the package's declarations, which
+  // is the thing that is missing. Fall through to the chain root rather than
+  // giving up.
+  const sym = symbolAt(node, checker);
+  if (!sym) return chainRootPackage(node, checker, depth);
+  // The receiver IS the import: a module object or namespace. Its type name
+  // lives in the package, so the bare import path is the most this can say.
+  const bind = importBindingOf(sym);
+  if (bind) return bind.kind === 'named' ? bind.pkg + '.' + bind.name : bind.pkg;
+
+  const decl = typedDeclarationOf(sym);
+  if (!decl) return chainRootPackage(node, checker, depth);
+  // An annotation is the strongest signal and the one that reproduces the
+  // checker's key: `private db: Pool` -> pg.Pool.
+  if (decl.type && ts.isTypeReferenceNode(decl.type)) {
+    const named = syntacticQualifiedName(decl.type.typeName, checker);
+    if (named) return named;
+  }
+  if (decl.initializer) return syntacticClientType(decl.initializer, checker, depth + 1);
+  return chainRootPackage(node, checker, depth);
+}
+
+// A property chain INTO a package: `client.chat.completions` on a
+// `new OpenAI()`. The member's own type name (`Completions`) is declared
+// inside the package, so syntax cannot reach it -- but the chain's root can
+// still be attributed, and the package is the receiver's identity one level
+// coarser. Returns '' for anything whose root is not a package (a local
+// object, `this` with no annotation), so no site is invented.
+function chainRootPackage(node, checker, depth) {
+  if (!ts.isPropertyAccessExpression(node)) return '';
+  return clientPackage(syntacticClientType(node.expression, checker, depth + 1));
+}
+
+// ---------------------------------------------------------------------------
 // Receiver type resolution via the TypeChecker.
 //
 // Returns { clientType, resolved, version }:
@@ -540,8 +803,11 @@ function _computeReturnsThenable(call, checker) {
   }
 }
 
-function resolveClientType(receiver, checker, program) {
-  const unresolved = { clientType: '', resolved: false, version: '' };
+// checkerClientType is the primary resolver: the TypeChecker's answer, or null
+// when it has none. Null is the signal to try syntax (see resolveClientType),
+// so every give-up point below is one place, not a scattered policy.
+function checkerClientType(receiver, checker, program) {
+  const unresolved = null;
   let type;
   try {
     type = checker.getTypeAtLocation(receiver);
@@ -582,7 +848,6 @@ function resolveClientType(receiver, checker, program) {
     if (!stable) return unresolved;
     return {
       clientType: pkgInfo.pkg + '.' + stable,
-      resolved: true,
       version: packageVersion(pkgInfo.dir),
     };
   }
@@ -601,9 +866,40 @@ function resolveClientType(receiver, checker, program) {
     // stable spelling available: fail closed rather than emit a local path.
     const stable = stableTypeName(typeName, null, null);
     if (!stable) return unresolved;
-    return { clientType: imp.pkg + '.' + stable, resolved: true, version: '' };
+    return { clientType: imp.pkg + '.' + stable, version: '' };
   }
   return unresolved;
+}
+
+// resolveClientType returns `{clientType, resolved, version, tier}`:
+//   tier `high`   -- the TypeChecker resolved a concrete named type from an
+//                    identifiable external package.
+//   tier `medium` -- the checker could not, but the source's imports and
+//                    annotations name the package and the type (po-pk3fp.2).
+//                    The usual cause is an uninstalled node_modules, where the
+//                    checker fails SILENTLY rather than erroring.
+//   tier `low`    -- neither; `resolved` is false and `clientType` is ''.
+//
+// `resolved` is true for both high and medium, and it has to be: it is the
+// gate that lets a WEAK I/O verb through, so a false here drops every
+// `pool.query` and `redis.get` on an uninstalled tree as container noise. The
+// tier is how the two are told apart.
+function resolveClientType(receiver, checker, program) {
+  const byChecker = checkerClientType(receiver, checker, program);
+  if (byChecker) {
+    return {
+      clientType: byChecker.clientType,
+      resolved: true,
+      version: byChecker.version,
+      tier: 'high',
+    };
+  }
+  const bySyntax = syntacticClientType(receiver, checker, 0);
+  if (bySyntax) {
+    // No package on disk means no package.json, so no version to report.
+    return { clientType: bySyntax, resolved: true, version: '', tier: 'medium' };
+  }
+  return { clientType: '', resolved: false, version: '', tier: 'low' };
 }
 
 // ---------------------------------------------------------------------------
@@ -717,16 +1013,18 @@ function emissionIdentity(receiver, method, clientType, resolved, checker) {
     return { framework: 'console', category: 'log' };
   }
   if (resolved && clientType) {
-    if (
-      (clientType.startsWith('winston.') || clientType === 'pino' || clientType.startsWith('pino.')) &&
-      EMISSION_LOG_METHODS.has(method)
-    ) {
+    // Keyed on the PACKAGE, so a syntactically resolved `winston` reaches the
+    // same arm as the checker's `winston.Logger` (po-pk3fp.2). Without this a
+    // logger on an uninstalled tree routes into the G1 client lane instead of
+    // the emission lane -- a wrong KIND of site, not merely a coarser key.
+    const pkg = clientPackage(clientType);
+    if ((pkg === 'winston' || pkg === 'pino') && EMISSION_LOG_METHODS.has(method)) {
       return { framework: clientType, category: 'log' };
     }
-    if (clientType.startsWith('@opentelemetry/') && EMISSION_TRACE_METHODS.has(method)) {
+    if (pkg.startsWith('@opentelemetry/') && EMISSION_TRACE_METHODS.has(method)) {
       return { framework: clientType, category: 'trace' };
     }
-    if (clientType.startsWith('@sentry/') && EMISSION_CAPTURE_METHODS.has(method)) {
+    if (pkg.startsWith('@sentry/') && EMISSION_CAPTURE_METHODS.has(method)) {
       return { framework: clientType, category: 'error_capture' };
     }
     return null;
@@ -937,6 +1235,10 @@ function siteKey(rec) {
 function runRetrieve(root, snapshot, filesArg, includeTests) {
   const program = buildProgram(root);
   const checker = program.getTypeChecker();
+  // Syntactic attribution reads the program's own `paths`, so a tsconfig-less
+  // repo simply has no aliases. Reset per run rather than per process: the
+  // test harness drives several roots in one node.
+  resetSyntacticState(program.getCompilerOptions());
   const rootReal = fs.realpathSync(root);
 
   const relPathOf = (abs) => {
@@ -1071,7 +1373,29 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
   // NAMED, not just counted: rvl's packet index flags each skipped file so a
   // warm scan can report the repository-wide number from reused entries.
   repoConfig.test_files_skipped_paths = [...skippedTests].sort();
-  return { records, repoConfig };
+
+  // The dependency state this run saw, carried on the wire (po-pk3fp.2).
+  // Retrieval statistics, like test_files_skipped, riding the one line the
+  // helper writes on every run. An uninstalled tree resolves from SYNTAX, at
+  // tier `medium` and without client_version, and that is a fact about the
+  // scan rather than an ambient property of the machine that ran it -- the
+  // whole reason this used to abstain instead.
+  const uninstalled = missingDependencyTrees(root);
+  repoConfig.dependency_trees_uninstalled = uninstalled.length;
+  repoConfig.dependency_trees_uninstalled_paths = [...uninstalled].sort();
+  // Import specifiers syntax could not map to a package: tsconfig path
+  // aliases, which name a workspace directory rather than an npm package.
+  repoConfig.unmappable_specifiers = [..._unmappableSpecifiers].sort();
+  return {
+    records,
+    repoConfig,
+    // Not emitted: what main() needs to tell "resolved less than it would
+    // have" from "could not resolve anything at all".
+    attribution: {
+      packages: _mappedSpecifiers.size,
+      unmappable: [..._unmappableSpecifiers].sort(),
+    },
+  };
 }
 
 // collectRepoConfig walks EVERY scanned source file (repo-scoped, so never
@@ -1214,7 +1538,7 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
   const receiver = prop.expression;
   const method = prop.name.getText();
 
-  const { clientType, resolved, version } = resolveClientType(
+  const { clientType, resolved, version, tier: typeTier } = resolveClientType(
     receiver,
     checker,
     program,
@@ -1251,7 +1575,7 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
         site_kind: SITE_KIND_SERVER_ENTRY,
         provenance: {
           client_type_resolved: true,
-          confidence_tier: 'high',
+          confidence_tier: typeTier,
           callers_total: 0,
           callers_included: 0,
           callees_total: 0,
@@ -1278,18 +1602,27 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     // friends are registrations, not I/O, and are usually synchronous. That
     // altitude has its own type-driven selection table (isJobRegistration), so
     // a G1 awaitability heuristic must not silently veto it.
+    //
+    // At tier `medium` the awaitability arm is SKIPPED (po-pk3fp.2). It is a
+    // type test, and with no installed package `callReturnsThenable` fails
+    // open on every call -- so keeping it would admit every property call in
+    // the file, which is precisely the zod/knex builder flood it was written
+    // to stop (on infisical, 99.5% of resolved sites carried no I/O verb and
+    // zod + knex builders were 86.5% of those). A gate that cannot evaluate
+    // must not wave things through: at `medium` a named I/O verb is required.
     const namedIO = STRONG_IO_METHODS.has(method) || WEAK_IO_METHODS.has(method);
     if (
       namedIO ||
       isJobRegistration(clientType, method) ||
-      callReturnsThenable(node, checker, clientType + '.' + method)
+      (typeTier === 'high' &&
+        callReturnsThenable(node, checker, clientType + '.' + method))
     ) {
       emit = true;
-      tier = 'high';
+      tier = typeTier;
     }
   } else if (STRONG_IO_METHODS.has(method)) {
     emit = true;
-    tier = resolved ? 'high' : 'low';
+    tier = resolved ? typeTier : 'low';
   }
   if (!emit) return null;
 
@@ -1346,7 +1679,7 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
 function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
   const callee = node.expression;
   if (!callee) return null;
-  const { clientType, resolved, version } = resolveClientType(
+  const { clientType, resolved, version, tier } = resolveClientType(
     callee,
     checker,
     program,
@@ -1376,7 +1709,7 @@ function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
     client_construction: [],
     provenance: {
       client_type_resolved: true,
-      confidence_tier: 'high',
+      confidence_tier: tier,
       callers_total: 0,
       callers_included: 0,
       callees_total: 0,
@@ -1612,44 +1945,62 @@ function main(argv) {
     const root = path.resolve(args.root);
     const snapshot = args.name || path.basename(root) || root;
 
-    // ABSTAIN ON AN UNINSTALLED DEPENDENCY TREE (po-av01j.132).
+    // AN UNINSTALLED DEPENDENCY TREE IS A DEGRADATION, NOT AN ABSTAIN
+    // (po-av01j.132, narrowed by po-pk3fp.2).
     //
     // tsindex resolves client types through the TypeScript compiler, which
     // reads node_modules. Without it, resolution fails SILENTLY rather than
     // erroring: the interesting receivers (axios, octokit, a query builder)
     // come back unresolved and are skipped, so the run reports a small number
     // of sites and exit 0 -- which reads as "scanned, and this repo is mostly
-    // clean".
+    // clean". Measured on this helper's own fixture, identical source and
+    // tsconfig with only node_modules differing: 32 sites -> 6. The gate-set
+    // contract records the same effect at scale, 1,911 -> 83,927 sites at one
+    // fixed commit. A PARTIAL result that looks complete is worse than none,
+    // so for a year this abstained outright.
     //
-    // Measured, identical source and tsconfig, only node_modules differing:
-    // 0 sites without, 1 site (axios.AxiosStatic) with. On a real repo the
-    // same effect returned 3 sites from 90 .ts files, and the gate-set
-    // contract already records 1,911 -> 83,927 sites at one fixed commit on a
-    // larger repo. A PARTIAL result that looks complete is worse than none.
+    // That cost 68 of the fleet's 97 TypeScript repos, every customer scanning
+    // a checkout they have not installed, and every repo whose install cannot
+    // be made to succeed. The durable answer is that a SPEC KEY does not need
+    // the module on disk: the import names the package and the source names
+    // the type, so `pg.Pool` is recoverable from syntax (see
+    // syntacticClientType). The run below now does that, reports tier `medium`
+    // for what it recovered that way, and carries the dependency state on its
+    // repo_config record so the degradation is never silent.
     //
-    // Same charter as rustindex on an unloadable cargo workspace and goindex
-    // with no module: abstain rather than guess. Exit 3 is the helper ABSTAIN
-    // code rvl reads (po-av01j.102), so it surfaces as a COVERAGE line.
-    const missing = missingDependencyTrees(root);
-    if (missing.length > 0) {
-      process.stderr.write(
-        `tsindex: ${missing.length} workspace(s) declare dependencies but have no ` +
-          `installed node_modules (${missing.slice(0, 3).join(', ')}` +
-          `${missing.length > 3 ? ', ...' : ''}). TypeScript type resolution reads ` +
-          `node_modules, and without it client receivers resolve to nothing and are ` +
-          `silently skipped -- so tsindex abstains rather than reporting a partial ` +
-          `scan as a complete one. Install dependencies (npm ci / pnpm install ` +
-          `--frozen-lockfile / yarn install --immutable) and re-run.\n`,
-      );
-      return 3;
-    }
-
-    const { records, repoConfig } = runRetrieve(
+    // What syntax genuinely cannot cross is a tsconfig PATH ALIAS: `@app/db`
+    // names a workspace directory, and following it needs the package contents
+    // this tree does not have. When aliases are the only external imports
+    // there is nothing left to recover, and the original argument applies
+    // unchanged -- so that case still abstains, and names the aliases, which
+    // is the only actionable thing to say about it. Exit 3 is the helper
+    // ABSTAIN code rvl reads (po-av01j.102), surfacing as a COVERAGE line.
+    const { records, repoConfig, attribution } = runRetrieve(
       root,
       snapshot,
       args.files,
       args.includeTests,
     );
+    if (
+      repoConfig.dependency_trees_uninstalled > 0 &&
+      attribution.packages === 0 &&
+      attribution.unmappable.length > 0
+    ) {
+      process.stderr.write(
+        `tsindex: ${repoConfig.dependency_trees_uninstalled} workspace(s) declare ` +
+          `dependencies but have no installed node_modules, and every external ` +
+          `import goes through a tsconfig path alias ` +
+          `(${attribution.unmappable.slice(0, 3).join(', ')}` +
+          `${attribution.unmappable.length > 3 ? ', ...' : ''}), which names a ` +
+          `workspace directory rather than a package. Nothing here can be ` +
+          `attributed to a package without the installed tree, so tsindex ` +
+          `abstains rather than reporting a near-empty scan as a complete one. ` +
+          `Install dependencies (npm ci / pnpm install --frozen-lockfile / ` +
+          `yarn install --immutable) and re-run.\n`,
+      );
+      return 3;
+    }
+
     emit(records);
     // One repo-scoped record per run, after the site packets. rvl_core's
     // parse_stream keys on kind:"repo_config" to route it away from sites.
@@ -1657,7 +2008,12 @@ function main(argv) {
     process.stderr.write(
       `${snapshot}: ${records.length} retrieved sites, ` +
         `${repoConfig.constructions.length} config constructions, ` +
-        `${repoConfig.test_files_skipped} test files skipped\n`,
+        `${repoConfig.test_files_skipped} test files skipped` +
+        (repoConfig.dependency_trees_uninstalled > 0
+          ? `, ${repoConfig.dependency_trees_uninstalled} uninstalled ` +
+            `workspace(s) resolved from import syntax (tier medium, no versions)`
+          : '') +
+        `\n`,
     );
     return 0;
   }

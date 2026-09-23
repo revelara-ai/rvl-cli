@@ -38,9 +38,11 @@ is a `receiver.method(...)` call. Every record carries:
 - `client_type` — the resolved, package-qualified type (`pg.Pool`,
   `axios.AxiosStatic`, `ioredis.Redis`); `""` when unresolved.
 - `client_version` — the resolved package's version from its `package.json`,
-  when readable; `""` otherwise. Kept a **separate field** rather than folded
-  into `client_type`, so `site_key` (which contains `client_type`) stays stable
-  across version bumps and matches `rvl_index::site_key`.
+  when readable; `""` otherwise, and always `""` for a syntactically resolved
+  type (there is no installed package to read a version from). Kept a
+  **separate field** rather than folded into `client_type`, so `site_key`
+  (which contains `client_type`) stays stable across version bumps and matches
+  `rvl_index::site_key`.
 - `snippet` — source of the full call expression, so a call-time `{ timeout }`
   is visible.
 - `enclosing_function_body` — source of the enclosing function, or `""` at
@@ -72,7 +74,10 @@ line, mirroring goindex's `RepoConfig`:
 
     {"packet_schema":2,"kind":"repo_config","snapshot_id":"<name>",
      "constructions":[{"type":"typeorm.DataSource","fields":["query_timeout"]}],
-     "test_files_skipped":12,"test_files_skipped_paths":["e2e/login.ts", ...]}
+     "test_files_skipped":12,"test_files_skipped_paths":["e2e/login.ts", ...],
+     "dependency_trees_uninstalled":2,
+     "dependency_trees_uninstalled_paths":["backend","frontend"],
+     "unmappable_specifiers":["@app/db"]}
 
 Its `kind` is the literal `"repo_config"`; `rvl_core::parse_stream` keys on that
 to route it away from the site stream. `constructions` is a **deduped** list of
@@ -97,10 +102,20 @@ case-insensitive substring match: `query_timeout`, `statement_timeout`,
 
 **`type` resolution** reuses the site packets' package-identity resolver: the
 constructed type resolves to `<pkg>.<TypeName>` (`typeorm.DataSource`, `pg.Pool`,
-`axios.AxiosInstance`); when it cannot be attributed to an external package
-(a local subclass, an unresolved factory) it falls back to the
-constructor/factory identifier text (`GlobalWorkspaceDataSource`,
-`axios.create`).
+`axios.AxiosInstance`); on an uninstalled tree it resolves syntactically to the
+same `<pkg>.<TypeName>` for a `new X({...})` and to the bare package for a
+factory (`axios`); and when it cannot be attributed to an external package at
+all (a local subclass, a locally-defined factory) it falls back to the
+constructor/factory identifier text (`GlobalWorkspaceDataSource`).
+
+`dependency_trees_uninstalled` (additive) is how many declaring workspaces had
+no installed `node_modules`, and `_paths` names them. A non-zero count means
+this run resolved client types from IMPORT SYNTAX rather than the TypeChecker
+— tier `medium`, no `client_version` — so the reader can tell a degraded scan
+from a full one instead of inferring it from a low site count.
+`unmappable_specifiers` names the import specifiers neither path could
+attribute (tsconfig path aliases). Like `test_files_skipped` these are
+retrieval statistics, not construction facts.
 
 `test_files_skipped` (v2, additive) is how many test files this run declined
 to read, and `test_files_skipped_paths` names them (repo-relative, sorted)
@@ -179,6 +194,58 @@ that introduced the receiver's root identifier (`import { Pool } from 'pg'` →
 `pg`). This is weaker than the path signal but recovers a package name the
 compiler could not attribute to a directory.
 
+### Resolution without an installed `node_modules`
+
+The TypeChecker needs the package on disk. A SPEC KEY does not: an import
+statement names the package, and the source names the type.
+
+    import { Pool } from 'pg';           //         -> package `pg`
+    const pool = new Pool({ ... });      // pool    -> pg.Pool
+    constructor(private db: Pool) {}     // this.db -> pg.Pool
+    import Redis from 'ioredis';         //
+    const redis = new Redis();           // redis   -> ioredis.Redis
+    import axios from 'axios';           // axios   -> axios
+
+So when the checker comes back empty, tsindex attributes the receiver
+syntactically and reports tier `medium`. The first cases reproduce the
+checker's key EXACTLY, which is the point: the ratified TypeScript judgments
+are keyed on `pg.Pool`, `ioredis.Redis`, `typeorm.DataSource`, and an
+approximate key would match nothing. What syntax cannot reach is a name
+declared INSIDE the package — a module object's type (`axios.AxiosStatic`), a
+member of a property chain (`client.chat.completions`), a handler callback's
+parameter (express's `res`) — and there it falls back to the bare import path,
+which names the same thing one level coarser and still classifies through
+`rvl_spec::client_family`.
+
+Two consequences are deliberate:
+
+- The **awaitability gate is skipped** at tier `medium`. It is a type test, and
+  with no package `callReturnsThenable` fails open on every call, so keeping it
+  would admit every property call in the file — the zod/knex builder flood it
+  was written to stop. At `medium` a named I/O verb is required instead, which
+  is why `axios.create(...)` and `z.string()` are not sites while
+  `pool.query(...)` and `redis.get(...)` are.
+- The **framework tables key on the package**, not on `<pkg>.<Type>`, so a
+  bare `express`, `node-cron` or `winston` still reaches the server-entry,
+  background-job and emission lanes. A logger landing in the G1 client lane
+  would be a wrong KIND of site, not merely a coarser key.
+
+Measured on this helper's own fixture, identical source and `tsconfig`, only
+`node_modules` differing: 32 sites installed, 6 before this existed, 26 after.
+An installed tree is bit-identical to before — the fallback runs only after the
+checker has failed. An installed tree is still strictly better (versions, the
+awaitability filter, chained and callback-typed receivers), which is why a
+TypeScript gate set must still pin lockfile provenance.
+
+**Abstain.** For a year an uninstalled tree abstained outright (exit 3), on the
+argument that a partial result which looks complete is worse than none. That
+cost 68 of the fleet's 97 TypeScript repos. The abstain now fires only for the
+residue syntax genuinely cannot cross: a tree with no installed
+`node_modules` whose external imports ALL go through tsconfig `paths` aliases,
+which name a workspace directory rather than a package and can only be
+followed through the package contents that are missing. The stderr message
+names those specifiers.
+
 ### Confidence tiers (the dynamic-typing reality)
 
 TypeScript is gradually typed, so resolution is reported per site rather than
@@ -187,6 +254,10 @@ assumed:
 - **`high`** (`client_type_resolved: true`) — the checker resolved a concrete
   named type from an identifiable external package. `pool.query`, `axios.get`,
   `redis.get`, `this.db.query`.
+- **`medium`** (`client_type_resolved: true`) — the checker could not resolve
+  the type, but the SOURCE names it: an import statement names the package and
+  a `new Pool()`, a `db: Pool` annotation or a `private db: Pool` property
+  names the type. See "Resolution without an installed node_modules" below.
 - **`low`** (`client_type_resolved: false`, `client_type: ""`) — the receiver
   is `any`/`unknown`, unresolved, or resolves only to a TypeScript built-in lib
   type (`Array`, `Map`, `Promise`, `string`). The site is **still emitted**
@@ -252,3 +323,13 @@ types keep distinct keys, that an unresolved strong-verb call still emits at
 `testdata/fixture-tests/` holds one file per test-path convention beside
 three production files, for the tests that pin what is skipped, what is
 counted, and what `--include-tests` restores.
+
+The uninstalled-tree tests copy `testdata/fixture/` **without** its
+`node_modules` rather than carrying a second fixture, so the two runs differ in
+exactly one thing — which is the property the whole lane turns on. They pin
+that the same `pg.Pool` / `ioredis.Redis` / `bullmq.Queue` site keys come back,
+at tier `medium` with no version; that the installed run is unchanged at
+`high`; that builder and factory calls do not flood in once the awaitability
+gate is unavailable; that loggers and spans still route to the emission lane;
+and that a tree whose only external imports are path aliases still abstains
+and names them.
