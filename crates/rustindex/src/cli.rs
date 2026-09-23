@@ -199,9 +199,6 @@ fn execute() -> anyhow::Result<()> {
         writeln!(out, "{}", serde_json::to_string(&v)?)?;
     }
 
-    // Workspace/engine provenance: which engine produced this stream, and
-    // which dependency resolution it saw. Unknown `kind`s are routed away
-    // from Site parsing by rvl_core::parse_stream.
     // Workspace/engine provenance: which engine produced this stream, which
     // dependency resolution it saw, and WHICH WORKSPACES it saw -- including
     // the ones that declined, so a consumer can tell "this crate was declined"
