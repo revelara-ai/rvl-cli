@@ -182,19 +182,21 @@ test('a hoisted monorepo does not trip the missing-node_modules abstain', () => 
   }
 });
 
-test('a repo with no node_modules anywhere still abstains', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-bare-'));
+test('a repo with no node_modules no longer abstains for that alone', () => {
+  // po-pk3fp.2 narrowed this. An uninstalled tree used to abstain outright,
+  // which cost the fleet 68 of its 97 TypeScript repos. It now scans, because
+  // an import statement names the package and the source names the type; only
+  // the specifiers syntax genuinely cannot map still abstain (see the path-
+  // alias test below).
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-uninstalled-'));
   try {
     fs.mkdirSync(path.join(tmp, 'packages', 'app'), { recursive: true });
     fs.writeFileSync(
       path.join(tmp, 'packages', 'app', 'package.json'),
       JSON.stringify({ name: 'app', dependencies: { axios: '^1.0.0' } }),
     );
-    assert.throws(
-      () => run('--retrieve', '--root', tmp),
-      (e) => e.status === 3,
-      'expected the abstain exit code',
-    );
+    const out = run('--retrieve', '--root', tmp);
+    assert.ok(typeof out === 'string');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -748,4 +750,287 @@ test('--files naming only a test file emits no sites and still counts the skip',
   );
   assert.deepStrictEqual(scannedFiles(included.sites), ['src/service.test.ts']);
   assert.strictEqual(included.cfg.test_files_skipped, 0);
+});
+
+// --- resolution WITHOUT an installed node_modules (po-pk3fp.2) -------------
+//
+// tsindex used to abstain outright on a checkout whose workspaces declare
+// dependencies but have none installed: 68 of the fleet's 97 TypeScript repos,
+// every customer scanning a tree they have not installed, and every repo whose
+// install cannot be made to succeed.
+//
+// The durable fix is that a spec key does not need the module on disk. An
+// import statement names the package, and a `new Pool()`, a `db: Pool`
+// annotation or a `private db: Pool` property names the type -- so
+// `pg.Pool` is recoverable from syntax alone, identically to what the
+// TypeChecker reports when the package IS installed.
+//
+// The fixture is copied WITHOUT node_modules so the two runs differ in exactly
+// one thing, which is the property the whole lane turns on.
+
+function fixtureWithoutNodeModules(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-nodeps-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(FIXTURE_ROOT, dir, {
+    recursive: true,
+    filter: (src) => path.basename(src) !== 'node_modules',
+  });
+  assert.strictEqual(
+    fs.existsSync(path.join(dir, 'node_modules')),
+    false,
+    'the uninstalled copy must have no node_modules',
+  );
+  return dir;
+}
+
+test('an uninstalled checkout scans instead of abstaining', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites, cfg } = retrieveFrom(dir);
+  // Before the fix this run exited 3 and produced nothing; bypassing the
+  // abstain produced 6 sites against the installed run's 32.
+  assert.ok(
+    sites.length >= 20,
+    `an uninstalled checkout must still retrieve its client sites, got ${sites.length}`,
+  );
+  // The degradation is on the wire, never ambient: this run resolved from
+  // syntax because the tree is uninstalled, and the record says so.
+  assert.ok(cfg.dependency_trees_uninstalled >= 1, JSON.stringify(cfg));
+  assert.ok(
+    cfg.dependency_trees_uninstalled_paths.includes('.'),
+    JSON.stringify(cfg.dependency_trees_uninstalled_paths),
+  );
+});
+
+test('uninstalled resolution yields the SAME spec keys the checker does', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const bare = retrieveFrom(dir).sites;
+  const installed = retrieveRecords();
+  // Every type a `new Ctor()`, a type annotation or a class property names in
+  // source is recoverable without the package. These are the ratified TS
+  // judgment keys, so they must match EXACTLY, not merely resemble.
+  for (const type of ['pg.Pool', 'ioredis.Redis', 'bullmq.Queue']) {
+    const want = installed
+      .filter((r) => r.client_type === type)
+      .map((r) => r.site_key)
+      .sort();
+    const got = bare
+      .filter((r) => r.client_type === type)
+      .map((r) => r.site_key)
+      .sort();
+    assert.ok(want.length > 0, `the installed run must have ${type} sites`);
+    assert.deepStrictEqual(got, want, `${type} keys must survive an uninstalled tree`);
+  }
+});
+
+test('a syntactically resolved site reports tier medium, not high', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  const pool = sites.filter((r) => r.client_type === 'pg.Pool');
+  assert.ok(pool.length >= 1);
+  for (const r of pool) {
+    // Resolved: the weak-verb gate needs this, or every pool.query and
+    // redis.get is dropped as container noise.
+    assert.strictEqual(r.provenance.client_type_resolved, true);
+    // But NOT high: the type came from import syntax, not the TypeChecker,
+    // and a reader must be able to tell those apart.
+    assert.strictEqual(r.provenance.confidence_tier, 'medium');
+    // No package on disk means no package.json to read a version from.
+    assert.strictEqual(r.client_version, '');
+  }
+  // The installed run is untouched: the fallback runs only after the checker.
+  for (const r of retrieveRecords().filter((x) => x.client_type === 'pg.Pool')) {
+    assert.strictEqual(r.provenance.confidence_tier, 'high');
+  }
+});
+
+test('a module object used directly resolves to the bare import path', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  // `import axios from 'axios'; axios.get(...)`. The module object's TYPE
+  // name (AxiosStatic) lives in the package, so syntax cannot recover it --
+  // but the import path can, and that is the key shape a spec author writes.
+  const axios = sites.filter((r) => r.client_type === 'axios' && r.func === 'get');
+  assert.ok(axios.length >= 1, JSON.stringify(sites.map((s) => s.client_type)));
+  assert.strictEqual(axios[0].provenance.confidence_tier, 'medium');
+  // A bare package name must still reach the framework tables that key on
+  // `<pkg>.<Type>`: express routes and node-cron schedules are registrations
+  // whether or not the type name resolved.
+  assert.ok(
+    sites.some((r) => r.site_kind === 'server_entry' && r.client_type === 'express'),
+    'an express route registration must survive: ' +
+      JSON.stringify(sites.filter((s) => s.site_kind === 'server_entry')),
+  );
+  assert.ok(
+    sites.some((r) => r.site_kind === 'background_job' && r.client_type === 'node-cron'),
+    'a node-cron schedule must survive',
+  );
+});
+
+test('repo_config construction types survive an uninstalled tree', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { cfg } = retrieveFrom(dir);
+  const types = cfg.constructions.map((c) => c.type);
+  // Without this the config lane sees `Pool`/`DataSource`/`axios.create` --
+  // bare identifier text that no ConfigSpec is keyed on, and that
+  // rvl_spec::client_family cannot classify into an I/O family.
+  for (const t2 of ['pg.Pool', 'ioredis.Redis', 'typeorm.DataSource']) {
+    assert.ok(types.includes(t2), `${t2} missing from ${JSON.stringify(types)}`);
+  }
+});
+
+test('a bare checkout with a resolvable import scans; site keys stay unique', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-bare-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { pg: '^8.0.0' } }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'src', 'db.ts'),
+      "import { Pool } from 'pg';\n" +
+        'const pool = new Pool({ connectionTimeoutMillis: 5000 });\n' +
+        'export class Repo {\n' +
+        '  constructor(private readonly db: Pool) {}\n' +
+        '  find(sql: string) { return this.db.query(sql); }\n' +
+        '}\n' +
+        'export function load(id: number) { return pool.query("SELECT 1", [id]); }\n',
+    );
+    const { sites, cfg } = retrieveFrom(tmp);
+    const keys = sites.map((r) => r.site_key);
+    assert.strictEqual(new Set(keys).size, keys.length, JSON.stringify(keys));
+    // Both the module-scope const and the constructor-parameter property
+    // resolve: the annotation names the type, and the import names the package.
+    assert.deepStrictEqual(
+      sites.filter((r) => r.client_type === 'pg.Pool' && r.func === 'query').length,
+      2,
+      JSON.stringify(sites.map((s) => [s.client_type, s.func, s.receiver])),
+    );
+    assert.deepStrictEqual(cfg.constructions, [
+      { type: 'pg.Pool', fields: ['connectionTimeoutMillis'] },
+    ]);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a tree whose only external imports are tsconfig path aliases abstains', () => {
+  // The residue the syntactic path genuinely cannot cross. `@app/db` is a
+  // path alias onto a workspace directory, so the specifier names no package
+  // and following it needs the package CONTENTS the tree does not have.
+  // Reporting a near-empty scan as a complete one is the failure the original
+  // abstain existed to prevent, so this case still abstains -- and names the
+  // aliases, which is the only actionable thing to say about it.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-alias-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { '@app/db': '*' } }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'src', 'use.ts'),
+      "import { db } from '@app/db';\nexport function load() { return db.query('SELECT 1'); }\n",
+    );
+    let err;
+    try {
+      run('--retrieve', '--root', tmp);
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'expected the abstain exit');
+    assert.strictEqual(err.status, 3, String(err.stderr));
+    assert.match(String(err.stderr), /@app\/db/, 'the abstain must NAME the specifier');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('an uninstalled tree does not flood with builder calls', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  // The awaitability gate is a TYPE test: with no package it answers "yes" to
+  // everything, so leaving it in would emit every property call in the file.
+  // That is the zod/knex builder flood it exists to stop -- 99.5% of resolved
+  // sites on infisical carried no I/O verb. At tier medium a named I/O verb
+  // is required instead.
+  const types = sites.map((r) => `${r.client_type}.${r.func}`);
+  for (const noise of ['zodlike.string', 'zodlike.object', 'axios.create', 'express.Router']) {
+    assert.strictEqual(
+      types.includes(noise),
+      false,
+      `${noise} is a builder/factory call, not a site: ${JSON.stringify(types)}`,
+    );
+  }
+  // And the real calls are still there, so this is a filter rather than a
+  // retreat to the old near-empty scan.
+  assert.ok(types.filter((t2) => t2 === 'pg.Pool.query').length >= 4, JSON.stringify(types));
+});
+
+test('an uninstalled tree still routes emissions out of the client lane', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  // A logger reaching the G1 client lane is a wrong KIND of site, not just a
+  // coarser key: `logger.error(...)` would read as an unbounded client call.
+  // The emission tables key on the package, so the syntactic `winston`
+  // reaches the same arm as the checker's `winston.Logger`.
+  const winston = sites.filter((r) => r.client_type === 'winston');
+  assert.ok(winston.length >= 1, JSON.stringify(sites.map((s) => s.client_type)));
+  for (const r of winston) {
+    assert.strictEqual(r.site_kind, 'emission_point');
+  }
+  const otel = sites.filter((r) => r.client_type === '@opentelemetry/api');
+  assert.ok(otel.length >= 1, 'an otel span must stay an emission point');
+  assert.strictEqual(otel[0].site_kind, 'emission_point');
+});
+
+test('path aliases beside real imports do not poison the run', () => {
+  // The common monorepo shape, and the one the fleet unlock turns on: some
+  // imports are packages, some are tsconfig `paths` onto workspace
+  // directories. The aliases are named as unmappable and their receivers stay
+  // unattributed; the packages resolve normally and the run does NOT abstain.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-mixed-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'package.json'),
+      JSON.stringify({ name: 'm', dependencies: { pg: '^8.0.0', axios: '^1.0.0' } }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+        include: ['src/**/*.ts'],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'src', 'app.ts'),
+      "import { Pool } from 'pg';\n" +
+        "import axios from 'axios';\n" +
+        "import { helper } from '@app/db';\n" +
+        'const pool = new Pool({ connectionTimeoutMillis: 3000 });\n' +
+        'export async function go(id: number) {\n' +
+        "  const r = await pool.query('SELECT 1', [id]);\n" +
+        "  const h = await helper.query('SELECT 2');\n" +
+        "  const u = await axios.get('/x');\n" +
+        '  return [r, h, u];\n' +
+        '}\n',
+    );
+    const { sites, cfg } = retrieveFrom(tmp);
+    assert.deepStrictEqual(
+      sites.map((r) => `${r.client_type}.${r.func}`).sort(),
+      ['axios.get', 'pg.Pool.query'],
+      JSON.stringify(sites.map((r) => [r.client_type, r.func, r.receiver])),
+    );
+    assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
+    assert.strictEqual(cfg.dependency_trees_uninstalled, 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
