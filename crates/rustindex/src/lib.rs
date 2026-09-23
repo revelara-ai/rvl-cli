@@ -23,3 +23,4 @@ pub mod cli;
 pub mod derive;
 pub mod ra;
 pub mod symbol;
+pub mod workspace;
