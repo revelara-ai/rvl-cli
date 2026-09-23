@@ -368,3 +368,52 @@ fn golden_no_desugar_junk_and_no_stub_internals() {
             .collect::<Vec<_>>()
     );
 }
+
+/// po-pk3fp.11: dolthub/dolt, genspark-ai/genoffice and google/osv-scanner
+/// keep their crates in a SUBDIRECTORY, and rustindex abstained on the repo
+/// root with "could not find Cargo.toml". Point the scan at the fixture's
+/// parent and the nested workspace must be found, loaded, and derived with
+/// paths still relative to the SCAN ROOT -- the index rust-analyzer produces
+/// is relative to the workspace it was pointed at.
+#[test]
+fn golden_nested_workspace_is_found_and_paths_stay_scan_root_relative() {
+    let Some((_, index)) = indexed() else { return };
+    let root = fixture_root()
+        .parent()
+        .expect("testdata/ is the fixture's parent")
+        .to_path_buf();
+
+    let dirs = rustindex::workspace::discover_workspaces(&root);
+    assert_eq!(
+        dirs,
+        vec![fixture_root()],
+        "the nested workspace is the one to index"
+    );
+    let load = rustindex::workspace::load_workspaces(&root, &dirs);
+    assert!(load.declined.is_empty(), "{:#?}", load.declined);
+    assert_eq!(load.loaded[0].rel, "fixture");
+
+    let mut nested = index.clone();
+    rustindex::workspace::rebase_index(&mut nested, &load.loaded[0].rel);
+    let d = rustindex::derive::derive(&root, "fixture", &nested, None);
+
+    assert!(
+        !d.sites.is_empty(),
+        "a workspace one directory down still yields sites"
+    );
+    assert!(
+        d.sites.iter().all(|s| s.file_path.starts_with("fixture/")),
+        "every path is relative to the scan root: {:#?}",
+        d.sites
+            .iter()
+            .map(|s| &s.file_path)
+            .take(5)
+            .collect::<Vec<_>>()
+    );
+    // Snippets come from re-reading the source at root.join(file_path): a
+    // rebase that did not match the source layout would silently empty them.
+    assert!(
+        d.sites.iter().any(|s| !s.snippet.is_empty()),
+        "the rebased paths must still resolve to the source on disk"
+    );
+}
