@@ -523,7 +523,7 @@ func main() {
 		if snap == "" {
 			snap = filepath.Base(abs2)
 		}
-		sites, modules, loadErr := runRetrieveAll(abs2, snap)
+		sites, scan := runRetrieveAll(abs2, snap)
 		// ABSTAIN, never a silent zero (po-av01j.131). No module means goindex
 		// had nothing to load, which is a different claim from "loaded the code
 		// and found no client calls". Returning an empty stream with exit 0 for
@@ -532,7 +532,7 @@ func main() {
 		// (po-av01j.102); rustindex already does this for an unloadable cargo
 		// workspace and this is the same charter: no heuristic tier, abstain
 		// rather than guess.
-		if modules == 0 {
+		if len(scan.Discovered) == 0 {
 			fmt.Fprintf(os.Stderr,
 				"goindex: no go.mod under %s, so there is no module to load; goindex abstains "+
 					"rather than reporting an empty scan as a clean one. If this is a monorepo, "+
@@ -551,19 +551,54 @@ func main() {
 		// Deliberately NOT the abstain code 3: abstaining says "I could have
 		// looked and chose not to, and that is working as intended". Here
 		// nothing could be looked at, and the fix is on the machine.
-		if loadErr != nil {
+		if scan.Err != nil {
 			fmt.Fprintf(os.Stderr,
-				"goindex: %v.\nNo Go source was analysed, so this is a FAILED lane, not an empty "+
-					"one. The usual cause is that the `go` tool is not on PATH (go/packages shells "+
-					"out to it); install Go, or point PATH at it, and re-run.\n", loadErr)
+				"goindex: %v.\nNo Go source was analysed in that module, so this is a FAILED lane, "+
+					"not an empty one -- even though %d of %d module(s) did load. The usual cause "+
+					"is that the `go` tool is not on PATH (go/packages shells out to it); install "+
+					"Go, or point PATH at it, and re-run.\n",
+				scan.Err, len(scan.Loaded), len(scan.Discovered))
 			os.Exit(2)
+		}
+		// THE THIRD STATE (po-pk3fp.12). Modules exist, none of them held any
+		// Go, and nothing failed. That is not a clean scan -- there is no code
+		// here to have been clean -- so it abstains rather than emitting an
+		// empty stream at exit 0. dolthub/dolt is the near miss that named
+		// this: its protobuf-only proto/ module used to take the FAILED arm
+		// above and throw away the 201 packages under go/ with it.
+		if len(scan.Loaded) == 0 {
+			fmt.Fprintf(os.Stderr,
+				"goindex: found %d module(s) under %s but none of them contained any Go packages "+
+					"(a module whose `go list ./...` matches nothing -- a protobuf-only or "+
+					"generated-code module, say). Nothing was analysed, so goindex abstains "+
+					"rather than reporting an empty scan as a clean one.\n",
+				len(scan.Discovered), abs2)
+			os.Exit(3)
 		}
 		if *files != "" {
 			sites = filterToFiles(sites, strings.Split(*files, ","))
 		}
 		emitRetrieved(sites)
 		emitRepoConfig(lastRepoConfig)
-		fmt.Fprintf(os.Stderr, "%s: %d retrieved sites\n", snap, len(sites))
+		// REPORT THE SKIP ON EVERY PATH, not just the failing ones. Passing
+		// over an empty module is now routine, and a routine skip that says
+		// nothing is how "goindex read one module of seven" would look exactly
+		// like "goindex read the repo". Naming the skipped modules keeps the
+		// operator able to tell those apart without re-running anything.
+		if len(scan.Empty) > 0 {
+			rels := make([]string, 0, len(scan.Empty))
+			for _, m := range scan.Empty {
+				r, err := filepath.Rel(abs2, m)
+				if err != nil {
+					r = m
+				}
+				rels = append(rels, filepath.ToSlash(r))
+			}
+			fmt.Fprintf(os.Stderr, "%s: skipped %d module(s) holding no Go packages: %s\n",
+				snap, len(rels), strings.Join(rels, ", "))
+		}
+		fmt.Fprintf(os.Stderr, "%s: %d retrieved sites from %d of %d module(s)\n",
+			snap, len(sites), len(scan.Loaded), len(scan.Discovered))
 		return
 	}
 
