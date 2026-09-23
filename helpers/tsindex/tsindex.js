@@ -517,6 +517,13 @@ const NODE_BUILTINS = new Set(require('module').builtinModules);
 // at a workspace directory, so attributing `@app/db` to a package named
 // `@app/db` would invent one. Reset per run (runRetrieve), because the test
 // harness drives several roots in one process.
+//
+// Read off the built program's options, which means aliases declared only in
+// a tsconfig this one `extends` are NOT seen: `readConfigFile` +
+// `parseJsonConfigFileContent` does not follow `extends` (a pre-existing
+// property of buildProgram, not of this pass). Such a specifier is attributed
+// to a package named after the alias, which matches no spec and abstains
+// downstream as no_spec -- noise, never a wrong verdict.
 let _pathAliases = [];
 // Alias-shaped specifiers this run declined to attribute, for the abstain.
 let _unmappableSpecifiers = new Set();
@@ -555,6 +562,11 @@ function matchesPathAlias(spec) {
 // null when it names something else: a relative/absolute path, a Node builtin,
 // a `#` subpath import, or a tsconfig path alias. Subpaths are stripped the
 // same way `packageFromImport` strips them, so the two agree on the key.
+//
+// It also RECORDS what it saw, deliberately: every specifier syntax considers
+// passes through here exactly once per use, so this is the one place that can
+// say whether the run attributed anything at all -- which is what the abstain
+// in main() turns on.
 function externalPackageOf(spec) {
   if (!spec) return null;
   if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) return null;

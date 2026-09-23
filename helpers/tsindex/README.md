@@ -237,6 +237,12 @@ checker has failed. An installed tree is still strictly better (versions, the
 awaitability filter, chained and callback-typed receivers), which is why a
 TypeScript gate set must still pin lockfile provenance.
 
+**Known limit.** The alias list comes from the built program's options, and
+`extends` is not followed, so `paths` declared only in a base tsconfig are not
+seen. Such a specifier is attributed to a package named after the alias, which
+matches no spec and abstains downstream as `no_spec` — noise, never a wrong
+verdict.
+
 **Abstain.** For a year an uninstalled tree abstained outright (exit 3), on the
 argument that a partial result which looks complete is worse than none. That
 cost 68 of the fleet's 97 TypeScript repos. The abstain now fires only for the

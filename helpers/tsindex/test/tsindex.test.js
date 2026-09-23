@@ -989,3 +989,48 @@ test('an uninstalled tree still routes emissions out of the client lane', (t) =>
   assert.ok(otel.length >= 1, 'an otel span must stay an emission point');
   assert.strictEqual(otel[0].site_kind, 'emission_point');
 });
+
+test('path aliases beside real imports do not poison the run', () => {
+  // The common monorepo shape, and the one the fleet unlock turns on: some
+  // imports are packages, some are tsconfig `paths` onto workspace
+  // directories. The aliases are named as unmappable and their receivers stay
+  // unattributed; the packages resolve normally and the run does NOT abstain.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsx-mixed-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, 'package.json'),
+      JSON.stringify({ name: 'm', dependencies: { pg: '^8.0.0', axios: '^1.0.0' } }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+        include: ['src/**/*.ts'],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'src', 'app.ts'),
+      "import { Pool } from 'pg';\n" +
+        "import axios from 'axios';\n" +
+        "import { helper } from '@app/db';\n" +
+        'const pool = new Pool({ connectionTimeoutMillis: 3000 });\n' +
+        'export async function go(id: number) {\n' +
+        "  const r = await pool.query('SELECT 1', [id]);\n" +
+        "  const h = await helper.query('SELECT 2');\n" +
+        "  const u = await axios.get('/x');\n" +
+        '  return [r, h, u];\n' +
+        '}\n',
+    );
+    const { sites, cfg } = retrieveFrom(tmp);
+    assert.deepStrictEqual(
+      sites.map((r) => `${r.client_type}.${r.func}`).sort(),
+      ['axios.get', 'pg.Pool.query'],
+      JSON.stringify(sites.map((r) => [r.client_type, r.func, r.receiver])),
+    );
+    assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
+    assert.strictEqual(cfg.dependency_trees_uninstalled, 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
