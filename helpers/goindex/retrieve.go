@@ -512,7 +512,11 @@ var lastRepoConfig RepoConfig
 // from; `root` stays the REPO root so every emitted file_path is repo-relative
 // regardless of which module produced it -- downstream (--changed-only, the
 // packet index) keys on repo-relative paths.
-func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
+//
+// The `loaded` result separates a module that HELD no Go from one that could
+// not be READ. False with a nil error means the module matched no packages --
+// it is EMPTY, and the caller must carry on to the next module (po-pk3fp.12).
+func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loaded bool, err error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
@@ -525,16 +529,21 @@ func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
 	// SUCCESSFUL retrieval of zero sites, byte-identical to a genuinely empty
 	// repo. Every honesty mechanism downstream (the coverage note, the NOT
 	// CLEAN verdict, --strict) keys on a lane that FAILED, so all of them
-	// stayed silent over code nothing had read. The three arms below are the
-	// same fact at three depths: the loader errored, the loader returned no
-	// packages, or it returned packages that carry no type information. In
-	// none of them has any Go source been analysed.
+	// stayed silent over code nothing had read. The loader errored, or it
+	// returned packages that carry no type information: in both of those Go
+	// source EXISTS and was not read, so both stay errors.
 	if err != nil {
-		return nil, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
+		return nil, false, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
 	}
+	// ...BUT NEITHER IS AN EMPTY MODULE A LOAD THAT FAILED (po-pk3fp.12).
+	// This arm used to error too, on the reasoning that it was the same fact
+	// one depth down. It is not. `go list ./...` matching nothing means the
+	// module holds no Go to read -- dolthub/dolt's proto/ is protobuf only --
+	// and there is no honesty at stake in a directory with no source in it.
+	// Treating it as a failure cost dolt its entire Go lane, because proto/
+	// sorts before the go/ module that holds all 201 of the product packages.
 	if len(pkgs) == 0 {
-		return nil, fmt.Errorf(
-			"go/packages loaded no packages at all under %s, so no Go source was analysed", moduleDir)
+		return nil, false, nil
 	}
 	usable := 0
 	for _, p := range pkgs {
@@ -543,7 +552,7 @@ func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
 		}
 	}
 	if usable == 0 {
-		return nil, fmt.Errorf(
+		return nil, false, fmt.Errorf(
 			"go/packages returned %d package(s) under %s but none carried type information, "+
 				"so no Go source was analysed", len(pkgs), moduleDir)
 	}
@@ -965,7 +974,7 @@ func runRetrieveModule(moduleDir, root, name string) ([]RetrievedSite, error) {
 	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)
-	return out, nil
+	return out, true, nil
 }
 
 // RepoConfig is repo-scoped, not site-scoped, and that is the point. An
@@ -1083,35 +1092,64 @@ func discoverModules(root string) []string {
 // runRetrieve loads every module under `root` and concatenates their sites
 // (po-av01j.131).
 //
-// Returns the module count alongside the sites so the caller can tell an
-// HONEST ZERO ("modules loaded, no client calls found") from an ABSTENTION
-// ("no module to load"). Collapsing those two is the bug this replaces: the old
+// The moduleScan travels alongside the sites so the caller can tell an HONEST
+// ZERO ("modules loaded, no client calls found") from an ABSTENTION ("no
+// module to load"). Collapsing those two is the bug this replaces: the old
 // code returned an empty slice for both and exited 0, so a monorepo scan
 // reported Go as scanned and clean when Go was never looked at.
 func runRetrieve(root, name string) []RetrievedSite {
-	sites, _, _ := runRetrieveAll(root, name)
+	sites, _ := runRetrieveAll(root, name)
 	return sites
 }
 
-// runRetrieveAll returns the sites, the module count, and the FIRST load
-// failure encountered.
+// moduleScan is what a retrieval run can HONESTLY say about the modules it
+// met. Three outcomes, deliberately not two (po-pk3fp.12):
 //
-// One failing module of several is fatal to the whole run rather than dropped
-// (po-av01j.209). Emitting the modules that did load, as a success, would
-// report the failed module's code as scanned and clean -- the same
-// "nothing was scanned looks like nothing was wrong" collapse this returns an
-// error to prevent, just at monorepo granularity. Failing the LANE is not
-// failing the developer: rvl is fail-open per language, so the commit still
-// goes through, loudly marked NOT CLEAN.
-func runRetrieveAll(root, name string) ([]RetrievedSite, int, error) {
-	mods := discoverModules(root)
+//	Loaded  -- the module held Go and it was read.
+//	Empty   -- the module held no Go at all. Nothing to read, nothing at risk.
+//	Err     -- the module held Go that could NOT be read. The dangerous one.
+//
+// Folding Empty into Err is what failed dolthub/dolt's whole Go lane over a
+// protobuf-only proto/ directory. Folding Empty into Loaded would be worse: it
+// would let "nothing was examined" share an encoding with "examined and fine",
+// which is the collapse the whole goindex exit contract exists to prevent.
+type moduleScan struct {
+	Discovered []string // every module root discoverModules found
+	Loaded     []string // modules that yielded at least one usable package
+	Empty      []string // modules that matched no packages at all
+	FailedDir  string   // the module behind Err, named so the operator can go there
+	Err        error    // the FIRST genuine load failure, if any
+}
+
+// runRetrieveAll loads every discovered module and returns their sites with
+// the scan that describes them.
+//
+// One failing module of several is still fatal at the call site
+// (po-av01j.209): emitting the modules that did load, as a success, would
+// report the failed module's code as scanned and clean -- the same "nothing
+// was scanned looks like nothing was wrong" collapse, just at monorepo
+// granularity. Failing the LANE is not failing the developer: rvl is fail-open
+// per language, so the commit still goes through, loudly marked NOT CLEAN.
+//
+// An EMPTY module is not that, and the loop carries on past it. The run keeps
+// going after a genuine error too, but only to finish counting: the error is
+// retained and main still treats it as fatal.
+func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
+	scan := moduleScan{Discovered: discoverModules(root)}
 	var all []RetrievedSite
-	for _, m := range mods {
-		sites, err := runRetrieveModule(m, root, name)
-		if err != nil {
-			return nil, len(mods), err
+	for _, m := range scan.Discovered {
+		sites, loaded, err := runRetrieveModule(m, root, name)
+		switch {
+		case err != nil:
+			if scan.Err == nil {
+				scan.Err, scan.FailedDir = err, m
+			}
+		case !loaded:
+			scan.Empty = append(scan.Empty, m)
+		default:
+			scan.Loaded = append(scan.Loaded, m)
+			all = append(all, sites...)
 		}
-		all = append(all, sites...)
 	}
-	return all, len(mods), nil
+	return all, scan
 }
