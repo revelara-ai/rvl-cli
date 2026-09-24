@@ -853,7 +853,11 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						Enclosing: src.text(p, fd, fd),
 						ConstArgs: constArgs(info, c),
 					}
-					if t := info.TypeOf(sel.X); t != nil {
+					pkgPath, pkgRecv := packageReceiver(info, sel)
+					if pkgRecv {
+						rs.ClientType = pkgPath
+						rs.Prov.ClientTypeKnown = true
+					} else if t := info.TypeOf(sel.X); t != nil {
 						rs.ClientType = strings.TrimPrefix(t.String(), "*")
 						rs.Prov.ClientTypeKnown = true
 					}
@@ -862,7 +866,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						// A package-function registration (time.NewTicker,
 						// river.AddWorker) has no typed receiver value; carry
 						// the canonical framework identity instead.
-						if rs.ClientType == "" || rs.ClientType == "invalid type" {
+						if rs.ClientType == "" || rs.ClientType == "invalid type" || pkgRecv {
 							rs.ClientType = jobType
 							rs.Prov.ClientTypeKnown = true
 						}
@@ -1152,4 +1156,21 @@ func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
 		}
 	}
 	return all, scan
+}
+
+// packageReceiver reports the import path when sel.X names an imported package,
+// as http does in http.Get. go/types gives a package name the invalid type, so
+// reading TypeOf alone put the client type "invalid type" on the wire and no
+// spec could match the site. The path, not the spelling, is the identity: an
+// aliased import reads the same.
+func packageReceiver(info *types.Info, sel *ast.SelectorExpr) (string, bool) {
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	pn, ok := info.Uses[id].(*types.PkgName)
+	if !ok {
+		return "", false
+	}
+	return pn.Imported().Path(), true
 }

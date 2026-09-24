@@ -330,7 +330,10 @@ func runTyped(root, name string) ([]Site, error) {
 
 					// receiver: exact type, not its spelling
 					s.Receiver = exprString(sel.X)
-					if t := info.TypeOf(sel.X); t != nil {
+					if pkgPath, ok := packageReceiver(info, sel); ok {
+						s.ClientType = pkgPath
+						s.ClientCandidates = 1 // exact
+					} else if t := info.TypeOf(sel.X); t != nil {
 						s.ClientType = strings.TrimPrefix(t.String(), "*")
 						if to, ok := ix.ctors[s.ClientType]; ok {
 							s.ClientTimeouts = to
