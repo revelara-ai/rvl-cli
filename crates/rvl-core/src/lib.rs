@@ -276,6 +276,13 @@ impl Provenance {
     }
 }
 
+/// `client_construction_scope`: the constructions are the values traced to
+/// the call's receiver.
+pub const CONSTRUCTION_SCOPE_RECEIVER: &str = "receiver";
+/// `client_construction_scope`: the receiver was not traced; the
+/// constructions are candidates of the same type.
+pub const CONSTRUCTION_SCOPE_TYPE: &str = "type";
+
 /// One call site plus every piece of source bearing on it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Site {
@@ -303,6 +310,14 @@ pub struct Site {
     pub callees: Vec<Snippet>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub client_construction: Vec<Snippet>,
+    /// What `client_construction` is. Empty: whatever the retriever attached,
+    /// read as it always was. [`CONSTRUCTION_SCOPE_RECEIVER`]: the values
+    /// traced to this call's receiver, possibly none. [`CONSTRUCTION_SCOPE_TYPE`]:
+    /// the receiver was not traced, so these are constructions of the same
+    /// type found elsewhere, which may evidence an abstention but never a
+    /// pass. Additive within the v2 packet train.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_construction_scope: String,
     #[serde(default)]
     pub provenance: Provenance,
     #[serde(default)]
