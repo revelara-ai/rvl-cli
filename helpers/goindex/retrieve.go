@@ -191,6 +191,15 @@ type RetrievedSite struct {
 	// it, so a one-directional walk is structurally half-blind.
 	Callees      []Snippet `json:"callees"`
 	Construction []Snippet `json:"client_construction"`
+	// ConstructionScope says what Construction is. "receiver": the values
+	// that reach this call's receiver, traced through the type checker, and
+	// possibly none (a library's own value, such as http.DefaultClient).
+	// "type": the receiver could not be traced, so these are constructions of
+	// the same type found elsewhere in the repository, candidates only. One
+	// bounded client must never vouch for another, so downstream reads a
+	// "type" construction as evidence to abstain on, never to pass. Additive
+	// within the v2 packet train, like SiteKind.
+	ConstructionScope string `json:"client_construction_scope,omitempty"`
 	Prov         Provenance `json:"provenance"`
 
 	// ConstArgs: constant-valued arguments at this call site (schema v2).
@@ -572,6 +581,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// options MEAN is library knowledge and belongs to the spec layer.
 	assignsByType := map[string][]Snippet{}
 	assignsByName := map[string][]Snippet{}
+	reach := newReachIndex(pkgs)
 
 	rel := func(p *packages.Package, n ast.Node) (string, int) {
 		pos := p.Fset.Position(n.Pos())
@@ -676,6 +686,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 				}
 				return true
 			})
+			reach.collect(p, f, src, rel)
 		}
 	}
 
@@ -928,7 +939,18 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					}
 					rs.Prov.CalleesIncluded = len(rs.Callees)
 
-					if rs.ClientType != "" {
+					// The values that reach this receiver, when the type checker
+					// can say which: see trace.go.
+					if !pkgRecv {
+						if got, ok := reach.trace(varOf(info, sel.X), funcs, src, 0); ok {
+							rs.ConstructionScope = "receiver"
+							if len(got) > maxCtorsEmitted {
+								got = got[:maxCtorsEmitted]
+							}
+							rs.Construction = got
+						}
+					}
+					if rs.ConstructionScope == "" && rs.ClientType != "" {
 						// Assignments first: they carry the options literal a
 						// third-party constructor was called with, which is
 						// where a dependency's timeouts are actually set.
@@ -957,7 +979,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					// than a type match and marked as such by leaving
 					// ClientTypeKnown false, but it reaches `c.client` when the
 					// type could not be resolved at all.
-					if len(rs.Construction) == 0 {
+					if rs.ConstructionScope == "" && len(rs.Construction) == 0 {
 						seg := rs.Receiver
 						if i := strings.LastIndex(seg, "."); i >= 0 {
 							seg = seg[i+1:]
@@ -968,6 +990,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 							}
 							rs.Construction = append(rs.Construction, s)
 						}
+					}
+					if rs.ConstructionScope == "" {
+						rs.ConstructionScope = "type"
 					}
 					out = append(out, rs)
 					return true

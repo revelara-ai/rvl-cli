@@ -279,7 +279,18 @@ enum ConfigEvidence {
 /// because nothing at the site can corroborate or refute it. A declared bound
 /// is exempt: an operator's claim about the type as deployed, not about a
 /// field.
-fn config_evidence(s: &ConfigSpec, key: &str, constructions: &[Snippet]) -> ConfigEvidence {
+///
+/// `untraced`: the retriever could not trace which value reaches the call's
+/// receiver, so `constructions` are candidates of the type found elsewhere. A
+/// field one of them sets, to a bound or to a sentinel, is then evidence about
+/// some other client, and the site abstains on it rather than passing or
+/// failing. A default bound is a fact about the type and still counts.
+fn config_evidence(
+    s: &ConfigSpec,
+    key: &str,
+    constructions: &[Snippet],
+    untraced: bool,
+) -> ConfigEvidence {
     // A declared (.revelara.yaml) bound carries its policy provenance into
     // the reason: the finding must be auditable back to the declaration.
     if s.declared {
@@ -294,7 +305,16 @@ fn config_evidence(s: &ConfigSpec, key: &str, constructions: &[Snippet]) -> Conf
         DefaultBound::Seconds { seconds } => Some(seconds),
         _ => None,
     };
-    let set = field_evidence(s, constructions);
+    let mut set = field_evidence(s, constructions);
+    if untraced && set.is_some() {
+        if default.is_none() {
+            return ConfigEvidence::Unresolved(format!(
+                "client config {key}: the construction that reaches this call was not traced, \
+                 and a construction of the type elsewhere cannot vouch for it"
+            ));
+        }
+        set = None;
+    }
     match s.bounds {
         Bounds::WholeCall => match (default, set) {
             // A sentinel beats the library default too: the author wrote the
@@ -491,6 +511,7 @@ pub fn propagate(
     let mut unbounded: Vec<String> = Vec::new();
     let mut served_unresolved = false;
     let mut client_unresolved = false;
+    let mut untraced_family = false;
     // An exact-type config spec for this client that names no bounding
     // field, so the site could not check it.
     let mut config_unresolved: Option<String> = None;
@@ -643,6 +664,8 @@ pub fn propagate(
             },
             Mechanism::ClientConfig => {
                 let before = whole.len() + phase.len() + unbounded.len();
+                let scope = site.client_construction_scope.as_str();
+                let untraced = scope == rvl_core::CONSTRUCTION_SCOPE_TYPE;
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
@@ -653,7 +676,7 @@ pub fn propagate(
                 for c in &site.client_construction {
                     if let Some(s) = specs.config(&c.symbol) {
                         record(
-                            config_evidence(s, &c.symbol, &site.client_construction),
+                            config_evidence(s, &c.symbol, &site.client_construction, untraced),
                             &mut whole,
                             &mut phase,
                             &mut unbounded,
@@ -666,7 +689,12 @@ pub fn propagate(
                 if let Some(s) = specs.config(&site.client_type) {
                     if s.scope == Scope::ThisClient && s.confidence >= rvl_spec::MIN_CONFIDENCE {
                         record(
-                            config_evidence(s, &site.client_type, &site.client_construction),
+                            config_evidence(
+                                s,
+                                &site.client_type,
+                                &site.client_construction,
+                                untraced,
+                            ),
                             &mut whole,
                             &mut phase,
                             &mut unbounded,
@@ -687,13 +715,21 @@ pub fn propagate(
                 // Nor is an exact field switched off: the repo-level family
                 // bound counts that same literal as "sets Timeout" without
                 // reading the value, so broadening would re-credit it.
+                // Nor is a call whose construction the retriever traced: the
+                // client that reaches it is known, and another client of the
+                // family bounds nothing about it.
                 if whole.len() + phase.len() + unbounded.len() == before
                     && config_unresolved.is_none()
+                    && scope != rvl_core::CONSTRUCTION_SCOPE_RECEIVER
                 {
                     if let Some(bound) =
                         client_family(&site.client_type).and_then(|f| client.get(&f))
                     {
                         match bound {
+                            // Untraced: the family bound is another client's.
+                            ServedBound::Agreed(Bounds::WholeCall) if untraced => {
+                                untraced_family = true
+                            }
                             ServedBound::Agreed(Bounds::WholeCall) => whole.push(
                                 "repo constructs this client's family with a single, unconflicted whole-call timeout".into(),
                             ),
@@ -738,6 +774,15 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason: "conflicting client-config specs in this family".into(),
+        };
+    }
+    if untraced_family {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason: "repo bounds this client's family with a whole-call timeout, but the \
+                     construction that reaches this call was not traced"
+                .into(),
         };
     }
     // An exact-type config spec that names no bounding field: the
@@ -1299,6 +1344,106 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn scoped(mut s: Site, scope: &str) -> Site {
+        s.client_construction_scope = scope.into();
+        s
+    }
+
+    #[test]
+    fn an_untraced_bounded_construction_abstains_never_satisfies() {
+        // One bounded client elsewhere in the repo must not vouch for a call
+        // whose own receiver goindex could not trace.
+        let f = propagate(
+            &scoped(
+                http_do_site("http.Client{Timeout: 5 * time.Second}"),
+                rvl_core::CONSTRUCTION_SCOPE_TYPE,
+            ),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(f.reason.contains("not traced"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_traced_bounded_construction_satisfies() {
+        let f = propagate(
+            &scoped(
+                http_do_site("http.Client{Timeout: 5 * time.Second}"),
+                rvl_core::CONSTRUCTION_SCOPE_RECEIVER,
+            ),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_traced_unbounded_client_is_not_rescued_by_family_broadening() {
+        // The repo bounds some other HTTP client; this call's own client is
+        // http.Client{}, and the retriever says so.
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &scoped(
+                http_do_site("http.Client{}"),
+                rvl_core::CONSTRUCTION_SCOPE_RECEIVER,
+            ),
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_traced_library_value_with_no_construction_violates() {
+        // http.DefaultClient: traced, and nothing in the repo configures it.
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_RECEIVER);
+        s.client_construction.clear();
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn untraced_family_broadening_abstains_never_satisfies() {
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_TYPE);
+        s.client_construction.clear();
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(f.reason.contains("not traced"), "{}", f.reason);
+    }
+
+    #[test]
+    fn an_untraced_sentinel_abstains_never_violates() {
+        // Timeout: 0 on some other client of the type says nothing about this one.
+        let mut cfg = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
+        cfg.unbounded_sentinels = vec!["0".into()];
+        let f = propagate(
+            &scoped(
+                http_do_site("http.Client{Timeout: 0}"),
+                rvl_core::CONSTRUCTION_SCOPE_TYPE,
+            ),
+            &http_do_cache(vec![cfg]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
     }
 
     #[test]
