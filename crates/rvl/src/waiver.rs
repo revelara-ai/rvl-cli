@@ -149,6 +149,24 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     false
 }
 
+/// Reduce a ladder site (`render::Finding.site`) to the bare file path a
+/// waiver glob is written against: `path:line` and `path:line:col` lose their
+/// numeric suffixes, and a config-lane `path (unit)` loses its unit. A colon
+/// followed by anything other than digits is part of the path and stays.
+pub fn site_path(site: &str) -> &str {
+    let mut path = match site.rsplit_once(" (") {
+        Some((p, unit)) if unit.ends_with(')') => p,
+        _ => site,
+    };
+    while let Some((p, n)) = path.rsplit_once(':') {
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        path = p;
+    }
+    path
+}
+
 /// True when some ACTIVE waiver's matcher equals `class_rule` (case-insensitive)
 /// AND the waiver's paths are empty or a glob matches `site_path`. Mirrors
 /// `matchWaiver` + `ApplyWaivers`: an empty rule never matches, the first active
@@ -528,6 +546,48 @@ mod tests {
         let ws = vec![w("rule.x", &["**/*.go"], "")];
         assert!(is_waived("rule.x", "pkg/a/b.go", &ws, "2026-08-02"));
         assert!(!is_waived("rule.x", "pkg/a/b.py", &ws, "2026-08-02"));
+    }
+
+    // --- site_path (po-av01j.98) ---
+
+    #[test]
+    fn site_path_strips_the_line_suffix_of_a_ladder_site() {
+        assert_eq!(
+            site_path("internal/pay/prod.env:1"),
+            "internal/pay/prod.env"
+        );
+        assert_eq!(site_path("src/a.ts:12"), "src/a.ts");
+        assert_eq!(site_path("src/a.ts:12:7"), "src/a.ts", "file:line:col");
+    }
+
+    #[test]
+    fn site_path_strips_the_config_lane_unit_suffix() {
+        assert_eq!(
+            site_path(".github/workflows/ci.yml (build)"),
+            ".github/workflows/ci.yml"
+        );
+    }
+
+    #[test]
+    fn site_path_leaves_bare_paths_and_non_numeric_colons_alone() {
+        assert_eq!(site_path("pkg/a/b.go"), "pkg/a/b.go");
+        assert_eq!(site_path("repo"), "repo");
+        assert_eq!(site_path("dir/a:b.go"), "dir/a:b.go");
+        assert_eq!(site_path("dir/a.go:"), "dir/a.go:");
+    }
+
+    /// The production caller hands `is_waived` a ladder site, which is
+    /// `path:line`. Before po-av01j.98 the glob saw the `:line` suffix, so
+    /// `**/*.env` and an exact path both failed to match.
+    #[test]
+    fn is_waived_matches_path_globs_against_a_ladder_site() {
+        let site = site_path("internal/pay/prod.env:1");
+        for glob in ["internal/pay/prod.env", "**/*.env", "internal/*/prod.env"] {
+            let ws = vec![w("secret.x", &[glob], "")];
+            assert!(is_waived("secret.x", site, &ws, "2026-08-02"), "{glob}");
+        }
+        let ws = vec![w("secret.x", &["other/*.env"], "")];
+        assert!(!is_waived("secret.x", site, &ws, "2026-08-02"));
     }
 
     #[test]
