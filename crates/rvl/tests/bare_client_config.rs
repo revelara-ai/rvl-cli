@@ -182,6 +182,9 @@ fn goindex_binary(dir: &Path) -> Option<PathBuf> {
     let bin = dir.join("goindex");
     match Command::new("go")
         .args(["build", "-o"])
+        // A `go` binary locates its own root; an inherited GOROOT naming
+        // another release fails every std package (see cli.rs go_build_command).
+        .env_remove("GOROOT")
         .arg(&bin)
         .arg(".")
         .current_dir(&src)
