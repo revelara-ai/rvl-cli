@@ -149,6 +149,11 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("risk ready", "service", Empty::Absent),  // risk.go:535
     ("risk ready", "format", Empty::Absent),   // risk.go:574
     ("risk ready", "limit", Empty::Error),     // risk.go:498/506
+    // rvl-native (po-av01j.221), NOT the Absent family convention: an empty
+    // team read as "no filter" would widen a per-team view to the whole
+    // register (`--team="$TEAM"` with TEAM unset). Rejected at parse time.
+    ("risk list", "team", Empty::Error),
+    ("risk ready", "team", Empty::Error),
     ("risk show", "format", Empty::Absent),    // risk.go:751
     ("risk context", "format", Empty::Absent), // risk.go:920
     // risk.go:1097/1152: `--reason=` OVERRIDES the "Resolved" default and is

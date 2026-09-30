@@ -161,6 +161,30 @@ fn an_empty_numeric_flag_exits_2_and_never_reaches_the_wire() {
     );
 }
 
+/// (a2) `--team=` is a USAGE ERROR too (po-av01j.221). The flag is
+/// rvl-native (rvl-cli never had it), so there is no Go behaviour to copy,
+/// and the Absent convention of the other string filters would be wrong
+/// here: `--team="$TEAM"` with TEAM unset would quietly widen a per-team
+/// view to the whole register, the empty-filter-returns-everything failure.
+#[test]
+fn an_empty_team_exits_2_and_never_reaches_the_wire() {
+    let stub = Stub::start();
+    for cmd in [vec!["risk", "list"], vec!["risk", "ready"]] {
+        let mut eq = String::new();
+        for extra in spellings("--team", &mut eq) {
+            let argv: Vec<&str> = cmd.iter().copied().chain(extra).collect();
+            let (code, err) = run(&stub, &argv);
+            assert_eq!(code, 2, "{argv:?} must exit 2, stderr: {err}");
+            assert!(err.contains("--team"), "{argv:?} must name --team: {err}");
+        }
+    }
+    assert!(
+        stub.requests().is_empty(),
+        "a usage error must not talk to the server: {:?}",
+        stub.requests()
+    );
+}
+
 /// (b) A MISSPELLED flag is a usage error whatever its spelling. The argv
 /// strip disabled unknown-flag detection for the entire `--x=` shape, so
 /// `risk list --serivce=` exited 0 and listed everything, hiding the typo.

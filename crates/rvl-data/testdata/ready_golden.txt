@@ -15,6 +15,7 @@
         "RC-018"
       ],
       "last_seen_at": "2026-08-01T10:00:00Z",
+      "narrative": "dropped-by-cli",
       "uca_type": "not_provided"
     },
     {
@@ -23,8 +24,7 @@
       "title": "No timeout",
       "category": "fault_tolerance",
       "score": 65,
-      "status": "applicable",
-      "linked_services": null
+      "status": "applicable"
     }
   ],
   "total": 3,
