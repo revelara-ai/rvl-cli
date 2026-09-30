@@ -10,6 +10,8 @@
 //! failures only, and a signed artifact that merely needs a newer binary is
 //! not a trust failure.
 
+pub mod auto;
+
 use base64::Engine;
 use ed25519_dalek::Verifier;
 use rvl_core::BIN;
@@ -196,6 +198,11 @@ impl CacheStore {
         Ok(Self {
             root: root.to_path_buf(),
         })
+    }
+
+    /// The store's root directory (where the auto-sync state lives).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn dir(&self, name: &str) -> PathBuf {
