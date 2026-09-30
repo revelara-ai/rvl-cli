@@ -3005,38 +3005,225 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
 /// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
 /// its NuGet restore (Roslyn) is unavailable — matching the tsindex
 /// "run npm install first" skip convention.
+///
+/// The build is bounded (po-l1a0p): an unbounded one sat for 10h48m on 12 s
+/// of CPU and stopped the dev loop. RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS
+/// overrides the default of 600 s; a cold NuGet restore plus Release build
+/// takes about a minute.
 fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if std::process::Command::new("dotnet")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP csindex e2e: no dotnet SDK");
-        return None;
+    let secs = std::env::var("RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    build_csindex_with(
+        std::ffi::OsStr::new("dotnet"),
+        dir,
+        std::time::Duration::from_secs(secs),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `build_csindex` with the dotnet program and the bound as parameters, so a
+/// fake dotnet can prove the bound. Ok(None) is a skip, Err is a failure.
+///
+/// What each measure is for:
+/// * The project is copied into `dir` and built there. Test binaries from
+///   several worktrees run at once and otherwise all restore and compile
+///   into the same helpers/csindex/obj.
+/// * --disable-build-servers, -nodeReuse:false and UseSharedCompilation=false
+///   stop the build from handing work to, or waiting on, a Roslyn compiler
+///   server or MSBuild node that outlives it and is shared with other runs.
+/// * Output goes to files, not pipes, and the build runs in its own process
+///   group that is killed whole on timeout, so no descendant can keep the
+///   test waiting.
+fn build_csindex_with(
+    dotnet: &std::ffi::OsStr,
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match run_bounded(
+        std::process::Command::new(dotnet).arg("--version"),
+        dir,
+        "dotnet-version",
+        std::time::Duration::from_secs(60),
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP csindex e2e: no dotnet SDK");
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
+        Ok(None) => return Err("`dotnet --version` timed out after 60s".to_string()),
+        Ok(Some(_)) => {}
     }
-    let csdir = helpers_dir().join("csindex");
+
+    let src = dir.join("csindex-src");
+    std::fs::create_dir_all(&src).map_err(|e| format!("create {src:?}: {e}"))?;
+    for entry in std::fs::read_dir(helpers_dir().join("csindex")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::copy(&path, src.join(path.file_name().unwrap()))
+                .map_err(|e| format!("copy {path:?}: {e}"))?;
+        }
+    }
     let out_dir = dir.join("csindex-build");
-    let out = std::process::Command::new("dotnet")
-        .args(["build", "-c", "Release", "-o"])
-        .arg(&out_dir)
-        .current_dir(&csdir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let args: [&std::ffi::OsStr; 8] = [
+        "build".as_ref(),
+        "-c".as_ref(),
+        "Release".as_ref(),
+        "--disable-build-servers".as_ref(),
+        "-nodeReuse:false".as_ref(),
+        "-p:UseSharedCompilation=false".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_os_str(),
+    ];
+    let shown = format!(
+        "{} {} (in {})",
+        dotnet.to_string_lossy(),
+        args.map(|a| a.to_string_lossy().into_owned()).join(" "),
+        src.display()
+    );
+    let mut cmd = std::process::Command::new(dotnet);
+    cmd.args(args)
+        .current_dir(&src)
+        .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_NOLOGO", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
+    let (status, output) = match run_bounded(&mut cmd, dir, "dotnet-build", timeout) {
+        Ok(Some(done)) => done,
+        Ok(None) => {
+            return Err(format!(
+                "csindex build timed out after {timeout:?} and was killed: {shown}"
+            ))
+        }
+        Err(e) => return Err(format!("csindex build did not start: {shown}: {e}")),
+    };
+    if !status.success() {
+        // NU1301: NuGet could not reach its feed, so Roslyn was never
+        // restored. That is the environment (no network, cold cache), not our
+        // helper, so it is a skip like a missing SDK.
+        if output.contains("NU1301") {
+            eprintln!(
+                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache"
+            );
+            return Ok(None);
+        }
         // The SDK being absent is a skip (handled above); the SDK being
         // present while OUR helper fails to compile is a defect. This exact
         // branch hid four CS0103 errors through an entire epic (po-av01j.47),
         // because a green skip reads identically to a green pass.
-        panic!(
-            "csindex failed to build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return Err(format!("csindex failed to build: {shown}\n{output}"));
     }
     let dll = out_dir.join("csindex.dll");
     if dll.is_file() {
-        Some(dll)
+        Ok(Some(dll))
     } else {
-        panic!("csindex built but produced no csindex.dll at {out_dir:?}")
+        Err(format!(
+            "csindex built but produced no csindex.dll at {out_dir:?}"
+        ))
+    }
+}
+
+/// Run `cmd` to completion or until `timeout`, with stdout and stderr in
+/// files under `dir` named after `tag`. Ok(Some) carries the exit status and
+/// the combined output; Ok(None) is a timeout, after which the command's
+/// whole process group has been killed.
+fn run_bounded(
+    cmd: &mut std::process::Command,
+    dir: &std::path::Path,
+    tag: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    let out_path = dir.join(format!("{tag}.stdout"));
+    let err_path = dir.join(format!("{tag}.stderr"));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&out_path)?)
+        .stderr(std::fs::File::create(&err_path)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        // Kill the whole group before reaping the leader, so its pid (the
+        // group id) cannot have been reused by an unrelated process.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    Ok(Some((
+        status,
+        format!("{}{}", read(&out_path), read(&err_path)),
+    )))
+}
+
+/// A dotnet build that never ends must fail the test within the bound, name
+/// the build command, and leave nothing running (po-l1a0p). The fake dotnet
+/// answers `--version` and then sleeps in a CHILD on `build`, the way a
+/// compiler server or MSBuild node outlives the process the test started:
+/// killing only the direct child would leave that sleeper holding the pipes.
+#[cfg(unix)]
+#[test]
+fn csindex_build_that_never_ends_fails_within_the_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleeper.pid");
+    let fake = dir.path().join("dotnet");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 8.0.0; exit 0; fi\n\
+             sleep 600 &\n\
+             echo $! > '{}'\n\
+             wait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bound = std::time::Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let err = build_csindex_with(fake.as_os_str(), dir.path(), bound)
+        .expect_err("a build that never ends must fail, not pass or skip");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < bound + std::time::Duration::from_secs(10),
+        "the build must fail at the bound ({bound:?}), took {elapsed:?}"
+    );
+    assert!(
+        err.contains("timed out") && err.contains(&format!("{} build -c Release", fake.display())),
+        "the failure must say it timed out and name the build command: {err}"
+    );
+    let sleeper = std::fs::read_to_string(&pid_file).unwrap();
+    let proc_dir = std::path::Path::new("/proc").join(sleeper.trim());
+    if std::path::Path::new("/proc/self").exists() {
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_dir.exists() && std::time::Instant::now() < gone_by {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !proc_dir.exists(),
+            "the build's own children must be killed on timeout, {} still runs",
+            sleeper.trim()
+        );
     }
 }
 
