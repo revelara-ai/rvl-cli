@@ -371,7 +371,7 @@ fn risk_list_encodes_filters_like_go_url_values() {
 // --- risk list/ready --team (po-av01j.221, server half po-av01j.201) ---
 
 /// The server's answer to a slug it does not know: 400 validation_error,
-/// naming the slugs it does know (polaris 7c90e5dd).
+/// naming the slugs it does know (server commit 7c90e5dd).
 const UNKNOWN_TEAM_400: &str = r#"{"error":"validation_error","message":"unknown team \"paymnets\"; known team slugs: checkout, payments"}"#;
 
 #[test]
