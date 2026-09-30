@@ -853,6 +853,32 @@ fn every_language_seen_is_named_including_the_ones_that_found_nothing() {
     );
 }
 
+// po-av01j.138. A helper that parsed a unit only partly (for C/C++, a header
+// that is not installed made clang drop whole statements, calls and all) must
+// not print a zero that reads like the clean one above. The line names the
+// loss and goes yellow, like a failure: both change what the numbers mean.
+#[test]
+fn a_partial_parse_is_not_rendered_like_a_clean_zero() {
+    let cov = Coverage {
+        lang_status: vec![LangStatus {
+            lang: "C/C++".into(),
+            state: LangState::Partial,
+            detail: "0 sites, INCOMPLETE: 1 of 1 translation unit had parse errors".into(),
+        }],
+        ..Default::default()
+    };
+    let out = render_lang_status(&cov, false);
+    assert!(
+        out.contains("C/C++ 0 sites, INCOMPLETE: 1 of 1 translation unit"),
+        "{out}"
+    );
+    let colored = render_lang_status(&cov, true);
+    assert!(
+        colored.contains("\u{1b}[33m"),
+        "a partial lane is yellow: {colored:?}"
+    );
+}
+
 #[test]
 fn a_failed_language_is_distinguishable_from_one_that_abstained() {
     let cov = Coverage {
