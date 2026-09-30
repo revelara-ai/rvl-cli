@@ -53,6 +53,10 @@ pub struct OutDoc {
     /// The hook-adjudication agent block verbatim when `--hook` ran; null
     /// otherwise. Provenance-tagged and separate, exactly as rendered.
     pub hook_agent: Option<String>,
+    /// `scan --blend` status (po-av01j.205): complete or not, why, counts,
+    /// and the BLEND block verbatim. Null when `--blend` was not given. A
+    /// status report, not findings: engine rows above are never rewritten.
+    pub blend: Option<crate::blend::BlendSummary>,
 }
 
 /// One per-site eval row. Field names match the old top-level array (and the
@@ -183,6 +187,7 @@ pub fn build(
     propagated: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
     hook_agent_block: Option<&str>,
+    blend: Option<&crate::blend::BlendSummary>,
     blocked: bool,
 ) -> OutDoc {
     let findings = ladder
@@ -290,6 +295,7 @@ pub fn build(
         undecided,
         covered_classes: covered.into_iter().collect(),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
+        blend: blend.cloned(),
     }
 }
 
@@ -324,6 +330,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             blocked,
         );
@@ -371,6 +378,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             false,
         );

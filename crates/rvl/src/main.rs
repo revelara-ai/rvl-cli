@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod base_ref;
+mod blend;
 mod changed;
 mod compat;
 mod config_lane;
@@ -158,6 +159,18 @@ enum Cmd {
         /// (po-av01j.15, `--hook`); this flag never invokes a model.
         #[arg(long)]
         agent: bool,
+        /// Blend the deterministic scan with your own coding agent
+        /// (po-av01j.205): the undecided runtime call sites, and only those,
+        /// go to the agent (claude/copilot on PATH, `agent:` in
+        /// ~/.revelara/config.yaml, or RVL_AGENT_CMD) and its verdicts merge
+        /// into a BLEND section. Advisory unless `.revelara.yaml` sets
+        /// `scanner.agent_verdicts: gate`. An agent that is vetoed
+        /// (RVL_NO_AGENT=1, org force_deny, `scanner.use_agent: deny`),
+        /// missing, failing or out of budget fails OPEN, and the footer says
+        /// NOT A BLENDED RESULT. Manual scans only: refused with `--hook` and
+        /// the v1 hook aliases, which keep the consented hook lane.
+        #[arg(long)]
+        blend: bool,
         /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
         /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
         /// the same question `--hook pre-commit` asks. Accepted because v1's
@@ -542,11 +555,12 @@ impl From<CompletionShell> for clap_complete::Shell {
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
 /// deterministic scan proceeds. Extended per po-av01j.15 with the consented
-/// hook-adjudication pointer.
+/// hook-adjudication pointer, and per po-av01j.205 with the `--blend` one.
 fn agent_alias_notice() {
     eprintln!(
         "note: --agent is a deprecated rvl-cli compatibility alias; {BIN} runs its \
-         deterministic scan (no model calls) — drop --agent. For consented agent \
+         deterministic scan (no model calls) — drop --agent. To blend in your own \
+         agent on a manual scan, run '{BIN} scan --blend'. For consented agent \
          adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
          scanner.agent_hooks in .revelara.yaml and run '{BIN} scan --incremental \
          --hook <pre-commit|pre-push>'; see '{BIN} skills' for the agent-side \
@@ -3006,6 +3020,7 @@ fn run_scan(
     color: Option<&str>,
     strict: bool,
     include_tests: bool,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // The full path treats "no language detected" as a clean pass too
@@ -3049,6 +3064,8 @@ fn run_scan(
             &structure,
             None,
             None,
+            // No language, so no call site the blend could be asked about.
+            None,
             out,
             color,
             start,
@@ -3079,6 +3096,7 @@ fn run_scan(
     structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    let blended = blend.then(|| blend::run(path, None, &findings, &sites, stdout_color(color)));
     render_scan_output(
         state_path,
         path,
@@ -3089,6 +3107,7 @@ fn run_scan(
         &structure,
         Some(&lane),
         None,
+        blended.as_ref(),
         out,
         color,
         start,
@@ -3204,6 +3223,8 @@ fn render_scan_output(
     structure: &[render::Finding],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
+    // `scan --blend` (po-av01j.205); None when not requested.
+    blended: Option<&blend::BlendOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -3255,6 +3276,7 @@ fn render_scan_output(
         ..Default::default()
     };
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
+    coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
@@ -3286,6 +3308,10 @@ fn render_scan_output(
     // built from `findings`, which agent verdicts never touch.
     if let Some(a) = hook_agent {
         ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
+    // `--blend` follows the same rule: rows only in gate mode, agent-tagged.
+    if let Some(b) = blended {
+        ladder_findings.extend(b.gate_findings.iter().cloned());
     }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
@@ -3324,6 +3350,7 @@ fn render_scan_output(
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
+            blended.map(|b| &b.summary),
             blocked,
         )
     });
@@ -3345,6 +3372,9 @@ fn render_scan_output(
         if !a.block.is_empty() {
             print!("\n{}", a.block);
         }
+    }
+    if let Some(b) = blended {
+        print!("\n{}", b.block);
     }
 
     if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
@@ -4194,6 +4224,7 @@ fn run_scan_incremental(
     changed_only: bool,
     hook: Option<&str>,
     base_chain: &base_ref::Chain,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
 
@@ -4378,6 +4409,18 @@ fn run_scan_incremental(
             stdout_color(color),
         )
     });
+    // `--blend` (po-av01j.205): the same residue, whole repo, or the
+    // changed set under --changed-only so the agent never sees files the
+    // report is not about.
+    let blended = blend.then(|| {
+        blend::run(
+            path,
+            changed_only.then_some(changed_files.as_slice()),
+            &findings,
+            &sites,
+            stdout_color(color),
+        )
+    });
     render_scan_output(
         state_path,
         path,
@@ -4388,6 +4431,7 @@ fn run_scan_incremental(
         &structure,
         Some(&lane),
         hook_agent.as_ref(),
+        blended.as_ref(),
         out,
         color,
         start,
@@ -5982,6 +6026,7 @@ fn run() -> anyhow::Result<ExitCode> {
             changed_only,
             base,
             agent,
+            blend,
             staged,
             pre_push,
             mode,
@@ -6019,6 +6064,15 @@ fn run() -> anyhow::Result<ExitCode> {
                 base_chain.is_configured(),
             )?;
             compat::set_never_block(never_block);
+            // `--blend` is a manual scan. On the hook path the consented lane
+            // (po-av01j.15) owns agent use, and a v1 shim must never grow an
+            // agent call it did not ask for; refuse rather than pick one.
+            anyhow::ensure!(
+                !(blend && hook.is_some()),
+                "--blend is for manual scans and cannot run on the hook path \
+                 (--hook, --staged, --pre-push); hooks use the consented agent lane \
+                 (scanner.use_agent + scanner.agent_hooks in .revelara.yaml)"
+            );
             match notice {
                 // The v1 notice already names `--agent` and says exactly what
                 // ran instead, so the generic alias paragraph would only add
@@ -6066,6 +6120,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     changed_only,
                     hook.as_deref(),
                     &base_chain,
+                    blend,
                 )
             } else {
                 // Hook adjudication is delta-scoped by definition; without
@@ -6089,6 +6144,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     color.as_deref(),
                     strict,
                     include_tests,
+                    blend,
                 )
             }
         }

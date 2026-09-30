@@ -79,7 +79,7 @@ notice naming the repair:
 
 | Flag | Behavior now |
 | --- | --- |
-| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. |
+| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. To blend in your agent, use `--blend` (manual scans only). |
 | `--staged` | Alias for `--incremental --changed-only --hook pre-commit`. |
 | `--pre-push` | Alias for `--incremental --changed-only --hook pre-push`. |
 | `--mode enforce\|eval` | `enforce` is the only mode; `eval` reports without blocking. |

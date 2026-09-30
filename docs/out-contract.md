@@ -76,7 +76,8 @@ The orchestrator uses it to:
       "lever": "judge", "scope": "runtime" }
   ],
   "covered_classes": ["net/http.Client.Do", "redis.pipeline"],
-  "hook_agent": null
+  "hook_agent": null,
+  "blend": null
 }
 ```
 
@@ -134,6 +135,13 @@ The orchestrator uses it to:
 - `hook_agent` is the hook-adjudication block as rendered text, present when
   `--hook` ran with the agent lane enabled and verdicts to show (verdicts are
   provenance-tagged and separate, exactly as rendered). Null otherwise.
+- `blend` is present when `rvl scan --blend` ran, null otherwise. It is a
+  status report, not findings: `complete` (bool), `reason` (why the blend
+  is incomplete, else null), `agent` (the agent consulted, else null), the
+  counts `in_scope`, `sent`, `cleared`, `warned`, `undecided` and
+  `out_of_scope`, and `block`, the BLEND section as rendered text.
+  `complete: false` means the report is the deterministic half alone.
+  Nothing in `findings`, `sites` or `undecided` changes because of it.
 - `exit` duplicates the process exit code so a consumer holding only the file
   knows whether the gate fired (`0` clean, `3` blocking).
 
