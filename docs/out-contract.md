@@ -65,7 +65,11 @@ The orchestrator uses it to:
       "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2 },
       "no_spec_keys": ["github_actions permissions"],
       "unparseable_files": 0
-    }
+    },
+    "retrieval": [
+      { "lang": "go", "calls_resolved": 18233, "candidates": 412,
+        "unretrieved": { "io.ReadAll": 3 } }
+    ]
   },
   "sites": [
     { "site_id": "...", "snapshot_id": "...", "verdict": "violates",
@@ -119,6 +123,17 @@ The orchestrator uses it to:
     test files its packet index flagged when they were first retrieved as
     well as the ones it re-parsed this pass. `rvl scan --include-tests`
     makes the second zero by scanning them.
+  - `retrieval[]`: the retrieval denominator, one row per language whose
+    helper measures it (Go today). `resolved`/`total` is resolution over the
+    sites the extractor RETRIEVED, and the extractor's tables decide what is
+    retrieved, so never quote that percentage without this row.
+    `candidates` is the call sites the extractor retrieved; `calls_resolved`
+    is every call in non-test code whose callee the type checker resolved
+    (crude by design: most are not I/O); `unretrieved` counts calls the
+    helper's corpus knows are I/O and its tables do not retrieve, keyed by
+    surface (`io.ReadAll`). The counts are whole-repo even under
+    `--incremental`, but a warm pass that re-parsed no file of a language has
+    no row for it: absent means not measured this run, never zero.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime

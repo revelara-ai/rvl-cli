@@ -146,6 +146,11 @@ pub struct OutCoverage {
     pub retrievers: Vec<OutRetriever>,
     pub degraded: Vec<OutDegraded>,
     pub config: Option<OutConfig>,
+    /// The retrieval denominator per language (po-av01j.219): candidate call
+    /// sites the extractor retrieved, out of every call the type checker
+    /// resolved, plus the known I/O it did not retrieve. `resolved`/`total`
+    /// is measured over the retrieved sites only, so quote them together.
+    pub retrieval: Vec<rvl_core::RetrievalCensus>,
 }
 
 /// A site the engine reached and abstained on, with the lever that closes it.
@@ -285,6 +290,7 @@ pub fn build(
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
                 unparseable_files: c.unparseable_files,
             }),
+            retrieval: coverage.retrieval.clone(),
         },
         sites: site_rows,
         undecided,
@@ -375,6 +381,28 @@ mod tests {
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
+    /// po-av01j.219: the retrieval denominator reaches the document beside
+    /// resolved/total, so a consumer never quotes a coverage percentage
+    /// without the extractor scope it was measured over.
+    #[test]
+    fn coverage_carries_the_retrieval_denominator() {
+        let mut cov = render::Coverage::default();
+        let mut unretrieved = std::collections::BTreeMap::new();
+        unretrieved.insert("io.ReadAll".to_string(), 3);
+        cov.retrieval = vec![rvl_core::RetrievalCensus {
+            lang: "go".into(),
+            calls_resolved: 4200,
+            candidates: 97,
+            unretrieved,
+        }];
+        let doc = build(&[], &cov, None, &[], &[], None, false);
+        let v = serde_json::to_value(&doc.coverage).unwrap();
+        assert_eq!(v["retrieval"][0]["lang"], "go");
+        assert_eq!(v["retrieval"][0]["candidates"], 97);
+        assert_eq!(v["retrieval"][0]["calls_resolved"], 4200);
+        assert_eq!(v["retrieval"][0]["unretrieved"]["io.ReadAll"], 3);
     }
 
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE

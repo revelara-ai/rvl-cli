@@ -161,6 +161,52 @@ pub struct Coverage {
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
     pub empty_api_corpus: bool,
+    /// The retrieval denominator per language that measures it
+    /// (po-av01j.219). `resolved`/`total` above is resolution over RETRIEVED
+    /// sites, and the extractor tables decide what is retrieved; this is how
+    /// many call sites were retrieved out of the ones that exist, and which
+    /// known I/O the tables left out. Empty when no helper reported one.
+    pub retrieval: Vec<rvl_core::RetrievalCensus>,
+}
+
+/// The retrieval-denominator lines (po-av01j.219), one per language that
+/// measured one. Printed whether or not any site is in scope: the census
+/// describes the repo, not the sites this scan resolved.
+///
+/// Yellow when the corpus names I/O the tables skipped, because then the
+/// resolved percentage above is known to exclude real I/O; dim otherwise.
+pub fn render_retrieval(cov: &Coverage, color: bool) -> String {
+    let mut o = String::new();
+    for r in &cov.retrieval {
+        // One decimal, not the integer percent the resolved line uses: the
+        // crude denominator is large, and nats-server's 118 of 25263 printed
+        // as "0%", which reads as "nothing retrieved".
+        let pct = 100.0 * r.candidates as f64 / r.calls_resolved.max(1) as f64;
+        let missed: Vec<String> = r
+            .unretrieved
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(surface, n)| format!("{surface} {n}"))
+            .collect();
+        let line = format!(
+            "  {} retrieval: {} candidate call sites of {} resolved calls ({:.1}%) \u{00b7} known I/O not retrieved: {}",
+            r.lang,
+            r.candidates,
+            r.calls_resolved,
+            pct,
+            if missed.is_empty() {
+                "none".to_string()
+            } else {
+                missed.join(", ")
+            }
+        );
+        let _ = writeln!(
+            o,
+            "{}",
+            paint(&line, if missed.is_empty() { "2" } else { "33" }, color)
+        );
+    }
+    o
 }
 
 /// The one-line per-language roll-call. Rendered whenever anything was seen, so
@@ -582,6 +628,7 @@ pub fn render_ladder(
         );
         let _ = writeln!(o, "{}", paint(&line, "33", color));
     }
+    o.push_str(&render_retrieval(&cov, color));
     o.push_str(&render_lang_status(&cov, color));
     o.push_str(&render_coverage_degradations(&cov, color));
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {

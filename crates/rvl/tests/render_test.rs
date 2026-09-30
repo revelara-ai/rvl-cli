@@ -113,6 +113,7 @@ fn cov() -> Coverage {
         degraded: Vec::new(),
         degraded_note: None,
         lang_status: Vec::new(),
+        retrieval: Vec::new(),
     }
 }
 
@@ -167,6 +168,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         degraded: Vec::new(),
         degraded_note: None,
         lang_status: Vec::new(),
+        retrieval: Vec::new(),
     };
     let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
@@ -226,6 +228,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -268,6 +271,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -301,6 +305,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -330,6 +335,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -358,6 +364,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -391,6 +398,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -471,6 +479,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         Some(&cc),
         "0.1s",
@@ -510,6 +519,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 degraded: Vec::new(),
                 degraded_note: None,
                 lang_status: Vec::new(),
+                retrieval: Vec::new(),
             },
             cfg,
             "0.1s",
@@ -994,4 +1004,63 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
     );
+}
+
+// --- the retrieval denominator (po-av01j.219) ---
+
+fn go_census(candidates: usize, calls: usize, readall: usize) -> rvl_core::RetrievalCensus {
+    let mut unretrieved = std::collections::BTreeMap::new();
+    if readall > 0 {
+        unretrieved.insert("io.ReadAll".to_string(), readall);
+    }
+    rvl_core::RetrievalCensus {
+        lang: "go".into(),
+        calls_resolved: calls,
+        candidates,
+        unretrieved,
+    }
+}
+
+/// Coverage is resolution over RETRIEVED sites. The retrieval denominator
+/// prints beside it, with the known I/O the extractor tables do not
+/// retrieve, so "97% resolved" can no longer read as a statement about the
+/// whole repo.
+#[test]
+fn coverage_prints_the_retrieval_denominator_and_known_unretrieved_io() {
+    let mut c = cov();
+    c.retrieval = vec![go_census(97, 4200, 3)];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(out.contains("1/1 API surfaces resolved"), "{out}");
+    assert!(
+        out.contains("go retrieval: 97 candidate call sites of 4200 resolved calls (2.3%)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("known I/O not retrieved: io.ReadAll 3"),
+        "{out}"
+    );
+}
+
+/// The denominator is a fact about the repo, not about the sites in scope:
+/// it prints even when the resolution line has nothing to count.
+#[test]
+fn retrieval_denominator_prints_when_no_site_is_in_scope() {
+    let mut c = cov();
+    c.resolved = 0;
+    c.total = 0;
+    c.retrieval = vec![go_census(0, 12, 0)];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(
+        out.contains("go retrieval: 0 candidate call sites of 12 resolved calls (0.0%)"),
+        "{out}"
+    );
+    assert!(out.contains("known I/O not retrieved: none"), "{out}");
+}
+
+/// No census (an older helper, a language that does not measure it) prints
+/// no retrieval line: absent is not zero.
+#[test]
+fn no_census_prints_no_retrieval_line() {
+    let out = render_ladder(&[], cov(), None, "0.1s", false);
+    assert!(!out.contains("retrieval:"), "{out}");
 }

@@ -1096,6 +1096,7 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            retrieval: Vec::new(),
         }
     }
 
@@ -1208,6 +1209,7 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            retrieval: Vec::new(),
         }
     }
 

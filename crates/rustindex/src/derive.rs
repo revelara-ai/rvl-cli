@@ -863,6 +863,8 @@ pub fn derive(
             // it has no test-path skip to count.
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            // rustindex does not measure a retrieval denominator yet.
+            retrieval: Vec::new(),
         },
     }
 }
