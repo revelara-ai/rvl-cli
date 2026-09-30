@@ -372,8 +372,9 @@ fn precision_wilson_lb_pass_and_fail() {
 
 #[test]
 fn unsure_rows_are_excluded_but_counted() {
-    // 52 decided (50 violates + 2 satisfies) + 3 unsure
-    let s = score_gate(&gold(50, 2, 3), 50, 0.90).unwrap();
+    // 52 decided (50 violates + 2 satisfies) + 3 unsure; the manifest
+    // declares the 52 decided rows it scores.
+    let s = score_gate(&gold(50, 2, 3), 52, 0.90).unwrap();
     assert_eq!(s.n_decided, 52);
     assert_eq!(s.n_unsure, 3);
     assert_eq!(s.confirmed_violates, 50);
@@ -390,6 +391,54 @@ fn too_few_decided_is_refused() {
             required: 50
         }
     );
+}
+
+#[test]
+fn more_decided_than_the_manifest_declares_is_refused() {
+    // po-av01j.92. The manifest pre-registers a seeded sample of 50. Those 50
+    // land at LB ~0.88; fifteen more rows adjudicated and appended would lift
+    // the number over 0.90. The published claim would cite a sample of 50 while
+    // the number came from 65 rows selected under no stated rule.
+    let err = score_gate(&gold(62, 3, 0), 50, 0.90).unwrap_err();
+    assert_eq!(
+        err,
+        Refusal::GoldExceedsSample {
+            decided: 65,
+            declared: 50
+        }
+    );
+    assert_eq!(
+        check_gold_matches_sample(&gold(62, 3, 0), 50).unwrap_err(),
+        Refusal::GoldExceedsSample {
+            decided: 65,
+            declared: 50
+        }
+    );
+}
+
+#[test]
+fn decided_rows_must_equal_the_declared_sample_exactly() {
+    assert!(check_gold_matches_sample(&gold(45, 5, 0), 50).is_ok());
+    // Unsure rows are the panel declining to decide; they are neither part of
+    // the decided sample nor a mismatch.
+    assert!(check_gold_matches_sample(&gold(45, 5, 4), 50).is_ok());
+    assert_eq!(
+        check_gold_matches_sample(&gold(40, 8, 2), 50).unwrap_err(),
+        Refusal::GoldTooSmall {
+            decided: 48,
+            required: 50
+        }
+    );
+}
+
+#[test]
+fn the_sample_mismatch_refusal_names_both_counts() {
+    let msg = Refusal::GoldExceedsSample {
+        decided: 65,
+        declared: 50,
+    }
+    .to_string();
+    assert!(msg.contains("65") && msg.contains("50"), "{msg}");
 }
 
 // --- The minikube DEV/DOGFOOD spec cache (po-av01j.80) ---

@@ -682,6 +682,12 @@ specs borrowed by method for {borrowed} rows",
                     Ok(v) => v,
                     Err(r) => refuse(&r),
                 };
+            // The gold must be the pre-registered sample (po-av01j.92). Checked
+            // before consumption: a set whose rows are not the declared sample
+            // is invalid evidence, refused like the other provenance checks.
+            if let Err(r) = gate::check_gold_matches_sample(&rows, manifest.sample_size) {
+                refuse(&r);
+            }
 
             // The population, printed WITH the number, always.
             println!(
@@ -692,6 +698,15 @@ specs borrowed by method for {borrowed} rows",
                 println!("  repo {} @ {}", pin.repo, pin.frozen_sha);
             }
             println!("  sampling frame: {}", manifest.sampling_frame.trim());
+            let n_unsure = rows
+                .iter()
+                .filter(|r| r.adjudicated == gate::AdjudicatedVerdict::Unsure)
+                .count();
+            println!(
+                "  sample: {} decided + {n_unsure} unsure adjudications = sample_size {}",
+                rows.len() - n_unsure,
+                manifest.sample_size
+            );
             println!(
                 "  adjudication: {} by {} ({})",
                 manifest.adjudication.protocol,
