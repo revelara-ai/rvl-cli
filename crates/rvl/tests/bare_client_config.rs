@@ -181,6 +181,10 @@ fn goindex_binary(dir: &Path) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../helpers/goindex");
     let bin = dir.join("goindex");
     match Command::new("go")
+        // go derives GOROOT from its own binary; an inherited one left by
+        // another toolchain (gvm) fails the build with "compile: version
+        // go1.X does not match go tool version go1.Y".
+        .env_remove("GOROOT")
         .args(["build", "-o"])
         .arg(&bin)
         .arg(".")

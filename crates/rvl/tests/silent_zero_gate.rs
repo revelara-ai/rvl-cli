@@ -84,6 +84,10 @@ fn goindex_binary() -> Option<PathBuf> {
                 .parent()?
                 .join("goindex-under-test");
             let st = Command::new("go")
+                // go derives GOROOT from its own binary; an inherited one left by
+                // another toolchain (gvm) fails the build with "compile: version
+                // go1.X does not match go tool version go1.Y".
+                .env_remove("GOROOT")
                 .arg("build")
                 .arg("-o")
                 .arg(&out)

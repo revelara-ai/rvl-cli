@@ -424,6 +424,10 @@ fn scan_without_retrieved_runs_the_go_helper() {
     let dir = tempfile::tempdir().unwrap();
     let goindex_bin = dir.path().join("goindex");
     let build = Command::new("go")
+        // go derives GOROOT from its own binary; an inherited one left by
+        // another toolchain (gvm) fails the build with "compile: version
+        // go1.X does not match go tool version go1.Y".
+        .env_remove("GOROOT")
         .args(["build", "-o"])
         .arg(&goindex_bin)
         .arg(".")
@@ -941,6 +945,10 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
     match Command::new("go")
+        // go derives GOROOT from its own binary; an inherited one left by
+        // another toolchain (gvm) fails the build with "compile: version
+        // go1.X does not match go tool version go1.Y".
+        .env_remove("GOROOT")
         .args(["build", "-o"])
         .arg(&goindex_bin)
         .arg(".")
