@@ -148,6 +148,11 @@ pub struct OutCoverage {
     /// Test files the retrievers skipped, summed across languages
     ///; the per-language split is in the COVERAGE block.
     pub test_files_skipped: usize,
+    /// Workspaces scanned without their installed dependencies, summed
+    /// across languages (po-pk3fp.15). Non-zero means those lanes resolved
+    /// client types from import syntax; the per-language split is in the
+    /// COVERAGE block.
+    pub dependency_trees_uninstalled: usize,
     pub degraded_note: Option<String>,
     pub lang_status: Vec<OutLang>,
     pub retrievers: Vec<OutRetriever>,
@@ -253,6 +258,11 @@ pub fn build(
             },
             generated_skipped: coverage.generated_skipped,
             test_files_skipped: coverage.test_files_skipped.iter().map(|t| t.count).sum(),
+            dependency_trees_uninstalled: coverage
+                .dependencies_uninstalled
+                .iter()
+                .map(|d| d.count)
+                .sum(),
             degraded_note: coverage.degraded_note.clone(),
             lang_status: coverage
                 .lang_status

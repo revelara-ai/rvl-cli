@@ -600,6 +600,21 @@ pub struct RepoConfig {
     /// by [`RepoConfig::absorb`] alongside the count.
     #[serde(default)]
     pub test_files_skipped_paths: Vec<String>,
+    /// Workspaces that declare dependencies but have no installed tree, as
+    /// the helper saw them (po-pk3fp.2). Like `test_files_skipped`, a
+    /// retrieval statistic on the repo-scoped record, additive within v2 and
+    /// zero from a helper that does not report it. Only tsindex does: an
+    /// uninstalled tree is resolved from import syntax, at tier `medium`,
+    /// with no `client_version`. SUMMED by [`RepoConfig::absorb`], which is
+    /// right across languages and WRONG across the batches of one helper,
+    /// since each batch restates the whole-repo number; read it through
+    /// [`RepoConfig::uninstalled_dependency_trees`].
+    #[serde(default)]
+    pub dependency_trees_uninstalled: usize,
+    /// The repo-relative workspace directories behind that count.
+    /// Concatenated by [`RepoConfig::absorb`], repeats included.
+    #[serde(default)]
+    pub dependency_trees_uninstalled_paths: Vec<String>,
 }
 
 impl RepoConfig {
@@ -638,6 +653,26 @@ impl RepoConfig {
         self.test_files_skipped += other.test_files_skipped;
         self.test_files_skipped_paths
             .extend(other.test_files_skipped_paths);
+        self.dependency_trees_uninstalled += other.dependency_trees_uninstalled;
+        self.dependency_trees_uninstalled_paths
+            .extend(other.dependency_trees_uninstalled_paths);
+    }
+
+    /// How many dependency trees ONE helper's stream reported uninstalled.
+    ///
+    /// The distinct named workspaces when the helper named them, because a
+    /// batched `--files` run writes one repo-scoped record per batch and
+    /// every one restates the same whole-repo state: three batches over a
+    /// repo with two uninstalled workspaces sum to six. The summed count is
+    /// the fallback for a record that carries the number without the names.
+    pub fn uninstalled_dependency_trees(&self) -> usize {
+        if self.dependency_trees_uninstalled_paths.is_empty() {
+            return self.dependency_trees_uninstalled;
+        }
+        self.dependency_trees_uninstalled_paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 }
 
@@ -960,6 +995,47 @@ mod tests {
             cfg.test_files_skipped_paths,
             vec!["e2e/login.ts", "tests/test_a.py", "conftest.py"]
         );
+    }
+
+    /// tsindex reports the workspaces it resolved from import syntax on its
+    /// `repo_config` record (po-pk3fp.2), count and paths. Both are read,
+    /// and both merge across records the way the test-file skip does.
+    #[test]
+    fn uninstalled_dependency_trees_are_carried_and_merged_across_records() {
+        let a = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let b = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":1,"dependency_trees_uninstalled_paths":["tools"]}"#;
+        let (_, cfg, skipped) = parse_stream(&format!("{a}\n{b}\n"));
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.dependency_trees_uninstalled, 3);
+        assert_eq!(
+            cfg.dependency_trees_uninstalled_paths,
+            vec!["backend", "frontend", "tools"]
+        );
+        assert_eq!(cfg.uninstalled_dependency_trees(), 3);
+    }
+
+    /// A batched `--files` run writes one `repo_config` per batch, and each
+    /// restates the WHOLE-REPO dependency state. The reported number is the
+    /// distinct workspaces, not the sum: two uninstalled workspaces seen by
+    /// three batches are two, not six.
+    #[test]
+    fn batches_restating_the_same_uninstalled_trees_count_them_once() {
+        let rec = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{rec}\n{rec}\n{rec}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 2);
+    }
+
+    /// A record that carries the count without the names still reports it,
+    /// and a helper that reports neither (goindex, pyindex) reads as zero.
+    #[test]
+    fn an_unnamed_uninstalled_count_is_kept_and_an_absent_one_is_zero() {
+        let unnamed = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":1}"#;
+        let (_, cfg, _) = parse_stream(&format!("{unnamed}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 1);
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{go}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 0);
+        assert!(cfg.dependency_trees_uninstalled_paths.is_empty());
     }
 
     /// Only the two documented carriers are read. A future repo-scoped

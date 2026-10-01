@@ -159,6 +159,15 @@ excluded without saying so reads as a file that was scanned:
   flags each named file, so a warm scan reports the repository-wide count
   from reused entries rather than the files it happened to re-parse.
 
+`tsindex` also reports, on the same `repo_config` record, the workspaces
+that declare dependencies with no installed tree
+(`dependency_trees_uninstalled`, with the directories beside it as
+`dependency_trees_uninstalled_paths`). It resolves those from import syntax
+rather than abstaining, and `rvl` prints `TypeScript: 2 workspaces without
+installed dependencies (client types resolved from import syntax: medium
+tier, no client versions)` in COVERAGE; `--out` carries the total as
+`coverage.dependency_trees_uninstalled`.
+
 | Retriever | Skipped by default |
 | --- | --- |
 | `goindex` | `*_test.go`, anything under `vendor/` |

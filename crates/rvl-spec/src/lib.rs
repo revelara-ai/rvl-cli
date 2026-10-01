@@ -1120,6 +1120,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
@@ -1232,6 +1234,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
