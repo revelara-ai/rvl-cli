@@ -2550,6 +2550,53 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
     );
 }
 
+/// C G2, live end to end (po-av01j.50): cindex inventories the civetweb and
+/// mongoose registrations as server entries, rvl routes them to the G2 lane
+/// and keeps them out of the G1 site count. The fixture registers `/healthz`,
+/// so RC-020 is satisfied and stays off the ladder; it attaches no rate
+/// limiter, so RC-069 surfaces.
+#[test]
+fn live_c_scan_judges_civetweb_and_mongoose_server_entries() {
+    let Some(cindex) = cindex_helper("live_c_scan_judges_civetweb_and_mongoose_server_entries")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-server");
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("sites 0") && stdout.contains("server-entry 5"),
+        "the five registrations are server entries, not G1 sites: {stdout}"
+    );
+    assert!(
+        !stdout.contains("RC-020"),
+        "the registered /healthz endpoint satisfies the health control: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-069"),
+        "no rate limiter is attached, so RC-069 must surface: {stdout}"
+    );
+}
+
 /// Go, live end to end: goindex inventories the fixture's emissions (slog
 /// aggregates, the recover_block swallow), the seed specs judge them, and the
 /// ladder surfaces RC-027 (swallow) and RC-046 (no spans at I/O boundaries)
