@@ -17,10 +17,23 @@
 //!     `owner/repo@ref` action (the pinning control's evidence). Local
 //!     (`./...`) and `docker://` steps carry no GitHub ref and emit nothing.
 //!
+//! Alongside the packets it states the PREDICATES a conditional spec's guard
+//! is judged against (po-av01j.133.10). These are facts about what a unit is,
+//! not settings, so they are never packets:
+//!
+//!   * `workflow.triggers` — the event names under `on:`, for the whole file.
+//!   * `job.publishes_image` — whether the job's own steps push a container
+//!     image. Withheld when the steps are out of sight (a reusable-workflow
+//!     call), so a guard on it abstains rather than closing on a guess.
+//!   * `workflow.publishes_image` — any job does; withheld if any is unknown.
+//!
 //! Anything else in a workflow file is not inventoried: the key list is
 //! spec-driven, exactly as the typed retrievers only inventory client calls.
 
-use crate::{render_value, ConfigPacket, ConfigRetriever, ProvenanceStep, Resolution, Retrieved};
+use crate::{
+    render_value, ConfigPacket, ConfigPredicate, ConfigRetriever, ProvenanceStep, Resolution,
+    Retrieved, FILE_SCOPE,
+};
 use serde_yaml::Value;
 
 pub struct GithubActions;
@@ -72,6 +85,55 @@ fn split_uses(uses: &str) -> Option<(&str, String)> {
     Some(match uses.rsplit_once('@') {
         Some((a, r)) => (a, r.to_string()),
         None => (uses, String::new()),
+    })
+}
+
+/// The event names under `on:`, sorted, or None when the key is missing or in
+/// a shape that names no event.
+fn triggers(root: &serde_yaml::Mapping) -> Option<Vec<String>> {
+    // YAML 1.1 reads a bare `on` key as the boolean true; accept either so the
+    // fact does not depend on which YAML version the parser implements.
+    let on = get(root, "on").or_else(|| root.get(Value::Bool(true)))?;
+    let mut events: Vec<String> = match on {
+        Value::String(s) => vec![s.clone()],
+        Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Value::Mapping(m) => m
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect(),
+        _ => return None,
+    };
+    events.sort();
+    events.dedup();
+    (!events.is_empty()).then_some(events)
+}
+
+/// Whether one step pushes a container image: the evidence is the PUSH, so a
+/// build-only step does not count.
+fn step_publishes_image(step: &serde_yaml::Mapping) -> bool {
+    if let Some(uses) = get(step, "uses").and_then(Value::as_str) {
+        if uses.split('@').next() == Some("docker/build-push-action") {
+            // `push` defaults to false. Anything but a literal false is an
+            // expression that pushes on some event, which is what a guard asks.
+            return match get(step, "with")
+                .and_then(Value::as_mapping)
+                .and_then(|w| get(w, "push"))
+            {
+                None | Some(Value::Bool(false)) | Some(Value::Null) => false,
+                Some(Value::String(s)) => s != "false",
+                Some(_) => true,
+            };
+        }
+    }
+    get(step, "run").and_then(Value::as_str).is_some_and(|run| {
+        run.lines().any(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words.windows(2).any(|w| w == ["docker", "push"])
+                || (words.contains(&"docker") && words.contains(&"--push"))
+        })
     })
 }
 
@@ -147,6 +209,19 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         provenance,
     };
 
+    let predicate = |unit: &str, key: &str, values: Vec<String>| ConfigPredicate {
+        file_path: rel_path.to_string(),
+        unit: unit.to_string(),
+        key: key.to_string(),
+        values,
+    };
+    if let Some(events) = triggers(root) {
+        out.predicates
+            .push(predicate(FILE_SCOPE, "workflow.triggers", events));
+    }
+    // Some(any job publishes), or None once any job's steps are out of sight.
+    let mut wf_publishes = Some(false);
+
     // Workflow-level facts consulted by the per-job resolution below.
     let wf_permissions = get(root, "permissions");
     let wf_concurrency = get(root, "concurrency");
@@ -182,6 +257,24 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         };
         let unit = format!("job:{job_id}");
         let jpath = |k: &str| format!("jobs.{job_id}.{k}");
+
+        // job.publishes_image: decidable only from the job's OWN steps. A job
+        // that calls a reusable workflow runs steps this file does not hold.
+        match get(job, "steps").and_then(Value::as_sequence) {
+            Some(steps) if get(job, "uses").is_none() => {
+                let publishes = steps
+                    .iter()
+                    .filter_map(Value::as_mapping)
+                    .any(step_publishes_image);
+                out.predicates.push(predicate(
+                    &unit,
+                    "job.publishes_image",
+                    vec![publishes.to_string()],
+                ));
+                wf_publishes = wf_publishes.map(|any| any || publishes);
+            }
+            _ => wf_publishes = None,
+        }
 
         // job.timeout-minutes: explicit, else the documented 6h default.
         match get(job, "timeout-minutes") {
@@ -322,6 +415,13 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 )],
             ));
         }
+    }
+    if let Some(publishes) = wf_publishes {
+        out.predicates.push(predicate(
+            FILE_SCOPE,
+            "workflow.publishes_image",
+            vec![publishes.to_string()],
+        ));
     }
     out
 }
@@ -528,5 +628,130 @@ mod tests {
         let got = packets("some: config\nother: keys\n");
         assert!(got.packets.is_empty());
         assert_eq!(got.unparseable, 1);
+    }
+
+    // ---- po-av01j.133.10: guard predicates for conditional specs ----
+
+    fn fact<'a>(got: &'a Retrieved, unit: &str, key: &str) -> Option<&'a [String]> {
+        got.predicates
+            .iter()
+            .find(|f| f.unit == unit && f.key == key)
+            .map(|f| f.values.as_slice())
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // `on:` has three authored shapes and all three name the same set.
+    #[test]
+    fn workflow_triggers_are_read_from_every_shape_of_on() {
+        let jobs = "jobs:\n  build:\n    runs-on: x\n";
+        for on in [
+            "on: [push, pull_request]\n",
+            "on:\n  pull_request:\n  push:\n    branches: [main]\n",
+        ] {
+            let got = packets(&format!("{on}{jobs}"));
+            assert_eq!(
+                fact(&got, crate::FILE_SCOPE, "workflow.triggers"),
+                Some(strs(&["pull_request", "push"]).as_slice()),
+                "{on}"
+            );
+        }
+        let got = packets(&format!("on: push\n{jobs}"));
+        assert_eq!(
+            fact(&got, crate::FILE_SCOPE, "workflow.triggers"),
+            Some(strs(&["push"]).as_slice())
+        );
+    }
+
+    // A fact is not a setting: it must not join the packets, where a key with
+    // no spec is queued for the spec factory as unjudged.
+    #[test]
+    fn predicates_are_not_packets() {
+        let got = packets("on: push\njobs:\n  build:\n    runs-on: x\n");
+        assert!(!got.predicates.is_empty());
+        assert!(
+            got.packets
+                .iter()
+                .all(|p| p.key != "workflow.triggers" && !p.key.ends_with("publishes_image")),
+            "{:?}",
+            got.packets
+        );
+    }
+
+    #[test]
+    fn a_job_that_pushes_an_image_says_so_and_the_workflow_inherits_it() {
+        let got = packets(
+            "on: push\njobs:\n  test:\n    steps:\n      - run: make test\n  image:\n    steps:\n      - uses: docker/build-push-action@v6\n        with:\n          push: true\n",
+        );
+        assert_eq!(
+            fact(&got, "job:test", "job.publishes_image"),
+            Some(strs(&["false"]).as_slice())
+        );
+        assert_eq!(
+            fact(&got, "job:image", "job.publishes_image"),
+            Some(strs(&["true"]).as_slice())
+        );
+        assert_eq!(
+            fact(&got, crate::FILE_SCOPE, "workflow.publishes_image"),
+            Some(strs(&["true"]).as_slice())
+        );
+    }
+
+    #[test]
+    fn the_publish_evidence_is_the_push_not_the_build() {
+        let publishes = |steps: &str| {
+            let got = packets(&format!("on: push\njobs:\n  j:\n    steps:\n{steps}"));
+            fact(&got, "job:j", "job.publishes_image").map(|v| v.to_vec())
+        };
+        // build-push-action defaults to push: false: a build-only job.
+        assert_eq!(
+            publishes("      - uses: docker/build-push-action@v6\n"),
+            Some(strs(&["false"]))
+        );
+        assert_eq!(
+            publishes(
+                "      - uses: docker/build-push-action@v6\n        with:\n          push: false\n"
+            ),
+            Some(strs(&["false"]))
+        );
+        // An expression pushes on SOME event, which is what the guard asks.
+        assert_eq!(
+            publishes(
+                "      - uses: docker/build-push-action@v6\n        with:\n          push: ${{ github.event_name != 'pull_request' }}\n"
+            ),
+            Some(strs(&["true"]))
+        );
+        assert_eq!(
+            publishes(
+                "      - run: |\n          docker build -t app .\n          docker push app\n"
+            ),
+            Some(strs(&["true"]))
+        );
+        assert_eq!(
+            publishes("      - run: docker build -t app .\n"),
+            Some(strs(&["false"]))
+        );
+    }
+
+    // A reusable-workflow call hides its steps in another file, possibly
+    // another repo. Whether it publishes is unknown, and "false" would close a
+    // guard on a guess, so the fact is withheld and the guard abstains.
+    #[test]
+    fn a_job_whose_steps_are_out_of_sight_emits_no_publish_fact() {
+        let got = packets(
+            "on: push\njobs:\n  test:\n    steps:\n      - run: make test\n  release:\n    uses: org/repo/.github/workflows/release.yml@v2\n",
+        );
+        assert_eq!(fact(&got, "job:release", "job.publishes_image"), None);
+        assert_eq!(
+            fact(&got, crate::FILE_SCOPE, "workflow.publishes_image"),
+            None,
+            "one unknown job makes the workflow unknown"
+        );
+        assert_eq!(
+            fact(&got, "job:test", "job.publishes_image"),
+            Some(strs(&["false"]).as_slice())
+        );
     }
 }

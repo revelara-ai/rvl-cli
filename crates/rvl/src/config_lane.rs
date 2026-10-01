@@ -36,7 +36,7 @@ fn rule_phrase(reason: &str) -> &str {
 /// Run the config lane over `root` with the already-loaded specs.
 pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneOutput {
     let retrieval = rvl_config::retrieve_repo(root, snapshot_id);
-    let findings = rvl_config::eval::evaluate_all(&retrieval.packets, specs);
+    let findings = rvl_config::eval::evaluate_all(&retrieval.packets, &retrieval.predicates, specs);
 
     let mut coverage = render::ConfigCoverage {
         total: retrieval.packets.len(),
@@ -312,5 +312,74 @@ mod tests {
         let out = run(dir.path(), &specs("high"), "snap");
         assert!(out.findings.is_empty());
         assert!(out.coverage.is_empty());
+    }
+
+    // po-av01j.133.10. `workflow.concurrency` was REJECTED as a spec because
+    // the unconditional form fires on every lint and test workflow, where two
+    // overlapping runs are harmless. Restated as a conditional spec it fires
+    // only where overlapping runs race to publish. Driven from the WIRE form
+    // through real workflow files, so the retriever's predicates, the spec
+    // grammar and the evaluator are proven to agree on the predicate key.
+    #[test]
+    fn the_rejected_concurrency_candidate_decides_as_a_conditional_spec() {
+        let specs = SpecCache::load(
+            r#"{"config_keys": [
+                {"format": "github-actions", "key": "workflow.concurrency",
+                 "expect": {"kind": "when",
+                            "guard": {"key": "workflow.publishes_image",
+                                      "any_of": ["true"]},
+                            "then": {"kind": "present"}},
+                 "confidence": 0.9, "control": "RC-014", "severity": "medium",
+                 "fix": "set a workflow-level concurrency group"}
+            ]}"#,
+        )
+        .unwrap();
+        let publish = "    steps:\n      - uses: docker/build-push-action@v6\n        with:\n          push: true\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("lint.yml"),
+            "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: make lint\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf.join("release.yml"),
+            format!("on: push\njobs:\n  image:\n{publish}"),
+        )
+        .unwrap();
+        std::fs::write(
+            wf.join("serialized.yml"),
+            format!("on: push\nconcurrency: release\njobs:\n  image:\n{publish}"),
+        )
+        .unwrap();
+
+        let out = run(dir.path(), &specs, "snap");
+        let class: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.class_rule == "github-actions.workflow.concurrency")
+            .collect();
+        assert_eq!(class.len(), 1, "{:?}", out.findings);
+        assert_eq!(
+            class[0].example_sites,
+            vec![".github/workflows/release.yml (workflow)".to_string()],
+            "only the unserialized publishing workflow violates"
+        );
+        assert_eq!(class[0].control, "RC-014");
+        // All three concurrency packets RESOLVED: violates, not-applicable,
+        // satisfies. None fell to an abstention.
+        assert_eq!(out.coverage.resolved, 3, "{:?}", out.coverage);
+        assert_eq!(out.coverage.abstain_other, 0, "{:?}", out.coverage);
+        // And the predicates did not leak into the unjudged-keys queue.
+        assert!(
+            out.coverage
+                .no_spec_keys
+                .iter()
+                .all(|k| !k.contains("triggers") && !k.contains("publishes_image")),
+            "{:?}",
+            out.coverage.no_spec_keys
+        );
     }
 }

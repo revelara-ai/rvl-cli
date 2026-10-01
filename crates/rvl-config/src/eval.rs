@@ -11,9 +11,11 @@
 //!     verification run — a wrong config spec is multiplied across every repo
 //!     using the format, exactly like a wrong API spec);
 //!   * value set outside the repo → out-of-repo declaration (policy file);
-//!   * unknown pattern name → the spec is newer than this scanner: upgrade.
+//!   * unknown pattern name → the spec is newer than this scanner: upgrade;
+//!   * guard predicate not retrieved → same lever: the retriever does not
+//!     state the fact a conditional spec asks about.
 
-use crate::{ConfigPacket, Resolution};
+use crate::{ConfigPacket, ConfigPredicate, Resolution};
 use rvl_core::Verdict;
 use rvl_spec::{ConfigExpect, SpecCache, MIN_CONFIDENCE};
 
@@ -78,7 +80,11 @@ fn authored_nowhere(p: &ConfigPacket) -> bool {
         .any(|s| matches!(s.role.as_str(), "explicit" | "inherited" | "default-block"))
 }
 
-pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
+pub fn evaluate(
+    p: &ConfigPacket,
+    predicates: &[ConfigPredicate],
+    specs: &SpecCache,
+) -> ConfigFinding {
     let id = p.id();
     let abstain = |reason: String| ConfigFinding {
         packet_id: id.clone(),
@@ -107,6 +113,39 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
         fix: spec.fix.clone(),
     };
 
+    // A conditional spec is peeled to the expectation it guards BEFORE anything
+    // about the value is consulted, so the inner expectation keeps every one of
+    // its own semantics below (po-av01j.133.10). Nested guards are a
+    // conjunction: the first that fails to hold ends the judgment.
+    let mut expect = &spec.expect;
+    while let ConfigExpect::When { guard, then } = expect {
+        let Some(fact) = predicates
+            .iter()
+            .find(|f| f.key == guard.key && f.applies_to(p))
+        else {
+            // The retriever stated nothing about this unit. Judging `then`
+            // anyway is the unconditional spec the guard exists to prevent,
+            // and not-applicable would be a pass on a guess.
+            return abstain(format!(
+                "guard predicate '{}' was not retrieved for this unit: the spec is \
+                 newer than this scanner, or the fact is not decidable from the repo",
+                guard.key
+            ));
+        };
+        if !fact.values.iter().any(|v| guard.any_of.contains(v)) {
+            return decided(
+                Verdict::NotApplicable,
+                format!(
+                    "guard not met: {} is {}, not any of {}",
+                    guard.key,
+                    fact.values.join(", "),
+                    guard.any_of.join(", ")
+                ),
+            );
+        }
+        expect = then;
+    }
+
     // An out-of-repo VALUE is unknowable here, so the value-bearing variants
     // abstain before the expectation is consulted and none of them can guess.
     //
@@ -123,7 +162,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
     // cannot see, which is honest), so the spec abstained on exactly the case
     // it exists to catch and had never fired once in six rounds of dogfooding.
     if p.resolution == Resolution::Unresolvable {
-        if matches!(spec.expect, ConfigExpect::Present) && authored_nowhere(p) {
+        if matches!(expect, ConfigExpect::Present) && authored_nowhere(p) {
             return decided(
                 Verdict::Violates,
                 format!(
@@ -140,7 +179,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
     }
     let value = p.resolved_value.as_deref().unwrap_or("");
 
-    match &spec.expect {
+    match expect {
         ConfigExpect::Present => match p.resolution {
             Resolution::AsAuthored | Resolution::Rendered => decided(
                 Verdict::Satisfies,
@@ -214,6 +253,7 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
                 )
             }
         }
+        ConfigExpect::When { .. } => unreachable!("peeled above"),
         ConfigExpect::Pattern { name } => match pattern_matches(name, value) {
             None => abstain(format!(
                 "unknown pattern '{name}': the spec is newer than this scanner"
@@ -232,15 +272,28 @@ pub fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
 
 /// Apply the specs to every packet. Index-aligned 1:1 with the input, the
 /// same contract as `propagate_all`.
-pub fn evaluate_all(packets: &[ConfigPacket], specs: &SpecCache) -> Vec<ConfigFinding> {
-    packets.iter().map(|p| evaluate(p, specs)).collect()
+pub fn evaluate_all(
+    packets: &[ConfigPacket],
+    predicates: &[ConfigPredicate],
+    specs: &SpecCache,
+) -> Vec<ConfigFinding> {
+    packets
+        .iter()
+        .map(|p| evaluate(p, predicates, specs))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ProvenanceStep;
-    use rvl_spec::{ConfigKeySpec, SpecFile};
+    use rvl_spec::{ConfigGuard, ConfigKeySpec, SpecFile};
+
+    /// The unconditional variants never read a predicate, so their tests judge
+    /// with none.
+    fn evaluate(p: &ConfigPacket, specs: &SpecCache) -> ConfigFinding {
+        super::evaluate(p, &[], specs)
+    }
 
     fn packet(key: &str, value: Option<&str>, resolution: Resolution) -> ConfigPacket {
         ConfigPacket {
@@ -630,10 +683,212 @@ mod tests {
             packet("job.timeout-minutes", Some("15"), Resolution::AsAuthored),
             packet("job.other", Some("x"), Resolution::AsAuthored),
         ];
-        let findings = evaluate_all(&packets, &c);
+        let findings = evaluate_all(&packets, &[], &c);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].verdict, Verdict::Satisfies);
         assert_eq!(findings[1].verdict, Verdict::Abstain);
         assert_eq!(findings[1].packet_id, packets[1].id());
+    }
+
+    // ---- po-av01j.133.10: the conditional variant ----
+
+    fn when_publishing(then: ConfigExpect) -> ConfigExpect {
+        ConfigExpect::When {
+            guard: ConfigGuard {
+                key: "workflow.publishes_image".into(),
+                any_of: vec!["true".into()],
+            },
+            then: Box::new(then),
+        }
+    }
+
+    fn predicate(unit: &str, key: &str, values: &[&str]) -> ConfigPredicate {
+        ConfigPredicate {
+            file_path: ".github/workflows/ci.yml".into(),
+            unit: unit.into(),
+            key: key.into(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn unset_concurrency() -> ConfigPacket {
+        let mut p = packet(
+            "workflow.concurrency",
+            Some("none"),
+            Resolution::PlatformDefault,
+        );
+        p.unit = "workflow".into();
+        p
+    }
+
+    // The rejected candidate, restated. Unconditionally, `present` on
+    // workflow.concurrency fires on every lint workflow in existence.
+    #[test]
+    fn a_held_guard_judges_the_inner_expectation_both_ways() {
+        let c = cache(
+            "workflow.concurrency",
+            when_publishing(ConfigExpect::Present),
+            0.9,
+        );
+        let facts = [predicate(
+            crate::FILE_SCOPE,
+            "workflow.publishes_image",
+            &["true"],
+        )];
+        let bad = super::evaluate(&unset_concurrency(), &facts, &c);
+        assert_eq!(bad.verdict, Verdict::Violates, "{}", bad.reason);
+        assert_eq!(bad.control, "RC-013");
+
+        let mut set = unset_concurrency();
+        set.resolved_value = Some("deploy".into());
+        set.resolution = Resolution::AsAuthored;
+        let ok = super::evaluate(&set, &facts, &c);
+        assert_eq!(ok.verdict, Verdict::Satisfies, "{}", ok.reason);
+    }
+
+    #[test]
+    fn an_unmet_guard_is_not_applicable_and_says_which_guard() {
+        let c = cache(
+            "workflow.concurrency",
+            when_publishing(ConfigExpect::Present),
+            0.9,
+        );
+        let facts = [predicate(
+            crate::FILE_SCOPE,
+            "workflow.publishes_image",
+            &["false"],
+        )];
+        let f = super::evaluate(&unset_concurrency(), &facts, &c);
+        assert_eq!(f.verdict, Verdict::NotApplicable, "{}", f.reason);
+        assert!(
+            f.reason.contains("workflow.publishes_image"),
+            "the reason must name the guard: {}",
+            f.reason
+        );
+        assert_eq!(f.control, "RC-013", "a spec decided this, so it rides");
+    }
+
+    // The safety property. A guard this scanner cannot read must neither fire
+    // the inner expectation unconditionally (the noise the variant exists to
+    // remove) nor pass silently.
+    #[test]
+    fn a_guard_with_no_retrieved_predicate_abstains_and_names_the_lever() {
+        let c = cache(
+            "workflow.concurrency",
+            when_publishing(ConfigExpect::Present),
+            0.9,
+        );
+        let f = super::evaluate(&unset_concurrency(), &[], &c);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(
+            f.reason.contains("guard predicate") && f.reason.contains("newer than this scanner"),
+            "{}",
+            f.reason
+        );
+    }
+
+    // A predicate describes ONE unit. Another file's fact, or another job's,
+    // must not open or close this packet's guard.
+    #[test]
+    fn a_predicate_for_another_unit_or_file_does_not_reach_the_packet() {
+        let guard_on_job = ConfigExpect::When {
+            guard: ConfigGuard {
+                key: "job.publishes_image".into(),
+                any_of: vec!["true".into()],
+            },
+            then: Box::new(ConfigExpect::Present),
+        };
+        let c = cache("job.timeout-minutes", guard_on_job, 0.9);
+        let p = packet(
+            "job.timeout-minutes",
+            Some("360"),
+            Resolution::PlatformDefault,
+        );
+        let other_job = [predicate("job:release", "job.publishes_image", &["true"])];
+        assert_eq!(
+            super::evaluate(&p, &other_job, &c).verdict,
+            Verdict::Abstain
+        );
+        let mut other_file = predicate("job:build", "job.publishes_image", &["true"]);
+        other_file.file_path = ".github/workflows/other.yml".into();
+        assert_eq!(
+            super::evaluate(&p, &[other_file], &c).verdict,
+            Verdict::Abstain
+        );
+        let same = [predicate("job:build", "job.publishes_image", &["true"])];
+        assert_eq!(super::evaluate(&p, &same, &c).verdict, Verdict::Violates);
+    }
+
+    #[test]
+    fn a_set_valued_predicate_holds_on_any_shared_member() {
+        let on_push = ConfigExpect::When {
+            guard: ConfigGuard {
+                key: "workflow.triggers".into(),
+                any_of: vec!["push".into(), "release".into()],
+            },
+            then: Box::new(ConfigExpect::Present),
+        };
+        let c = cache("workflow.concurrency", on_push, 0.9);
+        let run = |events: &[&str]| {
+            let facts = [predicate(crate::FILE_SCOPE, "workflow.triggers", events)];
+            super::evaluate(&unset_concurrency(), &facts, &c).verdict
+        };
+        assert_eq!(run(&["pull_request", "push"]), Verdict::Violates);
+        assert_eq!(run(&["pull_request"]), Verdict::NotApplicable);
+    }
+
+    // The inner expectation keeps ALL of its own semantics behind a held guard,
+    // including the `present` authorship exception on an unresolvable value and
+    // the abstention of a value-bearing variant on the same packet.
+    #[test]
+    fn the_inner_expectation_keeps_its_unresolvable_semantics() {
+        let facts = [predicate(
+            crate::FILE_SCOPE,
+            "workflow.publishes_image",
+            &["true"],
+        )];
+        let p = unauthored_unresolvable("job.permissions");
+        let present = cache(
+            "job.permissions",
+            when_publishing(ConfigExpect::Present),
+            0.9,
+        );
+        assert_eq!(
+            super::evaluate(&p, &facts, &present).verdict,
+            Verdict::Violates
+        );
+        let equals = cache(
+            "job.permissions",
+            when_publishing(ConfigExpect::Equals {
+                value: "read".into(),
+            }),
+            0.9,
+        );
+        assert_eq!(
+            super::evaluate(&p, &facts, &equals).verdict,
+            Verdict::Abstain
+        );
+    }
+
+    // Guards nest as a conjunction: every one must hold.
+    #[test]
+    fn nested_guards_must_all_hold() {
+        let both = ConfigExpect::When {
+            guard: ConfigGuard {
+                key: "workflow.triggers".into(),
+                any_of: vec!["push".into()],
+            },
+            then: Box::new(when_publishing(ConfigExpect::Present)),
+        };
+        let c = cache("workflow.concurrency", both, 0.9);
+        let run = |publishes: &str| {
+            let facts = [
+                predicate(crate::FILE_SCOPE, "workflow.triggers", &["push"]),
+                predicate(crate::FILE_SCOPE, "workflow.publishes_image", &[publishes]),
+            ];
+            super::evaluate(&unset_concurrency(), &facts, &c).verdict
+        };
+        assert_eq!(run("true"), Verdict::Violates);
+        assert_eq!(run("false"), Verdict::NotApplicable);
     }
 }
