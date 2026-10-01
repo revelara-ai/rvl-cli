@@ -126,7 +126,7 @@ impl Emitter<'_> {
             file_path: self.file_anchor.to_string(),
             line: 0,
             unit: unit.to_string(),
-            key: key.to_string(),
+            key: crate::key_ledger::declared("kubernetes", key),
             resolved_value: Some(value),
             resolution,
             provenance,
@@ -348,15 +348,15 @@ pub(super) fn packets_from_doc(doc: &Value, em: &mut Emitter) {
         let cunit = format!("container:{kind_lower}/{name}/{cname}");
         let cpath = format!("{prefix}.containers[{cname}]");
 
-        for (section, resource) in [
-            ("requests", "cpu"),
-            ("requests", "memory"),
-            ("limits", "cpu"),
-            ("limits", "memory"),
+        for (key, section, resource) in [
+            ("container.resources.requests.cpu", "requests", "cpu"),
+            ("container.resources.requests.memory", "requests", "memory"),
+            ("container.resources.limits.cpu", "limits", "cpu"),
+            ("container.resources.limits.memory", "limits", "memory"),
         ] {
             em.setting(
                 &cunit,
-                &format!("container.resources.{section}.{resource}"),
+                key,
                 doc,
                 &format!("{cpath}.resources.{section}.{resource}"),
                 &format!("resources.{section}.{resource}"),

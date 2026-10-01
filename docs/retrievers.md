@@ -14,7 +14,7 @@ further setup:
 | `tsindex.js` | embedded in the binary | `node` + a TypeScript 5.x compiler¹ |
 | `javaindex.java` | embedded in the binary | a JDK 11+ (JEP 330 source mode) |
 | `goindex` | in the release archive | the `go` tool |
-| `cindex` | in the release archive | a system `libclang`² |
+| `cindex` | in the release archive, with its pinned `libclang` | none in a release; a system `libclang` in a source build² |
 | `rustindex` | in the release archive | `rust-analyzer` |
 | `csindex` | not shipped: it pulls ~9 MB of Roslyn | a .NET 8 SDK³ |
 
@@ -24,9 +24,13 @@ the one command to run and that language degrades rather than failing the
 scan. The pin matters: npm's `typescript` now resolves to the 7.x native port,
 whose JS API this helper cannot drive.
 
-² `cindex` dlopens libclang at run time, so the binary installs everywhere and
-fails closed with actionable guidance where the library is absent.
-`cindex --engine-check` prints the version it resolved.
+² `cindex` dlopens libclang at run time. A release archive carries a pinned,
+checksummed libclang (LLVM 18.1.1) in `libclang/` beside `cindex`, and a
+release `cindex` uses only that one, so C/C++ results do not depend on the
+machine. A source build uses the system library instead. `LIBCLANG_PATH`
+overrides both. Where no library can be loaded, `cindex` fails closed with
+actionable guidance. `cindex --engine-check` prints the version it resolved
+and which engine it was (`[vendored ...]`, `[system]` or `[LIBCLANG_PATH ...]`).
 
 ³ Build it once from a clone; the output directory is a location `rvl`
 searches, so there is no separate install step:
@@ -40,8 +44,9 @@ rvl doctor --fix             # close what can be closed safely
 ```
 
 `doctor` names, per language lane, which retriever resolved, from which
-slot, and whether the runtime it drives is installed. A stale helper
-shadowing the shipped one is only visible here. It also reports
+slot, and whether the runtime it drives is installed. When that retriever is
+not the build `rvl` ships, the same line says `helper drift` (see
+[Helper drift](#helper-drift)). It also reports
 credentials, spec-cache freshness, and git-hook wiring. `--fix` performs only
 safe, idempotent, local repairs, announcing each one first; anything needing a
 system package manager or `sudo` is printed, never run. Exit codes: `0`
@@ -82,6 +87,35 @@ The embedded scripts are written to `~/.revelara/helpers/<rvl version>/` on
 first use, and rewritten whenever their contents no longer hash to the
 embedded text, so an edited or truncated copy is restored instead of
 silently scanning wrong. `RVL_HELPER_DIR` relocates that directory.
+
+### Helper drift
+
+A helper found in slot 1, 2, 4 or 5 can be a different build from the one
+this `rvl` ships. The usual cause is an old `pyindex.py` left beside the
+binary by an earlier `make install`, or an `RVL_…` export that a shell profile
+still carries. The scan then describes an older scanner than the one you think
+you ran.
+
+When the helper that ran has a shipped sibling (a bundled helper, otherwise
+the embedded copy), the scan compares their content versions and adds one
+line to `COVERAGE` if they do not agree:
+
+```text
+  retrievers: Python /home/u/.local/bin/pyindex.py (bundled)
+  helper drift: Python /home/u/.local/bin/pyindex.py (bundled) differs from the copy embedded in this rvl (content 3fa91c0b77de, shipped 9c41d2e07a15)
+```
+
+The content version is the second line of a helper's `--packet-schema` reply:
+the first 12 hex digits of a sha256 of the helper's own source. A version is
+an identity, not an age, so two different versions are reported as `differs`.
+A helper that reports no version was built before this handshake existed, and
+that one is reported as `older`.
+
+This is a warning only. The scan runs the helper it resolved and its exit code
+does not change, because a different helper is often deliberate. To clear the
+line, remove or rebuild the named file, or unset the override. `--out` carries
+the same text in `coverage.retrievers[].drift`. `rustindex` and `cindex` do
+not report a content version yet, so they are never compared.
 
 Per-language toolchain setup and the full hook workflow are covered in
 [Local scanning](https://app.revelara.ai/help/local-scanning).
@@ -128,6 +162,36 @@ is positive evidence the bound was switched off, so the site violates with
 the value cited, unless another construction of the type sets a real value.
 A spec that lists none credits any set value.
 
+Decorators get the same treatment through their own spec section. A bound
+on a decorator, such as `@shared_task(time_limit=120)`, covers every call in
+the function, so the site's API spec can't say which values switch it off. A
+`decorators` entry does that instead. It names the decorator's identity
+(`celery.shared_task`), the written names it governs, matched on the last
+dotted segment (`shared_task`, `task`), and its `unbounded_sentinels`. A
+bound key set to one of those values (`time_limit=0`, `time_limit=None`)
+earns no credit. The scan then keeps looking for other bounds instead of
+reporting a violation, because the call can still carry its own. With no
+matching decorator spec, any value earns credit, as before.
+
+An API spec can name a `capacity_arg`, the constructor argument that gives
+the receiver a finite capacity (`{"name": "maxsize", "position": 0}` for
+`queue.Queue.put`). Such a call blocks only when the receiver can fill, so
+the scan reads the constructions that reach the receiver before it reports
+the call:
+
+- Every construction leaves the argument out, or sets it to zero or a
+  negative number: the call cannot block, and the site is `not_applicable`
+  with the construction cited.
+- A construction sets a positive integer: the site is judged as usual, so a
+  `put` with no timeout on a `queue.Queue(maxsize=10)` violates.
+- No construction was found, the construction was not traced to the
+  receiver, or the value is not an integer literal: a site that would
+  violate abstains instead. A bound that was found still satisfies.
+
+A spec with no `capacity_arg` is read as before. pyindex attaches to a local
+receiver only the constructions in its own function, so a same-named queue
+in another function does not change the answer.
+
 One limit to know: goindex attaches every construction of a type in the
 module to every site using it, so one `Timeout`-bearing literal is evidence
 for every `http.Client` call in the repo. The reason names the file and line
@@ -154,6 +218,15 @@ excluded without saying so reads as a file that was scanned:
   `coverage.test_files_skipped`. A zero prints nothing. The packet index
   flags each named file, so a warm scan reports the repository-wide count
   from reused entries rather than the files it happened to re-parse.
+
+`tsindex` also reports, on the same `repo_config` record, the workspaces
+that declare dependencies with no installed tree
+(`dependency_trees_uninstalled`, with the directories beside it as
+`dependency_trees_uninstalled_paths`). It resolves those from import syntax
+rather than abstaining, and `rvl` prints `TypeScript: 2 workspaces without
+installed dependencies (client types resolved from import syntax: medium
+tier, no client versions)` in COVERAGE; `--out` carries the total as
+`coverage.dependency_trees_uninstalled`.
 
 | Retriever | Skipped by default |
 | --- | --- |

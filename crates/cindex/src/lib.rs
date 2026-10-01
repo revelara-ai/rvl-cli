@@ -2,8 +2,9 @@
 //!
 //! Engine (DECIDED, po-ae75b.9): the libclang C API, runtime-loaded via
 //! `clang-sys`'s `runtime` feature. LibTooling is the pre-registered escape
-//! valve and is NOT used. Release packaging vendors a pinned, checksummed
-//! LLVM; a dev build finds the system libclang (LIBCLANG_PATH overrides).
+//! valve and is NOT used. Release archives vendor a pinned, checksummed
+//! libclang beside the helper; a dev build finds the system libclang
+//! (LIBCLANG_PATH overrides both). See `engine.rs`.
 //!
 //! Retrieval only: this helper decides nothing about reliability, it only
 //! says what the code is. See README.md for the packet contract, the
@@ -23,6 +24,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod engine;
 mod retrieve;
 
 /// The packet contract version this emitter stamps. Must agree with
@@ -75,8 +77,10 @@ pub fn run() -> ExitCode {
     }
     if do_engine_check {
         return match retrieve::load_engine() {
-            Ok(version) => {
-                println!("{version}");
+            // One line: the version, then which engine loaded it, so a
+            // doctor shows whether a release is on its pinned bundle.
+            Ok(engine) => {
+                println!("{} [{}]", engine.version, engine.source.describe());
                 ExitCode::SUCCESS
             }
             Err(e) => {

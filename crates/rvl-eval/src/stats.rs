@@ -15,8 +15,16 @@ pub fn wilson_interval(successes: u64, n: u64) -> (f64, f64) {
     if n == 0 {
         return (0.0, 1.0);
     }
-    let n = n as f64;
-    let p = successes as f64 / n;
+    wilson_interval_at(successes as f64 / n as f64, n as f64)
+}
+
+/// The Wilson interval at proportion `p` and a sample size that need not be
+/// whole. An effective sample size (`DesignEffect::n_eff`) is fractional, and
+/// rounding it would move the bound in a direction nobody chose.
+fn wilson_interval_at(p: f64, n: f64) -> (f64, f64) {
+    if n <= 0.0 {
+        return (0.0, 1.0);
+    }
     let z2 = Z95 * Z95;
     let denom = 1.0 + z2 / n;
     let center = p + z2 / (2.0 * n);
@@ -33,6 +41,78 @@ pub fn wilson_lower_bound(successes: u64, n: u64) -> f64 {
         return 0.0;
     }
     wilson_interval(successes, n).0
+}
+
+/// The gate metric on clustered rows: Wilson 95% lower bound at the observed
+/// proportion `p` and the effective sample size `n_eff`.
+pub fn wilson_lower_bound_at(p: f64, n_eff: f64) -> f64 {
+    if n_eff <= 0.0 {
+        return 0.0;
+    }
+    wilson_interval_at(p, n_eff).0
+}
+
+/// The intra-cluster correlation the gate assumes: 1.0, the upper bound.
+///
+/// WHY A CONSTANT AND NOT AN ESTIMATE (po-io8sk.1). The usual estimate of rho
+/// comes from the within- and between-cluster variance of the outcome. A gate
+/// set sits at precision near 1, where both are zero and rho is undefined: a
+/// perfect 50/50 drawn from 4 specs would estimate to "no correlation" and get
+/// deff = 1, which is exactly the run the adjustment exists to refuse. Worse,
+/// one false positive would make rho estimable and the verdict would flip on a
+/// row that says nothing about clustering.
+///
+/// 1.0 is the one value that needs no tuning. It is also what the mechanism
+/// says: one spec decides every site of its class, so the sites of a cluster
+/// are one decision observed many times.
+pub const GATE_ICC: f64 = 1.0;
+
+/// A clustered sample's size, raw and effective. Reported together, always:
+/// `n_eff` alone hides how much evidence was discounted, and `n` alone is the
+/// number this type exists to stop a gate from trusting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DesignEffect {
+    pub n: usize,
+    pub n_clusters: usize,
+    pub deff: f64,
+    pub n_eff: f64,
+}
+
+/// Kish design effect for a clustered sample:
+///
+///   deff = 1 + (m' - 1) * rho,   m' = sum(m_k^2) / n,   n_eff = n / deff
+///
+/// `m_k` are the cluster sizes and `m'` is the size-weighted mean cluster
+/// size, which is Kish's form for unequal clusters (it reduces to the plain
+/// mean when the clusters are equal). The plain mean understates the effect
+/// when one cluster dominates, and gate sets are dominated: one repo supplied
+/// 182 of the 232 violates in eval-go-v1.
+///
+/// At rho = 1 this is n_eff = n^2 / sum(m_k^2), the effective number of
+/// clusters. At rho = 0, or when every cluster is a singleton, n_eff = n.
+pub fn kish_design_effect(cluster_sizes: &[usize], rho: f64) -> DesignEffect {
+    let n: usize = cluster_sizes.iter().sum();
+    let n_clusters = cluster_sizes.iter().filter(|m| **m > 0).count();
+    if n == 0 {
+        return DesignEffect {
+            n,
+            n_clusters,
+            deff: 1.0,
+            n_eff: 0.0,
+        };
+    }
+    let sum_sq: f64 = cluster_sizes
+        .iter()
+        .map(|m| (*m as f64) * (*m as f64))
+        .sum();
+    let weighted_mean_size = sum_sq / n as f64;
+    let deff = 1.0 + (weighted_mean_size - 1.0) * rho;
+    DesignEffect {
+        n,
+        n_clusters,
+        deff,
+        n_eff: n as f64 / deff,
+    }
 }
 
 /// Percentile by the nearest-rank method on a sorted copy of `values`.
@@ -118,6 +198,38 @@ mod tests {
         // degenerate ends stay in [0, 1]
         assert_eq!(wilson_interval(0, 0), (0.0, 1.0));
         assert!(wilson_interval(50, 50).1 <= 1.0);
+    }
+
+    #[test]
+    fn kish_design_effect_matches_a_hand_computed_example() {
+        // Clusters of 20, 15, 10 and 5: n = 50, sum(m^2) = 400 + 225 + 100 +
+        // 25 = 750, so the size-weighted mean cluster size is 750 / 50 = 15.
+        let sizes = [20, 15, 10, 5];
+        // rho = 0.5: deff = 1 + (15 - 1) * 0.5 = 8, n_eff = 50 / 8 = 6.25.
+        let d = kish_design_effect(&sizes, 0.5);
+        assert_eq!((d.n, d.n_clusters), (50, 4));
+        assert!((d.deff - 8.0).abs() < 1e-12);
+        assert!((d.n_eff - 6.25).abs() < 1e-12);
+        // rho = 1, the gate's value: deff = 15, n_eff = 50 / 15 = 3.33.
+        let d = kish_design_effect(&sizes, GATE_ICC);
+        assert!((d.deff - 15.0).abs() < 1e-12);
+        assert!((d.n_eff - 50.0 / 15.0).abs() < 1e-12);
+        // rho = 0, or every cluster a singleton: no adjustment.
+        assert!((kish_design_effect(&sizes, 0.0).n_eff - 50.0).abs() < 1e-12);
+        assert!((kish_design_effect(&[1; 50], GATE_ICC).n_eff - 50.0).abs() < 1e-12);
+        // No rows: no evidence, and no division by zero.
+        let d = kish_design_effect(&[], GATE_ICC);
+        assert_eq!((d.n, d.n_clusters), (0, 0));
+        assert_eq!(d.n_eff, 0.0);
+    }
+
+    #[test]
+    fn wilson_lower_bound_at_a_fractional_n() {
+        // Agrees with the integer form when n is whole.
+        assert!((wilson_lower_bound_at(0.9, 50.0) - wilson_lower_bound(45, 50)).abs() < 1e-12);
+        // p = 1 reduces to n / (n + z^2): 3.3333 / (3.3333 + 3.8415) = 0.4646.
+        assert!((wilson_lower_bound_at(1.0, 50.0 / 15.0) - 0.4646).abs() < 1e-4);
+        assert_eq!(wilson_lower_bound_at(1.0, 0.0), 0.0);
     }
 
     #[test]

@@ -38,6 +38,12 @@ func TestConstructionIsTracedToTheReceiver(t *testing.T) {
 		{"fromCtor", "receiver", true, 1},
 		{"fetch", "", false, -1}, // two methods named fetch; checked below by receiver
 		{"fromParam", "type", false, -1},
+		{"fromBoundedParam", "receiver", true, 2},
+		{"viaFuncValue", "receiver", true, 1},
+		{"storedFunc", "type", false, -1},
+		{"ExportedMethod", "type", false, -1},
+		{"fromFuncValue", "unresolved", false, 0},
+		{"fromDependency", "unresolved", false, 0},
 	}
 	for _, tc := range cases {
 		if tc.symbol == "fetch" {
@@ -81,5 +87,34 @@ func TestConstructionIsTracedToTheReceiver(t *testing.T) {
 	}
 	if loose.ConstructionScope != "receiver" || sets(*loose) {
 		t.Errorf("Loose.hc is assigned an unbounded client: scope %q, constructions %+v", loose.ConstructionScope, loose.Construction)
+	}
+}
+
+// The enclosing source is where the propagator looks for a deadline. A
+// declaration over the snippet budget is cut from the top, so a call in a
+// literal at the bottom of it is sent with the literal instead.
+func TestEnclosingIsTheLiteralWhenTheDeclarationIsCut(t *testing.T) {
+	bySymbol := map[string]RetrievedSite{}
+	for _, s := range runRetrieve("testdata/tracefixture", "tracefixture") {
+		if s.Method == "Do" {
+			bySymbol[s.Symbol] = s
+		}
+	}
+	long, ok := bySymbol["longSetup"]
+	if !ok {
+		t.Fatal("longSetup: no site retrieved")
+	}
+	if !strings.Contains(long.Enclosing, "context.WithTimeout") {
+		t.Errorf("longSetup: the literal's deadline is missing from the enclosing source:\n%s", long.Enclosing)
+	}
+	if strings.Contains(long.Enclosing, "func longSetup") {
+		t.Errorf("longSetup: want the literal, got the declaration:\n%s", long.Enclosing)
+	}
+	short, ok := bySymbol["shortSetup"]
+	if !ok {
+		t.Fatal("shortSetup: no site retrieved")
+	}
+	if !strings.Contains(short.Enclosing, "func shortSetup") || !strings.Contains(short.Enclosing, "context.WithTimeout") {
+		t.Errorf("shortSetup: want the whole declaration, got:\n%s", short.Enclosing)
 	}
 }

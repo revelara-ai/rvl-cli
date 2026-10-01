@@ -40,6 +40,7 @@ headless and CI use work with no config file at all.
 | `RVL_SCAN_TIMEOUT` | HTTP timeout for submission mode (default 60s) |
 | `RVL_HELPER_DIR` | Relocate the extracted-helper directory |
 | `RVL_GOINDEX`, `RVL_PYINDEX`, `RVL_TSINDEX`, `RVL_JAVAINDEX`, `RVL_CINDEX`, `RVL_RUSTINDEX`, `RVL_CSINDEX` | Point a lane at a specific helper (slot 1) |
+| `RVL_NODE_MAX_OLD_SPACE_MB` | V8 heap limit, in MB, for the `node` that runs the TypeScript helper. Default: half of physical memory, at most 16384. `0` leaves node's own default (about 4 GB). A `NODE_OPTIONS` that sets `--max-old-space-size` is respected when this is unset |
 | `RVL_RUST_ANALYZER` | Path to the `rust-analyzer` binary the Rust lane drives (`RVL_RUST_ANALYZER_SHA256` optionally pins its checksum) |
 | `RVL_CACHE_DIR`, `RVL_INDEX_DIR`, `RVL_SKILLS_CACHE_DIR` | Relocate the spec cache, packet index, skills cache |
 | `RVL_ALLOW_UNSIGNED_PLUGIN=1` | Accept plugin content from a server with no signing key |
@@ -104,7 +105,7 @@ notice naming the repair:
 
 | Flag | Behavior now |
 | --- | --- |
-| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. |
+| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. To blend in your agent, use `--blend` (manual scans only). |
 | `--staged` | Alias for `--incremental --changed-only --hook pre-commit`. |
 | `--pre-push` | Alias for `--incremental --changed-only --hook pre-push`. |
 | `--mode enforce\|eval` | `enforce` is the only mode; `eval` reports without blocking. |

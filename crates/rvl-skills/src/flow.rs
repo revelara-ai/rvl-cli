@@ -22,6 +22,9 @@ pub struct Env<'a> {
     pub store: &'a SkillsStore,
     pub fetcher: &'a dyn Fetcher,
     pub home: &'a Path,
+    /// Fingerprint of the server + org key in use
+    /// ([`crate::store::cache_scope`]); `None` when there is no key.
+    pub cache_scope: Option<String>,
     /// RVL_OFFLINE=1: no fetch attempted, cache-only.
     pub offline: bool,
     /// RVL_ALLOW_UNSIGNED_PLUGIN=1: accept content without a verifiable
@@ -99,6 +102,17 @@ fn acquire_from_cache(env: &Env, editor: &str) -> anyhow::Result<Option<Acquired
     };
     let mut warnings = Vec::new();
     check_cached_signature(env, editor, &bytes, &meta, &mut warnings)?;
+    // Reached with another scope only when there is no server to refetch
+    // from (offline, or unreachable): install the verified copy, and say
+    // whose it is.
+    if let (Some(cached), Some(current)) = (&meta.scope, &env.cache_scope) {
+        if cached != current {
+            warnings.push(format!(
+                "cached skills for {editor} were fetched with a different API key or server; \
+                 re-run '{BIN} skills install' online to refetch them for this one"
+            ));
+        }
+    }
     Ok(Some(Acquired {
         bytes,
         version: meta.version,
@@ -159,6 +173,7 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
             sha256: rvl_cache::sha256_hex(&download.bytes),
             signing_key_hex: key_hex,
             fetched_at: rvl_cache::today_utc(),
+            scope: env.cache_scope.clone(),
         },
     )?;
 
@@ -171,7 +186,9 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
 }
 
 /// Resolve a verified tarball for `editor`: served version first, cache
-/// when it already matches or when the network is down/off.
+/// when it already matches or when the network is down/off. The server
+/// filters content by the org's intelligence tier under one semver, so the
+/// cached pin matches only when the same scope fetched it.
 fn acquire(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
     if env.offline {
         return acquire_from_cache(env, editor)?.ok_or_else(|| {
@@ -183,7 +200,10 @@ fn acquire(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
     }
     match env.fetcher.fetch_version() {
         Ok(served) => {
-            if env.store.cached_version(editor).as_deref() == Some(served.as_str()) {
+            let pinned = env.store.cached_meta(editor).is_some_and(|meta| {
+                meta.version == served && meta.scope.is_some() && meta.scope == env.cache_scope
+            });
+            if pinned {
                 if let Some(acquired) = acquire_from_cache(env, editor)? {
                     return Ok(acquired);
                 }
@@ -590,6 +610,7 @@ mod tests {
                 store,
                 fetcher,
                 home: self.home.path(),
+                cache_scope: Some("org-a".to_string()),
                 offline: false,
                 allow_unsigned: false,
                 allow_missing_checksum: false,
@@ -619,7 +640,10 @@ mod tests {
             SKILL
         );
         // Cache pinned, install recorded.
-        assert_eq!(store.cached_version("codex").as_deref(), Some("0.2.0"));
+        assert_eq!(
+            store.cached_meta("codex").map(|m| m.version).as_deref(),
+            Some("0.2.0")
+        );
         assert_eq!(store.read_installed()["codex"].version, "0.2.0");
     }
 
@@ -637,6 +661,107 @@ mod tests {
         assert!(!first.from_cache);
         assert!(second.from_cache, "same served version must reuse the pin");
         assert_eq!(fetcher.tarball_calls.get(), 1);
+    }
+
+    #[test]
+    fn switching_org_refetches_even_when_the_served_version_matches() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let h = by_name("codex").unwrap();
+        install_one(&fx.env(&store, &fetcher), h.as_ref()).unwrap();
+        assert_eq!(
+            store.cached_meta("codex").unwrap().scope.as_deref(),
+            Some("org-a")
+        );
+
+        // Same served semver, another org's key: the tier-filtered content
+        // can differ, so the pin does not hold.
+        let mut env = fx.env(&store, &fetcher);
+        env.cache_scope = Some("org-b".to_string());
+        let report = install_one(&env, h.as_ref()).unwrap();
+        assert!(!report.from_cache, "another org must not reuse the pin");
+        assert_eq!(fetcher.tarball_calls.get(), 2);
+        assert_eq!(
+            store.cached_meta("codex").unwrap().scope.as_deref(),
+            Some("org-b")
+        );
+
+        // And the new pin holds for the new org.
+        let again = install_one(&env, h.as_ref()).unwrap();
+        assert!(again.from_cache);
+        assert_eq!(fetcher.tarball_calls.get(), 2);
+    }
+
+    #[test]
+    fn slot_with_no_recorded_scope_is_refetched_once() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        // A slot as an older rvl wrote it: no scope.
+        store
+            .save(
+                "codex",
+                &tarball,
+                &Meta {
+                    version: "0.2.0".to_string(),
+                    sha256: rvl_cache::sha256_hex(&tarball),
+                    signing_key_hex: Some(hex::encode(key.to_bytes())),
+                    fetched_at: "2026-08-04".to_string(),
+                    scope: None,
+                },
+            )
+            .unwrap();
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let h = by_name("codex").unwrap();
+
+        let first = install_one(&env, h.as_ref()).unwrap();
+        assert!(!first.from_cache, "unknown origin must not be trusted");
+        let second = install_one(&env, h.as_ref()).unwrap();
+        assert!(second.from_cache);
+        assert_eq!(fetcher.tarball_calls.get(), 1);
+    }
+
+    #[test]
+    fn fallback_to_another_orgs_cache_says_so() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let h = by_name("codex").unwrap();
+        install_one(&fx.env(&store, &fetcher), h.as_ref()).unwrap();
+
+        let dead = MockFetcher::down("connection refused");
+        let differs = |r: &InstallReport| {
+            r.warnings
+                .iter()
+                .any(|w| w.contains("different API key or server"))
+        };
+
+        // Unreachable server, another org's key: still installs, and warns.
+        let mut env = fx.env(&store, &dead);
+        env.cache_scope = Some("org-b".to_string());
+        let report = install_one(&env, h.as_ref()).unwrap();
+        assert!(report.from_cache);
+        assert!(differs(&report), "warnings: {:?}", report.warnings);
+
+        // Offline, same.
+        env.offline = true;
+        let report = install_one(&env, h.as_ref()).unwrap();
+        assert!(differs(&report), "warnings: {:?}", report.warnings);
+
+        // Offline with no key at all has no identity to compare: quiet.
+        env.cache_scope = None;
+        let report = install_one(&env, h.as_ref()).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // The org that fetched it: quiet.
+        let mut env = fx.env(&store, &dead);
+        env.offline = true;
+        let report = install_one(&env, h.as_ref()).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[test]
@@ -801,7 +926,10 @@ mod tests {
         assert!(!fx.home.path().join(".agents/skills/rvl-scan").exists());
         assert!(store.read_installed().is_empty(), "record forgotten");
         // The cache slot survives: removal must not brick a later install.
-        assert_eq!(store.cached_version("codex").as_deref(), Some("0.2.0"));
+        assert_eq!(
+            store.cached_meta("codex").map(|m| m.version).as_deref(),
+            Some("0.2.0")
+        );
     }
 
     #[test]

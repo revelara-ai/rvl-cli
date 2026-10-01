@@ -101,6 +101,13 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// `rvl scan --blend` ran and its agent half did not answer for every
+    /// undecided runtime site (po-av01j.205): vetoed, no agent, timed out,
+    /// failed, malformed, or over the cap. Carries the reason. The footer
+    /// then refuses "commit clean": the report is the deterministic half
+    /// alone, and presenting it as the blend is the po-av01j.199 bug at a new
+    /// seam. `None` when no blend ran or it completed.
+    pub blend_incomplete: Option<String>,
     /// Distinct machine-generated files whose packets were dropped before
     /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
     /// without saying so reads as having scanned them, and it moves every
@@ -110,6 +117,12 @@ pub struct Coverage {
     /// Same rule as `generated_skipped`: reported, never silent. Only
     /// languages with a non-zero count are listed.
     pub test_files_skipped: Vec<TestFilesSkipped>,
+    /// Workspaces whose declared dependencies were not installed, per
+    /// language (po-pk3fp.15). The lane still scanned, from import syntax,
+    /// which is a weaker scan than one that resolved types from the
+    /// installed tree, and the roll-call above prints the same "N sites"
+    /// for both. Only languages with a non-zero count are listed.
+    pub dependencies_uninstalled: Vec<DependenciesUninstalled>,
     pub resolved: usize,
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
@@ -174,6 +187,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         && cov.retrievers.is_empty()
         && cov.generated_skipped == 0
         && cov.test_files_skipped.is_empty()
+        && cov.dependencies_uninstalled.is_empty()
     {
         return String::new();
     }
@@ -215,6 +229,19 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             .collect();
         let line = format!("  retrievers: {}", parts.join(" \u{00b7} "));
         let _ = writeln!(o, "{}", paint(&line, "2", color));
+        // po-vd7ii left the reader to notice that a path above was the wrong
+        // one. A helper that is measurably not the shipped build gets its own
+        // line, in the warning color, so the roll-call cannot be skimmed past
+        // (po-8ozxg).
+        for r in &cov.retrievers {
+            if let Some(drift) = &r.drift {
+                let line = format!(
+                    "  helper drift: {} {} ({}) {drift}",
+                    r.lang, r.path, r.source
+                );
+                let _ = writeln!(o, "{}", paint(&line, "33", color));
+            }
+        }
     }
     if cov.generated_skipped > 0 {
         let g = format!(
@@ -236,7 +263,30 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         );
         let _ = writeln!(o, "{}", paint(&line, "2", color));
     }
+    // A lane that scanned without its installed dependencies (po-pk3fp.15):
+    // the roll-call's "N sites" is the same for a tree resolved from the
+    // packages and one resolved from import syntax, so the weaker scan is
+    // named here. Dim like the lines above it, because the lane did run; a
+    // zero prints nothing.
+    for d in cov.dependencies_uninstalled.iter().filter(|d| d.count > 0) {
+        let line = format!(
+            "  {}: {} workspace{} without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)",
+            d.lang,
+            d.count,
+            if d.count == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
     o
+}
+
+/// How many of one language's workspaces declare dependencies that are not
+/// installed, so the helper resolved their client types from import syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependenciesUninstalled {
+    pub lang: String,
+    pub count: usize,
 }
 
 /// How many test files one language's helper declined to read.
@@ -295,6 +345,9 @@ pub struct RetrieverInfo {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// Set when this helper is not the build this binary ships and a shipped
+    /// sibling exists to compare against: what differs, in words (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +411,10 @@ pub struct ConfigCoverage {
     pub abstain_outside_repo: usize,
     /// Any other undecided outcome (low-confidence spec, unknown pattern).
     pub abstain_other: usize,
+    /// Settings whose key the ledger marks vocabulary only: no spec judges
+    /// them and none is wanted (`rvl_config::key_ledger`). Kept out of
+    /// `abstain_no_spec` so that lever counts only real authoring gaps.
+    pub vocabulary_only: usize,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format
@@ -368,7 +425,7 @@ pub struct ConfigCoverage {
 
 impl ConfigCoverage {
     pub fn abstain_total(&self) -> usize {
-        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other
+        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other + self.vocabulary_only
     }
     /// Nothing to render: the lane saw no config at all.
     pub fn is_empty(&self) -> bool {
@@ -604,6 +661,9 @@ pub fn render_ladder(
                 if cc.abstain_other > 0 {
                     parts.push(format!("{} other", cc.abstain_other));
                 }
+                if cc.vocabulary_only > 0 {
+                    parts.push(format!("{} vocabulary only", cc.vocabulary_only));
+                }
                 let aline = format!("  config abstain \u{2014} {}", parts.join(" \u{00b7} "));
                 let _ = writeln!(o, "{}", paint(&aline, "2", color));
             }
@@ -707,7 +767,7 @@ pub fn render_ladder(
     if blocking.is_empty() {
         let mut foot = format!(
             "{} {} advisory",
-            if nothing_scanned {
+            if nothing_scanned || cov.blend_incomplete.is_some() {
                 paint("\u{26a0}", "33", color)
             } else {
                 paint("\u{2713}", "32", color)
@@ -728,6 +788,21 @@ pub fn render_ladder(
                 paint(
                     "NOT CLEAN \u{2014} nothing was scanned (see COVERAGE); \
                      commit allowed, rvl fails open",
+                    "33",
+                    color
+                )
+            );
+        } else if let Some(why) = &cov.blend_incomplete {
+            // Same fail-open posture as above: the agent being unavailable
+            // must not block a commit, so the verdict line carries it.
+            let _ = writeln!(
+                o,
+                "{foot} \u{00b7} {}",
+                paint(
+                    &format!(
+                        "NOT A BLENDED RESULT \u{2014} {why} (see BLEND); \
+                         deterministic half only, rvl fails open"
+                    ),
                     "33",
                     color
                 )
