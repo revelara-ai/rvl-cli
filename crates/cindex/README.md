@@ -148,8 +148,9 @@ schema-v2 contract fields (`packet_schema: 2`, agreeing with
 - `callers` / `callees` / `client_construction` — **empty in v1** (pyindex
   precedent): cross-TU graph walking is future work and the keys keep the
   shape stable.
-- `site_kind` — `""` for a classic G1 client-call site, `"background_job"`
-  for a G3 thread-start registration (below).
+- `site_kind` — absent for a classic G1 client-call site, `"background_job"`
+  for a G3 thread-start registration, `"server_entry"` for a G2 handler
+  registration (both below).
 - `lang` — `"c_cpp"`.
 
 ## G3 background-job sites (po-av01j.51)
@@ -200,6 +201,34 @@ which is exactly the mid-confidence semantics the gate protocol quarantines.
 Uninstantiated templates have no types to ask about — abstention, documented,
 counted.
 
+## G2 server entries: civetweb and mongoose (po-av01j.50)
+
+HTTP handler registrations of the embedded C servers ride the same stream,
+stamped `site_kind: "server_entry"`. rvl routes them to the G2 server-entry
+lane (`rvl_propagate::server_entry`) and never to the G1 client-call lane.
+G1 packets carry no `site_kind` key at all. The set is identity-driven like
+the G1 allowlist, and it is emitted in no-db mode too (LOW tier):
+
+| Call | `client_type` | Route path |
+| --- | --- | --- |
+| `mg_set_request_handler(ctx, uri, handler, cbdata)` (civetweb) | `civetweb.mg_context` | a literal `uri` rides `const_args` (index 1) |
+| `mg_http_listen(mgr, url, fn, fn_data)` (mongoose) | `mongoose.mg_mgr` | none: this is the listener, its routes live in `fn` |
+| `mg_http_match_uri(hm, glob)` (mongoose) | `mongoose.mg_http_message` | a literal `glob` rides `const_args` (index 1) |
+| `mg_match(hm->uri, mg_str(glob), caps)` (mongoose) | `mongoose.mg_http_message` | the literal rides `snippet` |
+
+`mg_match` is mongoose's general glob matcher, so it is gated two ways, both
+mechanical: its first argument must read a field named `uri`, and its
+enclosing function must be one that the same TU passes to `mg_http_listen`
+as the event handler. A method match, or a match outside a registered
+handler, is not emitted. The gate needs resolved declarations, so it does
+not apply in no-db mode.
+
+A mongoose server has no closed route table: the event handler can dispatch
+by `strcmp`, or in another TU. The listener registration therefore stays a
+route registration with no resolvable path, and the lane can find a mongoose
+health endpoint (RC-020 satisfied) but never asserts that one is absent.
+The civetweb C++ wrapper (`CivetServer::addHandler`) is not inventoried.
+
 ## Performance posture
 
 What is implemented now vs deliberately documented for later:
@@ -222,6 +251,7 @@ Golden packet tests run the built helper over the
 checked-in fixtures (`testdata/fixture-c`, `fixture-cpp`, `fixture-nodb`)
 and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
-accounting. Engine-dependent tests skip (loudly) without libclang; the pure
+accounting. `testdata/fixture-server` pins the civetweb/mongoose G2
+server entries and the `mg_match` event-handler gate. Engine-dependent tests skip (loudly) without libclang; the pure
 compile-db plumbing (shell splitting, arg filtering, the allowlist) is unit
 tested and always runs.

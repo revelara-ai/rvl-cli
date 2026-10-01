@@ -83,6 +83,22 @@ fn snippet_timeout_arg(call: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// Whether the value text [`snippet_timeout_arg`] returned shows a literal: a
+/// number (`5`, `2.5`, the `10` of `10 * time.Second`), a quoted string, or
+/// the first element of a tuple (`(3, 10)`). Anything else -- a name, an
+/// attribute, a call, nothing at all -- is an expression whose value the text
+/// does not show.
+fn snippet_value_is_literal(value: &str) -> bool {
+    let v = value.trim_start_matches(['(', '[']);
+    let v = v.strip_prefix(['-', '+']).unwrap_or(v);
+    let mut chars = v.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() || c == '"' || c == '\'' => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 /// A schema-v2 constant argument whose KEYWORD NAME says it is a timeout.
 /// Name-keyed only: a bare positional constant says nothing about being a
 /// timeout — that would take the API's signature, which is spec knowledge.
@@ -97,20 +113,76 @@ fn const_timeout_arg(site: &Site) -> Option<&ConstArg> {
 /// A decorator or annotation carrying a time bound. Looks at the decorators the
 /// retriever reported on chain roots and at the enclosing source, since a
 /// decorator sits textually above the function it bounds.
-fn has_bounding_decorator(site: &Site) -> bool {
-    const KEYS: [&str; 4] = ["time_limit", "soft_time_limit", "timeout", "deadline"];
+fn has_bounding_decorator(site: &Site, specs: &SpecCache) -> bool {
     let decorated = site
         .provenance
         .chain_roots
         .iter()
         .flat_map(|r| r.decorators.iter())
-        .any(|d| KEYS.iter().any(|k| d.contains(k)));
+        .any(|d| decorator_bounds(d, specs));
     decorated
         || site
             .enclosing_function_body
             .lines()
             .take_while(|l| l.trim_start().starts_with('@') || l.trim().is_empty())
-            .any(|l| KEYS.iter().any(|k| l.contains(k)))
+            .any(|l| decorator_bounds(l, specs))
+}
+
+/// Whether one decorator's text carries a time bound.
+///
+/// Any identifier mentioning a bound key credits one, as before, with ONE
+/// exception (po-av01j.58): a key given a value that a decorator spec for this
+/// decorator declares as "no bound". `@shared_task(time_limit=0)` switches
+/// celery's limit off, and crediting the key's mere presence was the same
+/// value-blind false pass po-av01j.25 removed from the call-arg path. Which
+/// values mean that is library knowledge, read off the decorator's own spec
+/// and never decided here: with no spec, every value credits as it did.
+///
+/// A disabled limit only withholds the credit. The decorator is ambient
+/// context, and the call may still carry a bound of its own, so the search
+/// goes on rather than calling the site unbounded.
+fn decorator_bounds(deco: &str, specs: &SpecCache) -> bool {
+    const KEYS: [&str; 4] = ["time_limit", "soft_time_limit", "timeout", "deadline"];
+    let text = deco.trim_start();
+    let callable = text
+        .trim_start_matches('@')
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    let mut rest = text;
+    while let Some(at) = rest.find(is_ident_char) {
+        let tail = &rest[at..];
+        let len = tail.find(|c| !is_ident_char(c)).unwrap_or(tail.len());
+        let (ident, after) = tail.split_at(len);
+        rest = after;
+        if !KEYS.iter().any(|k| ident.contains(k)) {
+            continue;
+        }
+        let disabled = KEYS.contains(&ident)
+            && keyword_value(after).is_some_and(|v| {
+                !v.is_empty() && specs.decorator_is_unbounded_sentinel(callable, v)
+            });
+        if !disabled {
+            return true;
+        }
+    }
+    false
+}
+
+/// The value a keyword argument is given, when `after` (the text following
+/// its name) opens with `=` or `:`: the token up to whitespace or an
+/// argument/call delimiter. None when the name is not being assigned.
+fn keyword_value(after: &str) -> Option<&str> {
+    let rest = after.trim_start();
+    let rest = rest
+        .strip_prefix('=')
+        .filter(|r| !r.starts_with('='))
+        .or_else(|| rest.strip_prefix(':').filter(|r| !r.starts_with(':')))?
+        .trim_start();
+    let end = rest
+        .find(|c: char| c.is_whitespace() || "),;]}".contains(c))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -793,7 +865,7 @@ fn judge(
     if has_session_bound(&scope_src) && !has_session_bound(&site.snippet) {
         whole.push("database session bound set in scope".into());
     }
-    if has_bounding_decorator(site) {
+    if has_bounding_decorator(site, specs) {
         whole.push("bounding decorator on the enclosing function".into());
     }
     for m in &spec.bounded_by {
@@ -848,15 +920,20 @@ fn judge(
                     // Its provenance is weaker (snippet text, not a resolved
                     // constant) and the reason says so.
                     //
-                    // A NON-CONSTANT argument (`timeout=cfg.Timeout`) still
-                    // credits a bound here, as it always has. Whether it should
-                    // abstain instead under a sentinel-declaring spec is a
-                    // large population and a measurable precision swing, so it
-                    // is gated on the eval set rather than assumed: po-av01j.59.
+                    // A NON-CONSTANT argument (`timeout=self.timeout`,
+                    // `{ timeout: opts.t }`) is a name, not a value. Under a
+                    // spec that declares sentinels it is the same ignorance as
+                    // the unfolded const_arg above and abstains the same way
+                    // (po-av01j.59); a spec that declares none still credits
+                    // it, as it always has.
                     if !value.is_empty() && spec.is_unbounded_sentinel(&value) {
                         unbounded.push(format!(
                             "the timeout argument at the call is the spec-declared unbounded sentinel {key}={value} (snippet text)"
                         ));
+                    } else if !spec.unbounded_sentinels.is_empty()
+                        && !snippet_value_is_literal(&value)
+                    {
+                        value_unresolved = true;
                     } else {
                         whole.push("timeout argument at the call".into());
                     }
@@ -1095,7 +1172,8 @@ mod tests {
     use super::*;
     use rvl_core::{Provenance, RootFact, Snippet};
     use rvl_spec::{
-        ApiSpec, Blocking, BlockingIntent, ConfigSpec, DefaultBound, Scope, ScopeSpec, SpecFile,
+        ApiSpec, Blocking, BlockingIntent, ConfigSpec, DecoratorSpec, DefaultBound, Scope,
+        ScopeSpec, SpecFile,
     };
     use std::collections::HashMap;
 
@@ -1133,6 +1211,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1172,6 +1251,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1214,6 +1294,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1416,6 +1497,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -1551,6 +1633,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1780,6 +1863,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         }));
         let f = propagate(&s, &cache, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
@@ -2156,6 +2240,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -2529,6 +2614,79 @@ mod tests {
         assert!(f.reason.contains("did not resolve"), "{}", f.reason);
     }
 
+    /// The v1 fallback over one snippet, under a spec declaring `sentinels`.
+    fn fallback(snippet: &str, sentinels: &[&str]) -> Finding {
+        let mut s = site();
+        s.snippet = snippet.into();
+        propagate(
+            &s,
+            &cache_with_sentinels(
+                vec![Mechanism::CallArg],
+                vec![],
+                sentinels.iter().map(|v| v.to_string()).collect(),
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_abstains_under_a_sentinel_declaring_spec() {
+        // po-av01j.59: `timeout=self.timeout` is a name, not a value. On an
+        // API where some values of that argument mean no bound, a value the
+        // lane cannot see is undecidable, so it routes to a human like the
+        // unfolded const_arg does -- and never to a violation.
+        for snippet in [
+            "pool.Query(sql, timeout=self.timeout)",
+            "queue.add('rebuild', data, { timeout: opts.t })",
+            "pool.Query(sql, timeout=get_timeout())",
+            "pool.Query(sql, timeout=)",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Abstain, "{snippet}: {}", f.reason);
+            assert!(f.reason.contains("did not resolve"), "{}", f.reason);
+        }
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_still_satisfies_without_declared_sentinels() {
+        // The parity guard: a spec that declares no sentinels says no value of
+        // the argument turns the bound off, so the v1 heuristic is untouched.
+        let f = fallback("pool.Query(sql, timeout=self.timeout)", &[]);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_literal_timeout_in_snippet_text_still_satisfies_under_a_sentinel_declaring_spec() {
+        // TypeScript reports no keyword names, so `{ timeout: 5000 }` only ever
+        // reaches the fallback. Text that shows a real value is a bound.
+        for snippet in [
+            "queue.add('rebuild', data, { timeout: 5000 })",
+            "pool.Query(sql, timeout=2.5)",
+            "pool.Query(sql, timeout=(3, 10))",
+            "pool.Query(sql, timeout='5s')",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Satisfies, "{snippet}: {}", f.reason);
+        }
+    }
+
+    #[test]
+    fn an_independent_bound_outranks_a_non_constant_timeout_argument() {
+        let mut s = site();
+        s.snippet = "pool.Query(sql, timeout=self.timeout)".into();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef sync():\n    pool.Query(sql, timeout=self.timeout)"
+                .into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
     #[test]
     fn an_independent_bound_outranks_a_sentinel_no_false_positive() {
         // A sentinel says the call's OWN timeout is off, not that nothing
@@ -2582,6 +2740,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let client = HashMap::from([(
             Family::Database,
@@ -2687,6 +2846,96 @@ mod tests {
             propagate(&s, &specs, &ServedBound::None, &HashMap::new()).verdict,
             Verdict::Satisfies
         );
+    }
+
+    /// The Decorator-mechanism cache plus a celery decorator spec declaring
+    /// `0` and `None` as the values that switch a task's limit off
+    /// (po-av01j.58).
+    fn cache_with_celery_decorator_spec() -> SpecCache {
+        let mut specs = cache(vec![Mechanism::Decorator], vec![]);
+        specs.merge(SpecCache::from_file(SpecFile {
+            decorators: vec![DecoratorSpec {
+                identity: "celery.shared_task".into(),
+                names: vec!["shared_task".into(), "task".into()],
+                unbounded_sentinels: vec!["0".into(), "None".into()],
+                confidence: 0.9,
+                rationale: String::new(),
+            }],
+            ..Default::default()
+        }));
+        specs
+    }
+
+    fn credits_decorator(s: &Site, specs: &SpecCache) -> bool {
+        propagate(s, specs, &ServedBound::None, &HashMap::new())
+            .reason
+            .contains("bounding decorator")
+    }
+
+    #[test]
+    fn a_decorator_limit_set_to_a_declared_sentinel_is_not_a_bound() {
+        // po-av01j.58: @shared_task(time_limit=0) and time_limit=None switch
+        // celery's limit OFF. Crediting the key's mere presence is the same
+        // value-blind false pass po-av01j.25 removed from the call-arg path.
+        let specs = cache_with_celery_decorator_spec();
+        for deco in [
+            "@shared_task(time_limit=0)",
+            "@shared_task(time_limit=None)",
+            "@app.task(bind=True, time_limit = 0, soft_time_limit=None)",
+        ] {
+            let mut s = site();
+            s.enclosing_function_body = format!("{deco}\ndef build_report():\n    db.query()");
+            let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
+            assert_ne!(f.verdict, Verdict::Satisfies, "{deco}: {}", f.reason);
+            assert!(
+                !f.reason.contains("bounding decorator"),
+                "{deco}: {}",
+                f.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_retriever_reported_decorator_is_value_aware_too() {
+        let specs = cache_with_celery_decorator_spec();
+        let mut s = site();
+        s.provenance.chain_roots = vec![RootFact {
+            decorators: vec!["@shared_task(time_limit=0)".into()],
+            ..Default::default()
+        }];
+        assert!(!credits_decorator(&s, &specs));
+        s.provenance.chain_roots[0].decorators = vec!["@shared_task(time_limit=120)".into()];
+        assert!(credits_decorator(&s, &specs));
+    }
+
+    #[test]
+    fn one_real_limit_on_the_decorator_still_bounds_the_task() {
+        // A soft limit of 60s is a real bound even when the hard limit is off.
+        let specs = cache_with_celery_decorator_spec();
+        let mut s = site();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=0, soft_time_limit=60)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &specs));
+        // An unresolved value is not a sentinel: a name proves nothing either
+        // way, and the pre-.58 answer stands.
+        s.enclosing_function_body =
+            "@shared_task(time_limit=settings.LIMIT)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &specs));
+    }
+
+    #[test]
+    fn without_a_decorator_spec_a_sentinel_value_still_credits_as_before() {
+        // Which values disable a bound is library knowledge. No spec, no
+        // knowledge: propagation hard-codes nothing and behaves as it did.
+        let mut s = site();
+        s.enclosing_function_body = "@shared_task(time_limit=0)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(
+            &s,
+            &cache(vec![Mechanism::Decorator], vec![])
+        ));
+        // And a spec for a DIFFERENT decorator does not reach this one.
+        s.enclosing_function_body = "@retry(timeout=0)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &cache_with_celery_decorator_spec()));
     }
 
     #[test]
@@ -2801,6 +3050,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
+            decorators: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
@@ -2867,6 +3117,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 

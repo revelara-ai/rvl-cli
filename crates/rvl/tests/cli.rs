@@ -1269,6 +1269,51 @@ fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, se
     }
 }
 
+/// An index written before the redb 2 -> 4 bump is in a file format the new
+/// engine refuses to open. Every user has one, so the first command after an
+/// upgrade must work AND say why the index is cold, not fail with the storage
+/// engine's "manual upgrade required" (po-av01j.210).
+#[test]
+fn index_status_rebuilds_an_old_format_index_and_says_so() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let index_dir = dir.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    // A real index written by redb 2.6.3; shared with the rvl-index tests.
+    let gz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rvl-index/tests/testdata/packets-redb2.redb.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(gz).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    std::fs::write(index_dir.join("packets.redb"), bytes).unwrap();
+
+    let status = || {
+        bin()
+            .args(["index", "status"])
+            .env("RVL_INDEX_DIR", &index_dir)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl")
+    };
+    let out = status();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "status must succeed: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("0 file(s) indexed"),
+        "a rebuilt index is empty"
+    );
+    assert!(
+        stderr.contains("older on-disk format") && stderr.contains("rebuilt"),
+        "the rebuild must be reported, got: {stderr}"
+    );
+
+    // Once rebuilt, the note does not repeat.
+    let again = status();
+    assert!(again.status.success());
+    assert!(!String::from_utf8_lossy(&again.stderr).contains("rebuilt"));
+}
+
 /// The detached child's log, or a marker when it never wrote one. A detached
 /// reindex that fails MUST leave this behind: "no log" is itself the finding.
 fn reindex_log(cache_dir: &std::path::Path) -> String {
@@ -1680,6 +1725,108 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
     assert!(
         !stdout.contains("unsupported config formats sighted: terraform"),
         "supported formats must not be sighted: {stdout}"
+    );
+}
+
+/// A repo with NO supported language: a planted (fake) token so the content
+/// lane has a finding, and Terraform with an unpinned provider and no state
+/// backend. This is the content-only early return in `run_scan`.
+fn write_content_only_terraform_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+    std::fs::write(
+        repo.join("main.tf"),
+        "terraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\" }\n  }\n}\n",
+    )
+    .unwrap();
+    repo
+}
+
+/// po-av01j.31: the content-only path used to return before any spec cache
+/// was resolved, so the config lane never ran on the repos it was built for
+/// (pure terraform/.env trees). Both lanes must report in one scan.
+#[test]
+fn content_only_repo_runs_the_config_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"terraform","key":"provider.version-constraint","expect":{"kind":"present"},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin provider versions in required_providers","rationale":"an unconstrained provider floats to the newest release"},
+            {"format":"terraform","key":"terraform.backend","expect":{"kind":"present"},"confidence":0.9,"control":"RC-030","severity":"medium","fix":"configure a remote state backend in the terraform block","rationale":"local state cannot be shared, locked, or recovered"}
+        ]
+    }"#).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // The content lane still reports and still blocks...
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "the planted token must still block: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    // ...and the config lane now runs beside it.
+    assert!(
+        stdout.contains("terraform provider.version-constraint"),
+        "unpinned provider must surface on the content-only path: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("terraform terraform.backend"),
+        "missing remote state must surface on the content-only path: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-030"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+}
+
+/// With no spec cache at all the config lane cannot run, but that must not
+/// cost the content lane its verdict (a fresh install must still catch a
+/// committed token), and the skipped lane must be named, not left silent.
+#[test]
+fn content_only_repo_without_a_spec_cache_still_blocks_and_names_the_skipped_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a missing spec cache must not cost the content lane its verdict: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    assert!(
+        stderr.contains("config lane did not run"),
+        "the skipped lane must be named on stderr: {stderr}"
     );
 }
 
@@ -2449,6 +2596,53 @@ fn scan_decides_c_background_job_sites_end_to_end() {
     assert!(
         workers[0].0 == "abstain" && workers[0].1.contains("depends"),
         "the thread start must abstain on the depends spec: {workers:?}"
+    );
+}
+
+/// C G2, live end to end (po-av01j.50): cindex inventories the civetweb and
+/// mongoose registrations as server entries, rvl routes them to the G2 lane
+/// and keeps them out of the G1 site count. The fixture registers `/healthz`,
+/// so RC-020 is satisfied and stays off the ladder; it attaches no rate
+/// limiter, so RC-069 surfaces.
+#[test]
+fn live_c_scan_judges_civetweb_and_mongoose_server_entries() {
+    let Some(cindex) = cindex_helper("live_c_scan_judges_civetweb_and_mongoose_server_entries")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-server");
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("sites 0") && stdout.contains("server-entry 5"),
+        "the five registrations are server entries, not G1 sites: {stdout}"
+    );
+    assert!(
+        !stdout.contains("RC-020"),
+        "the registered /healthz endpoint satisfies the health control: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-069"),
+        "no rate limiter is attached, so RC-069 must surface: {stdout}"
     );
 }
 
@@ -6153,24 +6347,13 @@ fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
     );
 }
 
-/// PARTIAL STAGING, and the limit of this fix stated out loud. The staged hunk
-/// puts the file in scope; the retrievers still read WORKING-TREE bytes, so the
-/// unstaged hunk is judged too. That is a known gap — what the scan must never
-/// do is carry it silently, so it names the partially staged files.
-#[test]
-fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
-    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
-    stage(&root, &["add", "half.py"]);
-    // Further edit, deliberately NOT staged.
-    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
-    let specs = dir.path().join("specs.json");
+/// Run the pre-commit gate over `root`, exactly as the installed shim does.
+fn pre_commit_gate(dir: &std::path::Path, root: &std::path::Path) -> std::process::Output {
+    let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
-
-    let out = bin()
+    bin()
         .arg("scan")
-        .arg(&root)
+        .arg(root)
         .args([
             "--incremental",
             "--changed-only",
@@ -6179,17 +6362,117 @@ fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("HOME", dir.path().join("home"))
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .env("RVL_INDEX_DIR", dir.join("index"))
+        .env("HOME", dir.join("home"))
+        .env_remove("RVL_FORCE")
         .output()
-        .expect("failed to run rvl");
+        .expect("failed to run rvl")
+}
+
+/// PARTIAL STAGING IS REFUSED (po-io8sk.3). The staged hunk puts the file in
+/// scope, but every lane reads WORKING-TREE bytes, so the scan would judge
+/// content that is not the content being committed. That used to be a note on
+/// stderr over a verdict the commit did not earn; it is now an error. Exit 1,
+/// not `EXIT_BLOCKED`: the code was never judged.
+#[test]
+fn a_partially_staged_file_is_refused_not_judged_on_working_tree_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    // Further edit, deliberately NOT staged.
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a partially staged file must fail the gate as 'not judged':\n{stdout}\n{stderr}"
+    );
     assert!(
         stderr.contains("half.py") && stderr.contains("unstaged edits"),
-        "a partially staged file must be named, not silently judged on \
-         working-tree bytes: {stderr}"
+        "the refusal must name the partially staged file: {stderr}"
     );
+    assert!(
+        stderr.contains("git stash --keep-index"),
+        "the refusal must say how to get the staged content judged: {stderr}"
+    );
+    assert!(
+        !stdout.contains("commit clean"),
+        "a refused scan must not print a verdict: {stdout}"
+    );
+}
+
+/// THE RACE THE REFUSAL CLOSES. The author stages a secret, then deletes it
+/// from the working tree without staging the deletion. The working tree is
+/// clean, the commit is not. A gate that read working-tree bytes passed this
+/// commit; the verdict must never be `0` here.
+#[test]
+fn a_staged_secret_hidden_by_an_unstaged_edit_cannot_pass_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(
+        root.join("leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "leak.py"]);
+    std::fs::write(root.join("leak.py"), "VALUE = 1\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the staged secret is what gets committed; a clean working tree must \
+         not buy a clean verdict:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The refusal is scoped to the gap, not to staging in general: once the
+/// working tree and the index agree on the file, the same commit is judged.
+#[test]
+fn a_fully_staged_file_is_still_judged_by_the_pre_commit_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "index and working tree agree, so the scan must run:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE REFERENCE CI JOB SHIPS, and the copy in the docs is the file
+/// (po-io8sk.3). docs/gating.md names the required CI check as the guard and
+/// the hook as the fast path; a guard nobody can copy is not a guard.
+#[test]
+fn gating_docs_ship_the_reference_ci_job_verbatim() {
+    let docs = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into()),
+    )
+    .join("../../docs");
+    let job = std::fs::read_to_string(docs.join("examples/rvl-gate.yml"))
+        .expect("docs/examples/rvl-gate.yml must exist");
+    let gating = std::fs::read_to_string(docs.join("gating.md")).unwrap();
+    assert!(
+        gating.contains(job.trim_end()),
+        "docs/gating.md must carry docs/examples/rvl-gate.yml verbatim"
+    );
+    for needle in ["pull_request", "merge_group", "--strict", "lang_status"] {
+        assert!(job.contains(needle), "reference job must mention {needle}");
+    }
 }
 
 /// PRE-PUSH picks up the commits in the pushed range, so a finding introduced

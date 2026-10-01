@@ -1,5 +1,23 @@
 # Gating commits and CI
 
+rvl gates a change in two places, and they are not equal:
+
+1. **The CI check is the guard.** A required status check runs `rvl scan` on
+   the pull request's merge ref, and on the merge queue's candidate when you
+   use one. It judges a commit: the content that lands. Nothing an author
+   does locally can change what it reads.
+2. **The hook is the fast path.** The pre-commit and pre-push hooks give the
+   same verdict in seconds, before the code leaves the laptop. They are a
+   convenience, not a control.
+
+The order matters because a local hook checks first and git acts second.
+`git commit --no-verify` skips the hook. A squash-merge creates a commit on
+the default branch that no hook ever saw. A hook that is not installed does
+not run. Only a check on the commit itself closes those paths, so make the
+CI job below a required check before you rely on the gate.
+
+## The hook: the fast path
+
 ```sh
 rvl hook install --pre-commit    # gate `git commit`
 rvl hook install --pre-push      # gate `git push`
@@ -21,6 +39,18 @@ exec rvl scan . --incremental --changed-only --hook pre-commit
 touched, so a one-file docs commit does not surface the whole repository.
 It requires `--incremental`, and the changed set comes from git, never from
 the packet index.
+
+The pre-commit scan reads working-tree files, not the staged blobs. When a
+staged file also has unstaged edits (`git add -p`, or an edit after
+`git add`), those two differ, and a verdict on one says nothing about the
+other. The scan refuses that case with exit `1` and names the files:
+
+```
+error: pre-commit: 1 staged file(s) also have unstaged edits (half.py).
+```
+
+Stage the rest of the file, or set the unstaged edits aside for the commit
+with `git stash --keep-index` and restore them with `git stash pop`.
 
 ## Exit codes
 
@@ -47,7 +77,68 @@ unread code. The next section covers how to catch that in CI.
 To get past a blocked commit deliberately, `RVL_FORCE=1 git commit …` or arm
 a one-shot override with `rvl scan force-next`.
 
-## In CI
+## In CI: the guard
+
+Ship this job and make `rvl-gate` a required check on your default branch.
+It is [`docs/examples/rvl-gate.yml`](examples/rvl-gate.yml):
+
+```yaml
+# Reference job: rvl as the authoritative gate. Copy to
+# .github/workflows/rvl-gate.yml and mark the `rvl-gate` check as required in
+# the branch protection rule (or ruleset) for your default branch.
+#
+# A pre-commit hook judges the working tree and can be skipped with
+# `git commit --no-verify`. This job judges a commit: the pull request's merge
+# ref, and the merge queue's candidate when you use one. That is the content
+# that lands, so this check is the guard and the hook is the fast path.
+name: rvl-gate
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  rvl-gate:
+    runs-on: ubuntu-latest
+    steps:
+      # On pull_request this checks out refs/pull/N/merge: the PR head merged
+      # with the current base, not the PR head alone. Full history, so the
+      # base ref that --changed-only diverges from is reachable.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Put `rvl` on PATH here, pinned to a version. See "Install" in the rvl
+      # README for the supported channels.
+
+      # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
+      # lane that could not read the code. Both fail the job. A pull_request
+      # event exports GITHUB_BASE_REF; a merge_group event does not, so the
+      # base is passed in.
+      - name: Gate the change
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+          RVL_BASE_REF: ${{ github.event.merge_group.base_sha }}
+        run: rvl scan . --incremental --changed-only --strict
+
+      # The coverage assertion: every lane rvl claimed to scan read at least
+      # one site. A full scan, because the incremental path has no roll-call.
+      # Exit 3 is tolerated here: this step asks "was the code read", and the
+      # step above already gave the verdict on the change.
+      - name: Assert coverage
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: |
+          rvl scan . --strict --out findings.json || [ "$?" -eq 3 ]
+          jq -e '.coverage.lang_status
+                 | all(.state == "scanned" and ((.detail | tonumber?) // 0) > 0)' \
+            findings.json
+```
+
+The rest of this section explains each line of it.
 
 Credentials come from the environment, so CI needs no `rvl login`:
 
