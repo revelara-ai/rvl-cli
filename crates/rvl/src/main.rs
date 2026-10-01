@@ -4652,6 +4652,29 @@ fn run_scan_incremental(
         }
     }
 
+    // REFUSE A PARTIALLY STAGED FILE (po-io8sk.3). The changed PATHS come
+    // from the git index, but every lane reads working-tree bytes, so a file
+    // that is staged and then edited again would be judged on content that is
+    // not the content being committed: the scan passes one tree and git
+    // commits another. This was a note on stderr; a gate that knows its
+    // verdict is about the wrong bytes must not print one. An error (exit 1,
+    // "never judged"), not EXIT_BLOCKED, and before the scan so it costs
+    // nothing. `dirty` is only ever populated for the pre-commit mode.
+    if let Ok(cs) = &resolved {
+        if !cs.dirty.is_empty() {
+            anyhow::bail!(
+                "pre-commit: {} staged file(s) also have unstaged edits ({}).\n  \
+                 rvl reads working-tree content, so the scan would judge bytes that are \
+                 not the bytes being committed. Refusing rather than printing a verdict \
+                 for the wrong content.\n  \
+                 Either stage the rest (`git add <file>`), or set the unstaged edits \
+                 aside for the commit (`git stash --keep-index`, then `git stash pop`).",
+                cs.dirty.len(),
+                cs.dirty.join(", ")
+            );
+        }
+    }
+
     let scan = incremental_scan_pass(index_dir, path, strict)?;
 
     // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
@@ -4697,19 +4720,6 @@ fn run_scan_incremental(
     let changed_files = match &resolved {
         Ok(cs) => {
             eprintln!("changed set: {} file(s) from {}", cs.files.len(), cs.source);
-            if !cs.dirty.is_empty() {
-                // KNOWN GAP, STATED OUT LOUD: the changed PATHS come from the
-                // git index, but the retrievers read working-tree bytes, so a
-                // partially staged file is judged in its working-tree form.
-                eprintln!(
-                    "note: {} staged file(s) also have unstaged edits ({}); \
-                     rvl reads working-tree content, so those hunks are \
-                     included in the judgment even though they are not being \
-                     committed",
-                    cs.dirty.len(),
-                    cs.dirty.join(", ")
-                );
-            }
             cs.files.clone()
         }
         Err(e) => {
