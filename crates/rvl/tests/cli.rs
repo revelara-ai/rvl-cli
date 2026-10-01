@@ -6597,3 +6597,80 @@ fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
         "a heap OOM must name the limit and the override: {text}"
     );
 }
+
+// --- `--oss-only`: load the OSS tier alone (po-7wgx3) ---
+//
+// The layering itself is proven on signed stores in rvl-cache's tests; a CLI
+// test cannot install a tier (the pinned keyset has no private half here), so
+// these cover the flag's surface: it parses on `scan` and `report`, it names
+// the tier it needs, and it refuses the dev overrides that bypass the tiers.
+
+#[test]
+fn oss_only_scan_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unloadable tier fails closed"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier") && stderr.contains("rvl sync"),
+        "error must name the flag, the tier and the fix: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_report_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["report", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier"),
+        "error must name the flag and the tier: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_refuses_the_dev_overrides_that_bypass_the_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    for (cmd, flag) in [
+        ("scan", "--specs-file"),
+        ("scan", "--judgments"),
+        ("report", "--specs-file"),
+    ] {
+        let out = bin()
+            .args([cmd, "--oss-only", "--retrieved"])
+            .arg(&packets)
+            .arg(flag)
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{cmd} --oss-only {flag} must be a usage error"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("--oss-only") && stderr.contains(flag),
+            "usage error must name both flags: {stderr}"
+        );
+    }
+}

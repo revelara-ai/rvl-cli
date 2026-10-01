@@ -621,18 +621,36 @@ impl TieredLoaded {
     }
 }
 
-/// Load both tiers, tolerating either store being absent or unloadable.
-/// Each present tier is fully verified (signature at load, as always); a
-/// tier that fails verification is treated as absent, never as trusted.
+/// Which tiers a load may open. A LOAD filter only: sync still installs
+/// every tier the credentials allow, so dropping the filter needs no re-sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TierFilter {
+    /// The OSS baseline plus the commercial overlay when one is installed.
+    #[default]
+    Both,
+    /// The OSS tier alone, exactly what a no-key install loads. The
+    /// commercial store is never opened, so it contributes no specs, no
+    /// judgments and no staleness or upgrade chatter.
+    OssOnly,
+}
+
+/// Load the tiers `filter` allows, tolerating either store being absent or
+/// unloadable. Each present tier is fully verified (signature at load, as
+/// always); a tier that fails verification is treated as absent, never as
+/// trusted.
 pub fn load_tiered(
     commercial: &CacheStore,
     oss: &CacheStore,
     keyset: &Keyset,
     today: &str,
+    filter: TierFilter,
 ) -> TieredLoaded {
     TieredLoaded {
         oss: oss.load(keyset, today).ok(),
-        commercial: commercial.load(keyset, today).ok(),
+        commercial: match filter {
+            TierFilter::Both => commercial.load(keyset, today).ok(),
+            TierFilter::OssOnly => None,
+        },
     }
 }
 
