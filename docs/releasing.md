@@ -32,6 +32,19 @@ so a fresh install scans with no setup:
   cross-compiles it per target triple into `crates/rvl/dist-extras/`
   (`.github/build-setup.yml`, spliced into dist's build job via
   `github-build-setup`), and `[package.metadata.dist] include` packs it.
+- **`libclang/`**, the engine `cindex` loads, is vendored, not built: a
+  pinned, checksummed libclang so a release scans C/C++ the same way on every
+  machine. `crates/cindex/libclang.pin` names the LLVM version and, per target
+  triple, the download and its sha256. `ci/fetch-libclang.sh` (also spliced in
+  via `.github/build-setup.yml`) verifies every download against the pin,
+  fails the build on a mismatch, and writes `crates/rvl/dist-extras/libclang/`
+  (the library, clang's builtin headers of the same version, and LLVM's
+  license), which `include` packs beside `cindex`. The same step sets
+  `CINDEX_REQUIRE_VENDORED_LIBCLANG` for the build, so a release `cindex`
+  whose bundle is missing fails closed rather than using the system clang.
+  Adding a release target means pinning a library for it first:
+  `cargo test -p cindex` fails until `libclang.pin` and the `targets` in
+  `dist-workspace.toml` agree.
 - **`csindex`** is deliberately not shipped: the assembly is ~39 KB but pulls
   ~9 MB of `Microsoft.CodeAnalysis` behind it, more than the rest of the
   archive combined. Scanning a C# repo without it fails closed with the one

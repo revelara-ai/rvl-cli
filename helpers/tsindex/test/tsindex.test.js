@@ -229,8 +229,9 @@ test('an unresolved receiver still emits a STRONG verb at low confidence', () =>
 
 test('construction of a resolved client is retrievable', () => {
   const records = retrieveRecords();
+  // service.ts constructs its pool in-file; crossmodule.ts imports one.
   const pool = records.find(
-    (r) => r.client_type === 'pg.Pool' && r.func === 'query',
+    (r) => r.client_type === 'pg.Pool' && r.func === 'query' && r.file_path === 'src/service.ts',
   );
   assert.ok(pool, 'expected the pool.query site');
   const sources = pool.client_construction.map((c) => c.source);
@@ -1033,4 +1034,162 @@ test('path aliases beside real imports do not poison the run', () => {
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// --- following the repo's OWN modules without node_modules (po-pk3fp.10) ---
+//
+// A client is usually constructed in one module and imported everywhere else,
+// so the specifier at the call site is `./db`, not `pg`. The TypeChecker
+// follows that import whether or not node_modules exists -- the repo's own
+// modules are in the program -- and syntax has to follow it too, through
+// named exports, barrels and default exports, down to the import of the
+// package that names the type.
+
+function writeTree(t, prefix, files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), typeof body === 'string' ? body : JSON.stringify(body));
+  }
+  return dir;
+}
+
+test('a client imported from a sibling module keeps its key on an uninstalled tree', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const keysIn = (sites) =>
+    sites
+      .filter((r) => r.file_path === 'src/crossmodule.ts')
+      .map((r) => r.site_key)
+      .sort();
+  const want = keysIn(retrieveRecords());
+  // Named export, namespace import, barrel re-export, default export of a
+  // construction, and a type re-exported under another name.
+  assert.strictEqual(want.length, 5, JSON.stringify(want));
+  assert.deepStrictEqual(keysIn(retrieveFrom(dir).sites), want);
+});
+
+test('an awaited SDK call keeps its site on an uninstalled tree', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  // `client.chat.completions.create(...)` carries no I/O verb, so the installed
+  // run admits it through the checker's awaitability test, which cannot run
+  // without the package. The source says the same thing syntactically: the
+  // call's result is awaited or returned from an async function. The member
+  // type (`Completions`) lives in the package, so the key is one level coarser.
+  const creates = sites.filter((r) => r.func === 'create' && r.client_type === 'openai');
+  assert.deepStrictEqual(
+    creates.map((r) => `${r.file_path}:${r.line_number}`).sort(),
+    ['src/emitters.ts:58', 'src/llm.ts:11'],
+    JSON.stringify(sites.map((r) => [r.client_type, r.func, r.file_path, r.line_number])),
+  );
+  for (const r of creates) assert.strictEqual(r.provenance.confidence_tier, 'medium');
+});
+
+test('a wildcard re-export of a package is named, never guessed', (t) => {
+  // `export * from 'ioredis'` in a local barrel: whether `Redis` comes from
+  // ioredis is a fact about the package's CONTENTS, which the tree does not
+  // have. Guessing would be right here and wrong beside a second `export *`,
+  // so the receiver stays unattributed and the specifier is named.
+  const dir = writeTree(t, 'tsx-star-', {
+    'package.json': { name: 's', dependencies: { pg: '^8', ioredis: '^5' } },
+    'src/clients.ts': "export * from 'ioredis';\n",
+    'src/use.ts':
+      "import { Pool } from 'pg';\n" +
+      "import { Redis } from './clients';\n" +
+      'const pool = new Pool();\n' +
+      'const redis = new Redis();\n' +
+      "export async function go() { return [await pool.query('x'), await redis.get('k')]; }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.client_type}.${r.func}`),
+    ['pg.Pool.query'],
+    JSON.stringify(sites.map((r) => [r.client_type, r.func])),
+  );
+  assert.deepStrictEqual(cfg.unmappable_specifiers, ["export * from 'ioredis'"]);
+});
+
+test('a tree reachable only through wildcard re-exports abstains and names them', (t) => {
+  const dir = writeTree(t, 'tsx-staronly-', {
+    'package.json': { name: 's', dependencies: { ioredis: '^5' } },
+    'src/clients.ts': "export * from 'ioredis';\n",
+    'src/use.ts':
+      "import { Redis } from './clients';\n" +
+      'const redis = new Redis();\n' +
+      "export async function go() { return redis.get('k'); }\n",
+  });
+  let err;
+  try {
+    run('--retrieve', '--root', dir);
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, 'expected the abstain exit');
+  assert.strictEqual(err.status, 3, String(err.stderr));
+  assert.match(String(err.stderr), /export \* from 'ioredis'/);
+});
+
+test('path aliases declared in a nested workspace tsconfig are unmappable', (t) => {
+  // Monorepos declare `paths` per workspace. An alias the root tsconfig does
+  // not know is otherwise attributed to a package named `~`, which counts as
+  // attributed and can hold off the abstain on a tree that resolved nothing.
+  const dir = writeTree(t, 'tsx-nested-', {
+    'package.json': { name: 'root', private: true },
+    'packages/api/package.json': { name: 'api', dependencies: { pg: '^8' } },
+    'packages/api/tsconfig.json': {
+      compilerOptions: { baseUrl: '.', paths: { '~/*': ['src/*'] } },
+    },
+    'packages/api/src/use.ts':
+      "import { db } from '~/db';\nexport async function go() { return db.query('x'); }\n",
+  });
+  let err;
+  try {
+    run('--retrieve', '--root', dir);
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, 'every external import is an alias, so this must abstain');
+  assert.strictEqual(err.status, 3, String(err.stderr));
+  assert.match(String(err.stderr), /~\/db/);
+});
+
+test('a path alias from an extended tsconfig is honored', (t) => {
+  const dir = writeTree(t, 'tsx-extends-', {
+    'package.json': { name: 'e', dependencies: { pg: '^8' } },
+    'tsconfig.base.json': {
+      compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+    },
+    'tsconfig.json': { extends: './tsconfig.base.json', include: ['src/**/*.ts'] },
+    'src/use.ts':
+      "import { Pool } from 'pg';\n" +
+      "import { helper } from '@app/db';\n" +
+      'const pool = new Pool();\n' +
+      "export async function go() { return [await pool.query('x'), await helper.query('y')]; }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(sites.map((r) => `${r.client_type}.${r.func}`), ['pg.Pool.query']);
+  assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
+});
+
+test('a path alias onto in-repo source resolves through it', (t) => {
+  // The alias names a workspace directory, and that directory is right here:
+  // it is the package CONTENTS that are missing, not the repo's own source.
+  // Following the alias into it is what the checker does too.
+  const dir = writeTree(t, 'tsx-inrepo-', {
+    'package.json': { name: 'i', dependencies: { pg: '^8' } },
+    'tsconfig.json': {
+      compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+    },
+    'packages/db/src/index.ts': "import { Pool } from 'pg';\nexport const pool = new Pool();\n",
+    'src/use.ts':
+      "import { pool } from '@app/db';\nexport async function go() { return pool.query('x'); }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.file_path}:${r.client_type}.${r.func}`),
+    ['src/use.ts:pg.Pool.query'],
+    JSON.stringify(sites.map((r) => [r.file_path, r.client_type, r.func])),
+  );
+  assert.deepStrictEqual(cfg.unmappable_specifiers, []);
 });
