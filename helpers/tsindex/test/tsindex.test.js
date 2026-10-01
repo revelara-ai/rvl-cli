@@ -1193,3 +1193,88 @@ test('a path alias onto in-repo source resolves through it', (t) => {
   );
   assert.deepStrictEqual(cfg.unmappable_specifiers, []);
 });
+
+// --- the abstain's install advice (po-av01j.170) ---
+//
+// tsindex reads node_modules for TYPE RESOLUTION only: it never loads or runs
+// a package. So the install it asks for must not be one that runs every
+// package's install scripts. A plain `npm ci` fails outright on a repo whose
+// native dependency cannot build on the user's toolchain (Online Boutique's
+// `pprof` on node 24), and asks someone who only wants a SCAN to execute
+// code from hundreds of packages.
+
+// A tree that abstains (its only external import is a wildcard re-export)
+// beside the package it depends on, whose install script cannot succeed.
+function treeWithUnbuildableDependency(t) {
+  const dir = writeTree(t, 'tsx-native-', {
+    'dep/package.json': {
+      name: 'nativeclient',
+      version: '1.0.0',
+      types: 'index.d.ts',
+      scripts: { install: 'node -e "process.exit(1)"' },
+    },
+    'dep/index.d.ts': 'export class Client { query(sql: string): Promise<string>; }\n',
+    'app/package.json': { name: 'app', dependencies: { nativeclient: 'file:../dep' } },
+    'app/src/clients.ts': "export * from 'nativeclient';\n",
+    'app/src/use.ts':
+      "import { Client } from './clients';\n" +
+      'const client = new Client();\n' +
+      "export async function go() { return client.query('SELECT 1'); }\n",
+  });
+  return path.join(dir, 'app');
+}
+
+function abstainMessage(root) {
+  try {
+    run('--retrieve', '--root', root);
+  } catch (e) {
+    assert.strictEqual(e.status, 3, String(e.stderr));
+    return String(e.stderr);
+  }
+  return assert.fail('expected the abstain exit');
+}
+
+test('the abstain advises the script-free install first, and says why', (t) => {
+  const msg = abstainMessage(treeWithUnbuildableDependency(t));
+  for (const form of [
+    'npm ci --ignore-scripts',
+    'pnpm install --frozen-lockfile --ignore-scripts',
+    'yarn install --immutable --mode=skip-build',
+  ]) {
+    assert.ok(msg.includes(form), `the abstain must name \`${form}\`: ${msg}`);
+  }
+  // The reason, in one line: what makes skipping the scripts safe to advise.
+  assert.match(msg, /only to resolve types/);
+  // The plain form survives as the FALLBACK, after the script-free one.
+  const plain = msg.search(/npm ci(?! --ignore-scripts)/);
+  assert.ok(plain > msg.indexOf('npm ci --ignore-scripts'), msg);
+});
+
+test('a script-free install resolves the abstain where the plain install fails', (t) => {
+  const app = treeWithUnbuildableDependency(t);
+  const npm = (...args) => {
+    try {
+      execFileSync(
+        'npm',
+        ['install', '--install-links', '--offline', '--no-audit', '--no-fund', ...args],
+        { cwd: app, encoding: 'utf8', stdio: 'pipe' },
+      );
+      return 0;
+    } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      return e.status;
+    }
+  };
+  const plain = npm();
+  if (plain === null) return t.skip('npm is not on PATH');
+  assert.notStrictEqual(plain, 0, 'the dependency must fail to build for this to prove anything');
+  abstainMessage(app);
+
+  assert.strictEqual(npm('--ignore-scripts'), 0);
+  const { sites, cfg } = retrieveFrom(app);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.client_type}.${r.func}`),
+    ['nativeclient.Client.query'],
+  );
+  assert.strictEqual(cfg.dependency_trees_uninstalled, 0);
+});
