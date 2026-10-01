@@ -1,5 +1,14 @@
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 #[test]
 fn version_flag_reports_name_and_semver() {
     let out = Command::new(env!("CARGO_BIN_EXE_rvl"))
@@ -414,7 +423,7 @@ fn force_next_outside_a_repo_is_refused() {
 /// just missing the compiler).
 #[test]
 fn scan_without_retrieved_runs_the_go_helper() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let fixture = goindex_src.join("testdata").join("fixture");
@@ -952,7 +961,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
 /// Build goindex from source, or None when no Go toolchain is available (the
 /// test is then skipped with a log line, matching the scan e2e convention).
 fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
@@ -979,7 +988,7 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn goindex_fixture() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
@@ -1718,14 +1727,14 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
 /// timeout re-application). Production specs ride the LLM factory; this file
 /// exists so the e2e tests exercise real verdicts.
 fn background_jobs_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("background_jobs_specs.json")
 }
 
 fn helper_fixture(helper: &str) -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
@@ -1915,14 +1924,14 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("g4_seed_specs.json")
 }
 
 fn helpers_dir() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     manifest
         .parent()
         .and_then(|p| p.parent())
@@ -1933,7 +1942,7 @@ fn helpers_dir() -> std::path::PathBuf {
 /// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
 /// an API's own timeout argument that mean no bound.
 fn sentinel_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("sentinel_seed_specs.json")
@@ -2024,7 +2033,7 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
     let rows = scan_fixture_findings(
@@ -2063,7 +2072,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
@@ -2137,7 +2146,7 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let fixture = workspace
         .join("crates")
@@ -2331,7 +2340,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
 /// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
 /// emission section). The production corpus rides the LLM factory, HITL.
 fn java_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("java_seed_specs.json")
@@ -2448,7 +2457,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
 /// sqlx identities — the production corpus rides the LLM factory, HITL).
 fn rust_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("testdata")
         .join("rust_seed_specs.json")
@@ -2468,7 +2477,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
             return;
         }
     }
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .unwrap()
@@ -2936,7 +2945,7 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
 /// for the G4 lane. The production corpus rides the LLM factory, HITL — see
 /// the gate-set mint bead under po-av01j.
 fn csharp_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("csharp_seed_specs.json")

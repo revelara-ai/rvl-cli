@@ -1189,10 +1189,17 @@ fn render_compound_context(d: &CompoundRiskDetailResponse) -> String {
 mod tests {
     use super::*;
 
+    /// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+    /// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+    /// carries the compile-time path of whichever checkout built it, which may be gone.
+    fn manifest_dir() -> std::path::PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+            .into()
+    }
+
     fn testdata(name: &str) -> Vec<u8> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata")
-            .join(name);
+        let p = manifest_dir().join("testdata").join(name);
         std::fs::read(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
     }
 

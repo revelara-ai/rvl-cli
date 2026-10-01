@@ -6,6 +6,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// Locate the `cindex` executable.
 ///
 /// It is NOT a bin of this package — it is a bin of `rvl`
@@ -40,9 +49,7 @@ fn bin() -> Command {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join(name)
+    manifest_dir().join("testdata").join(name)
 }
 
 /// True when the runtime engine loads; otherwise logs a SKIP line.
