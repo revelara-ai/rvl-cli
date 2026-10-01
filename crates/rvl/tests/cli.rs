@@ -6273,3 +6273,69 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- node helper heap limit (po-av01j.118) ---
+
+/// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
+/// return everything rvl printed. `None` when `node` is absent.
+fn scan_with_fake_tsindex(script: &str, heap_mb: &str) -> Option<String> {
+    if Command::new("node").arg("--version").output().is_err() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("index.ts"), "export const x = 1;\n").unwrap();
+    let helper = dir.path().join("tsindex.js");
+    std::fs::write(&helper, script).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVL_TSINDEX", &helper)
+        .env("RVL_NODE_MAX_OLD_SPACE_MB", heap_mb)
+        .env_remove("NODE_OPTIONS")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The limit must reach `node` itself, ahead of the script: V8 reads it at
+/// startup, so a flag placed after `tsindex.js` would be a helper argument and
+/// change nothing. The fake helper reports the flags node actually parsed.
+#[test]
+fn node_helper_runs_with_a_raised_heap_limit() {
+    let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
+                  process.exit(1);\n";
+    let Some(text) = scan_with_fake_tsindex(script, "777") else {
+        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        return;
+    };
+    assert!(
+        text.contains("execArgv=--max-old-space-size=777"),
+        "node must be started with the heap limit: {text}"
+    );
+}
+
+/// A REAL V8 heap exhaustion, not a simulated exit code: the helper allocates
+/// until node aborts under a 32 MB limit. The scan must say what happened and
+/// which variable moves the ceiling, because "signal: 6" names neither.
+#[test]
+fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
+    let script = "const hold = [];\n\
+                  for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
+    let Some(text) = scan_with_fake_tsindex(script, "32") else {
+        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        return;
+    };
+    assert!(
+        text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
+        "a heap OOM must name the limit and the override: {text}"
+    );
+}
