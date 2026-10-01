@@ -157,6 +157,17 @@ jobs:
           chmod +x "$out"
           file "$out" || true
         shell: "bash"
+      - name: "Fetch the pinned libclang for this target"
+        run: |
+          set -euo pipefail
+          targets=(${{ join(matrix.targets, ' ') }})
+          if [ "${#targets[@]}" -ne 1 ]; then
+            echo "libclang packaging assumes one target per job, got: ${targets[*]}" >&2
+            exit 1
+          fi
+          ci/fetch-libclang.sh "${targets[0]}" "$GITHUB_WORKSPACE/crates/rvl/dist-extras"
+          echo "CINDEX_REQUIRE_VENDORED_LIBCLANG=1" >> "$GITHUB_ENV"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

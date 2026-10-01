@@ -1,5 +1,14 @@
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 #[test]
 fn version_flag_reports_name_and_semver() {
     let out = Command::new(env!("CARGO_BIN_EXE_rvl"))
@@ -79,6 +88,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(out.status.success(), "offline sync is a successful no-op");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
+}
+
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
 }
 
 #[test]
@@ -414,7 +464,7 @@ fn force_next_outside_a_repo_is_refused() {
 /// just missing the compiler).
 #[test]
 fn scan_without_retrieved_runs_the_go_helper() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let fixture = goindex_src.join("testdata").join("fixture");
@@ -614,6 +664,62 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
+/// po-av01j.98: a waiver scoped with `paths:` must match the finding's FILE.
+/// Every other waiver e2e omits `paths:`, which is the always-matches branch,
+/// so the glob being fed `path:line` went unnoticed. An exact path and the
+/// `**/*.env` idiom both suppress; a glob for another directory does not.
+#[test]
+fn path_scoped_waiver_matches_the_finding_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("internal/pay")).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(
+        repo.join("internal/pay/prod.env"),
+        format!("GH_TOKEN=\"{token}\"\n"),
+    )
+    .unwrap();
+
+    let scan = |paths: &str| {
+        std::fs::write(
+            repo.join(".revelara.yaml"),
+            format!(
+                "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n    paths: {paths}\n"
+            ),
+        )
+        .unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (out.status.code(), stdout)
+    };
+
+    for paths in ["[\"internal/pay/prod.env\"]", "[\"**/*.env\"]"] {
+        let (code, stdout) = scan(paths);
+        assert_eq!(
+            code,
+            Some(0),
+            "paths: {paths} must suppress the finding: {stdout}"
+        );
+        assert!(
+            stdout.contains("suppressed"),
+            "paths: {paths} must fold into Suppressed: {stdout}"
+        );
+    }
+
+    let (code, stdout) = scan("[\"other/*.env\"]");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "a waiver scoped to another directory must not suppress: {stdout}"
+    );
+}
+
 // --- exit-code contract (po-av01j.94) ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
@@ -674,7 +780,6 @@ fn advisory_only_scan_exits_zero() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
@@ -714,17 +819,36 @@ fn advisory_only_scan_exits_zero() {
 /// production corpus rides the LLM factory.
 const SERVER_SPECS_SEED: &str = include_str!("testdata/server_specs_seed.json");
 
+/// A Go packet identity a hand-authored stream in this file claims goindex
+/// emits: (func, client_type, site_kind).
+type GoIdentity = (&'static str, &'static str, &'static str);
+
+/// `mux.HandleFunc(...)`, the G2 route registration.
+const GO_SERVE_MUX_ROUTE: GoIdentity = ("HandleFunc", "net/http.ServeMux", "server_entry");
+/// A `recover()` block, the G4 swallow aggregate.
+const GO_RECOVER_BLOCK: GoIdentity = ("recover", "recover_block", "emission_point");
+/// A method call on a `*slog.Logger`, the G4 log aggregate.
+const GO_SLOG_LOGGER: GoIdentity = ("Warn", "log/slog.Logger", "emission_point");
+
+/// Every Go identity the hand-authored streams use. Each is pinned against
+/// goindex's live output by `go_hand_authored_identities_are_what_goindex_emits`,
+/// so a stream can never encode an identity goindex does not produce
+/// (po-av01j.57).
+const GO_HAND_AUTHORED_IDENTITIES: &[GoIdentity] =
+    &[GO_SERVE_MUX_ROUTE, GO_RECOVER_BLOCK, GO_SLOG_LOGGER];
+
 /// One JSONL server-entry registration record for a fixture stream.
-fn server_entry_line(file: &str, line: u32, method: &str, snippet: &str) -> String {
+fn server_entry_line(file: &str, line: u32, snippet: &str) -> String {
+    let (func, client_type, site_kind) = GO_SERVE_MUX_ROUTE;
     serde_json::json!({
         "snapshot_id": "fixture",
         "file_path": file,
         "line_number": line,
-        "func": method,
-        "client_type": "net/http.ServeMux",
+        "func": func,
+        "client_type": client_type,
         "snippet": snippet,
         "lang": "go",
-        "site_kind": "server_entry",
+        "site_kind": site_kind,
     })
     .to_string()
 }
@@ -742,14 +866,12 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
     stream.push_str(&server_entry_line(
         "routes.go",
         11,
-        "HandleFunc",
         r#"mux.HandleFunc("/orders", ordersHandler)"#,
     ));
     stream.push('\n');
@@ -813,15 +935,15 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/healthz", healthHandler)"#,
     ));
     stream.push('\n');
+    // A ServeMux has no middleware verb (goindex inventories no `Use` on it),
+    // so the stdlib limiter shape is a wrapped handler on a registration.
     stream.push_str(&server_entry_line(
         "routes.go",
         12,
-        "Use",
-        "r.Use(middleware.Throttle(100))",
+        r#"mux.HandleFunc("/users", throttle(usersHandler))"#,
     ));
     stream.push('\n');
     std::fs::write(&packets_path, stream).unwrap();
@@ -936,7 +1058,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
 /// Build goindex from source, or None when no Go toolchain is available (the
 /// test is then skipped with a log line, matching the scan e2e convention).
 fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
@@ -963,13 +1085,54 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn goindex_fixture() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
         .join("goindex")
         .join("testdata")
         .join("fixture")
+}
+
+/// Every Go identity a hand-authored stream in this file uses is one goindex
+/// really emits over its fixture. Those streams test the Rust side without a
+/// Go toolchain; this is what keeps them describing goindex's behaviour and
+/// not their author's intent (po-av01j.57).
+#[test]
+fn go_hand_authored_identities_are_what_goindex_emits() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = Command::new(&goindex)
+        .args(["-retrieve", "-name", "fx", "-root"])
+        .arg(goindex_fixture())
+        .output()
+        .expect("failed to run goindex");
+    assert!(
+        out.status.success(),
+        "goindex -retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let emitted: Vec<(String, String, String)> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| p.get("kind").is_none())
+        .map(|p| {
+            let field = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+            (field("func"), field("client_type"), field("site_kind"))
+        })
+        .collect();
+    for &(func, client_type, site_kind) in GO_HAND_AUTHORED_IDENTITIES {
+        assert!(
+            emitted
+                .iter()
+                .any(|(f, t, k)| f == func && t == client_type && k == site_kind),
+            "goindex never emits ({func}, {client_type}, {site_kind}) over its fixture, \
+             so the hand-authored stream using it tests an intent, not goindex: {emitted:?}"
+        );
+    }
 }
 
 /// `index reindex <repo>` with NO --retrieved runs the helpers itself: this is
@@ -1661,14 +1824,14 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
 /// timeout re-application). Production specs ride the LLM factory; this file
 /// exists so the e2e tests exercise real verdicts.
 fn background_jobs_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("background_jobs_specs.json")
 }
 
 fn helper_fixture(helper: &str) -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
@@ -1787,12 +1950,18 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
                 r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":"recover","client_type":"recover_block","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("error_capture", 2)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("error_capture", 2),
+                f = GO_RECOVER_BLOCK.0,
+                t = GO_RECOVER_BLOCK.1,
+                k = GO_RECOVER_BLOCK.2,
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("log", 7)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("log", 7),
+                f = GO_SLOG_LOGGER.0,
+                t = GO_SLOG_LOGGER.1,
+                k = GO_SLOG_LOGGER.2,
             ),
         ),
     )
@@ -1852,14 +2021,14 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("g4_seed_specs.json")
 }
 
 fn helpers_dir() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     manifest
         .parent()
         .and_then(|p| p.parent())
@@ -1870,7 +2039,7 @@ fn helpers_dir() -> std::path::PathBuf {
 /// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
 /// an API's own timeout argument that mean no bound.
 fn sentinel_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("sentinel_seed_specs.json")
@@ -1946,6 +2115,95 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
 }
 
+/// The SEED corpus declaring a CAPACITY PRECONDITION (po-av01j.231): the
+/// constructor argument without which a queue's `put` cannot block.
+fn queue_capacity_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("queue_capacity_specs.json")
+}
+
+/// Python, live end to end: `put` on a `queue.Queue()` built with no maxsize
+/// cannot block, so it is not_applicable, while the same call on a
+/// `queue.Queue(maxsize=10)` with no timeout still violates. A queue that
+/// arrives as a parameter has no construction to read and abstains. The
+/// pilot's site (a queue built in `__init__`, put from another method) is the
+/// fourth row.
+#[test]
+fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import queue\nfrom queue import LifoQueue\n\n\n\
+         def unbounded(x):\n    q = queue.Queue()\n    q.put(x)\n\n\n\
+         def bounded(x):\n    q = queue.Queue(maxsize=10)\n    q.put(x)\n\n\n\
+         def sized_by_caller(n, x):\n    stack = LifoQueue(n)\n    stack.put(x)\n\n\n\
+         class Client:\n    \
+             def __init__(self):\n        self._notifications = queue.Queue()\n\n    \
+             def on_notification(self, notification):\n        \
+                 self._notifications.put(notification)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(queue_capacity_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let by_line = |line: u32| {
+        let rows = verdicts_for(doc["sites"].as_array().unwrap(), &format!("svc.py:{line}"));
+        assert_eq!(rows.len(), 1, "one finding at svc.py:{line}: {rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+
+    let (verdict, reason) = by_line(7);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert_eq!(
+        reason,
+        "cannot block: unbounded queue (queue.Queue constructed with no maxsize at svc.py:6)"
+    );
+
+    let (verdict, reason) = by_line(12);
+    assert_eq!(verdict, "violates", "{reason}");
+    assert_eq!(reason, "no bound anywhere and the search was complete");
+
+    let (verdict, reason) = by_line(17);
+    assert_eq!(verdict, "abstain", "{reason}");
+    assert!(reason.contains("could not be read"), "{reason}");
+
+    let (verdict, reason) = by_line(25);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert!(reason.contains("svc.py:22"), "{reason}");
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
@@ -1961,7 +2219,7 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
     let rows = scan_fixture_findings(
@@ -2000,7 +2258,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
@@ -2074,7 +2332,7 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let fixture = workspace
         .join("crates")
@@ -2268,7 +2526,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
 /// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
 /// emission section). The production corpus rides the LLM factory, HITL.
 fn java_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("java_seed_specs.json")
@@ -2385,7 +2643,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
 /// sqlx identities — the production corpus rides the LLM factory, HITL).
 fn rust_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("testdata")
         .join("rust_seed_specs.json")
@@ -2405,7 +2663,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
             return;
         }
     }
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .unwrap()
@@ -2578,19 +2836,42 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     let home = dir.path().join("home"); // isolates org policy + user config
     std::fs::create_dir_all(&home).unwrap();
-    let out = bin()
-        .args(["scan", "--incremental", "--hook", "pre-commit"])
-        .arg(&repo)
-        .arg("--specs-file")
-        .arg(&specs)
-        .env("RVL_GOINDEX", &goindex_bin)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("RVL_AGENT_CMD", &stub)
-        .env("HOME", &home)
-        .output()
-        .expect("failed to run rvl");
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The hook's 10s retrieval cap fails OPEN: on a loaded host the scan
+    // degrades to zero sites and, correctly, renders no agent block. That is
+    // not the path under test, so a capped run is retried from a clean cache
+    // and index; a run that is still capped fails naming the cap, not the
+    // agent block.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        for state in ["cache", "index", "agent-telemetry.jsonl"] {
+            let path = dir.path().join(state);
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = bin()
+            .args(["scan", "--incremental", "--hook", "pre-commit"])
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_AGENT_CMD", &stub)
+            .env("HOME", &home)
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if !stdout.contains("retrieval capped at") {
+            break (out, stdout);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "the hook retrieval cap fired on all {ATTEMPTS} attempts (host too loaded \
+             to exercise the agent lane): {stdout}"
+        );
+    };
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
     assert!(
@@ -2663,7 +2944,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
-/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// GitRepository tracking a branch, and an Argo Experiment the family does not
 /// parse. Seed config-key specs cover the pin-shape and remediation keys.
 fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // The config lane is the subject; the code lane gets one unspecced Go
@@ -2690,7 +2971,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     .unwrap();
     std::fs::write(
         dir.join("deploy/rollout.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
     )
     .unwrap();
     let specs = dir.join("specs.json");
@@ -2748,7 +3029,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         stdout.contains("RC-050"),
         "the deciding spec's control rides into the ladder: {stdout}"
     );
-    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // The unparsed Argo Experiment is a product-identity sighting, never a
     // generic kubernetes one.
     assert!(
         stdout.contains("argo-rollouts (1)"),
@@ -2873,78 +3154,51 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
 /// for the G4 lane. The production corpus rides the LLM factory, HITL — see
 /// the gate-set mint bead under po-av01j.
 fn csharp_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("csharp_seed_specs.json")
 }
 
-/// C#, golden packet stream: a `--retrieved` stream shaped exactly like
-/// csindex output is decided by the seed C# specs WITHOUT a dotnet SDK
-/// present. This is the contract test for the Rust side of the lane: the
-/// satisfies / violates / abstain shapes, G2 registrations routed out of the
-/// G1 lane, and a G4 catch_clause swallow surfacing under RC-027.
+/// The C# golden packet stream: csindex's own output over its fixture,
+/// GENERATED by a live run and committed (po-av01j.57), never hand-authored.
+/// A hand-authored stream encodes what its author meant csindex to emit, and
+/// stayed green through po-av01j.47 while csindex could not compile at all.
+/// `csindex_live_output_matches_the_committed_golden` fails the moment the
+/// two diverge; `RVL_UPDATE_GOLDEN=1` regenerates this file from csindex.
+fn csharp_retrieved_golden() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("csharp_retrieved_golden.jsonl")
+}
+
+/// C#, golden packet stream: the committed csindex output is decided by the
+/// seed C# specs WITHOUT a dotnet SDK present. This is the contract test for
+/// the Rust side of the lane: the satisfies / violates / abstain shapes, G2
+/// registrations routed out of the G1 lane, and a G4 catch_clause swallow
+/// surfacing under RC-027.
 #[test]
 fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
     let dir = tempfile::tempdir().unwrap();
-    let packets = dir.path().join("retrieved.jsonl");
-    let mk = |line: u32, symbol: &str, func: &str, ctype: &str, snippet: &str, extra: &str| {
-        format!(
-            r#"{{"packet_schema":2,"snapshot_id":"fx","file_path":"Svc.cs","line_number":{line},"symbol":{symbol:?},"func":{func:?},"receiver":"_c","client_type":{ctype:?},"snippet":{snippet:?},"lang":"csharp"{extra}}}"#
-        )
-    };
-    let stream = [
-        // Satisfies: HttpClient carries a whole-call default Timeout (100s),
-        // spec knowledge riding the this_client config spec.
-        mk(
-            10,
-            "FetchUser",
-            "GetAsync",
-            "System.Net.Http.HttpClient",
-            "await _c.GetAsync(url)",
-            "",
-        ),
-        // Violates: a gRPC call has NO default deadline; the seed spec says
-        // the bound rides CallOptions at the call, and none is present.
-        mk(
-            20,
-            "SayHello",
-            "AsyncUnaryCall",
-            "Grpc.Core.CallInvoker",
-            "_c.AsyncUnaryCall(method, host, options, req)",
-            "",
-        ),
-        // Abstain: librdkafka retries internally; whether app-level retry
-        // wrapping is needed is per-site judgment (RC-022 seed, depends).
-        mk(
-            30,
-            "Publish",
-            "ProduceAsync",
-            "Confluent.Kafka.IProducer",
-            "await _c.ProduceAsync(topic, msg)",
-            "",
-        ),
-        // A G2 route registration must be routed OUT of the G1 lane.
-        mk(
-            40,
-            "MapRoutes",
-            "MapGet",
-            "Microsoft.AspNetCore.Builder.WebApplication",
-            "app.MapGet(\"/health\", handler)",
-            r#","site_kind":"server_entry""#,
-        ),
-        // A G4 catch_clause swallow aggregate surfaces under RC-027.
-        mk(
-            50,
-            "Handle",
-            "catch",
-            "catch_clause",
-            "",
-            r#","site_kind":"emission_point","const_args":[{"index":0,"name":"emission_category","value":"error_capture","how":"aggregate"},{"index":0,"name":"emission_count","value":"1","how":"aggregate"}]"#,
-        ),
-    ]
-    .join("\n");
-    std::fs::write(&packets, stream + "\n").unwrap();
+    let packets = csharp_retrieved_golden();
+    let golden = std::fs::read_to_string(&packets).expect(
+        "the C# golden is missing: regenerate it with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+    );
+    // Every site record gets an --out row except server_entry registrations
+    // and emission_point aggregates, which their own lanes judge.
+    let g1_sites = golden
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| {
+            p.get("kind").is_none()
+                && !matches!(
+                    p["site_kind"].as_str(),
+                    Some("server_entry" | "emission_point")
+                )
+        })
+        .count();
 
     let out_path = dir.path().join("findings.json");
     let out = bin()
@@ -2984,16 +3238,20 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
             .any(|(v, r)| v == "abstain" && r.contains("depends")),
         "the Kafka produce must abstain on the depends spec: {g1:?}"
     );
-    // The route registration and the emission aggregate stay OUT of the G1
+    // The route registration and the emission aggregates stay OUT of the G1
     // verdict rows (their lanes judge them).
     assert!(
-        !g1.iter().any(|(_, r)| r.contains("MapGet")),
-        "a server_entry registration must not be judged as a client call: {g1:?}"
+        verdicts_for(&rows, "Server.cs:14").is_empty(),
+        "a server_entry registration must not be judged as a client call: {rows:?}"
+    );
+    assert!(
+        verdicts_for(&rows, "Emitters.cs").is_empty(),
+        "an emission_point aggregate must not be judged as a client call: {rows:?}"
     );
     assert_eq!(
         rows.len(),
-        3,
-        "only the three G1 call sites belong in --out: {rows:?}"
+        g1_sites,
+        "only the golden's G1 and job sites belong in --out: {rows:?}"
     );
     // The G4 swallow surfaces in the ladder, control-mapped and advisory.
     assert!(
@@ -3005,39 +3263,294 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
 /// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
 /// its NuGet restore (Roslyn) is unavailable — matching the tsindex
 /// "run npm install first" skip convention.
+///
+/// The build is bounded (po-l1a0p): an unbounded one sat for 10h48m on 12 s
+/// of CPU and stopped the dev loop. RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS
+/// overrides the default of 600 s; a cold NuGet restore plus Release build
+/// takes about a minute.
 fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if std::process::Command::new("dotnet")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP csindex e2e: no dotnet SDK");
-        return None;
+    let secs = std::env::var("RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    build_csindex_with(
+        std::ffi::OsStr::new("dotnet"),
+        dir,
+        std::time::Duration::from_secs(secs),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `build_csindex` with the dotnet program and the bound as parameters, so a
+/// fake dotnet can prove the bound. Ok(None) is a skip, Err is a failure.
+///
+/// What each measure is for:
+/// * The project is copied into `dir` and built there. Test binaries from
+///   several worktrees run at once and otherwise all restore and compile
+///   into the same helpers/csindex/obj.
+/// * --disable-build-servers, -nodeReuse:false and UseSharedCompilation=false
+///   stop the build from handing work to, or waiting on, a Roslyn compiler
+///   server or MSBuild node that outlives it and is shared with other runs.
+/// * Output goes to files, not pipes, and the build runs in its own process
+///   group that is killed whole on timeout, so no descendant can keep the
+///   test waiting.
+fn build_csindex_with(
+    dotnet: &std::ffi::OsStr,
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match run_bounded(
+        std::process::Command::new(dotnet).arg("--version"),
+        dir,
+        "dotnet-version",
+        std::time::Duration::from_secs(60),
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // CI provisions the SDK, so there a missing one is a broken
+            // runner, not a skip: the C# lane is the one whose green skip hid
+            // a helper that could not compile (po-av01j.47).
+            if std::env::var_os("CI").is_some() {
+                return Err("no dotnet SDK under CI: the C# live tests cannot run".to_string());
+            }
+            eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
+        Ok(None) => return Err("`dotnet --version` timed out after 60s".to_string()),
+        Ok(Some(_)) => {}
     }
-    let csdir = helpers_dir().join("csindex");
+
+    let src = dir.join("csindex-src");
+    std::fs::create_dir_all(&src).map_err(|e| format!("create {src:?}: {e}"))?;
+    for entry in std::fs::read_dir(helpers_dir().join("csindex")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::copy(&path, src.join(path.file_name().unwrap()))
+                .map_err(|e| format!("copy {path:?}: {e}"))?;
+        }
+    }
     let out_dir = dir.join("csindex-build");
-    let out = std::process::Command::new("dotnet")
-        .args(["build", "-c", "Release", "-o"])
-        .arg(&out_dir)
-        .current_dir(&csdir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let args: [&std::ffi::OsStr; 8] = [
+        "build".as_ref(),
+        "-c".as_ref(),
+        "Release".as_ref(),
+        "--disable-build-servers".as_ref(),
+        "-nodeReuse:false".as_ref(),
+        "-p:UseSharedCompilation=false".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_os_str(),
+    ];
+    let shown = format!(
+        "{} {} (in {})",
+        dotnet.to_string_lossy(),
+        args.map(|a| a.to_string_lossy().into_owned()).join(" "),
+        src.display()
+    );
+    let mut cmd = std::process::Command::new(dotnet);
+    cmd.args(args)
+        .current_dir(&src)
+        .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_NOLOGO", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
+    let (status, output) = match run_bounded(&mut cmd, dir, "dotnet-build", timeout) {
+        Ok(Some(done)) => done,
+        Ok(None) => {
+            return Err(format!(
+                "csindex build timed out after {timeout:?} and was killed: {shown}"
+            ))
+        }
+        Err(e) => return Err(format!("csindex build did not start: {shown}: {e}")),
+    };
+    if !status.success() {
+        // NU1301: NuGet could not reach its feed, so Roslyn was never
+        // restored. That is the environment (no network, cold cache), not our
+        // helper, so it is a skip like a missing SDK.
+        if output.contains("NU1301") {
+            // Under CI the feed is part of the runner, so this is fatal there
+            // for the same reason a missing SDK is.
+            if std::env::var_os("CI").is_some() {
+                return Err(format!(
+                    "NuGet restore could not reach its feed (NU1301) under CI: {shown}\n{output}"
+                ));
+            }
+            eprintln!(
+                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache"
+            );
+            return Ok(None);
+        }
         // The SDK being absent is a skip (handled above); the SDK being
         // present while OUR helper fails to compile is a defect. This exact
         // branch hid four CS0103 errors through an entire epic (po-av01j.47),
         // because a green skip reads identically to a green pass.
-        panic!(
-            "csindex failed to build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return Err(format!("csindex failed to build: {shown}\n{output}"));
     }
     let dll = out_dir.join("csindex.dll");
     if dll.is_file() {
-        Some(dll)
+        Ok(Some(dll))
     } else {
-        panic!("csindex built but produced no csindex.dll at {out_dir:?}")
+        Err(format!(
+            "csindex built but produced no csindex.dll at {out_dir:?}"
+        ))
     }
+}
+
+/// Run `cmd` to completion or until `timeout`, with stdout and stderr in
+/// files under `dir` named after `tag`. Ok(Some) carries the exit status and
+/// the combined output; Ok(None) is a timeout, after which the command's
+/// whole process group has been killed.
+fn run_bounded(
+    cmd: &mut std::process::Command,
+    dir: &std::path::Path,
+    tag: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    let out_path = dir.join(format!("{tag}.stdout"));
+    let err_path = dir.join(format!("{tag}.stderr"));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&out_path)?)
+        .stderr(std::fs::File::create(&err_path)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        // Kill the whole group before reaping the leader, so its pid (the
+        // group id) cannot have been reused by an unrelated process.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    Ok(Some((
+        status,
+        format!("{}{}", read(&out_path), read(&err_path)),
+    )))
+}
+
+/// A dotnet build that never ends must fail the test within the bound, name
+/// the build command, and leave nothing running (po-l1a0p). The fake dotnet
+/// answers `--version` and then sleeps in a CHILD on `build`, the way a
+/// compiler server or MSBuild node outlives the process the test started:
+/// killing only the direct child would leave that sleeper holding the pipes.
+#[cfg(unix)]
+#[test]
+fn csindex_build_that_never_ends_fails_within_the_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleeper.pid");
+    let fake = dir.path().join("dotnet");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 8.0.0; exit 0; fi\n\
+             sleep 600 &\n\
+             echo $! > '{}'\n\
+             wait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bound = std::time::Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let err = build_csindex_with(fake.as_os_str(), dir.path(), bound)
+        .expect_err("a build that never ends must fail, not pass or skip");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < bound + std::time::Duration::from_secs(10),
+        "the build must fail at the bound ({bound:?}), took {elapsed:?}"
+    );
+    assert!(
+        err.contains("timed out") && err.contains(&format!("{} build -c Release", fake.display())),
+        "the failure must say it timed out and name the build command: {err}"
+    );
+    let sleeper = std::fs::read_to_string(&pid_file).unwrap();
+    let proc_dir = std::path::Path::new("/proc").join(sleeper.trim());
+    if std::path::Path::new("/proc/self").exists() {
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_dir.exists() && std::time::Instant::now() < gone_by {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !proc_dir.exists(),
+            "the build's own children must be killed on timeout, {} still runs",
+            sleeper.trim()
+        );
+    }
+}
+
+/// Run csindex over its fixture and return the JSONL stream it emits. The
+/// snapshot name is fixed, so the stream is byte-stable across machines.
+fn csindex_retrieve_fixture(csindex_dll: &std::path::Path) -> String {
+    let out = std::process::Command::new("dotnet")
+        .arg(csindex_dll)
+        .args(["--retrieve", "--root"])
+        .arg(helper_fixture("csindex"))
+        .args(["--name", "fx"])
+        .output()
+        .expect("failed to run csindex");
+    assert!(
+        out.status.success(),
+        "csindex --retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("csindex emitted non-UTF-8")
+}
+
+/// The committed C# golden IS csindex's behaviour: a live run over the
+/// fixture must reproduce it byte for byte. This is what binds the
+/// no-SDK contract test above to the helper it stands in for. After an
+/// intended csindex change, regenerate with
+/// `RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output`
+/// and review the diff like code.
+#[test]
+fn csindex_live_output_matches_the_committed_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let live = csindex_retrieve_fixture(&csindex_dll);
+    let golden_path = csharp_retrieved_golden();
+    if std::env::var_os("RVL_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden_path, &live).unwrap();
+        return;
+    }
+    let golden = std::fs::read_to_string(&golden_path).unwrap_or_default();
+    if live == golden {
+        return;
+    }
+    let first_diff = live
+        .lines()
+        .zip(golden.lines())
+        .position(|(l, g)| l != g)
+        .unwrap_or_else(|| live.lines().count().min(golden.lines().count()));
+    panic!(
+        "csindex's live output has drifted from {golden_path:?} at line {}:\n  live:   {}\n  golden: {}\n\
+         If the csindex change is intended, regenerate with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+        first_diff + 1,
+        live.lines().nth(first_diff).unwrap_or("<end of stream>"),
+        golden.lines().nth(first_diff).unwrap_or("<end of stream>"),
+    );
 }
 
 /// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
@@ -3572,6 +4085,70 @@ fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
         doc["coverage"]["test_files_skipped"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
+/// A stream from a tsindex run over an uninstalled tree says so on its
+/// repo-scoped record, and the scan must repeat it (po-pk3fp.15): on the
+/// COVERAGE block and on `--out`. Without the line, a scan resolved from
+/// import syntax reads exactly like one resolved from the installed tree.
+#[test]
+fn a_scan_names_the_dependency_trees_that_were_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let run = |stream: &str, out_name: &str| {
+        let p = dir.path().join(format!("{out_name}.jsonl"));
+        std::fs::write(&p, stream).unwrap();
+        let out_path = dir.path().join(format!("{out_name}.json"));
+        let out = bin()
+            .args(["scan", "--retrieved"])
+            .arg(&p)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan errored: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        (stdout, doc)
+    };
+    let base = std::fs::read_to_string(&packets).unwrap();
+
+    let (stdout, doc) = run(&base, "installed");
+    assert!(
+        !stdout.contains("installed dependencies"),
+        "a stream that reports nothing uninstalled prints nothing: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 0,
+        "{}",
+        doc["coverage"]
+    );
+
+    let degraded = format!(
+        "{base}{}\n",
+        r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"fixture","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#
+    );
+    let (stdout, doc) = run(&degraded, "uninstalled");
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "the stream's dependency state must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 2,
         "{}",
         doc["coverage"]
     );
@@ -6106,4 +6683,147 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     );
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- node helper heap limit (po-av01j.118) ---
+
+/// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
+/// return everything rvl printed. `None` when `node` is absent.
+fn scan_with_fake_tsindex(script: &str, heap_mb: &str) -> Option<String> {
+    if Command::new("node").arg("--version").output().is_err() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("index.ts"), "export const x = 1;\n").unwrap();
+    let helper = dir.path().join("tsindex.js");
+    std::fs::write(&helper, script).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVL_TSINDEX", &helper)
+        .env("RVL_NODE_MAX_OLD_SPACE_MB", heap_mb)
+        .env_remove("NODE_OPTIONS")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The limit must reach `node` itself, ahead of the script: V8 reads it at
+/// startup, so a flag placed after `tsindex.js` would be a helper argument and
+/// change nothing. The fake helper reports the flags node actually parsed.
+#[test]
+fn node_helper_runs_with_a_raised_heap_limit() {
+    let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
+                  process.exit(1);\n";
+    let Some(text) = scan_with_fake_tsindex(script, "777") else {
+        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        return;
+    };
+    assert!(
+        text.contains("execArgv=--max-old-space-size=777"),
+        "node must be started with the heap limit: {text}"
+    );
+}
+
+/// A REAL V8 heap exhaustion, not a simulated exit code: the helper allocates
+/// until node aborts under a 32 MB limit. The scan must say what happened and
+/// which variable moves the ceiling, because "signal: 6" names neither.
+#[test]
+fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
+    let script = "const hold = [];\n\
+                  for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
+    let Some(text) = scan_with_fake_tsindex(script, "32") else {
+        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        return;
+    };
+    assert!(
+        text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
+        "a heap OOM must name the limit and the override: {text}"
+    );
+}
+
+// --- `--oss-only`: load the OSS tier alone (po-7wgx3) ---
+//
+// The layering itself is proven on signed stores in rvl-cache's tests; a CLI
+// test cannot install a tier (the pinned keyset has no private half here), so
+// these cover the flag's surface: it parses on `scan` and `report`, it names
+// the tier it needs, and it refuses the dev overrides that bypass the tiers.
+
+#[test]
+fn oss_only_scan_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unloadable tier fails closed"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier") && stderr.contains("rvl sync"),
+        "error must name the flag, the tier and the fix: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_report_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["report", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier"),
+        "error must name the flag and the tier: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_refuses_the_dev_overrides_that_bypass_the_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    for (cmd, flag) in [
+        ("scan", "--specs-file"),
+        ("scan", "--judgments"),
+        ("report", "--specs-file"),
+    ] {
+        let out = bin()
+            .args([cmd, "--oss-only", "--retrieved"])
+            .arg(&packets)
+            .arg(flag)
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{cmd} --oss-only {flag} must be a usage error"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("--oss-only") && stderr.contains(flag),
+            "usage error must name both flags: {stderr}"
+        );
+    }
 }

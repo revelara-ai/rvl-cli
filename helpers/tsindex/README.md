@@ -114,8 +114,14 @@ this run resolved client types from IMPORT SYNTAX rather than the TypeChecker
 — tier `medium`, no `client_version` — so the reader can tell a degraded scan
 from a full one instead of inferring it from a low site count.
 `unmappable_specifiers` names the import specifiers neither path could
-attribute (tsconfig path aliases). Like `test_files_skipped` these are
-retrieval statistics, not construction facts.
+attribute: tsconfig path aliases (from any `tsconfig.json` under the root,
+`extends` followed) with no in-repo source behind them, and wildcard
+re-exports of a package through a local module, spelled
+`export * from '<pkg>'`. Syntax follows the repo's own modules — a client
+imported from `./db`, a barrel's `export { Pool as PgPool } from 'pg'`, an
+`export default new Redis()` — to the same key the checker reports, and an
+alias onto in-repo source is followed the same way. Like
+`test_files_skipped` these are retrieval statistics, not construction facts.
 
 `test_files_skipped` (v2, additive) is how many test files this run declined
 to read, and `test_files_skipped_paths` names them (repo-relative, sorted)
@@ -205,6 +211,7 @@ statement names the package, and the source names the type.
     import Redis from 'ioredis';         //
     const redis = new Redis();           // redis   -> ioredis.Redis
     import axios from 'axios';           // axios   -> axios
+    import { pool } from './db';         // pool    -> pg.Pool, through ./db
 
 So when the checker comes back empty, tsindex attributes the receiver
 syntactically and reports tier `medium`. The first cases reproduce the
@@ -217,40 +224,61 @@ parameter (express's `res`) — and there it falls back to the bare import path,
 which names the same thing one level coarser and still classifies through
 `rvl_spec::client_family`.
 
+The repo's OWN modules are in the program whether or not `node_modules`
+exists, so syntax follows them (po-pk3fp.10): a named export, a namespace
+import, a barrel's `export { Pool as PgPool } from 'pg'`, and an `export
+default new Redis()` all reach the import that names the package, and the key
+matches the checker's exactly.
+
 Two consequences are deliberate:
 
 - The **awaitability gate is skipped** at tier `medium`. It is a type test, and
   with no package `callReturnsThenable` fails open on every call, so keeping it
   would admit every property call in the file — the zod/knex builder flood it
-  was written to stop. At `medium` a named I/O verb is required instead, which
-  is why `axios.create(...)` and `z.string()` are not sites while
-  `pool.query(...)` and `redis.get(...)` are.
+  was written to stop. At `medium` the SOURCE must say the call is
+  asynchronous instead — its result is awaited, chained with `.then`, or
+  returned from an async function — or the method must be a named I/O verb.
+  That is why `axios.create(...)` and `z.string()` are not sites while
+  `pool.query(...)`, `redis.get(...)` and an awaited
+  `client.chat.completions.create(...)` are.
 - The **framework tables key on the package**, not on `<pkg>.<Type>`, so a
   bare `express`, `node-cron` or `winston` still reaches the server-entry,
   background-job and emission lanes. A logger landing in the G1 client lane
   would be a wrong KIND of site, not merely a coarser key.
 
 Measured on this helper's own fixture, identical source and `tsconfig`, only
-`node_modules` differing: 32 sites installed, 6 before this existed, 26 after.
+`node_modules` differing: 32 sites installed, 6 before this existed, 26 after
+po-pk3fp.2. po-pk3fp.10 added a cross-module file (5 sites) and the awaited
+LLM calls: 36 installed, 33 uninstalled, and every uninstalled key either
+equals its installed key or is the same site one level coarser.
 An installed tree is bit-identical to before — the fallback runs only after the
 checker has failed. An installed tree is still strictly better (versions, the
 awaitability filter, chained and callback-typed receivers), which is why a
 TypeScript gate set must still pin lockfile provenance.
 
-**Known limit.** The alias list comes from the built program's options, and
-`extends` is not followed, so `paths` declared only in a base tsconfig are not
-seen. Such a specifier is attributed to a package named after the alias, which
-matches no spec and abstains downstream as `no_spec` — noise, never a wrong
-verdict.
+**Path aliases.** The alias list is the built program's `paths` plus those of
+every `tsconfig.json` under the root, with `extends` followed, so a workspace's
+own aliases are seen. An alias onto source that exists in the repo is followed
+like any local module; one that is not is named in `unmappable_specifiers`.
 
 **Abstain.** For a year an uninstalled tree abstained outright (exit 3), on the
 argument that a partial result which looks complete is worse than none. That
 cost 68 of the fleet's 97 TypeScript repos. The abstain now fires only for the
 residue syntax genuinely cannot cross: a tree with no installed
-`node_modules` whose external imports ALL go through tsconfig `paths` aliases,
-which name a workspace directory rather than a package and can only be
-followed through the package contents that are missing. The stderr message
-names those specifiers.
+`node_modules` whose external imports ALL go through tsconfig `paths` aliases
+with no in-repo source behind them, or through a local `export * from
+'<pkg>'`, whose names only the missing package contents list. A wildcard is
+never guessed: right beside one `export *`, a guess is wrong beside two. The
+stderr message names those specifiers.
+
+The message advises the install that skips install scripts — `npm ci
+--ignore-scripts`, `pnpm install --frozen-lockfile --ignore-scripts`, `yarn
+install --immutable --mode=skip-build` — because tsindex reads `node_modules`
+only to resolve types and never runs a package's code. That install works on a
+repo whose native dependency cannot build on the user's toolchain, where a
+plain `npm ci` exits 1, and it does not ask someone to execute hundreds of
+packages' scripts in order to scan. The plain form is the fallback for a
+package that generates its types at install.
 
 ### Confidence tiers (the dynamic-typing reality)
 
@@ -297,6 +325,22 @@ Everything else — `items.push(x)`, `s.trim()`, `obj.toString()` — has a meth
 in neither allowlist and an unresolved-or-builtin receiver, and is never
 emitted. A deliberately small, conservative allowlist that favours a
 resolvable, meaningful set over indexing every property call in the file.
+
+## Memory
+
+tsindex builds one TypeScript program for the whole repository, so peak memory
+grows with the repository: retrieving infisical (7746 files, dependencies
+installed) peaks at 4.4 GB RSS. V8's default heap limit is about 4 GB on a
+64-bit host whatever the machine has, and reaching it is an abort (SIGABRT,
+exit 134 through a shell), not a slow run.
+
+`rvl` therefore starts the helper as `node --max-old-space-size=<MB>
+tsindex.js`, with half of physical memory, at most 16384 MB. Set
+`RVL_NODE_MAX_OLD_SPACE_MB` to choose the limit (`0` leaves node's default); a
+`NODE_OPTIONS` that already sets `--max-old-space-size` is respected. When the
+helper does abort, the COVERAGE line names the limit it ran under and the
+variable. Run by hand, the script gets node's default unless you pass the flag
+yourself.
 
 ## callers/callees are empty in v1
 

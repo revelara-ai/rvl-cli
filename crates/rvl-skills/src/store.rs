@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! <root>/<editor>/plugin.tar.gz   # the verified tarball as fetched
-//! <root>/<editor>/meta.json       # version pin + sha256 + signing key
+//! <root>/<editor>/meta.json       # version pin + sha256 + signing key + scope
 //! <root>/installed.json           # harness -> installed version/location
 //! ```
 
@@ -31,6 +31,24 @@ pub struct Meta {
     pub signing_key_hex: Option<String>,
     /// "YYYY-MM-DD" fetch date, for staleness display.
     pub fetched_at: String,
+    /// Fingerprint ([`cache_scope`]) of the server + org key that fetched
+    /// this tarball. The server filters content by the org's intelligence
+    /// tier, so a version pin holds only for the scope that fetched it.
+    /// Absent in slots written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// Fingerprint of the credentials a tarball is fetched with. `None` when
+/// there is no org key (offline installs run without one). A truncated,
+/// domain-separated digest: it tells two keys apart and is not the key.
+pub fn cache_scope(base_url: &str, org_key: &str) -> Option<String> {
+    if org_key.is_empty() {
+        return None;
+    }
+    let server = base_url.trim_end_matches('/');
+    let digest = rvl_cache::sha256_hex(format!("rvl-skills-scope\0{server}\0{org_key}").as_bytes());
+    Some(digest[..16].to_string())
 }
 
 /// One installed harness, tracked for drift reporting.
@@ -104,9 +122,9 @@ impl SkillsStore {
         Ok(Some((tarball, meta)))
     }
 
-    /// The pinned version of the cached tarball, if any.
-    pub fn cached_version(&self, editor: &str) -> Option<String> {
-        self.load(editor).ok().flatten().map(|(_, m)| m.version)
+    /// The pin of the cached tarball, if the slot is present and intact.
+    pub fn cached_meta(&self, editor: &str) -> Option<Meta> {
+        self.load(editor).ok().flatten().map(|(_, m)| m)
     }
 
     /// Read the installed-harness registry (empty when absent/corrupt —
@@ -163,7 +181,56 @@ mod tests {
             sha256,
             signing_key_hex: Some("ab".repeat(32)),
             fetched_at: "2026-08-04".to_string(),
+            scope: cache_scope("https://api.example.test", "org-a-key"),
         }
+    }
+
+    #[test]
+    fn cache_scope_separates_orgs_and_servers_without_holding_the_key() {
+        let a = cache_scope("https://api.example.test", "org-a-key").expect("scope");
+        assert_eq!(
+            cache_scope("https://api.example.test", "org-a-key").as_deref(),
+            Some(a.as_str()),
+            "stable across runs"
+        );
+        // A trailing slash is the same server.
+        assert_eq!(
+            cache_scope("https://api.example.test/", "org-a-key").as_deref(),
+            Some(a.as_str())
+        );
+        assert_ne!(
+            cache_scope("https://api.example.test", "org-b-key").as_deref(),
+            Some(a.as_str())
+        );
+        assert_ne!(
+            cache_scope("https://self-hosted.example.test", "org-a-key").as_deref(),
+            Some(a.as_str())
+        );
+        assert!(!a.contains("org-a-key"), "the key never reaches disk: {a}");
+        // No key, no identity.
+        assert_eq!(cache_scope("https://api.example.test", ""), None);
+    }
+
+    #[test]
+    fn meta_written_before_the_scope_field_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillsStore::open(dir.path()).unwrap();
+        let tarball = b"tarball bytes".to_vec();
+        let slot = dir.path().join("claude");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("plugin.tar.gz"), &tarball).unwrap();
+        std::fs::write(
+            slot.join("meta.json"),
+            format!(
+                r#"{{"version":"0.2.0","sha256":"{}","fetched_at":"2026-08-04"}}"#,
+                rvl_cache::sha256_hex(&tarball)
+            ),
+        )
+        .unwrap();
+
+        let meta = store.cached_meta("claude").expect("legacy slot loads");
+        assert_eq!(meta.version, "0.2.0");
+        assert_eq!(meta.scope, None);
     }
 
     #[test]
@@ -177,7 +244,10 @@ mod tests {
         let (loaded, loaded_meta) = store.load("claude").unwrap().expect("cached");
         assert_eq!(loaded, tarball);
         assert_eq!(loaded_meta, m);
-        assert_eq!(store.cached_version("claude").as_deref(), Some("0.2.0"));
+        assert_eq!(
+            store.cached_meta("claude").map(|m| m.version).as_deref(),
+            Some("0.2.0")
+        );
     }
 
     #[test]
@@ -185,7 +255,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SkillsStore::open(dir.path()).unwrap();
         assert!(store.load("claude").unwrap().is_none());
-        assert_eq!(store.cached_version("claude"), None);
+        assert_eq!(store.cached_meta("claude").map(|m| m.version), None);
     }
 
     #[test]
@@ -200,7 +270,7 @@ mod tests {
 
         let err = store.load("claude").unwrap_err();
         assert!(err.to_string().contains("corrupt"), "got: {err}");
-        assert_eq!(store.cached_version("claude"), None);
+        assert_eq!(store.cached_meta("claude").map(|m| m.version), None);
     }
 
     #[test]

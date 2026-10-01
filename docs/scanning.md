@@ -114,6 +114,32 @@ binary, nothing to uninstall, no migration. The OSS store lives in an
 two never conflict. Remove the key and the scanner falls back to the free
 tier.
 
+### Scanning with the free tier only
+
+To see what the free tier reports on an install that also has the commercial
+tier, add `--oss-only`:
+
+```sh
+rvl scan --oss-only
+rvl report --oss-only
+```
+
+The flag skips the commercial tier at load time, so the scan behaves exactly
+like a no-key install: vocabulary lanes only, no judgments, and every finding
+advisory except lanes that carry their own severity (secret detection). Use
+it to demo the free tier, to compare the two tiers on the same repo, or to
+check the free experience before you publish.
+
+`--oss-only` is a load filter. `rvl sync` still syncs both tiers and nothing
+is uninstalled, so the next scan without the flag uses both tiers again. Each
+run prints a note on stderr that the commercial tier was not loaded. If the
+OSS tier is not installed the scan fails and tells you to run `rvl sync`; it
+does not fall back to the commercial tier. The flag cannot be combined with
+`--specs-file` or `--judgments`, which bypass the tiers.
+
+`rvl explain` and `rvl suppress` resolve an id from the last scan, so they
+work on the findings of an `--oss-only` scan without a flag of their own.
+
 ## Reading the output
 
 A scan report is a ladder with three printed sections and a footer:
@@ -203,6 +229,21 @@ them. To scan test code anyway, run a full scan with `rvl scan
 skip in place and a warm scan could only honor it for the files it
 re-parsed. Hook scans therefore never include test code; there is no
 `--include-tests` on `rvl index reindex` either.
+
+The TypeScript retriever scans a workspace whose dependencies are not
+installed, but it resolves client types from import syntax instead of from
+the packages. That is a weaker scan: medium tier, no client versions, and
+coarser keys for module objects. The roll-call prints the same site count
+for both, so COVERAGE names the difference,
+
+```
+  TypeScript: 2 workspaces without installed dependencies (client types resolved from import syntax: medium tier, no client versions)
+```
+
+and `--out` carries the total as `coverage.dependency_trees_uninstalled`.
+Install the dependencies and scan again to get the full resolution. A warm
+scan prints the line when it re-parses TypeScript in this pass; packets it
+reuses from the index keep the resolution they were retrieved with.
 
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly
@@ -378,6 +419,50 @@ agent-tagged warning. Blocking stays deterministic-only unless the repo
 commits `scanner.agent_verdicts: gate`. Agent verdicts never enter the eval
 rows or the shape-only report.
 
+### Blending the scan with your agent from the command line
+
+`rvl scan --blend` does the same adjudication for a manual scan, in one
+command, with no hook and no repo opt-in:
+
+```sh
+rvl scan --blend
+rvl scan --blend --incremental --changed-only   # only the files you changed
+```
+
+The deterministic scan runs first and settles everything it can. Then the
+undecided call sites in runtime code, and only those, go to your agent
+(found the same way as above). Undecided sites in test, migration, dev-only
+and backfill code are not sent; the report counts them. One run sends at
+most 50 sites, in batches of 10, under a 5-minute total budget. The first
+batch that fails, times out or replies off-contract stops the run.
+
+The agent's verdicts print in a `BLEND` section after the ladder, with the
+same asymmetric rules: `satisfies` clears a site, `violates` is an
+agent-tagged advisory warning, and only `scanner.agent_verdicts: gate` lets
+it block. The deterministic findings and the `--out` eval rows never change.
+
+Typing `--blend` is the consent for that run. These still refuse it:
+`RVL_NO_AGENT=1`, the org kill switch, and an explicit
+`scanner.use_agent: deny` in `.revelara.yaml`.
+
+When the agent half does not answer (refused, not installed, failed,
+timed out, or undecided sites over the cap), the scan fails open: the exit
+code is the deterministic one. But the footer does not say "commit clean".
+It says what happened:
+
+```
+⚠ 0 advisory · NOT A BLENDED RESULT — agent half unavailable: RVL_NO_AGENT=1 (env hard-off) (see BLEND); deterministic half only, rvl fails open
+```
+
+`--blend` is for manual scans. It is refused with `--hook` and with the
+old CLI's `--staged` and `--pre-push`, so a hook never starts calling an
+agent it was not configured for. `--agent` is unchanged: it is a
+compatibility alias for the deterministic scan and never calls a model.
+
+`--blend` covers adjudication only. The expert lenses that `/rvl:scan`
+runs as a scanner in their own right are not part of it yet, and the
+`BLEND` section says so on every run.
+
 ## Privacy
 
 The deterministic scan runs entirely locally and your code never leaves the
@@ -416,6 +501,7 @@ channels precisely.
 | `rvl doctor [--fix]` | Machine/repo readiness |
 | `rvl sync` | Refresh rulesets (both tiers if keyed) |
 | `rvl cache status` | Installed ruleset versions and staleness |
+| `rvl cache keys [--json]` | Every config key the retrievers emit: specced, awaiting a spec, or vocabulary only |
 | `rvl index init\|reindex\|status` | The incremental packet index |
 | `rvl hook install\|doctor` | The git-hook gates |
 | `rvl completion bash\|zsh\|fish` | Shell completion |

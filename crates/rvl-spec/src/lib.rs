@@ -291,6 +291,43 @@ pub struct ApiSpec {
     /// remove, never a hidden defect.
     #[serde(default)]
     pub blocking_intent: BlockingIntent,
+    /// The authorer-assigned I/O family of this API's client (po-3t3oj.40),
+    /// read by [`SpecCache::call_family`]. Same wire contract as
+    /// [`ConfigSpec::family`]: absent, unreadable or unknown is `None`, which
+    /// falls back to the keyword classifier.
+    #[serde(
+        default,
+        deserialize_with = "lenient_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub family: Option<Family>,
+    /// The constructor argument that gives this API's RECEIVER a finite
+    /// capacity, when the call blocks only because that capacity is full
+    /// (po-av01j.231). `queue.Queue.put` "blocks until a free slot is
+    /// available if the queue is full", and a `queue.Queue()` built with no
+    /// `maxsize` is never full: the spec's premise cannot occur at that site,
+    /// and reporting a missing deadline there is a false violation.
+    ///
+    /// Library knowledge, like [`ApiSpec::unbounded_sentinels`], so it is
+    /// declared here and never guessed by propagation. `None` -- every spec
+    /// authored before the field existed -- changes nothing. Skipped on
+    /// serialization when absent so such a spec round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_arg: Option<CapacityArg>,
+}
+
+/// Where a receiver's constructor takes its capacity: see
+/// [`ApiSpec::capacity_arg`]. The contract is the one Python's queue family
+/// documents: a positive integer is a finite capacity, so the call can block;
+/// the argument absent, zero or negative means no limit, so it cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityArg {
+    /// The keyword the argument is passed by (`maxsize`).
+    pub name: String,
+    /// Its zero-based position when passed positionally (`queue.Queue(10)`).
+    /// Absent for a keyword-only argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
 }
 
 impl ApiSpec {
@@ -350,15 +387,48 @@ pub enum Scope {
 /// deliberately CONSERVATIVE: only strong, well-known markers classify; an
 /// unrecognised type returns `None` and never borrows another family's bound —
 /// a finding is left for a human rather than risk a cross-family false pass.
-/// (The more general design is an authorer-assigned family tag on the spec;
-/// this keyword classifier is the sound interim — see po-3t3oj.34.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// An authorer-assigned tag on the spec (`family`, po-3t3oj.40) takes
+/// precedence where one exists; this keyword classifier is the fallback for
+/// every spec without one — see po-3t3oj.34.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Family {
     Database,
     Http,
     Cache,
     Rpc,
+    #[serde(rename = "queue")]
     MessageQueue,
+}
+
+impl Family {
+    /// The authored spelling of a family (`database`, `http`, `cache`, `rpc`,
+    /// `queue`), or `None` for anything else. A closed vocabulary, matched
+    /// exactly: a near-miss must not be guessed into a family, because the
+    /// family is what licenses borrowing another client's bound.
+    pub fn from_tag(tag: &str) -> Option<Family> {
+        match tag {
+            "database" => Some(Family::Database),
+            "http" => Some(Family::Http),
+            "cache" => Some(Family::Cache),
+            "rpc" => Some(Family::Rpc),
+            "queue" => Some(Family::MessageQueue),
+            _ => None,
+        }
+    }
+}
+
+/// Read an authored `family` without ever failing the artifact. A value this
+/// binary does not recognise — a family added by a newer corpus, a null, a
+/// non-string — becomes `None`, which is the keyword fallback: the spec
+/// behaves as if the tag were absent instead of failing `SpecCache::load` for
+/// every spec in the file.
+fn lenient_family<'de, D>(d: D) -> Result<Option<Family>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(Family::from_tag))
 }
 
 /// Classify a client type into an I/O family, or `None` if unrecognised.
@@ -512,9 +582,29 @@ pub struct ConfigSpec {
     /// policy provenance into the finding's reason.
     #[serde(default, skip_serializing)]
     pub declared: bool,
+    /// The authorer-assigned I/O family of this client type (po-3t3oj.40).
+    /// The factory knows what a type IS; the keyword classifier only knows
+    /// what its name looks like, so it misses a bare `Repository` or a
+    /// re-exported `QueryRunner`. When present the tag wins; absent — every
+    /// spec authored before the field existed, and every `.revelara.yaml`
+    /// declaration — falls back to [`client_family`], so those behave exactly
+    /// as they did. Additive in both directions: the envelope schema version
+    /// does not move, and a legacy spec round-trips byte for byte.
+    #[serde(
+        default,
+        deserialize_with = "lenient_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub family: Option<Family>,
 }
 
 impl ConfigSpec {
+    /// The family this type's bound may broaden to: the authored tag, else
+    /// the keyword classifier, else none (never a basis for broadening).
+    pub fn family_or_classified(&self) -> Option<Family> {
+        self.family.or_else(|| client_family(&self.type_name))
+    }
+
     /// A whole-call `this_client` spec keyed on a bare type: it asserts that
     /// constructing the type bounds every call through it, without saying
     /// which field carries the bound or that the library bounds it by
@@ -602,6 +692,30 @@ pub enum ConfigExpect {
     AtLeast { value: f64 },
     /// The resolved value, parsed as a number, must be <= `value`.
     AtMost { value: f64 },
+    /// The resolved value must NOT equal `value` (po-pk3fp.13).
+    ///
+    /// The complement `equals` and `one_of` cannot state: "not the default
+    /// Argo CD project" has no enumerable satisfying set, and a Flux
+    /// `remediation.retries` of `-1` (remediate forever) is the strongest
+    /// setting, which `at_least 1` flagged. `not_equals "0"` says both.
+    NotEquals { value: String },
+    /// The resolved value, parsed as a duration, must be >= `value`.
+    ///
+    /// Both sides are duration strings in the Go / Prometheus grammar
+    /// (`30s`, `10m`, `1h30m`, `2d`), which is what Flux intervals and alert
+    /// `for:` clauses are authored in. `at_least` cannot judge them: `10m` is
+    /// not a number, and a bare number carries no unit. A value or a bound
+    /// that is not a duration ABSTAINS, the same rule as `at_least`.
+    DurationAtLeast { value: String },
+    /// The resolved value, parsed as a duration, must be <= `value`.
+    DurationAtMost { value: String },
+    /// A `kind` this binary does not know. The one key abstains instead of
+    /// the whole artifact failing to parse, so an expectation added by a
+    /// newer scanner degrades the way an unknown pattern name does. Binaries
+    /// that predate this variant still reject unknown kinds outright: an
+    /// artifact must not carry a kind older than its scanner floor.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A spec about one config key in one config format — the G6 analog of
@@ -846,6 +960,20 @@ impl SpecCache {
     pub fn config(&self, type_name: &str) -> Option<&ConfigSpec> {
         self.configs.get(type_name)
     }
+    /// The I/O family of a call, which names the one repo-level client bound
+    /// that may broaden to it. The authored tag on the call's own API spec
+    /// wins; then the tag on its client type's config spec, at or above the
+    /// confidence floor; then the keyword classifier on the type name. `None`
+    /// — no tag and no recognised keyword — is never broadened.
+    pub fn call_family(&self, api: &ApiSpec, client_type: &str) -> Option<Family> {
+        api.family
+            .or_else(|| {
+                self.config(client_type)
+                    .filter(|c| c.confidence >= MIN_CONFIDENCE)
+                    .and_then(|c| c.family)
+            })
+            .or_else(|| client_family(client_type))
+    }
     /// The G6 config-lane lookup: the spec for one (format, key) identity.
     pub fn config_key(&self, format: &str, key: &str) -> Option<&ConfigKeySpec> {
         self.config_keys.get(&(format.to_string(), key.to_string()))
@@ -1016,7 +1144,7 @@ impl SpecCache {
             {
                 continue;
             }
-            let Some(fam) = client_family(&c.type_name) else {
+            let Some(fam) = spec.family_or_classified() else {
                 continue;
             };
             let seen = by_family.entry(fam).or_default();
@@ -1107,6 +1235,8 @@ mod tests {
             unbounded_sentinels: vec![],
             default_bound: DefaultBound::Unknown,
             blocking_intent: BlockingIntent::Incidental,
+            family: None,
+            capacity_arg: None,
         }
     }
 
@@ -1158,6 +1288,7 @@ mod tests {
                     default_bound: DefaultBound::Unknown,
                     unbounded_sentinels: vec![],
                     declared: false,
+                    family: None,
                 })
                 .collect(),
             decorators: vec![],
@@ -1177,6 +1308,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
@@ -1262,6 +1395,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared,
+            family: None,
         }
     }
 
@@ -1290,6 +1424,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
@@ -1320,6 +1456,138 @@ mod tests {
         let mut no_default = cfg(Bounds::WholeCall, Scope::ThisClient, &[], false);
         no_default.default_bound = DefaultBound::None;
         assert!(no_default.names_no_bounding_field());
+    }
+
+    #[test]
+    fn an_authored_family_parses_and_a_legacy_spec_round_trips_without_it() {
+        let legacy: ConfigSpec = serde_json::from_str(
+            r#"{"type":"typeorm.Repository","bounds":"whole_call","scope":"this_client","confidence":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.family, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("family"));
+        for (tag, fam) in [
+            ("database", Family::Database),
+            ("http", Family::Http),
+            ("cache", Family::Cache),
+            ("rpc", Family::Rpc),
+            ("queue", Family::MessageQueue),
+        ] {
+            let c: ConfigSpec = serde_json::from_str(&format!(
+                r#"{{"type":"x.Repository","bounds":"whole_call","scope":"this_client","confidence":1,"family":"{tag}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.family, Some(fam), "{tag}");
+            // What is written back is what the authorer wrote.
+            assert!(serde_json::to_string(&c)
+                .unwrap()
+                .contains(&format!(r#""family":"{tag}""#)));
+            let a: ApiSpec = serde_json::from_str(&format!(
+                r#"{{"type":"x.Repository","method":"find","blocking":"yes","family":"{tag}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(a.family, Some(fam), "{tag}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_family_degrades_to_the_keyword_fallback_and_never_fails_the_load() {
+        // A newer corpus, a null, a wrong type, a near-miss spelling: each is
+        // "no tag", and the rest of the artifact still loads.
+        for bad in [
+            r#""storage""#,
+            "null",
+            "7",
+            r#"["database"]"#,
+            r#""Database""#,
+        ] {
+            let text = format!(
+                r#"{{"apis":[{{"type":"x.Repository","method":"find","blocking":"yes","family":{bad}}}],
+                    "configs":[{{"type":"x.Repository","bounds":"whole_call","scope":"this_client","confidence":1,"family":{bad}}}]}}"#
+            );
+            let c = SpecCache::load(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(c.config("x.Repository").unwrap().family, None, "{bad}");
+            let key = ("x.Repository".to_string(), "find".to_string());
+            assert_eq!(c.api(&key).unwrap().family, None, "{bad}");
+        }
+    }
+
+    /// A whole-call `this_client` config spec naming `Timeout`, for a type
+    /// the keyword classifier does not recognise unless told.
+    fn tagged(type_name: &str, family: Option<Family>, confidence: f64) -> ConfigSpec {
+        ConfigSpec {
+            type_name: type_name.into(),
+            confidence,
+            family,
+            ..cfg(Bounds::WholeCall, Scope::ThisClient, &["Timeout"], false)
+        }
+    }
+
+    #[test]
+    fn an_authored_family_recovers_broadening_for_a_type_the_keywords_miss() {
+        // A bare `Repository` carries no keyword, so untagged it is no basis
+        // for broadening; tagged `database` it bounds the Database family.
+        let repo = repo_with(&[("orm.Repository", &["Timeout"])]);
+        assert_eq!(client_family("orm.Repository"), None);
+        assert!(cache_of(vec![tagged("orm.Repository", None, 1.0)])
+            .client_bound_by_family(&repo)
+            .is_empty());
+        assert_eq!(
+            cache_of(vec![tagged("orm.Repository", Some(Family::Database), 1.0)])
+                .client_bound_by_family(&repo)
+                .get(&Family::Database),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+    }
+
+    #[test]
+    fn an_authored_family_overrides_the_keyword_classifier() {
+        // `httpcache.Store` reads as Http by keyword; the authorer says cache.
+        // The bound lands in Cache and NOT in Http, so the tag cannot widen a
+        // bound into two families at once.
+        let got = cache_of(vec![tagged("httpcache.Store", Some(Family::Cache), 1.0)])
+            .client_bound_by_family(&repo_with(&[("httpcache.Store", &["Timeout"])]));
+        assert_eq!(
+            got.get(&Family::Cache),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+        assert_eq!(got.get(&Family::Http), None);
+    }
+
+    #[test]
+    fn call_family_prefers_the_api_tag_then_the_config_tag_then_keywords() {
+        let api_of = |family| ApiSpec {
+            type_name: "orm.Repository".into(),
+            family,
+            ..api(Blocking::Yes, 0.9)
+        };
+        let none = cache_of(vec![]);
+        // Nothing authored, no keyword: no family, so never broadened.
+        assert_eq!(none.call_family(&api_of(None), "orm.Repository"), None);
+        // Nothing authored: the keyword classifier, exactly as before.
+        assert_eq!(
+            none.call_family(&api_of(None), "typeorm.QueryRunner"),
+            Some(Family::Database)
+        );
+        // The API's own tag wins over the keywords.
+        assert_eq!(
+            none.call_family(&api_of(Some(Family::Cache)), "typeorm.QueryRunner"),
+            Some(Family::Cache)
+        );
+        // No API tag: the client type's config spec says what the type is.
+        let with_cfg = cache_of(vec![tagged("orm.Repository", Some(Family::Database), 0.9)]);
+        assert_eq!(
+            with_cfg.call_family(&api_of(None), "orm.Repository"),
+            Some(Family::Database)
+        );
+        assert_eq!(
+            with_cfg.call_family(&api_of(Some(Family::Rpc)), "orm.Repository"),
+            Some(Family::Rpc)
+        );
+        // A config spec below the confidence floor is ignored entirely, tag
+        // included: a shaky spec must not license borrowing a bound.
+        let shaky = cache_of(vec![tagged("orm.Repository", Some(Family::Database), 0.3)]);
+        assert_eq!(shaky.call_family(&api_of(None), "orm.Repository"), None);
     }
 
     #[test]
@@ -1812,11 +2080,55 @@ mod tests {
         assert_eq!(by_design_label(&why), None);
     }
 
+    // --- capacity precondition (po-av01j.231) ---
+
+    #[test]
+    fn a_cache_without_capacity_arg_declares_none() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[{"type":"queue.Queue","method":"put","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":1.0}],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.apis[0].capacity_arg, None);
+        // Absent stays absent on the wire: a legacy spec round-trips.
+        assert!(!serde_json::to_string(&f.apis[0])
+            .unwrap()
+            .contains("capacity_arg"));
+    }
+
+    #[test]
+    fn capacity_arg_parses_with_and_without_a_position() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[
+                 {"type":"queue.Queue","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"maxsize","position":0}},
+                 {"type":"k.Only","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"capacity"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.apis[0].capacity_arg,
+            Some(CapacityArg {
+                name: "maxsize".into(),
+                position: Some(0)
+            })
+        );
+        assert_eq!(
+            f.apis[1].capacity_arg,
+            Some(CapacityArg {
+                name: "capacity".into(),
+                position: None
+            })
+        );
+    }
+
     #[test]
     fn merge_carries_the_winning_specs_blocking_intent() {
         let mk = |confidence: f64, bi: BlockingIntent| SpecFile {
             apis: vec![ApiSpec {
                 blocking_intent: bi,
+                family: None,
                 ..api(Blocking::Yes, confidence)
             }],
             ..Default::default()
@@ -2076,12 +2388,65 @@ mod tests {
             ConfigExpect::Pattern {
                 name: "sha40".into(),
             },
+            ConfigExpect::AtLeast { value: 2.0 },
+            ConfigExpect::AtMost { value: 60.0 },
+            ConfigExpect::NotEquals {
+                value: "default".into(),
+            },
+            ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ConfigExpect::DurationAtMost {
+                value: "10m".into(),
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
             let back: ConfigExpect = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back, "{json}");
         }
+    }
+
+    #[test]
+    fn config_expect_names_the_new_kinds_in_snake_case() {
+        // The wire names the factory authors against.
+        for (json, want) in [
+            (
+                r#"{"kind":"not_equals","value":"0"}"#,
+                ConfigExpect::NotEquals { value: "0".into() },
+            ),
+            (
+                r#"{"kind":"duration_at_most","value":"10m"}"#,
+                ConfigExpect::DurationAtMost {
+                    value: "10m".into(),
+                },
+            ),
+            (
+                r#"{"kind":"duration_at_least","value":"1m"}"#,
+                ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<ConfigExpect>(json).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn an_unknown_expect_kind_does_not_fail_the_whole_cache() {
+        // One spec from a newer factory must cost one key, not every spec in
+        // the artifact.
+        let cache = SpecCache::load(
+            r#"{"config_keys": [
+                {"format": "flux", "key": "a", "expect": {"kind": "from_the_future", "n": 1}},
+                {"format": "flux", "key": "b", "expect": {"kind": "present"}}
+            ]}"#,
+        )
+        .expect("an unknown kind degrades, it does not abort the load");
+        assert_eq!(
+            cache.config_key("flux", "a").unwrap().expect,
+            ConfigExpect::Unknown
+        );
+        assert_eq!(
+            cache.config_key("flux", "b").unwrap().expect,
+            ConfigExpect::Present
+        );
     }
 
     #[test]

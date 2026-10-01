@@ -477,11 +477,25 @@ class FileIndex:
             return "", False
         return "", False
 
-    def constructions_for(self, recv, recv_str, client_type):
-        """Construction snippets bearing on this receiver, capped."""
+    def constructions_for(self, recv, recv_str, client_type, func_node=None):
+        """Construction snippets bearing on this receiver, capped.
+
+        A bare-name receiver constructed inside the enclosing function is a
+        LOCAL of it, so only that function's constructions reach the call: a
+        same-named variable in another function is a different object, and
+        attaching its construction made an unbounded `queue.Queue()` and a
+        bounded one indistinguishable at their `put` sites (po-av01j.231). A
+        name the function does not construct is the module's and keeps every
+        construction of it.
+        """
         out = []
         if isinstance(recv, ast.Name) and recv.id in self.ctor_by_var:
             out = self.ctor_by_var[recv.id]
+            if func_node is not None:
+                first = func_node.lineno
+                last = getattr(func_node, "end_lineno", None) or first
+                local = [c for c in out if first <= c["line"] <= last]
+                out = local or out
         elif recv_str in self.ctor_by_selfattr:
             out = self.ctor_by_selfattr[recv_str]
         elif (isinstance(recv, ast.Attribute)
@@ -806,7 +820,8 @@ def retrieve_file(abs_path, file_path, snapshot):
         line = node.lineno
         snippet = _segment(source, node)
         body = _segment(source, func_node) if func_node is not None else ""
-        constructions = idx.constructions_for(recv, recv_str, client_type)
+        constructions = idx.constructions_for(
+            recv, recv_str, client_type, func_node)
 
         record = {
             "packet_schema": PACKET_SCHEMA,

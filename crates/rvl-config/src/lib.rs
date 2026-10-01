@@ -24,7 +24,8 @@
 //!     machine, so a sighting is structurally incapable of carrying it.
 //!
 //! New formats (Kubernetes, Prometheus/sloth, dependency manifests,
-//! Terraform, Argo/Flux — po-av01j.20-.24) plug in by implementing
+//! Terraform, Argo/Flux — po-av01j.20-.24; operator CRs — po-pk3fp.13) plug
+//! in by implementing
 //! [`ConfigRetriever`] and joining [`registry`].
 
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,9 @@ pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
+pub mod key_ledger;
 pub mod kubernetes;
+pub mod operators;
 pub mod prometheus;
 pub mod terraform;
 
@@ -215,9 +218,10 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(prometheus::PrometheusRules),
         Box::new(argo_flux::ArgoFlux),
         Box::new(terraform::Terraform),
+        Box::new(operators::OperatorCrs),
         // Kubernetes stays LAST: its content claim (bare apiVersion+kind
         // YAML) is the broadest, so narrower families (sloth CRDs, Argo/Flux
-        // CRs, rule files) must get first refusal.
+        // and operator CRs, rule files) must get first refusal.
         Box::new(kubernetes::Kubernetes),
     ]
 }
@@ -949,8 +953,8 @@ mod tests {
         // An argoproj.io CR the family does not parse: a product sighting,
         // never absorbed into the kubernetes bucket.
         std::fs::write(
-            root.join("deploy/rollout.yaml"),
-            "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+            root.join("deploy/experiment.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
         )
         .unwrap();
         // A generic Kubernetes manifest: claimed by the kubernetes family
@@ -975,9 +979,9 @@ mod tests {
             "a generic manifest is claimed by the kubernetes family: {:?}",
             got.packets
         );
-        // The argo-rollouts CR is declined by BOTH families (argo_flux does
-        // not parse Rollout; kubernetes refuses foreign apiVersion groups)
-        // and sights by product.
+        // The argo-rollouts Experiment is declined by BOTH families (argo_flux
+        // does not parse that kind; kubernetes refuses foreign apiVersion
+        // groups) and sights by product.
         assert_eq!(
             got.sightings,
             vec![FormatSighting {
@@ -986,6 +990,52 @@ mod tests {
                 retriever_exists: false,
             }]
         );
+    }
+
+    #[test]
+    fn retrieve_repo_routes_rollouts_and_operator_crs_by_content() {
+        // po-pk3fp.13: these were identity-only sightings, so no spec could
+        // be authored against them.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deploy")).unwrap();
+        for (file, body) in [
+            (
+                "rollout.yaml",
+                "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\nspec:\n  strategy:\n    canary: {}\n",
+            ),
+            (
+                "pg.yaml",
+                "apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n  name: pg\nspec:\n  instances: 3\n",
+            ),
+            (
+                "kyverno.yaml",
+                "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: registries\nspec:\n  rules:\n  - name: allowed\n    validate:\n      message: no\n",
+            ),
+            (
+                "gatekeeper.yaml",
+                "apiVersion: constraints.gatekeeper.sh/v1beta1 # Copyright\nkind: K8sAllowedRepos\nmetadata:\n  name: repos\nspec:\n  enforcementAction: dryrun\n",
+            ),
+        ] {
+            std::fs::write(root.join("deploy").join(file), body).unwrap();
+        }
+        let got = retrieve_repo(root, "snap");
+        for (format, key) in [
+            ("argo-rollouts", "rollout.strategy"),
+            ("cnpg", "cluster.backup.method"),
+            ("kyverno", "rule.validate.failureAction"),
+            ("gatekeeper", "constraint.enforcementAction"),
+        ] {
+            assert!(
+                got.packets
+                    .iter()
+                    .any(|p| p.format == format && p.key == key),
+                "{format} {key} missing: {:?}",
+                got.packets
+            );
+        }
+        assert!(got.sightings.is_empty(), "{:?}", got.sightings);
+        assert_eq!(got.unparseable_files, 0);
     }
 
     #[test]

@@ -11,13 +11,20 @@
 //! available the tests log SKIP and return, so a CI env without the rustup
 //! component degrades to unit coverage rather than failing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join("fixture")
+    manifest_dir().join("testdata").join("fixture")
 }
 
 /// Discover + index the fixture once per test binary; None = skip.

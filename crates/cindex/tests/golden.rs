@@ -6,6 +6,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// Locate the `cindex` executable.
 ///
 /// It is NOT a bin of this package — it is a bin of `rvl`
@@ -40,9 +49,7 @@ fn bin() -> Command {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join(name)
+    manifest_dir().join("testdata").join(name)
 }
 
 /// True when the runtime engine loads; otherwise logs a SKIP line.
@@ -351,4 +358,119 @@ fn unparseable_tus_are_counted_never_guessed() {
     let st = stats(&records);
     assert_eq!(st["tus_total"], 1);
     assert_eq!(st["tus_failed"], 1);
+}
+
+/// The built `cindex` installed in `<tmp>/bin`, with a vendored bundle beside
+/// it whose "library" is not a library. Needs no libclang on the machine.
+///
+/// The executable is a hard link, not a copy: a copy is open for writing while
+/// it is made, and a child forked by another test thread in that window holds
+/// the write descriptor until its own exec, so running the copy fails with
+/// "Text file busy" (po-jz4qz). A symlink would not do, because `cindex`
+/// finds its bundle beside its resolved path. The temp directory is under the
+/// profile directory so that the link never crosses a filesystem.
+fn install_with_broken_bundle() -> (tempfile::TempDir, PathBuf) {
+    let built = bin_path();
+    let tmp = tempfile::tempdir_in(built.parent().expect("target/<profile> directory")).unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let bundle = bin_dir.join("libclang");
+    std::fs::create_dir_all(bundle.join("include")).unwrap();
+    let lib = if cfg!(target_os = "macos") {
+        "libclang.dylib"
+    } else {
+        "libclang.so"
+    };
+    std::fs::write(bundle.join(lib), b"not a shared object").unwrap();
+    let exe = bin_dir.join(built.file_name().expect("cindex file name"));
+    std::fs::hard_link(&built, &exe).unwrap();
+    (tmp, exe)
+}
+
+/// The vendored bundle beside the executable is what loads (po-av01j.49),
+/// ahead of any system libclang: with a bundle whose library is garbage the
+/// probe must FAIL and name the bundle, even on a machine where the system
+/// search would have succeeded. Falling through to the system clang would
+/// make release scans depend on the machine again.
+#[test]
+fn engine_check_loads_the_vendored_bundle_before_the_system_libclang() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env_remove("LIBCLANG_PATH")
+        .output()
+        .expect("run the installed cindex");
+    assert!(
+        !out.status.success(),
+        "a broken vendored bundle must not be bypassed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    let bundle = exe
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("libclang");
+    assert!(
+        err.contains(&bundle.display().to_string()),
+        "the error must name the bundle it tried: {err}"
+    );
+}
+
+/// LIBCLANG_PATH stays the operator's override, bundle or not.
+#[test]
+fn libclang_path_overrides_the_vendored_bundle() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env("LIBCLANG_PATH", "/nonexistent/po-av01j.49")
+        .output()
+        .expect("run the installed cindex");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("vendored"),
+        "LIBCLANG_PATH was set, so the bundle must not be consulted: {err}"
+    );
+}
+
+/// The installed executable must run at once while other threads fork
+/// (po-jz4qz). A forked child holds every descriptor of its parent until its
+/// own exec; if the install opens the executable for writing, the kernel
+/// refuses to run it during that window ("Text file busy").
+#[test]
+fn bundle_install_is_executable_at_once_while_other_threads_fork() {
+    const INSTALLERS: usize = 4;
+    const ROUNDS_PER_INSTALLER: usize = 50;
+    const FORKERS: usize = 8;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..FORKERS {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    bin().arg("--packet-schema").output().expect("run cindex");
+                }
+            });
+        }
+        let installers: Vec<_> = (0..INSTALLERS)
+            .map(|_| {
+                s.spawn(|| {
+                    for round in 0..ROUNDS_PER_INSTALLER {
+                        let (_tmp, exe) = install_with_broken_bundle();
+                        if let Err(e) = Command::new(&exe).arg("--packet-schema").output() {
+                            return Err(format!("round {round}: {e}"));
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        let results: Vec<_> = installers.into_iter().map(|h| h.join()).collect();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in results {
+            r.expect("installer thread")
+                .unwrap_or_else(|e| panic!("the installed cindex did not run: {e}"));
+        }
+    });
 }
