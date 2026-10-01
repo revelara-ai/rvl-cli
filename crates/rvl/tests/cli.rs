@@ -2115,6 +2115,95 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
 }
 
+/// The SEED corpus declaring a CAPACITY PRECONDITION (po-av01j.231): the
+/// constructor argument without which a queue's `put` cannot block.
+fn queue_capacity_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("queue_capacity_specs.json")
+}
+
+/// Python, live end to end: `put` on a `queue.Queue()` built with no maxsize
+/// cannot block, so it is not_applicable, while the same call on a
+/// `queue.Queue(maxsize=10)` with no timeout still violates. A queue that
+/// arrives as a parameter has no construction to read and abstains. The
+/// pilot's site (a queue built in `__init__`, put from another method) is the
+/// fourth row.
+#[test]
+fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import queue\nfrom queue import LifoQueue\n\n\n\
+         def unbounded(x):\n    q = queue.Queue()\n    q.put(x)\n\n\n\
+         def bounded(x):\n    q = queue.Queue(maxsize=10)\n    q.put(x)\n\n\n\
+         def sized_by_caller(n, x):\n    stack = LifoQueue(n)\n    stack.put(x)\n\n\n\
+         class Client:\n    \
+             def __init__(self):\n        self._notifications = queue.Queue()\n\n    \
+             def on_notification(self, notification):\n        \
+                 self._notifications.put(notification)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(queue_capacity_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let by_line = |line: u32| {
+        let rows = verdicts_for(doc["sites"].as_array().unwrap(), &format!("svc.py:{line}"));
+        assert_eq!(rows.len(), 1, "one finding at svc.py:{line}: {rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+
+    let (verdict, reason) = by_line(7);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert_eq!(
+        reason,
+        "cannot block: unbounded queue (queue.Queue constructed with no maxsize at svc.py:6)"
+    );
+
+    let (verdict, reason) = by_line(12);
+    assert_eq!(verdict, "violates", "{reason}");
+    assert_eq!(reason, "no bound anywhere and the search was complete");
+
+    let (verdict, reason) = by_line(17);
+    assert_eq!(verdict, "abstain", "{reason}");
+    assert!(reason.contains("could not be read"), "{reason}");
+
+    let (verdict, reason) = by_line(25);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert!(reason.contains("svc.py:22"), "{reason}");
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
@@ -2855,7 +2944,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
-/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// GitRepository tracking a branch, and an Argo Experiment the family does not
 /// parse. Seed config-key specs cover the pin-shape and remediation keys.
 fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // The config lane is the subject; the code lane gets one unspecced Go
@@ -2882,7 +2971,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     .unwrap();
     std::fs::write(
         dir.join("deploy/rollout.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
     )
     .unwrap();
     let specs = dir.join("specs.json");
@@ -2940,7 +3029,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         stdout.contains("RC-050"),
         "the deciding spec's control rides into the ladder: {stdout}"
     );
-    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // The unparsed Argo Experiment is a product-identity sighting, never a
     // generic kubernetes one.
     assert!(
         stdout.contains("argo-rollouts (1)"),
@@ -3174,44 +3263,238 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
 /// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
 /// its NuGet restore (Roslyn) is unavailable — matching the tsindex
 /// "run npm install first" skip convention.
+///
+/// The build is bounded (po-l1a0p): an unbounded one sat for 10h48m on 12 s
+/// of CPU and stopped the dev loop. RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS
+/// overrides the default of 600 s; a cold NuGet restore plus Release build
+/// takes about a minute.
 fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if std::process::Command::new("dotnet")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        // CI provisions the SDK, so there a missing one is a broken runner,
-        // not a skip: the C# lane is the one whose green skip hid a helper
-        // that could not compile (po-av01j.47).
-        if std::env::var_os("CI").is_some() {
-            panic!("no dotnet SDK under CI: the C# live tests cannot run");
+    let secs = std::env::var("RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    build_csindex_with(
+        std::ffi::OsStr::new("dotnet"),
+        dir,
+        std::time::Duration::from_secs(secs),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `build_csindex` with the dotnet program and the bound as parameters, so a
+/// fake dotnet can prove the bound. Ok(None) is a skip, Err is a failure.
+///
+/// What each measure is for:
+/// * The project is copied into `dir` and built there. Test binaries from
+///   several worktrees run at once and otherwise all restore and compile
+///   into the same helpers/csindex/obj.
+/// * --disable-build-servers, -nodeReuse:false and UseSharedCompilation=false
+///   stop the build from handing work to, or waiting on, a Roslyn compiler
+///   server or MSBuild node that outlives it and is shared with other runs.
+/// * Output goes to files, not pipes, and the build runs in its own process
+///   group that is killed whole on timeout, so no descendant can keep the
+///   test waiting.
+fn build_csindex_with(
+    dotnet: &std::ffi::OsStr,
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match run_bounded(
+        std::process::Command::new(dotnet).arg("--version"),
+        dir,
+        "dotnet-version",
+        std::time::Duration::from_secs(60),
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // CI provisions the SDK, so there a missing one is a broken
+            // runner, not a skip: the C# lane is the one whose green skip hid
+            // a helper that could not compile (po-av01j.47).
+            if std::env::var_os("CI").is_some() {
+                return Err("no dotnet SDK under CI: the C# live tests cannot run".to_string());
+            }
+            eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
+            return Ok(None);
         }
-        eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
-        return None;
+        Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
+        Ok(None) => return Err("`dotnet --version` timed out after 60s".to_string()),
+        Ok(Some(_)) => {}
     }
-    let csdir = helpers_dir().join("csindex");
+
+    let src = dir.join("csindex-src");
+    std::fs::create_dir_all(&src).map_err(|e| format!("create {src:?}: {e}"))?;
+    for entry in std::fs::read_dir(helpers_dir().join("csindex")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::copy(&path, src.join(path.file_name().unwrap()))
+                .map_err(|e| format!("copy {path:?}: {e}"))?;
+        }
+    }
     let out_dir = dir.join("csindex-build");
-    let out = std::process::Command::new("dotnet")
-        .args(["build", "-c", "Release", "-o"])
-        .arg(&out_dir)
-        .current_dir(&csdir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let args: [&std::ffi::OsStr; 8] = [
+        "build".as_ref(),
+        "-c".as_ref(),
+        "Release".as_ref(),
+        "--disable-build-servers".as_ref(),
+        "-nodeReuse:false".as_ref(),
+        "-p:UseSharedCompilation=false".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_os_str(),
+    ];
+    let shown = format!(
+        "{} {} (in {})",
+        dotnet.to_string_lossy(),
+        args.map(|a| a.to_string_lossy().into_owned()).join(" "),
+        src.display()
+    );
+    let mut cmd = std::process::Command::new(dotnet);
+    cmd.args(args)
+        .current_dir(&src)
+        .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_NOLOGO", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
+    let (status, output) = match run_bounded(&mut cmd, dir, "dotnet-build", timeout) {
+        Ok(Some(done)) => done,
+        Ok(None) => {
+            return Err(format!(
+                "csindex build timed out after {timeout:?} and was killed: {shown}"
+            ))
+        }
+        Err(e) => return Err(format!("csindex build did not start: {shown}: {e}")),
+    };
+    if !status.success() {
+        // NU1301: NuGet could not reach its feed, so Roslyn was never
+        // restored. That is the environment (no network, cold cache), not our
+        // helper, so it is a skip like a missing SDK.
+        if output.contains("NU1301") {
+            // Under CI the feed is part of the runner, so this is fatal there
+            // for the same reason a missing SDK is.
+            if std::env::var_os("CI").is_some() {
+                return Err(format!(
+                    "NuGet restore could not reach its feed (NU1301) under CI: {shown}\n{output}"
+                ));
+            }
+            eprintln!(
+                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache"
+            );
+            return Ok(None);
+        }
         // The SDK being absent is a skip (handled above); the SDK being
         // present while OUR helper fails to compile is a defect. This exact
         // branch hid four CS0103 errors through an entire epic (po-av01j.47),
         // because a green skip reads identically to a green pass.
-        panic!(
-            "csindex failed to build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return Err(format!("csindex failed to build: {shown}\n{output}"));
     }
     let dll = out_dir.join("csindex.dll");
     if dll.is_file() {
-        Some(dll)
+        Ok(Some(dll))
     } else {
-        panic!("csindex built but produced no csindex.dll at {out_dir:?}")
+        Err(format!(
+            "csindex built but produced no csindex.dll at {out_dir:?}"
+        ))
+    }
+}
+
+/// Run `cmd` to completion or until `timeout`, with stdout and stderr in
+/// files under `dir` named after `tag`. Ok(Some) carries the exit status and
+/// the combined output; Ok(None) is a timeout, after which the command's
+/// whole process group has been killed.
+fn run_bounded(
+    cmd: &mut std::process::Command,
+    dir: &std::path::Path,
+    tag: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    let out_path = dir.join(format!("{tag}.stdout"));
+    let err_path = dir.join(format!("{tag}.stderr"));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&out_path)?)
+        .stderr(std::fs::File::create(&err_path)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        // Kill the whole group before reaping the leader, so its pid (the
+        // group id) cannot have been reused by an unrelated process.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    Ok(Some((
+        status,
+        format!("{}{}", read(&out_path), read(&err_path)),
+    )))
+}
+
+/// A dotnet build that never ends must fail the test within the bound, name
+/// the build command, and leave nothing running (po-l1a0p). The fake dotnet
+/// answers `--version` and then sleeps in a CHILD on `build`, the way a
+/// compiler server or MSBuild node outlives the process the test started:
+/// killing only the direct child would leave that sleeper holding the pipes.
+#[cfg(unix)]
+#[test]
+fn csindex_build_that_never_ends_fails_within_the_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleeper.pid");
+    let fake = dir.path().join("dotnet");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 8.0.0; exit 0; fi\n\
+             sleep 600 &\n\
+             echo $! > '{}'\n\
+             wait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bound = std::time::Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let err = build_csindex_with(fake.as_os_str(), dir.path(), bound)
+        .expect_err("a build that never ends must fail, not pass or skip");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < bound + std::time::Duration::from_secs(10),
+        "the build must fail at the bound ({bound:?}), took {elapsed:?}"
+    );
+    assert!(
+        err.contains("timed out") && err.contains(&format!("{} build -c Release", fake.display())),
+        "the failure must say it timed out and name the build command: {err}"
+    );
+    let sleeper = std::fs::read_to_string(&pid_file).unwrap();
+    let proc_dir = std::path::Path::new("/proc").join(sleeper.trim());
+    if std::path::Path::new("/proc/self").exists() {
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_dir.exists() && std::time::Instant::now() < gone_by {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !proc_dir.exists(),
+            "the build's own children must be killed on timeout, {} still runs",
+            sleeper.trim()
+        );
     }
 }
 
@@ -3802,6 +4085,70 @@ fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
         doc["coverage"]["test_files_skipped"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
+/// A stream from a tsindex run over an uninstalled tree says so on its
+/// repo-scoped record, and the scan must repeat it (po-pk3fp.15): on the
+/// COVERAGE block and on `--out`. Without the line, a scan resolved from
+/// import syntax reads exactly like one resolved from the installed tree.
+#[test]
+fn a_scan_names_the_dependency_trees_that_were_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let run = |stream: &str, out_name: &str| {
+        let p = dir.path().join(format!("{out_name}.jsonl"));
+        std::fs::write(&p, stream).unwrap();
+        let out_path = dir.path().join(format!("{out_name}.json"));
+        let out = bin()
+            .args(["scan", "--retrieved"])
+            .arg(&p)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan errored: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        (stdout, doc)
+    };
+    let base = std::fs::read_to_string(&packets).unwrap();
+
+    let (stdout, doc) = run(&base, "installed");
+    assert!(
+        !stdout.contains("installed dependencies"),
+        "a stream that reports nothing uninstalled prints nothing: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 0,
+        "{}",
+        doc["coverage"]
+    );
+
+    let degraded = format!(
+        "{base}{}\n",
+        r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"fixture","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#
+    );
+    let (stdout, doc) = run(&degraded, "uninstalled");
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "the stream's dependency state must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 2,
         "{}",
         doc["coverage"]
     );
@@ -6402,4 +6749,81 @@ fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
         text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
         "a heap OOM must name the limit and the override: {text}"
     );
+}
+
+// --- `--oss-only`: load the OSS tier alone (po-7wgx3) ---
+//
+// The layering itself is proven on signed stores in rvl-cache's tests; a CLI
+// test cannot install a tier (the pinned keyset has no private half here), so
+// these cover the flag's surface: it parses on `scan` and `report`, it names
+// the tier it needs, and it refuses the dev overrides that bypass the tiers.
+
+#[test]
+fn oss_only_scan_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unloadable tier fails closed"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier") && stderr.contains("rvl sync"),
+        "error must name the flag, the tier and the fix: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_report_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["report", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier"),
+        "error must name the flag and the tier: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_refuses_the_dev_overrides_that_bypass_the_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    for (cmd, flag) in [
+        ("scan", "--specs-file"),
+        ("scan", "--judgments"),
+        ("report", "--specs-file"),
+    ] {
+        let out = bin()
+            .args([cmd, "--oss-only", "--retrieved"])
+            .arg(&packets)
+            .arg(flag)
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{cmd} --oss-only {flag} must be a usage error"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("--oss-only") && stderr.contains(flag),
+            "usage error must name both flags: {stderr}"
+        );
+    }
 }

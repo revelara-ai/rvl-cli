@@ -370,8 +370,8 @@ mod tests {
         let out = run(dir.path(), &specs("high"), "snap");
         let cov = &out.coverage;
         assert_eq!(
-            cov.vocabulary_only, 2,
-            "module.source and module.version-pin: {cov:?}"
+            cov.vocabulary_only, 3,
+            "module.source, module.version-pin and terraform.module-kind: {cov:?}"
         );
         assert!(
             !cov.no_spec_keys.contains("terraform module.source")
@@ -396,7 +396,7 @@ mod tests {
         let line = |needle: &str| text.lines().position(|l| l.contains(needle));
         assert!(
             text.contains(&format!(
-                "config keys: {} emitted \u{00b7} 2 specced \u{00b7} {} awaiting a spec \u{00b7} 2 vocabulary only",
+                "config keys: {} emitted \u{00b7} 2 specced \u{00b7} {} awaiting a spec \u{00b7} 3 vocabulary only",
                 q.emitted, q.mint_queue
             )),
             "{text}"

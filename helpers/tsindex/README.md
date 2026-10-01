@@ -9,6 +9,12 @@ decides nothing about reliability, it only says what the code is.
     node tsindex.js --retrieve --root <repo> --include-tests       # also read test paths
     node tsindex.js --packet-schema                                # negotiate before loading
 
+`--packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of `tsindex.js` itself. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 Install once with `npm install` (its only dependency is `typescript`). rvl
 invokes it as `node tsindex.js …`, the same way it runs `pyindex.py` under
 `python3`; helper discovery is env override (`RVL_TSINDEX`) → a helper next
@@ -270,6 +276,15 @@ with no in-repo source behind them, or through a local `export * from
 '<pkg>'`, whose names only the missing package contents list. A wildcard is
 never guessed: right beside one `export *`, a guess is wrong beside two. The
 stderr message names those specifiers.
+
+The message advises the install that skips install scripts — `npm ci
+--ignore-scripts`, `pnpm install --frozen-lockfile --ignore-scripts`, `yarn
+install --immutable --mode=skip-build` — because tsindex reads `node_modules`
+only to resolve types and never runs a package's code. That install works on a
+repo whose native dependency cannot build on the user's toolchain, where a
+plain `npm ci` exits 1, and it does not ask someone to execute hundreds of
+packages' scripts in order to scan. The plain form is the fallback for a
+package that generates its types at install.
 
 ### Confidence tiers (the dynamic-typing reality)
 

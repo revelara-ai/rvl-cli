@@ -84,14 +84,7 @@ func typedHasCtxParam(info *types.Info, fd *ast.FuncDecl) bool {
 }
 
 func loadTyped(root string) (*typedIndex, error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports |
-			packages.NeedDeps,
-		Dir:   root,
-		Tests: false,
-	}
-	pkgs, err := packages.Load(cfg, "./...")
+	pkgs, err := packages.Load(loadConfig(root), "./...")
 	// Load failure, no packages, and packages with no type information are the
 	// same fact at three depths: nothing was analysed (po-av01j.209). Reporting
 	// any of them as an empty index would let the caller emit an empty stream
@@ -273,12 +266,7 @@ func runTyped(root, name string) ([]Site, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-		Dir: root, Tests: false,
-	}
-	pkgs, err := packages.Load(cfg, "./...")
+	pkgs, err := packages.Load(loadConfig(root), "./...")
 	// This arm returned nil with no message at all -- an even quieter version
 	// of the same defect (po-av01j.209).
 	if err != nil {

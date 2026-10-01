@@ -1,0 +1,28 @@
+{
+  "__comment": "SEED / test-grade G1 spec corpus carrying a CAPACITY PRECONDITION (po-av01j.231). `capacity_arg` names the constructor argument that gives the receiver a finite capacity: put blocks only when the queue can fill, so a queue built with no maxsize (or maxsize <= 0) cannot block and the site is not_applicable. Which argument carries that meaning is library knowledge and therefore lives here, never in propagation. PRODUCTION corpus authoring rides the LLM factory and is HITL - these entries exist so the e2e test exercises real verdicts at identities pyindex actually emits, nothing more.",
+  "apis": [
+    {
+      "type": "queue.Queue",
+      "method": "put",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 1.0,
+      "rationale": "SEED RC-019: put blocks until a free slot is available if the queue is full; the bound is the per-call timeout= argument, and timeout=None waits forever. A queue with maxsize <= 0 is infinite and never full.",
+      "unbounded_sentinels": ["None"],
+      "capacity_arg": {"name": "maxsize", "position": 0}
+    },
+    {
+      "type": "queue.LifoQueue",
+      "method": "put",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 1.0,
+      "rationale": "SEED RC-019: same surface as queue.Queue.put",
+      "unbounded_sentinels": ["None"],
+      "capacity_arg": {"name": "maxsize", "position": 0}
+    }
+  ],
+  "configs": []
+}

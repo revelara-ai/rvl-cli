@@ -114,6 +114,32 @@ binary, nothing to uninstall, no migration. The OSS store lives in an
 two never conflict. Remove the key and the scanner falls back to the free
 tier.
 
+### Scanning with the free tier only
+
+To see what the free tier reports on an install that also has the commercial
+tier, add `--oss-only`:
+
+```sh
+rvl scan --oss-only
+rvl report --oss-only
+```
+
+The flag skips the commercial tier at load time, so the scan behaves exactly
+like a no-key install: vocabulary lanes only, no judgments, and every finding
+advisory except lanes that carry their own severity (secret detection). Use
+it to demo the free tier, to compare the two tiers on the same repo, or to
+check the free experience before you publish.
+
+`--oss-only` is a load filter. `rvl sync` still syncs both tiers and nothing
+is uninstalled, so the next scan without the flag uses both tiers again. Each
+run prints a note on stderr that the commercial tier was not loaded. If the
+OSS tier is not installed the scan fails and tells you to run `rvl sync`; it
+does not fall back to the commercial tier. The flag cannot be combined with
+`--specs-file` or `--judgments`, which bypass the tiers.
+
+`rvl explain` and `rvl suppress` resolve an id from the last scan, so they
+work on the findings of an `--oss-only` scan without a flag of their own.
+
 ## Reading the output
 
 A scan report is a ladder with three printed sections and a footer:
@@ -203,6 +229,21 @@ them. To scan test code anyway, run a full scan with `rvl scan
 skip in place and a warm scan could only honor it for the files it
 re-parsed. Hook scans therefore never include test code; there is no
 `--include-tests` on `rvl index reindex` either.
+
+The TypeScript retriever scans a workspace whose dependencies are not
+installed, but it resolves client types from import syntax instead of from
+the packages. That is a weaker scan: medium tier, no client versions, and
+coarser keys for module objects. The roll-call prints the same site count
+for both, so COVERAGE names the difference,
+
+```
+  TypeScript: 2 workspaces without installed dependencies (client types resolved from import syntax: medium tier, no client versions)
+```
+
+and `--out` carries the total as `coverage.dependency_trees_uninstalled`.
+Install the dependencies and scan again to get the full resolution. A warm
+scan prints the line when it re-parses TypeScript in this pass; packets it
+reuses from the index keep the resolution they were retrieved with.
 
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly

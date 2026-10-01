@@ -187,6 +187,10 @@ pub enum Refusal {
     },
     /// Fewer decided adjudications than the manifest's sample_size claims.
     GoldTooSmall { decided: usize, required: usize },
+    /// More decided adjudications than the manifest's sample_size declares
+    /// (po-av01j.92). The sampling frame describes `declared` rows; scoring
+    /// the extra ones reports a number the published frame does not describe.
+    GoldExceedsSample { decided: usize, declared: usize },
     /// A gate set in a language whose retrieval depends on installed packages
     /// pinned a commit but no dependency tree (po-av01j.117). The SHA alone
     /// does not determine the packet stream, so the set is not reproducible.
@@ -262,6 +266,13 @@ impl std::fmt::Display for Refusal {
                     "refused: only {decided} decided adjudications < sample_size {required}"
                 )
             }
+            Refusal::GoldExceedsSample { decided, declared } => write!(
+                f,
+                "refused: {decided} decided adjudications but the manifest declares sample_size {declared}. \
+                 The sampling frame describes {declared} rows; scoring the other {extra} reports a number \
+                 the frame does not describe. Mint a fresh set whose manifest declares the rows it scores.",
+                extra = decided - declared
+            ),
         }
     }
 }
@@ -656,6 +667,29 @@ pub fn validate_gate_set(
     Ok(registry.registry_version)
 }
 
+/// The decided gold rows must be exactly the sample the manifest pre-registers
+/// (po-av01j.92). `>=` read as a safety margin, but it let rows adjudicated
+/// after the draw, under no stated rule, move the number while the published
+/// claim still cited the seeded sample. `Unsure` rows are not part of the
+/// decided sample, so they neither count toward it nor break the match.
+pub fn check_gold_matches_sample(rows: &[GoldRow], sample_size: usize) -> Result<(), Refusal> {
+    let decided = rows
+        .iter()
+        .filter(|r| r.adjudicated != AdjudicatedVerdict::Unsure)
+        .count();
+    match decided.cmp(&sample_size) {
+        std::cmp::Ordering::Less => Err(Refusal::GoldTooSmall {
+            decided,
+            required: sample_size,
+        }),
+        std::cmp::Ordering::Greater => Err(Refusal::GoldExceedsSample {
+            decided,
+            declared: sample_size,
+        }),
+        std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
 /// Annotation for a set minted against an older registry than the one supplied
 /// (po-av01j.93), or `None` when the versions match.
 ///
@@ -705,12 +739,7 @@ pub fn score_gate(rows: &[GoldRow], sample_size: usize, target: f64) -> Result<G
         .filter(|r| r.adjudicated == AdjudicatedVerdict::Unsure)
         .count();
     let n_decided = rows.len() - n_unsure;
-    if n_decided < sample_size {
-        return Err(Refusal::GoldTooSmall {
-            decided: n_decided,
-            required: sample_size,
-        });
-    }
+    check_gold_matches_sample(rows, sample_size)?;
     let confirmed = rows
         .iter()
         .filter(|r| r.adjudicated == AdjudicatedVerdict::Violates)
@@ -793,6 +822,10 @@ pub struct EngineGateScore {
 ///
 /// `Unsure` rows are excluded from both terms, as before: the panel declining
 /// to decide is not evidence either way.
+///
+/// This scores whatever gold it is handed. The caller checks first that the
+/// gold is the pre-registered sample (`check_gold_matches_sample`); the gate
+/// command does so before it consumes the set.
 pub fn score_gate_against_engine(
     joined: &[JoinedRow],
     sample_size: usize,

@@ -30,6 +30,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -87,6 +88,20 @@ if (!ts || typeof ts.createProgram !== 'function' || !ts.sys) {
 // macro_expansion (always false for TypeScript, which has no macros;
 // mechanical for C/C++). v2 is a strict superset of v1.
 const PACKET_SCHEMA = 2;
+
+// contentVersion is the second line of the --packet-schema reply: which
+// tsindex this is. The schema integer says what SHAPE the stream has. It does
+// not move when the helper learns a new client surface, so a week-old tsindex
+// and today's answer the same "2" and scan differently. This is the first 12
+// hex digits of the sha256 of this file. rvl computes the same value for the
+// copy it ships and warns when the helper it found is a different one.
+function contentVersion() {
+  return crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(__filename))
+    .digest('hex')
+    .slice(0, 12);
+}
 
 // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes and
 // pyindex's MAX_SNIPPET_BYTES. A pathologically long function body should not
@@ -2101,7 +2116,9 @@ function main(argv) {
 
   // Let a consumer negotiate the contract before paying for a load.
   if (args.packetSchema) {
-    writeStdoutSync(String(PACKET_SCHEMA) + '\n');
+    writeStdoutSync(
+      String(PACKET_SCHEMA) + '\n' + 'content-version ' + contentVersion() + '\n'
+    );
     return 0;
   }
 
@@ -2140,6 +2157,13 @@ function main(argv) {
     // names them, which is the only actionable thing to say about it. Exit 3
     // is the helper ABSTAIN code rvl reads (po-av01j.102), surfacing as a
     // COVERAGE line.
+    //
+    // The install it then asks for is the SCRIPT-FREE one (po-av01j.170).
+    // Type resolution needs the packages' declaration files and nothing an
+    // install script builds, so a plain `npm ci` is both more than the scan
+    // needs and less likely to work: it exits 1 on a repo whose native
+    // dependency cannot build on the user's toolchain, and it runs code from
+    // every package in the tree for someone who only asked for a scan.
     const { records, repoConfig, attribution } = runRetrieve(
       root,
       snapshot,
@@ -2160,8 +2184,14 @@ function main(argv) {
           `package contents can resolve. Nothing here can be ` +
           `attributed to a package without the installed tree, so tsindex ` +
           `abstains rather than reporting a near-empty scan as a complete one. ` +
-          `Install dependencies (npm ci / pnpm install --frozen-lockfile / ` +
-          `yarn install --immutable) and re-run.\n`,
+          `Install dependencies without their install scripts ` +
+          `(npm ci --ignore-scripts / pnpm install --frozen-lockfile ` +
+          `--ignore-scripts / yarn install --immutable --mode=skip-build) and ` +
+          `re-run: tsindex reads node_modules only to resolve types and runs ` +
+          `no package code, so native modules need not build. If the scan ` +
+          `still abstains because a package generates its types at install, ` +
+          `use the plain form (npm ci / pnpm install --frozen-lockfile / ` +
+          `yarn install --immutable).\n`,
       );
       return 3;
     }
