@@ -704,6 +704,13 @@ enum CacheCmd {
     },
     /// Show installed cache versions and staleness.
     Status,
+    /// List every config key the retrievers emit and where it stands against
+    /// the installed specs: specced, awaiting a spec, or vocabulary only.
+    Keys {
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// All runtime configuration, resolved once. `base_url` and `org_key` layer
@@ -6269,6 +6276,36 @@ fn run() -> anyhow::Result<ExitCode> {
                             "no spec cache installed; run '{BIN} sync' or '{BIN} cache import'"
                         )
                     }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            CacheCmd::Keys { json } => {
+                // The same tiered load a scan performs, so the queue is
+                // measured against the specs a scan would actually judge with.
+                let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+                let tiers =
+                    rvl_cache::load_tiered(&store, &oss_store, &keyset, &rvl_cache::today_utc());
+                let specs = match tiers.spec_texts()? {
+                    Some((base, overlay)) => {
+                        let mut cache = rvl_spec::SpecCache::load(&base)?;
+                        if let Some(overlay) = &overlay {
+                            cache.merge(rvl_spec::SpecCache::load(overlay)?);
+                        }
+                        Some(cache)
+                    }
+                    None => None,
+                };
+                let artifact_loaded = specs.is_some();
+                let queue = rvl_config::key_ledger::mint_queue(&specs.unwrap_or_default());
+                if json {
+                    let mut doc = serde_json::to_value(&queue)?;
+                    doc["artifact_loaded"] = artifact_loaded.into();
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    print!(
+                        "{}",
+                        config_lane::render_key_report(&queue, artifact_loaded)
+                    );
                 }
                 Ok(ExitCode::SUCCESS)
             }

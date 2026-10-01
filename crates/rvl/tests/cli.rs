@@ -81,6 +81,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
 }
 
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
+}
+
 #[test]
 fn cache_import_refuses_missing_signature() {
     let dir = tempfile::tempdir().unwrap();

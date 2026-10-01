@@ -238,7 +238,7 @@ impl Emitter<'_> {
             file_path: self.file.to_string(),
             line: 0,
             unit: self.unit.clone(),
-            key: key.to_string(),
+            key: crate::key_ledger::declared(self.format, key),
             resolved_value: value,
             resolution,
             provenance,
@@ -412,12 +412,14 @@ fn emit_application(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>, base: &
             );
             // The automated block's knobs have documented `false` defaults.
             let am = v.as_mapping();
-            for knob in ["prune", "selfHeal"] {
-                let key = format!("application.syncPolicy.automated.{knob}");
+            for (knob, key) in [
+                ("prune", "application.syncPolicy.automated.prune"),
+                ("selfHeal", "application.syncPolicy.automated.selfHeal"),
+            ] {
                 let key_path = jp(&format!("syncPolicy.automated.{knob}"));
                 match am.and_then(|a| get(a, knob)) {
-                    Some(v) => e.authored(&key, &key_path, v),
-                    None => e.platform_default(&key, &key_path, knob, "false"),
+                    Some(v) => e.authored(key, &key_path, v),
+                    None => e.platform_default(key, &key_path, knob, "false"),
                 }
             }
             // Retry is judged where sync is automated: an unattended failure
@@ -523,8 +525,10 @@ fn emit_helmrelease(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
     }
     // Remediation retries: documented default 0 — a failed install/upgrade
     // is NOT remediated unless asked. This is the rollback control's fact.
-    for action in ["install", "upgrade"] {
-        let key = format!("helmrelease.{action}.remediation.retries");
+    for (action, key) in [
+        ("install", "helmrelease.install.remediation.retries"),
+        ("upgrade", "helmrelease.upgrade.remediation.retries"),
+    ] {
         let key_path = format!("spec.{action}.remediation.retries");
         let retries = sget(action)
             .and_then(Value::as_mapping)
@@ -532,9 +536,9 @@ fn emit_helmrelease(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
             .and_then(Value::as_mapping)
             .and_then(|r| get(r, "retries"));
         match retries {
-            Some(v) => e.authored(&key, &key_path, v),
+            Some(v) => e.authored(key, &key_path, v),
             None => e.platform_default(
-                &key,
+                key,
                 &key_path,
                 &format!("{action}.remediation.retries"),
                 "0",

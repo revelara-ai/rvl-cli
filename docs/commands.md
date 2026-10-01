@@ -14,7 +14,7 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
 | `rvl index <init\|reindex\|status>` | Incremental-scan packet index (content-hash keyed). `reindex --detach` rebuilds in the background. |
 | `rvl sync` | Refresh the spec cache from the Revelara API (async-safe, never blocks a scan). With no key, syncs the OSS vocabulary tier; with a key, both tiers. |
-| `rvl cache <import\|status>` | Spec-cache maintenance, including air-gapped import of a signed artifact. |
+| `rvl cache <import\|status\|keys>` | Spec-cache maintenance, including air-gapped import of a signed artifact. `keys` lists every config key the retrievers emit and where it stands against the installed specs: specced, awaiting a spec, or vocabulary only (emitted as evidence, never judged). |
 
 `scan`, `explain`, `suppress`, and `report` all take the same input escape
 hatches: `--retrieved <packets.jsonl>` scans a prebuilt retriever packet

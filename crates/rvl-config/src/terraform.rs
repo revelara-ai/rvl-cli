@@ -766,7 +766,7 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
         file_path: file.to_string(),
         line: 0,
         unit: unit.to_string(),
-        key: key.to_string(),
+        key: crate::key_ledger::declared("terraform", key),
         resolved_value: value,
         resolution,
         provenance,
