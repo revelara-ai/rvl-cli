@@ -327,6 +327,101 @@ fn no_db_fallback_is_the_extern_c_allowlist_at_low_tier() {
 }
 
 #[test]
+fn server_fixture_emits_civetweb_and_mongoose_registrations_as_server_entries() {
+    if !engine_available(
+        "server_fixture_emits_civetweb_and_mongoose_registrations_as_server_entries",
+    ) {
+        return;
+    }
+    let (sites, _records) = retrieve(&fixture("fixture-server"), &[]);
+    // Nothing in this fixture is a G1 client call: every record is a G2 entry.
+    for s in &sites {
+        assert_eq!(s["site_kind"], "server_entry", "site_kind stamp: {s}");
+        assert_eq!(s["provenance"]["client_type_resolved"], true, "{s}");
+    }
+
+    // civetweb: both registrations, the literal path in const_args, the
+    // dynamic one emitted WITHOUT a path (the lane abstains on it).
+    let civet = sites_with_method(&sites, "mg_set_request_handler");
+    assert_eq!(civet.len(), 2, "both civetweb registrations: {sites:?}");
+    let has_path = |s: &serde_json::Value, path: &str| {
+        s["const_args"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|c| c["value"] == format!("{path:?}")))
+    };
+    let health = civet
+        .iter()
+        .find(|s| has_path(s, "/healthz"))
+        .expect("the /healthz registration carries its literal path");
+    assert_eq!(health["client_type"], "civetweb.mg_context");
+    assert_eq!(health["symbol"], "serve");
+    assert_eq!(health["file_path"], "src/civet.c");
+    let dynamic = civet.iter().find(|s| !has_path(s, "/healthz")).unwrap();
+    assert!(
+        !dynamic["snippet"].as_str().unwrap().contains('"'),
+        "the dynamic registration carries no literal path: {dynamic}"
+    );
+
+    // mongoose: the listener registration.
+    let listens = sites_with_method(&sites, "mg_http_listen");
+    assert_eq!(listens.len(), 1, "the listener registration: {sites:?}");
+    assert_eq!(listens[0]["client_type"], "mongoose.mg_mgr");
+
+    // mongoose: route matches inside the REGISTERED event handler.
+    let uri_matches = sites_with_method(&sites, "mg_http_match_uri");
+    assert_eq!(uri_matches.len(), 1, "{sites:?}");
+    assert_eq!(uri_matches[0]["client_type"], "mongoose.mg_http_message");
+    assert!(has_path(uri_matches[0], "/api/users"), "{}", uri_matches[0]);
+
+    let matches = sites_with_method(&sites, "mg_match");
+    assert_eq!(
+        matches.len(),
+        1,
+        "only the uri match inside the registered handler is a route \
+         (not the method match, not the match outside a handler): {matches:?}"
+    );
+    assert_eq!(matches[0]["symbol"], "ev_handler");
+    assert_eq!(matches[0]["client_type"], "mongoose.mg_http_message");
+    assert!(
+        matches[0]["snippet"]
+            .as_str()
+            .is_some_and(|s| s.contains("\"/api/health\"")),
+        "the route path rides the snippet: {}",
+        matches[0]
+    );
+}
+
+#[test]
+fn g1_packets_carry_no_site_kind_key() {
+    if !engine_available("g1_packets_carry_no_site_kind_key") {
+        return;
+    }
+    // Absent means the classic G1 call site; the key must not appear at all,
+    // so pre-existing G1 streams stay byte-identical.
+    let (sites, _) = retrieve(&fixture("fixture-c"), &[]);
+    assert!(!sites.is_empty());
+    for s in &sites {
+        assert!(
+            s.get("site_kind").is_none(),
+            "G1 site grew a site_kind: {s}"
+        );
+    }
+}
+
+#[test]
+fn no_db_server_entry_is_emitted_at_low_tier() {
+    if !engine_available("no_db_server_entry_is_emitted_at_low_tier") {
+        return;
+    }
+    let (sites, _) = retrieve(&fixture("fixture-nodb"), &[]);
+    let regs = sites_with_method(&sites, "mg_set_request_handler");
+    assert_eq!(regs.len(), 1, "{sites:?}");
+    assert_eq!(regs[0]["site_kind"], "server_entry");
+    assert_eq!(regs[0]["client_type"], "civetweb.mg_context");
+    assert_eq!(regs[0]["provenance"]["client_type_resolved"], false);
+}
+
+#[test]
 fn files_filter_restricts_emission_to_the_named_files() {
     if !engine_available("files_filter_restricts_emission_to_the_named_files") {
         return;

@@ -797,16 +797,18 @@ specs borrowed by method for {borrowed} rows",
                 cache.len()
             );
 
-            let engine_sites: Vec<(String, u64, bool)> = sites
+            let engine_sites: Vec<gate::EngineSite> = sites
                 .iter()
                 .zip(engine_findings.iter())
-                .map(|(s, f)| {
-                    (
-                        s.file_path.clone(),
-                        // Site carries u32, GoldRow u64. Widening is lossless.
-                        u64::from(s.line_number),
-                        f.verdict == rvl_core::Verdict::Violates,
-                    )
+                .map(|(s, f)| gate::EngineSite {
+                    file_path: s.file_path.clone(),
+                    // Site carries u32, GoldRow u64. Widening is lossless.
+                    line_number: u64::from(s.line_number),
+                    flagged: f.verdict == rvl_core::Verdict::Violates,
+                    // The cluster key (po-io8sk.1): the retriever stamps
+                    // each site with the repo it came from.
+                    repo: s.snapshot_id.clone(),
+                    class: rvl_triage::class_key_string(s),
                 })
                 .collect();
             let joined = gate::join_gold_to_engine(&rows, &engine_sites);
@@ -831,8 +833,14 @@ specs borrowed by method for {borrowed} rows",
                 "  confirmed violates {} | FALSE POSITIVES {}",
                 s.confirmed_violates, s.false_positives
             );
+            // Never a lone scalar: the bound is taken at n_eff, so the four
+            // numbers that produce n_eff are printed next to it (po-io8sk.1).
             println!(
-                "  precision {:.3} | Wilson 95% LB {:.3} | target {target:.2}",
+                "  n {} | n_clusters {} | deff {:.2} | n_eff {:.1}  (clusters are (repo, spec class))",
+                s.n_scored, s.n_clusters, s.deff, s.n_eff
+            );
+            println!(
+                "  precision {:.3} | Wilson 95% LB {:.3} at n_eff | target {target:.2}",
                 s.precision, s.wilson_lb
             );
             println!(
