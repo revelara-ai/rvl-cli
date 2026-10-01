@@ -602,6 +602,30 @@ pub enum ConfigExpect {
     AtLeast { value: f64 },
     /// The resolved value, parsed as a number, must be <= `value`.
     AtMost { value: f64 },
+    /// The resolved value must NOT equal `value` (po-pk3fp.13).
+    ///
+    /// The complement `equals` and `one_of` cannot state: "not the default
+    /// Argo CD project" has no enumerable satisfying set, and a Flux
+    /// `remediation.retries` of `-1` (remediate forever) is the strongest
+    /// setting, which `at_least 1` flagged. `not_equals "0"` says both.
+    NotEquals { value: String },
+    /// The resolved value, parsed as a duration, must be >= `value`.
+    ///
+    /// Both sides are duration strings in the Go / Prometheus grammar
+    /// (`30s`, `10m`, `1h30m`, `2d`), which is what Flux intervals and alert
+    /// `for:` clauses are authored in. `at_least` cannot judge them: `10m` is
+    /// not a number, and a bare number carries no unit. A value or a bound
+    /// that is not a duration ABSTAINS, the same rule as `at_least`.
+    DurationAtLeast { value: String },
+    /// The resolved value, parsed as a duration, must be <= `value`.
+    DurationAtMost { value: String },
+    /// A `kind` this binary does not know. The one key abstains instead of
+    /// the whole artifact failing to parse, so an expectation added by a
+    /// newer scanner degrades the way an unknown pattern name does. Binaries
+    /// that predate this variant still reject unknown kinds outright: an
+    /// artifact must not carry a kind older than its scanner floor.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A spec about one config key in one config format — the G6 analog of
@@ -1924,12 +1948,65 @@ mod tests {
             ConfigExpect::Pattern {
                 name: "sha40".into(),
             },
+            ConfigExpect::AtLeast { value: 2.0 },
+            ConfigExpect::AtMost { value: 60.0 },
+            ConfigExpect::NotEquals {
+                value: "default".into(),
+            },
+            ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ConfigExpect::DurationAtMost {
+                value: "10m".into(),
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
             let back: ConfigExpect = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back, "{json}");
         }
+    }
+
+    #[test]
+    fn config_expect_names_the_new_kinds_in_snake_case() {
+        // The wire names the factory authors against.
+        for (json, want) in [
+            (
+                r#"{"kind":"not_equals","value":"0"}"#,
+                ConfigExpect::NotEquals { value: "0".into() },
+            ),
+            (
+                r#"{"kind":"duration_at_most","value":"10m"}"#,
+                ConfigExpect::DurationAtMost {
+                    value: "10m".into(),
+                },
+            ),
+            (
+                r#"{"kind":"duration_at_least","value":"1m"}"#,
+                ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<ConfigExpect>(json).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn an_unknown_expect_kind_does_not_fail_the_whole_cache() {
+        // One spec from a newer factory must cost one key, not every spec in
+        // the artifact.
+        let cache = SpecCache::load(
+            r#"{"config_keys": [
+                {"format": "flux", "key": "a", "expect": {"kind": "from_the_future", "n": 1}},
+                {"format": "flux", "key": "b", "expect": {"kind": "present"}}
+            ]}"#,
+        )
+        .expect("an unknown kind degrades, it does not abort the load");
+        assert_eq!(
+            cache.config_key("flux", "a").unwrap().expect,
+            ConfigExpect::Unknown
+        );
+        assert_eq!(
+            cache.config_key("flux", "b").unwrap().expect,
+            ConfigExpect::Present
+        );
     }
 
     #[test]
