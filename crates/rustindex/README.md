@@ -91,7 +91,14 @@ moniker) — that is what propagation's `call_arg` mechanism credits.
 Rust gate floors follow the expansion gate protocol (po-ae75b.2): RELATIVE
 formula — decided% >= Go comparator − 10 on the pinned backend corpus;
 precision Wilson LB >= 0.90 on n >= 50 quarantined gate-grade sites; gate
-sets are single-use, minted at first gate and re-verified at cutover. The
+sets are single-use, minted at first gate and re-verified at cutover. Both
+numbers are cluster-adjusted: the bound is taken at the effective sample size
+`n_eff = n / deff`, not at raw n, and a run with `n_eff < 50` is refused.
+Sites cluster by (repo, spec class), because one spec decides every site of
+its class, and `deff` is the Kish design effect of that clustering
+(`crates/rvl-eval/src/stats.rs`). `rvl-eval gate` prints n, n_clusters, deff
+and n_eff next to the bound. No language holds a passing claim under this
+rule today: the one minted set, eval-go-v1, is withdrawn. The
 gate machinery is language-generic (`rvl-eval gate`, `language: rust` in the
 manifest); minting + adjudication is HITL and tracked as its own bead under
 the epic. The seed spec corpus (`crates/rvl/tests/testdata/
