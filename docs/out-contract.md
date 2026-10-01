@@ -67,7 +67,9 @@ The orchestrator uses it to:
                    "vocabulary_only": 4 },
       "no_spec_keys": ["github_actions permissions"],
       "unparseable_files": 0
-    }
+    },
+    "structure": { "total": 6, "violates": 1, "satisfies": 3, "abstain": 1,
+                   "not_applicable": 1 }
   },
   "sites": [
     { "site_id": "...", "snapshot_id": "...", "verdict": "violates",
@@ -78,6 +80,10 @@ The orchestrator uses it to:
       "lever": "judge", "scope": "runtime" }
   ],
   "covered_classes": ["net/http.Client.Do", "redis.pipeline"],
+  "structure": [
+    { "site_id": "repo", "snapshot_id": "...", "verdict": "violates",
+      "reason": "no test files for go", "class": "repo_structure.RC-033" }
+  ],
   "hook_agent": null,
   "blend": null
 }
@@ -136,6 +142,25 @@ The orchestrator uses it to:
     so they are counted apart from `no_spec` and never appear in
     `no_spec_keys`. `rvl cache keys` lists which keys carry the marker and
     why.
+  - `structure`: the repo-structure lane's verdict counts (`total`,
+    `violates`, `satisfies`, `abstain`, `not_applicable`), one control each.
+    It mirrors the `structure:` line of the COVERAGE block. Null when the
+    lane did not run.
+- `structure` is the repo-structure lane: one eval row per control (RC-033,
+  RC-057, RC-058, RC-034, RC-070, RC-006) in that order, with the same five
+  fields as a `sites` row. `site_id` is always `repo`, because the lane
+  judges the repository and not a location, so `class`
+  (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
+  `satisfies`, `abstain` and `not_applicable` included, and the rows are
+  pre-waiver engine truth. The violations among them are also ladder rows in
+  `findings`, post-waiver. The rows are kept out of `sites` on purpose:
+  `coverage.resolved`, `coverage.total`, `undecided` and `covered_classes`
+  count call sites only. The array is empty when the lane did not run
+  (`--changed-only`, or a `--retrieved` stream with no `repo_structure`
+  record). An empty array never means that the repository satisfies the
+  controls. To score the lane, run
+  `rvl-eval score --lane structure --findings <scan.json> --gold <gold.json>`;
+  a gold case id is a control code (`RC-033`) or the full class.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime

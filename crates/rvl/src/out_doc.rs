@@ -18,6 +18,10 @@ use std::collections::BTreeSet;
 
 use crate::render;
 
+/// The `site_id` of every `structure` row: the lane judges the repository as
+/// a whole, so a row is identified by its `class`, not by a location.
+pub const STRUCTURE_SITE_ID: &str = "repo";
+
 /// Which abstain lever closes an unresolved site. The same classification the
 /// COVERAGE block buckets by; kept as one function so the rendered counts and
 /// the per-site `undecided` rows can never disagree.
@@ -50,6 +54,15 @@ pub struct OutDoc {
     pub sites: Vec<OutSite>,
     pub undecided: Vec<OutUndecided>,
     pub covered_classes: Vec<String>,
+    /// The repo-structure lane (po-av01j.28): one eval row per control
+    /// (RC-033/057/058/034/070/006) with EVERY verdict, satisfies and
+    /// abstain included, pre-waiver. Kept out of `sites` on purpose: these
+    /// rows describe the repo, not a call site, so they must not move
+    /// `coverage.resolved/total`, `undecided` or `covered_classes`. Empty
+    /// when the lane did not run (`--changed-only`, or a `--retrieved`
+    /// stream with no `repo_structure` record). The violations among them
+    /// are also ladder rows in `findings`, post-waiver.
+    pub structure: Vec<OutSite>,
     /// The hook-adjudication agent block verbatim when `--hook` ran; null
     /// otherwise. Provenance-tagged and separate, exactly as rendered.
     pub hook_agent: Option<String>,
@@ -61,8 +74,10 @@ pub struct OutDoc {
 
 /// One per-site eval row. Field names match the old top-level array (and the
 /// rvl-eval `run` emitter) exactly, so harness consumers migrate by reading
-/// `.sites` instead of the document root, nothing else.
-#[derive(Serialize)]
+/// `.sites` instead of the document root, nothing else. The `structure` rows
+/// reuse the shape with `site_id` fixed to [`STRUCTURE_SITE_ID`] and `class`
+/// set to `repo_structure.RC-XXX`, so the one findings loader reads both.
+#[derive(Clone, Debug, Serialize)]
 pub struct OutSite {
     pub site_id: String,
     pub snapshot_id: String,
@@ -142,6 +157,17 @@ pub struct OutConfig {
     pub unparseable_files: usize,
 }
 
+/// The repo-structure lane's verdict counts, one control each. Mirrors the
+/// COVERAGE block's `structure:` line.
+#[derive(Serialize)]
+pub struct OutStructureCoverage {
+    pub total: usize,
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    pub not_applicable: usize,
+}
+
 #[derive(Serialize)]
 pub struct OutCoverage {
     pub resolved: usize,
@@ -161,6 +187,8 @@ pub struct OutCoverage {
     pub retrievers: Vec<OutRetriever>,
     pub degraded: Vec<OutDegraded>,
     pub config: Option<OutConfig>,
+    /// Null when the structure lane did not run.
+    pub structure: Option<OutStructureCoverage>,
 }
 
 /// A site the engine reached and abstained on, with the lever that closes it.
@@ -197,6 +225,7 @@ pub fn build(
     config: Option<&render::ConfigCoverage>,
     propagated: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
+    structure: &[OutSite],
     hook_agent_block: Option<&str>,
     blend: Option<&crate::blend::BlendSummary>,
     blocked: bool,
@@ -308,10 +337,18 @@ pub fn build(
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
                 unparseable_files: c.unparseable_files,
             }),
+            structure: coverage.structure.map(|c| OutStructureCoverage {
+                total: c.total(),
+                violates: c.violates,
+                satisfies: c.satisfies,
+                abstain: c.abstain,
+                not_applicable: c.not_applicable,
+            }),
         },
         sites: site_rows,
         undecided,
         covered_classes: covered.into_iter().collect(),
+        structure: structure.to_vec(),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
         blend: blend.cloned(),
     }
@@ -346,6 +383,7 @@ mod tests {
             std::slice::from_ref(&f),
             &render::Coverage::default(),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -396,11 +434,71 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
+    /// The structure lane rides its own array (po-av01j.28): repo-level rows
+    /// must not change what the site-shaped fields mean.
+    #[test]
+    fn structure_rows_ride_their_own_array_and_leave_sites_alone() {
+        let row = |control: &str, verdict: &str| OutSite {
+            site_id: STRUCTURE_SITE_ID.into(),
+            snapshot_id: "snap".into(),
+            verdict: verdict.into(),
+            reason: "r".into(),
+            class: format!("repo_structure.{control}"),
+        };
+        let rows = [
+            row("RC-033", "violates"),
+            row("RC-057", "satisfies"),
+            row("RC-034", "abstain"),
+        ];
+        let coverage = render::Coverage {
+            structure: render::StructureCoverage::from_verdicts(
+                rows.iter().map(|r| r.verdict.as_str()),
+            ),
+            ..Default::default()
+        };
+        let doc = build(&[], &coverage, None, &[], &[], &rows, None, None, false);
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["structure"].as_array().unwrap().len(), 3);
+        assert_eq!(v["structure"][0]["site_id"], "repo");
+        assert_eq!(v["structure"][0]["class"], "repo_structure.RC-033");
+        assert_eq!(v["structure"][2]["verdict"], "abstain");
+        assert_eq!(v["sites"].as_array().unwrap().len(), 0);
+        assert_eq!(v["undecided"].as_array().unwrap().len(), 0);
+        assert_eq!(v["covered_classes"].as_array().unwrap().len(), 0);
+        assert_eq!(v["coverage"]["total"], 0);
+        assert_eq!(
+            v["coverage"]["structure"],
+            serde_json::json!({"total": 3, "violates": 1, "satisfies": 1,
+                               "abstain": 1, "not_applicable": 0})
+        );
+    }
+
+    /// A scan whose structure lane did not run says so: an empty array and a
+    /// null summary, never six fabricated abstains.
+    #[test]
+    fn no_structure_lane_is_an_empty_array_and_a_null_summary() {
+        let doc = build(
+            &[],
+            &render::Coverage::default(),
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+        );
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["structure"], serde_json::json!([]));
+        assert!(v["coverage"]["structure"].is_null());
     }
 
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE
