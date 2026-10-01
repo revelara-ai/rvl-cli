@@ -43,6 +43,10 @@ fn bin() -> Command {
     ] {
         c.env_remove(k);
     }
+    // THE SUITE MUST NOT REACH THE NETWORK (po-av01j.171). A scan on the
+    // signed cache now starts a background cache check; offline turns it
+    // off. auto_sync_cli.rs covers that check against a local server.
+    c.env("RVL_OFFLINE", "1");
     c
 }
 
