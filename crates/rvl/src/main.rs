@@ -2400,6 +2400,22 @@ fn strip_generated_packets(text: &str, root: &Path) -> (String, usize) {
     (kept, dropped.len())
 }
 
+/// One language's uninstalled-dependency line, from that language's own
+/// repo-scoped record; empty when every declared tree was installed. Called
+/// where the stream is still one language's, so COVERAGE can name the lane.
+fn dependencies_uninstalled_of(
+    lang: &str,
+    cfg: &rvl_core::RepoConfig,
+) -> Vec<render::DependenciesUninstalled> {
+    match cfg.uninstalled_dependency_trees() {
+        0 => Vec::new(),
+        count => vec![render::DependenciesUninstalled {
+            lang: lang.to_string(),
+            count,
+        }],
+    }
+}
+
 struct RetrievedStream {
     text: String,
     /// Distinct machine-generated files whose packets were dropped. Reported in
@@ -2408,6 +2424,10 @@ struct RetrievedStream {
     /// Test files each helper declined to read, per language. The
     /// same rule as `generated_skipped`: reported, never silent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Workspaces whose dependencies were not installed, per language
+    /// (po-pk3fp.15). The lane scanned, from import syntax alone, and the
+    /// report has to say so.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
     /// Set when EVERY detected language failed, so the call-site lane is empty
     /// for a reason the reader must be told (po-av01j.145). Rendered by the
     /// COVERAGE block, never swallowed.
@@ -2446,7 +2466,9 @@ fn resolve_packet_stream(
         // a captured stream that skipped files must not scan as a false
         // zero. One language per stream is not guaranteed here, so the lane
         // is named for what it is.
-        let test_files_skipped = match rvl_core::parse_stream(&text).1.test_files_skipped {
+        let cfg = rvl_core::parse_stream(&text).1;
+        let dependencies_uninstalled = dependencies_uninstalled_of("retrieved stream", &cfg);
+        let test_files_skipped = match cfg.test_files_skipped {
             0 => Vec::new(),
             count => vec![render::TestFilesSkipped {
                 lang: "retrieved stream".to_string(),
@@ -2459,6 +2481,7 @@ fn resolve_packet_stream(
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
             test_files_skipped,
+            dependencies_uninstalled,
             total_failure: None,
             degraded: Vec::new(),
             // A prebuilt stream says nothing about which helpers ran, so the
@@ -2484,6 +2507,7 @@ fn resolve_packet_stream(
             text: String::new(),
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             total_failure: None,
             retrievers: Vec::new(),
             status: detect_unsupported(path)
@@ -2548,6 +2572,7 @@ fn resolve_packet_stream(
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
     let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
+    let mut dependencies_uninstalled: Vec<render::DependenciesUninstalled> = Vec::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
     let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
@@ -2592,7 +2617,13 @@ fn resolve_packet_stream(
                 // its repo-scoped record. Read per language HERE,
                 // where the stream is still one language's, so COVERAGE can
                 // name the lane; the merged stream only knows the total.
-                let skipped = rvl_core::parse_stream(&out).1.test_files_skipped;
+                let cfg = rvl_core::parse_stream(&out).1;
+                // The dependency state the helper resolved against rides the
+                // same record and is read at the same point for the same
+                // reason (po-pk3fp.15).
+                dependencies_uninstalled
+                    .extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
+                let skipped = cfg.test_files_skipped;
                 if skipped > 0 {
                     test_files_skipped.push(render::TestFilesSkipped {
                         lang: lang.to_string(),
@@ -2639,6 +2670,7 @@ fn resolve_packet_stream(
         text: combined,
         generated_skipped,
         test_files_skipped,
+        dependencies_uninstalled,
         total_failure,
         status,
         degraded,
@@ -3244,6 +3276,7 @@ fn run_scan(
             0,
             false,
             Vec::new(),
+            Vec::new(),
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
@@ -3289,6 +3322,7 @@ fn run_scan(
         stream.generated_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
+        stream.dependencies_uninstalled.clone(),
     )
 }
 
@@ -3414,6 +3448,8 @@ fn render_scan_output(
     empty_api_corpus: bool,
     // Test files the retrievers declined to read, per language.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    // Workspaces scanned without their installed dependencies, per language.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -3426,6 +3462,7 @@ fn render_scan_output(
         generated_skipped,
         empty_api_corpus,
         test_files_skipped,
+        dependencies_uninstalled,
         degraded_note,
         lang_status,
         retrievers,
@@ -3604,6 +3641,12 @@ struct HelperRetriever {
     /// alternative is letting one language's refusal abort the whole delta,
     /// which is the same bug this bead fixes on the full path.
     degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>>,
+    /// Languages whose helper resolved against an uninstalled dependency
+    /// tree during this pass (po-pk3fp.15). Shared for the same reason
+    /// `degraded` is, and read per language for the same reason the full
+    /// path does: the merged `RepoConfig` no longer knows whose count it is.
+    dependencies_uninstalled:
+        std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>>,
 }
 
 impl HelperRetriever {
@@ -3663,6 +3706,11 @@ impl HelperRetriever {
             };
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
+            // Same tolerance as `push_degradation`: a poisoned lock loses a
+            // COVERAGE line, never the scan.
+            if let Ok(mut g) = self.dependencies_uninstalled.lock() {
+                g.extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
+            }
             // The test files the helper declined to read ride `cfg` too
             // (`test_files_skipped_paths`), and `absorb` concatenates them,
             // so the caller can flag each one in the index.
@@ -3711,6 +3759,11 @@ struct RetrieveResult {
     /// of the same commit from warming the index, and must not alter the
     /// verdict line either.
     degraded_langs: Vec<Lang>,
+    /// Languages whose helper ran this pass against an uninstalled
+    /// dependency tree (po-pk3fp.15). Filled in by the caller, like
+    /// `degraded_langs`. Empty when no helper ran: the packet index does not
+    /// record the dependency state its reused packets were resolved under.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
 }
 
 /// The outcome of running a closure under a wall-clock cap.
@@ -3759,6 +3812,7 @@ fn resolve_budgeted(
             // Filled in by the caller, which holds the per-language degradation
             // collector this function never sees.
             degraded_langs: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
         }),
         Budgeted::TimedOut => {
             if strict {
@@ -3777,6 +3831,7 @@ fn resolve_budgeted(
                 )),
                 // A whole-pass degradation already blocks re-indexing outright.
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         }
         Budgeted::Failed(e) => {
@@ -3790,6 +3845,7 @@ fn resolve_budgeted(
                     "retrieval failed ({e}); results cover the reused portion only"
                 )),
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         }
     }
@@ -3841,6 +3897,11 @@ struct IncrementalScan {
     /// nobody is told about is the silent exclusion the line exists to
     /// prevent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Languages whose helper ran THIS pass against an uninstalled
+    /// dependency tree (po-pk3fp.15). Unlike the test-file skip this is the
+    /// pass's own observation, not a repository-wide one: the index keeps no
+    /// record of the dependency state behind a reused packet.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
     /// The candidate set was EMPTY: this tree holds no file any retriever
     /// reads (po-av01j.198). Not a degradation and not an error — there was
     /// nothing to retrieve — but the caller must SAY so, because a gate that
@@ -3861,6 +3922,7 @@ impl IncrementalScan {
             reparsed_files: Vec::new(),
             lang_degraded: Vec::new(),
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             no_supported_sources: true,
         }
     }
@@ -3983,6 +4045,7 @@ where
                 count,
             })
             .collect(),
+        dependencies_uninstalled: rr.dependencies_uninstalled,
         // This function is only reached with a candidate set in hand; the
         // no-source case short-circuits in `incremental_scan_pass`.
         no_supported_sources: false,
@@ -4041,6 +4104,11 @@ fn incremental_scan_pass(
     // closure is `FnOnce` and moves.
     let attempted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
     let attempted_w = std::sync::Arc::clone(&attempted);
+    // What the helpers said about the dependency trees they resolved against;
+    // the retriever moves into the budget thread, so this is the handle that
+    // outlives it.
+    let dependencies: std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>> =
+        Default::default();
     let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
         attempted_w.store(
             langs_of_paths(changed).len(),
@@ -4049,6 +4117,7 @@ fn incremental_scan_pass(
         // Budget only the potentially-slow helper retrieval.
         let retriever = HelperRetriever {
             degraded: std::sync::Arc::clone(&collector),
+            dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
             root: root.clone(),
             name: name.clone(),
         };
@@ -4064,6 +4133,9 @@ fn incremental_scan_pass(
         // first that has a `RetrieveResult` to put them on.
         if let Ok(g) = collector.lock() {
             rr.degraded_langs = g.iter().map(|d| d.lang).collect();
+        }
+        if let Ok(mut g) = dependencies.lock() {
+            rr.dependencies_uninstalled = std::mem::take(&mut g);
         }
         Ok(rr)
     })?;
@@ -4272,8 +4344,11 @@ fn run_index_build(
 
     let name = snapshot_name(&root);
     let degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
+    let dependencies: std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>> =
+        Default::default();
     let retriever = HelperRetriever {
         degraded: std::sync::Arc::clone(&degraded),
+        dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
         root: root.clone(),
         name,
     };
@@ -4291,13 +4366,20 @@ fn run_index_build(
             repo_cfg,
             degraded_note: None,
             degraded_langs,
+            dependencies_uninstalled: dependencies
+                .lock()
+                .map(|mut g| std::mem::take(&mut *g))
+                .unwrap_or_default(),
         })
     })?;
     // The skipped test files are flagged in the index for the warm scan to
     // count; this line is the only place a background warm can say so.
     let skipped: usize = scan.test_files_skipped.iter().map(|t| t.count).sum();
+    // Likewise for the dependency state: the packets this run indexed were
+    // resolved from import syntax, and the index itself does not record that.
+    let uninstalled: usize = scan.dependencies_uninstalled.iter().map(|d| d.count).sum();
     println!(
-        "reindexed: reused {} unchanged, retrieved {} changed{}",
+        "reindexed: reused {} unchanged, retrieved {} changed{}{}",
         scan.reused_files,
         scan.retrieved_files,
         if skipped == 0 {
@@ -4306,6 +4388,14 @@ fn run_index_build(
             format!(
                 ", {skipped} test file{} skipped (tests are not scanned for API surfaces)",
                 if skipped == 1 { "" } else { "s" }
+            )
+        },
+        if uninstalled == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {uninstalled} workspace{} without installed dependencies",
+                if uninstalled == 1 { "" } else { "s" }
             )
         }
     );
@@ -4614,6 +4704,7 @@ fn run_scan_incremental(
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
+        scan.dependencies_uninstalled.clone(),
     )
 }
 
@@ -8143,6 +8234,7 @@ mod tests {
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         };
         let candidates = walk_source_files(dir.path());
@@ -8168,12 +8260,56 @@ mod tests {
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         };
         let scan2 = incremental_sites(&idx, dir.path(), &candidates, fake2).unwrap();
         assert_eq!(scan2.reused_files, 2, "both files now reused");
         assert_eq!(scan2.retrieved_files, 0);
         assert_eq!(calls2.get(), 0, "no helper run when nothing changed");
+    }
+
+    /// One language's record becomes one line, named for the lane, and a
+    /// fully installed tree becomes none (po-pk3fp.15). Batches restating the
+    /// same workspaces are counted once.
+    #[test]
+    fn a_language_names_its_uninstalled_dependency_trees_once() {
+        let rec = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let cfg = rvl_core::parse_stream(&format!("{rec}\n{rec}\n")).1;
+        assert_eq!(
+            dependencies_uninstalled_of("TypeScript", &cfg),
+            vec![render::DependenciesUninstalled {
+                lang: "TypeScript".to_string(),
+                count: 2,
+            }]
+        );
+        assert!(
+            dependencies_uninstalled_of("Go", &rvl_core::RepoConfig::default()).is_empty(),
+            "an installed tree prints nothing"
+        );
+    }
+
+    /// The warm path carries what its helpers said to COVERAGE too: a hook
+    /// scan that re-parsed TypeScript against an uninstalled tree must not
+    /// report it the way a fully resolved one reads (po-pk3fp.15).
+    #[test]
+    fn a_warm_pass_carries_the_uninstalled_dependency_state_its_helpers_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        std::fs::write(dir.path().join("app.ts"), "export const a = 1;\n").unwrap();
+        let reported = vec![render::DependenciesUninstalled {
+            lang: "TypeScript".to_string(),
+            count: 1,
+        }];
+        let fake = |_: &[PathBuf]| {
+            Ok(RetrieveResult {
+                dependencies_uninstalled: reported.clone(),
+                ..Default::default()
+            })
+        };
+        let candidates = walk_source_files(dir.path());
+        let scan = incremental_sites(&idx, dir.path(), &candidates, fake).unwrap();
+        assert_eq!(scan.dependencies_uninstalled, reported);
     }
 
     #[test]
@@ -8335,6 +8471,7 @@ mod tests {
             reparsed_files: Vec::new(),
             lang_degraded,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             no_supported_sources: false,
         }
     }

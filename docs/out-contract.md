@@ -53,6 +53,7 @@ The orchestrator uses it to:
     "abstain": { "no_spec": 90, "bounds": 40, "judge": 30, "other": 6 },
     "generated_skipped": 3,
     "test_files_skipped": 12,
+    "dependency_trees_uninstalled": 0,
     "degraded_note": null,
     "lang_status": [ { "lang": "go", "state": "scanned", "detail": "1240" } ],
     "retrievers": [ { "lang": "go", "path": "...", "source": "bundled" } ],
@@ -121,6 +122,15 @@ The orchestrator uses it to:
     test files its packet index flagged when they were first retrieved as
     well as the ones it re-parsed this pass. `rvl scan --include-tests`
     makes the second zero by scanning them.
+  - `dependency_trees_uninstalled`: workspaces that declare dependencies
+    with no installed tree, summed across languages. Non-zero means the
+    TypeScript retriever resolved those workspaces' client types from import
+    syntax: the packets are tier `medium`, carry no `client_version`, and
+    are not filtered by awaitability. `lang_status` still says `scanned`,
+    so this is the field that tells such a scan from a fully resolved one.
+    On a warm (`--incremental`) scan it counts what the retrievers that ran
+    this pass reported; the packet index does not record the dependency
+    state behind a reused packet.
   - `config.abstain.vocabulary_only`: config settings whose key is emitted
     as evidence and deliberately never judged. They have no spec by design,
     so they are counted apart from `no_spec` and never appear in

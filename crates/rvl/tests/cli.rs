@@ -4001,6 +4001,70 @@ fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
     );
 }
 
+/// A stream from a tsindex run over an uninstalled tree says so on its
+/// repo-scoped record, and the scan must repeat it (po-pk3fp.15): on the
+/// COVERAGE block and on `--out`. Without the line, a scan resolved from
+/// import syntax reads exactly like one resolved from the installed tree.
+#[test]
+fn a_scan_names_the_dependency_trees_that_were_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let run = |stream: &str, out_name: &str| {
+        let p = dir.path().join(format!("{out_name}.jsonl"));
+        std::fs::write(&p, stream).unwrap();
+        let out_path = dir.path().join(format!("{out_name}.json"));
+        let out = bin()
+            .args(["scan", "--retrieved"])
+            .arg(&p)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan errored: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        (stdout, doc)
+    };
+    let base = std::fs::read_to_string(&packets).unwrap();
+
+    let (stdout, doc) = run(&base, "installed");
+    assert!(
+        !stdout.contains("installed dependencies"),
+        "a stream that reports nothing uninstalled prints nothing: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 0,
+        "{}",
+        doc["coverage"]
+    );
+
+    let degraded = format!(
+        "{base}{}\n",
+        r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"fixture","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#
+    );
+    let (stdout, doc) = run(&degraded, "uninstalled");
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "the stream's dependency state must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
 // --- scan submission mode (po-av01j.153, rvl-cli parity) ---
 
 mod submit_mock {
