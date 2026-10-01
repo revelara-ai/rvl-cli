@@ -512,6 +512,7 @@ pub fn propagate(
     let mut served_unresolved = false;
     let mut client_unresolved = false;
     let mut untraced_family = false;
+    let mut construction_unresolved = false;
     // An exact-type config spec for this client that names no bounding
     // field, so the site could not check it.
     let mut config_unresolved: Option<String> = None;
@@ -666,6 +667,10 @@ pub fn propagate(
                 let before = whole.len() + phase.len() + unbounded.len();
                 let scope = site.client_construction_scope.as_str();
                 let untraced = scope == rvl_core::CONSTRUCTION_SCOPE_TYPE;
+                // The receiver was traced to a value built where the
+                // retriever cannot read: no construction is attached, and
+                // finding none is not evidence that the client is unbounded.
+                construction_unresolved = scope == rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED;
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
@@ -717,10 +722,12 @@ pub fn propagate(
                 // reading the value, so broadening would re-credit it.
                 // Nor is a call whose construction the retriever traced: the
                 // client that reaches it is known, and another client of the
-                // family bounds nothing about it.
+                // family bounds nothing about it. The same holds for a
+                // client built outside the repository.
                 if whole.len() + phase.len() + unbounded.len() == before
                     && config_unresolved.is_none()
                     && scope != rvl_core::CONSTRUCTION_SCOPE_RECEIVER
+                    && !construction_unresolved
                 {
                     if let Some(bound) =
                         client_family(&site.client_type).and_then(|f| client.get(&f))
@@ -796,6 +803,19 @@ pub fn propagate(
             site_id: id,
             verdict: Verdict::Abstain,
             reason,
+        };
+    }
+    // The client is a dependency's value (po-av01j.232): cli/cli sends its
+    // requests on a client go-gh builds, under context.Background(). Whether
+    // that client carries a Timeout is written in the dependency, so the
+    // call is neither passed on the type nor failed on the missing field.
+    if construction_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason: "the client that reaches this call is built outside this repository, \
+                     so its bound cannot be read here"
+                .into(),
         };
     }
     // Resolved sentinel with nothing else bounding the call: decided, and
@@ -1427,6 +1447,39 @@ mod tests {
         );
         assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
         assert!(f.reason.contains("not traced"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_client_built_outside_the_repo_abstains_never_violates() {
+        // The receiver was traced to a dependency's call result: no
+        // construction is readable, and that is not evidence of no bound.
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED);
+        s.client_construction.clear();
+        // Another HTTP client the repo bounds says nothing about this one.
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(f.reason.contains("outside this repository"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_deadline_in_scope_bounds_a_client_built_outside_the_repo() {
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED);
+        s.client_construction.clear();
+        s.enclosing_function_body =
+            "ctx, cancel := context.WithTimeout(ctx, time.Second)\nc.Do(req)".into();
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
     }
 
     #[test]
