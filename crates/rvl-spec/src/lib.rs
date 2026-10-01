@@ -291,6 +291,33 @@ pub struct ApiSpec {
     /// remove, never a hidden defect.
     #[serde(default)]
     pub blocking_intent: BlockingIntent,
+    /// The constructor argument that gives this API's RECEIVER a finite
+    /// capacity, when the call blocks only because that capacity is full
+    /// (po-av01j.231). `queue.Queue.put` "blocks until a free slot is
+    /// available if the queue is full", and a `queue.Queue()` built with no
+    /// `maxsize` is never full: the spec's premise cannot occur at that site,
+    /// and reporting a missing deadline there is a false violation.
+    ///
+    /// Library knowledge, like [`ApiSpec::unbounded_sentinels`], so it is
+    /// declared here and never guessed by propagation. `None` -- every spec
+    /// authored before the field existed -- changes nothing. Skipped on
+    /// serialization when absent so such a spec round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_arg: Option<CapacityArg>,
+}
+
+/// Where a receiver's constructor takes its capacity: see
+/// [`ApiSpec::capacity_arg`]. The contract is the one Python's queue family
+/// documents: a positive integer is a finite capacity, so the call can block;
+/// the argument absent, zero or negative means no limit, so it cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityArg {
+    /// The keyword the argument is passed by (`maxsize`).
+    pub name: String,
+    /// Its zero-based position when passed positionally (`queue.Queue(10)`).
+    /// Absent for a keyword-only argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
 }
 
 impl ApiSpec {
@@ -1051,6 +1078,7 @@ mod tests {
             unbounded_sentinels: vec![],
             default_bound: DefaultBound::Unknown,
             blocking_intent: BlockingIntent::Incidental,
+            capacity_arg: None,
         }
     }
 
@@ -1754,6 +1782,49 @@ mod tests {
         let (v, why) = spec_gate(Some(&s)).unwrap();
         assert_eq!(v, Verdict::Abstain);
         assert_eq!(by_design_label(&why), None);
+    }
+
+    // --- capacity precondition (po-av01j.231) ---
+
+    #[test]
+    fn a_cache_without_capacity_arg_declares_none() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[{"type":"queue.Queue","method":"put","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":1.0}],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.apis[0].capacity_arg, None);
+        // Absent stays absent on the wire: a legacy spec round-trips.
+        assert!(!serde_json::to_string(&f.apis[0])
+            .unwrap()
+            .contains("capacity_arg"));
+    }
+
+    #[test]
+    fn capacity_arg_parses_with_and_without_a_position() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[
+                 {"type":"queue.Queue","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"maxsize","position":0}},
+                 {"type":"k.Only","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"capacity"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.apis[0].capacity_arg,
+            Some(CapacityArg {
+                name: "maxsize".into(),
+                position: Some(0)
+            })
+        );
+        assert_eq!(
+            f.apis[1].capacity_arg,
+            Some(CapacityArg {
+                name: "capacity".into(),
+                position: None
+            })
+        );
     }
 
     #[test]

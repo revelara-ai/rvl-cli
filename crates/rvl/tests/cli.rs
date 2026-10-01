@@ -2115,6 +2115,95 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
 }
 
+/// The SEED corpus declaring a CAPACITY PRECONDITION (po-av01j.231): the
+/// constructor argument without which a queue's `put` cannot block.
+fn queue_capacity_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("queue_capacity_specs.json")
+}
+
+/// Python, live end to end: `put` on a `queue.Queue()` built with no maxsize
+/// cannot block, so it is not_applicable, while the same call on a
+/// `queue.Queue(maxsize=10)` with no timeout still violates. A queue that
+/// arrives as a parameter has no construction to read and abstains. The
+/// pilot's site (a queue built in `__init__`, put from another method) is the
+/// fourth row.
+#[test]
+fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import queue\nfrom queue import LifoQueue\n\n\n\
+         def unbounded(x):\n    q = queue.Queue()\n    q.put(x)\n\n\n\
+         def bounded(x):\n    q = queue.Queue(maxsize=10)\n    q.put(x)\n\n\n\
+         def sized_by_caller(n, x):\n    stack = LifoQueue(n)\n    stack.put(x)\n\n\n\
+         class Client:\n    \
+             def __init__(self):\n        self._notifications = queue.Queue()\n\n    \
+             def on_notification(self, notification):\n        \
+                 self._notifications.put(notification)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(queue_capacity_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let by_line = |line: u32| {
+        let rows = verdicts_for(doc["sites"].as_array().unwrap(), &format!("svc.py:{line}"));
+        assert_eq!(rows.len(), 1, "one finding at svc.py:{line}: {rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+
+    let (verdict, reason) = by_line(7);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert_eq!(
+        reason,
+        "cannot block: unbounded queue (queue.Queue constructed with no maxsize at svc.py:6)"
+    );
+
+    let (verdict, reason) = by_line(12);
+    assert_eq!(verdict, "violates", "{reason}");
+    assert_eq!(reason, "no bound anywhere and the search was complete");
+
+    let (verdict, reason) = by_line(17);
+    assert_eq!(verdict, "abstain", "{reason}");
+    assert!(reason.contains("could not be read"), "{reason}");
+
+    let (verdict, reason) = by_line(25);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert!(reason.contains("svc.py:22"), "{reason}");
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job

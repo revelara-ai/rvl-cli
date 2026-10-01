@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -151,6 +152,37 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertTrue(
             any("OpenAI(" in s for s in ctor_sources),
             "construction of the chained client must be retrievable")
+
+    def test_a_local_receiver_carries_only_its_own_functions_construction(self):
+        # An assignment inside a function binds a LOCAL, so a same-named
+        # variable constructed in another function never reaches this call.
+        # Attaching both made `q = queue.Queue()` and `q = queue.Queue(maxsize=10)`
+        # indistinguishable at their `q.put` sites (po-av01j.231). A name the
+        # function does not assign is the module's, and keeps every
+        # construction of it.
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "svc.py"), "w") as f:
+                f.write(
+                    "import queue\n\n"
+                    "shared = queue.Queue(maxsize=3)\n\n\n"
+                    "def unbounded(x):\n"
+                    "    q = queue.Queue()\n"
+                    "    q.put(x)\n\n\n"
+                    "def bounded(x):\n"
+                    "    q = queue.Queue(maxsize=10)\n"
+                    "    q.put(x)\n\n\n"
+                    "def module_level(x):\n"
+                    "    shared.put(x)\n")
+            code, out, err = _run("--retrieve", "--root", root)
+            self.assertEqual(code, 0, err)
+            sites, _ = _parse_stream(out)
+        ctors = {
+            r["symbol"]: [c["source"] for c in r["client_construction"]]
+            for r in sites if r["func"] == "put"
+        }
+        self.assertEqual(ctors["unbounded"], ["q = queue.Queue()"])
+        self.assertEqual(ctors["bounded"], ["q = queue.Queue(maxsize=10)"])
+        self.assertEqual(ctors["module_level"], ["shared = queue.Queue(maxsize=3)"])
 
     def test_noise_calls_are_not_emitted(self):
         # items.append(...) and os.path.join(...) must never be sites
