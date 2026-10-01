@@ -1943,11 +1943,25 @@ fn run_helper(
     } else {
         chunk_files(files, MAX_FILES_ARG_BYTES)
     };
+    let node_heap_mb = (helper.kind == HelperKind::NodeScript)
+        .then(|| {
+            node_heap_limit_mb(
+                std::env::var(NODE_HEAP_ENV).ok().as_deref(),
+                std::env::var("NODE_OPTIONS").ok().as_deref(),
+                physical_memory_mb(),
+            )
+        })
+        .flatten();
     let mut merged = String::new();
     for batch in &batches {
         let argv = helper_argv(helper, root, name, batch, include_tests);
         let (program, args) = argv.split_first().expect("argv always has a program");
         let mut cmd = std::process::Command::new(program);
+        if let Some(mb) = node_heap_mb {
+            // Ahead of the script: V8 reads its flags at startup, and anything
+            // after `tsindex.js` is the helper's argument, not node's.
+            cmd.arg(format!("--max-old-space-size={mb}"));
+        }
         cmd.args(args);
         if helper.kind == HelperKind::NodeScript {
             cmd.env("NODE_PATH", node_path_for(root));
@@ -1978,10 +1992,11 @@ fn run_helper(
         if !output.status.success() {
             let kind = classify_helper_exit(output.status.code());
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(Err((
-                kind,
-                helper_degrade_reason(kind, &output.status, &stderr),
-            )));
+            let mut reason = helper_degrade_reason(kind, &output.status, &stderr);
+            if helper.kind == HelperKind::NodeScript && node_aborted(&output.status) {
+                reason = format!("{}; {reason}", node_abort_hint(node_heap_mb));
+            }
+            return Ok(Err((kind, reason)));
         }
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -1992,6 +2007,100 @@ fn run_helper(
         return Ok(Err(d));
     }
     Ok(Ok(merged))
+}
+
+/// Operator override for the heap limit a `node` helper runs under, in MB.
+/// `0` passes no limit at all and leaves node to its own default.
+const NODE_HEAP_ENV: &str = "RVL_NODE_MAX_OLD_SPACE_MB";
+
+/// The most heap rvl grants a `node` helper on its own initiative, in MB.
+const NODE_HEAP_CAP_MB: u64 = 16 * 1024;
+
+/// The V8 old-space limit, in MB, to start a `node` helper with; `None` passes
+/// no flag (po-av01j.118).
+///
+/// V8's default limit is about 4 GB on a 64-bit host however much RAM the
+/// machine has, and exceeding it is an abort, not a slow run. tsindex holds one
+/// TypeScript program for the whole repository, and retrieving infisical (7746
+/// files) peaks at 4.4 GB RSS: it completes with nothing to spare, the uncached
+/// thenable check died at that ceiling, and Rocket.Chat is larger still. A
+/// fixed limit under an input that grows is the defect, so the limit is derived
+/// from the host instead: half of physical memory, which leaves the other half
+/// for rvl, the OS and the file cache, capped at [`NODE_HEAP_CAP_MB`]. This is
+/// a ceiling on growth, not a reservation; a small repo uses what it used
+/// before.
+///
+/// Precedence, most specific first:
+///   1. [`NODE_HEAP_ENV`], a positive integer of MB, or `0` for no flag. An
+///      unparseable value is ignored rather than fatal.
+///   2. A `NODE_OPTIONS` that already sets `--max-old-space-size`: the child
+///      inherits it, and a command-line flag would override what the operator
+///      set on purpose.
+///   3. Half of physical memory, capped. Unknown memory size passes no flag.
+fn node_heap_limit_mb(
+    env_override: Option<&str>,
+    node_options: Option<&str>,
+    physical_mb: Option<u64>,
+) -> Option<u64> {
+    if let Some(mb) = env_override.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return (mb > 0).then_some(mb);
+    }
+    // V8 accepts the flag spelled with dashes or underscores.
+    if node_options.is_some_and(|o| o.replace('_', "-").contains("--max-old-space-size")) {
+        return None;
+    }
+    physical_mb
+        .map(|mb| (mb / 2).min(NODE_HEAP_CAP_MB))
+        .filter(|mb| *mb > 0)
+}
+
+/// Physical memory of this host in MB, when the platform will say.
+#[cfg(unix)]
+fn physical_memory_mb() -> Option<u64> {
+    // SAFETY: sysconf takes no pointers and has no preconditions; it returns
+    // -1 for a name it does not support, which the conversion rejects.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let bytes = u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)?;
+    Some(bytes / (1024 * 1024))
+}
+
+#[cfg(not(unix))]
+fn physical_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Did `node` abort? V8 calls abort() when the heap is exhausted, so the
+/// process dies of SIGABRT; a wrapper shell reports the same death as exit 134.
+fn node_aborted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGABRT) {
+            return true;
+        }
+    }
+    status.code() == Some(134)
+}
+
+/// What to tell the reader when a `node` helper aborted. The raw status is
+/// "signal: 6" followed by a frame of a native stack trace, which names neither
+/// the cause nor the one setting that moves the ceiling.
+fn node_abort_hint(limit_mb: Option<u64>) -> String {
+    let limit = match limit_mb {
+        Some(mb) => format!("the {mb} MB heap limit rvl set"),
+        None => "node's own heap limit".to_string(),
+    };
+    format!(
+        "node aborted, which is how V8 reports an exhausted heap; it ran under {limit}. \
+         Set {NODE_HEAP_ENV}=<MB> to raise it"
+    )
 }
 
 /// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
@@ -7468,6 +7577,70 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    /// po-av01j.118. The policy is pure so each rung of the precedence is
+    /// pinned without depending on the box the suite runs on.
+    #[test]
+    fn node_heap_limit_scales_with_the_host_and_yields_to_the_operator() {
+        // Derived: half of physical memory, so a 32 GB host gets 16 GB of
+        // heap rather than V8's flat 4 GB...
+        assert_eq!(node_heap_limit_mb(None, None, Some(32_768)), Some(16_384));
+        assert_eq!(node_heap_limit_mb(None, None, Some(8_192)), Some(4_096));
+        // ...and never more than the cap, however large the host.
+        assert_eq!(
+            node_heap_limit_mb(None, None, Some(512 * 1024)),
+            Some(NODE_HEAP_CAP_MB)
+        );
+        // Unknown memory size: say nothing rather than guess.
+        assert_eq!(node_heap_limit_mb(None, None, None), None);
+
+        // The explicit override beats everything, including the cap.
+        assert_eq!(
+            node_heap_limit_mb(Some("24000"), Some("--max-old-space-size=1"), Some(8_192)),
+            Some(24_000)
+        );
+        // 0 opts out: node keeps its own default.
+        assert_eq!(node_heap_limit_mb(Some("0"), None, Some(32_768)), None);
+        // Garbage is ignored, not fatal and not an opt-out.
+        assert_eq!(
+            node_heap_limit_mb(Some("lots"), None, Some(8_192)),
+            Some(4_096)
+        );
+
+        // An operator's NODE_OPTIONS limit is inherited by the child; a
+        // command-line flag would silently override it.
+        for opts in [
+            "--max-old-space-size=2048",
+            "--enable-source-maps --max_old_space_size=2048",
+        ] {
+            assert_eq!(node_heap_limit_mb(None, Some(opts), Some(32_768)), None);
+        }
+        // Unrelated NODE_OPTIONS do not switch the limit off.
+        assert_eq!(
+            node_heap_limit_mb(None, Some("--enable-source-maps"), Some(8_192)),
+            Some(4_096)
+        );
+    }
+
+    #[test]
+    fn node_abort_hint_names_the_limit_in_force_and_the_override() {
+        let set = node_abort_hint(Some(4096));
+        assert!(
+            set.contains("4096 MB") && set.contains(NODE_HEAP_ENV),
+            "{set}"
+        );
+        let unset = node_abort_hint(None);
+        assert!(
+            unset.contains("node's own heap limit") && unset.contains(NODE_HEAP_ENV),
+            "{unset}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_memory_is_readable_on_unix() {
+        assert!(physical_memory_mb().is_some_and(|mb| mb > 0));
     }
 
     #[test]

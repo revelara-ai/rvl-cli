@@ -298,6 +298,22 @@ in neither allowlist and an unresolved-or-builtin receiver, and is never
 emitted. A deliberately small, conservative allowlist that favours a
 resolvable, meaningful set over indexing every property call in the file.
 
+## Memory
+
+tsindex builds one TypeScript program for the whole repository, so peak memory
+grows with the repository: retrieving infisical (7746 files, dependencies
+installed) peaks at 4.4 GB RSS. V8's default heap limit is about 4 GB on a
+64-bit host whatever the machine has, and reaching it is an abort (SIGABRT,
+exit 134 through a shell), not a slow run.
+
+`rvl` therefore starts the helper as `node --max-old-space-size=<MB>
+tsindex.js`, with half of physical memory, at most 16384 MB. Set
+`RVL_NODE_MAX_OLD_SPACE_MB` to choose the limit (`0` leaves node's default); a
+`NODE_OPTIONS` that already sets `--max-old-space-size` is respected. When the
+helper does abort, the COVERAGE line names the limit it ran under and the
+variable. Run by hand, the script gets node's default unless you pass the flag
+yourself.
+
 ## callers/callees are empty in v1
 
 This helper reports per-site evidence and in-scope construction, not a
