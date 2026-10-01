@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 mod agent;
+mod autosync;
 mod base_ref;
 mod blend;
 mod changed;
@@ -95,6 +96,12 @@ enum Cmd {
         /// Loudly announced; never silent.
         #[arg(long)]
         specs_file: Option<PathBuf>,
+        /// Pin the spec cache content_version (one, or a comma-separated
+        /// list with one per tier) so a CI gate is reproducible across time.
+        /// The scan refuses to run on anything else, and a pinned scan never
+        /// starts a background cache check. Also RVL_SPEC_VERSION.
+        #[arg(long)]
+        spec_version: Option<String>,
         /// DEV ONLY: override the signed cache's judgments with a JSON array.
         /// The ratified corpus ships inside the cache, so no flag is needed;
         /// this is loudly announced when used. Unjudged classes still surface,
@@ -373,7 +380,12 @@ enum Cmd {
     },
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVL_OFFLINE=1 disables all fetches).
-    Sync,
+    Sync {
+        // po-av01j.171. Hidden: a scan starts it, a person runs plain `sync`.
+        /// The check a scan hands off: silent, always exit 0.
+        #[arg(long, hide = true)]
+        background: bool,
+    },
     /// Spec-cache maintenance.
     Cache {
         #[command(subcommand)]
@@ -2316,6 +2328,56 @@ fn helper_degrade_reason(
     }
 }
 
+/// Did the helper parse some of its units only PARTLY? Read off the
+/// `retrieval_stats` record(s) on one language's stream: `tus_incomplete`
+/// counts units whose parse raised errors, which clang recovers from by
+/// dropping the construct, calls and all (po-av01j.138). Such a unit's zero
+/// is not a complete zero, and the roll-call must not print it like one.
+///
+/// Returns the one-line explanation, or None for a clean parse or for a
+/// helper that does not report the field. A batched run carries one record
+/// per batch, so the counts SUM.
+fn incomplete_parse_note(stream: &str) -> Option<String> {
+    let (mut incomplete, mut parsed, mut headers, mut undeclared) = (0u64, 0u64, 0u64, 0u64);
+    for line in stream.lines().filter(|l| l.contains("\"retrieval_stats\"")) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("kind").and_then(|k| k.as_str()) != Some("retrieval_stats") {
+            continue;
+        }
+        let n = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        incomplete += n("tus_incomplete");
+        parsed += n("tus_parsed");
+        headers += n("includes_missing");
+        undeclared += n("decls_unresolved");
+    }
+    if incomplete == 0 {
+        return None;
+    }
+    let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut causes = Vec::new();
+    if headers > 0 {
+        causes.push(plural(headers, "header not found", "headers not found"));
+    }
+    if undeclared > 0 {
+        causes.push(plural(
+            undeclared,
+            "undeclared identifier",
+            "undeclared identifiers",
+        ));
+    }
+    let causes = if causes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", causes.join(", "))
+    };
+    Some(format!(
+        "{incomplete} of {} had parse errors{causes}; calls clang could not build are not counted",
+        plural(parsed, "translation unit", "translation units")
+    ))
+}
+
 /// Derive the snapshot tag for a scan target: the canonical base name of
 /// `path`, falling back to "repo" when that is unavailable (e.g. `.` at `/`).
 fn snapshot_name(path: &Path) -> String {
@@ -2768,10 +2830,19 @@ fn resolve_packet_stream(
                 // and found nothing. Counting site packets rather than lines
                 // keeps repo_config/retrieval_stats records out of the number.
                 let sites = out.matches("\"site_key\"").count();
-                status.push(render::LangStatus {
-                    lang: lang.to_string(),
-                    state: render::LangState::Scanned,
-                    detail: sites.to_string(),
+                // ...unless the helper says part of what it parsed was lost
+                // to parse errors: then the count is a floor, not an answer.
+                status.push(match incomplete_parse_note(&out) {
+                    None => render::LangStatus {
+                        lang: lang.to_string(),
+                        state: render::LangState::Scanned,
+                        detail: sites.to_string(),
+                    },
+                    Some(note) => render::LangStatus {
+                        lang: lang.to_string(),
+                        state: render::LangState::Partial,
+                        detail: format!("{sites} sites, INCOMPLETE: {note}"),
+                    },
                 });
                 if !combined.is_empty() && !combined.ends_with('\n') {
                     combined.push('\n');
@@ -3034,6 +3105,9 @@ fn findings_from_sites(
                     );
                 }
             }
+            // Before the no-tier bail, so a CI pin over an empty cache says
+            // what it wanted rather than only that nothing loaded.
+            autosync::cache_header(&tiers, store.root(), repo_root)?;
             let judgments = tiers.judgments();
             let commercial_loaded = tiers.commercial.is_some();
             match tiers.spec_texts()? {
@@ -6396,8 +6470,9 @@ fn run() -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(f.code));
         }
         // Onboarding surface (po-av01j.163): init needs the skills machinery
-        // for its plugin step but never the spec cache; hook is pure file
-        // operations on .git/hooks. Both dispatch before the store opens.
+        // for its plugin step and syncs the spec cache itself (po-av01j.171),
+        // so it opens no store here; hook is pure file operations on
+        // .git/hooks. Both dispatch before the store opens.
         Cmd::Init {
             project,
             skip_plugin,
@@ -6423,6 +6498,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     // already reported by the machinery.
                     Ok(!installed.is_empty())
                 },
+                || autosync::init_sync(&cfg),
             ));
         }
         Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
@@ -6532,8 +6608,10 @@ fn run() -> anyhow::Result<ExitCode> {
             pre_push,
             mode,
             hook,
+            spec_version,
             ..
         } => {
+            autosync::set_pin(autosync::resolve_pin(spec_version));
             let path = path.unwrap_or_else(|| PathBuf::from("."));
             let tiers = tier_filter(oss_only);
             // The base-ref chain (po-av01j.194), resolved once and used twice:
@@ -6607,7 +6685,7 @@ fn run() -> anyhow::Result<ExitCode> {
             );
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
-            if incremental && retrieved.is_none() {
+            let result = if incremental && retrieved.is_none() {
                 run_scan_incremental(
                     &store,
                     &keyset,
@@ -6650,7 +6728,11 @@ fn run() -> anyhow::Result<ExitCode> {
                     include_tests,
                     blend,
                 )
-            }
+            };
+            // After the scan, never before: the check it starts can install
+            // a new cache, and that must apply to the NEXT run only.
+            autosync::after_scan(&cfg, specs_file.is_none());
+            result
         }
         Cmd::Report {
             path,
@@ -6710,7 +6792,8 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
         ),
-        Cmd::Sync => {
+        Cmd::Sync { background: true } => Ok(autosync::background(&cfg, &store, &keyset)),
+        Cmd::Sync { background: false } => {
             // Tiered sync (po-scnmv.13). The OSS vocabulary tier syncs with
             // NO credentials — the public binary works out of the box; the
             // commercial tier still requires the org key. No-key is no longer
@@ -6725,12 +6808,9 @@ fn run() -> anyhow::Result<ExitCode> {
                 print!("oss tier: ");
                 let _ = std::io::stdout().flush();
             }
-            let oss_code = report(&rvl_cache::sync(
-                &oss_store,
-                &oss_fetcher,
-                &keyset,
-                cfg.offline,
-            ));
+            let oss_outcome = rvl_cache::sync(&oss_store, &oss_fetcher, &keyset, cfg.offline);
+            autosync::note_if_current(&cfg.cache_dir, [Some(&oss_outcome)]);
+            let oss_code = report(&oss_outcome);
             if cfg.org_key.is_empty() {
                 if !cfg.offline {
                     eprintln!(
@@ -6752,12 +6832,9 @@ fn run() -> anyhow::Result<ExitCode> {
             // A keyed install's exit code stays governed by the commercial
             // sync, exactly as before this slice; an OSS hiccup is reported
             // above but must not fail a healthy commercial sync.
-            Ok(report(&rvl_cache::sync(
-                &store,
-                &fetcher,
-                &keyset,
-                cfg.offline,
-            )))
+            let outcome = rvl_cache::sync(&store, &fetcher, &keyset, cfg.offline);
+            autosync::note_if_current(&cfg.cache_dir, [Some(&outcome)]);
+            Ok(report(&outcome))
         }
         Cmd::Index { cmd } => match cmd {
             IndexCmd::Init { path, retrieved } => {
@@ -7710,6 +7787,30 @@ mod tests {
             "got: {out}"
         );
         assert!(out.contains("/opt/rvl/goindex (bundled)"), "got: {out}");
+    }
+
+    /// po-av01j.138: cindex's stats for the SAME call with and without its
+    /// header. The clean record is not a partial parse; the truncated one is,
+    /// and the note says how much was lost and why.
+    #[test]
+    fn an_incomplete_parse_is_read_off_the_retrieval_stats_record() {
+        let clean = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","mode":"allowlist","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":0,"tus_incomplete_paths":[],"includes_missing":0,"decls_unresolved":0,"calls_callee_unresolved":0,"cpp_files_skipped_no_db":0}"#;
+        assert_eq!(incomplete_parse_note(clean), None);
+        // A helper that predates the field is not accused of anything.
+        let old = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"python","files_total":1,"files_parsed":1,"files_failed":0,"sites":0}"#;
+        assert_eq!(incomplete_parse_note(old), None);
+
+        let truncated = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","mode":"allowlist","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/a.c"],"includes_missing":1,"decls_unresolved":7,"calls_callee_unresolved":0,"cpp_files_skipped_no_db":0}"#;
+        let note = incomplete_parse_note(truncated).expect("a truncated parse is reported");
+        assert!(note.contains("1 of 1 translation unit"), "{note}");
+        assert!(note.contains("1 header not found"), "{note}");
+        assert!(note.contains("7 undeclared identifiers"), "{note}");
+
+        // A batched run carries one record per batch: they SUM.
+        let batched = format!("{truncated}\n{truncated}\n");
+        let note = incomplete_parse_note(&batched).unwrap();
+        assert!(note.contains("2 of 2 translation units"), "{note}");
+        assert!(note.contains("2 headers not found"), "{note}");
     }
 
     #[test]

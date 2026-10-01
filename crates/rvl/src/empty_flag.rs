@@ -68,6 +68,9 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("scan", "specs-file", Empty::Error),
     ("scan", "judgments", Empty::Error),
     ("scan", "out", Empty::Error),
+    // rvl-native (po-av01j.171). A CI pin is an optional string: empty ==
+    // not given, so RVL_SPEC_VERSION still applies and nothing is pinned.
+    ("scan", "spec-version", Empty::Absent),
     // Added when po-av01j.185 and .191 merged in alongside .192; this table is
     // what caught them. Each read off rvl-cli origin/main, not inferred:
     //
@@ -149,6 +152,11 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("risk ready", "service", Empty::Absent),  // risk.go:535
     ("risk ready", "format", Empty::Absent),   // risk.go:574
     ("risk ready", "limit", Empty::Error),     // risk.go:498/506
+    // rvl-native (po-av01j.221), NOT the Absent family convention: an empty
+    // team read as "no filter" would widen a per-team view to the whole
+    // register (`--team="$TEAM"` with TEAM unset). Rejected at parse time.
+    ("risk list", "team", Empty::Error),
+    ("risk ready", "team", Empty::Error),
     ("risk show", "format", Empty::Absent),    // risk.go:751
     ("risk context", "format", Empty::Absent), // risk.go:920
     // risk.go:1097/1152: `--reason=` OVERRIDES the "Resolved" default and is
@@ -303,6 +311,7 @@ pub fn normalize(cmd: &mut crate::Cmd) {
             scan_dir,
             timeout,
             format,
+            spec_version,
             ..
         } => {
             // Only the three rvl-cli-parity paths can be empty at all (they
@@ -311,7 +320,16 @@ pub fn normalize(cmd: &mut crate::Cmd) {
             for p in [target, file, scan_dir] {
                 absent_path(p);
             }
-            for s in [color, hook, base, service, team, timeout, format] {
+            for s in [
+                color,
+                hook,
+                base,
+                service,
+                team,
+                timeout,
+                format,
+                spec_version,
+            ] {
                 absent_str(s);
             }
         }

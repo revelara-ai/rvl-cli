@@ -190,11 +190,10 @@ fn goindex_binary(dir: &Path) -> Option<PathBuf> {
     let src = manifest_dir().join("../../helpers/goindex");
     let bin = dir.join("goindex");
     match Command::new("go")
-        // go derives GOROOT from its own binary; an inherited one left by
-        // another toolchain (gvm) fails the build with "compile: version
-        // go1.X does not match go tool version go1.Y".
-        .env_remove("GOROOT")
         .args(["build", "-o"])
+        // A `go` binary locates its own root; an inherited GOROOT naming
+        // another release fails every std package (see cli.rs go_build_command).
+        .env_remove("GOROOT")
         .arg(&bin)
         .arg(".")
         .current_dir(&src)
