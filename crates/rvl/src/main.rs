@@ -5466,6 +5466,7 @@ impl SkillsCtx {
             store: &self.store,
             fetcher: &self.fetcher,
             home: &self.home,
+            cache_scope: self.fetcher.cache_scope(),
             offline: self.offline,
             allow_unsigned: self.allow_unsigned,
             allow_missing_checksum: self.allow_missing_checksum,
