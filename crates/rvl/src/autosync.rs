@@ -205,6 +205,11 @@ fn describe(tier: &str, o: &SyncOutcome) -> String {
         SyncOutcome::SchemaTooNew { hint } => format!("{tier}: {hint}"),
         SyncOutcome::Rejected { reason } => format!("{tier} rejected ({reason})"),
         SyncOutcome::FetchFailed { reason } => format!("{tier} fetch failed ({reason})"),
+        // Not a network failure (po-gcn3q): the server answered, and has no
+        // cache at this address, so retrying the same sync cannot help.
+        SyncOutcome::NotPublished { url } => {
+            format!("{tier} not published by the server ({url})")
+        }
         SyncOutcome::InstallFailed { reason } => format!("{tier} install failed ({reason})"),
     }
 }
@@ -231,6 +236,7 @@ mod tests {
             SyncOutcome::SchemaTooNew { hint: "h".into() },
             SyncOutcome::Rejected { reason: "r".into() },
             SyncOutcome::FetchFailed { reason: "f".into() },
+            SyncOutcome::NotPublished { url: "u".into() },
             SyncOutcome::InstallFailed { reason: "i".into() },
         ] {
             assert!(describe("oss tier", &o).starts_with("oss tier"));
@@ -246,5 +252,12 @@ mod tests {
             resolve_pin(Some(" 2026-09-01.a ".into())).as_deref(),
             Some("2026-09-01.a")
         );
+    }
+
+    #[test]
+    fn describe_keeps_not_published_apart_from_a_fetch_failure() {
+        let line = describe("oss tier", &SyncOutcome::NotPublished { url: "u".into() });
+        assert!(line.contains("not published"), "{line}");
+        assert!(!line.contains("fetch failed"), "{line}");
     }
 }
