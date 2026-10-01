@@ -3023,6 +3023,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
