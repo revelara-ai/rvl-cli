@@ -6149,24 +6149,13 @@ fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
     );
 }
 
-/// PARTIAL STAGING, and the limit of this fix stated out loud. The staged hunk
-/// puts the file in scope; the retrievers still read WORKING-TREE bytes, so the
-/// unstaged hunk is judged too. That is a known gap — what the scan must never
-/// do is carry it silently, so it names the partially staged files.
-#[test]
-fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
-    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
-    stage(&root, &["add", "half.py"]);
-    // Further edit, deliberately NOT staged.
-    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
-    let specs = dir.path().join("specs.json");
+/// Run the pre-commit gate over `root`, exactly as the installed shim does.
+fn pre_commit_gate(dir: &std::path::Path, root: &std::path::Path) -> std::process::Output {
+    let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
-
-    let out = bin()
+    bin()
         .arg("scan")
-        .arg(&root)
+        .arg(root)
         .args([
             "--incremental",
             "--changed-only",
@@ -6175,17 +6164,117 @@ fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("HOME", dir.path().join("home"))
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .env("RVL_INDEX_DIR", dir.join("index"))
+        .env("HOME", dir.join("home"))
+        .env_remove("RVL_FORCE")
         .output()
-        .expect("failed to run rvl");
+        .expect("failed to run rvl")
+}
+
+/// PARTIAL STAGING IS REFUSED (po-io8sk.3). The staged hunk puts the file in
+/// scope, but every lane reads WORKING-TREE bytes, so the scan would judge
+/// content that is not the content being committed. That used to be a note on
+/// stderr over a verdict the commit did not earn; it is now an error. Exit 1,
+/// not `EXIT_BLOCKED`: the code was never judged.
+#[test]
+fn a_partially_staged_file_is_refused_not_judged_on_working_tree_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    // Further edit, deliberately NOT staged.
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a partially staged file must fail the gate as 'not judged':\n{stdout}\n{stderr}"
+    );
     assert!(
         stderr.contains("half.py") && stderr.contains("unstaged edits"),
-        "a partially staged file must be named, not silently judged on \
-         working-tree bytes: {stderr}"
+        "the refusal must name the partially staged file: {stderr}"
     );
+    assert!(
+        stderr.contains("git stash --keep-index"),
+        "the refusal must say how to get the staged content judged: {stderr}"
+    );
+    assert!(
+        !stdout.contains("commit clean"),
+        "a refused scan must not print a verdict: {stdout}"
+    );
+}
+
+/// THE RACE THE REFUSAL CLOSES. The author stages a secret, then deletes it
+/// from the working tree without staging the deletion. The working tree is
+/// clean, the commit is not. A gate that read working-tree bytes passed this
+/// commit; the verdict must never be `0` here.
+#[test]
+fn a_staged_secret_hidden_by_an_unstaged_edit_cannot_pass_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(
+        root.join("leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "leak.py"]);
+    std::fs::write(root.join("leak.py"), "VALUE = 1\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the staged secret is what gets committed; a clean working tree must \
+         not buy a clean verdict:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The refusal is scoped to the gap, not to staging in general: once the
+/// working tree and the index agree on the file, the same commit is judged.
+#[test]
+fn a_fully_staged_file_is_still_judged_by_the_pre_commit_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "index and working tree agree, so the scan must run:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE REFERENCE CI JOB SHIPS, and the copy in the docs is the file
+/// (po-io8sk.3). docs/gating.md names the required CI check as the guard and
+/// the hook as the fast path; a guard nobody can copy is not a guard.
+#[test]
+fn gating_docs_ship_the_reference_ci_job_verbatim() {
+    let docs = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into()),
+    )
+    .join("../../docs");
+    let job = std::fs::read_to_string(docs.join("examples/rvl-gate.yml"))
+        .expect("docs/examples/rvl-gate.yml must exist");
+    let gating = std::fs::read_to_string(docs.join("gating.md")).unwrap();
+    assert!(
+        gating.contains(job.trim_end()),
+        "docs/gating.md must carry docs/examples/rvl-gate.yml verbatim"
+    );
+    for needle in ["pull_request", "merge_group", "--strict", "lang_status"] {
+        assert!(job.contains(needle), "reference job must mention {needle}");
+    }
 }
 
 /// PRE-PUSH picks up the commits in the pushed range, so a finding introduced
