@@ -352,3 +352,69 @@ fn unparseable_tus_are_counted_never_guessed() {
     assert_eq!(st["tus_total"], 1);
     assert_eq!(st["tus_failed"], 1);
 }
+
+/// A copy of the built `cindex` in `<tmp>/bin`, with a vendored bundle beside
+/// it whose "library" is not a library. Needs no libclang on the machine.
+fn install_with_broken_bundle() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let bundle = bin_dir.join("libclang");
+    std::fs::create_dir_all(bundle.join("include")).unwrap();
+    let lib = if cfg!(target_os = "macos") {
+        "libclang.dylib"
+    } else {
+        "libclang.so"
+    };
+    std::fs::write(bundle.join(lib), b"not a shared object").unwrap();
+    let exe = bin_dir.join("cindex");
+    std::fs::copy(bin_path(), &exe).unwrap();
+    (tmp, exe)
+}
+
+/// The vendored bundle beside the executable is what loads (po-av01j.49),
+/// ahead of any system libclang: with a bundle whose library is garbage the
+/// probe must FAIL and name the bundle, even on a machine where the system
+/// search would have succeeded. Falling through to the system clang would
+/// make release scans depend on the machine again.
+#[test]
+fn engine_check_loads_the_vendored_bundle_before_the_system_libclang() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env_remove("LIBCLANG_PATH")
+        .output()
+        .expect("run the copied cindex");
+    assert!(
+        !out.status.success(),
+        "a broken vendored bundle must not be bypassed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    let bundle = exe
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("libclang");
+    assert!(
+        err.contains(&bundle.display().to_string()),
+        "the error must name the bundle it tried: {err}"
+    );
+}
+
+/// LIBCLANG_PATH stays the operator's override, bundle or not.
+#[test]
+fn libclang_path_overrides_the_vendored_bundle() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env("LIBCLANG_PATH", "/nonexistent/po-av01j.49")
+        .output()
+        .expect("run the copied cindex");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("vendored"),
+        "LIBCLANG_PATH was set, so the bundle must not be consulted: {err}"
+    );
+}

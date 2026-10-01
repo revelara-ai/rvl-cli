@@ -1,0 +1,39 @@
+# The libclang every RELEASE archive vendors beside `cindex` (po-av01j.49).
+#
+# Engine pin po-ae75b.9 requires release scan results to be reproducible
+# across machines, so a release does not use the scanning machine's clang: it
+# ships this one. ci/fetch-libclang.sh reads this file in release CI, verifies
+# every download against the sha256 below and fails the release on any
+# mismatch. tests/libclang_pin.rs holds the `lib` triples to the `targets` in
+# dist-workspace.toml, so a new release target cannot ship unpinned.
+#
+# LIBRARY: the per-platform wheels of the `libclang` PyPI project
+# (github.com/sighingnow/libclang), which build the official LLVM 18.1.1
+# source into one self-contained libclang (it links only libc, libm, libdl,
+# libpthread and librt). Chosen over the official clang+llvm release tarballs
+# because those are 1 GB+ per target for the one library cindex loads. The
+# checksums are the ones PyPI publishes for each file (pypi.org/pypi/libclang
+# /18.1.1/json), re-verified by download on 2026-09-30. aarch64-apple-darwin
+# uses the `18.1.1-1` rebuild, which is the file pip itself resolves to.
+#
+# HEADERS: the wheels ship no clang builtin headers (stddef.h, stdarg.h,
+# stdint.h ...), and without them a TU that includes any libc header fails
+# with a fatal diagnostic while still counting as parsed. They come from the
+# official clang source tarball of the SAME version, lib/Headers.
+#
+# To bump: change every line together (one LLVM version for all targets),
+# take each sha256 from the publisher, and re-run `cargo test -p cindex`.
+#
+# Format, whitespace-separated, `#` starts a comment:
+#   version <llvm-version>
+#   headers <url> <sha256> <directory-inside-the-tarball>
+#   lib <rust-target-triple> <url> <sha256> <library-member> <license-member>
+
+version 18.1.1
+
+headers https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.1/clang-18.1.1.src.tar.xz 412a482b81a969846b127552f8fa2251c7d57a82337f848fe7fea8e6ce614836 clang-18.1.1.src/lib/Headers
+
+lib x86_64-unknown-linux-gnu https://files.pythonhosted.org/packages/1d/fc/716c1e62e512ef1c160e7984a73a5fc7df45166f2ff3f254e71c58076f7c/libclang-18.1.1-py2.py3-none-manylinux2010_x86_64.whl c533091d8a3bbf7460a00cb6c1a71da93bffe148f172c7d03b1c31fbf8aa2a0b libclang-18.1.1.data/platlib/clang/native/libclang.so libclang-18.1.1.dist-info/LICENSE.TXT
+lib aarch64-unknown-linux-gnu https://files.pythonhosted.org/packages/3c/3d/f0ac1150280d8d20d059608cf2d5ff61b7c3b7f7bcf9c0f425ab92df769a/libclang-18.1.1-py2.py3-none-manylinux2014_aarch64.whl 54dda940a4a0491a9d1532bf071ea3ef26e6dbaf03b5000ed94dd7174e8f9592 libclang-18.1.1.data/platlib/clang/native/libclang.so libclang-18.1.1.dist-info/LICENSE.TXT
+lib x86_64-apple-darwin https://files.pythonhosted.org/packages/e2/e5/fc61bbded91a8830ccce94c5294ecd6e88e496cc85f6704bf350c0634b70/libclang-18.1.1-py2.py3-none-macosx_10_9_x86_64.whl 6f14c3f194704e5d09769108f03185fce7acaf1d1ae4bbb2f30a72c2400cb7c5 libclang-18.1.1.data/platlib/clang/native/libclang.dylib libclang-18.1.1.dist-info/LICENSE.TXT
+lib aarch64-apple-darwin https://files.pythonhosted.org/packages/4b/49/f5e3e7e1419872b69f6f5e82ba56e33955a74bd537d8a1f5f1eff2f3668a/libclang-18.1.1-1-py2.py3-none-macosx_11_0_arm64.whl 0b2e143f0fac830156feb56f9231ff8338c20aecfe72b4ffe96f19e5a1dbb69a libclang-18.1.1.data/platlib/clang/native/libclang.dylib libclang-18.1.1.dist-info/LICENSE.TXT
