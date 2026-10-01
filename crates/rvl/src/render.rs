@@ -101,6 +101,13 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// `rvl scan --blend` ran and its agent half did not answer for every
+    /// undecided runtime site (po-av01j.205): vetoed, no agent, timed out,
+    /// failed, malformed, or over the cap. Carries the reason. The footer
+    /// then refuses "commit clean": the report is the deterministic half
+    /// alone, and presenting it as the blend is the po-av01j.199 bug at a new
+    /// seam. `None` when no blend ran or it completed.
+    pub blend_incomplete: Option<String>,
     /// Distinct machine-generated files whose packets were dropped before
     /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
     /// without saying so reads as having scanned them, and it moves every
@@ -714,7 +721,7 @@ pub fn render_ladder(
     if blocking.is_empty() {
         let mut foot = format!(
             "{} {} advisory",
-            if nothing_scanned {
+            if nothing_scanned || cov.blend_incomplete.is_some() {
                 paint("\u{26a0}", "33", color)
             } else {
                 paint("\u{2713}", "32", color)
@@ -735,6 +742,21 @@ pub fn render_ladder(
                 paint(
                     "NOT CLEAN \u{2014} nothing was scanned (see COVERAGE); \
                      commit allowed, rvl fails open",
+                    "33",
+                    color
+                )
+            );
+        } else if let Some(why) = &cov.blend_incomplete {
+            // Same fail-open posture as above: the agent being unavailable
+            // must not block a commit, so the verdict line carries it.
+            let _ = writeln!(
+                o,
+                "{foot} \u{00b7} {}",
+                paint(
+                    &format!(
+                        "NOT A BLENDED RESULT \u{2014} {why} (see BLEND); \
+                         deterministic half only, rvl fails open"
+                    ),
                     "33",
                     color
                 )
