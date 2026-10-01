@@ -30,6 +30,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -87,6 +88,20 @@ if (!ts || typeof ts.createProgram !== 'function' || !ts.sys) {
 // macro_expansion (always false for TypeScript, which has no macros;
 // mechanical for C/C++). v2 is a strict superset of v1.
 const PACKET_SCHEMA = 2;
+
+// contentVersion is the second line of the --packet-schema reply: which
+// tsindex this is. The schema integer says what SHAPE the stream has. It does
+// not move when the helper learns a new client surface, so a week-old tsindex
+// and today's answer the same "2" and scan differently. This is the first 12
+// hex digits of the sha256 of this file. rvl computes the same value for the
+// copy it ships and warns when the helper it found is a different one.
+function contentVersion() {
+  return crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(__filename))
+    .digest('hex')
+    .slice(0, 12);
+}
 
 // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes and
 // pyindex's MAX_SNIPPET_BYTES. A pathologically long function body should not
@@ -2101,7 +2116,9 @@ function main(argv) {
 
   // Let a consumer negotiate the contract before paying for a load.
   if (args.packetSchema) {
-    writeStdoutSync(String(PACKET_SCHEMA) + '\n');
+    writeStdoutSync(
+      String(PACKET_SCHEMA) + '\n' + 'content-version ' + contentVersion() + '\n'
+    );
     return 0;
   }
 

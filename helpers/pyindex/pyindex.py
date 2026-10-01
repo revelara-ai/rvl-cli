@@ -35,6 +35,7 @@
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import sys
@@ -1050,6 +1051,19 @@ def emit_stats(snapshot, stats, n_sites, out=sys.stdout):
 # CLI
 # ---------------------------------------------------------------------------
 
+def content_version():
+    """The second line of the --packet-schema reply: which pyindex this is.
+
+    The schema integer says what SHAPE the stream has. It does not move when
+    the helper learns a new client surface, so a week-old pyindex and today's
+    answer the same "2" and scan differently. This is the first 12 hex digits
+    of the sha256 of this file. rvl computes the same value for the copy it
+    ships and warns when the helper it found is a different one.
+    """
+    with open(os.path.abspath(__file__), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pyindex",
@@ -1079,6 +1093,7 @@ def main(argv=None):
     # Lets a consumer negotiate the contract before paying for a load.
     if args.packet_schema:
         print(PACKET_SCHEMA)
+        print("content-version " + content_version())
         return 0
 
     if args.retrieve:

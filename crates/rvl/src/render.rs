@@ -222,6 +222,19 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             .collect();
         let line = format!("  retrievers: {}", parts.join(" \u{00b7} "));
         let _ = writeln!(o, "{}", paint(&line, "2", color));
+        // po-vd7ii left the reader to notice that a path above was the wrong
+        // one. A helper that is measurably not the shipped build gets its own
+        // line, in the warning color, so the roll-call cannot be skimmed past
+        // (po-8ozxg).
+        for r in &cov.retrievers {
+            if let Some(drift) = &r.drift {
+                let line = format!(
+                    "  helper drift: {} {} ({}) {drift}",
+                    r.lang, r.path, r.source
+                );
+                let _ = writeln!(o, "{}", paint(&line, "33", color));
+            }
+        }
     }
     if cov.generated_skipped > 0 {
         let g = format!(
@@ -302,6 +315,9 @@ pub struct RetrieverInfo {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// Set when this helper is not the build this binary ships and a shipped
+    /// sibling exists to compare against: what differs, in words (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

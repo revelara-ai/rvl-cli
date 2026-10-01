@@ -8,6 +8,12 @@ decides nothing about reliability, it only says what the code is.
     java javaindex.java --retrieve --root <repo> --files A.java,B.java  # incremental reload
     java javaindex.java --packet-schema                                 # negotiate before loading
 
+`--packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of `javaindex.java` itself. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 ## Engine: the JDK's own javac Compiler Tree API, in source-file mode
 
 The deliberate, on-record engine choice (po-av01j.9): **javac's Compiler Tree
