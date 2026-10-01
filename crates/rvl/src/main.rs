@@ -22,7 +22,9 @@ mod waiver;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome};
+use rvl_cache::{
+    offline_from_env, CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TierFilter,
+};
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -95,6 +97,13 @@ enum Cmd {
         /// they are never dropped.
         #[arg(long)]
         judgments: Option<PathBuf>,
+        /// Load the OSS tier alone, even when a commercial tier is installed,
+        /// so the scan behaves exactly like a no-key install: vocabulary lanes
+        /// only, no judgments, everything advisory except lanes that carry
+        /// their own severity (secrets). A load filter: `sync` is untouched
+        /// and nothing is uninstalled. Announced on stderr on every run.
+        #[arg(long, conflicts_with_all = ["specs_file", "judgments"])]
+        oss_only: bool,
         /// Write findings JSON here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -292,6 +301,10 @@ enum Cmd {
         /// DEV ONLY: bypass the signed cache and load specs from a file.
         #[arg(long)]
         specs_file: Option<PathBuf>,
+        /// Load the OSS tier alone, as `scan --oss-only` does, so the report
+        /// shows what a no-key install would send.
+        #[arg(long, conflicts_with = "specs_file")]
+        oss_only: bool,
         /// Warm re-scan: reuse the persistent packet index. Ignored when
         /// `--retrieved` is given.
         #[arg(long)]
@@ -2682,12 +2695,13 @@ fn resolve_findings(
     stream: &str,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
-        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, repo_root, verbose,
+        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, tiers, repo_root, verbose,
     )
 }
 
@@ -2759,6 +2773,15 @@ fn resolve_judgments(
     }
 }
 
+/// `--oss-only` as the load filter it selects.
+fn tier_filter(oss_only: bool) -> TierFilter {
+    if oss_only {
+        TierFilter::OssOnly
+    } else {
+        TierFilter::Both
+    }
+}
+
 /// The pipeline shared by the packet-stream path and the incremental path:
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
@@ -2776,6 +2799,7 @@ fn findings_from_sites(
     skipped: usize,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tier_filter: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
@@ -2803,7 +2827,25 @@ fn findings_from_sites(
             // commercial judgment lanes when a keyed sync installed them.
             // Either tier alone scans; only BOTH missing is fatal.
             let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
-            let tiers = rvl_cache::load_tiered(store, &oss_store, keyset, &rvl_cache::today_utc());
+            let tiers = rvl_cache::load_tiered(
+                store,
+                &oss_store,
+                keyset,
+                &rvl_cache::today_utc(),
+                tier_filter,
+            );
+            // A NARROWED LOAD IS NEVER QUIET (po-7wgx3). Without the
+            // commercial tier nothing grades an API surface, so the ladder
+            // reads lighter than the install's real answer. Said on stderr on
+            // every run, for the same reason `--specs-file` is: a scan whose
+            // inputs were reduced must not look like the ordinary one.
+            if tier_filter == TierFilter::OssOnly {
+                eprintln!(
+                    "note: --oss-only: the commercial tier was not loaded; this scan uses \
+                     the OSS vocabulary tier alone, so API surfaces are unjudged and \
+                     findings are advisory"
+                );
+            }
             for loaded in [&tiers.commercial, &tiers.oss].into_iter().flatten() {
                 if let Some(hint) = &loaded.upgrade_hint {
                     eprintln!("{hint}");
@@ -2825,6 +2867,10 @@ fn findings_from_sites(
             let commercial_loaded = tiers.commercial.is_some();
             match tiers.spec_texts()? {
                 Some((base, overlay)) => (base, overlay, judgments, commercial_loaded),
+                None if tier_filter == TierFilter::OssOnly => anyhow::bail!(
+                    "--oss-only needs the OSS tier, and it is not installed or did not \
+                     verify: run '{BIN} sync' (the OSS vocabulary tier needs no API key)"
+                ),
                 None => anyhow::bail!(
                     "no spec cache tier loadable: run '{BIN} sync' \
                      (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
@@ -3132,6 +3178,7 @@ fn run_scan(
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
@@ -3202,6 +3249,7 @@ fn run_scan(
         &stream.text,
         specs_file,
         judgments,
+        tiers,
         Some(path),
         true,
     )?;
@@ -4334,6 +4382,7 @@ fn run_scan_incremental(
     path: &std::path::Path,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
@@ -4457,6 +4506,7 @@ fn run_scan_incremental(
         0,
         specs_file,
         judgments,
+        tiers,
         Some(path),
         true,
     )?;
@@ -4613,6 +4663,7 @@ fn run_explain(
         &stream.text,
         specs_file,
         judgments,
+        TierFilter::Both,
         Some(path),
         false,
     )?;
@@ -4679,6 +4730,7 @@ fn run_suppress(
                         &stream.text,
                         specs_file,
                         judgments,
+                        TierFilter::Both,
                         Some(scan_path),
                         false,
                     )?;
@@ -4740,6 +4792,7 @@ fn run_report(
     path: &std::path::Path,
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
+    tiers: TierFilter,
     incremental: bool,
     json: bool,
     out: Option<&std::path::Path>,
@@ -4774,6 +4827,7 @@ fn run_report(
             0,
             specs_file,
             None,
+            tiers,
             Some(path),
             false,
         )?;
@@ -4786,6 +4840,7 @@ fn run_report(
             &stream.text,
             specs_file,
             None,
+            tiers,
             Some(path),
             false,
         )?;
@@ -6134,6 +6189,7 @@ fn run() -> anyhow::Result<ExitCode> {
             retrieved,
             specs_file,
             judgments,
+            oss_only,
             out,
             color,
             incremental,
@@ -6150,6 +6206,7 @@ fn run() -> anyhow::Result<ExitCode> {
             ..
         } => {
             let path = path.unwrap_or_else(|| PathBuf::from("."));
+            let tiers = tier_filter(oss_only);
             // The base-ref chain (po-av01j.194), resolved once and used twice:
             // to pick the changed-set question below, and HERE to decide what
             // a v1 `--changed-only` meant. v1 resolved that flag against this
@@ -6230,6 +6287,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     &path,
                     specs_file.as_deref(),
                     judgments.as_deref(),
+                    tiers,
                     out.as_deref(),
                     color.as_deref(),
                     strict,
@@ -6256,6 +6314,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     retrieved.as_deref(),
                     specs_file.as_deref(),
                     judgments.as_deref(),
+                    tiers,
                     out.as_deref(),
                     color.as_deref(),
                     strict,
@@ -6268,6 +6327,7 @@ fn run() -> anyhow::Result<ExitCode> {
             path,
             retrieved,
             specs_file,
+            oss_only,
             incremental,
             json,
             out,
@@ -6278,6 +6338,7 @@ fn run() -> anyhow::Result<ExitCode> {
             &path.unwrap_or_else(|| PathBuf::from(".")),
             retrieved.as_deref(),
             specs_file.as_deref(),
+            tier_filter(oss_only),
             incremental,
             json,
             out.as_deref(),
@@ -6448,8 +6509,13 @@ fn run() -> anyhow::Result<ExitCode> {
                 // The same tiered load a scan performs, so the queue is
                 // measured against the specs a scan would actually judge with.
                 let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
-                let tiers =
-                    rvl_cache::load_tiered(&store, &oss_store, &keyset, &rvl_cache::today_utc());
+                let tiers = rvl_cache::load_tiered(
+                    &store,
+                    &oss_store,
+                    &keyset,
+                    &rvl_cache::today_utc(),
+                    TierFilter::Both,
+                );
                 let specs = match tiers.spec_texts()? {
                     Some((base, overlay)) => {
                         let mut cache = rvl_spec::SpecCache::load(&base)?;

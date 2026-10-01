@@ -534,3 +534,76 @@ fn a_304_is_up_to_date_not_a_signature_failure() {
         Err(e) => panic!("a 304 must not be an error: {e}"),
     }
 }
+
+// --- tier filter (po-7wgx3) ---
+
+/// A keyed install: the OSS vocabulary tier under `oss/` and a commercial
+/// tier carrying judgments beside it, both signed by the same keyset.
+fn keyed_install(k: &TestKeys) -> (tempfile::TempDir, CacheStore, CacheStore) {
+    let (dir, commercial) = store();
+    let oss = commercial.subdir_store(OSS_DIR).unwrap();
+    let oss_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "content_version": "2026-07-30.1",
+        "specs": {"apis": [], "configs": [], "server": ["oss-vocabulary"]}
+    }))
+    .unwrap();
+    assert!(matches!(
+        oss.install(&oss_bytes, &sign_b64(k, &oss_bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+    let com_bytes = envelope_with_judgments("2026-07-30.1", "blocking");
+    assert!(matches!(
+        commercial.install(&com_bytes, &sign_b64(k, &com_bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+    (dir, commercial, oss)
+}
+
+#[test]
+fn tier_filter_both_layers_the_commercial_tier_over_oss() {
+    let k = keys();
+    let (_d, commercial, oss) = keyed_install(&k);
+    let t = load_tiered(&commercial, &oss, &k.keyset, "2026-07-30", TierFilter::Both);
+    assert!(t.oss.is_some() && t.commercial.is_some());
+    assert!(t.judgments().is_some());
+    let (_base, overlay) = t.spec_texts().unwrap().unwrap();
+    assert!(overlay.is_some());
+}
+
+#[test]
+fn tier_filter_oss_only_behaves_like_a_no_key_install() {
+    let k = keys();
+    let (_d, commercial, oss) = keyed_install(&k);
+    let t = load_tiered(
+        &commercial,
+        &oss,
+        &k.keyset,
+        "2026-07-30",
+        TierFilter::OssOnly,
+    );
+    assert!(t.oss.is_some());
+    assert!(t.commercial.is_none(), "the commercial tier must not load");
+    assert!(t.judgments().is_none(), "no judgments: everything advisory");
+    let (base, overlay) = t.spec_texts().unwrap().unwrap();
+    assert!(base.contains("oss-vocabulary"));
+    assert!(overlay.is_none(), "no commercial overlay to merge");
+}
+
+#[test]
+fn tier_filter_oss_only_never_falls_back_to_the_commercial_tier() {
+    let k = keys();
+    let (_d, commercial) = store();
+    let oss = commercial.subdir_store(OSS_DIR).unwrap();
+    let com_bytes = envelope_with_judgments("2026-07-30.1", "blocking");
+    commercial.install(&com_bytes, &sign_b64(&k, &com_bytes), &k.keyset);
+    let t = load_tiered(
+        &commercial,
+        &oss,
+        &k.keyset,
+        "2026-07-30",
+        TierFilter::OssOnly,
+    );
+    assert!(!t.any());
+    assert!(t.spec_texts().unwrap().is_none());
+}

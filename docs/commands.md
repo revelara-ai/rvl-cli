@@ -22,6 +22,12 @@ stream instead of running helpers, and `--specs-file` is a loudly-announced
 dev-only bypass of the signed cache (`--judgments` likewise overrides the
 cache's judgment corpus).
 
+`scan` and `report` also take `--oss-only`, which loads the OSS tier alone
+even when a commercial tier is installed, so the result matches a no-key
+install. It is a load filter (`rvl sync` is unchanged), it is announced on
+stderr, and it cannot be combined with `--specs-file` or `--judgments`. See
+[Scanning](scanning.md#scanning-with-the-free-tier-only).
+
 ### Submission mode
 
 `rvl scan` doubles as the rvl-cli-compatible submission command: when
