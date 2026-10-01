@@ -282,6 +282,10 @@ pub const CONSTRUCTION_SCOPE_RECEIVER: &str = "receiver";
 /// `client_construction_scope`: the receiver was not traced; the
 /// constructions are candidates of the same type.
 pub const CONSTRUCTION_SCOPE_TYPE: &str = "type";
+/// `client_construction_scope`: the receiver was traced to a value built
+/// outside the repository (a dependency's call result), so no construction
+/// is attached and none can be read.
+pub const CONSTRUCTION_SCOPE_UNRESOLVED: &str = "unresolved";
 
 /// One call site plus every piece of source bearing on it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,7 +319,10 @@ pub struct Site {
     /// traced to this call's receiver, possibly none. [`CONSTRUCTION_SCOPE_TYPE`]:
     /// the receiver was not traced, so these are constructions of the same
     /// type found elsewhere, which may evidence an abstention but never a
-    /// pass. Additive within the v2 packet train.
+    /// pass. [`CONSTRUCTION_SCOPE_UNRESOLVED`]: the receiver is a value built
+    /// outside the repository; nothing is attached, and the site abstains
+    /// unless something else bounds the call. Additive within the v2 packet
+    /// train.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_construction_scope: String,
     #[serde(default)]
