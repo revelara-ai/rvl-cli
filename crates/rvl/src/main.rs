@@ -839,6 +839,10 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
             eprintln!("fetch failed: {reason} (continuing on the installed cache)");
             ExitCode::FAILURE
         }
+        SyncOutcome::NotPublished { url } => {
+            eprintln!("{}", rvl_cache::not_published_message(url));
+            ExitCode::FAILURE
+        }
         SyncOutcome::InstallFailed { reason } => {
             eprintln!(
                 "install failed: {reason} (a verified cache survives in current or \
