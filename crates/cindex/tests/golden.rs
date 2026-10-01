@@ -360,10 +360,18 @@ fn unparseable_tus_are_counted_never_guessed() {
     assert_eq!(st["tus_failed"], 1);
 }
 
-/// A copy of the built `cindex` in `<tmp>/bin`, with a vendored bundle beside
+/// The built `cindex` installed in `<tmp>/bin`, with a vendored bundle beside
 /// it whose "library" is not a library. Needs no libclang on the machine.
+///
+/// The executable is a hard link, not a copy: a copy is open for writing while
+/// it is made, and a child forked by another test thread in that window holds
+/// the write descriptor until its own exec, so running the copy fails with
+/// "Text file busy" (po-jz4qz). A symlink would not do, because `cindex`
+/// finds its bundle beside its resolved path. The temp directory is under the
+/// profile directory so that the link never crosses a filesystem.
 fn install_with_broken_bundle() -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+    let built = bin_path();
+    let tmp = tempfile::tempdir_in(built.parent().expect("target/<profile> directory")).unwrap();
     let bin_dir = tmp.path().join("bin");
     let bundle = bin_dir.join("libclang");
     std::fs::create_dir_all(bundle.join("include")).unwrap();
@@ -373,8 +381,8 @@ fn install_with_broken_bundle() -> (tempfile::TempDir, PathBuf) {
         "libclang.so"
     };
     std::fs::write(bundle.join(lib), b"not a shared object").unwrap();
-    let exe = bin_dir.join("cindex");
-    std::fs::copy(bin_path(), &exe).unwrap();
+    let exe = bin_dir.join(built.file_name().expect("cindex file name"));
+    std::fs::hard_link(&built, &exe).unwrap();
     (tmp, exe)
 }
 
@@ -390,7 +398,7 @@ fn engine_check_loads_the_vendored_bundle_before_the_system_libclang() {
         .arg("--engine-check")
         .env_remove("LIBCLANG_PATH")
         .output()
-        .expect("run the copied cindex");
+        .expect("run the installed cindex");
     assert!(
         !out.status.success(),
         "a broken vendored bundle must not be bypassed: {}",
@@ -417,11 +425,52 @@ fn libclang_path_overrides_the_vendored_bundle() {
         .arg("--engine-check")
         .env("LIBCLANG_PATH", "/nonexistent/po-av01j.49")
         .output()
-        .expect("run the copied cindex");
+        .expect("run the installed cindex");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !err.contains("vendored"),
         "LIBCLANG_PATH was set, so the bundle must not be consulted: {err}"
     );
+}
+
+/// The installed executable must run at once while other threads fork
+/// (po-jz4qz). A forked child holds every descriptor of its parent until its
+/// own exec; if the install opens the executable for writing, the kernel
+/// refuses to run it during that window ("Text file busy").
+#[test]
+fn bundle_install_is_executable_at_once_while_other_threads_fork() {
+    const INSTALLERS: usize = 4;
+    const ROUNDS_PER_INSTALLER: usize = 50;
+    const FORKERS: usize = 8;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..FORKERS {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    bin().arg("--packet-schema").output().expect("run cindex");
+                }
+            });
+        }
+        let installers: Vec<_> = (0..INSTALLERS)
+            .map(|_| {
+                s.spawn(|| {
+                    for round in 0..ROUNDS_PER_INSTALLER {
+                        let (_tmp, exe) = install_with_broken_bundle();
+                        if let Err(e) = Command::new(&exe).arg("--packet-schema").output() {
+                            return Err(format!("round {round}: {e}"));
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        let results: Vec<_> = installers.into_iter().map(|h| h.join()).collect();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in results {
+            r.expect("installer thread")
+                .unwrap_or_else(|e| panic!("the installed cindex did not run: {e}"));
+        }
+    });
 }
