@@ -12,6 +12,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
+const crypto = require('node:crypto');
 
 const HERE = __dirname;
 const TSINDEX = path.join(HERE, '..', 'tsindex.js');
@@ -42,8 +43,23 @@ function repoConfig(...extra) {
 }
 
 test('--packet-schema prints 2', () => {
-  const out = run('--packet-schema').trim();
-  assert.strictEqual(out, '2');
+  // Line 1 stays the bare schema integer, so a consumer that reads only the
+  // first line of the reply keeps working.
+  const out = run('--packet-schema');
+  assert.strictEqual(out.split('\n')[0], '2');
+});
+
+test('--packet-schema reports this file\'s content version', () => {
+  // The handshake (po-8ozxg): rvl compares this value against the copy it
+  // ships, and computes it for a script by hashing the file. The two must be
+  // the same number or every tsindex reads as drifted.
+  const want = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(TSINDEX))
+    .digest('hex')
+    .slice(0, 12);
+  const out = run('--packet-schema');
+  assert.strictEqual(out.split('\n')[1], 'content-version ' + want);
 });
 
 test('retrieval emits records, each with schema and site_key', () => {

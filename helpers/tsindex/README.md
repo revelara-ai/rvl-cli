@@ -9,6 +9,12 @@ decides nothing about reliability, it only says what the code is.
     node tsindex.js --retrieve --root <repo> --include-tests       # also read test paths
     node tsindex.js --packet-schema                                # negotiate before loading
 
+`--packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of `tsindex.js` itself. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 Install once with `npm install` (its only dependency is `typescript`). rvl
 invokes it as `node tsindex.js …`, the same way it runs `pyindex.py` under
 `python3`; helper discovery is env override (`RVL_TSINDEX`) → a helper next

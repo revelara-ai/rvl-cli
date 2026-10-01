@@ -7,6 +7,7 @@ depends on, and neither is recoverable after the fact.
 Run from the pyindex dir:  python3 -m unittest   (or python3 test_pyindex.py)
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -52,7 +53,18 @@ class TestPacketSchema(unittest.TestCase):
     def test_packet_schema_prints_the_v2_version(self):
         code, out, _ = _run("--packet-schema")
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "2")
+        # Line 1 stays the bare schema integer, so a consumer that reads only
+        # the first line of the reply keeps working.
+        self.assertEqual(out.splitlines()[0], "2")
+
+    def test_packet_schema_reports_this_files_content_version(self):
+        # The handshake (po-8ozxg): rvl compares this value against the copy
+        # it ships, and computes it for a script by hashing the file. The two
+        # must be the same number or every pyindex reads as drifted.
+        _, out, _ = _run("--packet-schema")
+        with open(PYINDEX, "rb") as f:
+            want = hashlib.sha256(f.read()).hexdigest()[:12]
+        self.assertEqual(out.splitlines()[1], "content-version " + want)
 
 
 class TestRetrievedPackets(unittest.TestCase):

@@ -110,6 +110,9 @@ pub struct OutRetriever {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// How this helper differs from the build this binary ships, when it does
+    /// and a shipped sibling exists to compare against (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -280,6 +283,7 @@ pub fn build(
                     lang: r.lang.clone(),
                     path: r.path.clone(),
                     source: r.source.clone(),
+                    drift: r.drift.clone(),
                 })
                 .collect(),
             degraded: coverage

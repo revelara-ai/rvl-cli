@@ -11,6 +11,7 @@ mod doctor;
 mod embedded_helpers;
 mod empty_flag;
 mod force;
+mod helper_drift;
 mod hook;
 mod init;
 mod out_doc;
@@ -1507,6 +1508,136 @@ fn missing_helper_hint(lang: Lang) -> String {
     }
 }
 
+/// The scripted-helper filename to also look for, for a language whose helper
+/// ships as a script rather than a native binary (pyindex.py, tsindex.js).
+fn helper_script_name(lang: Lang) -> Option<String> {
+    let base = lang.helper_base();
+    match lang {
+        Lang::Python => Some(format!("{base}.py")),
+        Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::CSharp => Some(format!("{base}.dll")),
+        Lang::Java => Some(format!("{base}.java")),
+        Lang::Go | Lang::Rust | Lang::CCpp => None,
+    }
+}
+
+/// The helper packaged with the running binary, if there is one: adjacent, or
+/// in the pkgshare dir a package manager files the archive's non-binary
+/// members into. Step 2 of [`resolve_helper`], and the sibling a helper found
+/// by any other step is compared against ([`helper_drift`]).
+fn bundled_helper(lang: Lang) -> Option<ResolvedHelper> {
+    let base = lang.helper_base();
+    let script_name = helper_script_name(lang);
+    let exe = std::env::current_exe().ok()?;
+    for dir in packaged_helper_dirs(exe.parent()?) {
+        let cand = dir.join(base);
+        if cand.is_file() {
+            return Some(classify_helper(lang, &cand, "bundled"));
+        }
+        if let Some(script) = &script_name {
+            let cand_script = dir.join(script);
+            if cand_script.is_file() {
+                return Some(classify_helper(lang, &cand_script, "bundled"));
+            }
+        }
+    }
+    None
+}
+
+/// How long a helper gets to answer `--packet-schema`. The contract is that it
+/// answers before loading anything, so a real helper takes milliseconds; the
+/// bound is for a program that is not one (a wrapper that ignores its
+/// arguments and starts a full retrieval).
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The content version of a helper on disk (po-8ozxg), or `None` when it
+/// cannot be established.
+///
+/// A scripted helper IS one source file, so its version is read off the file:
+/// no interpreter start, and a copy from before the handshake still gets a
+/// version to compare. A native helper is asked with `--packet-schema`.
+///
+/// Every failure is `None`, never an error. This feeds a warning, and a
+/// warning that cannot be computed must not cost anyone their scan.
+fn helper_content_version(helper: &ResolvedHelper) -> Option<String> {
+    let mut cmd = match helper.kind {
+        HelperKind::PyScript | HelperKind::NodeScript | HelperKind::JavaSource => {
+            let bytes = std::fs::read(&helper.path).ok()?;
+            return Some(helper_drift::content_version(&bytes));
+        }
+        HelperKind::Executable => std::process::Command::new(&helper.path),
+        HelperKind::DotnetAssembly => {
+            let mut c = std::process::Command::new("dotnet");
+            c.arg(&helper.path);
+            c
+        }
+    };
+    let mut child = cmd
+        .arg("--packet-schema")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut stdout).ok()?;
+    helper_drift::parse_handshake(&stdout)
+}
+
+/// Is the helper that is about to run a different build from the one this rvl
+/// ships? `Some(text)` is the statement for the reader; `None` means "the
+/// same" or "nothing to compare against" (po-8ozxg).
+///
+/// The shipped sibling is the bundled helper when one exists, otherwise the
+/// copy embedded in this binary. A helper resolved from one of those slots is
+/// its own reference, with one exception: a BUNDLED script still has an
+/// embedded sibling, and that pair is the one that actually went stale in the
+/// field. `make install` puts pyindex.py beside rvl, a later build of rvl
+/// replaces only the binary, and the adjacent script outranks the newer one
+/// carried inside it.
+///
+/// An env override is compared too. It is deliberate when it is typed and a
+/// stale shadow when it is a forgotten export in a shell profile, and the
+/// output cannot tell which, so it says what it measured.
+fn helper_drift(lang: Lang, ran: &ResolvedHelper) -> Option<String> {
+    if ran.source == "embedded" {
+        return None;
+    }
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    let bundled = bundled_helper(lang).filter(|b| !same_file(&b.path, &ran.path));
+    let (shipped, label) = match (ran.source.as_str(), bundled) {
+        (source, Some(b)) if source != "bundled" => (
+            helper_content_version(&b)?,
+            format!("the bundled {}", b.path.display()),
+        ),
+        _ => (
+            helper_drift::content_version(embedded_for(lang)?.contents.as_bytes()),
+            format!("the copy embedded in this {BIN}"),
+        ),
+    };
+    helper_drift::describe(helper_content_version(ran).as_deref(), &shipped, &label)
+}
+
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
@@ -1542,32 +1673,10 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         ));
     }
     let base = lang.helper_base();
-    // The scripted-helper filename to also look for, for a language whose helper
-    // ships as a script rather than a native binary (pyindex.py, tsindex.js).
-    let script_name = match lang {
-        Lang::Python => Some(format!("{base}.py")),
-        Lang::TypeScript => Some(format!("{base}.js")),
-        Lang::CSharp => Some(format!("{base}.dll")),
-        Lang::Java => Some(format!("{base}.java")),
-        Lang::Go | Lang::Rust | Lang::CCpp => None,
-    };
-    // (2) packaged with the binary: adjacent, or in the pkgshare dir a
-    // package manager files the archive's non-binary members into.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for dir in packaged_helper_dirs(exe_dir) {
-                let cand = dir.join(base);
-                if cand.is_file() {
-                    return Ok(classify_helper(lang, &cand, "bundled"));
-                }
-                if let Some(script) = &script_name {
-                    let cand_script = dir.join(script);
-                    if cand_script.is_file() {
-                        return Ok(classify_helper(lang, &cand_script, "bundled"));
-                    }
-                }
-            }
-        }
+    let script_name = helper_script_name(lang);
+    // (2) packaged with the binary.
+    if let Some(bundled) = bundled_helper(lang) {
+        return Ok(bundled);
     }
     // (3) the copy carried inside this binary, written out on first use.
     // Best-effort: an unwritable HOME degrades to the PATH lookup below rather
@@ -2604,6 +2713,7 @@ fn resolve_packet_stream(
             lang: lang.to_string(),
             path: helper.path.display().to_string(),
             source: helper.source.clone(),
+            drift: helper_drift(lang, &helper),
         });
         match run_helper(lang, &helper, path, &name, &[], include_tests)? {
             Ok(out) => {
@@ -7474,11 +7584,13 @@ mod tests {
                     lang: "Python".into(),
                     path: "/home/u/.local/bin/pyindex.py".into(),
                     source: "PATH".into(),
+                    drift: None,
                 },
                 render::RetrieverInfo {
                     lang: "Go".into(),
                     path: "/opt/rvl/goindex".into(),
                     source: "bundled".into(),
+                    drift: None,
                 },
             ],
             ..Default::default()

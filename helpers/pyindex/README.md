@@ -9,7 +9,13 @@ reliability, it only says what the code is.
     pyindex --retrieve --root <repo> --include-tests       # also read test paths
     pyindex --packet-schema                                # negotiate before loading
 
-Standard library only (`ast`, `argparse`, `json`, `os`, `sys`). No pyright, no
+`--packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of `pyindex.py` itself. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
+Standard library only (`ast`, `argparse`, `hashlib`, `json`, `os`, `sys`). No pyright, no
 LibCST, no third-party anything — a deliberate conservative choice for
 pinnability and a clean dependency story.
 
