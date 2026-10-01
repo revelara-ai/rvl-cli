@@ -269,6 +269,105 @@ fn fetch_failure_is_an_outcome_not_an_error() {
     assert!(matches!(out, SyncOutcome::FetchFailed { .. }));
 }
 
+// --- "never published" is not "network down" (po-gcn3q) ---
+
+struct NotPublishedFetcher;
+impl Fetcher for NotPublishedFetcher {
+    fn fetch(&self, _: Option<&str>) -> anyhow::Result<Fetched> {
+        Ok(Fetched::NotPublished {
+            url: "https://api.example.test/api/v1/scanner/spec-cache".into(),
+        })
+    }
+}
+
+#[test]
+fn not_published_is_its_own_outcome_and_keeps_the_installed_cache() {
+    let k = keys();
+    let (_d, s) = store();
+    let v1 = envelope_bytes(1, "2026-07-29.1");
+    s.install(&v1, &sign_b64(&k, &v1), &k.keyset);
+
+    let out = sync(&s, &NotPublishedFetcher, &k.keyset, false);
+    let SyncOutcome::NotPublished { url } = out else {
+        panic!("expected NotPublished, got {out:?}");
+    };
+    assert!(url.ends_with("/api/v1/scanner/spec-cache"));
+    let loaded = s.load(&k.keyset, "2026-07-30").unwrap();
+    assert_eq!(loaded.envelope.content_version, "2026-07-29.1");
+}
+
+#[test]
+fn not_published_message_names_the_endpoint_and_is_not_a_network_message() {
+    let msg = not_published_message("https://api.example.test/api/v1/scanner/spec-cache");
+    assert!(msg.contains("https://api.example.test/api/v1/scanner/spec-cache"));
+    assert!(msg.contains("404"), "{msg}");
+    assert!(msg.contains("published"), "{msg}");
+    assert!(!msg.contains("fetch failed"), "{msg}");
+}
+
+/// A loopback server that answers every request with `status` and an empty
+/// body, then closes. Returns its base URL.
+fn serve_status(status: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    base
+}
+
+#[test]
+fn http_404_on_the_artifact_is_not_published_for_both_tiers() {
+    let base = serve_status("404 Not Found");
+    let commercial = HttpFetcher {
+        base_url: base.clone(),
+        org_key: "k".into(),
+    };
+    let Ok(Fetched::NotPublished { url }) = commercial.fetch(None) else {
+        panic!("commercial 404 must be NotPublished");
+    };
+    assert_eq!(url, format!("{base}/api/v1/scanner/spec-cache"));
+
+    let oss = OssHttpFetcher {
+        base_url: base.clone(),
+    };
+    let Ok(Fetched::NotPublished { url }) = oss.fetch(None) else {
+        panic!("oss 404 must be NotPublished");
+    };
+    assert_eq!(url, format!("{base}/api/v1/scanner/spec-cache/oss"));
+}
+
+#[test]
+fn server_errors_and_dead_networks_stay_fetch_failed() {
+    let k = keys();
+    let (_d, s) = store();
+
+    let f = HttpFetcher {
+        base_url: serve_status("500 Internal Server Error"),
+        org_key: "k".into(),
+    };
+    let out = sync(&s, &f, &k.keyset, false);
+    assert!(matches!(out, SyncOutcome::FetchFailed { .. }), "{out:?}");
+
+    // A port nothing listens on: bind, read the address, drop the listener.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let f = OssHttpFetcher { base_url: dead };
+    let out = sync(&s, &f, &k.keyset, false);
+    assert!(matches!(out, SyncOutcome::FetchFailed { .. }), "{out:?}");
+}
+
 // --- air-gapped import ---
 
 #[test]
@@ -531,6 +630,7 @@ fn a_304_is_up_to_date_not_a_signature_failure() {
              body then fails signature verification",
             bytes.len()
         ),
+        Ok(Fetched::NotPublished { url }) => panic!("a 304 from {url} is not a 404"),
         Err(e) => panic!("a 304 must not be an error: {e}"),
     }
 }

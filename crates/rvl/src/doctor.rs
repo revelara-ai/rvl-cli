@@ -799,7 +799,13 @@ fn apply_fixes(root: &Path) {
             rvl_cache::Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX),
         ) {
             let outcome = rvl_cache::sync(&store, &fetcher, &keyset, cfg.offline);
-            eprintln!("doctor --fix: spec cache: {outcome:?}");
+            match outcome {
+                rvl_cache::SyncOutcome::NotPublished { url } => eprintln!(
+                    "doctor --fix: spec cache: {}",
+                    rvl_cache::not_published_message(&url)
+                ),
+                outcome => eprintln!("doctor --fix: spec cache: {outcome:?}"),
+            }
         }
         acted = true;
     }
