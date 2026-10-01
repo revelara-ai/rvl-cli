@@ -8,13 +8,23 @@
 //! head shows an apiVersion in the `argoproj.io` or `*.fluxcd.io` groups AND
 //! a kind this retriever parses. Generic Kubernetes manifests are NEVER
 //! claimed (they belong to the Kubernetes family, po-av01j.20); argo/flux
-//! CRs of other kinds (Rollouts, Workflows, image automation, ...) are
+//! CRs of other kinds (Experiments, Workflows, image automation, ...) are
 //! sighted identity-only by [`sight_unrecognized`] instead.
 //!
 //! Kinds parsed, and the facts emitted (packet formats are per-product,
 //! `argo-cd` and `flux`, so spec identities and waiver class rules read
 //! naturally):
 //!
+//!   * Rollout (`argoproj.io`, format `argo-rollouts`, po-pk3fp.13) —
+//!     `rollout.strategy` (`canary` | `blueGreen`, else absent),
+//!     `rollout.canary.steps.count` (canary only; no steps is `0`), and
+//!     `rollout.analysis`: WHERE an analysis can abort the rollout
+//!     (`background`, `step`, `prePromotion`, `postPromotion`, joined with
+//!     `+`), else absent. A rollout with no analysis cannot roll itself back.
+//!   * AnalysisTemplate / ClusterAnalysisTemplate (format `argo-rollouts`) —
+//!     `analysistemplate.metrics.count` and
+//!     `analysistemplate.metrics.without-condition`: metrics with neither a
+//!     success nor a failure condition, which are measured and never judged.
 //!   * Application / ApplicationSet (`argoproj.io`, format `argo-cd`) —
 //!     `application.syncPolicy.automated` (presence), `.prune` / `.selfHeal`
 //!     (documented `false` defaults), `application.syncPolicy.retry`
@@ -70,6 +80,9 @@ pub struct ArgoFlux;
 
 /// Packet format for Argo CD resources.
 const FORMAT_ARGO: &str = "argo-cd";
+/// Packet format for Argo Rollouts resources: a separate product from Argo
+/// CD that shares its apiVersion group.
+const FORMAT_ROLLOUTS: &str = "argo-rollouts";
 /// Packet format for Flux resources.
 const FORMAT_FLUX: &str = "flux";
 
@@ -103,7 +116,7 @@ impl ConfigRetriever for ArgoFlux {
 }
 
 /// The apiVersion group: everything before the first `/`.
-fn group_of(api_version: &str) -> &str {
+pub(crate) fn group_of(api_version: &str) -> &str {
     api_version.split('/').next().unwrap_or(api_version)
 }
 
@@ -121,6 +134,7 @@ fn is_flux_group(group: &str) -> bool {
 fn recognized(group: &str, kind: &str) -> bool {
     match kind {
         "Application" | "ApplicationSet" => is_argo_group(group),
+        "Rollout" | "AnalysisTemplate" | "ClusterAnalysisTemplate" => is_argo_group(group),
         "Kustomization" => group == "kustomize.toolkit.fluxcd.io",
         "HelmRelease" => group == "helm.toolkit.fluxcd.io",
         "GitRepository" | "HelmRepository" => group == "source.toolkit.fluxcd.io",
@@ -131,7 +145,7 @@ fn recognized(group: &str, kind: &str) -> bool {
 /// Per-document (apiVersion, kind) pairs found in a bounded head window.
 /// Column-0 scanning only — the same discipline as `sight_format`'s sniffs;
 /// the content is read locally and discarded.
-fn head_scan(head: &str) -> Vec<(String, String)> {
+pub(crate) fn head_scan(head: &str) -> Vec<(String, String)> {
     let clean = |v: &str| v.trim().trim_matches('"').trim_matches('\'').to_string();
     let mut out: Vec<(String, String)> = Vec::new();
     let mut api = String::new();
@@ -216,16 +230,32 @@ fn pin_shape(reference: &str) -> &'static str {
 
 /// One config unit's packet sink: carries the constants every packet of the
 /// unit repeats so the emitters below read as key lists.
-struct Emitter<'a> {
+pub(crate) struct Emitter<'a> {
     out: &'a mut Retrieved,
-    file: &'a str,
+    pub(crate) file: &'a str,
     snapshot: &'a str,
     format: &'static str,
     unit: String,
 }
 
-impl Emitter<'_> {
-    fn push(
+impl<'a> Emitter<'a> {
+    pub(crate) fn new(
+        out: &'a mut Retrieved,
+        file: &'a str,
+        snapshot: &'a str,
+        format: &'static str,
+        unit: String,
+    ) -> Self {
+        Self {
+            out,
+            file,
+            snapshot,
+            format,
+            unit,
+        }
+    }
+
+    pub(crate) fn push(
         &mut self,
         key: &str,
         value: Option<String>,
@@ -246,14 +276,14 @@ impl Emitter<'_> {
     }
 
     /// An explicitly authored value.
-    fn authored(&mut self, key: &str, key_path: &str, v: &Value) {
+    pub(crate) fn authored(&mut self, key: &str, key_path: &str, v: &Value) {
         let p = vec![ProvenanceStep::new(self.file, key_path, "explicit")];
         self.push(key, Some(render_value(v)), Resolution::AsAuthored, p);
     }
 
     /// A decidable authored absence: the CR is the whole authored intent, so
     /// a missing key is an authored fact, not a platform-side unknown.
-    fn absent(&mut self, key: &str, key_path: &str) {
+    pub(crate) fn absent(&mut self, key: &str, key_path: &str) {
         let p = vec![ProvenanceStep::new(self.file, key_path, "absent")];
         self.push(
             key,
@@ -264,7 +294,13 @@ impl Emitter<'_> {
     }
 
     /// An absent key governed by a platform-DOCUMENTED default value.
-    fn platform_default(&mut self, key: &str, key_path: &str, default_note: &str, value: &str) {
+    pub(crate) fn platform_default(
+        &mut self,
+        key: &str,
+        key_path: &str,
+        default_note: &str,
+        value: &str,
+    ) {
         let p = vec![
             ProvenanceStep::new(self.file, key_path, "absent"),
             ProvenanceStep::new("", default_note, "platform-default"),
@@ -302,24 +338,9 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             .and_then(Value::as_str)
             .unwrap_or("unnamed");
         let spec = get(m, "spec").and_then(Value::as_mapping);
-        fn emitter<'a>(
-            out: &'a mut Retrieved,
-            file: &'a str,
-            snapshot: &'a str,
-            format: &'static str,
-            unit: String,
-        ) -> Emitter<'a> {
-            Emitter {
-                out,
-                file,
-                snapshot,
-                format,
-                unit,
-            }
-        }
         match kind {
             "Application" => {
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -334,7 +355,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                     .and_then(Value::as_mapping)
                     .and_then(|t| get(t, "spec"))
                     .and_then(Value::as_mapping);
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -343,8 +364,28 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 );
                 emit_application(&mut e, tmpl, "spec.template.spec");
             }
+            "Rollout" => {
+                let mut e = Emitter::new(
+                    &mut out,
+                    rel_path,
+                    snapshot_id,
+                    FORMAT_ROLLOUTS,
+                    format!("rollout:{name}"),
+                );
+                emit_rollout(&mut e, spec);
+            }
+            "AnalysisTemplate" | "ClusterAnalysisTemplate" => {
+                let mut e = Emitter::new(
+                    &mut out,
+                    rel_path,
+                    snapshot_id,
+                    FORMAT_ROLLOUTS,
+                    format!("{}:{name}", kind.to_ascii_lowercase()),
+                );
+                emit_analysis_template(&mut e, spec);
+            }
             "Kustomization" => {
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -354,7 +395,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 emit_kustomization(&mut e, spec);
             }
             "HelmRelease" => {
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -364,7 +405,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 emit_helmrelease(&mut e, spec);
             }
             "GitRepository" => {
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -374,7 +415,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 emit_gitrepository(&mut e, spec);
             }
             "HelmRepository" => {
-                let mut e = emitter(
+                let mut e = Emitter::new(
                     &mut out,
                     rel_path,
                     snapshot_id,
@@ -598,7 +639,127 @@ fn emit_helmrepository(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
     }
 }
 
-fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
+/// A Rollout's progressive-delivery shape (RC-036): which strategy it uses,
+/// how many canary steps it takes, and where an analysis can abort it. The
+/// values are shapes and counts; template names, weights and services are
+/// never emitted.
+fn emit_rollout(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
+    let strategy = spec
+        .and_then(|s| get(s, "strategy"))
+        .and_then(Value::as_mapping);
+    let Some((name, body)) = ["canary", "blueGreen"]
+        .into_iter()
+        .find_map(|n| strategy.and_then(|s| get(s, n)).map(|v| (n, v)))
+    else {
+        // A Rollout requires one of the two; without it there is no rollout
+        // shape to describe.
+        e.absent("rollout.strategy", "spec.strategy");
+        return;
+    };
+    let base = format!("spec.strategy.{name}");
+    let provenance =
+        |file: &str, key_path: String, role: &str| vec![ProvenanceStep::new(file, &key_path, role)];
+    let p = provenance(e.file, base.clone(), "explicit");
+    e.push(
+        "rollout.strategy",
+        Some(name.to_string()),
+        Resolution::AsAuthored,
+        p,
+    );
+    let body = body.as_mapping();
+    let has = |k: &str| body.is_some_and(|b| get(b, k).is_some_and(|v| !v.is_null()));
+
+    // Where an analysis can stop this rollout, in a fixed order so the value
+    // compares stably.
+    let mut analysis: Vec<&str> = Vec::new();
+    if name == "canary" {
+        let steps = body
+            .and_then(|b| get(b, "steps"))
+            .and_then(Value::as_sequence);
+        // No steps means the canary goes straight to full weight: a count of
+        // 0 is the authored fact, and a numeric bound can judge it.
+        let role = if steps.is_some() {
+            "explicit"
+        } else {
+            "absent"
+        };
+        let p = provenance(e.file, format!("{base}.steps"), role);
+        e.push(
+            "rollout.canary.steps.count",
+            Some(steps.map_or(0, Vec::len).to_string()),
+            Resolution::AsAuthored,
+            p,
+        );
+        if has("analysis") {
+            analysis.push("background");
+        }
+        let step_analysis = steps.is_some_and(|steps| {
+            steps
+                .iter()
+                .filter_map(Value::as_mapping)
+                .any(|step| get(step, "analysis").is_some())
+        });
+        if step_analysis {
+            analysis.push("step");
+        }
+    } else {
+        for (field, label) in [
+            ("prePromotionAnalysis", "prePromotion"),
+            ("postPromotionAnalysis", "postPromotion"),
+        ] {
+            if has(field) {
+                analysis.push(label);
+            }
+        }
+    }
+    if analysis.is_empty() {
+        e.absent("rollout.analysis", &base);
+    } else {
+        let p = provenance(e.file, base, "explicit");
+        e.push(
+            "rollout.analysis",
+            Some(analysis.join("+")),
+            Resolution::AsAuthored,
+            p,
+        );
+    }
+}
+
+/// An AnalysisTemplate's metrics, as counts: how many there are, and how many
+/// carry neither a successCondition nor a failureCondition. Such a metric is
+/// measured and never judged, so it cannot fail an analysis run. The
+/// conditions and queries themselves are never emitted.
+fn emit_analysis_template(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
+    let metrics = spec
+        .and_then(|s| get(s, "metrics"))
+        .and_then(Value::as_sequence);
+    let role = if metrics.is_some() {
+        "explicit"
+    } else {
+        "absent"
+    };
+    let unconditioned = metrics.map_or(0, |ms| {
+        ms.iter()
+            .filter(|m| {
+                !m.as_mapping().is_some_and(|m| {
+                    get(m, "successCondition").is_some() || get(m, "failureCondition").is_some()
+                })
+            })
+            .count()
+    });
+    for (key, count) in [
+        (
+            "analysistemplate.metrics.count",
+            metrics.map_or(0, Vec::len),
+        ),
+        ("analysistemplate.metrics.without-condition", unconditioned),
+    ] {
+        let p = vec![ProvenanceStep::new(e.file, "spec.metrics", role)];
+        e.push(key, Some(count.to_string()), Resolution::AsAuthored, p);
+    }
+}
+
+pub(crate) fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
     m.get(Value::String(key.to_string()))
 }
 
@@ -635,9 +796,16 @@ mod tests {
         ));
         // An argo group with an unrecognized kind is sighted, not claimed.
         assert!(!r.matches_head(
-            "deploy/rollout.yaml",
-            "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\n"
+            "deploy/experiment.yaml",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\n"
         ));
+        // Rollouts and their analysis templates are parsed (po-pk3fp.13).
+        for kind in ["Rollout", "AnalysisTemplate", "ClusterAnalysisTemplate"] {
+            assert!(r.matches_head(
+                "deploy/rollout.yaml",
+                &format!("apiVersion: argoproj.io/v1alpha1\nkind: {kind}\n")
+            ));
+        }
         // Only YAML paths are ever claimed.
         assert!(!r.matches_head("deploy/app.json", APP_HEAD));
         // Path-based matching never claims: content is the router.
@@ -660,7 +828,7 @@ mod tests {
         // recognized kind in ANOTHER doc must not combine into a claim.
         assert!(!r.matches_head(
             "a.yaml",
-            "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\n---\napiVersion: apps/v1\nkind: Application\n"
+            "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\n---\napiVersion: apps/v1\nkind: Application\n"
         ));
     }
 
@@ -939,6 +1107,111 @@ mod tests {
         );
         let p = find(&got, "helmrepository:bitnami", "helmrepository.interval");
         assert_eq!(p.resolved_value.as_deref(), Some("10m"));
+    }
+
+    const ROLLOUT_HEAD: &str =
+        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n";
+
+    #[test]
+    fn canary_rollout_emits_step_count_and_where_analysis_runs() {
+        let got = packets(&format!(
+            "{ROLLOUT_HEAD}spec:\n  strategy:\n    canary:\n      analysis:\n        templates:\n        - templateName: success-rate\n      steps:\n      - setWeight: 20\n      - pause: {{duration: 10m}}\n      - analysis:\n          templates:\n          - templateName: latency\n      - setWeight: 100\n"
+        ));
+        let strategy = find(&got, "rollout:web", "rollout.strategy");
+        assert_eq!(strategy.format, "argo-rollouts");
+        assert_eq!(strategy.resolved_value.as_deref(), Some("canary"));
+        let steps = find(&got, "rollout:web", "rollout.canary.steps.count");
+        assert_eq!(steps.resolved_value.as_deref(), Some("4"));
+        assert_eq!(steps.provenance[0].key_path, "spec.strategy.canary.steps");
+        let analysis = find(&got, "rollout:web", "rollout.analysis");
+        assert_eq!(analysis.resolved_value.as_deref(), Some("background+step"));
+        assert_eq!(analysis.resolution, Resolution::AsAuthored);
+        assert_eq!(got.unparseable, 0);
+    }
+
+    #[test]
+    fn canary_rollout_without_steps_or_analysis_is_decidably_bare() {
+        // No steps means the canary goes straight to 100%, and no analysis
+        // means nothing can abort it: both are authored facts of this CR.
+        let got = packets(&format!(
+            "{ROLLOUT_HEAD}spec:\n  strategy:\n    canary: {{}}\n"
+        ));
+        let steps = find(&got, "rollout:web", "rollout.canary.steps.count");
+        assert_eq!(steps.resolved_value.as_deref(), Some("0"));
+        assert_eq!(steps.provenance[0].role, "absent");
+        let analysis = find(&got, "rollout:web", "rollout.analysis");
+        assert_eq!(analysis.resolved_value.as_deref(), Some(ABSENT_RENDERING));
+        assert_eq!(analysis.provenance[0].role, "absent");
+    }
+
+    #[test]
+    fn blue_green_rollout_names_its_promotion_analysis_and_has_no_step_count() {
+        let got = packets(&format!(
+            "{ROLLOUT_HEAD}spec:\n  strategy:\n    blueGreen:\n      activeService: web\n      prePromotionAnalysis:\n        templates:\n        - templateName: smoke\n"
+        ));
+        assert_eq!(
+            find(&got, "rollout:web", "rollout.strategy")
+                .resolved_value
+                .as_deref(),
+            Some("blueGreen")
+        );
+        assert_eq!(
+            find(&got, "rollout:web", "rollout.analysis")
+                .resolved_value
+                .as_deref(),
+            Some("prePromotion")
+        );
+        assert!(!got
+            .packets
+            .iter()
+            .any(|p| p.key == "rollout.canary.steps.count"));
+    }
+
+    #[test]
+    fn rollout_without_a_strategy_is_absent_and_emits_nothing_else() {
+        let got = packets(&format!("{ROLLOUT_HEAD}spec:\n  replicas: 2\n"));
+        assert_eq!(
+            find(&got, "rollout:web", "rollout.strategy")
+                .resolved_value
+                .as_deref(),
+            Some(ABSENT_RENDERING)
+        );
+        assert_eq!(got.packets.len(), 1, "{:?}", got.packets);
+    }
+
+    #[test]
+    fn analysis_template_counts_metrics_that_can_never_fail() {
+        // A metric with neither successCondition nor failureCondition is
+        // measured and never judged, so it cannot abort a rollout.
+        let got = packets(
+            "apiVersion: argoproj.io/v1alpha1\nkind: AnalysisTemplate\nmetadata:\n  name: success-rate\nspec:\n  metrics:\n  - name: ok\n    successCondition: result[0] >= 0.95\n  - name: errors\n    failureCondition: result[0] > 0.05\n  - name: watched-only\n    interval: 1m\n---\napiVersion: argoproj.io/v1alpha1\nkind: ClusterAnalysisTemplate\nmetadata:\n  name: shared\nspec: {}\n",
+        );
+        let unit = "analysistemplate:success-rate";
+        assert_eq!(
+            find(&got, unit, "analysistemplate.metrics.count")
+                .resolved_value
+                .as_deref(),
+            Some("3")
+        );
+        let bare = find(&got, unit, "analysistemplate.metrics.without-condition");
+        assert_eq!(bare.resolved_value.as_deref(), Some("1"));
+        assert_eq!(bare.format, "argo-rollouts");
+        // Conditions are counted, never emitted: they can name internal metrics.
+        assert!(got.packets.iter().all(|p| !p
+            .resolved_value
+            .as_deref()
+            .unwrap_or("")
+            .contains("result")));
+        assert_eq!(
+            find(
+                &got,
+                "clusteranalysistemplate:shared",
+                "analysistemplate.metrics.count"
+            )
+            .resolved_value
+            .as_deref(),
+            Some("0")
+        );
     }
 
     #[test]

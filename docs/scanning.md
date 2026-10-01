@@ -230,6 +230,21 @@ skip in place and a warm scan could only honor it for the files it
 re-parsed. Hook scans therefore never include test code; there is no
 `--include-tests` on `rvl index reindex` either.
 
+The TypeScript retriever scans a workspace whose dependencies are not
+installed, but it resolves client types from import syntax instead of from
+the packages. That is a weaker scan: medium tier, no client versions, and
+coarser keys for module objects. The roll-call prints the same site count
+for both, so COVERAGE names the difference,
+
+```
+  TypeScript: 2 workspaces without installed dependencies (client types resolved from import syntax: medium tier, no client versions)
+```
+
+and `--out` carries the total as `coverage.dependency_trees_uninstalled`.
+Install the dependencies and scan again to get the full resolution. A warm
+scan prints the line when it re-parses TypeScript in this pass; packets it
+reuses from the index keep the resolution they were retrieved with.
+
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly
 having emitted nothing is reported as a failed lane, the report prints

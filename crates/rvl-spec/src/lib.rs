@@ -301,6 +301,33 @@ pub struct ApiSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub family: Option<Family>,
+    /// The constructor argument that gives this API's RECEIVER a finite
+    /// capacity, when the call blocks only because that capacity is full
+    /// (po-av01j.231). `queue.Queue.put` "blocks until a free slot is
+    /// available if the queue is full", and a `queue.Queue()` built with no
+    /// `maxsize` is never full: the spec's premise cannot occur at that site,
+    /// and reporting a missing deadline there is a false violation.
+    ///
+    /// Library knowledge, like [`ApiSpec::unbounded_sentinels`], so it is
+    /// declared here and never guessed by propagation. `None` -- every spec
+    /// authored before the field existed -- changes nothing. Skipped on
+    /// serialization when absent so such a spec round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_arg: Option<CapacityArg>,
+}
+
+/// Where a receiver's constructor takes its capacity: see
+/// [`ApiSpec::capacity_arg`]. The contract is the one Python's queue family
+/// documents: a positive integer is a finite capacity, so the call can block;
+/// the argument absent, zero or negative means no limit, so it cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityArg {
+    /// The keyword the argument is passed by (`maxsize`).
+    pub name: String,
+    /// Its zero-based position when passed positionally (`queue.Queue(10)`).
+    /// Absent for a keyword-only argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
 }
 
 impl ApiSpec {
@@ -665,6 +692,30 @@ pub enum ConfigExpect {
     AtLeast { value: f64 },
     /// The resolved value, parsed as a number, must be <= `value`.
     AtMost { value: f64 },
+    /// The resolved value must NOT equal `value` (po-pk3fp.13).
+    ///
+    /// The complement `equals` and `one_of` cannot state: "not the default
+    /// Argo CD project" has no enumerable satisfying set, and a Flux
+    /// `remediation.retries` of `-1` (remediate forever) is the strongest
+    /// setting, which `at_least 1` flagged. `not_equals "0"` says both.
+    NotEquals { value: String },
+    /// The resolved value, parsed as a duration, must be >= `value`.
+    ///
+    /// Both sides are duration strings in the Go / Prometheus grammar
+    /// (`30s`, `10m`, `1h30m`, `2d`), which is what Flux intervals and alert
+    /// `for:` clauses are authored in. `at_least` cannot judge them: `10m` is
+    /// not a number, and a bare number carries no unit. A value or a bound
+    /// that is not a duration ABSTAINS, the same rule as `at_least`.
+    DurationAtLeast { value: String },
+    /// The resolved value, parsed as a duration, must be <= `value`.
+    DurationAtMost { value: String },
+    /// A `kind` this binary does not know. The one key abstains instead of
+    /// the whole artifact failing to parse, so an expectation added by a
+    /// newer scanner degrades the way an unknown pattern name does. Binaries
+    /// that predate this variant still reject unknown kinds outright: an
+    /// artifact must not carry a kind older than its scanner floor.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A spec about one config key in one config format — the G6 analog of
@@ -1105,6 +1156,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             blocking_intent: BlockingIntent::Incidental,
             family: None,
+            capacity_arg: None,
         }
     }
 
@@ -1175,6 +1227,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
@@ -1288,6 +1342,8 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         }
     }
 
@@ -1940,6 +1996,49 @@ mod tests {
         assert_eq!(by_design_label(&why), None);
     }
 
+    // --- capacity precondition (po-av01j.231) ---
+
+    #[test]
+    fn a_cache_without_capacity_arg_declares_none() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[{"type":"queue.Queue","method":"put","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":1.0}],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.apis[0].capacity_arg, None);
+        // Absent stays absent on the wire: a legacy spec round-trips.
+        assert!(!serde_json::to_string(&f.apis[0])
+            .unwrap()
+            .contains("capacity_arg"));
+    }
+
+    #[test]
+    fn capacity_arg_parses_with_and_without_a_position() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[
+                 {"type":"queue.Queue","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"maxsize","position":0}},
+                 {"type":"k.Only","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"capacity"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.apis[0].capacity_arg,
+            Some(CapacityArg {
+                name: "maxsize".into(),
+                position: Some(0)
+            })
+        );
+        assert_eq!(
+            f.apis[1].capacity_arg,
+            Some(CapacityArg {
+                name: "capacity".into(),
+                position: None
+            })
+        );
+    }
+
     #[test]
     fn merge_carries_the_winning_specs_blocking_intent() {
         let mk = |confidence: f64, bi: BlockingIntent| SpecFile {
@@ -2137,12 +2236,65 @@ mod tests {
             ConfigExpect::Pattern {
                 name: "sha40".into(),
             },
+            ConfigExpect::AtLeast { value: 2.0 },
+            ConfigExpect::AtMost { value: 60.0 },
+            ConfigExpect::NotEquals {
+                value: "default".into(),
+            },
+            ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ConfigExpect::DurationAtMost {
+                value: "10m".into(),
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
             let back: ConfigExpect = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back, "{json}");
         }
+    }
+
+    #[test]
+    fn config_expect_names_the_new_kinds_in_snake_case() {
+        // The wire names the factory authors against.
+        for (json, want) in [
+            (
+                r#"{"kind":"not_equals","value":"0"}"#,
+                ConfigExpect::NotEquals { value: "0".into() },
+            ),
+            (
+                r#"{"kind":"duration_at_most","value":"10m"}"#,
+                ConfigExpect::DurationAtMost {
+                    value: "10m".into(),
+                },
+            ),
+            (
+                r#"{"kind":"duration_at_least","value":"1m"}"#,
+                ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<ConfigExpect>(json).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn an_unknown_expect_kind_does_not_fail_the_whole_cache() {
+        // One spec from a newer factory must cost one key, not every spec in
+        // the artifact.
+        let cache = SpecCache::load(
+            r#"{"config_keys": [
+                {"format": "flux", "key": "a", "expect": {"kind": "from_the_future", "n": 1}},
+                {"format": "flux", "key": "b", "expect": {"kind": "present"}}
+            ]}"#,
+        )
+        .expect("an unknown kind degrades, it does not abort the load");
+        assert_eq!(
+            cache.config_key("flux", "a").unwrap().expect,
+            ConfigExpect::Unknown
+        );
+        assert_eq!(
+            cache.config_key("flux", "b").unwrap().expect,
+            ConfigExpect::Present
+        );
     }
 
     #[test]

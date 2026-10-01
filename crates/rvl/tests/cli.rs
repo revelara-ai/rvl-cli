@@ -2115,6 +2115,95 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
 }
 
+/// The SEED corpus declaring a CAPACITY PRECONDITION (po-av01j.231): the
+/// constructor argument without which a queue's `put` cannot block.
+fn queue_capacity_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("queue_capacity_specs.json")
+}
+
+/// Python, live end to end: `put` on a `queue.Queue()` built with no maxsize
+/// cannot block, so it is not_applicable, while the same call on a
+/// `queue.Queue(maxsize=10)` with no timeout still violates. A queue that
+/// arrives as a parameter has no construction to read and abstains. The
+/// pilot's site (a queue built in `__init__`, put from another method) is the
+/// fourth row.
+#[test]
+fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import queue\nfrom queue import LifoQueue\n\n\n\
+         def unbounded(x):\n    q = queue.Queue()\n    q.put(x)\n\n\n\
+         def bounded(x):\n    q = queue.Queue(maxsize=10)\n    q.put(x)\n\n\n\
+         def sized_by_caller(n, x):\n    stack = LifoQueue(n)\n    stack.put(x)\n\n\n\
+         class Client:\n    \
+             def __init__(self):\n        self._notifications = queue.Queue()\n\n    \
+             def on_notification(self, notification):\n        \
+                 self._notifications.put(notification)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(queue_capacity_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let by_line = |line: u32| {
+        let rows = verdicts_for(doc["sites"].as_array().unwrap(), &format!("svc.py:{line}"));
+        assert_eq!(rows.len(), 1, "one finding at svc.py:{line}: {rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+
+    let (verdict, reason) = by_line(7);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert_eq!(
+        reason,
+        "cannot block: unbounded queue (queue.Queue constructed with no maxsize at svc.py:6)"
+    );
+
+    let (verdict, reason) = by_line(12);
+    assert_eq!(verdict, "violates", "{reason}");
+    assert_eq!(reason, "no bound anywhere and the search was complete");
+
+    let (verdict, reason) = by_line(17);
+    assert_eq!(verdict, "abstain", "{reason}");
+    assert!(reason.contains("could not be read"), "{reason}");
+
+    let (verdict, reason) = by_line(25);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert!(reason.contains("svc.py:22"), "{reason}");
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
@@ -2855,7 +2944,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
-/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// GitRepository tracking a branch, and an Argo Experiment the family does not
 /// parse. Seed config-key specs cover the pin-shape and remediation keys.
 fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // The config lane is the subject; the code lane gets one unspecced Go
@@ -2882,7 +2971,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     .unwrap();
     std::fs::write(
         dir.join("deploy/rollout.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
     )
     .unwrap();
     let specs = dir.join("specs.json");
@@ -2940,7 +3029,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         stdout.contains("RC-050"),
         "the deciding spec's control rides into the ladder: {stdout}"
     );
-    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // The unparsed Argo Experiment is a product-identity sighting, never a
     // generic kubernetes one.
     assert!(
         stdout.contains("argo-rollouts (1)"),
@@ -3996,6 +4085,70 @@ fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
         doc["coverage"]["test_files_skipped"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
+/// A stream from a tsindex run over an uninstalled tree says so on its
+/// repo-scoped record, and the scan must repeat it (po-pk3fp.15): on the
+/// COVERAGE block and on `--out`. Without the line, a scan resolved from
+/// import syntax reads exactly like one resolved from the installed tree.
+#[test]
+fn a_scan_names_the_dependency_trees_that_were_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let run = |stream: &str, out_name: &str| {
+        let p = dir.path().join(format!("{out_name}.jsonl"));
+        std::fs::write(&p, stream).unwrap();
+        let out_path = dir.path().join(format!("{out_name}.json"));
+        let out = bin()
+            .args(["scan", "--retrieved"])
+            .arg(&p)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan errored: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        (stdout, doc)
+    };
+    let base = std::fs::read_to_string(&packets).unwrap();
+
+    let (stdout, doc) = run(&base, "installed");
+    assert!(
+        !stdout.contains("installed dependencies"),
+        "a stream that reports nothing uninstalled prints nothing: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 0,
+        "{}",
+        doc["coverage"]
+    );
+
+    let degraded = format!(
+        "{base}{}\n",
+        r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"fixture","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#
+    );
+    let (stdout, doc) = run(&degraded, "uninstalled");
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "the stream's dependency state must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 2,
         "{}",
         doc["coverage"]
     );

@@ -106,6 +106,7 @@ fn cov() -> Coverage {
         abstain_no_spec: 0,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -161,6 +162,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_no_spec: 1,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -221,6 +223,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -264,6 +267,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -298,6 +302,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -328,6 +333,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -357,6 +363,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -391,6 +398,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -490,6 +498,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -530,6 +539,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 abstain_no_spec: 0,
                 generated_skipped: 0,
                 test_files_skipped: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
                 abstain_bounds: 0,
                 abstain_judge: 0,
                 abstain_other: 0,
@@ -1021,6 +1031,61 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
     assert!(
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
+    );
+}
+
+// --- dependency trees not installed (po-pk3fp.15) ---
+
+#[test]
+fn uninstalled_dependencies_are_named_per_language_and_zero_is_silent() {
+    // "TypeScript 900 sites" reads the same for a tree resolved from the
+    // installed packages and one resolved from import syntax alone. The
+    // second is a weaker scan, so the lane says which one it was.
+    let mut c = cov();
+    c.dependencies_uninstalled = vec![
+        DependenciesUninstalled {
+            lang: "TypeScript".into(),
+            count: 2,
+        },
+        DependenciesUninstalled {
+            lang: "retrieved stream".into(),
+            count: 1,
+        },
+    ];
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains(
+            "  TypeScript: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("  retrieved stream: 1 workspace without installed dependencies"),
+        "singular for one: {out}"
+    );
+    let quiet = render_lang_status(&cov(), false);
+    assert!(
+        !quiet.contains("installed dependencies"),
+        "zero must print nothing: {quiet}"
+    );
+}
+
+#[test]
+fn an_uninstalled_tree_is_reported_even_with_no_roll_call() {
+    // The warm path has no roll-call. The dependency line must not vanish
+    // with it, the same rule the skipped-test count follows.
+    let c = Coverage {
+        dependencies_uninstalled: vec![DependenciesUninstalled {
+            lang: "TypeScript".into(),
+            count: 1,
+        }],
+        ..Default::default()
+    };
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains("TypeScript: 1 workspace without installed dependencies"),
+        "got: {out:?}"
     );
 }
 

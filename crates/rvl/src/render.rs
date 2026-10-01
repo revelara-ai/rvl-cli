@@ -117,6 +117,12 @@ pub struct Coverage {
     /// Same rule as `generated_skipped`: reported, never silent. Only
     /// languages with a non-zero count are listed.
     pub test_files_skipped: Vec<TestFilesSkipped>,
+    /// Workspaces whose declared dependencies were not installed, per
+    /// language (po-pk3fp.15). The lane still scanned, from import syntax,
+    /// which is a weaker scan than one that resolved types from the
+    /// installed tree, and the roll-call above prints the same "N sites"
+    /// for both. Only languages with a non-zero count are listed.
+    pub dependencies_uninstalled: Vec<DependenciesUninstalled>,
     pub resolved: usize,
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
@@ -181,6 +187,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         && cov.retrievers.is_empty()
         && cov.generated_skipped == 0
         && cov.test_files_skipped.is_empty()
+        && cov.dependencies_uninstalled.is_empty()
     {
         return String::new();
     }
@@ -243,7 +250,30 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         );
         let _ = writeln!(o, "{}", paint(&line, "2", color));
     }
+    // A lane that scanned without its installed dependencies (po-pk3fp.15):
+    // the roll-call's "N sites" is the same for a tree resolved from the
+    // packages and one resolved from import syntax, so the weaker scan is
+    // named here. Dim like the lines above it, because the lane did run; a
+    // zero prints nothing.
+    for d in cov.dependencies_uninstalled.iter().filter(|d| d.count > 0) {
+        let line = format!(
+            "  {}: {} workspace{} without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)",
+            d.lang,
+            d.count,
+            if d.count == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
     o
+}
+
+/// How many of one language's workspaces declare dependencies that are not
+/// installed, so the helper resolved their client types from import syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependenciesUninstalled {
+    pub lang: String,
+    pub count: usize,
 }
 
 /// How many test files one language's helper declined to read.

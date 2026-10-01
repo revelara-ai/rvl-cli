@@ -197,8 +197,11 @@ type RetrievedSite struct {
 	// "type": the receiver could not be traced, so these are constructions of
 	// the same type found elsewhere in the repository, candidates only. One
 	// bounded client must never vouch for another, so downstream reads a
-	// "type" construction as evidence to abstain on, never to pass. Additive
-	// within the v2 packet train, like SiteKind.
+	// "type" construction as evidence to abstain on, never to pass.
+	// "unresolved": the receiver was traced to a value built outside this
+	// repository (a dependency's call result), so there is no construction to
+	// attach and none of the type elsewhere speaks for it. Additive within the
+	// v2 packet train, like SiteKind.
 	ConstructionScope string `json:"client_construction_scope,omitempty"`
 	Prov         Provenance `json:"provenance"`
 
@@ -384,6 +387,11 @@ func (s *srcIndex) text(pkg *packages.Package, from, to ast.Node) string {
 		out = out[:maxSnippetBytes] + "\n// ... truncated"
 	}
 	return out
+}
+
+// span is the byte length of n's source, before any truncation.
+func (s *srcIndex) span(pkg *packages.Package, n ast.Node) int {
+	return pkg.Fset.Position(n.End()).Offset - pkg.Fset.Position(n.Pos()).Offset
 }
 
 type retFunc struct {
@@ -689,6 +697,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 			reach.collect(p, f, src, rel)
 		}
 	}
+	reach.finish()
 
 	callees := map[string][]*retFunc{}
 
@@ -812,7 +821,22 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 				if me == nil {
 					continue
 				}
+				// The function literals open around the node being visited,
+				// innermost last.
+				var lits []*ast.FuncLit
+				var stack []ast.Node
 				ast.Inspect(fd.Body, func(x ast.Node) bool {
+					if x == nil {
+						if _, ok := stack[len(stack)-1].(*ast.FuncLit); ok {
+							lits = lits[:len(lits)-1]
+						}
+						stack = stack[:len(stack)-1]
+						return true
+					}
+					stack = append(stack, x)
+					if fl, ok := x.(*ast.FuncLit); ok {
+						lits = append(lits, fl)
+					}
 					c, ok := x.(*ast.CallExpr)
 					if !ok {
 						return true
@@ -856,12 +880,23 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						return true
 					}
 					file, line := rel(p, c)
+					// The enclosing function is the declaration, so a
+					// deadline derived before a closure is in scope of a call
+					// inside it. A declaration over the snippet budget is cut
+					// from the top, though, and a call in a handler literal
+					// at the bottom of a long main() then loses the literal
+					// it sits in, deadline included. The innermost literal is
+					// the function that call is in, so it is sent instead.
+					var enclosing ast.Node = fd
+					if len(lits) > 0 && src.span(p, fd) > maxSnippetBytes {
+						enclosing = lits[len(lits)-1]
+					}
 					rs := RetrievedSite{
 						Snapshot: name, File: file, Line: line,
 						Symbol: fd.Name.Name, Method: callee.Name(),
 						Receiver:  exprString(sel.X),
 						CallSite:  src.text(p, c, c),
-						Enclosing: src.text(p, fd, fd),
+						Enclosing: src.text(p, enclosing, enclosing),
 						ConstArgs: constArgs(info, c),
 					}
 					pkgPath, pkgRecv := packageReceiver(info, sel)
@@ -942,12 +977,15 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					// The values that reach this receiver, when the type checker
 					// can say which: see trace.go.
 					if !pkgRecv {
-						if got, ok := reach.trace(varOf(info, sel.X), funcs, src, 0); ok {
+						switch got, st := reach.trace(varOf(info, sel.X), funcs, src, 0); st {
+						case traceOK:
 							rs.ConstructionScope = "receiver"
 							if len(got) > maxCtorsEmitted {
 								got = got[:maxCtorsEmitted]
 							}
 							rs.Construction = got
+						case traceOpaque:
+							rs.ConstructionScope = "unresolved"
 						}
 					}
 					if rs.ConstructionScope == "" && rs.ClientType != "" {
