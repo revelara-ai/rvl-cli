@@ -571,8 +571,12 @@ mod tests {
         let h = hash_file(&tu).unwrap();
         let files = std::slice::from_ref(&tu);
 
-        let legacy: Entry =
-            serde_json::from_str(&format!(r#"{{"hash":"{h}","sites":[]}}"#)).unwrap();
+        // Stamped with the current packet contract: an unstamped entry is a
+        // miss on that ground alone, which is not what this test is about.
+        let legacy: Entry = serde_json::from_str(&format!(
+            r#"{{"hash":"{h}","packet_schema":{PACKET_SCHEMA},"sites":[]}}"#
+        ))
+        .unwrap();
         idx.put_entry(&tu, legacy).unwrap();
         assert!(idx.lookup(&tu, &h).unwrap().is_some());
         assert_eq!(idx.plan_reload(files).unchanged, vec![tu.clone()]);
