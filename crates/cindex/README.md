@@ -29,12 +29,57 @@ used.
   rvl surfaces that error rather than silently under-reporting a detected
   C/C++ repo.
 - **Pinning discipline:** a dev build uses the system libclang (floor:
-  libclang 6.0, the `clang_6_0` API feature). RELEASE artifacts must vendor a
-  pinned, checksummed LLVM build so scan results are reproducible across
-  machines — that packaging rides its own bead; nothing in this crate may
-  grow a dependency on system-specific clang behavior beyond the C API.
+  libclang 6.0, the `clang_6_0` API feature). RELEASE archives vendor a
+  pinned, checksummed libclang so scan results are reproducible across
+  machines (see "Release engine" below). Nothing in this crate may grow a
+  dependency on system-specific clang behavior beyond the C API.
 - `--engine-check` exists so callers (tests, doctors) can probe the engine
-  cheaply; engine-dependent tests SKIP with a log line when it fails.
+  cheaply; engine-dependent tests SKIP with a log line when it fails. It
+  prints one line: the clang version, then which engine loaded it —
+  `[vendored <path>]`, `[system]` or `[LIBCLANG_PATH <path>]`.
+
+## Release engine: the vendored libclang (po-av01j.49)
+
+**Pinned version: LLVM 18.1.1**, for every release target.
+[`libclang.pin`](libclang.pin) is the single source of truth: per Rust
+target triple, the library download and its sha256, plus the clang source
+tarball whose `lib/Headers` supplies the builtin headers. The comments in
+that file say where each artifact comes from and why.
+
+Release CI (`.github/build-setup.yml`) runs
+[`ci/fetch-libclang.sh <triple> crates/rvl/dist-extras`](../../ci/fetch-libclang.sh)
+before `dist build`. It checks every download against the pin, fails the
+release on any mismatch, and only then writes the bundle, which dist's
+`include` packs beside `cindex`:
+
+    rvl-<triple>/
+      rvl  cindex  rustindex  goindex
+      libclang/
+        libclang.so | libclang.dylib   the pinned library
+        include/                       clang 18.1.1 builtin headers (stddef.h ...)
+        LICENSE.TXT                    LLVM's license
+
+Engine resolution at run time (`src/engine.rs`), first match wins:
+
+1. `LIBCLANG_PATH`: an explicit override, used as-is.
+2. `libclang/` beside the **symlink-resolved** `cindex`. Homebrew runs the
+   helper through a link in its `bin`; the bundle sits beside the Caskroom
+   original. A half-present bundle fails closed.
+3. The system libclang. A release build (compiled with
+   `CINDEX_REQUIRE_VENDORED_LIBCLANG`, which release CI sets) never takes this
+   step: with its bundle missing it fails closed, because a release that
+   quietly scans with a different clang is not reproducible.
+
+On the vendored engine every TU also gets `-resource-dir <bundle>`. The
+vendored library reports a relative resource dir and cannot find its own
+builtin headers; without them any TU that includes a libc header takes a
+fatal `'stddef.h' file not found` and still comes back as "parsed".
+
+To bump the pin, change every line of `libclang.pin` together (one LLVM
+version for all targets, the headers from that same version), and run
+`cargo test -p cindex`: `tests/libclang_pin.rs` holds the pinned triples to
+`dist-workspace.toml`'s `targets` and exercises the fetch script's
+fail-closed paths.
 
 ## Compile-database rules (native paths only)
 

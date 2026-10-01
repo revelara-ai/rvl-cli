@@ -3404,7 +3404,7 @@ fn render_scan_output(
     if !waivers.is_empty() {
         let today = rvl_cache::today_utc();
         for f in &mut ladder_findings {
-            if waiver::is_waived(&f.class_rule, &f.site, &waivers, &today) {
+            if waiver::is_waived(&f.class_rule, waiver::site_path(&f.site), &waivers, &today) {
                 f.suppressed = true;
             }
         }
