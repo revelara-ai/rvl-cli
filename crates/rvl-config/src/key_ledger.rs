@@ -66,6 +66,12 @@ const fn vocabulary_only(
 
 /// Every key the registered retrievers emit, sorted by (format, key).
 pub const EMITTED_KEYS: &[EmittedKey] = &[
+    judged("alertmanager", "inhibit_rules"),
+    judged("alertmanager", "route.group_by"),
+    judged("alertmanager", "route.group_interval"),
+    judged("alertmanager", "route.group_wait"),
+    judged("alertmanager", "route.receiver"),
+    judged("alertmanager", "route.repeat_interval"),
     judged("argo-cd", "application.ignoreDifferences"),
     judged("argo-cd", "application.project"),
     judged("argo-cd", "application.syncPolicy.automated"),
@@ -295,6 +301,7 @@ mod tests {
     /// The retriever sources, with their test modules cut off.
     fn retriever_sources() -> Vec<(&'static str, &'static str)> {
         [
+            ("alertmanager.rs", include_str!("alertmanager.rs")),
             ("argo_flux.rs", include_str!("argo_flux.rs")),
             ("dep_manifests.rs", include_str!("dep_manifests.rs")),
             ("github_actions.rs", include_str!("github_actions.rs")),
