@@ -16,6 +16,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// The `rustindex` executable is a bin target of the `rvl` package, so cargo
 /// has built it before this test runs.
 fn rustindex() -> &'static str {
@@ -35,7 +44,7 @@ fn rust_analyzer_available() -> bool {
 }
 
 fn fixture_src() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .parent()
         .unwrap()
         .join("rustindex")

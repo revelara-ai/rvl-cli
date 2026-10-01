@@ -685,9 +685,12 @@ specs borrowed by method for {borrowed} rows",
 
             // The population, printed WITH the number, always.
             println!(
-                "GATE RUN  set {} | language {} | minted {} | registry v{registry_version}",
-                manifest.set_id, manifest.language, manifest.minted
+                "GATE RUN  set {} | language {} | minted {} | registry v{registry_version} (minted against v{})",
+                manifest.set_id, manifest.language, manifest.minted, manifest.registry_version
             );
+            if let Some(note) = gate::registry_version_note(&manifest, &reg) {
+                println!("  {note}");
+            }
             for pin in &manifest.repos {
                 println!("  repo {} @ {}", pin.repo, pin.frozen_sha);
             }
