@@ -99,6 +99,17 @@ generating the db is user-run tooling (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 - **A TU that fails to parse is COUNTED, never guessed at**: the
   `retrieval_stats` record carries `tus_total` / `tus_parsed` / `tus_failed`,
   and coverage claims stop at what actually parsed.
+- **A TU that parses with errors is COUNTED as incomplete** (po-av01j.138).
+  Clang recovers from an error by dropping the construct: with
+  `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as a
+  multiplication of undeclared identifiers and the statement vanishes, calls
+  and all, leaving no call expression to count. So `tus_parsed` includes
+  `tus_incomplete` (TUs with any error diagnostic, paths in
+  `tus_incomplete_paths`), and `includes_missing` / `decls_unresolved` say
+  why. An incomplete TU still emits the sites that DID resolve, but its zero
+  is never reported as a clean one: `rvl scan` shows the lane as `partial`.
+  `calls_callee_unresolved` counts only calls clang formed whose callee did
+  not resolve; it is not a completeness claim (it was `calls_unresolved`).
 - Files not listed in the db are not scanned: the gate population for C/C++
   is compile-db repos (expansion gate protocol, po-ae75b.2).
 
@@ -188,7 +199,7 @@ The hardest typing story in the inventory, split into explicit tiers:
 | C++ member call, strong I/O verb (`execute`, `perform`, `request`, …) | emitted at the receiver's declared type | `client_type_resolved: true` |
 | C++ member call, weak verb (`get`, `send`, `query`, …) on an out-of-repo (third-party) type | emitted | `client_type_resolved: true` |
 | **Virtual dispatch** (weak or strong verb) | emitted at the STATIC interface identity | **mid tier:** `provenance.callee_candidates` = 1 + overriding definitions in the TU (>1 = ambiguous dispatch) |
-| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_unresolved`, never guessed | — |
+| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_callee_unresolved`, never guessed | — |
 | Weak verb on an in-repo, non-virtual type | not emitted (noise floor) | — |
 | No-db `.c` allowlist match | emitted | LOW: `client_type_resolved: false` |
 

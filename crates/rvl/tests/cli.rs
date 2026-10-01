@@ -43,6 +43,10 @@ fn bin() -> Command {
     ] {
         c.env_remove(k);
     }
+    // THE SUITE MUST NOT REACH THE NETWORK (po-av01j.171). A scan on the
+    // signed cache now starts a background cache check; offline turns it
+    // off. auto_sync_cli.rs covers that check against a local server.
+    c.env("RVL_OFFLINE", "1");
     c
 }
 
@@ -457,6 +461,17 @@ fn force_next_outside_a_repo_is_refused() {
 
 // --- single-command scan: helper orchestration (po-3t3oj.25) ---
 
+/// `go build`, with any inherited GOROOT dropped. A `go` binary locates its
+/// own root; an exported GOROOT that names another release (a gvm shell whose
+/// PATH resolves to an auto-switched toolchain) makes every std package fail
+/// with "compile: version ... does not match go tool version ...", which is
+/// the host's toolchain and not our helper failing to build.
+fn go_build_command() -> Command {
+    let mut cmd = Command::new("go");
+    cmd.arg("build").env_remove("GOROOT");
+    cmd
+}
+
 /// End-to-end: `rvl scan <dir>` with NO `--retrieved` must detect the Go
 /// source, run goindex itself, and feed the packets into the pipeline. Requires
 /// a `go` toolchain to build the helper; if `go` is absent the test is skipped
@@ -473,8 +488,8 @@ fn scan_without_retrieved_runs_the_go_helper() {
     // Build goindex from source so the test exercises a real helper run.
     let dir = tempfile::tempdir().unwrap();
     let goindex_bin = dir.path().join("goindex");
-    let build = Command::new("go")
-        .args(["build", "-o"])
+    let build = go_build_command()
+        .args(["-o"])
         .arg(&goindex_bin)
         .arg(".")
         .current_dir(&goindex_src)
@@ -1062,8 +1077,8 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
-    match Command::new("go")
-        .args(["build", "-o"])
+    match go_build_command()
+        .args(["-o"])
         .arg(&goindex_bin)
         .arg(".")
         .current_dir(&goindex_src)

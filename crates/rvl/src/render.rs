@@ -201,15 +201,20 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             .iter()
             .map(|s| match s.state {
                 LangState::Scanned => format!("{} {} sites", s.lang, s.detail),
+                LangState::Partial => format!("{} {}", s.lang, s.detail),
                 LangState::Abstained => format!("{} abstained", s.lang),
                 LangState::Failed => format!("{} FAILED", s.lang),
                 LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
                 LangState::NotInstalled => format!("{} helper not installed", s.lang),
             })
             .collect();
-        // Yellow when anything failed: a failure changes what the numbers above
-        // it mean, an abstention or an unsupported language does not.
-        let any_failed = cov.lang_status.iter().any(|s| s.state == LangState::Failed);
+        // Yellow when anything failed or parsed only partly: both change what
+        // the numbers above it mean, an abstention or an unsupported language
+        // does not.
+        let any_failed = cov
+            .lang_status
+            .iter()
+            .any(|s| matches!(s.state, LangState::Failed | LangState::Partial));
         let line = format!("  languages: {}", parts.join(" \u{00b7} "));
         let _ = writeln!(
             o,
@@ -331,7 +336,8 @@ pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
 pub struct LangStatus {
     pub lang: String,
     pub state: LangState,
-    /// Site count for Scanned; the reason for the others.
+    /// Site count for Scanned; the site count and what went unparsed for
+    /// Partial; the reason for the others.
     pub detail: String,
 }
 
@@ -355,6 +361,11 @@ pub enum LangState {
     /// The helper ran to completion. `detail` carries the packet count, which
     /// may legitimately be zero.
     Scanned,
+    /// The helper ran to completion, but some units parsed only partly
+    /// (po-av01j.138): clang recovered from errors, usually a header that is
+    /// not installed, by dropping constructs, and any call inside one went
+    /// with it. `detail` carries the site count, which is a floor, and why.
+    Partial,
     /// The helper ran and declined, with a reason. Working as intended.
     Abstained,
     /// The helper could not run or errored. NOT working as intended.

@@ -94,6 +94,10 @@ fn goindex_binary() -> Option<PathBuf> {
                 .join("goindex-under-test");
             let st = Command::new("go")
                 .arg("build")
+                // A `go` binary locates its own root; an inherited GOROOT naming
+                // another release fails every std package (see cli.rs
+                // go_build_command).
+                .env_remove("GOROOT")
                 .arg("-o")
                 .arg(&out)
                 .arg(".")

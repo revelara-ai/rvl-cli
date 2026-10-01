@@ -32,7 +32,9 @@ headless and CI use work with no config file at all.
 | `RVL_API_KEY` | API key (config `api_key`) |
 | `RVL_API_URL` | API endpoint (config `api_url`) |
 | `RVL_ORG_NAME` | Organization name (config `org_name`) |
-| `RVL_OFFLINE=1` | Kill switch for every network fetch |
+| `RVL_OFFLINE=1` | Kill switch for every network fetch, including the background spec-cache check |
+| `RVL_SPEC_VERSION` | Pin the spec cache content_version for `scan` (same as `--spec-version`); see below |
+| `CI` | When set (and not `0`/`false`), a scan does not start the background spec-cache check |
 | `RVL_BASE_REF` | Base ref for `--changed-only` (below `--base`, above CI's own vars) |
 | `RVL_FORCE=1` | Commit despite blocking findings |
 | `RVL_SCAN_TIMEOUT` | HTTP timeout for submission mode (default 60s) |
@@ -70,6 +72,29 @@ on top of the public vocabulary baseline, and removing the key falls back to
 the baseline. The judgments corpus (what grades a finding) rides only in the
 commercial tier. See [Scanning your repo with rvl](scanning.md) for the
 user-facing guide.
+
+### Keeping the cache current
+
+You do not need to run `rvl sync` by hand:
+
+- `rvl init` syncs both tiers (the commercial one only with a key) before it
+  finishes. A failed fetch does not fail init; it says to run `rvl sync`.
+- A scan on the signed cache starts at most one background check every six
+  hours, after the scan has finished. The scan never waits for it, and a
+  failed check is silent. The last check time is `auto-sync.stamp` in the
+  cache root; `rvl sync` and `rvl init` reset it.
+- A cache the check installs applies from the NEXT scan, never the running
+  one, so a single scan always runs on one corpus. When a repo's scan runs on
+  a different corpus than its previous scan, stderr says so:
+  `spec cache updated since this repo's last scan: <old> -> <new>`. A result
+  that changed with no code change is then visibly the corpus, not the code.
+
+The background check is off with `RVL_OFFLINE=1`, in CI (`CI` set), and when
+the scan is pinned. To make a CI gate reproducible across time, pin the
+corpus with `--spec-version <content_version>` or `RVL_SPEC_VERSION` (a
+comma-separated list gives one version per tier; `rvl cache status` prints
+them). A pinned scan refuses to run on any other installed version; install
+the pinned artifact with `rvl cache import`.
 
 ## Compatibility flags
 
