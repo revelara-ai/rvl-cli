@@ -4213,6 +4213,37 @@ fn detached_log_path(cache_dir: &std::path::Path) -> PathBuf {
     cache_dir.join("reindex.log")
 }
 
+/// The size past which the detached reindex log is rotated at the next spawn.
+/// A warm writes about a kilobyte, so this is roughly a thousand commits of
+/// history before the oldest generation is dropped.
+const DETACHED_LOG_CAP: u64 = 1024 * 1024;
+
+/// Where the previous generation of the detached reindex log is kept.
+fn rotated_log_path(log_path: &std::path::Path) -> PathBuf {
+    let mut name = log_path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Keep the detached reindex log bounded: once it is over `cap`, move it to
+/// `reindex.log.1` (replacing the generation before it) so the next spawn
+/// starts a fresh file. One line per post-commit warm, forever, is otherwise
+/// a file that only grows (po-gvzpc).
+///
+/// A rename, never a truncate. Two warms can be alive at once, and a warm
+/// that is still writing keeps its handle on the renamed file, so its output
+/// lands whole in `reindex.log.1` instead of being cut in half.
+///
+/// Best effort on purpose: a log that cannot be rotated is appended to as
+/// before. Refusing to start the warm over housekeeping would trade a large
+/// file for a stale index.
+fn rotate_detached_log(log_path: &std::path::Path, cap: u64) {
+    let over_cap = std::fs::metadata(log_path).is_ok_and(|m| m.len() > cap);
+    if over_cap {
+        std::fs::rename(log_path, rotated_log_path(log_path)).ok();
+    }
+}
+
 /// How long a background warm waits for a busy index. Generous on purpose:
 /// it runs behind a commit with nobody watching, so waiting out a concurrent
 /// scan costs nothing while giving up loses the entire reindex.
@@ -4245,6 +4276,7 @@ fn run_index_build(
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        rotate_detached_log(&log_path, DETACHED_LOG_CAP);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -6707,6 +6739,74 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the detached reindex log stays bounded (po-gvzpc) ---
+
+    /// A log under the cap is left alone: rotating on every spawn would throw
+    /// away the history the log exists to keep.
+    #[test]
+    fn a_detached_log_under_the_cap_is_not_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        std::fs::write(&log, "warm 1\n").unwrap();
+
+        rotate_detached_log(&log, 64);
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "warm 1\n");
+        assert!(!rotated_log_path(&log).exists());
+    }
+
+    /// Over the cap, the log becomes the one kept generation and the earlier
+    /// generation is dropped, so the pair never holds more than about twice
+    /// the cap.
+    #[test]
+    fn a_detached_log_over_the_cap_replaces_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        let rotated = rotated_log_path(&log);
+        std::fs::write(&rotated, "ancient\n").unwrap();
+        std::fs::write(&log, "x".repeat(65)).unwrap();
+
+        rotate_detached_log(&log, 64);
+
+        assert!(!log.exists(), "the next spawn must start a fresh log");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "x".repeat(65));
+    }
+
+    /// The first detached warm has no log yet, and that is not an error.
+    #[test]
+    fn a_missing_detached_log_is_left_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+
+        rotate_detached_log(&log, 64);
+
+        assert!(!log.exists());
+        assert!(!rotated_log_path(&log).exists());
+    }
+
+    /// The reason this rotates instead of truncating: a warm that is still
+    /// alive when the next one spawns must not have its output cut. Its
+    /// handle follows the file, so what it writes afterwards is still whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_still_writing_keeps_its_output_across_a_rotation() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        writer.write_all("y".repeat(65).as_bytes()).unwrap();
+
+        rotate_detached_log(&log, 64);
+        writer.write_all(b"\nstill here\n").unwrap();
+
+        let kept = std::fs::read_to_string(rotated_log_path(&log)).unwrap();
+        assert_eq!(kept, format!("{}\nstill here\n", "y".repeat(65)));
+    }
 
     // --- an empty commercial API corpus is never quiet ---
 
