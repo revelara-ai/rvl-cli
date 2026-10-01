@@ -109,6 +109,9 @@ struct SiteOut {
     lang: &'static str,
     const_args: Vec<ConstArgOut>,
     macro_expansion: bool,
+    /// "" = a classic G1 client-call site; [`SITE_KIND_BACKGROUND_JOB`] = a
+    /// G3 thread-start registration (po-av01j.51).
+    site_kind: &'static str,
 }
 
 /// Repo-scoped retrieval accounting. Rides the same stream tagged by `kind`;
@@ -332,6 +335,29 @@ fn c_family(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The `site_kind` a G3 registration carries (the cross-helper contract value).
+const SITE_KIND_BACKGROUND_JOB: &str = "background_job";
+
+/// The C free-function G3 set: calls that START a background thread, mapped
+/// to their client type. Registrations only — the retriever reports where a
+/// thread starts and never analyzes the loop it runs.
+fn c_job_family(name: &str) -> Option<&'static str> {
+    match name {
+        "pthread_create" => Some("posix.pthread"),
+        _ => None,
+    }
+}
+
+/// (client type, site kind) of a C free function on either identity table.
+fn c_identity(name: &str) -> Option<(&'static str, &'static str)> {
+    c_family(name)
+        .map(|family| (family, ""))
+        .or_else(|| c_job_family(name).map(|family| (family, SITE_KIND_BACKGROUND_JOB)))
+}
+
+/// C++ types whose construction WITH a callable starts a background thread.
+const THREAD_TYPES: &[&str] = &["std::thread", "std::jthread"];
 
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
@@ -681,6 +707,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let client_type: String;
     let mut receiver = String::new();
     let mut virtual_usr: Option<String> = None;
+    let mut site_kind = "";
 
     if callee_resolved {
         let ckind = clang_getCursorKind(callee);
@@ -690,10 +717,11 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         }
         match ckind {
             k if k == CXCursor_FunctionDecl => {
-                let Some(family) = c_family(&method) else {
+                let Some((family, kind)) = c_identity(&method) else {
                     return;
                 };
                 client_type = family.to_string();
+                site_kind = kind;
             }
             k if k == CXCursor_CXXMethod => {
                 if !st.compile_db_mode {
@@ -730,19 +758,41 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     }
                 }
             }
-            _ => return, // constructors, destructors, conversions: not G1 calls
+            k if k == CXCursor_Constructor => {
+                // G3: constructing a thread type WITH a callable is the
+                // registration. The default constructor starts nothing and a
+                // copy/move only transfers a thread that already runs. A
+                // thread built inside a library header (`emplace_back`) sits
+                // in a system header and is a documented abstention.
+                if !st.compile_db_mode {
+                    return; // C++ without a db is a documented abstention
+                }
+                let class_cur = clang_getCursorSemanticParent(callee);
+                let type_name = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
+                if !THREAD_TYPES.contains(&type_name.as_str())
+                    || clang_Cursor_getNumArguments(call) < 1
+                    || clang_CXXConstructor_isCopyConstructor(callee) != 0
+                    || clang_CXXConstructor_isMoveConstructor(callee) != 0
+                {
+                    return;
+                }
+                client_type = type_name;
+                site_kind = SITE_KIND_BACKGROUND_JOB;
+            }
+            _ => return, // other constructors, destructors, conversions: not sites
         }
     } else if !st.compile_db_mode {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
-        let Some(family) = c_family(&method) else {
+        let Some((family, kind)) = c_identity(&method) else {
             if method.is_empty() {
                 st.calls_unresolved += 1;
             }
             return;
         };
         client_type = family.to_string();
+        site_kind = kind;
     } else {
         // Compile-db mode with an unresolved callee: the uninstantiated
         // template's dependent call lands here. Counted, never guessed.
@@ -788,6 +838,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
             lang: "c_cpp",
             const_args,
             macro_expansion,
+            site_kind,
         },
         virtual_usr,
     });
@@ -1040,5 +1091,19 @@ mod tests {
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
         assert_eq!(c_family("printf"), None);
+    }
+
+    #[test]
+    fn c_identity_keeps_thread_starts_off_the_g1_table() {
+        assert_eq!(c_identity("PQexec"), Some(("libpq.PGconn", "")));
+        assert_eq!(
+            c_identity("pthread_create"),
+            Some(("posix.pthread", SITE_KIND_BACKGROUND_JOB))
+        );
+        // A thread start is a G3 registration, never a classic G1 call site.
+        assert_eq!(c_family("pthread_create"), None);
+        // Lifecycle calls around the thread are not registrations.
+        assert_eq!(c_identity("pthread_join"), None);
+        assert_eq!(c_identity("pthread_detach"), None);
     }
 }
