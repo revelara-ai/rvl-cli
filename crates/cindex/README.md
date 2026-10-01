@@ -149,6 +149,38 @@ schema-v2 contract fields (`packet_schema: 2`, agreeing with
   shape stable.
 - `lang` — `"c_cpp"`.
 
+### G4 emission-point aggregates
+
+Log statements ride the same stream, stamped `site_kind: "emission_point"`
+(G1 client-call packets carry no `site_kind` key at all). They are
+AGGREGATES: one packet per enclosing function × framework × category, never
+one per log line. The packet's `line_number`, `func` and `snippet` are those
+of the function's FIRST emission call into that framework, and two
+`const_args` entries with `how: "aggregate"` carry the rest:
+`emission_category` and `emission_count` (the `rvl_core` G4 convention the
+other helpers follow).
+
+| Framework | What counts | `client_type` |
+| --- | --- | --- |
+| syslog | global `syslog` / `vsyslog` | `posix.syslog` |
+| spdlog | `spdlog::logger` members and `spdlog::` free functions `trace`/`debug`/`info`/`warn`/`error`/`critical`/`log`; the `SPDLOG_*` macros, which expand to `logger::log` | `spdlog::logger` |
+| glog | `google::LogMessage::stream()`: what each `LOG`/`PLOG`/`VLOG`/`LOG_IF` statement expands to, once per statement | `google::LogMessage` |
+
+- Identities are resolved, never matched on a bare name in C++: a user's
+  `app::syslog` or `Report::info` abstains. A framework's configuration
+  surface (`openlog`, `set_level`, `flush`) is not an emission.
+- `macro_expansion` is true when ANY counted call sits in a recorded macro
+  expansion, so the macro surfaces (`SPDLOG_*`, `LOG()`) are flagged by the
+  same mechanical ranges as G1 sites.
+- The no-db allowlist tier inventories `syslog` in `.c` files at LOW tier
+  (`client_type_resolved: false`), like every other no-db packet.
+- **The only category is `log`.** `error_capture` (emission on an error path)
+  needs C++ catch-clause analysis, which this helper does not have yet.
+- Not inventoried: a call outside any function (a namespace-scope
+  initializer), and a call with a dependent callee in an uninstantiated
+  template (counted in `calls_unresolved`, as for G1). Calls inside a lambda
+  count toward the enclosing named function.
+
 ## C/C++ typing tiers
 
 The hardest typing story in the inventory, split into explicit tiers:
@@ -192,6 +224,7 @@ Golden packet tests run the built helper over the
 checked-in fixtures (`testdata/fixture-c`, `fixture-cpp`, `fixture-nodb`)
 and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
-accounting. Engine-dependent tests skip (loudly) without libclang; the pure
+accounting; `testdata/fixture-emission` pins the G4 aggregates (syslog,
+spdlog, glog). Engine-dependent tests skip (loudly) without libclang; the pure
 compile-db plumbing (shell splitting, arg filtering, the allowlist) is unit
 tested and always runs.

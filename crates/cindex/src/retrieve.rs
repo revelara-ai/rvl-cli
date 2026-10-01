@@ -109,6 +109,10 @@ struct SiteOut {
     lang: &'static str,
     const_args: Vec<ConstArgOut>,
     macro_expansion: bool,
+    /// Empty on G1 client calls and then left off the packet, so a G1 stream
+    /// is unchanged; [`SITE_KIND_EMISSION`] on G4 aggregates.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    site_kind: &'static str,
 }
 
 /// Repo-scoped retrieval accounting. Rides the same stream tagged by `kind`;
@@ -362,6 +366,41 @@ const WEAK_VERBS: &[&str] = &[
     "exec", "wait", "recv",
 ];
 
+// --- G4 emission identities ---
+
+/// Mirrors `rvl_core::SITE_KIND_EMISSION`.
+const SITE_KIND_EMISSION: &str = "emission_point";
+
+/// The only category this helper reports. `error_capture` needs to know that
+/// an emission sits on an error path, which waits on C++ catch-clause
+/// analysis (po-av01j.52).
+const EMISSION_CATEGORY_LOG: &str = "log";
+
+/// spdlog's emitting names, shared by `spdlog::logger` members and the free
+/// functions that forward to the default logger. The rest of that surface
+/// (`set_level`, `flush`, `set_pattern`) configures and emits nothing.
+const SPDLOG_EMIT_VERBS: &[&str] = &["trace", "debug", "info", "warn", "error", "critical", "log"];
+
+/// The G4 candidate set: a resolved callee's identity mapped to the framework
+/// its aggregate is filed under. `scope` is the class for a member function
+/// and the namespace path for a free one (`""` = global).
+///
+/// Identity-driven, like [`c_family`]: a C++ name counts only inside its own
+/// namespace or class, so a user's `app::syslog` or `Report::info` abstains.
+/// The macro surfaces need no rule of their own: `SPDLOG_*` expands to a
+/// `logger::log` member call, and every glog `LOG`/`PLOG`/`VLOG`/`LOG_IF`
+/// statement to exactly one `google::LogMessage::stream()` call.
+fn emission_framework(is_method: bool, scope: &str, name: &str) -> Option<&'static str> {
+    match (is_method, scope) {
+        (false, "") if matches!(name, "syslog" | "vsyslog") => Some("posix.syslog"),
+        (false, "spdlog") | (true, "spdlog::logger") if SPDLOG_EMIT_VERBS.contains(&name) => {
+            Some("spdlog::logger")
+        }
+        (true, "google::LogMessage") if name == "stream" => Some("google::LogMessage"),
+        _ => None,
+    }
+}
+
 // --- libclang plumbing ---
 
 unsafe fn cx_string(s: CXString) -> String {
@@ -390,6 +429,21 @@ unsafe fn loc_parts(
         cx_string(clang_getFileName(file))
     };
     (path, line, col, off)
+}
+
+/// The `::`-joined namespaces enclosing a declaration; empty at global scope.
+/// Non-namespace parents (an `extern "C"` block) are transparent.
+unsafe fn namespace_path(decl: CXCursor) -> String {
+    let mut parts = Vec::new();
+    let mut cur = clang_getCursorSemanticParent(decl);
+    while clang_Cursor_isNull(cur) == 0 && clang_isTranslationUnit(clang_getCursorKind(cur)) == 0 {
+        if clang_getCursorKind(cur) == CXCursor_Namespace {
+            parts.push(cx_string(clang_getCursorSpelling(cur)));
+        }
+        cur = clang_getCursorSemanticParent(cur);
+    }
+    parts.reverse();
+    parts.join("::")
 }
 
 /// First child of a cursor, if any.
@@ -521,6 +575,13 @@ struct PendingSite {
     virtual_usr: Option<String>,
 }
 
+/// One G4 aggregate under construction: the packet of the function's FIRST
+/// emission call into a framework, and how many calls it stands for.
+struct EmissionAgg {
+    site: SiteOut,
+    count: u32,
+}
+
 struct WalkState {
     root: PathBuf,
     snapshot: String,
@@ -531,6 +592,10 @@ struct WalkState {
     /// base-method USR -> number of overriding definitions seen in this TU.
     override_counts: HashMap<String, u32>,
     pending: Vec<PendingSite>,
+    /// G4 aggregates of this TU in first-seen order (the stream must be
+    /// deterministic), indexed by (enclosing function USR, framework).
+    emissions: Vec<EmissionAgg>,
+    emission_index: HashMap<(String, &'static str), usize>,
     calls_unresolved: u32,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
@@ -685,6 +750,29 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     if callee_resolved {
         let ckind = clang_getCursorKind(callee);
         method = cx_string(clang_getCursorSpelling(callee));
+        let framework = match ckind {
+            k if k == CXCursor_FunctionDecl => {
+                emission_framework(false, &namespace_path(callee), &method)
+            }
+            k if k == CXCursor_CXXMethod => {
+                let class_cur = clang_getCursorSemanticParent(callee);
+                let class = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
+                emission_framework(true, &class, &method)
+            }
+            _ => None,
+        };
+        if let Some(framework) = framework {
+            record_emission(
+                call,
+                framework,
+                method,
+                file_path,
+                exp_line,
+                macro_expansion,
+                st,
+            );
+            return;
+        }
         if method.starts_with("operator") {
             return;
         }
@@ -736,6 +824,18 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
+        if let Some(framework) = emission_framework(false, "", &method) {
+            record_emission(
+                call,
+                framework,
+                method,
+                file_path,
+                exp_line,
+                macro_expansion,
+                st,
+            );
+            return;
+        }
         let Some(family) = c_family(&method) else {
             if method.is_empty() {
                 st.calls_unresolved += 1;
@@ -788,9 +888,66 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
             lang: "c_cpp",
             const_args,
             macro_expansion,
+            site_kind: "",
         },
         virtual_usr,
     });
+}
+
+/// Count one emission call toward its (enclosing function, framework)
+/// aggregate. Log statements are the highest-volume site class there is, so
+/// the stream carries one packet per aggregate, never one per log line. A
+/// call outside any function (a namespace-scope initializer) has no function
+/// to aggregate under and is not inventoried.
+unsafe fn record_emission(
+    call: CXCursor,
+    framework: &'static str,
+    method: String,
+    file_path: String,
+    line: u32,
+    macro_expansion: bool,
+    st: &mut WalkState,
+) {
+    let Some(f) = st.fn_stack.last().copied() else {
+        return;
+    };
+    let key = (cx_string(clang_getCursorUSR(f)), framework);
+    let idx = match st.emission_index.get(&key) {
+        Some(&idx) => idx,
+        None => {
+            let site = SiteOut {
+                packet_schema: PACKET_SCHEMA,
+                site_key: format!("{file_path}:{line}:{framework}:{method}"),
+                snapshot_id: st.snapshot.clone(),
+                file_path,
+                line_number: line,
+                symbol: cx_string(clang_getCursorSpelling(f)),
+                method,
+                receiver: String::new(),
+                client_type: framework.to_string(),
+                snippet: extent_text(call, st, 2000),
+                enclosing_function_body: extent_text(f, st, 8000),
+                callers: Vec::new(),
+                callees: Vec::new(),
+                client_construction: Vec::new(),
+                provenance: ProvenanceOut {
+                    client_type_resolved: st.compile_db_mode,
+                    ..Default::default()
+                },
+                lang: "c_cpp",
+                const_args: Vec::new(),
+                macro_expansion: false,
+                site_kind: SITE_KIND_EMISSION,
+            };
+            st.emissions.push(EmissionAgg { site, count: 0 });
+            st.emission_index.insert(key, st.emissions.len() - 1);
+            st.emissions.len() - 1
+        }
+    };
+    let agg = &mut st.emissions[idx];
+    agg.count += 1;
+    // Set when ANY counted call sits in an expansion (rustindex precedent).
+    agg.site.macro_expansion |= macro_expansion;
 }
 
 /// Parse one TU and drain its sites. Returns None when the TU fails to parse.
@@ -831,6 +988,8 @@ unsafe fn walk_tu(
     st.fn_stack.clear();
     st.override_counts.clear();
     st.pending.clear();
+    st.emissions.clear();
+    st.emission_index.clear();
     st.macro_ranges.clear();
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
@@ -841,7 +1000,7 @@ unsafe fn walk_tu(
     clang_visitChildren(root_cursor, visitor, st as *mut WalkState as CXClientData);
     // Finalize the mid tier: a virtual callee's ambiguity is 1 (its own
     // definition) + the overriding definitions this TU declares.
-    let sites = st
+    let mut sites: Vec<SiteOut> = st
         .pending
         .drain(..)
         .map(|mut p| {
@@ -852,6 +1011,24 @@ unsafe fn walk_tu(
             p.site
         })
         .collect();
+    // Category and count ride const_args (the rvl-core G4 convention).
+    sites.extend(st.emissions.drain(..).map(|mut agg| {
+        agg.site.const_args = vec![
+            ConstArgOut {
+                index: 0,
+                name: "emission_category".to_string(),
+                value: EMISSION_CATEGORY_LOG.to_string(),
+                how: "aggregate",
+            },
+            ConstArgOut {
+                index: 0,
+                name: "emission_count".to_string(),
+                value: agg.count.to_string(),
+                how: "aggregate",
+            },
+        ];
+        agg.site
+    }));
     clang_disposeTranslationUnit(tu);
     Some(sites)
 }
@@ -929,6 +1106,8 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         fn_stack: Vec::new(),
         override_counts: HashMap::new(),
         pending: Vec::new(),
+        emissions: Vec::new(),
+        emission_index: HashMap::new(),
         calls_unresolved: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
@@ -1040,5 +1219,49 @@ mod tests {
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
         assert_eq!(c_family("printf"), None);
+    }
+
+    #[test]
+    fn emission_framework_is_scoped_to_the_framework_identity() {
+        assert_eq!(
+            emission_framework(false, "", "syslog"),
+            Some("posix.syslog")
+        );
+        assert_eq!(
+            emission_framework(false, "", "vsyslog"),
+            Some("posix.syslog")
+        );
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "warn"),
+            Some("spdlog::logger")
+        );
+        // SPDLOG_* macros expand to logger::log.
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "log"),
+            Some("spdlog::logger")
+        );
+        assert_eq!(
+            emission_framework(false, "spdlog", "info"),
+            Some("spdlog::logger")
+        );
+        assert_eq!(
+            emission_framework(true, "google::LogMessage", "stream"),
+            Some("google::LogMessage")
+        );
+        // Configuration surface of a framework is not emission.
+        assert_eq!(emission_framework(false, "", "openlog"), None);
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "set_level"),
+            None
+        );
+        assert_eq!(emission_framework(false, "spdlog", "set_level"), None);
+        // The same names outside the framework's scope abstain.
+        assert_eq!(emission_framework(false, "app", "syslog"), None);
+        assert_eq!(emission_framework(true, "app::Report", "info"), None);
+        assert_eq!(emission_framework(false, "", "info"), None);
+        assert_eq!(
+            emission_framework(true, "std::stringstream", "stream"),
+            None
+        );
     }
 }

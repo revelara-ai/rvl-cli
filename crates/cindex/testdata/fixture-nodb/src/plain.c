@@ -8,3 +8,11 @@ int use_curl(void *h) {
   helper_step(h);       /* NOT allowlisted: never emitted */
   return 0;
 }
+
+/* syslog is on the allowlist tier too: with no compile db its two calls still
+ * make one G4 aggregate, stamped low tier like every other no-db packet. */
+int note(void) {
+  syslog(3, "first");
+  syslog(3, "second");
+  return 0;
+}
