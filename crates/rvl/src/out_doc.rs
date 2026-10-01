@@ -125,6 +125,9 @@ pub struct OutConfigAbstain {
     pub no_spec: usize,
     pub outside_repo: usize,
     pub other: usize,
+    /// Unjudged by design (the key ledger's vocabulary-only marker): not a
+    /// lever, and never part of `no_spec` or `no_spec_keys`.
+    pub vocabulary_only: usize,
 }
 
 #[derive(Serialize)]
@@ -286,6 +289,7 @@ pub fn build(
                     no_spec: c.abstain_no_spec,
                     outside_repo: c.abstain_outside_repo,
                     other: c.abstain_other,
+                    vocabulary_only: c.vocabulary_only,
                 },
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
                 unparseable_files: c.unparseable_files,

@@ -51,3 +51,24 @@
     CGO_ENABLED=0 go build -C helpers/goindex -trimpath -o "$out" .
     chmod +x "$out"
     file "$out" || true
+# The pinned libclang cindex loads in a release (po-av01j.49). Engine pin
+# po-ae75b.9: release scan results must not depend on the scanning machine's
+# clang, so the archive carries one. ci/fetch-libclang.sh reads
+# crates/cindex/libclang.pin, verifies every download's sha256 and FAILS this
+# job on a mismatch; it writes crates/rvl/dist-extras/libclang/, which
+# `include` packs beside cindex.
+#
+# CINDEX_REQUIRE_VENDORED_LIBCLANG reaches `dist build`'s cargo through
+# GITHUB_ENV and is read at COMPILE time: a release cindex whose bundle is
+# missing fails closed instead of quietly scanning with the system clang.
+- name: Fetch the pinned libclang for this target
+  shell: bash
+  run: |
+    set -euo pipefail
+    targets=(${{ join(matrix.targets, ' ') }})
+    if [ "${#targets[@]}" -ne 1 ]; then
+      echo "libclang packaging assumes one target per job, got: ${targets[*]}" >&2
+      exit 1
+    fi
+    ci/fetch-libclang.sh "${targets[0]}" "$GITHUB_WORKSPACE/crates/rvl/dist-extras"
+    echo "CINDEX_REQUIRE_VENDORED_LIBCLANG=1" >> "$GITHUB_ENV"

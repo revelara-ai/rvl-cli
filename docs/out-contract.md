@@ -62,7 +62,8 @@ The orchestrator uses it to:
     ],
     "config": {
       "resolved": 120, "total": 140,
-      "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2 },
+      "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2,
+                   "vocabulary_only": 4 },
       "no_spec_keys": ["github_actions permissions"],
       "unparseable_files": 0
     }
@@ -120,6 +121,11 @@ The orchestrator uses it to:
     test files its packet index flagged when they were first retrieved as
     well as the ones it re-parsed this pass. `rvl scan --include-tests`
     makes the second zero by scanning them.
+  - `config.abstain.vocabulary_only`: config settings whose key is emitted
+    as evidence and deliberately never judged. They have no spec by design,
+    so they are counted apart from `no_spec` and never appear in
+    `no_spec_keys`. `rvl cache keys` lists which keys carry the marker and
+    why.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime

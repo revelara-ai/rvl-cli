@@ -153,7 +153,12 @@ adjudication:
     .unwrap();
     let registry = Registry {
         registry_version: 3,
-        repos: vec!["go-gitea/gitea".to_string()],
+        repos: [(
+            "go-gitea/gitea".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )]
+        .into_iter()
+        .collect(),
     };
 
     for spelling in ["go-gitea/gitea", "go-gitea_gitea", "GO-GITEA/GITEA"] {

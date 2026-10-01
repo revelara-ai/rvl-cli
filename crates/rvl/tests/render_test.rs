@@ -433,6 +433,23 @@ fn unjudged_keys_are_named_not_just_counted() {
 }
 
 #[test]
+fn vocabulary_only_keys_are_counted_apart_from_missing_specs() {
+    // Both are unjudged; only one of them is a gap.
+    let cc = ConfigCoverage {
+        resolved: 1,
+        total: 4,
+        abstain_no_spec: 1,
+        vocabulary_only: 2,
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+    assert!(
+        out.contains("1 no spec") && out.contains("2 vocabulary only"),
+        "{out}"
+    );
+}
+
+#[test]
 fn unjudged_key_list_states_what_it_dropped() {
     // Capping is fine; capping silently would read as "that is the whole queue".
     let cc = ConfigCoverage {
@@ -454,6 +471,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         abstain_no_spec: 1,
         abstain_outside_repo: 2,
         abstain_other: 0,
+        vocabulary_only: 0,
         unparseable_files: 1,
         no_spec_keys: Default::default(),
         sightings: vec![

@@ -1,5 +1,14 @@
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 #[test]
 fn version_flag_reports_name_and_semver() {
     let out = Command::new(env!("CARGO_BIN_EXE_rvl"))
@@ -79,6 +88,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(out.status.success(), "offline sync is a successful no-op");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
+}
+
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
 }
 
 #[test]
@@ -414,7 +464,7 @@ fn force_next_outside_a_repo_is_refused() {
 /// just missing the compiler).
 #[test]
 fn scan_without_retrieved_runs_the_go_helper() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let fixture = goindex_src.join("testdata").join("fixture");
@@ -614,6 +664,62 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
+/// po-av01j.98: a waiver scoped with `paths:` must match the finding's FILE.
+/// Every other waiver e2e omits `paths:`, which is the always-matches branch,
+/// so the glob being fed `path:line` went unnoticed. An exact path and the
+/// `**/*.env` idiom both suppress; a glob for another directory does not.
+#[test]
+fn path_scoped_waiver_matches_the_finding_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("internal/pay")).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(
+        repo.join("internal/pay/prod.env"),
+        format!("GH_TOKEN=\"{token}\"\n"),
+    )
+    .unwrap();
+
+    let scan = |paths: &str| {
+        std::fs::write(
+            repo.join(".revelara.yaml"),
+            format!(
+                "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n    paths: {paths}\n"
+            ),
+        )
+        .unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (out.status.code(), stdout)
+    };
+
+    for paths in ["[\"internal/pay/prod.env\"]", "[\"**/*.env\"]"] {
+        let (code, stdout) = scan(paths);
+        assert_eq!(
+            code,
+            Some(0),
+            "paths: {paths} must suppress the finding: {stdout}"
+        );
+        assert!(
+            stdout.contains("suppressed"),
+            "paths: {paths} must fold into Suppressed: {stdout}"
+        );
+    }
+
+    let (code, stdout) = scan("[\"other/*.env\"]");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "a waiver scoped to another directory must not suppress: {stdout}"
+    );
+}
+
 // --- exit-code contract (po-av01j.94) ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
@@ -674,7 +780,6 @@ fn advisory_only_scan_exits_zero() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
@@ -714,17 +819,36 @@ fn advisory_only_scan_exits_zero() {
 /// production corpus rides the LLM factory.
 const SERVER_SPECS_SEED: &str = include_str!("testdata/server_specs_seed.json");
 
+/// A Go packet identity a hand-authored stream in this file claims goindex
+/// emits: (func, client_type, site_kind).
+type GoIdentity = (&'static str, &'static str, &'static str);
+
+/// `mux.HandleFunc(...)`, the G2 route registration.
+const GO_SERVE_MUX_ROUTE: GoIdentity = ("HandleFunc", "net/http.ServeMux", "server_entry");
+/// A `recover()` block, the G4 swallow aggregate.
+const GO_RECOVER_BLOCK: GoIdentity = ("recover", "recover_block", "emission_point");
+/// A method call on a `*slog.Logger`, the G4 log aggregate.
+const GO_SLOG_LOGGER: GoIdentity = ("Warn", "log/slog.Logger", "emission_point");
+
+/// Every Go identity the hand-authored streams use. Each is pinned against
+/// goindex's live output by `go_hand_authored_identities_are_what_goindex_emits`,
+/// so a stream can never encode an identity goindex does not produce
+/// (po-av01j.57).
+const GO_HAND_AUTHORED_IDENTITIES: &[GoIdentity] =
+    &[GO_SERVE_MUX_ROUTE, GO_RECOVER_BLOCK, GO_SLOG_LOGGER];
+
 /// One JSONL server-entry registration record for a fixture stream.
-fn server_entry_line(file: &str, line: u32, method: &str, snippet: &str) -> String {
+fn server_entry_line(file: &str, line: u32, snippet: &str) -> String {
+    let (func, client_type, site_kind) = GO_SERVE_MUX_ROUTE;
     serde_json::json!({
         "snapshot_id": "fixture",
         "file_path": file,
         "line_number": line,
-        "func": method,
-        "client_type": "net/http.ServeMux",
+        "func": func,
+        "client_type": client_type,
         "snippet": snippet,
         "lang": "go",
-        "site_kind": "server_entry",
+        "site_kind": site_kind,
     })
     .to_string()
 }
@@ -742,14 +866,12 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
     stream.push_str(&server_entry_line(
         "routes.go",
         11,
-        "HandleFunc",
         r#"mux.HandleFunc("/orders", ordersHandler)"#,
     ));
     stream.push('\n');
@@ -813,15 +935,15 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/healthz", healthHandler)"#,
     ));
     stream.push('\n');
+    // A ServeMux has no middleware verb (goindex inventories no `Use` on it),
+    // so the stdlib limiter shape is a wrapped handler on a registration.
     stream.push_str(&server_entry_line(
         "routes.go",
         12,
-        "Use",
-        "r.Use(middleware.Throttle(100))",
+        r#"mux.HandleFunc("/users", throttle(usersHandler))"#,
     ));
     stream.push('\n');
     std::fs::write(&packets_path, stream).unwrap();
@@ -936,7 +1058,7 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
 /// Build goindex from source, or None when no Go toolchain is available (the
 /// test is then skipped with a log line, matching the scan e2e convention).
 fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
@@ -963,13 +1085,54 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn goindex_fixture() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
         .join("goindex")
         .join("testdata")
         .join("fixture")
+}
+
+/// Every Go identity a hand-authored stream in this file uses is one goindex
+/// really emits over its fixture. Those streams test the Rust side without a
+/// Go toolchain; this is what keeps them describing goindex's behaviour and
+/// not their author's intent (po-av01j.57).
+#[test]
+fn go_hand_authored_identities_are_what_goindex_emits() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = Command::new(&goindex)
+        .args(["-retrieve", "-name", "fx", "-root"])
+        .arg(goindex_fixture())
+        .output()
+        .expect("failed to run goindex");
+    assert!(
+        out.status.success(),
+        "goindex -retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let emitted: Vec<(String, String, String)> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| p.get("kind").is_none())
+        .map(|p| {
+            let field = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+            (field("func"), field("client_type"), field("site_kind"))
+        })
+        .collect();
+    for &(func, client_type, site_kind) in GO_HAND_AUTHORED_IDENTITIES {
+        assert!(
+            emitted
+                .iter()
+                .any(|(f, t, k)| f == func && t == client_type && k == site_kind),
+            "goindex never emits ({func}, {client_type}, {site_kind}) over its fixture, \
+             so the hand-authored stream using it tests an intent, not goindex: {emitted:?}"
+        );
+    }
 }
 
 /// `index reindex <repo>` with NO --retrieved runs the helpers itself: this is
@@ -1661,14 +1824,14 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
 /// timeout re-application). Production specs ride the LLM factory; this file
 /// exists so the e2e tests exercise real verdicts.
 fn background_jobs_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("background_jobs_specs.json")
 }
 
 fn helper_fixture(helper: &str) -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
@@ -1787,12 +1950,18 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
                 r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":"recover","client_type":"recover_block","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("error_capture", 2)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("error_capture", 2),
+                f = GO_RECOVER_BLOCK.0,
+                t = GO_RECOVER_BLOCK.1,
+                k = GO_RECOVER_BLOCK.2,
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("log", 7)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("log", 7),
+                f = GO_SLOG_LOGGER.0,
+                t = GO_SLOG_LOGGER.1,
+                k = GO_SLOG_LOGGER.2,
             ),
         ),
     )
@@ -1852,14 +2021,14 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("g4_seed_specs.json")
 }
 
 fn helpers_dir() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     manifest
         .parent()
         .and_then(|p| p.parent())
@@ -1870,7 +2039,7 @@ fn helpers_dir() -> std::path::PathBuf {
 /// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
 /// an API's own timeout argument that mean no bound.
 fn sentinel_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("sentinel_seed_specs.json")
@@ -1961,7 +2130,7 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
     let rows = scan_fixture_findings(
@@ -2000,7 +2169,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
@@ -2074,7 +2243,7 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let fixture = workspace
         .join("crates")
@@ -2268,7 +2437,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
 /// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
 /// emission section). The production corpus rides the LLM factory, HITL.
 fn java_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("java_seed_specs.json")
@@ -2385,7 +2554,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
 /// sqlx identities — the production corpus rides the LLM factory, HITL).
 fn rust_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("testdata")
         .join("rust_seed_specs.json")
@@ -2405,7 +2574,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
             return;
         }
     }
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .unwrap()
@@ -2578,19 +2747,42 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     let home = dir.path().join("home"); // isolates org policy + user config
     std::fs::create_dir_all(&home).unwrap();
-    let out = bin()
-        .args(["scan", "--incremental", "--hook", "pre-commit"])
-        .arg(&repo)
-        .arg("--specs-file")
-        .arg(&specs)
-        .env("RVL_GOINDEX", &goindex_bin)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("RVL_AGENT_CMD", &stub)
-        .env("HOME", &home)
-        .output()
-        .expect("failed to run rvl");
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The hook's 10s retrieval cap fails OPEN: on a loaded host the scan
+    // degrades to zero sites and, correctly, renders no agent block. That is
+    // not the path under test, so a capped run is retried from a clean cache
+    // and index; a run that is still capped fails naming the cap, not the
+    // agent block.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        for state in ["cache", "index", "agent-telemetry.jsonl"] {
+            let path = dir.path().join(state);
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = bin()
+            .args(["scan", "--incremental", "--hook", "pre-commit"])
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_AGENT_CMD", &stub)
+            .env("HOME", &home)
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if !stdout.contains("retrieval capped at") {
+            break (out, stdout);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "the hook retrieval cap fired on all {ATTEMPTS} attempts (host too loaded \
+             to exercise the agent lane): {stdout}"
+        );
+    };
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
     assert!(
@@ -2873,78 +3065,51 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
 /// for the G4 lane. The production corpus rides the LLM factory, HITL — see
 /// the gate-set mint bead under po-av01j.
 fn csharp_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("csharp_seed_specs.json")
 }
 
-/// C#, golden packet stream: a `--retrieved` stream shaped exactly like
-/// csindex output is decided by the seed C# specs WITHOUT a dotnet SDK
-/// present. This is the contract test for the Rust side of the lane: the
-/// satisfies / violates / abstain shapes, G2 registrations routed out of the
-/// G1 lane, and a G4 catch_clause swallow surfacing under RC-027.
+/// The C# golden packet stream: csindex's own output over its fixture,
+/// GENERATED by a live run and committed (po-av01j.57), never hand-authored.
+/// A hand-authored stream encodes what its author meant csindex to emit, and
+/// stayed green through po-av01j.47 while csindex could not compile at all.
+/// `csindex_live_output_matches_the_committed_golden` fails the moment the
+/// two diverge; `RVL_UPDATE_GOLDEN=1` regenerates this file from csindex.
+fn csharp_retrieved_golden() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("csharp_retrieved_golden.jsonl")
+}
+
+/// C#, golden packet stream: the committed csindex output is decided by the
+/// seed C# specs WITHOUT a dotnet SDK present. This is the contract test for
+/// the Rust side of the lane: the satisfies / violates / abstain shapes, G2
+/// registrations routed out of the G1 lane, and a G4 catch_clause swallow
+/// surfacing under RC-027.
 #[test]
 fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
     let dir = tempfile::tempdir().unwrap();
-    let packets = dir.path().join("retrieved.jsonl");
-    let mk = |line: u32, symbol: &str, func: &str, ctype: &str, snippet: &str, extra: &str| {
-        format!(
-            r#"{{"packet_schema":2,"snapshot_id":"fx","file_path":"Svc.cs","line_number":{line},"symbol":{symbol:?},"func":{func:?},"receiver":"_c","client_type":{ctype:?},"snippet":{snippet:?},"lang":"csharp"{extra}}}"#
-        )
-    };
-    let stream = [
-        // Satisfies: HttpClient carries a whole-call default Timeout (100s),
-        // spec knowledge riding the this_client config spec.
-        mk(
-            10,
-            "FetchUser",
-            "GetAsync",
-            "System.Net.Http.HttpClient",
-            "await _c.GetAsync(url)",
-            "",
-        ),
-        // Violates: a gRPC call has NO default deadline; the seed spec says
-        // the bound rides CallOptions at the call, and none is present.
-        mk(
-            20,
-            "SayHello",
-            "AsyncUnaryCall",
-            "Grpc.Core.CallInvoker",
-            "_c.AsyncUnaryCall(method, host, options, req)",
-            "",
-        ),
-        // Abstain: librdkafka retries internally; whether app-level retry
-        // wrapping is needed is per-site judgment (RC-022 seed, depends).
-        mk(
-            30,
-            "Publish",
-            "ProduceAsync",
-            "Confluent.Kafka.IProducer",
-            "await _c.ProduceAsync(topic, msg)",
-            "",
-        ),
-        // A G2 route registration must be routed OUT of the G1 lane.
-        mk(
-            40,
-            "MapRoutes",
-            "MapGet",
-            "Microsoft.AspNetCore.Builder.WebApplication",
-            "app.MapGet(\"/health\", handler)",
-            r#","site_kind":"server_entry""#,
-        ),
-        // A G4 catch_clause swallow aggregate surfaces under RC-027.
-        mk(
-            50,
-            "Handle",
-            "catch",
-            "catch_clause",
-            "",
-            r#","site_kind":"emission_point","const_args":[{"index":0,"name":"emission_category","value":"error_capture","how":"aggregate"},{"index":0,"name":"emission_count","value":"1","how":"aggregate"}]"#,
-        ),
-    ]
-    .join("\n");
-    std::fs::write(&packets, stream + "\n").unwrap();
+    let packets = csharp_retrieved_golden();
+    let golden = std::fs::read_to_string(&packets).expect(
+        "the C# golden is missing: regenerate it with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+    );
+    // Every site record gets an --out row except server_entry registrations
+    // and emission_point aggregates, which their own lanes judge.
+    let g1_sites = golden
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| {
+            p.get("kind").is_none()
+                && !matches!(
+                    p["site_kind"].as_str(),
+                    Some("server_entry" | "emission_point")
+                )
+        })
+        .count();
 
     let out_path = dir.path().join("findings.json");
     let out = bin()
@@ -2984,16 +3149,20 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
             .any(|(v, r)| v == "abstain" && r.contains("depends")),
         "the Kafka produce must abstain on the depends spec: {g1:?}"
     );
-    // The route registration and the emission aggregate stay OUT of the G1
+    // The route registration and the emission aggregates stay OUT of the G1
     // verdict rows (their lanes judge them).
     assert!(
-        !g1.iter().any(|(_, r)| r.contains("MapGet")),
-        "a server_entry registration must not be judged as a client call: {g1:?}"
+        verdicts_for(&rows, "Server.cs:14").is_empty(),
+        "a server_entry registration must not be judged as a client call: {rows:?}"
+    );
+    assert!(
+        verdicts_for(&rows, "Emitters.cs").is_empty(),
+        "an emission_point aggregate must not be judged as a client call: {rows:?}"
     );
     assert_eq!(
         rows.len(),
-        3,
-        "only the three G1 call sites belong in --out: {rows:?}"
+        g1_sites,
+        "only the golden's G1 and job sites belong in --out: {rows:?}"
     );
     // The G4 swallow surfaces in the ladder, control-mapped and advisory.
     assert!(
@@ -3011,7 +3180,13 @@ fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .output()
         .is_err()
     {
-        eprintln!("SKIP csindex e2e: no dotnet SDK");
+        // CI provisions the SDK, so there a missing one is a broken runner,
+        // not a skip: the C# lane is the one whose green skip hid a helper
+        // that could not compile (po-av01j.47).
+        if std::env::var_os("CI").is_some() {
+            panic!("no dotnet SDK under CI: the C# live tests cannot run");
+        }
+        eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
         return None;
     }
     let csdir = helpers_dir().join("csindex");
@@ -3038,6 +3213,61 @@ fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     } else {
         panic!("csindex built but produced no csindex.dll at {out_dir:?}")
     }
+}
+
+/// Run csindex over its fixture and return the JSONL stream it emits. The
+/// snapshot name is fixed, so the stream is byte-stable across machines.
+fn csindex_retrieve_fixture(csindex_dll: &std::path::Path) -> String {
+    let out = std::process::Command::new("dotnet")
+        .arg(csindex_dll)
+        .args(["--retrieve", "--root"])
+        .arg(helper_fixture("csindex"))
+        .args(["--name", "fx"])
+        .output()
+        .expect("failed to run csindex");
+    assert!(
+        out.status.success(),
+        "csindex --retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("csindex emitted non-UTF-8")
+}
+
+/// The committed C# golden IS csindex's behaviour: a live run over the
+/// fixture must reproduce it byte for byte. This is what binds the
+/// no-SDK contract test above to the helper it stands in for. After an
+/// intended csindex change, regenerate with
+/// `RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output`
+/// and review the diff like code.
+#[test]
+fn csindex_live_output_matches_the_committed_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let live = csindex_retrieve_fixture(&csindex_dll);
+    let golden_path = csharp_retrieved_golden();
+    if std::env::var_os("RVL_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden_path, &live).unwrap();
+        return;
+    }
+    let golden = std::fs::read_to_string(&golden_path).unwrap_or_default();
+    if live == golden {
+        return;
+    }
+    let first_diff = live
+        .lines()
+        .zip(golden.lines())
+        .position(|(l, g)| l != g)
+        .unwrap_or_else(|| live.lines().count().min(golden.lines().count()));
+    panic!(
+        "csindex's live output has drifted from {golden_path:?} at line {}:\n  live:   {}\n  golden: {}\n\
+         If the csindex change is intended, regenerate with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+        first_diff + 1,
+        live.lines().nth(first_diff).unwrap_or("<end of stream>"),
+        golden.lines().nth(first_diff).unwrap_or("<end of stream>"),
+    );
 }
 
 /// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
@@ -6106,4 +6336,70 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     );
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- node helper heap limit (po-av01j.118) ---
+
+/// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
+/// return everything rvl printed. `None` when `node` is absent.
+fn scan_with_fake_tsindex(script: &str, heap_mb: &str) -> Option<String> {
+    if Command::new("node").arg("--version").output().is_err() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("index.ts"), "export const x = 1;\n").unwrap();
+    let helper = dir.path().join("tsindex.js");
+    std::fs::write(&helper, script).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVL_TSINDEX", &helper)
+        .env("RVL_NODE_MAX_OLD_SPACE_MB", heap_mb)
+        .env_remove("NODE_OPTIONS")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The limit must reach `node` itself, ahead of the script: V8 reads it at
+/// startup, so a flag placed after `tsindex.js` would be a helper argument and
+/// change nothing. The fake helper reports the flags node actually parsed.
+#[test]
+fn node_helper_runs_with_a_raised_heap_limit() {
+    let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
+                  process.exit(1);\n";
+    let Some(text) = scan_with_fake_tsindex(script, "777") else {
+        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        return;
+    };
+    assert!(
+        text.contains("execArgv=--max-old-space-size=777"),
+        "node must be started with the heap limit: {text}"
+    );
+}
+
+/// A REAL V8 heap exhaustion, not a simulated exit code: the helper allocates
+/// until node aborts under a 32 MB limit. The scan must say what happened and
+/// which variable moves the ceiling, because "signal: 6" names neither.
+#[test]
+fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
+    let script = "const hold = [];\n\
+                  for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
+    let Some(text) = scan_with_fake_tsindex(script, "32") else {
+        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        return;
+    };
+    assert!(
+        text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
+        "a heap OOM must name the limit and the override: {text}"
+    );
 }

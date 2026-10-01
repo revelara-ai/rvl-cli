@@ -365,6 +365,10 @@ pub struct ConfigCoverage {
     pub abstain_outside_repo: usize,
     /// Any other undecided outcome (low-confidence spec, unknown pattern).
     pub abstain_other: usize,
+    /// Settings whose key the ledger marks vocabulary only: no spec judges
+    /// them and none is wanted (`rvl_config::key_ledger`). Kept out of
+    /// `abstain_no_spec` so that lever counts only real authoring gaps.
+    pub vocabulary_only: usize,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format
@@ -375,7 +379,7 @@ pub struct ConfigCoverage {
 
 impl ConfigCoverage {
     pub fn abstain_total(&self) -> usize {
-        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other
+        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other + self.vocabulary_only
     }
     /// Nothing to render: the lane saw no config at all.
     pub fn is_empty(&self) -> bool {
@@ -610,6 +614,9 @@ pub fn render_ladder(
                 }
                 if cc.abstain_other > 0 {
                     parts.push(format!("{} other", cc.abstain_other));
+                }
+                if cc.vocabulary_only > 0 {
+                    parts.push(format!("{} vocabulary only", cc.vocabulary_only));
                 }
                 let aline = format!("  config abstain \u{2014} {}", parts.join(" \u{00b7} "));
                 let _ = writeln!(o, "{}", paint(&aline, "2", color));

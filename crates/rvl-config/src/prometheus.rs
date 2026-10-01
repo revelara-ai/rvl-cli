@@ -160,7 +160,7 @@ impl Emitter<'_> {
             file_path: self.rel_path.to_string(),
             line: 0,
             unit: unit.to_string(),
-            key: key.to_string(),
+            key: crate::key_ledger::declared("prometheus-rules", key),
             resolved_value: value,
             resolution,
             provenance,
@@ -389,12 +389,14 @@ impl Emitter<'_> {
             // "labeled" (labels present), "configured" (present, unlabeled),
             // "disabled" (disable: true), or "" (absent).
             let alerting = get(s, "alerting").and_then(Value::as_mapping);
-            for which in ["page_alert", "ticket_alert"] {
-                let key = format!("slo.alerting.{which}");
+            for (which, key) in [
+                ("page_alert", "slo.alerting.page_alert"),
+                ("ticket_alert", "slo.alerting.ticket_alert"),
+            ] {
                 let key_path = kp(&format!("alerting.{which}"));
                 let Some(sub) = alerting.and_then(|a| get(a, which)) else {
                     out.packets
-                        .push(self.authored_absent(&unit, &key, &key_path));
+                        .push(self.authored_absent(&unit, key, &key_path));
                     continue;
                 };
                 let sub_map = sub.as_mapping();
@@ -415,7 +417,7 @@ impl Emitter<'_> {
                 };
                 out.packets.push(self.packet(
                     &unit,
-                    &key,
+                    key,
                     Some(state.to_string()),
                     Resolution::AsAuthored,
                     vec![ProvenanceStep::new(self.rel_path, &key_path, "explicit")],

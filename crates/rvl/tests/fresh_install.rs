@@ -14,12 +14,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// "The scan RAN" — clean (0) or gate-fired (3). Anything else is the scanner
 /// itself failing, which is what a helperless machine used to produce.
 const EXIT_BLOCKED: i32 = 3;
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .expect("crates/rvl lives two levels under the workspace root")
@@ -27,7 +36,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn seed_specs() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("background_jobs_specs.json")
