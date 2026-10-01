@@ -252,6 +252,15 @@ fn c_fixture_emits_the_planted_g1_sites_with_const_args_and_macro_flag() {
     assert_eq!(st["tus_total"], 1);
     assert_eq!(st["tus_parsed"], 1);
     assert_eq!(st["tus_failed"], 0);
+    // Every header resolves, so this is a genuinely clean parse, and the
+    // stats must say so in the terms the missing-header case uses.
+    assert_eq!(st["tus_incomplete"], 0, "clean parse: {st}");
+    assert_eq!(st["includes_missing"], 0, "clean parse: {st}");
+    assert_eq!(st["decls_unresolved"], 0, "clean parse: {st}");
+    assert!(
+        st.get("calls_unresolved").is_none(),
+        "the old name read as a completeness claim and is gone: {st}"
+    );
 }
 
 #[test]
@@ -259,7 +268,7 @@ fn cpp_fixture_tiers_virtual_dispatch_and_abstains_on_templates() {
     if !engine_available("cpp_fixture_tiers_virtual_dispatch_and_abstains_on_templates") {
         return;
     }
-    let (sites, _records) = retrieve(&fixture("fixture-cpp"), &[]);
+    let (sites, records) = retrieve(&fixture("fixture-cpp"), &[]);
 
     // Virtual dispatch: emitted at the STATIC interface identity, mid tier =
     // callee_candidates counts the in-TU definitions (base + 2 overriders).
@@ -287,6 +296,20 @@ fn cpp_fixture_tiers_virtual_dispatch_and_abstains_on_templates() {
     assert!(
         !sites.iter().any(|s| s["symbol"] == "generic_talk"),
         "nothing emitted from the uninstantiated template body"
+    );
+    // The dependent callee is counted where it belongs: a call clang formed
+    // whose callee did not resolve. It is not a parse error, so the TU stays
+    // complete.
+    let st = stats(&records);
+    assert!(
+        st["calls_callee_unresolved"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "the dependent call is counted: {st}"
+    );
+    assert_eq!(
+        st["tus_incomplete"], 0,
+        "templates are not a parse error: {st}"
     );
 }
 
@@ -600,6 +623,77 @@ fn no_db_syslog_aggregates_at_low_tier() {
         note["provenance"]["client_type_resolved"], false,
         "no-db packets are LOW tier: {note}"
     );
+}
+
+/// Write a one-file no-db C repo and retrieve it.
+fn retrieve_c_source(src: &str) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/fetch.c"), src).unwrap();
+    retrieve(dir.path(), &[])
+}
+
+/// po-av01j.138: the SAME curl_easy_perform call, differing only in whether
+/// its declarations resolve. With the header missing, clang's recovery drops
+/// the whole statement (`CURL *h` parses as a multiplication of two undeclared
+/// identifiers), so no call expression exists to count. The site is lost, and
+/// before this fix the stats record was byte-identical to the clean case:
+/// `tus_parsed:1, tus_failed:0, calls_unresolved:0`. The loss must now be
+/// visible, and distinguishable from a genuinely clean parse.
+#[test]
+fn a_missing_header_is_reported_as_an_incomplete_parse_not_a_clean_zero() {
+    if !engine_available("a_missing_header_is_reported_as_an_incomplete_parse_not_a_clean_zero") {
+        return;
+    }
+    let body = "int fetch(void) {\n  CURL *h = curl_easy_init();\n  CURLcode rc = curl_easy_perform(h);\n  curl_easy_cleanup(h);\n  return (int)rc;\n}\n";
+
+    // The missing header: 0 sites, and the stats say why.
+    let (sites, records) = retrieve_c_source(&format!("#include <curl/curl.h>\n{body}"));
+    assert!(sites.is_empty(), "the site is lost to recovery: {sites:?}");
+    let missing = stats(&records);
+    assert_eq!(missing["tus_parsed"], 1, "{missing}");
+    assert_eq!(missing["tus_incomplete"], 1, "not a clean parse: {missing}");
+    assert_eq!(missing["includes_missing"], 1, "{missing}");
+    assert!(
+        missing["decls_unresolved"].as_u64().is_some_and(|n| n >= 1),
+        "undeclared identifiers are counted: {missing}"
+    );
+    assert_eq!(
+        missing["tus_incomplete_paths"],
+        serde_json::json!(["src/fetch.c"]),
+        "{missing}"
+    );
+
+    // The declarations written inline: 1 site, a clean parse.
+    let decls = "typedef void CURL;\ntypedef int CURLcode;\nextern CURL *curl_easy_init(void);\nextern CURLcode curl_easy_perform(CURL *);\nextern void curl_easy_cleanup(CURL *);\n";
+    let (sites, records) = retrieve_c_source(&format!("{decls}{body}"));
+    assert_eq!(sites_with_method(&sites, "curl_easy_perform").len(), 1);
+    let clean = stats(&records);
+    assert_eq!(clean["tus_incomplete"], 0, "{clean}");
+    assert_eq!(clean["includes_missing"], 0, "{clean}");
+    assert_eq!(clean["decls_unresolved"], 0, "{clean}");
+
+    // The whole point: the two records must differ.
+    assert_ne!(
+        missing, clean,
+        "a truncated parse must not report the same stats as a clean one"
+    );
+}
+
+/// A TU that loses a site to recovery still keeps the sites that DID resolve:
+/// they are real evidence. Dropping them would turn a partial answer into a
+/// bigger false negative. The TU is reported incomplete either way.
+#[test]
+fn an_incomplete_tu_keeps_its_resolved_sites() {
+    if !engine_available("an_incomplete_tu_keeps_its_resolved_sites") {
+        return;
+    }
+    let (sites, records) = retrieve_c_source(
+        "#include <curl/curl.h>\nint fetch(void *h) {\n  curl_easy_perform(h);\n  return undeclared_thing;\n}\n",
+    );
+    assert_eq!(sites_with_method(&sites, "curl_easy_perform").len(), 1);
+    let st = stats(&records);
+    assert_eq!(st["tus_incomplete"], 1, "{st}");
 }
 
 /// The built `cindex` installed in `<tmp>/bin`, with a vendored bundle beside

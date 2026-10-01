@@ -181,6 +181,7 @@ pub struct OutUndecided {
 fn lang_state_str(s: render::LangState) -> String {
     match s {
         render::LangState::Scanned => "scanned",
+        render::LangState::Partial => "partial",
         render::LangState::Abstained => "abstained",
         render::LangState::Failed => "failed",
         render::LangState::Unsupported => "unsupported",

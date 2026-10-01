@@ -127,13 +127,37 @@ struct StatsOut {
     /// "compile_db" | "allowlist"
     mode: &'static str,
     tus_total: u32,
+    /// TUs libclang returned an AST for. INCLUDES the incomplete ones below:
+    /// `tus_parsed - tus_incomplete` is the count of genuinely clean parses.
     tus_parsed: u32,
     /// TUs that failed to parse: counted and documented, never guessed at.
     tus_failed: u32,
-    /// Call expressions whose callee could not be resolved (template-dependent
-    /// callees in uninstantiated templates are the dominant class): documented
-    /// abstentions, never guesses.
-    calls_unresolved: u32,
+    /// Parsed TUs whose parse raised at least one error (po-av01j.138). Clang
+    /// recovers from an error by DROPPING the construct it could not build:
+    /// with `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as
+    /// a multiplication of two undeclared identifiers and the whole statement
+    /// vanishes, call and all. No call expression is left to count, so the
+    /// only record of the loss is the diagnostic. A zero from one of these
+    /// TUs is not a complete zero.
+    tus_incomplete: u32,
+    /// Repo-relative paths behind `tus_incomplete`, sorted.
+    tus_incomplete_paths: Vec<String>,
+    /// `#include` directives that resolved to no file, summed over TUs. The
+    /// usual cause: the repo is scanned without its -dev packages installed.
+    includes_missing: u32,
+    /// Error diagnostics naming an identifier with no visible declaration
+    /// (undeclared identifier or function, unknown type name). Each marks a
+    /// construct clang may have dropped, and every call inside it with it.
+    decls_unresolved: u32,
+    /// Call expressions clang DID form whose callee did not resolve
+    /// (template-dependent callees in uninstantiated templates are the
+    /// dominant class): documented abstentions, never guesses. NOT a
+    /// completeness claim: a call lost to recovery never becomes a call
+    /// expression and so can never be counted here. That is why this was
+    /// renamed from `calls_unresolved`, which read as "no call went
+    /// unresolved" when the parse had silently dropped calls
+    /// (po-av01j.138); `decls_unresolved` and `tus_incomplete` count those.
+    calls_callee_unresolved: u32,
     /// C++ sources seen in no-db mode: a flagless C++ parse is guesswork, so
     /// they are skipped and counted (documented abstention class).
     cpp_files_skipped_no_db: u32,
@@ -637,7 +661,10 @@ struct WalkState {
     /// USRs of the functions this TU passes to `mg_http_listen` as the event
     /// handler.
     http_handlers: HashSet<String>,
-    calls_unresolved: u32,
+    calls_callee_unresolved: u32,
+    /// Per-TU count of `#include` directives that resolved to no file,
+    /// collected in the preprocessing pass.
+    tu_includes_missing: u32,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
     /// detailed preprocessing record in a first pass. The v2 `macro_expansion`
@@ -712,7 +739,8 @@ extern "C" fn visitor(
 }
 
 /// Pass 1: collect macro-expansion ranges from the detailed preprocessing
-/// record. Purely mechanical evidence for the v2 `macro_expansion` flag.
+/// record (purely mechanical evidence for the v2 `macro_expansion` flag), and
+/// count the `#include` directives that resolved to no file.
 extern "C" fn macro_visitor(
     cursor: CXCursor,
     _parent: CXCursor,
@@ -730,6 +758,10 @@ extern "C" fn macro_visitor(
                     .or_default()
                     .push((s_off, e_off + 1));
             }
+        } else if clang_getCursorKind(cursor) == CXCursor_InclusionDirective
+            && clang_getIncludedFile(cursor).is_null()
+        {
+            st.tu_includes_missing += 1;
         }
     }
     CXChildVisit_Continue
@@ -902,7 +934,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         }
         let Some((family, kind)) = c_identity(&method) else {
             if method.is_empty() {
-                st.calls_unresolved += 1;
+                st.calls_callee_unresolved += 1;
             }
             return;
         };
@@ -911,7 +943,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     } else {
         // Compile-db mode with an unresolved callee: the uninstantiated
         // template's dependent call lands here. Counted, never guessed.
-        st.calls_unresolved += 1;
+        st.calls_callee_unresolved += 1;
         return;
     }
 
@@ -1023,13 +1055,57 @@ unsafe fn record_emission(
     agg.site.macro_expansion |= macro_expansion;
 }
 
+/// Is this diagnostic about an identifier with no visible declaration? The
+/// libclang C API exposes no diagnostic IDs, so the stable message stems are
+/// matched. A miss here only lowers `decls_unresolved`: the TU is still
+/// marked incomplete by its error count.
+fn is_undeclared_diagnostic(message: &str) -> bool {
+    const STEMS: &[&str] = &[
+        "undeclared identifier",
+        "call to undeclared function",
+        "implicit declaration of function",
+        "unknown type name",
+        "no type named",
+        "no member named",
+        "no template named",
+    ];
+    STEMS.iter().any(|stem| message.contains(stem))
+}
+
+/// What one parsed TU produced: its sites, plus the evidence of how complete
+/// the parse was (po-av01j.138).
+struct TuOutcome {
+    sites: Vec<SiteOut>,
+    /// Error or fatal diagnostics raised by the parse.
+    errors: u32,
+    includes_missing: u32,
+    decls_unresolved: u32,
+}
+
+/// Count the parse's error-severity diagnostics, and the subset that name an
+/// undeclared identifier.
+unsafe fn error_diagnostics(tu: CXTranslationUnit) -> (u32, u32) {
+    let (mut errors, mut undeclared) = (0u32, 0u32);
+    for i in 0..clang_getNumDiagnostics(tu) {
+        let d = clang_getDiagnostic(tu, i);
+        if clang_getDiagnosticSeverity(d) >= CXDiagnostic_Error {
+            errors += 1;
+            if is_undeclared_diagnostic(&cx_string(clang_getDiagnosticSpelling(d))) {
+                undeclared += 1;
+            }
+        }
+        clang_disposeDiagnostic(d);
+    }
+    (errors, undeclared)
+}
+
 /// Parse one TU and drain its sites. Returns None when the TU fails to parse.
 unsafe fn walk_tu(
     index: CXIndex,
     file: &Path,
     args: &[String],
     st: &mut WalkState,
-) -> Option<Vec<SiteOut>> {
+) -> Option<TuOutcome> {
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
@@ -1065,6 +1141,7 @@ unsafe fn walk_tu(
     st.emission_index.clear();
     st.http_handlers.clear();
     st.macro_ranges.clear();
+    st.tu_includes_missing = 0;
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
         root_cursor,
@@ -1109,8 +1186,14 @@ unsafe fn walk_tu(
         ];
         agg.site
     }));
+    let (errors, decls_unresolved) = error_diagnostics(tu);
     clang_disposeTranslationUnit(tu);
-    Some(sites)
+    Some(TuOutcome {
+        sites,
+        errors,
+        includes_missing: st.tu_includes_missing,
+        decls_unresolved,
+    })
 }
 
 /// Bounded walk for no-db mode: `.c` sources parsed with the allowlist tier,
@@ -1189,7 +1272,8 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         emissions: Vec::new(),
         emission_index: HashMap::new(),
         http_handlers: HashSet::new(),
-        calls_unresolved: 0,
+        calls_callee_unresolved: 0,
+        tu_includes_missing: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
         engine_args: engine.source.parse_args(),
@@ -1199,6 +1283,8 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut seen_keys: HashSet<String> = HashSet::new();
     let (mut tus_total, mut tus_parsed, mut tus_failed) = (0u32, 0u32, 0u32);
+    let (mut includes_missing, mut decls_unresolved) = (0u32, 0u32);
+    let mut tus_incomplete_paths: Vec<String> = Vec::new();
 
     let index = unsafe { clang_createIndex(0, 0) };
     let mut jobs = jobs;
@@ -1217,9 +1303,18 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
             continue;
         }
         match unsafe { walk_tu(index, &job.file, &job.args, &mut st) } {
-            Some(sites) => {
+            Some(tu) => {
                 tus_parsed += 1;
-                for s in sites {
+                includes_missing += tu.includes_missing;
+                decls_unresolved += tu.decls_unresolved;
+                // An incomplete TU still emits the sites that DID resolve:
+                // they are real evidence, and dropping them would turn a
+                // partial answer into a bigger false negative. What it must
+                // never do is count as a clean parse.
+                if tu.errors > 0 || tu.includes_missing > 0 {
+                    tus_incomplete_paths.push(rel.clone());
+                }
+                for s in tu.sites {
                     // A header included by many TUs re-emits its sites; the
                     // stream carries each site_key once.
                     if seen_keys.insert(s.site_key.clone()) {
@@ -1231,6 +1326,7 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         }
     }
     unsafe { clang_disposeIndex(index) };
+    tus_incomplete_paths.sort();
 
     let stats = StatsOut {
         kind: "retrieval_stats",
@@ -1245,7 +1341,11 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         tus_total,
         tus_parsed,
         tus_failed,
-        calls_unresolved: st.calls_unresolved,
+        tus_incomplete: tus_incomplete_paths.len() as u32,
+        tus_incomplete_paths,
+        includes_missing,
+        decls_unresolved,
+        calls_callee_unresolved: st.calls_callee_unresolved,
         cpp_files_skipped_no_db: cpp_skipped,
     };
     writeln!(out, "{}", serde_json::to_string(&stats)?)?;
@@ -1288,6 +1388,22 @@ mod tests {
             tu_parse_args(&argv, dir, file),
             vec!["-I/repo/vendor", "-I", "/repo/inc", "-O2"]
         );
+    }
+
+    #[test]
+    fn undeclared_diagnostics_are_recognized_and_other_errors_are_not() {
+        for m in [
+            "use of undeclared identifier 'CURL'",
+            "call to undeclared function 'curl_easy_init'; ISO C99 and later do not support implicit function declarations",
+            "implicit declaration of function 'foo' is invalid in C99",
+            "unknown type name 'CURL'",
+            "no type named 'Stub' in namespace 'rpc'",
+            "no member named 'perform' in 'Client'",
+        ] {
+            assert!(is_undeclared_diagnostic(m), "{m}");
+        }
+        assert!(!is_undeclared_diagnostic("'curl/curl.h' file not found"));
+        assert!(!is_undeclared_diagnostic("expected ';' after expression"));
     }
 
     #[test]

@@ -3,8 +3,12 @@
 //!
 //! JSON parity map:
 //! - `list --format=json`, `show --format=json`: raw server body verbatim.
-//! - `ready --format=json`: client-side filter + re-marshal — golden-tested
-//!   against Go's `json.MarshalIndent` on the exact rvl-cli structs.
+//! - `ready --format=json`: client-side filter, then each applicable risk
+//!   is emitted exactly as the server sent it inside a rebuilt
+//!   `{risks, total, page, limit}` wrapper (po-av01j.221: it used to
+//!   re-marshal a narrow 13-field struct, which silently dropped every field
+//!   the server added). Golden-tested against Go's `json.MarshalIndent` of
+//!   `[]json.RawMessage`.
 //! - `context --format=json`: the composed map (context body + `detail` +
 //!   `coverage_gap`) — golden-tested against Go's map re-marshal (sorted
 //!   keys) with the coverage struct keeping its field order.
@@ -13,7 +17,7 @@
 
 use crate::client::Client;
 use crate::display;
-use crate::gojson::{compact, path_escape, pretty, query_encode, G};
+use crate::gojson::{compact, compact_raw, path_escape, pretty, query_encode, G};
 use crate::risk_context_render as render;
 use crate::{CmdResult, Failure, BIN};
 use rvl_core::flag::EmptyFlag;
@@ -35,6 +39,10 @@ pub enum RiskCmd {
         /// Filter by linked service
         #[arg(long)]
         service: Option<String>,
+        /// Filter by owning team slug; an unknown slug is an error naming the
+        /// known ones
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        team: Option<String>,
         /// Output format: table (default) or json
         #[arg(long)]
         format: Option<String>,
@@ -50,6 +58,10 @@ pub enum RiskCmd {
         /// Filter by linked service
         #[arg(long)]
         service: Option<String>,
+        /// Filter by owning team slug; an unknown slug is an error naming the
+        /// known ones
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        team: Option<String>,
         /// Output format: table (default) or json
         #[arg(long)]
         format: Option<String>,
@@ -306,18 +318,23 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 status,
                 category,
                 service,
+                team,
                 format,
                 limit,
             } => {
                 // risk.go:417/420/423 — each filter is guarded `!= ""`, so an
                 // empty one is simply not a filter. `--limit=` is rejected by
                 // clap's typed parse, as `strconv.Atoi("")` is at risk.go:351.
+                // `--team` is rvl-native: its empty value is rejected at parse
+                // time, because an empty team read as "no filter" would widen
+                // a per-team view to the whole register without a word.
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(
                     &client,
                     status.empty_is_absent(),
                     category.empty_is_absent(),
                     service.empty_is_absent(),
+                    team.as_deref(),
                     limit,
                     format.empty_is_absent(),
                 )
@@ -325,15 +342,17 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
             RiskCmd::Ready {
                 category,
                 service,
+                team,
                 format,
                 limit,
             } => {
-                // risk.go:532/535.
+                // risk.go:532/535; `--team` as for `list`.
                 let (_, client) = crate::client::load_and_resolve()?;
                 ready_output(
                     &client,
                     category.empty_is_absent(),
                     service.empty_is_absent(),
+                    team.as_deref(),
                     limit as usize,
                     format.empty_is_absent(),
                 )
@@ -390,6 +409,7 @@ pub fn list_output(
     status: Option<&str>,
     category: Option<&str>,
     service: Option<&str>,
+    team: Option<&str>,
     limit: u32,
     format: Option<&str>,
 ) -> CmdResult {
@@ -402,6 +422,9 @@ pub fn list_output(
     }
     if let Some(s) = service {
         pairs.push(("service", s.to_string()));
+    }
+    if let Some(t) = team {
+        pairs.push(("team", t.to_string()));
     }
     let url = format!("{}/api/v1/risks?{}", client.api_url, query_encode(&pairs));
     let body = client
@@ -439,7 +462,7 @@ pub fn list_output(
     }
     if resp.total > resp.risks.len() as i64 {
         eprintln!(
-            "\nNote: showing first {} of {} total risks. Raise --limit or use --status / --category / --service to narrow.",
+            "\nNote: showing first {} of {} total risks. Raise --limit or use --status / --category / --service / --team to narrow.",
             resp.risks.len(),
             resp.total
         );
@@ -453,6 +476,7 @@ pub fn ready_output(
     client: &Client,
     category: Option<&str>,
     service: Option<&str>,
+    team: Option<&str>,
     limit: usize,
     format: Option<&str>,
 ) -> CmdResult {
@@ -467,30 +491,34 @@ pub fn ready_output(
     if let Some(s) = service {
         pairs.push(("service", s.to_string()));
     }
+    if let Some(t) = team {
+        pairs.push(("team", t.to_string()));
+    }
     let url = format!("{}/api/v1/risks?{}", client.api_url, query_encode(&pairs));
     let body = client
         .request("GET", &url, None)
         .map_err(|e| Failure::runtime(format!("Error fetching risks: {e}")))?;
-    let resp: ListRisksResponse = serde_json::from_slice(&body)
+    let resp = parse_ready_body(&body)
         .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
 
     if resp.total > resp.risks.len() as i64 {
         eprintln!(
-            "Warning: tenant has {} risks but the server returned only {} (capped at limit=1000). 'ready' ranking may be incomplete; tighten --category/--service to narrow.",
+            "Warning: tenant has {} risks but the server returned only {} (capped at limit=1000). 'ready' ranking may be incomplete; tighten --category/--service/--team to narrow.",
             resp.total,
             resp.risks.len()
         );
     }
 
-    let ready: Vec<&Risk> = resp
+    let ready: Vec<&ReadyRisk> = resp
         .risks
         .iter()
-        .filter(|r| r.status == "applicable")
+        .filter(|r| r.risk.status == "applicable")
         .collect();
 
     if format == Some("json") {
         return Ok(ready_json(&ready, limit));
     }
+    let ready: Vec<&Risk> = ready.iter().map(|r| &r.risk).collect();
 
     let mut out = String::new();
     if ready.is_empty() {
@@ -533,15 +561,60 @@ pub fn ready_output(
     Ok(out)
 }
 
+/// One risk from the list body: the typed view the table and the filter
+/// read, and the server's own bytes, which are what the JSON output prints.
+pub struct ReadyRisk {
+    pub risk: Risk,
+    pub raw: Box<serde_json::value::RawValue>,
+}
+
+pub struct ReadyBody {
+    pub risks: Vec<ReadyRisk>,
+    pub total: i64,
+}
+
+/// Parse a `GET /api/v1/risks` body, keeping each risk's raw JSON.
+pub fn parse_ready_body(body: &[u8]) -> Result<ReadyBody, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        risks: Vec<Box<serde_json::value::RawValue>>,
+        #[serde(default)]
+        total: i64,
+    }
+    let wire: Wire = serde_json::from_slice(body)?;
+    let risks = wire
+        .risks
+        .into_iter()
+        .map(|raw| {
+            Ok(ReadyRisk {
+                risk: serde_json::from_str(raw.get())?,
+                raw,
+            })
+        })
+        .collect::<Result<_, serde_json::Error>>()?;
+    Ok(ReadyBody {
+        risks,
+        total: wire.total,
+    })
+}
+
 /// The `risk ready --format=json` body: the wrapped `{risks, total, page,
-/// limit}` shape rvl-cli emits (po-9a07e), byte-identical to Go's
-/// `json.MarshalIndent` — including the nil-slice-as-null behavior when no
+/// limit}` shape rvl-cli emits (po-9a07e), with each risk passed through as
+/// the server sent it. Byte-identical to Go's `json.MarshalIndent` over
+/// `[]json.RawMessage`, including the nil-slice-as-null behavior when no
 /// risk is applicable.
-pub fn ready_json(ready: &[&Risk], limit: usize) -> String {
+pub fn ready_json(ready: &[&ReadyRisk], limit: usize) -> String {
     let risks_g = if ready.is_empty() {
         G::Null
     } else {
-        G::Arr(ready.iter().take(limit).map(|r| risk_g(r)).collect())
+        G::Arr(
+            ready
+                .iter()
+                .take(limit)
+                .map(|r| G::Raw(compact_raw(r.raw.get())))
+                .collect(),
+        )
     };
     let wrapped = G::Obj(vec![
         ("risks".to_string(), risks_g),
@@ -550,48 +623,6 @@ pub fn ready_json(ready: &[&Risk], limit: usize) -> String {
         ("limit".to_string(), G::Int(limit as i64)),
     ]);
     format!("{}\n", pretty(&wrapped))
-}
-
-/// One risk in Go struct-field order with Go omitempty semantics.
-fn risk_g(r: &Risk) -> G {
-    let mut f: Vec<(String, G)> = vec![
-        ("id".into(), G::Str(r.id.clone())),
-        ("risk_code".into(), G::Str(r.risk_code.clone())),
-        ("title".into(), G::Str(r.title.clone())),
-        ("category".into(), G::Str(r.category.clone())),
-        ("score".into(), G::Int(r.score)),
-        ("status".into(), G::Str(r.status.clone())),
-        (
-            "linked_services".into(),
-            match &r.linked_services {
-                None => G::Null,
-                Some(v) => G::Arr(v.iter().map(|s| G::Str(s.clone())).collect()),
-            },
-        ),
-    ];
-    if !r.control_codes.is_empty() {
-        f.push((
-            "control_codes".into(),
-            G::Arr(r.control_codes.iter().map(|s| G::Str(s.clone())).collect()),
-        ));
-    }
-    let opt = |key: &str, val: &str, f: &mut Vec<(String, G)>| {
-        if !val.is_empty() {
-            f.push((key.to_string(), G::Str(val.to_string())));
-        }
-    };
-    opt("stale_since", &r.stale_since, &mut f);
-    opt("last_seen_at", &r.last_seen_at, &mut f);
-    opt("resolved_at", &r.resolved_at, &mut f);
-    opt("uca_type", &r.uca_type, &mut f);
-    if !r.causal_factors.is_empty() {
-        f.push((
-            "causal_factors".into(),
-            G::Arr(r.causal_factors.iter().map(|s| G::Str(s.clone())).collect()),
-        ));
-    }
-    opt("loss_scenario", &r.loss_scenario, &mut f);
-    G::Obj(f)
 }
 
 fn classify_priority(score: i64) -> &'static str {
@@ -1207,21 +1238,22 @@ mod tests {
     /// to applicable, emit the wrapped shape. Mirrors the fixture flow the
     /// Go generator runs.
     fn ready_json_from_body(body: &[u8], limit: usize) -> String {
-        let resp: ListRisksResponse = serde_json::from_slice(body).unwrap();
-        let ready: Vec<&Risk> = resp
+        let resp = parse_ready_body(body).unwrap();
+        let ready: Vec<&ReadyRisk> = resp
             .risks
             .iter()
-            .filter(|r| r.status == "applicable")
+            .filter(|r| r.risk.status == "applicable")
             .collect();
         ready_json(&ready, limit)
     }
 
     #[test]
     fn ready_json_matches_go_golden() {
-        // Byte-identical to Go's json.MarshalIndent on rvl-cli's structs:
-        // unknown fields dropped, HTML escaping, absent linked_services as
-        // null, omitempty on control_codes/uca_type/..., limit applied to
-        // risks but total = all applicable.
+        // Byte-identical to Go's json.MarshalIndent over []json.RawMessage:
+        // every server field kept in server order (narrative, which the old
+        // struct dropped, included), HTML escaping, an absent
+        // linked_services left absent, limit applied to risks but total =
+        // all applicable.
         let got = ready_json_from_body(&testdata("ready_input.json"), 2);
         let want = String::from_utf8(testdata("ready_golden.txt")).unwrap();
         assert_eq!(got, want);
