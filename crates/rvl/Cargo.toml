@@ -28,6 +28,7 @@ rvl-spec = { path = "../rvl-spec" }
 rvl-propagate = { path = "../rvl-propagate" }
 rvl-triage = { path = "../rvl-triage" }
 rvl-index = { path = "../rvl-index" }
+flate2 = { workspace = true }
 rvl-structure = { path = "../rvl-structure" }
 rvl-emission = { path = "../rvl-emission" }
 serde = { workspace = true }
@@ -55,6 +56,7 @@ serde_json = { workspace = true }
 # "index is busy" path is exercised deterministically instead of by racing
 # two processes (po-l3jo5).
 rvl-index = { path = "../rvl-index" }
+flate2 = { workspace = true }
 
 # RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
 # this each of cindex/rustindex was its own dist "app" — its own archive, its
@@ -84,6 +86,12 @@ rvl-index = { path = "../rvl-index" }
 # archive against that list. Moving them to `include` would silently drop
 # them from that check.
 #
+# `include` also carries `libclang/`, the pinned engine cindex loads in a
+# release (po-av01j.49): ci/fetch-libclang.sh verifies it against
+# crates/cindex/libclang.pin and writes it into `dist-extras/` in the same
+# build-setup step list. cindex finds it beside its own resolved path, so it
+# must stay a sibling directory of the executables, never a `binary`.
+#
 # `include` carries goindex, which cargo cannot build: release CI cross-builds
 # it per target into `dist-extras/` before `dist build` runs. It is not a cargo
 # bin target, so Homebrew files it under `<prefix>/share/rvl` rather than
@@ -92,4 +100,4 @@ rvl-index = { path = "../rvl-index" }
 # of the archive combined.
 [package.metadata.dist]
 binaries = { "*" = ["rvl", "cindex", "rustindex"] }
-include = ["dist-extras/goindex"]
+include = ["dist-extras/goindex", "dist-extras/libclang"]

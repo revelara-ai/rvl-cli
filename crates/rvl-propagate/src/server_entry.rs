@@ -71,9 +71,11 @@ fn is_middleware_attachment(site: &Site) -> bool {
 /// (flask/fastapi/express/Go) or django's trailing-slash convention
 /// (`path("users/", ...)`). A bare word is NOT a path — accepting one would
 /// let a `name="health"` keyword argument satisfy RC-020, the false pass we
-/// refuse.
+/// refuse. A URL with a scheme is not a path either: a listener registered
+/// under `"http://0.0.0.0:8000/"` (mongoose) ends in a slash, and reading it
+/// as a resolved route would let RC-020 assert an absence it cannot see.
 fn is_pathish(s: &str) -> bool {
-    s.starts_with('/') || (s.len() > 1 && s.ends_with('/'))
+    s.starts_with('/') || (s.len() > 1 && s.ends_with('/') && !s.contains("://"))
 }
 
 /// The literal route paths a registration carries. Primary source: the
@@ -390,6 +392,7 @@ mod tests {
                     rationale: "seed".into(),
                 },
             ],
+            decorators: vec![],
         })
     }
 
@@ -502,6 +505,61 @@ mod tests {
             Verdict::Abstain,
             "a name= keyword must not satisfy the health control: {}",
             f.reason
+        );
+    }
+
+    #[test]
+    fn a_listen_url_with_a_trailing_slash_is_not_a_route_path() {
+        // mongoose registers a LISTENER under a URL. "http://0.0.0.0:8000/"
+        // ends in a slash, and reading it as a django-style route path would
+        // make the registration "resolved" and permit a false violation.
+        let mut s = entry(
+            "main.c",
+            9,
+            "mg_http_listen",
+            r#"mg_http_listen(&mgr, "http://0.0.0.0:8000/", fn, NULL)"#,
+            Some("http://0.0.0.0:8000/"),
+        );
+        s.client_type = "mongoose.mg_mgr".into();
+        let f = by_control(&evaluate(&[s], &seed_specs()), "RC-020").clone();
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(f.reason.contains("no resolvable path"), "{}", f.reason);
+    }
+
+    #[test]
+    fn c_registrations_are_judged_like_any_other_server_entry() {
+        // The shapes cindex emits: a civetweb registration with a literal
+        // path, and a mongoose route match whose path rides the snippet.
+        let mut civet = entry(
+            "srv.c",
+            18,
+            "mg_set_request_handler",
+            r#"mg_set_request_handler(ctx, "/healthz", health, 0)"#,
+            None,
+        );
+        civet.client_type = "civetweb.mg_context".into();
+        civet.const_args = vec![ConstArg {
+            index: 1,
+            name: String::new(),
+            value: r#""/healthz""#.into(),
+            how: "literal".into(),
+        }];
+        assert_eq!(
+            by_control(&evaluate(&[civet], &seed_specs()), "RC-020").verdict,
+            Verdict::Satisfies
+        );
+
+        let mut mongoose = entry(
+            "app.c",
+            8,
+            "mg_match",
+            r#"mg_match(hm->uri, mg_str("/api/health"), 0)"#,
+            None,
+        );
+        mongoose.client_type = "mongoose.mg_http_message".into();
+        assert_eq!(
+            by_control(&evaluate(&[mongoose], &seed_specs()), "RC-020").verdict,
+            Verdict::Satisfies
         );
     }
 

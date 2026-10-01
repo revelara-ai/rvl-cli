@@ -171,6 +171,10 @@ pub enum SyncOutcome {
     Rejected { reason: String },
     /// Network or server error; last state kept.
     FetchFailed { reason: String },
+    /// The server answered 404 for the artifact at `url`: it has never
+    /// published a spec cache. Not a network fault, so a retry does not help;
+    /// last state kept.
+    NotPublished { url: String },
     /// Verified artifact could not be written into place. The store may be
     /// mid-rotation: a verifiable copy survives in current or last-good and
     /// load() re-verifies whichever it finds.
@@ -180,7 +184,14 @@ pub enum SyncOutcome {
 /// What a fetcher returned.
 pub enum Fetched {
     NotModified,
-    New { bytes: Vec<u8>, sig_b64: String },
+    New {
+        bytes: Vec<u8>,
+        sig_b64: String,
+    },
+    /// HTTP 404 for the artifact at `url`: nothing has been published there.
+    NotPublished {
+        url: String,
+    },
 }
 
 /// Transport abstraction: HTTP in production, in-memory in tests.
@@ -485,10 +496,23 @@ pub fn sync(
     match fetcher.fetch(store.current_hash().as_deref()) {
         Ok(Fetched::NotModified) => SyncOutcome::UpToDate,
         Ok(Fetched::New { bytes, sig_b64 }) => store.install(&bytes, &sig_b64, keyset),
+        Ok(Fetched::NotPublished { url }) => SyncOutcome::NotPublished { url },
         Err(e) => SyncOutcome::FetchFailed {
             reason: e.to_string(),
         },
     }
+}
+
+/// The one wording for [`SyncOutcome::NotPublished`], shared by `sync` output
+/// and `doctor --fix`. It must not read as a network failure: the request
+/// arrived and the server said there is nothing to fetch.
+pub fn not_published_message(url: &str) -> String {
+    format!(
+        "HTTP 404 from {url}: the server has not published a spec cache, so retrying \
+         will not help. Check that the API URL is correct, or ask the server operator to publish \
+         one; '{BIN} cache import' installs a spec cache from a file. Continuing on the \
+         installed cache, if there is one"
+    )
 }
 
 /// sha256 hex helper shared by store and fetchers.
@@ -527,6 +551,9 @@ impl Fetcher for HttpFetcher {
             Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
             Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
+            // 404 on the artifact means "never published", which a user must
+            // be able to tell apart from a dead network (po-gcn3q).
+            Err(ureq::Error::Status(404, _)) => return Ok(Fetched::NotPublished { url }),
             Err(e) => return Err(e.into()),
         };
         let mut bytes = Vec::new();
@@ -570,6 +597,9 @@ impl Fetcher for OssHttpFetcher {
             Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
             Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
+            // 404 on the artifact means "never published", which a user must
+            // be able to tell apart from a dead network (po-gcn3q).
+            Err(ureq::Error::Status(404, _)) => return Ok(Fetched::NotPublished { url }),
             Err(e) => return Err(e.into()),
         };
         let mut bytes = Vec::new();
@@ -621,18 +651,36 @@ impl TieredLoaded {
     }
 }
 
-/// Load both tiers, tolerating either store being absent or unloadable.
-/// Each present tier is fully verified (signature at load, as always); a
-/// tier that fails verification is treated as absent, never as trusted.
+/// Which tiers a load may open. A LOAD filter only: sync still installs
+/// every tier the credentials allow, so dropping the filter needs no re-sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TierFilter {
+    /// The OSS baseline plus the commercial overlay when one is installed.
+    #[default]
+    Both,
+    /// The OSS tier alone, exactly what a no-key install loads. The
+    /// commercial store is never opened, so it contributes no specs, no
+    /// judgments and no staleness or upgrade chatter.
+    OssOnly,
+}
+
+/// Load the tiers `filter` allows, tolerating either store being absent or
+/// unloadable. Each present tier is fully verified (signature at load, as
+/// always); a tier that fails verification is treated as absent, never as
+/// trusted.
 pub fn load_tiered(
     commercial: &CacheStore,
     oss: &CacheStore,
     keyset: &Keyset,
     today: &str,
+    filter: TierFilter,
 ) -> TieredLoaded {
     TieredLoaded {
         oss: oss.load(keyset, today).ok(),
-        commercial: commercial.load(keyset, today).ok(),
+        commercial: match filter {
+            TierFilter::Both => commercial.load(keyset, today).ok(),
+            TierFilter::OssOnly => None,
+        },
     }
 }
 
