@@ -390,6 +390,7 @@ mod tests {
                     rationale: "seed".into(),
                 },
             ],
+            decorators: vec![],
         })
     }
 

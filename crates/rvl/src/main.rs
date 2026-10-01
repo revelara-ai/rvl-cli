@@ -3131,6 +3131,7 @@ fn findings_from_sites(
                         family: None,
                     })
                     .collect(),
+                decorators: vec![],
             };
             cache.merge(rvl_spec::SpecCache::from_file(overlay));
         }
