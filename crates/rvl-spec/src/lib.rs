@@ -787,6 +787,43 @@ pub struct ServerSpec {
     pub rationale: String,
 }
 
+/// What a DECORATOR's own arguments mean, keyed on the decorator's identity
+/// (po-av01j.58).
+///
+/// The decorator mechanism is AMBIENT: `@shared_task(time_limit=120)` bounds
+/// every call in the task, so propagation credits it for any blocking site
+/// whatever the site's own [`ApiSpec`] lists. That is also why the values that
+/// switch such a bound off cannot ride the site's spec the way
+/// [`ApiSpec::unbounded_sentinels`] do for call arguments -- a DB call inside a
+/// celery task has no reason to mention celery. They belong to the decorator,
+/// and this is the spec that carries them: `celery.shared_task` declares
+/// `time_limit=0` and `time_limit=None` as "no limit".
+///
+/// The retrievers emit decorators as raw text, so the only identity a
+/// decorator carries is the callable as written (`@shared_task(`,
+/// `@app.task(`). A spec governs the decorators whose written callable ends in
+/// one of `names`. That is loose -- another library's `@x.task` matches a
+/// celery spec naming `task` -- and deliberately so: the only effect of a
+/// match is that a sentinel value stops crediting a bound, which errs toward
+/// NOT crediting one, the only safe direction on this property.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecoratorSpec {
+    /// The decorator's library identity (`celery.shared_task`), the merge key.
+    pub identity: String,
+    /// The written callable's last dotted segment this spec governs
+    /// (`shared_task`, `task`).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Values of a bounding keyword argument (`time_limit`, `timeout`, ...)
+    /// that mean NO bound. Compared like [`ApiSpec::is_unbounded_sentinel`].
+    #[serde(default)]
+    pub unbounded_sentinels: Vec<String>,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpecFile {
     #[serde(default)]
@@ -809,6 +846,11 @@ pub struct SpecFile {
     /// a pre-G4 consumer with the field ignored — compatible both ways.
     #[serde(default)]
     pub emissions: Vec<EmissionSpec>,
+    /// Decorator-identity specs (po-av01j.58). Additive both ways, like the
+    /// sections above: a cache without it declares no decorator sentinels,
+    /// so every decorator bound is credited exactly as before.
+    #[serde(default)]
+    pub decorators: Vec<DecoratorSpec>,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -831,6 +873,7 @@ pub struct SpecCache {
     config_keys: HashMap<(String, String), ConfigKeySpec>,
     server: Vec<ServerSpec>,
     emissions: Vec<EmissionSpec>,
+    decorators: Vec<DecoratorSpec>,
 }
 
 impl SpecCache {
@@ -855,7 +898,40 @@ impl SpecCache {
         }
         c.server = f.server;
         c.emissions = f.emissions;
+        for d in f.decorators {
+            c.merge_decorator(d);
+        }
         c
+    }
+
+    /// Insert a decorator spec, keeping the higher-confidence entry per
+    /// identity -- the same policy as apis.
+    fn merge_decorator(&mut self, v: DecoratorSpec) {
+        match self
+            .decorators
+            .iter_mut()
+            .find(|d| d.identity == v.identity)
+        {
+            Some(existing) if existing.confidence >= v.confidence => {}
+            Some(existing) => *existing = v,
+            None => self.decorators.push(v),
+        }
+    }
+
+    /// Whether `value`, given to a bounding argument of the decorator whose
+    /// written callable is `callable` (`shared_task`, `app.task`), is a value
+    /// some usable decorator spec declares as NO bound. Every spec governing
+    /// the name is consulted, so the answer is the union of their sentinels:
+    /// see [`DecoratorSpec`] for why a loose match is the safe one. A
+    /// decorator no spec governs declares nothing.
+    pub fn decorator_is_unbounded_sentinel(&self, callable: &str, value: &str) -> bool {
+        let name = callable.trim().rsplit('.').next().unwrap_or_default();
+        let v = value.trim();
+        self.decorators
+            .iter()
+            .filter(|d| d.confidence >= MIN_CONFIDENCE && d.names.iter().any(|n| n == name))
+            .flat_map(|d| d.unbounded_sentinels.iter())
+            .any(|s| s.trim().eq_ignore_ascii_case(v))
     }
 
     /// The usable G2 server-entry specs: everything at or above the
@@ -926,6 +1002,7 @@ impl SpecCache {
             + self.config_keys.len()
             + self.server.len()
             + self.emissions.len()
+            + self.decorators.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -988,6 +1065,9 @@ impl SpecCache {
                 Some(existing) => *existing = v,
                 None => self.emissions.push(v),
             }
+        }
+        for v in other.decorators {
+            self.merge_decorator(v);
         }
     }
 
@@ -1211,6 +1291,7 @@ mod tests {
                     family: None,
                 })
                 .collect(),
+            decorators: vec![],
         })
     }
 
@@ -1326,6 +1407,7 @@ mod tests {
             emissions: vec![],
             apis: vec![],
             configs,
+            decorators: vec![],
         })
     }
 
@@ -1574,6 +1656,7 @@ mod tests {
             emissions: vec![],
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
+            decorators: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -1584,6 +1667,7 @@ mod tests {
             emissions: vec![],
             apis: vec![better],
             configs: vec![],
+            decorators: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -2131,6 +2215,72 @@ mod tests {
     }
 
     #[test]
+    fn a_decorator_spec_declares_sentinels_for_the_names_it_governs() {
+        // po-av01j.58: the decorator mechanism is ambient, so its sentinels
+        // cannot ride the SITE's api spec -- a DB call inside a celery task
+        // has no reason to mention celery. They ride a spec keyed on the
+        // decorator's own identity, matched on the written callable's last
+        // dotted segment, the only identity the retrievers' raw decorator
+        // text carries.
+        let cache = SpecCache::load(
+            r#"{"apis":[],"decorators":[{"identity":"celery.shared_task",
+                 "names":["shared_task","task"],"confidence":0.9,
+                 "unbounded_sentinels":["0","None"]}]}"#,
+        )
+        .unwrap();
+        assert!(cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+        assert!(cache.decorator_is_unbounded_sentinel("celery.shared_task", " none "));
+        assert!(cache.decorator_is_unbounded_sentinel("app.task", "None"));
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "120"));
+        assert!(
+            !cache.decorator_is_unbounded_sentinel("retry", "0"),
+            "a decorator no spec governs declares nothing"
+        );
+        assert_eq!(cache.len(), 1, "the section counts toward the cache");
+    }
+
+    #[test]
+    fn a_cache_without_a_decorators_section_declares_nothing() {
+        let cache = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+    }
+
+    #[test]
+    fn a_low_confidence_decorator_spec_decides_nothing() {
+        let cache = SpecCache::load(
+            r#"{"decorators":[{"identity":"celery.shared_task",
+                 "names":["shared_task"],"confidence":0.3,
+                 "unbounded_sentinels":["0"]}]}"#,
+        )
+        .unwrap();
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+    }
+
+    #[test]
+    fn decorator_specs_merge_by_identity_preferring_confidence() {
+        let mk = |confidence: f64, sentinels: Vec<&str>| SpecFile {
+            decorators: vec![DecoratorSpec {
+                identity: "celery.shared_task".into(),
+                names: vec!["shared_task".into()],
+                unbounded_sentinels: sentinels.into_iter().map(String::from).collect(),
+                confidence,
+                rationale: String::new(),
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, vec!["None"]));
+        base.merge(SpecCache::from_file(mk(0.95, vec!["0"])));
+        assert!(base.decorator_is_unbounded_sentinel("shared_task", "0"));
+        assert!(!base.decorator_is_unbounded_sentinel("shared_task", "None"));
+        base.merge(SpecCache::from_file(mk(0.6, vec!["-1"])));
+        assert!(
+            !base.decorator_is_unbounded_sentinel("shared_task", "-1"),
+            "a lower-confidence spec never displaces the winner"
+        );
+        assert_eq!(base.len(), 1);
+    }
+
+    #[test]
     fn spec_applicability_defaults_to_classic_call_sites_only() {
         // G3 (po-av01j.4): every existing spec was authored against G1 client
         // call sites. An undeclared site_kinds list must therefore keep the
@@ -2162,6 +2312,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![e(0.7, "base")],
+            decorators: vec![],
         });
         base.merge(SpecCache::from_file(SpecFile {
             apis: vec![],
@@ -2180,6 +2331,7 @@ mod tests {
                     rationale: "new".into(),
                 },
             ],
+            decorators: vec![],
         }));
         let specs = base.emission_specs();
         assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
@@ -2400,6 +2552,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         }));
         assert_eq!(c.api_count(), 1);
         assert_eq!(c.config_count(), 1);

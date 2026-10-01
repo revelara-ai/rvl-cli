@@ -1,10 +1,11 @@
 //! Destination-gate scoring: gate-set loading, provenance enforcement
-//! (fail-closed), and per-language precision as a Wilson 95% lower bound.
+//! (fail-closed), and per-language precision as a Wilson 95% lower bound at
+//! the cluster-adjusted effective sample size (po-io8sk.1).
 //!
 //! Contract sources: rvlscan-eval gate-sets/README.md and
 //! docs/POPULATION_TEMPLATE.md (po-3t3oj.10), wayfinder po-ipkfg.1 / po-ipkfg.11.
 
-use crate::stats::wilson_lower_bound;
+use crate::stats::{kish_design_effect, wilson_lower_bound, wilson_lower_bound_at, GATE_ICC};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -132,9 +133,13 @@ pub struct GoldRow {
     pub adjudicated: AdjudicatedVerdict,
 }
 
+/// The n >= 50 bar (po-ipkfg.1). It applies to the declared sample and to the
+/// effective sample size after the cluster adjustment (po-io8sk.1).
+pub const MIN_SAMPLE: usize = 50;
+
 /// Why a gate run was refused. All refusals are fail-closed: absence of
 /// evidence is refusal, never a skipped check.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Refusal {
     /// The set carries a `withdrawn:` block: retracted after minting by a
     /// human decision (po-av01j.119). Checked before everything else, because
@@ -152,6 +157,17 @@ pub enum Refusal {
     AlreadyConsumed { set_id: String, reason: String },
     /// sample_size below the n>=50 bar (po-ipkfg.1).
     SampleTooSmall(usize),
+    /// The scored rows clear the bar on raw n but not after the cluster
+    /// adjustment (po-io8sk.1): too few (repo, spec class) clusters decide
+    /// them. Distinct from `SampleTooSmall` on purpose. That one reads the
+    /// manifest's own `sample_size`, so a manifest can satisfy it by
+    /// declaration; this one is computed from the engine run.
+    EffectiveSampleTooSmall {
+        n: usize,
+        n_clusters: usize,
+        deff: f64,
+        n_eff: f64,
+    },
     /// Quarantine registry missing or unreadable.
     RegistryUnavailable(String),
     /// Any other required gate input missing, unreadable, or malformed
@@ -214,7 +230,19 @@ impl std::fmt::Display for Refusal {
                 f,
                 "refused: {set_id} is already consumed ({reason}). Gate sets are single-use per version; mint a fresh set rather than re-running this one."
             ),
-            Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < 50"),
+            Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < {MIN_SAMPLE}"),
+            Refusal::EffectiveSampleTooSmall {
+                n,
+                n_clusters,
+                deff,
+                n_eff,
+            } => write!(
+                f,
+                "refused: effective sample size is below {MIN_SAMPLE} (n {n} | n_clusters {n_clusters} | \
+                 deff {deff:.2} | n_eff {n_eff:.1}). One spec decides every site of its class, so the \
+                 {n} scored rows are {n_clusters} (repo, spec class) clusters and carry the evidence of \
+                 {n_eff:.1} independent observations. Mint a set that draws from more repos and spec classes."
+            ),
             Refusal::MissingDepsProvenance { repo, language } => write!(
                 f,
                 "refused: {repo} pins a commit but no dependency tree, and {language} retrieval reads installed packages. \
@@ -606,7 +634,7 @@ pub fn validate_gate_set(
     if manifest.consumed {
         return Err(Refusal::Consumed(manifest.set_id.clone()));
     }
-    if manifest.sample_size < 50 {
+    if manifest.sample_size < MIN_SAMPLE {
         return Err(Refusal::SampleTooSmall(manifest.sample_size));
     }
     // Older-than-minted is refused; newer is not, because the registry grows
@@ -778,6 +806,26 @@ pub struct JoinedRow {
     pub line_number: u64,
     pub adjudicated: AdjudicatedVerdict,
     pub engine: EngineSaid,
+    /// (repo, spec class) of the engine site that decided this location.
+    /// `None` only when the engine has no site here.
+    pub cluster: Option<(String, String)>,
+}
+
+/// One engine site, as the join needs it: where it is, whether the engine
+/// flagged it, and which cluster decided it.
+///
+/// THE CLUSTER KEY IS (repo, spec class) (po-io8sk.1). One spec decides every
+/// site of its class, and a repo applies one coding habit to all of them, so
+/// rows that share both are one decision observed many times. A stream that
+/// carries no repo identity leaves `repo` empty and clusters on the class
+/// alone: fewer clusters, a smaller n_eff, the fail-closed direction.
+#[derive(Debug, Clone)]
+pub struct EngineSite {
+    pub file_path: String,
+    pub line_number: u64,
+    pub flagged: bool,
+    pub repo: String,
+    pub class: String,
 }
 
 /// Engine-measured gate score (po-av01j.95).
@@ -800,7 +848,14 @@ pub struct EngineGateScore {
     /// means the gold and the checkout have drifted apart.
     pub unmatched: usize,
     pub n_unsure: usize,
+    /// (repo, spec class) clusters among the scored rows.
+    pub n_clusters: usize,
+    /// Kish design effect of that clustering at `stats::GATE_ICC`.
+    pub deff: f64,
+    /// n_scored / deff. The n the bound is taken at.
+    pub n_eff: f64,
     pub precision: f64,
+    /// Wilson 95% lower bound at `n_eff`, NOT at `n_scored`.
     pub wilson_lb: f64,
     pub pass: bool,
 }
@@ -822,6 +877,13 @@ pub struct EngineGateScore {
 ///
 /// `Unsure` rows are excluded from both terms, as before: the panel declining
 /// to decide is not evidence either way.
+///
+/// THE BOUND IS TAKEN AT n_eff, NOT AT n (po-io8sk.1). The scored rows are
+/// clustered by (repo, spec class), and 50 violates from 4 specs in 2 repos
+/// are far fewer than 50 independent observations. The Wilson bound on raw n
+/// is too tight for them, so the gate could pass on evidence it did not have.
+/// See `stats::kish_design_effect`. A run whose n_eff is under the n >= 50 bar
+/// is refused, the same as a sample that is too small on its face.
 ///
 /// This scores whatever gold it is handed. The caller checks first that the
 /// gold is the pre-registered sample (`check_gold_matches_sample`); the gate
@@ -865,7 +927,25 @@ pub fn score_gate_against_engine(
         .count();
     let false_positives = scored.len() - confirmed;
     let precision = confirmed as f64 / scored.len() as f64;
-    let wilson_lb = crate::stats::wilson_lower_bound(confirmed as u64, scored.len() as u64);
+
+    let mut cluster_sizes: BTreeMap<&(String, String), usize> = BTreeMap::new();
+    for r in &scored {
+        // A scored row is Flagged, and the join gives every Flagged row the
+        // cluster of the site that flagged it.
+        let key = r.cluster.as_ref().expect("a flagged row has a cluster");
+        *cluster_sizes.entry(key).or_insert(0) += 1;
+    }
+    let sizes: Vec<usize> = cluster_sizes.into_values().collect();
+    let design = kish_design_effect(&sizes, GATE_ICC);
+    if design.n_eff < MIN_SAMPLE as f64 {
+        return Err(Refusal::EffectiveSampleTooSmall {
+            n: design.n,
+            n_clusters: design.n_clusters,
+            deff: design.deff,
+            n_eff: design.n_eff,
+        });
+    }
+    let wilson_lb = wilson_lower_bound_at(precision, design.n_eff);
 
     Ok(EngineGateScore {
         n_scored: scored.len(),
@@ -874,6 +954,9 @@ pub fn score_gate_against_engine(
         no_longer_flagged,
         unmatched,
         n_unsure,
+        n_clusters: design.n_clusters,
+        deff: design.deff,
+        n_eff: design.n_eff,
         precision,
         wilson_lb,
         pass: wilson_lb >= target,
@@ -892,27 +975,34 @@ pub fn score_gate_against_engine(
 ///
 /// One location can carry several sites (different client types, different
 /// verdicts). Flagged wins: if ANY site at that location is a violation, the
-/// engine flagged that location, which is what the panel was shown.
-pub fn join_gold_to_engine(
-    rows: &[GoldRow],
-    engine_sites: &[(String, u64, bool)],
-) -> Vec<JoinedRow> {
+/// engine flagged that location, which is what the panel was shown. The
+/// location's cluster follows the same rule: it is the cluster of the first
+/// site in stream order that flagged it, or of the first site when none did.
+pub fn join_gold_to_engine(rows: &[GoldRow], engine_sites: &[EngineSite]) -> Vec<JoinedRow> {
     use std::collections::HashMap;
-    let mut by_loc: HashMap<(&str, u64), bool> = HashMap::new();
-    for (file, line, flagged) in engine_sites {
-        let e = by_loc.entry((file.as_str(), *line)).or_insert(false);
-        *e = *e || *flagged;
+    let mut by_loc: HashMap<(&str, u64), &EngineSite> = HashMap::new();
+    for site in engine_sites {
+        let e = by_loc
+            .entry((site.file_path.as_str(), site.line_number))
+            .or_insert(site);
+        if site.flagged && !e.flagged {
+            *e = site;
+        }
     }
     rows.iter()
-        .map(|r| JoinedRow {
-            file_path: r.file_path.clone(),
-            line_number: r.line_number,
-            adjudicated: r.adjudicated,
-            engine: match by_loc.get(&(r.file_path.as_str(), r.line_number)) {
-                Some(true) => EngineSaid::Flagged,
-                Some(false) => EngineSaid::NotFlagged,
-                None => EngineSaid::Absent,
-            },
+        .map(|r| {
+            let site = by_loc.get(&(r.file_path.as_str(), r.line_number));
+            JoinedRow {
+                file_path: r.file_path.clone(),
+                line_number: r.line_number,
+                adjudicated: r.adjudicated,
+                engine: match site {
+                    Some(s) if s.flagged => EngineSaid::Flagged,
+                    Some(_) => EngineSaid::NotFlagged,
+                    None => EngineSaid::Absent,
+                },
+                cluster: site.map(|s| (s.repo.clone(), s.class.clone())),
+            }
         })
         .collect()
 }
