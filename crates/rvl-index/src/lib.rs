@@ -14,7 +14,7 @@
 //!   failed job.
 
 use anyhow::Context;
-use redb::ReadableTableMetadata;
+use redb::{ReadableDatabase, ReadableTableMetadata};
 use rvl_core::Site;
 use rvl_core::BIN;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,7 @@ pub trait Retriever {
 /// The persistent index: path -> (content hash, packets retrieved from it).
 pub struct PacketIndex {
     db: redb::Database,
+    rebuilt_from_old_format: bool,
 }
 
 /// path -> JSON {hash, sites}. One table keeps the store trivially
@@ -149,15 +150,21 @@ impl PacketIndex {
     /// the lock for a few milliseconds throws away the whole reindex
     /// (po-l3jo5).
     ///
-    /// Only `DatabaseAlreadyOpen` is retried. A storage error or a required
-    /// format upgrade will not resolve itself, and retrying one for a minute
-    /// only delays the report.
+    /// Only `DatabaseAlreadyOpen` is retried. A storage error will not
+    /// resolve itself, and retrying one for a minute only delays the report.
+    ///
+    /// An index in an older on-disk format (one written by redb 2, which
+    /// redb 4 refuses to open) is deleted and created afresh. The index is a
+    /// content-hash cache, so nothing is lost but warmth, and the next scan
+    /// refills it. The rebuild is recorded, never silent: see
+    /// [`PacketIndex::rebuilt_from_old_format`] (po-av01j.210).
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let started = Instant::now();
         let mut backoff = Duration::from_millis(25);
+        let mut rebuilt_from_old_format = false;
         let db = loop {
             match redb::Database::create(path) {
                 Ok(db) => break db,
@@ -171,6 +178,14 @@ impl PacketIndex {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(250));
                 }
+                // Once only: a second refusal after the delete is a real
+                // fault, and looping on it would never end.
+                Err(redb::DatabaseError::UpgradeRequired(_)) if !rebuilt_from_old_format => {
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("removing old-format packet index at {}", path.display())
+                    })?;
+                    rebuilt_from_old_format = true;
+                }
                 Err(e) => {
                     return Err(anyhow::Error::new(e))
                         .with_context(|| format!("opening packet index at {}", path.display()))
@@ -183,7 +198,10 @@ impl PacketIndex {
             let _ = tx.open_table(ENTRIES)?;
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            rebuilt_from_old_format,
+        })
     }
 
     /// Record the packets retrieved from `file` at content hash `hash`.
@@ -299,6 +317,13 @@ impl PacketIndex {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// True when opening found an index in an older on-disk format and
+    /// replaced it with an empty one. Callers report it, so that a cold
+    /// scan after an upgrade has a stated cause.
+    pub fn rebuilt_from_old_format(&self) -> bool {
+        self.rebuilt_from_old_format
     }
 
     /// Number of indexed files.

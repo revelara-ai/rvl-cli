@@ -1269,6 +1269,51 @@ fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, se
     }
 }
 
+/// An index written before the redb 2 -> 4 bump is in a file format the new
+/// engine refuses to open. Every user has one, so the first command after an
+/// upgrade must work AND say why the index is cold, not fail with the storage
+/// engine's "manual upgrade required" (po-av01j.210).
+#[test]
+fn index_status_rebuilds_an_old_format_index_and_says_so() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let index_dir = dir.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    // A real index written by redb 2.6.3; shared with the rvl-index tests.
+    let gz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rvl-index/tests/testdata/packets-redb2.redb.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(gz).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    std::fs::write(index_dir.join("packets.redb"), bytes).unwrap();
+
+    let status = || {
+        bin()
+            .args(["index", "status"])
+            .env("RVL_INDEX_DIR", &index_dir)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl")
+    };
+    let out = status();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "status must succeed: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("0 file(s) indexed"),
+        "a rebuilt index is empty"
+    );
+    assert!(
+        stderr.contains("older on-disk format") && stderr.contains("rebuilt"),
+        "the rebuild must be reported, got: {stderr}"
+    );
+
+    // Once rebuilt, the note does not repeat.
+    let again = status();
+    assert!(again.status.success());
+    assert!(!String::from_utf8_lossy(&again.stderr).contains("rebuilt"));
+}
+
 /// The detached child's log, or a marker when it never wrote one. A detached
 /// reindex that fails MUST leave this behind: "no log" is itself the finding.
 fn reindex_log(cache_dir: &std::path::Path) -> String {

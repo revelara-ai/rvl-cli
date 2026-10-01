@@ -162,6 +162,17 @@ is positive evidence the bound was switched off, so the site violates with
 the value cited, unless another construction of the type sets a real value.
 A spec that lists none credits any set value.
 
+Decorators get the same treatment through their own spec section. A bound
+on a decorator, such as `@shared_task(time_limit=120)`, covers every call in
+the function, so the site's API spec can't say which values switch it off. A
+`decorators` entry does that instead. It names the decorator's identity
+(`celery.shared_task`), the written names it governs, matched on the last
+dotted segment (`shared_task`, `task`), and its `unbounded_sentinels`. A
+bound key set to one of those values (`time_limit=0`, `time_limit=None`)
+earns no credit. The scan then keeps looking for other bounds instead of
+reporting a violation, because the call can still carry its own. With no
+matching decorator spec, any value earns credit, as before.
+
 An API spec can name a `capacity_arg`, the constructor argument that gives
 the receiver a finite capacity (`{"name": "maxsize", "position": 0}` for
 `queue.Queue.put`). Such a call blocks only when the receiver can fill, so
