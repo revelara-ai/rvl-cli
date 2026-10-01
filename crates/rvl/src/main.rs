@@ -11,6 +11,7 @@ mod doctor;
 mod embedded_helpers;
 mod empty_flag;
 mod force;
+mod help_text;
 mod hook;
 mod init;
 mod out_doc;
@@ -71,12 +72,14 @@ enum Cmd {
     /// Exit codes: 0 = clean, 3 = BLOCKING findings remain (the gate fires),
     /// 1 = the scan could not complete, 2 = usage error.
     ///
-    /// SUBMISSION MODE (rvl-cli parity, po-av01j.153): when `--scan-dir`,
-    /// `--file`, `--stdin`, or `--service` is present, this command instead
-    /// submits risk findings to the Revelara risk register — same flags and
-    /// wire contract as `rvl scan --service <name> --scan-dir <dir>`, so
-    /// plugin skill content works against this binary verbatim. The
-    /// deterministic scan above is untouched when none of those flags appear.
+    /// SUBMISSION MODE: when `--scan-dir`, `--file`, `--stdin`, or
+    /// `--service` is present, this command instead submits risk findings to
+    /// the Revelara risk register, as in `rvl scan --service <name>
+    /// --scan-dir <dir>`. The deterministic scan above is untouched when none
+    /// of those flags appear.
+    //
+    // Submission mode is rvl-cli parity (po-av01j.153): same flags and wire
+    // contract, so plugin skill content works against this binary verbatim.
     Scan {
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
@@ -120,9 +123,11 @@ enum Cmd {
         /// re-parsed files alone.
         #[arg(long)]
         include_tests: bool,
-        /// Report and gate ONLY on findings in the files this change touched
-        /// (po-av01j.127). The changed set comes from GIT, never from the
-        /// packet index (po-sg7jb): staged paths under `--hook pre-commit`,
+        // Delta gating is po-av01j.127; the changed set being git's rather
+        // than the packet index's is po-sg7jb.
+        /// Report and gate ONLY on findings in the files this change touched.
+        /// The changed set comes from GIT, never from the packet index:
+        /// staged paths under `--hook pre-commit`,
         /// the pushed range under `--hook pre-push`, otherwise the working
         /// tree against HEAD. Outside a git work tree the scan REFUSES rather
         /// than widening to the whole repository. Requires `--incremental`,
@@ -136,8 +141,8 @@ enum Cmd {
         #[arg(long)]
         changed_only: bool,
         /// Base ref for `--changed-only`: the gate scopes to `<ref>...HEAD`,
-        /// the committed work on this branch since it diverged (po-av01j.194,
-        /// rvl-cli parity). THE FLAG IS THE TOP OF A CHAIN — `--base`,
+        /// the committed work on this branch since it diverged. THE FLAG IS
+        /// THE TOP OF A CHAIN — `--base`,
         /// `RVL_BASE_REF`, `GITHUB_BASE_REF`,
         /// `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `.revelara.yaml`
         /// `scanner.base_ref` — so CI needs no flag at all: a GitHub PR event
@@ -149,19 +154,21 @@ enum Cmd {
         /// that is set but not present in the clone (a shallow checkout) is a
         /// REFUSAL, never a fallback.
         ///
-        /// `--base=` means "not given" and falls through to the next link,
-        /// exactly as rvl-cli's `!= ""` guard does (scan.go:473/500).
+        /// `--base=` means "not given" and falls through to the next link.
+        //
+        // po-av01j.194, rvl-cli parity: the empty-value fall-through is
+        // rvl-cli's `!= ""` guard (scan.go:473/500).
         #[arg(long)]
         base: Option<String>,
         /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
         /// one-line deprecation notice and runs the deterministic scan.
-        /// Consented hook adjudication is configured separately
-        /// (po-av01j.15, `--hook`); this flag never invokes a model.
+        /// Consented hook adjudication is configured separately (`--hook`);
+        /// this flag never invokes a model.
         #[arg(long)]
         agent: bool,
-        /// Blend the deterministic scan with your own coding agent
-        /// (po-av01j.205): the undecided runtime call sites, and only those,
-        /// go to the agent (claude/copilot on PATH, `agent:` in
+        // po-av01j.205.
+        /// Blend the deterministic scan with your own coding agent: the
+        /// undecided runtime call sites, and only those, go to the agent (claude/copilot on PATH, `agent:` in
         /// ~/.revelara/config.yaml, or RVL_AGENT_CMD) and its verdicts merge
         /// into a BLEND section. Advisory unless `.revelara.yaml` sets
         /// `scanner.agent_verdicts: gate`. An agent that is vetoed
@@ -175,7 +182,8 @@ enum Cmd {
         /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
         /// the same question `--hook pre-commit` asks. Accepted because v1's
         /// `hook install` wrote it into `.git/hooks/pre-commit`, where no
-        /// human can update it before the next `git commit` (po-av01j.191).
+        /// human can update it before the next `git commit`.
+        // po-av01j.191.
         #[arg(long)]
         staged: bool,
         /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
@@ -192,11 +200,12 @@ enum Cmd {
         /// With `--incremental`, enables the CONSENTED hook-mode agent
         /// adjudication lane for delta-scoped undecided sites — OFF by
         /// default at every layer; see `scanner.use_agent` and
-        /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
+        /// `scanner.agent_hooks` in `.revelara.yaml`. The
         /// deterministic scan is unchanged either way; advisory agent verdicts
         /// cannot affect the exit code, and gate-mode verdicts
         /// (`scanner.agent_verdicts: gate`) block exactly like any other
-        /// BLOCKING row — see EXIT_BLOCKED.
+        /// BLOCKING row (exit 3).
+        // The hook lane is po-av01j.15; exit 3 is EXIT_BLOCKED.
         #[arg(long)]
         hook: Option<String>,
         /// Submission mode: service name the findings belong to (selects
@@ -379,7 +388,8 @@ enum Cmd {
     },
     /// Initialize Revelara for this repository: write .revelara.yaml with
     /// the project name and detected components, install the plugin skills,
-    /// and check credentials (rvl-cli `rvl init` parity, po-av01j.163).
+    /// and check credentials.
+    // rvl-cli `rvl init` parity (po-av01j.163).
     Init {
         /// Set project name (default: from git remote or directory name)
         #[arg(long)]
@@ -464,10 +474,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Compliance framework views. `compliance report` is rvl-cli's `rvl
-    /// report` readiness scorecard, renamed because this binary already
-    /// spells `report` for the scan privacy-payload preview
-    /// (po-av01j.185 item 2). Readiness/supporting framing only, never
+    // `compliance report` is rvl-cli's `rvl report` readiness scorecard,
+    // renamed because this binary already spells `report` for the scan
+    // privacy-payload preview (po-av01j.185 item 2).
+    /// Compliance framework views. `compliance report` prints the readiness
+    /// scorecard for a framework. Readiness/supporting framing only, never
     /// certification.
     Compliance {
         #[command(subcommand)]
@@ -503,13 +514,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::config::ConfigCmd,
     },
+    // `stpa submit` is the `stpa-review` skill's only ingestion path, since
+    // `scan --cs-file` carries the control structure alone (po-av01j.183).
+    // `stpa list-ucas` is po-av01j.202.
     /// STPA-inspired safety analysis. `stpa submit --file` ingests the
     /// losses, UCAs, loss scenarios and control-structure model produced by
-    /// the `stpa-review` skill — that skill's only ingestion path, since
-    /// `scan --cs-file` carries the control structure alone (po-av01j.183).
-    /// `stpa list-ucas` reads the UCA store back, including the design-review
-    /// UCAs that never become risks and so never show up in `risk list`
-    /// (po-av01j.202).
+    /// the `stpa-review` skill. `stpa list-ucas` reads the UCA store back,
+    /// including the design-review UCAs that never become risks and so never
+    /// show up in `risk list`.
     ///
     /// Revelara's analysis is STPA-inspired (adapted from Systems-Theoretic
     /// Process Analysis, Leveson & Thomas, MIT). Findings are candidates for
@@ -519,9 +531,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::stpa::StpaCmd,
     },
-    /// Print the version. rvl-cli spells this as a SUBCOMMAND (`rvl version`)
-    /// and has no `--version` flag; this binary accepts both, so a script
-    /// written against either spelling keeps working (po-av01j.185 item 3).
+    // rvl-cli spells this as a SUBCOMMAND (`rvl version`) and has no
+    // `--version` flag; this binary accepts both, so a script written against
+    // either spelling keeps working (po-av01j.185 item 3).
+    /// Print the version. Same output as `rvl --version`.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish).
     /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
@@ -616,7 +629,8 @@ enum PluginCmd {
         project: bool,
         /// rvl-cli COMPATIBILITY ALIAS: this binary spells "every harness"
         /// as OMITTING the harness name, so `--all` is exactly the default
-        /// and is accepted rather than rejected (po-av01j.188).
+        /// and is accepted rather than rejected.
+        // po-av01j.188.
         #[arg(long)]
         all: bool,
         /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
@@ -633,7 +647,8 @@ enum PluginCmd {
         #[arg(long)]
         no_register: bool,
         /// rvl-cli COMPATIBILITY ALIAS for the default "every installed
-        /// harness" sweep (po-av01j.188).
+        /// harness" sweep.
+        // po-av01j.188.
         #[arg(long)]
         all: bool,
         /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
