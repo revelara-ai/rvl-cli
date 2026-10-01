@@ -98,6 +98,7 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
 /// it, so one fully-resolved value serves.
 fn cov() -> Coverage {
     Coverage {
+        blend_incomplete: None,
         retrievers: vec![],
         empty_api_corpus: false,
         resolved: 1,
@@ -152,6 +153,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         f("hidden", "low", "low_value", 0),
     ];
     let cov = Coverage {
+        blend_incomplete: None,
         retrievers: vec![],
         empty_api_corpus: false,
         resolved: 58,
@@ -211,6 +213,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
     let out = render_ladder(
         &findings,
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 5,
@@ -253,6 +256,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
     let out = render_ladder(
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 1,
@@ -286,6 +290,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
     let out = render_ladder(
         &findings,
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 10,
@@ -315,6 +320,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let out = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 1,
@@ -343,6 +349,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let colored = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 1,
@@ -376,6 +383,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     let out = render_ladder(
         &[f("b", "high", "surface", 2)],
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 1,
@@ -425,6 +433,23 @@ fn unjudged_keys_are_named_not_just_counted() {
 }
 
 #[test]
+fn vocabulary_only_keys_are_counted_apart_from_missing_specs() {
+    // Both are unjudged; only one of them is a gap.
+    let cc = ConfigCoverage {
+        resolved: 1,
+        total: 4,
+        abstain_no_spec: 1,
+        vocabulary_only: 2,
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+    assert!(
+        out.contains("1 no spec") && out.contains("2 vocabulary only"),
+        "{out}"
+    );
+}
+
+#[test]
 fn unjudged_key_list_states_what_it_dropped() {
     // Capping is fine; capping silently would read as "that is the whole queue".
     let cc = ConfigCoverage {
@@ -446,6 +471,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         abstain_no_spec: 1,
         abstain_outside_repo: 2,
         abstain_other: 0,
+        vocabulary_only: 0,
         unparseable_files: 1,
         no_spec_keys: Default::default(),
         sightings: vec![
@@ -456,6 +482,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
     let out = render_ladder(
         &[],
         Coverage {
+            blend_incomplete: None,
             retrievers: vec![],
             empty_api_corpus: false,
             resolved: 1,
@@ -495,6 +522,7 @@ fn empty_config_coverage_renders_nothing_extra() {
         render_ladder(
             &[],
             Coverage {
+                blend_incomplete: None,
                 retrievers: vec![],
                 empty_api_corpus: false,
                 resolved: 1,
@@ -994,4 +1022,37 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
     );
+}
+
+// po-av01j.205. `rvl scan --blend` whose agent half did not answer is the
+// deterministic half alone. Fail open (no block), but the footer may not call
+// that a clean commit, same rule as po-av01j.199 at the new seam.
+#[test]
+fn an_incomplete_blend_does_not_render_the_clean_verdict() {
+    let cov = Coverage {
+        total: 4,
+        resolved: 2,
+        blend_incomplete: Some("agent half unavailable: RVL_NO_AGENT=1".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("commit clean"), "{out}");
+    assert!(out.contains("NOT A BLENDED RESULT"), "{out}");
+    assert!(
+        out.contains("RVL_NO_AGENT"),
+        "the footer must carry the reason: {out}"
+    );
+    assert!(out.contains("fails open"), "{out}");
+}
+
+#[test]
+fn a_complete_blend_keeps_the_clean_verdict() {
+    let cov = Coverage {
+        total: 4,
+        resolved: 2,
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("commit clean"), "{out}");
+    assert!(!out.contains("NOT A BLENDED RESULT"), "{out}");
 }

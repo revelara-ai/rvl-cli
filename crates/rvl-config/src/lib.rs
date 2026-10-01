@@ -35,6 +35,7 @@ pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
+pub mod key_ledger;
 pub mod kubernetes;
 pub mod prometheus;
 pub mod terraform;

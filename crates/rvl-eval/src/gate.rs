@@ -6,6 +6,7 @@
 
 use crate::stats::wilson_lower_bound;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A pinned source repo inside a gate-set manifest.
@@ -158,6 +159,23 @@ pub enum Refusal {
     EvidenceUnreadable(String),
     /// A manifest repo is not in the quarantine registry.
     RepoNotQuarantined(String),
+    /// A manifest pins a repo at a commit other than the registry's
+    /// frozen_sha for it (po-av01j.93): the repo was re-designated after
+    /// minting, or the manifest was edited, and either way the sample may not
+    /// have been drawn from the commit the gate would measure.
+    FrozenShaMismatch {
+        repo: String,
+        pinned: String,
+        registry: String,
+    },
+    /// The set was minted against a newer registry than the run supplied
+    /// (po-av01j.93). The supplied registry is stale or the wrong file, so
+    /// nothing it says about this set's repos is evidence.
+    RegistryVersionAhead {
+        set_id: String,
+        minted_against: u64,
+        supplied: u64,
+    },
     /// A gate-set repo appears in the engine's grounding corpus.
     GroundingOverlap(String),
     /// The artifact under test declares a grounding manifest and the run was
@@ -212,6 +230,25 @@ impl std::fmt::Display for Refusal {
                 write!(f, "refused (fail-closed): gate evidence unreadable: {e}")
             }
             Refusal::RepoNotQuarantined(r) => write!(f, "refused: {r} not in quarantine registry"),
+            Refusal::FrozenShaMismatch {
+                repo,
+                pinned,
+                registry,
+            } => write!(
+                f,
+                "refused: {repo} is pinned at {pinned} but the quarantine registry freezes it at {registry}. \
+                 The sample may not have been drawn from the commit this run would measure; mint a fresh set \
+                 against the current designation."
+            ),
+            Refusal::RegistryVersionAhead {
+                set_id,
+                minted_against,
+                supplied,
+            } => write!(
+                f,
+                "refused: {set_id} was minted against quarantine registry v{minted_against} but the run \
+                 supplied v{supplied}. The registry is stale or the wrong file; pass the current one."
+            ),
             Refusal::GroundingOverlap(r) => {
                 write!(f, "refused: gate-set repo {r} present in grounding corpus")
             }
@@ -405,16 +442,22 @@ pub fn check_manifest_matches_artifact(
     Ok(())
 }
 
-/// Quarantine registry: version + quarantined repo names.
+/// Quarantine registry: version + each quarantined repo's frozen_sha.
 #[derive(Debug)]
 pub struct Registry {
     pub registry_version: u64,
-    pub repos: Vec<String>,
+    /// Repo name -> the frozen_sha it was designated at. A manifest pin is
+    /// checked against it (po-av01j.93).
+    pub repos: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct QuarantinedRepo {
     repo: String,
+    /// Required: rvlscan-eval's own registry tests make it mandatory, and a
+    /// designation without one gives a manifest pin nothing to be checked
+    /// against.
+    frozen_sha: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,9 +473,24 @@ pub fn load_registry(path: &Path) -> Result<Registry, Refusal> {
         .map_err(|e| Refusal::RegistryUnavailable(format!("{}: {e}", path.display())))?;
     let f: QuarantineFile = serde_yaml::from_str(&raw)
         .map_err(|e| Refusal::RegistryUnavailable(format!("{}: {e}", path.display())))?;
+    if let Some(r) = f
+        .quarantined_repos
+        .iter()
+        .find(|r| r.frozen_sha.trim().is_empty())
+    {
+        return Err(Refusal::RegistryUnavailable(format!(
+            "{}: {} has a blank frozen_sha",
+            path.display(),
+            r.repo
+        )));
+    }
     Ok(Registry {
         registry_version: f.registry_version,
-        repos: f.quarantined_repos.into_iter().map(|r| r.repo).collect(),
+        repos: f
+            .quarantined_repos
+            .into_iter()
+            .map(|r| (r.repo, r.frozen_sha))
+            .collect(),
     })
 }
 
@@ -551,9 +609,31 @@ pub fn validate_gate_set(
     if manifest.sample_size < 50 {
         return Err(Refusal::SampleTooSmall(manifest.sample_size));
     }
+    // Older-than-minted is refused; newer is not, because the registry grows
+    // with every designation. See `registry_version_note` for that case.
+    if manifest.registry_version > registry.registry_version {
+        return Err(Refusal::RegistryVersionAhead {
+            set_id: manifest.set_id.clone(),
+            minted_against: manifest.registry_version,
+            supplied: registry.registry_version,
+        });
+    }
     for pin in &manifest.repos {
-        if !registry.repos.contains(&pin.repo) {
+        let Some(registry_sha) = registry.repos.get(&pin.repo) else {
             return Err(Refusal::RepoNotQuarantined(pin.repo.clone()));
+        };
+        // This is what catches a re-designation since minting, whatever the
+        // registry version says.
+        if !pin
+            .frozen_sha
+            .trim()
+            .eq_ignore_ascii_case(registry_sha.trim())
+        {
+            return Err(Refusal::FrozenShaMismatch {
+                repo: pin.repo.clone(),
+                pinned: pin.frozen_sha.clone(),
+                registry: registry_sha.clone(),
+            });
         }
         // A SHA alone does not determine the packet stream in these languages;
         // see DepsPin. A deps block whose hash is blank pins nothing while
@@ -608,6 +688,23 @@ pub fn check_gold_matches_sample(rows: &[GoldRow], sample_size: usize) -> Result
         }),
         std::cmp::Ordering::Equal => Ok(()),
     }
+}
+
+/// Annotation for a set minted against an older registry than the one supplied
+/// (po-av01j.93), or `None` when the versions match.
+///
+/// Not a refusal: every designation bumps the version, and `validate_gate_set`
+/// has already checked each pinned repo's SHA against the live registry. But
+/// the header used to print only the live version, which a reader took for the
+/// mint-time one, so the drift is printed next to the number.
+pub fn registry_version_note(manifest: &GateManifest, registry: &Registry) -> Option<String> {
+    (manifest.registry_version != registry.registry_version).then(|| {
+        format!(
+            "WARNING: {} was minted against quarantine registry v{}, this run supplied v{}. \
+             Every pinned SHA still matches its current designation.",
+            manifest.set_id, manifest.registry_version, registry.registry_version
+        )
+    })
 }
 
 /// Gate score for one language.

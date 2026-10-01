@@ -19,7 +19,8 @@
 # the executables beside rvl — see crates/rvl/Cargo.toml), so a plain
 # `cargo build` already lands them next to rvl; rustindex needs rust-analyzer
 # at runtime (`rustup component add rust-analyzer`) and cindex needs a system
-# libclang.
+# libclang. (Release archives vendor a pinned libclang instead; see
+# crates/cindex/libclang.pin and ci/fetch-libclang.sh.)
 #
 # Overridable: PROFILE (debug|release), CARGO, GO (e.g. `make helpers
 # GO='env -u GOROOT go'` on a gvm box whose GOROOT is mismatched).
@@ -90,8 +91,8 @@ uninstall:
 
 ## helpers: build goindex and place goindex + pyindex + javaindex next to the rvl binary
 ## (cindex and rustindex are bins of the rvl package: `build` already drops them in the
-## adjacent slot; scanning C/C++ additionally needs a system libclang until
-## releases vendor a pinned LLVM; scanning Rust needs rust-analyzer at runtime)
+## adjacent slot; scanning C/C++ from a source build needs a system libclang, which
+## release archives vendor instead; scanning Rust needs rust-analyzer at runtime)
 helpers: build
 	$(GO) build -C helpers/goindex -o $(abspath $(BIN_DIR))/goindex .
 	cp helpers/pyindex/pyindex.py $(BIN_DIR)/pyindex.py

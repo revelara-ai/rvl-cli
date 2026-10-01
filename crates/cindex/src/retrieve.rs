@@ -18,23 +18,50 @@ use std::path::{Path, PathBuf};
 
 use clang_sys::*;
 
+use crate::engine::{self, Source};
 use crate::PACKET_SCHEMA;
+
+/// A loaded engine: its version string and where it came from.
+pub struct Engine {
+    pub version: String,
+    pub source: Source,
+}
 
 /// Load libclang at runtime and report its version string. Fails with
 /// actionable guidance when no library can be found — rvl surfaces this
 /// stderr, so a detected C/C++ repo fails CLOSED rather than silently
-/// under-reporting.
-pub fn load_engine() -> Result<String, String> {
+/// under-reporting. Which library loads is decided by [`crate::engine`]:
+/// LIBCLANG_PATH, then the vendored bundle, then (dev builds only) the system.
+pub fn load_engine() -> Result<Engine, String> {
+    let exe = std::env::current_exe().ok();
+    let source = engine::resolve(
+        std::env::var_os("LIBCLANG_PATH").as_deref(),
+        exe.as_deref(),
+        engine::REQUIRE_VENDORED,
+    )
+    .map_err(|e| format!("cindex requires libclang (engine pin po-ae75b.9): {e}"))?;
     if !clang_sys::is_loaded() {
-        clang_sys::load().map_err(|e| {
-            format!(
+        if let Source::Vendored { lib, .. } = &source {
+            // clang-sys searches only LIBCLANG_PATH when it is set, and a file
+            // path there names that exact library, so this pins the load to
+            // the bundle. Safe to set: nothing else runs yet (the helper is
+            // single-threaded and has not spawned anything).
+            std::env::set_var("LIBCLANG_PATH", lib);
+        }
+        clang_sys::load().map_err(|e| match &source {
+            Source::Vendored { lib, .. } => format!(
+                "cindex could not load its vendored libclang at {}: {e}. \
+                 Reinstall rvl, or point LIBCLANG_PATH at a libclang to override the pin.",
+                lib.display()
+            ),
+            _ => format!(
                 "cindex requires libclang (engine pin po-ae75b.9) and none could be loaded: {e}. \
                  Install one (e.g. `apt install libclang-dev`) or point LIBCLANG_PATH at it."
-            )
+            ),
         })?;
     }
     let version = unsafe { cx_string(clang_getClangVersion()) };
-    Ok(version)
+    Ok(Engine { version, source })
 }
 
 // --- packet shapes (field-for-field with the goindex/pyindex/tsindex contract) ---
@@ -511,6 +538,9 @@ struct WalkState {
     /// flag is set mechanically: a site whose offset falls inside one of
     /// these ranges sits in an expansion.
     macro_ranges: HashMap<String, Vec<(u32, u32)>>,
+    /// Appended to every TU's args: the engine's own needs (the vendored
+    /// bundle's `-resource-dir`), after the compile db's flags so they win.
+    engine_args: Vec<String>,
 }
 
 impl WalkState {
@@ -773,6 +803,7 @@ unsafe fn walk_tu(
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
+        .chain(st.engine_args.iter())
         .filter_map(|a| CString::new(a.as_bytes()).ok())
         .collect();
     let arg_ptrs: Vec<*const std::os::raw::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
@@ -866,7 +897,7 @@ fn walk_no_db(root: &Path) -> (Vec<PathBuf>, u32) {
 
 /// Emit the packet stream for `root` to stdout.
 pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
-    load_engine().map_err(|e| anyhow::anyhow!(e))?;
+    let engine = load_engine().map_err(|e| anyhow::anyhow!(e))?;
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("cannot resolve --root {}: {e}", root.display()))?;
@@ -901,6 +932,7 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         calls_unresolved: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
+        engine_args: engine.source.parse_args(),
     };
 
     let stdout = std::io::stdout();

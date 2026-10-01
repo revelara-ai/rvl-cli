@@ -15,8 +15,9 @@ serde_json = { workspace = true }
 # `runtime` feature dlopens libclang at process start, so the WORKSPACE builds
 # on machines with no libclang installed; only running a retrieval needs the
 # library, and the helper fails closed with actionable guidance when it is
-# absent. Release packaging vendors a pinned, checksummed LLVM (follow-up
-# bead); a dev build uses the system library (LIBCLANG_PATH overrides).
+# absent. Release archives vendor a pinned, checksummed libclang beside the
+# helper (libclang.pin, ci/fetch-libclang.sh, src/engine.rs); a dev build
+# uses the system library. LIBCLANG_PATH overrides both.
 clang-sys = { version = "1.8", features = ["runtime", "clang_6_0"] }
 
 [dev-dependencies]

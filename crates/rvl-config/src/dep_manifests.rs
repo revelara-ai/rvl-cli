@@ -102,7 +102,7 @@ impl Cx<'_> {
             file_path: self.rel_path.to_string(),
             line: 0,
             unit: unit.to_string(),
-            key: key.to_string(),
+            key: crate::key_ledger::declared(FORMAT, key),
             resolved_value: value,
             resolution,
             provenance,

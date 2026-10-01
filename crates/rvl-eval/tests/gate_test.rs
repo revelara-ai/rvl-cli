@@ -46,10 +46,21 @@ seed_sets:
     reason: machine-labeled
 "#;
 
+const GITEA_SHA: &str = "a30d865b781b4611826bf44d60e44d9f6e8fdf4e";
+
 fn registry() -> Registry {
     Registry {
         registry_version: 1,
-        repos: vec!["go-gitea/gitea".into(), "influxdata/telegraf".into()],
+        repos: [
+            ("go-gitea/gitea", GITEA_SHA),
+            (
+                "influxdata/telegraf",
+                "20390646cf861af96b97b2344fe99812ef866cd4",
+            ),
+        ]
+        .into_iter()
+        .map(|(r, s)| (r.to_string(), s.to_string()))
+        .collect(),
     }
 }
 
@@ -348,7 +359,8 @@ quarantined_repos:
     .unwrap();
     let reg = load_registry(&path).unwrap();
     assert_eq!(reg.registry_version, 3);
-    assert_eq!(reg.repos, vec!["go-gitea/gitea".to_string()]);
+    assert_eq!(reg.repos.len(), 1);
+    assert_eq!(reg.repos["go-gitea/gitea"], "abc");
 }
 
 // --- Gate scoring ---
@@ -532,7 +544,12 @@ fn dev_cache_grounding_refuses_every_qualified_go_gate_set() {
 
         let reg = Registry {
             registry_version: 2,
-            repos: DEV_CACHE_GROUNDING.iter().map(|s| s.to_string()).collect(),
+            // Every repo at the SHA the manifest pins, so the only thing
+            // left to refuse on is the grounding overlap under test.
+            repos: DEV_CACHE_GROUNDING
+                .iter()
+                .map(|s| (s.to_string(), GITEA_SHA.to_string()))
+                .collect(),
         };
         let err = validate_gate_set(&m, &[], &reg, &grounding).unwrap_err();
 
@@ -615,7 +632,11 @@ adjudication:
 
 fn ts_registry() -> Registry {
     let mut r = registry();
-    r.repos.push("n8n-io/n8n".to_string());
+    r.repos.insert(
+        "n8n-io/n8n".to_string(),
+        "b1c2d3e4f5a60718293a4b5c6d7e8f9012345678".to_string(),
+    );
+    r.registry_version = 4;
     r
 }
 
@@ -678,4 +699,118 @@ fn lockfile_hash_mismatch_is_detected_against_a_checkout() {
         ..pinned
     };
     assert!(check_lockfile_matches(&ok, actual).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// The manifest's frozen_sha and registry_version are checked, not just
+// printed (po-av01j.93).
+//
+// A set minted, then a repo re-designated at a new frozen_sha, then the set
+// re-scored months later: the header printed today's registry version, the
+// population doc claimed the mint-time one, and the pinned SHA could be a
+// commit the sample was never drawn from. Nothing in the output let a reader
+// tell.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pin_that_disagrees_with_the_registry_sha_is_refused() {
+    let m = parse_manifest(MANIFEST_OK).unwrap();
+    let mut reg = registry();
+    let redesignated = "0123456789abcdef0123456789abcdef01234567";
+    reg.repos
+        .insert("go-gitea/gitea".into(), redesignated.into());
+    let err = validate_gate_set(&m, &[], &reg, &[]).unwrap_err();
+    assert_eq!(
+        err,
+        Refusal::FrozenShaMismatch {
+            repo: "go-gitea/gitea".into(),
+            pinned: GITEA_SHA.into(),
+            registry: redesignated.into(),
+        }
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains(GITEA_SHA) && msg.contains(redesignated),
+        "{msg}"
+    );
+}
+
+#[test]
+fn frozen_sha_comparison_ignores_hex_case_and_padding() {
+    let yaml = MANIFEST_OK.replace(GITEA_SHA, &format!(" {} ", GITEA_SHA.to_ascii_uppercase()));
+    let m = parse_manifest(&yaml).unwrap();
+    validate_gate_set(&m, &[], &registry(), &[]).expect("same commit, different spelling");
+}
+
+#[test]
+fn a_manifest_minted_against_a_newer_registry_than_supplied_is_refused() {
+    // The run was handed an OLDER registry than the one the set was minted
+    // against: the registry file is stale or wrong, so nothing it says about
+    // quarantine or SHAs is evidence for this set.
+    let yaml = MANIFEST_OK.replace("registry_version: 1", "registry_version: 5");
+    let m = parse_manifest(&yaml).unwrap();
+    let err = validate_gate_set(&m, &[], &registry(), &[]).unwrap_err();
+    assert_eq!(
+        err,
+        Refusal::RegistryVersionAhead {
+            set_id: "eval-go-v1".into(),
+            minted_against: 5,
+            supplied: 1,
+        }
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("v5") && msg.contains("v1"), "{msg}");
+}
+
+#[test]
+fn a_registry_that_moved_on_since_minting_validates_but_is_annotated() {
+    // The registry grows whenever a repo is designated, so refusing every set
+    // minted before the latest bump would retire sets for unrelated changes.
+    // The per-repo SHA check above is what catches a re-designation; the
+    // version drift is reported, loudly, next to the number.
+    let m = parse_manifest(MANIFEST_OK).unwrap();
+    let mut reg = registry();
+    reg.registry_version = 4;
+    assert_eq!(validate_gate_set(&m, &[], &reg, &[]).unwrap(), 4);
+    let note = registry_version_note(&m, &reg).expect("drift must be annotated");
+    assert!(note.contains("v1") && note.contains("v4"), "{note}");
+}
+
+#[test]
+fn matching_registry_versions_carry_no_annotation() {
+    let m = parse_manifest(MANIFEST_OK).unwrap();
+    assert_eq!(registry_version_note(&m, &registry()), None);
+}
+
+fn write_registry(name: &str, body: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("rvl_eval_gate_test_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quarantine.yaml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn a_registry_entry_without_a_frozen_sha_fails_closed() {
+    let path = write_registry(
+        "no_sha",
+        "registry_version: 3\nquarantined_repos:\n  - repo: go-gitea/gitea\n    language: go\n",
+    );
+    assert!(matches!(
+        load_registry(&path),
+        Err(Refusal::RegistryUnavailable(_))
+    ));
+}
+
+#[test]
+fn a_registry_entry_with_a_blank_frozen_sha_fails_closed() {
+    let path = write_registry(
+        "blank_sha",
+        "registry_version: 3\nquarantined_repos:\n  - repo: go-gitea/gitea\n    frozen_sha: \"  \"\n",
+    );
+    match load_registry(&path) {
+        Err(Refusal::RegistryUnavailable(e)) => assert!(e.contains("go-gitea/gitea"), "{e}"),
+        other => panic!("expected RegistryUnavailable, got {other:?}"),
+    }
 }
