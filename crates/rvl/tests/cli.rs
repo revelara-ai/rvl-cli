@@ -90,6 +90,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
 }
 
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
+}
+
 #[test]
 fn cache_import_refuses_missing_signature() {
     let dir = tempfile::tempdir().unwrap();
@@ -2706,19 +2747,42 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     let home = dir.path().join("home"); // isolates org policy + user config
     std::fs::create_dir_all(&home).unwrap();
-    let out = bin()
-        .args(["scan", "--incremental", "--hook", "pre-commit"])
-        .arg(&repo)
-        .arg("--specs-file")
-        .arg(&specs)
-        .env("RVL_GOINDEX", &goindex_bin)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("RVL_AGENT_CMD", &stub)
-        .env("HOME", &home)
-        .output()
-        .expect("failed to run rvl");
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The hook's 10s retrieval cap fails OPEN: on a loaded host the scan
+    // degrades to zero sites and, correctly, renders no agent block. That is
+    // not the path under test, so a capped run is retried from a clean cache
+    // and index; a run that is still capped fails naming the cap, not the
+    // agent block.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        for state in ["cache", "index", "agent-telemetry.jsonl"] {
+            let path = dir.path().join(state);
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = bin()
+            .args(["scan", "--incremental", "--hook", "pre-commit"])
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_AGENT_CMD", &stub)
+            .env("HOME", &home)
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if !stdout.contains("retrieval capped at") {
+            break (out, stdout);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "the hook retrieval cap fired on all {ATTEMPTS} attempts (host too loaded \
+             to exercise the agent lane): {stdout}"
+        );
+    };
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
     assert!(

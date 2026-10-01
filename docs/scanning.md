@@ -416,6 +416,7 @@ channels precisely.
 | `rvl doctor [--fix]` | Machine/repo readiness |
 | `rvl sync` | Refresh rulesets (both tiers if keyed) |
 | `rvl cache status` | Installed ruleset versions and staleness |
+| `rvl cache keys [--json]` | Every config key the retrievers emit: specced, awaiting a spec, or vocabulary only |
 | `rvl index init\|reindex\|status` | The incremental packet index |
 | `rvl hook install\|doctor` | The git-hook gates |
 | `rvl completion bash\|zsh\|fish` | Shell completion |
