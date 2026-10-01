@@ -190,12 +190,13 @@ pub enum KnowledgeCmd {
     },
     /// Show knowledge base health statistics
     Health {
-        /// ACCEPTED AND IGNORED, for rvl-cli parity: rvl-cli's `knowledge
-        /// health` takes no arguments at all and prints its fixed table, so
-        /// `--format=json` there is silently ignored and exits 0. Rejecting
-        /// it here would turn a working (if pointless) rvl-cli invocation
-        /// into exit 2 (po-av01j.185 item 8). There is no JSON rendering to
-        /// select — rvl-cli has none either.
+        // rvl-cli parity: rvl-cli's `knowledge health` takes no arguments
+        // at all and prints its fixed table, so `--format=json` there is
+        // silently ignored and exits 0. Rejecting it here would turn a
+        // working (if pointless) rvl-cli invocation into exit 2
+        // (po-av01j.185 item 8).
+        /// ACCEPTED AND IGNORED, for compatibility: the output is always the
+        /// fixed table. There is no JSON rendering to select.
         #[arg(long)]
         format: Option<String>,
     },

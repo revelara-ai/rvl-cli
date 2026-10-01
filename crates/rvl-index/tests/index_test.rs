@@ -293,3 +293,54 @@ fn a_skipped_test_file_is_flagged_and_reused_like_any_entry() {
     idx.put(&t, &h_t, &[]).unwrap();
     assert!(!idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
 }
+
+// --- on-disk format across the redb 2 -> 4 bump (po-av01j.210) ---
+//
+// Every user has a live index written by redb 2, and redb 4 refuses to open
+// that file format. The index is a content-hash cache, so the story is
+// detect-and-rebuild: opening must succeed with an empty index and SAY that
+// it rebuilt, never surface the storage engine's upgrade error.
+
+/// A real index written through `PacketIndex` by redb 2.6.3 (one entry),
+/// unpacked into `dir`.
+fn redb2_index(dir: &std::path::Path) -> PathBuf {
+    use std::io::Read;
+    let gz = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/packets-redb2.redb.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(gz).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let path = dir.join("packets.redb");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn an_index_written_by_redb_2_is_detected_and_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = redb2_index(dir.path());
+
+    let idx = PacketIndex::open(&path).expect("an old-format index must open, not error");
+    assert!(
+        idx.rebuilt_from_old_format(),
+        "the rebuild must be reported, not silent"
+    );
+    assert!(idx.is_empty().unwrap(), "a rebuilt index starts empty");
+
+    // The rebuilt index is a working one, and the rebuild happens once.
+    let f = write(dir.path(), "a.go", "package a");
+    let h = hash_file(&f).unwrap();
+    idx.put(&f, &h, &[site("a.go", 1, "http.Client", "Do")])
+        .unwrap();
+    drop(idx);
+    let idx = PacketIndex::open(&path).unwrap();
+    assert!(!idx.rebuilt_from_old_format());
+    assert_eq!(idx.get(&f, &h).unwrap().unwrap().len(), 1);
+}
+
+#[test]
+fn a_fresh_index_is_not_reported_as_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+    assert!(!idx.rebuilt_from_old_format());
+}

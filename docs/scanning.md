@@ -285,6 +285,13 @@ The installed shim runs
   `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `scanner.base_ref` in
   `.revelara.yaml`), so a GitHub PR job usually needs no flag at all.
 
+The hooks are the fast path, not the guard. `git commit --no-verify` and a
+squash-merge both produce commits no hook saw, so the authoritative gate is
+a required CI check on the merge ref:
+[Gating commits and CI](gating.md) ships the job. For the same reason the
+pre-commit scan refuses, with exit `1`, a staged file that also has unstaged
+edits: it reads the working tree, and that is not what the commit contains.
+
 `rvl index init/reindex/status` manages the incremental index directly.
 `rvl index reindex --detach` rebuilds it in the background, which is useful
 from your own post-commit hook to keep the next pre-commit scan warm.
@@ -347,7 +354,7 @@ consumes it, so it cannot silently apply to a later one.
 
 The scan engine never calls a model; your coding agent does. Used together,
 reliability issues get found and fixed while you are still working, and the
-commit gate becomes a backstop that rarely fires.
+commit hook rarely fires.
 
 ```sh
 rvl init            # writes .revelara.yaml AND installs the agent skills
