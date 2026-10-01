@@ -381,7 +381,8 @@ enum Cmd {
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVL_OFFLINE=1 disables all fetches).
     Sync {
-        /// The check a scan hands off (po-av01j.171): silent, always exit 0.
+        // po-av01j.171. Hidden: a scan starts it, a person runs plain `sync`.
+        /// The check a scan hands off: silent, always exit 0.
         #[arg(long, hide = true)]
         background: bool,
     },
