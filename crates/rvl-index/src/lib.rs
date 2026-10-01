@@ -76,6 +76,31 @@ struct Entry {
     #[serde(default)]
     test_skipped: bool,
     sites: Vec<Site>,
+    /// The files this entry's packets also depend on, as (index key, content
+    /// hash at indexing time): for a C/C++ translation unit, the headers it
+    /// includes. The entry is reusable only while every one still hashes the
+    /// same. `None` on an entry written before dependencies were recorded,
+    /// which is "unknown", not "none".
+    #[serde(default)]
+    deps: Option<Vec<(String, String)>>,
+}
+
+/// Content hashes of dependency files, memoized for one pass. Many
+/// translation units share the same headers; each is hashed once. `None` is
+/// an unreadable file, which never matches a recorded hash.
+type DepHashes = std::collections::HashMap<String, Option<String>>;
+
+impl Entry {
+    /// Does every recorded dependency still hash as it did at indexing time?
+    /// A missing or unreadable dependency is stale: fail toward doing the work.
+    fn deps_fresh(&self, memo: &mut DepHashes) -> bool {
+        self.deps.iter().flatten().all(|(path, recorded)| {
+            memo.entry(path.clone())
+                .or_insert_with(|| hash_file(Path::new(path)).ok())
+                .as_deref()
+                == Some(recorded.as_str())
+        })
+    }
 }
 
 /// How long [`PacketIndex::open`] waits for a busy index before giving up.
@@ -163,12 +188,32 @@ impl PacketIndex {
 
     /// Record the packets retrieved from `file` at content hash `hash`.
     pub fn put(&self, file: &Path, hash: &str, sites: &[Site]) -> anyhow::Result<()> {
+        self.put_with_deps(file, hash, sites, &[])
+    }
+
+    /// Record the packets retrieved from `file` at content hash `hash`,
+    /// together with the files those packets also depend on (`deps`, hashed
+    /// here as they are now). A later change to any of them makes the entry
+    /// stale. A dependency that cannot be read is recorded with a hash
+    /// nothing matches, so the entry is re-retrieved on the next pass.
+    pub fn put_with_deps(
+        &self,
+        file: &Path,
+        hash: &str,
+        sites: &[Site],
+        deps: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let deps = deps
+            .iter()
+            .map(|d| (key_of(d), hash_file(d).unwrap_or_default()))
+            .collect();
         self.put_entry(
             file,
             Entry {
                 hash: hash.to_string(),
                 test_skipped: false,
                 sites: sites.to_vec(),
+                deps: Some(deps),
             },
         )
     }
@@ -183,6 +228,7 @@ impl PacketIndex {
                 hash: hash.to_string(),
                 test_skipped: true,
                 sites: Vec::new(),
+                deps: Some(Vec::new()),
             },
         )
     }
@@ -213,15 +259,46 @@ impl PacketIndex {
     }
 
     /// What the index holds for `file` at `hash`: its packets and whether it
-    /// was skipped as test material rather than scanned.
+    /// was skipped as test material rather than scanned. `None` when the
+    /// stored hash differs or a recorded dependency has changed since.
     pub fn lookup(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
         Ok(self
             .entry(file)?
+            .filter(|e| e.hash == hash && e.deps_fresh(&mut DepHashes::new()))
+            .map(Indexed::from))
+    }
+
+    /// What the index holds for a file [`PacketIndex::plan_reload`] has just
+    /// declared unchanged at `hash`. Unlike [`PacketIndex::lookup`] it does
+    /// not hash the dependencies again: the plan did, a moment ago, and on a
+    /// header-heavy repo that second pass is the cost of the whole scan.
+    pub fn planned(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
+        Ok(self
+            .entry(file)?
             .filter(|e| e.hash == hash)
-            .map(|e| Indexed {
-                sites: e.sites,
-                test_skipped: e.test_skipped,
-            }))
+            .map(Indexed::from))
+    }
+
+    /// The indexed files that recorded `dep` as a dependency, sorted: for a
+    /// header, the translation units that include it.
+    pub fn dependents(&self, dep: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        use redb::ReadableTable;
+        let want = key_of(dep);
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(ENTRIES)?;
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (key, raw) = row?;
+            // An entry this build cannot decode has no dependencies to name.
+            let Ok(entry) = serde_json::from_str::<Entry>(raw.value()) else {
+                continue;
+            };
+            if entry.deps.iter().flatten().any(|(path, _)| *path == want) {
+                out.push(PathBuf::from(key.value()));
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Number of indexed files.
@@ -238,10 +315,29 @@ impl PacketIndex {
     /// Hash-gate the candidate files: split into reusable and must-retrieve.
     /// Unreadable files count as changed (fail toward doing the work).
     pub fn plan_reload(&self, files: &[PathBuf]) -> ReloadPlan {
+        self.plan_reload_with(files, |_| false)
+    }
+
+    /// [`PacketIndex::plan_reload`], for callers with files whose packets
+    /// depend on other files. Where `needs_deps` says so (a C/C++ source,
+    /// whose packets change with its headers), an entry written before
+    /// dependencies were recorded counts as changed: nothing says which
+    /// headers it saw, so it is retrieved again, once.
+    pub fn plan_reload_with(
+        &self,
+        files: &[PathBuf],
+        needs_deps: impl Fn(&Path) -> bool,
+    ) -> ReloadPlan {
         let mut plan = ReloadPlan::default();
+        let mut memo = DepHashes::new();
         for f in files {
             let reusable = match hash_file(f) {
-                Ok(h) => self.get(f, &h).ok().flatten().is_some(),
+                Ok(h) => self
+                    .entry(f)
+                    .ok()
+                    .flatten()
+                    .filter(|e| e.hash == h && e.deps_fresh(&mut memo))
+                    .is_some_and(|e| e.deps.is_some() || !needs_deps(f)),
                 Err(_) => false,
             };
             if reusable {
@@ -341,6 +437,15 @@ pub struct Indexed {
     pub test_skipped: bool,
 }
 
+impl From<Entry> for Indexed {
+    fn from(e: Entry) -> Self {
+        Indexed {
+            sites: e.sites,
+            test_skipped: e.test_skipped,
+        }
+    }
+}
+
 /// Index key for a path. Absolute where possible so the same file is not
 /// indexed twice under different relative spellings.
 fn key_of(file: &Path) -> String {
@@ -393,5 +498,40 @@ impl Budget {
 
     pub fn is_strict(&self) -> bool {
         self.strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry from before dependencies were recorded decodes and is
+    /// reusable at its hash, except for a file whose packets depend on
+    /// other files: nothing says which, so it is planned as changed. `put`
+    /// records "none", which is a known answer.
+    #[test]
+    fn a_pre_dependency_entry_is_replanned_only_where_dependencies_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+        let tu = dir.path().join("main.c");
+        std::fs::write(&tu, "x\n").unwrap();
+        let h = hash_file(&tu).unwrap();
+        let files = std::slice::from_ref(&tu);
+
+        let legacy: Entry =
+            serde_json::from_str(&format!(r#"{{"hash":"{h}","sites":[]}}"#)).unwrap();
+        idx.put_entry(&tu, legacy).unwrap();
+        assert!(idx.lookup(&tu, &h).unwrap().is_some());
+        assert_eq!(idx.plan_reload(files).unchanged, vec![tu.clone()]);
+        assert_eq!(
+            idx.plan_reload_with(files, |_| true).changed,
+            vec![tu.clone()]
+        );
+
+        idx.put(&tu, &h, &[]).unwrap();
+        assert_eq!(
+            idx.plan_reload_with(files, |_| true).unchanged,
+            vec![tu.clone()]
+        );
     }
 }

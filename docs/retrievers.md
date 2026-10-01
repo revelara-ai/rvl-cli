@@ -208,6 +208,13 @@ excluded without saying so reads as a file that was scanned:
   flags each named file, so a warm scan reports the repository-wide count
   from reused entries rather than the files it happened to re-parse.
 
+`cindex` writes one `tu_includes` record per translation unit it parsed:
+the in-repo headers that unit includes. The packet index stores the list
+with the unit's packets, together with the packets found in those headers.
+A warm scan re-parses a C or C++ source file when the file changed or when
+a header it includes changed. `rvl index reindex --files` accepts a header
+and re-parses the source files that include it.
+
 `tsindex` also reports, on the same `repo_config` record, the workspaces
 that declare dependencies with no installed tree
 (`dependency_trees_uninstalled`, with the directories beside it as

@@ -293,3 +293,73 @@ fn a_skipped_test_file_is_flagged_and_reused_like_any_entry() {
     idx.put(&t, &h_t, &[]).unwrap();
     assert!(!idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
 }
+
+// --- dependency (header -> TU) invalidation, po-av01j.53 ---
+
+#[test]
+fn an_entry_goes_stale_when_a_recorded_dependency_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+    let tu = write(dir.path(), "main.c", "#include \"api.h\"\n");
+    let header = write(dir.path(), "api.h", "int f(void);\n");
+    let h = hash_file(&tu).unwrap();
+    idx.put_with_deps(
+        &tu,
+        &h,
+        &[site("main.c", 3, "libcurl.CURL", "f")],
+        std::slice::from_ref(&header),
+    )
+    .unwrap();
+
+    // Fresh: the TU and its header are as indexed.
+    assert!(idx.lookup(&tu, &h).unwrap().is_some());
+    assert_eq!(
+        idx.plan_reload(std::slice::from_ref(&tu)).unchanged,
+        vec![tu.clone()]
+    );
+
+    // The header changes; the TU's own bytes do not. The shard is stale.
+    std::fs::write(&header, "long f(void);\n").unwrap();
+    assert!(idx.lookup(&tu, &h).unwrap().is_none());
+    assert_eq!(
+        idx.plan_reload(std::slice::from_ref(&tu)).changed,
+        vec![tu.clone()]
+    );
+
+    // A deleted header is stale too: fail toward doing the work.
+    idx.put_with_deps(&tu, &h, &[], std::slice::from_ref(&header))
+        .unwrap();
+    std::fs::remove_file(&header).unwrap();
+    assert!(idx.lookup(&tu, &h).unwrap().is_none());
+}
+
+#[test]
+fn dependents_maps_a_header_to_the_files_that_recorded_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+    let a = write(dir.path(), "a.c", "a\n");
+    let b = write(dir.path(), "b.c", "b\n");
+    let c = write(dir.path(), "c.c", "c\n");
+    let shared = write(dir.path(), "shared.h", "s\n");
+    let only_b = write(dir.path(), "only_b.h", "o\n");
+    idx.put_with_deps(
+        &a,
+        &hash_file(&a).unwrap(),
+        &[],
+        std::slice::from_ref(&shared),
+    )
+    .unwrap();
+    idx.put_with_deps(
+        &b,
+        &hash_file(&b).unwrap(),
+        &[],
+        &[shared.clone(), only_b.clone()],
+    )
+    .unwrap();
+    idx.put(&c, &hash_file(&c).unwrap(), &[]).unwrap();
+
+    let canon = |p: &PathBuf| p.canonicalize().unwrap();
+    assert_eq!(idx.dependents(&shared).unwrap(), vec![canon(&a), canon(&b)]);
+    assert_eq!(idx.dependents(&only_b).unwrap(), vec![canon(&b)]);
+    assert!(idx.dependents(&c).unwrap().is_empty());
+}

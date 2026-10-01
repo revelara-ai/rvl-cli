@@ -2320,6 +2320,94 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Copy a fixture tree into a scratch directory the test can edit.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// Header -> TU invalidation, end to end with the real cindex (po-av01j.53).
+/// A header edit changes no `.c` file, so the hash gate alone reused every
+/// TU. The index now holds each TU's include list: the edit re-parses the
+/// TUs that include the header, and a header named to `--files` (what the
+/// background warm passes) maps to those TUs.
+#[test]
+fn a_c_header_edit_re_parses_the_tus_that_include_it() {
+    let Some(cindex) = cindex_helper("a_c_header_edit_re_parses_the_tus_that_include_it") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let repo = dir.path().join("repo");
+    copy_tree(
+        &workspace
+            .join("crates")
+            .join("cindex")
+            .join("testdata")
+            .join("fixture-fd"),
+        &repo,
+    );
+    let reindex = |files: Option<&str>| -> String {
+        let mut cmd = bin();
+        cmd.args(["index", "reindex"]).arg(&repo);
+        if let Some(files) = files {
+            cmd.args(["--files", files]);
+        }
+        let out = cmd
+            .env("RVL_CINDEX", &cindex)
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "reindex failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+    let header = repo.join("include").join("proto.h");
+    let edit = |note: &str| {
+        let mut text = std::fs::read_to_string(&header).unwrap();
+        text.push_str(&format!("/* {note} */\n"));
+        std::fs::write(&header, text).unwrap();
+    };
+
+    let cold = reindex(None);
+    assert!(cold.contains("retrieved 2 changed"), "{cold}");
+    let warm = reindex(None);
+    assert!(warm.contains("reused 2 unchanged, retrieved 0"), "{warm}");
+
+    // Both TUs include proto.h: its edit makes both stale.
+    edit("first edit");
+    let after_edit = reindex(None);
+    assert!(
+        after_edit.contains("reused 0 unchanged, retrieved 2 changed"),
+        "a header edit must re-parse the TUs that include it: {after_edit}"
+    );
+
+    // The background warm names the changed file. The two TUs come in
+    // through the index's include graph (the third file is the header).
+    edit("second edit");
+    let named = reindex(Some("include/proto.h"));
+    assert!(named.contains("retrieved 3 changed"), "{named}");
+    let settled = reindex(None);
+    assert!(
+        settled.contains("reused 2 unchanged, retrieved 0"),
+        "{settled}"
+    );
+}
+
 /// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
 /// compile_commands.json, helper via RVL_CINDEX), the seed specs judge
 /// the C identities, and the judgments map the surfaced classes to RC-019 /

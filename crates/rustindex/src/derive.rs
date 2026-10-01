@@ -865,6 +865,8 @@ pub fn derive(
             test_files_skipped_paths: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
+            // The include graph is C/C++ only.
+            tu_includes: Vec::new(),
         },
     }
 }

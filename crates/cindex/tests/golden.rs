@@ -474,3 +474,86 @@ fn bundle_install_is_executable_at_once_while_other_threads_fork() {
         }
     });
 }
+
+/// The enclosing functions (`symbol`) of the sites for one method, sorted.
+fn symbols_of(sites: &[serde_json::Value], method: &str) -> Vec<String> {
+    let mut out: Vec<String> = sites_with_method(sites, method)
+        .iter()
+        .map(|s| s["symbol"].as_str().unwrap_or_default().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn read_and_write_are_emitted_only_on_an_fd_with_local_socket_evidence() {
+    if !engine_available("read_and_write_are_emitted_only_on_an_fd_with_local_socket_evidence") {
+        return;
+    }
+    let (sites, records) = retrieve(&fixture("fixture-fd"), &[]);
+
+    // read: a socket()-initialized local, an accept()-assigned local, and a
+    // parameter the same function hands to send(). Nothing else.
+    assert_eq!(
+        symbols_of(&sites, "read"),
+        vec!["accepted_fd", "param_used_as_socket", "socket_init_fd"]
+    );
+    assert_eq!(symbols_of(&sites, "write"), vec!["socket_init_fd"]);
+    for s in sites_with_method(&sites, "read")
+        .into_iter()
+        .chain(sites_with_method(&sites, "write"))
+    {
+        assert_eq!(s["client_type"], "posix.socket", "{s}");
+        assert_eq!(s["provenance"]["client_type_resolved"], true, "{s}");
+    }
+
+    // The abstentions are counted, never guessed at: param_unknown,
+    // reused_variable (socket then open), file_fd (write + read) and
+    // member_fd.
+    assert_eq!(stats(&records)["fd_calls_abstained"], 5);
+}
+
+#[test]
+fn every_parsed_tu_reports_the_repo_headers_it_includes() {
+    if !engine_available("every_parsed_tu_reports_the_repo_headers_it_includes") {
+        return;
+    }
+    let (sites, records) = retrieve(&fixture("fixture-fd"), &[]);
+    let mut graph: Vec<(String, Vec<String>)> = records
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("tu_includes"))
+        .map(|r| {
+            assert_eq!(r["packet_schema"].as_u64(), Some(2), "{r}");
+            (
+                r["file"].as_str().expect("file").to_string(),
+                r["includes"]
+                    .as_array()
+                    .expect("includes")
+                    .iter()
+                    .map(|i| i.as_str().expect("path").to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    graph.sort();
+    // Transitive (posixio.h comes in through proto.h), repo-relative, sorted,
+    // and without the TU itself.
+    let headers = vec![
+        "include/proto.h".to_string(),
+        "vendor/posixio.h".to_string(),
+    ];
+    assert_eq!(
+        graph,
+        vec![
+            ("src/files.c".to_string(), headers.clone()),
+            ("src/net.c".to_string(), headers),
+        ]
+    );
+    // The header's own site rides the stream once, at the header's path.
+    let in_header: Vec<_> = sites
+        .iter()
+        .filter(|s| s["file_path"] == "include/proto.h")
+        .collect();
+    assert_eq!(in_header.len(), 1, "{in_header:?}");
+    assert_eq!(in_header[0]["func"], "send");
+}

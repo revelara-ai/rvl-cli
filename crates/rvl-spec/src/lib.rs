@@ -1229,6 +1229,7 @@ mod tests {
             test_files_skipped_paths: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 
@@ -1344,6 +1345,7 @@ mod tests {
             test_files_skipped_paths: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 

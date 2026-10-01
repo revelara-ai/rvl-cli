@@ -132,6 +132,25 @@ struct StatsOut {
     /// C++ sources seen in no-db mode: a flagless C++ parse is guesswork, so
     /// they are skipped and counted (documented abstention class).
     cpp_files_skipped_no_db: u32,
+    /// POSIX `read`/`write` calls whose fd had no local socket evidence (or
+    /// conflicting evidence): documented abstentions, never guesses.
+    fd_calls_abstained: u32,
+}
+
+/// One parsed TU's edge list in the include graph: the in-repo files it
+/// includes, transitively. rvl keys header -> TU invalidation on this, so a
+/// changed header re-parses exactly the TUs that saw it.
+#[derive(Serialize)]
+struct TuIncludesOut {
+    kind: &'static str,
+    packet_schema: u32,
+    snapshot_id: String,
+    lang: &'static str,
+    /// Repo-relative path of the TU's source file.
+    file: String,
+    /// Repo-relative, sorted, without the TU itself. Headers outside the
+    /// repo (system, toolchain) are not listed.
+    includes: Vec<String>,
 }
 
 // --- compile db ---
@@ -312,8 +331,8 @@ fn load_compile_db(db_path: &Path, root: &Path) -> anyhow::Result<Vec<TuJob>> {
 
 /// The C free-function G1 candidate set: unique unmangled identities mapped
 /// to their client type. Identity-driven by design — C has no receiver to
-/// resolve. POSIX `read`/`write` are deliberately ABSENT: telling a socket fd
-/// from a file fd needs dataflow (documented abstention, follow-up bead).
+/// resolve. POSIX `read`/`write` are deliberately ABSENT: a socket fd and a
+/// file fd share them, so they go through [`fd_is_socket`] instead.
 fn c_family(name: &str) -> Option<&'static str> {
     match name {
         "curl_easy_perform" | "curl_easy_setopt" | "curl_easy_send" | "curl_easy_recv"
@@ -332,6 +351,40 @@ fn c_family(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The fd verbs a socket shares with a file. Emitted as `posix.socket` only
+/// when [`fd_is_socket`] finds local evidence for the fd.
+fn is_fd_verb(name: &str) -> bool {
+    matches!(name, "read" | "write")
+}
+
+/// Calls whose RESULT is a socket fd.
+const SOCKET_SOURCES: &[&str] = &["socket", "accept", "accept4"];
+
+/// Calls whose result is a fd that is NOT a socket. A variable that holds
+/// one of these and a socket in the same function is conflicting evidence.
+const FILE_SOURCES: &[&str] = &["open", "openat", "creat", "fileno", "dup", "dup2"];
+
+/// Calls that only make sense on a socket: an fd passed as their FIRST
+/// argument is one.
+const SOCKET_USERS: &[&str] = &[
+    "connect",
+    "bind",
+    "listen",
+    "accept",
+    "accept4",
+    "send",
+    "recv",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "setsockopt",
+    "getsockopt",
+    "getpeername",
+    "getsockname",
+    "shutdown",
+];
 
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
@@ -400,6 +453,17 @@ unsafe fn first_child(cursor: CXCursor) -> Option<CXCursor> {
     }
     let mut out: Option<CXCursor> = None;
     clang_visitChildren(cursor, grab, &mut out as *mut _ as CXClientData);
+    out
+}
+
+/// The direct children of a cursor, in source order.
+unsafe fn children(cursor: CXCursor) -> Vec<CXCursor> {
+    extern "C" fn push(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
+        unsafe { (*(data as *mut Vec<CXCursor>)).push(c) };
+        CXChildVisit_Continue
+    }
+    let mut out: Vec<CXCursor> = Vec::new();
+    clang_visitChildren(cursor, push, &mut out as *mut _ as CXClientData);
     out
 }
 
@@ -512,6 +576,121 @@ unsafe fn const_args_of(call: CXCursor) -> Vec<ConstArgOut> {
     out
 }
 
+// --- fd dataflow (POSIX read/write) ---
+
+/// A declaration's identity inside one TU: the file and byte offset it is
+/// spelled at. Locals have no stable USR across libclang versions.
+type DeclKey = (String, u32);
+
+unsafe fn decl_key(decl: CXCursor) -> DeclKey {
+    let (path, _, _, off) = loc_parts(clang_getCursorLocation(decl), clang_getExpansionLocation);
+    (path, off)
+}
+
+/// What one function's body says about the fds it names.
+#[derive(Default)]
+struct FdEvidence {
+    /// Variables assigned a socket, or handed to a socket-only call.
+    socket: HashSet<DeclKey>,
+    /// Variables assigned a non-socket fd.
+    file: HashSet<DeclKey>,
+}
+
+/// The local variable or parameter an expression names, if it is exactly that.
+unsafe fn local_ref(expr: CXCursor) -> Option<DeclKey> {
+    let e = peel(expr);
+    if clang_getCursorKind(e) != CXCursor_DeclRefExpr {
+        return None;
+    }
+    let decl = clang_getCursorReferenced(e);
+    let kind = clang_getCursorKind(decl);
+    (kind == CXCursor_VarDecl || kind == CXCursor_ParmDecl).then(|| decl_key(decl))
+}
+
+/// The callee name of an expression that is exactly a call. A call spells its
+/// callee's name whether or not the callee resolved (no-db mode).
+unsafe fn call_name(expr: CXCursor) -> Option<String> {
+    let e = peel(expr);
+    (clang_getCursorKind(e) == CXCursor_CallExpr).then(|| cx_string(clang_getCursorSpelling(e)))
+}
+
+/// Walk one function body and collect its fd evidence. FLOW-INSENSITIVE on
+/// purpose: order inside the function is not modelled, so a variable that
+/// holds both a socket and a file at different points is conflicting and
+/// [`fd_is_socket`] abstains on it.
+unsafe fn collect_fd_evidence(cursor: CXCursor, st: &mut WalkState, ev: &mut FdEvidence) {
+    let kids = children(cursor);
+    let kind = clang_getCursorKind(cursor);
+    let record = |key: DeclKey, source: &str, ev: &mut FdEvidence| {
+        if SOCKET_SOURCES.contains(&source) {
+            ev.socket.insert(key);
+        } else if FILE_SOURCES.contains(&source) {
+            ev.file.insert(key);
+        }
+    };
+    if kind == CXCursor_VarDecl {
+        // `int s = socket(...)`: the initializer is the last child.
+        if let Some(source) = kids.last().and_then(|init| call_name(*init)) {
+            record(decl_key(cursor), &source, ev);
+        }
+    } else if kind == CXCursor_BinaryOperator && kids.len() == 2 {
+        // `s = accept(...)`. The C API floor (libclang 6) cannot name the
+        // operator, so the text between the operands must be exactly `=`.
+        if let (Some(key), Some(source)) = (local_ref(kids[0]), call_name(kids[1])) {
+            let (lp, _, _, l_end) = loc_parts(
+                clang_getRangeEnd(clang_getCursorExtent(kids[0])),
+                clang_getFileLocation,
+            );
+            let (rp, _, _, r_start) = loc_parts(
+                clang_getRangeStart(clang_getCursorExtent(kids[1])),
+                clang_getFileLocation,
+            );
+            if lp == rp && st.source_slice(&lp, l_end, r_start, 16).trim() == "=" {
+                record(key, &source, ev);
+            }
+        }
+    } else if kind == CXCursor_CallExpr
+        && SOCKET_USERS.contains(&cx_string(clang_getCursorSpelling(cursor)).as_str())
+        && clang_Cursor_getNumArguments(cursor) > 0
+    {
+        if let Some(key) = local_ref(clang_Cursor_getArgument(cursor, 0)) {
+            ev.socket.insert(key);
+        }
+    }
+    for kid in kids {
+        collect_fd_evidence(kid, st, ev);
+    }
+}
+
+/// Is the fd a `read`/`write` call takes a socket, on LOCAL evidence alone?
+///
+/// True only when the first argument is a local variable or parameter of the
+/// enclosing function, that function assigns it a socket (`socket`, `accept`)
+/// or hands it to a socket-only call (`connect`, `send`, ...), and nothing in
+/// the function assigns it a file fd. Everything else abstains: a struct
+/// member, a global, an fd that arrives as a bare parameter, a call result.
+/// Inter-procedural provenance is not modelled, and a wrong guess here would
+/// stamp every file read in the repo as network I/O.
+unsafe fn fd_is_socket(call: CXCursor, st: &mut WalkState) -> bool {
+    if clang_Cursor_getNumArguments(call) <= 0 {
+        return false;
+    }
+    let Some(fd) = local_ref(clang_Cursor_getArgument(call, 0)) else {
+        return false;
+    };
+    let Some(func) = st.fn_stack.last().copied() else {
+        return false;
+    };
+    let func_key = decl_key(func);
+    if !st.fd_evidence.contains_key(&func_key) {
+        let mut ev = FdEvidence::default();
+        collect_fd_evidence(func, st, &mut ev);
+        st.fd_evidence.insert(func_key.clone(), ev);
+    }
+    let ev = &st.fd_evidence[&func_key];
+    ev.socket.contains(&fd) && !ev.file.contains(&fd)
+}
+
 // --- the walk ---
 
 struct PendingSite {
@@ -532,6 +711,13 @@ struct WalkState {
     override_counts: HashMap<String, u32>,
     pending: Vec<PendingSite>,
     calls_unresolved: u32,
+    fd_calls_abstained: u32,
+    /// Per-function fd evidence for the TU being walked, built on the first
+    /// `read`/`write` each function holds.
+    fd_evidence: HashMap<DeclKey, FdEvidence>,
+    /// Included path -> its repo-relative spelling (None outside the repo),
+    /// kept across TUs.
+    include_rel: HashMap<String, Option<String>>,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
     /// detailed preprocessing record in a first pass. The v2 `macro_expansion`
@@ -662,6 +848,51 @@ unsafe fn visit(cursor: CXCursor, st: &mut WalkState) {
     }
 }
 
+/// The client type of a C free-function call: the identity allowlist, plus
+/// `read`/`write` on an fd with local socket evidence. An fd verb without
+/// that evidence is counted as an abstention.
+unsafe fn c_client_type(call: CXCursor, method: &str, st: &mut WalkState) -> Option<&'static str> {
+    if is_fd_verb(method) {
+        if fd_is_socket(call, st) {
+            return Some("posix.socket");
+        }
+        st.fd_calls_abstained += 1;
+        return None;
+    }
+    c_family(method)
+}
+
+/// The in-repo files a parsed TU includes, transitively: repo-relative,
+/// sorted, without the TU's own source file.
+unsafe fn tu_includes(tu: CXTranslationUnit, tu_rel: &str, st: &mut WalkState) -> Vec<String> {
+    extern "C" fn collect(
+        file: CXFile,
+        _stack: *mut CXSourceLocation,
+        _len: c_uint,
+        data: CXClientData,
+    ) {
+        unsafe { (*(data as *mut Vec<String>)).push(cx_string(clang_getFileName(file))) };
+    }
+    let mut paths: Vec<String> = Vec::new();
+    clang_getInclusions(tu, collect, &mut paths as *mut _ as CXClientData);
+    let mut set = std::collections::BTreeSet::new();
+    for p in paths {
+        // TUs share most of their headers; resolve each path once per run.
+        let rel = match st.include_rel.get(&p) {
+            Some(rel) => rel.clone(),
+            None => {
+                let rel = st.rel_path(&p);
+                st.include_rel.insert(p, rel.clone());
+                rel
+            }
+        };
+        if let Some(rel) = rel.filter(|rel| rel != tu_rel) {
+            set.insert(rel);
+        }
+    }
+    set.into_iter().collect()
+}
+
 unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let loc = clang_getCursorLocation(call);
     if clang_Location_isInSystemHeader(loc) != 0 {
@@ -690,7 +921,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         }
         match ckind {
             k if k == CXCursor_FunctionDecl => {
-                let Some(family) = c_family(&method) else {
+                let Some(family) = c_client_type(call, &method, st) else {
                     return;
                 };
                 client_type = family.to_string();
@@ -736,7 +967,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
-        let Some(family) = c_family(&method) else {
+        let Some(family) = c_client_type(call, &method, st) else {
             if method.is_empty() {
                 st.calls_unresolved += 1;
             }
@@ -793,13 +1024,15 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     });
 }
 
-/// Parse one TU and drain its sites. Returns None when the TU fails to parse.
+/// Parse one TU and drain its sites, with the in-repo files it includes.
+/// Returns None when the TU fails to parse.
 unsafe fn walk_tu(
     index: CXIndex,
     file: &Path,
+    tu_rel: &str,
     args: &[String],
     st: &mut WalkState,
-) -> Option<Vec<SiteOut>> {
+) -> Option<(Vec<SiteOut>, Vec<String>)> {
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
@@ -832,6 +1065,7 @@ unsafe fn walk_tu(
     st.override_counts.clear();
     st.pending.clear();
     st.macro_ranges.clear();
+    st.fd_evidence.clear();
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
         root_cursor,
@@ -852,8 +1086,9 @@ unsafe fn walk_tu(
             p.site
         })
         .collect();
+    let includes = tu_includes(tu, tu_rel, st);
     clang_disposeTranslationUnit(tu);
-    Some(sites)
+    Some((sites, includes))
 }
 
 /// Bounded walk for no-db mode: `.c` sources parsed with the allowlist tier,
@@ -930,6 +1165,9 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         override_counts: HashMap::new(),
         pending: Vec::new(),
         calls_unresolved: 0,
+        fd_calls_abstained: 0,
+        fd_evidence: HashMap::new(),
+        include_rel: HashMap::new(),
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
         engine_args: engine.source.parse_args(),
@@ -956,9 +1194,18 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
             tus_failed += 1;
             continue;
         }
-        match unsafe { walk_tu(index, &job.file, &job.args, &mut st) } {
-            Some(sites) => {
+        match unsafe { walk_tu(index, &job.file, &rel, &job.args, &mut st) } {
+            Some((sites, includes)) => {
                 tus_parsed += 1;
+                let edges = TuIncludesOut {
+                    kind: "tu_includes",
+                    packet_schema: PACKET_SCHEMA,
+                    snapshot_id: name.to_string(),
+                    lang: "c_cpp",
+                    file: rel,
+                    includes,
+                };
+                writeln!(out, "{}", serde_json::to_string(&edges)?)?;
                 for s in sites {
                     // A header included by many TUs re-emits its sites; the
                     // stream carries each site_key once.
@@ -987,6 +1234,7 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         tus_failed,
         calls_unresolved: st.calls_unresolved,
         cpp_files_skipped_no_db: cpp_skipped,
+        fd_calls_abstained: st.fd_calls_abstained,
     };
     writeln!(out, "{}", serde_json::to_string(&stats)?)?;
     out.flush()?;
@@ -1036,9 +1284,12 @@ mod tests {
         assert_eq!(c_family("PQexec"), Some("libpq.PGconn"));
         assert_eq!(c_family("redisCommand"), Some("hiredis.redisContext"));
         assert_eq!(c_family("connect"), Some("posix.socket"));
-        // read/write are the documented fd-ambiguity abstention.
+        // read/write are never on the identity allowlist: a file fd shares
+        // them, so they go through the fd dataflow instead.
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
+        assert!(is_fd_verb("read") && is_fd_verb("write"));
+        assert!(!is_fd_verb("recv"));
         assert_eq!(c_family("printf"), None);
     }
 }
