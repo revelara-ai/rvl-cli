@@ -90,6 +90,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
 }
 
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
+}
+
 #[test]
 fn cache_import_refuses_missing_signature() {
     let dir = tempfile::tempdir().unwrap();
@@ -620,6 +661,62 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
         out2.status.code(),
         Some(0),
         "a waived (clean) scan must exit 0: {stdout2}"
+    );
+}
+
+/// po-av01j.98: a waiver scoped with `paths:` must match the finding's FILE.
+/// Every other waiver e2e omits `paths:`, which is the always-matches branch,
+/// so the glob being fed `path:line` went unnoticed. An exact path and the
+/// `**/*.env` idiom both suppress; a glob for another directory does not.
+#[test]
+fn path_scoped_waiver_matches_the_finding_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("internal/pay")).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(
+        repo.join("internal/pay/prod.env"),
+        format!("GH_TOKEN=\"{token}\"\n"),
+    )
+    .unwrap();
+
+    let scan = |paths: &str| {
+        std::fs::write(
+            repo.join(".revelara.yaml"),
+            format!(
+                "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n    paths: {paths}\n"
+            ),
+        )
+        .unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (out.status.code(), stdout)
+    };
+
+    for paths in ["[\"internal/pay/prod.env\"]", "[\"**/*.env\"]"] {
+        let (code, stdout) = scan(paths);
+        assert_eq!(
+            code,
+            Some(0),
+            "paths: {paths} must suppress the finding: {stdout}"
+        );
+        assert!(
+            stdout.contains("suppressed"),
+            "paths: {paths} must fold into Suppressed: {stdout}"
+        );
+    }
+
+    let (code, stdout) = scan("[\"other/*.env\"]");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "a waiver scoped to another directory must not suppress: {stdout}"
     );
 }
 
@@ -2650,19 +2747,42 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     let home = dir.path().join("home"); // isolates org policy + user config
     std::fs::create_dir_all(&home).unwrap();
-    let out = bin()
-        .args(["scan", "--incremental", "--hook", "pre-commit"])
-        .arg(&repo)
-        .arg("--specs-file")
-        .arg(&specs)
-        .env("RVL_GOINDEX", &goindex_bin)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("RVL_AGENT_CMD", &stub)
-        .env("HOME", &home)
-        .output()
-        .expect("failed to run rvl");
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The hook's 10s retrieval cap fails OPEN: on a loaded host the scan
+    // degrades to zero sites and, correctly, renders no agent block. That is
+    // not the path under test, so a capped run is retried from a clean cache
+    // and index; a run that is still capped fails naming the cap, not the
+    // agent block.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        for state in ["cache", "index", "agent-telemetry.jsonl"] {
+            let path = dir.path().join(state);
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = bin()
+            .args(["scan", "--incremental", "--hook", "pre-commit"])
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_AGENT_CMD", &stub)
+            .env("HOME", &home)
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if !stdout.contains("retrieval capped at") {
+            break (out, stdout);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "the hook retrieval cap fired on all {ATTEMPTS} attempts (host too loaded \
+             to exercise the agent lane): {stdout}"
+        );
+    };
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
     assert!(
@@ -6410,4 +6530,70 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     );
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- node helper heap limit (po-av01j.118) ---
+
+/// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
+/// return everything rvl printed. `None` when `node` is absent.
+fn scan_with_fake_tsindex(script: &str, heap_mb: &str) -> Option<String> {
+    if Command::new("node").arg("--version").output().is_err() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("index.ts"), "export const x = 1;\n").unwrap();
+    let helper = dir.path().join("tsindex.js");
+    std::fs::write(&helper, script).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVL_TSINDEX", &helper)
+        .env("RVL_NODE_MAX_OLD_SPACE_MB", heap_mb)
+        .env_remove("NODE_OPTIONS")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The limit must reach `node` itself, ahead of the script: V8 reads it at
+/// startup, so a flag placed after `tsindex.js` would be a helper argument and
+/// change nothing. The fake helper reports the flags node actually parsed.
+#[test]
+fn node_helper_runs_with_a_raised_heap_limit() {
+    let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
+                  process.exit(1);\n";
+    let Some(text) = scan_with_fake_tsindex(script, "777") else {
+        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        return;
+    };
+    assert!(
+        text.contains("execArgv=--max-old-space-size=777"),
+        "node must be started with the heap limit: {text}"
+    );
+}
+
+/// A REAL V8 heap exhaustion, not a simulated exit code: the helper allocates
+/// until node aborts under a 32 MB limit. The scan must say what happened and
+/// which variable moves the ceiling, because "signal: 6" names neither.
+#[test]
+fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
+    let script = "const hold = [];\n\
+                  for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
+    let Some(text) = scan_with_fake_tsindex(script, "32") else {
+        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        return;
+    };
+    assert!(
+        text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
+        "a heap OOM must name the limit and the override: {text}"
+    );
 }

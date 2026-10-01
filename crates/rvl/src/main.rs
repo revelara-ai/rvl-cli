@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 mod agent;
 mod base_ref;
+mod blend;
 mod changed;
 mod compat;
 mod config_lane;
@@ -158,6 +159,18 @@ enum Cmd {
         /// (po-av01j.15, `--hook`); this flag never invokes a model.
         #[arg(long)]
         agent: bool,
+        /// Blend the deterministic scan with your own coding agent
+        /// (po-av01j.205): the undecided runtime call sites, and only those,
+        /// go to the agent (claude/copilot on PATH, `agent:` in
+        /// ~/.revelara/config.yaml, or RVL_AGENT_CMD) and its verdicts merge
+        /// into a BLEND section. Advisory unless `.revelara.yaml` sets
+        /// `scanner.agent_verdicts: gate`. An agent that is vetoed
+        /// (RVL_NO_AGENT=1, org force_deny, `scanner.use_agent: deny`),
+        /// missing, failing or out of budget fails OPEN, and the footer says
+        /// NOT A BLENDED RESULT. Manual scans only: refused with `--hook` and
+        /// the v1 hook aliases, which keep the consented hook lane.
+        #[arg(long)]
+        blend: bool,
         /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
         /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
         /// the same question `--hook pre-commit` asks. Accepted because v1's
@@ -542,11 +555,12 @@ impl From<CompletionShell> for clap_complete::Shell {
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
 /// deterministic scan proceeds. Extended per po-av01j.15 with the consented
-/// hook-adjudication pointer.
+/// hook-adjudication pointer, and per po-av01j.205 with the `--blend` one.
 fn agent_alias_notice() {
     eprintln!(
         "note: --agent is a deprecated rvl-cli compatibility alias; {BIN} runs its \
-         deterministic scan (no model calls) — drop --agent. For consented agent \
+         deterministic scan (no model calls) — drop --agent. To blend in your own \
+         agent on a manual scan, run '{BIN} scan --blend'. For consented agent \
          adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
          scanner.agent_hooks in .revelara.yaml and run '{BIN} scan --incremental \
          --hook <pre-commit|pre-push>'; see '{BIN} skills' for the agent-side \
@@ -704,6 +718,13 @@ enum CacheCmd {
     },
     /// Show installed cache versions and staleness.
     Status,
+    /// List every config key the retrievers emit and where it stands against
+    /// the installed specs: specced, awaiting a spec, or vocabulary only.
+    Keys {
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// All runtime configuration, resolved once. `base_url` and `org_key` layer
@@ -1943,11 +1964,25 @@ fn run_helper(
     } else {
         chunk_files(files, MAX_FILES_ARG_BYTES)
     };
+    let node_heap_mb = (helper.kind == HelperKind::NodeScript)
+        .then(|| {
+            node_heap_limit_mb(
+                std::env::var(NODE_HEAP_ENV).ok().as_deref(),
+                std::env::var("NODE_OPTIONS").ok().as_deref(),
+                physical_memory_mb(),
+            )
+        })
+        .flatten();
     let mut merged = String::new();
     for batch in &batches {
         let argv = helper_argv(helper, root, name, batch, include_tests);
         let (program, args) = argv.split_first().expect("argv always has a program");
         let mut cmd = std::process::Command::new(program);
+        if let Some(mb) = node_heap_mb {
+            // Ahead of the script: V8 reads its flags at startup, and anything
+            // after `tsindex.js` is the helper's argument, not node's.
+            cmd.arg(format!("--max-old-space-size={mb}"));
+        }
         cmd.args(args);
         if helper.kind == HelperKind::NodeScript {
             cmd.env("NODE_PATH", node_path_for(root));
@@ -1978,10 +2013,11 @@ fn run_helper(
         if !output.status.success() {
             let kind = classify_helper_exit(output.status.code());
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(Err((
-                kind,
-                helper_degrade_reason(kind, &output.status, &stderr),
-            )));
+            let mut reason = helper_degrade_reason(kind, &output.status, &stderr);
+            if helper.kind == HelperKind::NodeScript && node_aborted(&output.status) {
+                reason = format!("{}; {reason}", node_abort_hint(node_heap_mb));
+            }
+            return Ok(Err((kind, reason)));
         }
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -1992,6 +2028,100 @@ fn run_helper(
         return Ok(Err(d));
     }
     Ok(Ok(merged))
+}
+
+/// Operator override for the heap limit a `node` helper runs under, in MB.
+/// `0` passes no limit at all and leaves node to its own default.
+const NODE_HEAP_ENV: &str = "RVL_NODE_MAX_OLD_SPACE_MB";
+
+/// The most heap rvl grants a `node` helper on its own initiative, in MB.
+const NODE_HEAP_CAP_MB: u64 = 16 * 1024;
+
+/// The V8 old-space limit, in MB, to start a `node` helper with; `None` passes
+/// no flag (po-av01j.118).
+///
+/// V8's default limit is about 4 GB on a 64-bit host however much RAM the
+/// machine has, and exceeding it is an abort, not a slow run. tsindex holds one
+/// TypeScript program for the whole repository, and retrieving infisical (7746
+/// files) peaks at 4.4 GB RSS: it completes with nothing to spare, the uncached
+/// thenable check died at that ceiling, and Rocket.Chat is larger still. A
+/// fixed limit under an input that grows is the defect, so the limit is derived
+/// from the host instead: half of physical memory, which leaves the other half
+/// for rvl, the OS and the file cache, capped at [`NODE_HEAP_CAP_MB`]. This is
+/// a ceiling on growth, not a reservation; a small repo uses what it used
+/// before.
+///
+/// Precedence, most specific first:
+///   1. [`NODE_HEAP_ENV`], a positive integer of MB, or `0` for no flag. An
+///      unparseable value is ignored rather than fatal.
+///   2. A `NODE_OPTIONS` that already sets `--max-old-space-size`: the child
+///      inherits it, and a command-line flag would override what the operator
+///      set on purpose.
+///   3. Half of physical memory, capped. Unknown memory size passes no flag.
+fn node_heap_limit_mb(
+    env_override: Option<&str>,
+    node_options: Option<&str>,
+    physical_mb: Option<u64>,
+) -> Option<u64> {
+    if let Some(mb) = env_override.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return (mb > 0).then_some(mb);
+    }
+    // V8 accepts the flag spelled with dashes or underscores.
+    if node_options.is_some_and(|o| o.replace('_', "-").contains("--max-old-space-size")) {
+        return None;
+    }
+    physical_mb
+        .map(|mb| (mb / 2).min(NODE_HEAP_CAP_MB))
+        .filter(|mb| *mb > 0)
+}
+
+/// Physical memory of this host in MB, when the platform will say.
+#[cfg(unix)]
+fn physical_memory_mb() -> Option<u64> {
+    // SAFETY: sysconf takes no pointers and has no preconditions; it returns
+    // -1 for a name it does not support, which the conversion rejects.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let bytes = u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)?;
+    Some(bytes / (1024 * 1024))
+}
+
+#[cfg(not(unix))]
+fn physical_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Did `node` abort? V8 calls abort() when the heap is exhausted, so the
+/// process dies of SIGABRT; a wrapper shell reports the same death as exit 134.
+fn node_aborted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGABRT) {
+            return true;
+        }
+    }
+    status.code() == Some(134)
+}
+
+/// What to tell the reader when a `node` helper aborted. The raw status is
+/// "signal: 6" followed by a frame of a native stack trace, which names neither
+/// the cause nor the one setting that moves the ceiling.
+fn node_abort_hint(limit_mb: Option<u64>) -> String {
+    let limit = match limit_mb {
+        Some(mb) => format!("the {mb} MB heap limit rvl set"),
+        None => "node's own heap limit".to_string(),
+    };
+    format!(
+        "node aborted, which is how V8 reports an exhausted heap; it ran under {limit}. \
+         Set {NODE_HEAP_ENV}=<MB> to raise it"
+    )
 }
 
 /// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
@@ -3006,6 +3136,7 @@ fn run_scan(
     color: Option<&str>,
     strict: bool,
     include_tests: bool,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // The full path treats "no language detected" as a clean pass too
@@ -3049,6 +3180,8 @@ fn run_scan(
             &structure,
             None,
             None,
+            // No language, so no call site the blend could be asked about.
+            None,
             out,
             color,
             start,
@@ -3079,6 +3212,7 @@ fn run_scan(
     structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    let blended = blend.then(|| blend::run(path, None, &findings, &sites, stdout_color(color)));
     render_scan_output(
         state_path,
         path,
@@ -3089,6 +3223,7 @@ fn run_scan(
         &structure,
         Some(&lane),
         None,
+        blended.as_ref(),
         out,
         color,
         start,
@@ -3204,6 +3339,8 @@ fn render_scan_output(
     structure: &[render::Finding],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
+    // `scan --blend` (po-av01j.205); None when not requested.
+    blended: Option<&blend::BlendOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -3255,6 +3392,7 @@ fn render_scan_output(
         ..Default::default()
     };
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
+    coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
@@ -3287,6 +3425,10 @@ fn render_scan_output(
     if let Some(a) = hook_agent {
         ladder_findings.extend(a.gate_findings.iter().cloned());
     }
+    // `--blend` follows the same rule: rows only in gate mode, agent-tagged.
+    if let Some(b) = blended {
+        ladder_findings.extend(b.gate_findings.iter().cloned());
+    }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -3295,7 +3437,7 @@ fn render_scan_output(
     if !waivers.is_empty() {
         let today = rvl_cache::today_utc();
         for f in &mut ladder_findings {
-            if waiver::is_waived(&f.class_rule, &f.site, &waivers, &today) {
+            if waiver::is_waived(&f.class_rule, waiver::site_path(&f.site), &waivers, &today) {
                 f.suppressed = true;
             }
         }
@@ -3324,6 +3466,7 @@ fn render_scan_output(
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
+            blended.map(|b| &b.summary),
             blocked,
         )
     });
@@ -3345,6 +3488,9 @@ fn render_scan_output(
         if !a.block.is_empty() {
             print!("\n{}", a.block);
         }
+    }
+    if let Some(b) = blended {
+        print!("\n{}", b.block);
     }
 
     if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
@@ -4194,6 +4340,7 @@ fn run_scan_incremental(
     changed_only: bool,
     hook: Option<&str>,
     base_chain: &base_ref::Chain,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
 
@@ -4378,6 +4525,18 @@ fn run_scan_incremental(
             stdout_color(color),
         )
     });
+    // `--blend` (po-av01j.205): the same residue, whole repo, or the
+    // changed set under --changed-only so the agent never sees files the
+    // report is not about.
+    let blended = blend.then(|| {
+        blend::run(
+            path,
+            changed_only.then_some(changed_files.as_slice()),
+            &findings,
+            &sites,
+            stdout_color(color),
+        )
+    });
     render_scan_output(
         state_path,
         path,
@@ -4388,6 +4547,7 @@ fn run_scan_incremental(
         &structure,
         Some(&lane),
         hook_agent.as_ref(),
+        blended.as_ref(),
         out,
         color,
         start,
@@ -5982,6 +6142,7 @@ fn run() -> anyhow::Result<ExitCode> {
             changed_only,
             base,
             agent,
+            blend,
             staged,
             pre_push,
             mode,
@@ -6019,6 +6180,15 @@ fn run() -> anyhow::Result<ExitCode> {
                 base_chain.is_configured(),
             )?;
             compat::set_never_block(never_block);
+            // `--blend` is a manual scan. On the hook path the consented lane
+            // (po-av01j.15) owns agent use, and a v1 shim must never grow an
+            // agent call it did not ask for; refuse rather than pick one.
+            anyhow::ensure!(
+                !(blend && hook.is_some()),
+                "--blend is for manual scans and cannot run on the hook path \
+                 (--hook, --staged, --pre-push); hooks use the consented agent lane \
+                 (scanner.use_agent + scanner.agent_hooks in .revelara.yaml)"
+            );
             match notice {
                 // The v1 notice already names `--agent` and says exactly what
                 // ran instead, so the generic alias paragraph would only add
@@ -6066,6 +6236,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     changed_only,
                     hook.as_deref(),
                     &base_chain,
+                    blend,
                 )
             } else {
                 // Hook adjudication is delta-scoped by definition; without
@@ -6089,6 +6260,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     color.as_deref(),
                     strict,
                     include_tests,
+                    blend,
                 )
             }
         }
@@ -6269,6 +6441,36 @@ fn run() -> anyhow::Result<ExitCode> {
                             "no spec cache installed; run '{BIN} sync' or '{BIN} cache import'"
                         )
                     }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            CacheCmd::Keys { json } => {
+                // The same tiered load a scan performs, so the queue is
+                // measured against the specs a scan would actually judge with.
+                let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+                let tiers =
+                    rvl_cache::load_tiered(&store, &oss_store, &keyset, &rvl_cache::today_utc());
+                let specs = match tiers.spec_texts()? {
+                    Some((base, overlay)) => {
+                        let mut cache = rvl_spec::SpecCache::load(&base)?;
+                        if let Some(overlay) = &overlay {
+                            cache.merge(rvl_spec::SpecCache::load(overlay)?);
+                        }
+                        Some(cache)
+                    }
+                    None => None,
+                };
+                let artifact_loaded = specs.is_some();
+                let queue = rvl_config::key_ledger::mint_queue(&specs.unwrap_or_default());
+                if json {
+                    let mut doc = serde_json::to_value(&queue)?;
+                    doc["artifact_loaded"] = artifact_loaded.into();
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    print!(
+                        "{}",
+                        config_lane::render_key_report(&queue, artifact_loaded)
+                    );
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -7468,6 +7670,70 @@ mod tests {
                 "repo"
             ]
         );
+    }
+
+    /// po-av01j.118. The policy is pure so each rung of the precedence is
+    /// pinned without depending on the box the suite runs on.
+    #[test]
+    fn node_heap_limit_scales_with_the_host_and_yields_to_the_operator() {
+        // Derived: half of physical memory, so a 32 GB host gets 16 GB of
+        // heap rather than V8's flat 4 GB...
+        assert_eq!(node_heap_limit_mb(None, None, Some(32_768)), Some(16_384));
+        assert_eq!(node_heap_limit_mb(None, None, Some(8_192)), Some(4_096));
+        // ...and never more than the cap, however large the host.
+        assert_eq!(
+            node_heap_limit_mb(None, None, Some(512 * 1024)),
+            Some(NODE_HEAP_CAP_MB)
+        );
+        // Unknown memory size: say nothing rather than guess.
+        assert_eq!(node_heap_limit_mb(None, None, None), None);
+
+        // The explicit override beats everything, including the cap.
+        assert_eq!(
+            node_heap_limit_mb(Some("24000"), Some("--max-old-space-size=1"), Some(8_192)),
+            Some(24_000)
+        );
+        // 0 opts out: node keeps its own default.
+        assert_eq!(node_heap_limit_mb(Some("0"), None, Some(32_768)), None);
+        // Garbage is ignored, not fatal and not an opt-out.
+        assert_eq!(
+            node_heap_limit_mb(Some("lots"), None, Some(8_192)),
+            Some(4_096)
+        );
+
+        // An operator's NODE_OPTIONS limit is inherited by the child; a
+        // command-line flag would silently override it.
+        for opts in [
+            "--max-old-space-size=2048",
+            "--enable-source-maps --max_old_space_size=2048",
+        ] {
+            assert_eq!(node_heap_limit_mb(None, Some(opts), Some(32_768)), None);
+        }
+        // Unrelated NODE_OPTIONS do not switch the limit off.
+        assert_eq!(
+            node_heap_limit_mb(None, Some("--enable-source-maps"), Some(8_192)),
+            Some(4_096)
+        );
+    }
+
+    #[test]
+    fn node_abort_hint_names_the_limit_in_force_and_the_override() {
+        let set = node_abort_hint(Some(4096));
+        assert!(
+            set.contains("4096 MB") && set.contains(NODE_HEAP_ENV),
+            "{set}"
+        );
+        let unset = node_abort_hint(None);
+        assert!(
+            unset.contains("node's own heap limit") && unset.contains(NODE_HEAP_ENV),
+            "{unset}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_memory_is_readable_on_unix() {
+        assert!(physical_memory_mb().is_some_and(|mb| mb > 0));
     }
 
     #[test]

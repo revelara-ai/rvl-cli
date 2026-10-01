@@ -378,6 +378,50 @@ agent-tagged warning. Blocking stays deterministic-only unless the repo
 commits `scanner.agent_verdicts: gate`. Agent verdicts never enter the eval
 rows or the shape-only report.
 
+### Blending the scan with your agent from the command line
+
+`rvl scan --blend` does the same adjudication for a manual scan, in one
+command, with no hook and no repo opt-in:
+
+```sh
+rvl scan --blend
+rvl scan --blend --incremental --changed-only   # only the files you changed
+```
+
+The deterministic scan runs first and settles everything it can. Then the
+undecided call sites in runtime code, and only those, go to your agent
+(found the same way as above). Undecided sites in test, migration, dev-only
+and backfill code are not sent; the report counts them. One run sends at
+most 50 sites, in batches of 10, under a 5-minute total budget. The first
+batch that fails, times out or replies off-contract stops the run.
+
+The agent's verdicts print in a `BLEND` section after the ladder, with the
+same asymmetric rules: `satisfies` clears a site, `violates` is an
+agent-tagged advisory warning, and only `scanner.agent_verdicts: gate` lets
+it block. The deterministic findings and the `--out` eval rows never change.
+
+Typing `--blend` is the consent for that run. These still refuse it:
+`RVL_NO_AGENT=1`, the org kill switch, and an explicit
+`scanner.use_agent: deny` in `.revelara.yaml`.
+
+When the agent half does not answer (refused, not installed, failed,
+timed out, or undecided sites over the cap), the scan fails open: the exit
+code is the deterministic one. But the footer does not say "commit clean".
+It says what happened:
+
+```
+⚠ 0 advisory · NOT A BLENDED RESULT — agent half unavailable: RVL_NO_AGENT=1 (env hard-off) (see BLEND); deterministic half only, rvl fails open
+```
+
+`--blend` is for manual scans. It is refused with `--hook` and with the
+old CLI's `--staged` and `--pre-push`, so a hook never starts calling an
+agent it was not configured for. `--agent` is unchanged: it is a
+compatibility alias for the deterministic scan and never calls a model.
+
+`--blend` covers adjudication only. The expert lenses that `/rvl:scan`
+runs as a scanner in their own right are not part of it yet, and the
+`BLEND` section says so on every run.
+
 ## Privacy
 
 The deterministic scan runs entirely locally and your code never leaves the
@@ -416,6 +460,7 @@ channels precisely.
 | `rvl doctor [--fix]` | Machine/repo readiness |
 | `rvl sync` | Refresh rulesets (both tiers if keyed) |
 | `rvl cache status` | Installed ruleset versions and staleness |
+| `rvl cache keys [--json]` | Every config key the retrievers emit: specced, awaiting a spec, or vocabulary only |
 | `rvl index init\|reindex\|status` | The incremental packet index |
 | `rvl hook install\|doctor` | The git-hook gates |
 | `rvl completion bash\|zsh\|fish` | Shell completion |

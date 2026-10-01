@@ -4,9 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue proves a candidate by dispatching this workflow on
+  # refs/heads/queue/pr-N and reading the `ci-gate` check run. No push trigger
+  # may match queue or queue/**: a push run there would race the dispatch.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# github.event_name is part of the group so a dispatched run never cancels or
+# replaces a push run or a pull_request run on the same ref. Only a superseded
+# pull_request run is cancelled: a push run on main and a dispatched candidate
+# run are each evidence somebody reads, so they run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,8 +29,11 @@ env:
 # free GitHub-hosted minutes rather than the shared fleet -- at that point set a
 # REPO-level `CI_RUNNER=""` to override the org value, no workflow edit needed.
 jobs:
+  # No display name on check or helpers: the merge queue reads each job's check
+  # run by name, and the queue config names these jobs by their ids. A `name:`
+  # here renames the check run and every proof fails with a missing job.
+  # check: fmt, clippy and the workspace tests.
   check:
-    name: fmt + clippy + test
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       # Self-hosted runners reuse the workspace across jobs, and a container
@@ -75,8 +90,8 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # helpers: go vet and go test for goindex, plus pyindex and tsindex.
   helpers:
-    name: helpers (go vet + test, pyindex, tsindex)
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Reclaim workspace ownership (self-hosted runner hygiene)
@@ -137,3 +152,30 @@ jobs:
             echo "internal codename found; the product name is Revelara" >&2
             exit 1
           fi
+
+  # The one check run the merge queue reads, and the one a ruleset can require.
+  # `check` and `helpers` are named in the queue config: do not rename them.
+  # always() makes this job run when a need failed or was cancelled, so that
+  # case reports a failure instead of a skipped (and so passing) check. The
+  # event list is every trigger this workflow has, so the condition is always()
+  # in effect; the merge queue's workflow guard needs to read workflow_dispatch
+  # by name in it.
+  ci-gate:
+    name: ci-gate
+    needs: [check, helpers]
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Every test job succeeded
+        run: |
+          # A dispatched or push run must see success from every job. Only a
+          # pull_request may also pass on skipped, which the merge queue's
+          # workflow guard requires of every gate; neither job has an `if:`
+          # today, so on a pull_request they are never skipped.
+          for r in "${{ needs.check.result }}" "${{ needs.helpers.result }}"; do
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              case "$r" in success|skipped) ;; *) echo "ci-gate: a test job was $r" >&2; exit 1 ;; esac
+            else
+              [ "$r" = "success" ] || { echo "ci-gate: a test job was $r" >&2; exit 1; }
+            fi
+          done

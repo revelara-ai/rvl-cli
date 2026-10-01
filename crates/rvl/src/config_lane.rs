@@ -9,8 +9,11 @@
 //! rule `<format>.<key>` — the exact mechanics code findings use.
 
 use crate::render;
+use rvl_config::key_ledger::{self, KeyState};
 use rvl_core::Verdict;
+use rvl_data::BIN;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Everything the config lane contributes to one scan.
@@ -63,10 +66,18 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         if f.verdict.is_resolved() {
             coverage.resolved += 1;
         } else if f.reason.starts_with("no config spec") {
-            coverage.abstain_no_spec += 1;
-            coverage
-                .no_spec_keys
-                .insert(format!("{} {}", p.format, p.key));
+            // No spec is a gap only where one is wanted: a vocabulary-only
+            // key is unjudged by design and stays out of the authoring lever.
+            let unjudged_by_design = key_ledger::lookup(&p.format, &p.key)
+                .is_some_and(|e| matches!(e.intent, key_ledger::Intent::VocabularyOnly(_)));
+            if unjudged_by_design {
+                coverage.vocabulary_only += 1;
+            } else {
+                coverage.abstain_no_spec += 1;
+                coverage
+                    .no_spec_keys
+                    .insert(format!("{} {}", p.format, p.key));
+            }
         } else if f.reason.contains("outside the repo") {
             coverage.abstain_outside_repo += 1;
         } else {
@@ -126,6 +137,46 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         findings: ladder,
         coverage,
     }
+}
+
+/// The standing mint queue as text, for `rvl cache keys`: every key the
+/// retrievers can emit, split by where it stands against the installed specs.
+/// Unlike a scan's `unjudged keys` line this does not depend on what one repo
+/// happens to contain, and it is never truncated.
+pub fn render_key_report(q: &key_ledger::MintQueue, artifact_loaded: bool) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "config keys: {} emitted \u{00b7} {} specced \u{00b7} {} awaiting a spec \u{00b7} {} vocabulary only",
+        q.emitted, q.specced, q.mint_queue, q.vocabulary_only
+    );
+    if !artifact_loaded {
+        let _ = writeln!(
+            o,
+            "no spec cache installed, so every judged key reads as awaiting a spec; \
+             run '{BIN} sync' or '{BIN} cache import'"
+        );
+    }
+    for (state, heading) in [
+        (KeyState::MintQueue, "awaiting a spec (the mint queue):"),
+        (KeyState::VocabularyOnly, "vocabulary only, not judged:"),
+        (KeyState::Specced, "specced:"),
+    ] {
+        let _ = writeln!(o, "\n{heading}");
+        let mut any = false;
+        for row in q.keys.iter().filter(|r| r.state == state) {
+            any = true;
+            if row.reason.is_empty() {
+                let _ = writeln!(o, "  {} {}", row.format, row.key);
+            } else {
+                let _ = writeln!(o, "  {} {} \u{2014} {}", row.format, row.key, row.reason);
+            }
+        }
+        if !any {
+            let _ = writeln!(o, "  (none)");
+        }
+    }
+    o
 }
 
 #[cfg(test)]
@@ -304,6 +355,71 @@ mod tests {
             "coverage: {:?}",
             out.coverage
         );
+    }
+
+    // A vocabulary-only key has no spec BY DESIGN. Counting it under the
+    // authoring lever would name a gap nobody intends to close.
+    #[test]
+    fn a_vocabulary_only_key_is_not_reported_as_a_missing_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.tf"),
+            "module \"vpc\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n  version = \"5.1.0\"\n}\n",
+        )
+        .unwrap();
+        let out = run(dir.path(), &specs("high"), "snap");
+        let cov = &out.coverage;
+        assert_eq!(
+            cov.vocabulary_only, 2,
+            "module.source and module.version-pin: {cov:?}"
+        );
+        assert!(
+            !cov.no_spec_keys.contains("terraform module.source")
+                && !cov.no_spec_keys.contains("terraform module.version-pin"),
+            "{cov:?}"
+        );
+        assert!(
+            cov.no_spec_keys.contains("terraform module.source-class"),
+            "a judged key with no spec stays in the queue: {cov:?}"
+        );
+        assert_eq!(
+            cov.resolved + cov.abstain_total(),
+            cov.total,
+            "every packet is accounted for: {cov:?}"
+        );
+    }
+
+    #[test]
+    fn key_report_names_the_queue_and_separates_vocabulary_only() {
+        let q = rvl_config::key_ledger::mint_queue(&specs("high"));
+        let text = render_key_report(&q, true);
+        let line = |needle: &str| text.lines().position(|l| l.contains(needle));
+        assert!(
+            text.contains(&format!(
+                "config keys: {} emitted \u{00b7} 2 specced \u{00b7} {} awaiting a spec \u{00b7} 2 vocabulary only",
+                q.emitted, q.mint_queue
+            )),
+            "{text}"
+        );
+        let (queue, vocab, specced) = (
+            line("awaiting a spec (the mint queue)").unwrap(),
+            line("vocabulary only, not judged").unwrap(),
+            line("specced:").unwrap(),
+        );
+        let at = |needle: &str| line(needle).unwrap_or_else(|| panic!("no {needle} in {text}"));
+        assert!((queue..vocab).contains(&at("github-actions workflow.concurrency")));
+        assert!((vocab..specced).contains(&at("terraform module.source ")));
+        assert!(at("github-actions job.timeout-minutes") > specced);
+        assert!(!text.contains("no spec cache"), "{text}");
+    }
+
+    // With nothing installed the whole judged ledger reads as queued. That is
+    // true, and it must not pass for a statement about the factory's backlog.
+    #[test]
+    fn key_report_says_when_no_artifact_was_loaded() {
+        let q = rvl_config::key_ledger::mint_queue(&SpecCache::default());
+        let text = render_key_report(&q, false);
+        assert!(text.contains("no spec cache installed"), "{text}");
     }
 
     #[test]

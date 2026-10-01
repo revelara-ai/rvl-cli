@@ -67,7 +67,7 @@ impl ConfigRetriever for GitlabCi {
             file_path: rel_path.to_string(),
             line: 0,
             unit: unit.to_string(),
-            key: key.to_string(),
+            key: crate::key_ledger::declared("gitlab-ci", key),
             resolved_value: value,
             resolution,
             provenance,
