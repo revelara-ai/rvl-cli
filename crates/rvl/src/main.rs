@@ -4091,7 +4091,7 @@ fn incremental_scan_pass(
         return Ok(IncrementalScan::no_source());
     }
 
-    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
+    let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
     let name = snapshot_name(path);
     let root = path.to_path_buf();
 
@@ -4250,6 +4250,24 @@ fn rotate_detached_log(log_path: &std::path::Path, cap: u64) {
 /// scan costs nothing while giving up loses the entire reindex.
 const INDEX_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Open the packet index under `index_dir`, reporting on stderr when it had
+/// to be rebuilt from an older on-disk format. Every command opens the index
+/// through here, so a cold scan after an upgrade always has a stated cause.
+fn open_packet_index(
+    index_dir: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<rvl_index::PacketIndex> {
+    let path = index_dir.join("packets.redb");
+    let index = rvl_index::PacketIndex::open_with_timeout(&path, timeout)?;
+    if index.rebuilt_from_old_format() {
+        eprintln!(
+            "note: the packet index at {} was in an older on-disk format and was rebuilt empty; the next scan refills it",
+            path.display()
+        );
+    }
+    Ok(index)
+}
+
 /// `index init` / `index reindex`, both packet-stream and live modes.
 ///
 /// Live mode (no --retrieved) is the background warm a post-commit hook
@@ -4308,10 +4326,7 @@ fn run_index_build(
     // The warm waits a long time for a busy index. It is a background batch
     // job; losing the whole reindex because a status check held the lock for
     // a few milliseconds is the bug this timeout exists to prevent.
-    let idx = rvl_index::PacketIndex::open_with_timeout(
-        &cfg.index_dir.join("packets.redb"),
-        INDEX_WARM_TIMEOUT,
-    )?;
+    let idx = open_packet_index(&cfg.index_dir, INDEX_WARM_TIMEOUT)?;
 
     if let Some(retrieved) = retrieved {
         let stream = std::fs::read_to_string(&retrieved)?;
@@ -6570,7 +6585,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 detach,
             } => run_index_build(&cfg, path, retrieved, files, detach),
             IndexCmd::Status => {
-                match rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb")) {
+                match open_packet_index(&cfg.index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT) {
                     Ok(idx) => {
                         println!(
                             "{} file(s) indexed at {}",
