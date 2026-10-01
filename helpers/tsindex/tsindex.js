@@ -2140,6 +2140,13 @@ function main(argv) {
     // names them, which is the only actionable thing to say about it. Exit 3
     // is the helper ABSTAIN code rvl reads (po-av01j.102), surfacing as a
     // COVERAGE line.
+    //
+    // The install it then asks for is the SCRIPT-FREE one (po-av01j.170).
+    // Type resolution needs the packages' declaration files and nothing an
+    // install script builds, so a plain `npm ci` is both more than the scan
+    // needs and less likely to work: it exits 1 on a repo whose native
+    // dependency cannot build on the user's toolchain, and it runs code from
+    // every package in the tree for someone who only asked for a scan.
     const { records, repoConfig, attribution } = runRetrieve(
       root,
       snapshot,
@@ -2160,8 +2167,14 @@ function main(argv) {
           `package contents can resolve. Nothing here can be ` +
           `attributed to a package without the installed tree, so tsindex ` +
           `abstains rather than reporting a near-empty scan as a complete one. ` +
-          `Install dependencies (npm ci / pnpm install --frozen-lockfile / ` +
-          `yarn install --immutable) and re-run.\n`,
+          `Install dependencies without their install scripts ` +
+          `(npm ci --ignore-scripts / pnpm install --frozen-lockfile ` +
+          `--ignore-scripts / yarn install --immutable --mode=skip-build) and ` +
+          `re-run: tsindex reads node_modules only to resolve types and runs ` +
+          `no package code, so native modules need not build. If the scan ` +
+          `still abstains because a package generates its types at install, ` +
+          `use the plain form (npm ci / pnpm install --frozen-lockfile / ` +
+          `yarn install --immutable).\n`,
       );
       return 3;
     }

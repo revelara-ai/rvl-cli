@@ -271,6 +271,15 @@ with no in-repo source behind them, or through a local `export * from
 never guessed: right beside one `export *`, a guess is wrong beside two. The
 stderr message names those specifiers.
 
+The message advises the install that skips install scripts — `npm ci
+--ignore-scripts`, `pnpm install --frozen-lockfile --ignore-scripts`, `yarn
+install --immutable --mode=skip-build` — because tsindex reads `node_modules`
+only to resolve types and never runs a package's code. That install works on a
+repo whose native dependency cannot build on the user's toolchain, where a
+plain `npm ci` exits 1, and it does not ask someone to execute hundreds of
+packages' scripts in order to scan. The plain form is the fallback for a
+package that generates its types at install.
+
 ### Confidence tiers (the dynamic-typing reality)
 
 TypeScript is gradually typed, so resolution is reported per site rather than
