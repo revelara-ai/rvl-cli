@@ -3375,20 +3375,50 @@ fn run_scan(
     if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
         // Content-only repo: no packet stream exists, so the structure lane
         // inventories the live tree directly (same as the incremental path).
-        // The config lane is skipped on this early path (no spec cache gets
-        // resolved before the return) -- follow-up tracked on the epic.
         let structure = resolve_structure_findings(None, "", path);
+        // The G6 config lane runs here too (po-av01j.31): a pure
+        // terraform/.env tree is the repo it was built for. It needs the spec
+        // cache, so resolve it through the same loader the full path uses,
+        // over an empty stream. Only the cache is kept: the server-entry and
+        // emission lanes judge code, and this repo has none.
+        //
+        // No loadable cache must not cost the content lane its verdict: a
+        // fresh install still has to catch a committed token. So that case
+        // degrades to the content and structure lanes alone and names the
+        // lane that did not run. An explicit `--specs-file` that fails to
+        // load stays an error; the user asked for those specs.
+        let specs = match resolve_findings(
+            store,
+            keyset,
+            "",
+            specs_file,
+            judgments,
+            tiers,
+            Some(path),
+            true,
+        ) {
+            Ok((_, _, _, specs, _, _)) => Some(specs),
+            Err(e) if specs_file.is_none() => {
+                eprintln!(
+                    "warning: the config lane did not run ({e:#}); \
+                     only the content and structure lanes are reported"
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let lane = specs
+            .as_ref()
+            .map(|s| config_lane::run(path, s, &snapshot_name(path)));
         return render_scan_output(
             state_path,
             path,
             &[],
             &citems,
             &[],
-            // No spec cache is resolved on this path, so every class renders
-            // the unknown-default wording -- which is the honest one.
-            None,
+            specs.as_ref(),
             &structure,
-            None,
+            lane.as_ref(),
             None,
             // No language, so no call site the blend could be asked about.
             None,
@@ -3547,7 +3577,7 @@ fn render_scan_output(
     // The specs the propagation ran against. Carried this far because the
     // ladder's sentence for an unbounded call depends on what the LIBRARY does
     // with no explicit bound, and only the spec knows that (po-av01j.175).
-    // `None` on the content-only path, where no spec cache is resolved at all.
+    // `None` only on the content-only path when no spec cache is loadable.
     specs: Option<&rvl_spec::SpecCache>,
     structure: &[render::Finding],
     config: Option<&config_lane::LaneOutput>,

@@ -1728,6 +1728,108 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
     );
 }
 
+/// A repo with NO supported language: a planted (fake) token so the content
+/// lane has a finding, and Terraform with an unpinned provider and no state
+/// backend. This is the content-only early return in `run_scan`.
+fn write_content_only_terraform_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+    std::fs::write(
+        repo.join("main.tf"),
+        "terraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\" }\n  }\n}\n",
+    )
+    .unwrap();
+    repo
+}
+
+/// po-av01j.31: the content-only path used to return before any spec cache
+/// was resolved, so the config lane never ran on the repos it was built for
+/// (pure terraform/.env trees). Both lanes must report in one scan.
+#[test]
+fn content_only_repo_runs_the_config_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"terraform","key":"provider.version-constraint","expect":{"kind":"present"},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin provider versions in required_providers","rationale":"an unconstrained provider floats to the newest release"},
+            {"format":"terraform","key":"terraform.backend","expect":{"kind":"present"},"confidence":0.9,"control":"RC-030","severity":"medium","fix":"configure a remote state backend in the terraform block","rationale":"local state cannot be shared, locked, or recovered"}
+        ]
+    }"#).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // The content lane still reports and still blocks...
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "the planted token must still block: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    // ...and the config lane now runs beside it.
+    assert!(
+        stdout.contains("terraform provider.version-constraint"),
+        "unpinned provider must surface on the content-only path: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("terraform terraform.backend"),
+        "missing remote state must surface on the content-only path: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-030"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+}
+
+/// With no spec cache at all the config lane cannot run, but that must not
+/// cost the content lane its verdict (a fresh install must still catch a
+/// committed token), and the skipped lane must be named, not left silent.
+#[test]
+fn content_only_repo_without_a_spec_cache_still_blocks_and_names_the_skipped_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a missing spec cache must not cost the content lane its verdict: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    assert!(
+        stderr.contains("config lane did not run"),
+        "the skipped lane must be named on stderr: {stderr}"
+    );
+}
+
 // --- declared bounds: out-of-code bound evidence via .revelara.yaml (po-3t3oj.30) ---
 
 /// A `scanner.bounds` declaration in `.revelara.yaml` is the out-of-code
