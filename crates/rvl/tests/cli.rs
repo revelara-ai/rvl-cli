@@ -623,6 +623,62 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
+/// po-av01j.98: a waiver scoped with `paths:` must match the finding's FILE.
+/// Every other waiver e2e omits `paths:`, which is the always-matches branch,
+/// so the glob being fed `path:line` went unnoticed. An exact path and the
+/// `**/*.env` idiom both suppress; a glob for another directory does not.
+#[test]
+fn path_scoped_waiver_matches_the_finding_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("internal/pay")).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(
+        repo.join("internal/pay/prod.env"),
+        format!("GH_TOKEN=\"{token}\"\n"),
+    )
+    .unwrap();
+
+    let scan = |paths: &str| {
+        std::fs::write(
+            repo.join(".revelara.yaml"),
+            format!(
+                "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n    paths: {paths}\n"
+            ),
+        )
+        .unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (out.status.code(), stdout)
+    };
+
+    for paths in ["[\"internal/pay/prod.env\"]", "[\"**/*.env\"]"] {
+        let (code, stdout) = scan(paths);
+        assert_eq!(
+            code,
+            Some(0),
+            "paths: {paths} must suppress the finding: {stdout}"
+        );
+        assert!(
+            stdout.contains("suppressed"),
+            "paths: {paths} must fold into Suppressed: {stdout}"
+        );
+    }
+
+    let (code, stdout) = scan("[\"other/*.env\"]");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "a waiver scoped to another directory must not suppress: {stdout}"
+    );
+}
+
 // --- exit-code contract (po-av01j.94) ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
