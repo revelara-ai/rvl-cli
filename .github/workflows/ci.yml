@@ -29,8 +29,11 @@ env:
 # free GitHub-hosted minutes rather than the shared fleet -- at that point set a
 # REPO-level `CI_RUNNER=""` to override the org value, no workflow edit needed.
 jobs:
+  # No display name on check or helpers: the merge queue reads each job's check
+  # run by name, and the queue config names these jobs by their ids. A `name:`
+  # here renames the check run and every proof fails with a missing job.
+  # check: fmt, clippy and the workspace tests.
   check:
-    name: fmt + clippy + test
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       # Self-hosted runners reuse the workspace across jobs, and a container
@@ -87,8 +90,8 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # helpers: go vet and go test for goindex, plus pyindex and tsindex.
   helpers:
-    name: helpers (go vet + test, pyindex, tsindex)
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Reclaim workspace ownership (self-hosted runner hygiene)
