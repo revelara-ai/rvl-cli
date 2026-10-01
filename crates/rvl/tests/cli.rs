@@ -2855,7 +2855,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
-/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// GitRepository tracking a branch, and an Argo Experiment the family does not
 /// parse. Seed config-key specs cover the pin-shape and remediation keys.
 fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // The config lane is the subject; the code lane gets one unspecced Go
@@ -2882,7 +2882,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     .unwrap();
     std::fs::write(
         dir.join("deploy/rollout.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
     )
     .unwrap();
     let specs = dir.join("specs.json");
@@ -2940,7 +2940,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         stdout.contains("RC-050"),
         "the deciding spec's control rides into the ladder: {stdout}"
     );
-    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // The unparsed Argo Experiment is a product-identity sighting, never a
     // generic kubernetes one.
     assert!(
         stdout.contains("argo-rollouts (1)"),

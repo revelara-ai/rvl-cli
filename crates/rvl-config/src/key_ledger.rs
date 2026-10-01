@@ -73,6 +73,19 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("argo-cd", "application.syncPolicy.automated.selfHeal"),
     judged("argo-cd", "application.syncPolicy.retry"),
     judged("argo-cd", "application.targetRevision.shape"),
+    judged("argo-rollouts", "analysistemplate.metrics.count"),
+    judged(
+        "argo-rollouts",
+        "analysistemplate.metrics.without-condition",
+    ),
+    judged("argo-rollouts", "rollout.analysis"),
+    judged("argo-rollouts", "rollout.canary.steps.count"),
+    judged("argo-rollouts", "rollout.strategy"),
+    judged("cnpg", "cluster.backup.method"),
+    judged("cnpg", "cluster.backup.retentionPolicy"),
+    judged("cnpg", "cluster.backup.wal-archiving"),
+    judged("cnpg", "scheduledbackup.schedule"),
+    judged("cnpg", "scheduledbackup.suspend"),
     judged("dep-manifests", "cargo_toml.package.edition"),
     judged(
         "dep-manifests",
@@ -99,6 +112,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("flux", "kustomization.prune"),
     judged("flux", "kustomization.timeout"),
     judged("flux", "kustomization.wait"),
+    judged("gatekeeper", "constraint.enforcementAction"),
     judged("github-actions", "job.continue-on-error"),
     judged("github-actions", "job.permissions"),
     judged("github-actions", "job.timeout-minutes"),
@@ -129,6 +143,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "workload.strategy.max-surge"),
     judged("kubernetes", "workload.strategy.max-unavailable"),
     judged("kubernetes", "workload.strategy.type"),
+    judged("kyverno", "rule.validate.failureAction"),
     judged("prometheus-rules", "group.interval"),
     judged("prometheus-rules", "rule.annotations.runbook"),
     judged("prometheus-rules", "rule.expr"),
@@ -151,9 +166,31 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "the raw version constraint or ref; module.pin-class is its judgeable shape",
     ),
     judged("terraform", "provider.version-constraint"),
+    judged(
+        "terraform",
+        "resource.aws_db_instance.backup_retention_period",
+    ),
+    judged(
+        "terraform",
+        "resource.aws_rds_cluster.backup_retention_period",
+    ),
+    judged(
+        "terraform",
+        "resource.google_sql_database_instance.backup_configuration.enabled",
+    ),
+    judged(
+        "terraform",
+        "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
+    ),
     judged("terraform", "resource.lifecycle.prevent_destroy"),
     judged("terraform", "terraform.backend"),
+    vocabulary_only(
+        "terraform",
+        "terraform.module-kind",
+        "root, reusable or indeterminate; terraform.root-backend is the judgeable fact it gates",
+    ),
     judged("terraform", "terraform.required_version"),
+    judged("terraform", "terraform.root-backend"),
 ];
 
 /// The ledger entry for one emitted identity.
@@ -272,6 +309,7 @@ mod tests {
                 include_str!("kubernetes/manifest.rs"),
             ),
             ("kubernetes/mod.rs", include_str!("kubernetes/mod.rs")),
+            ("operators.rs", include_str!("operators.rs")),
             ("prometheus.rs", include_str!("prometheus.rs")),
             ("terraform.rs", include_str!("terraform.rs")),
         ]
@@ -373,13 +411,21 @@ mod tests {
 
     #[test]
     fn every_ledger_format_belongs_to_a_registered_retriever() {
-        // argo-flux is one retriever emitting under two tool identities.
+        // argo-flux and operator-crs are each one retriever emitting under
+        // several tool identities.
         let mut formats: Vec<&str> = crate::registry()
             .iter()
             .map(|r| r.format_id())
-            .filter(|f| *f != "argo-flux")
+            .filter(|f| !matches!(*f, "argo-flux" | "operator-crs"))
             .collect();
-        formats.extend(["argo-cd", "flux"]);
+        formats.extend([
+            "argo-cd",
+            "argo-rollouts",
+            "flux",
+            "cnpg",
+            "kyverno",
+            "gatekeeper",
+        ]);
         for e in EMITTED_KEYS {
             assert!(
                 formats.contains(&e.format),
@@ -433,7 +479,7 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        assert_eq!(q.vocabulary_only, 2);
+        assert_eq!(q.vocabulary_only, 3);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(
