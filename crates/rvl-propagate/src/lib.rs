@@ -83,6 +83,22 @@ fn snippet_timeout_arg(call: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// Whether the value text [`snippet_timeout_arg`] returned shows a literal: a
+/// number (`5`, `2.5`, the `10` of `10 * time.Second`), a quoted string, or
+/// the first element of a tuple (`(3, 10)`). Anything else -- a name, an
+/// attribute, a call, nothing at all -- is an expression whose value the text
+/// does not show.
+fn snippet_value_is_literal(value: &str) -> bool {
+    let v = value.trim_start_matches(['(', '[']);
+    let v = v.strip_prefix(['-', '+']).unwrap_or(v);
+    let mut chars = v.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() || c == '"' || c == '\'' => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 /// A schema-v2 constant argument whose KEYWORD NAME says it is a timeout.
 /// Name-keyed only: a bare positional constant says nothing about being a
 /// timeout — that would take the API's signature, which is spec knowledge.
@@ -848,15 +864,20 @@ fn judge(
                     // Its provenance is weaker (snippet text, not a resolved
                     // constant) and the reason says so.
                     //
-                    // A NON-CONSTANT argument (`timeout=cfg.Timeout`) still
-                    // credits a bound here, as it always has. Whether it should
-                    // abstain instead under a sentinel-declaring spec is a
-                    // large population and a measurable precision swing, so it
-                    // is gated on the eval set rather than assumed: po-av01j.59.
+                    // A NON-CONSTANT argument (`timeout=self.timeout`,
+                    // `{ timeout: opts.t }`) is a name, not a value. Under a
+                    // spec that declares sentinels it is the same ignorance as
+                    // the unfolded const_arg above and abstains the same way
+                    // (po-av01j.59); a spec that declares none still credits
+                    // it, as it always has.
                     if !value.is_empty() && spec.is_unbounded_sentinel(&value) {
                         unbounded.push(format!(
                             "the timeout argument at the call is the spec-declared unbounded sentinel {key}={value} (snippet text)"
                         ));
+                    } else if !spec.unbounded_sentinels.is_empty()
+                        && !snippet_value_is_literal(&value)
+                    {
+                        value_unresolved = true;
                     } else {
                         whole.push("timeout argument at the call".into());
                     }
@@ -2527,6 +2548,79 @@ mod tests {
             f.reason
         );
         assert!(f.reason.contains("did not resolve"), "{}", f.reason);
+    }
+
+    /// The v1 fallback over one snippet, under a spec declaring `sentinels`.
+    fn fallback(snippet: &str, sentinels: &[&str]) -> Finding {
+        let mut s = site();
+        s.snippet = snippet.into();
+        propagate(
+            &s,
+            &cache_with_sentinels(
+                vec![Mechanism::CallArg],
+                vec![],
+                sentinels.iter().map(|v| v.to_string()).collect(),
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_abstains_under_a_sentinel_declaring_spec() {
+        // po-av01j.59: `timeout=self.timeout` is a name, not a value. On an
+        // API where some values of that argument mean no bound, a value the
+        // lane cannot see is undecidable, so it routes to a human like the
+        // unfolded const_arg does -- and never to a violation.
+        for snippet in [
+            "pool.Query(sql, timeout=self.timeout)",
+            "queue.add('rebuild', data, { timeout: opts.t })",
+            "pool.Query(sql, timeout=get_timeout())",
+            "pool.Query(sql, timeout=)",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Abstain, "{snippet}: {}", f.reason);
+            assert!(f.reason.contains("did not resolve"), "{}", f.reason);
+        }
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_still_satisfies_without_declared_sentinels() {
+        // The parity guard: a spec that declares no sentinels says no value of
+        // the argument turns the bound off, so the v1 heuristic is untouched.
+        let f = fallback("pool.Query(sql, timeout=self.timeout)", &[]);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_literal_timeout_in_snippet_text_still_satisfies_under_a_sentinel_declaring_spec() {
+        // TypeScript reports no keyword names, so `{ timeout: 5000 }` only ever
+        // reaches the fallback. Text that shows a real value is a bound.
+        for snippet in [
+            "queue.add('rebuild', data, { timeout: 5000 })",
+            "pool.Query(sql, timeout=2.5)",
+            "pool.Query(sql, timeout=(3, 10))",
+            "pool.Query(sql, timeout='5s')",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Satisfies, "{snippet}: {}", f.reason);
+        }
+    }
+
+    #[test]
+    fn an_independent_bound_outranks_a_non_constant_timeout_argument() {
+        let mut s = site();
+        s.snippet = "pool.Query(sql, timeout=self.timeout)".into();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef sync():\n    pool.Query(sql, timeout=self.timeout)"
+                .into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
     }
 
     #[test]
