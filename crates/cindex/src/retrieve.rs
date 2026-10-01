@@ -18,23 +18,50 @@ use std::path::{Path, PathBuf};
 
 use clang_sys::*;
 
+use crate::engine::{self, Source};
 use crate::PACKET_SCHEMA;
+
+/// A loaded engine: its version string and where it came from.
+pub struct Engine {
+    pub version: String,
+    pub source: Source,
+}
 
 /// Load libclang at runtime and report its version string. Fails with
 /// actionable guidance when no library can be found — rvl surfaces this
 /// stderr, so a detected C/C++ repo fails CLOSED rather than silently
-/// under-reporting.
-pub fn load_engine() -> Result<String, String> {
+/// under-reporting. Which library loads is decided by [`crate::engine`]:
+/// LIBCLANG_PATH, then the vendored bundle, then (dev builds only) the system.
+pub fn load_engine() -> Result<Engine, String> {
+    let exe = std::env::current_exe().ok();
+    let source = engine::resolve(
+        std::env::var_os("LIBCLANG_PATH").as_deref(),
+        exe.as_deref(),
+        engine::REQUIRE_VENDORED,
+    )
+    .map_err(|e| format!("cindex requires libclang (engine pin po-ae75b.9): {e}"))?;
     if !clang_sys::is_loaded() {
-        clang_sys::load().map_err(|e| {
-            format!(
+        if let Source::Vendored { lib, .. } = &source {
+            // clang-sys searches only LIBCLANG_PATH when it is set, and a file
+            // path there names that exact library, so this pins the load to
+            // the bundle. Safe to set: nothing else runs yet (the helper is
+            // single-threaded and has not spawned anything).
+            std::env::set_var("LIBCLANG_PATH", lib);
+        }
+        clang_sys::load().map_err(|e| match &source {
+            Source::Vendored { lib, .. } => format!(
+                "cindex could not load its vendored libclang at {}: {e}. \
+                 Reinstall rvl, or point LIBCLANG_PATH at a libclang to override the pin.",
+                lib.display()
+            ),
+            _ => format!(
                 "cindex requires libclang (engine pin po-ae75b.9) and none could be loaded: {e}. \
                  Install one (e.g. `apt install libclang-dev`) or point LIBCLANG_PATH at it."
-            )
+            ),
         })?;
     }
     let version = unsafe { cx_string(clang_getClangVersion()) };
-    Ok(version)
+    Ok(Engine { version, source })
 }
 
 // --- packet shapes (field-for-field with the goindex/pyindex/tsindex contract) ---
@@ -82,6 +109,10 @@ struct SiteOut {
     lang: &'static str,
     const_args: Vec<ConstArgOut>,
     macro_expansion: bool,
+    /// "" = a classic G1 client call (the key is omitted, so G1 packets are
+    /// unchanged); [`SITE_KIND_SERVER_ENTRY`] = a G2 handler registration.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    site_kind: &'static str,
 }
 
 /// Repo-scoped retrieval accounting. Rides the same stream tagged by `kind`;
@@ -306,6 +337,36 @@ fn c_family(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Mirrors `rvl_core::SITE_KIND_SERVER_ENTRY`.
+const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
+
+/// The C free-function G2 candidate set: HTTP handler registrations of the
+/// embedded servers, mapped to their framework identity. Identity-driven like
+/// [`c_family`]: each name is a unique unmangled identifier of ONE library
+/// (civetweb and mongoose share the `mg_` prefix, not these names).
+/// RETRIEVAL, not judgement: which path is a health endpoint is the lane's
+/// question. `mg_match` is deliberately ABSENT: it is mongoose's general glob
+/// matcher and is a route only under the event-handler gate in `handle_call`.
+fn server_family(name: &str) -> Option<&'static str> {
+    match name {
+        "mg_set_request_handler" => Some("civetweb.mg_context"),
+        "mg_http_listen" => Some("mongoose.mg_mgr"),
+        "mg_http_match_uri" => Some(MONGOOSE_MESSAGE),
+        _ => None,
+    }
+}
+
+/// The identity of a mongoose route match (`mg_http_match_uri`, gated
+/// `mg_match`): the request message whose URI is matched.
+const MONGOOSE_MESSAGE: &str = "mongoose.mg_http_message";
+
+/// (client type, site kind) of a C free function on either identity table.
+fn c_identity(name: &str) -> Option<(&'static str, &'static str)> {
+    c_family(name)
+        .map(|f| (f, ""))
+        .or_else(|| server_family(name).map(|f| (f, SITE_KIND_SERVER_ENTRY)))
+}
+
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
 const STRONG_VERBS: &[&str] = &[
@@ -376,27 +437,29 @@ unsafe fn first_child(cursor: CXCursor) -> Option<CXCursor> {
     out
 }
 
-/// Depth-first search for a DeclRefExpr referencing an enum constant.
-unsafe fn find_enum_ref(cursor: CXCursor) -> Option<CXCursor> {
-    if clang_getCursorKind(cursor) == CXCursor_DeclRefExpr {
+/// Depth-first search for the declaration of kind `target` that a
+/// DeclRefExpr or MemberRefExpr under `cursor` references.
+unsafe fn find_ref_of_kind(cursor: CXCursor, target: CXCursorKind) -> Option<CXCursor> {
+    let kind = clang_getCursorKind(cursor);
+    if kind == CXCursor_DeclRefExpr || kind == CXCursor_MemberRefExpr {
         let r = clang_getCursorReferenced(cursor);
-        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == CXCursor_EnumConstantDecl {
+        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == target {
             return Some(r);
         }
     }
     extern "C" fn walk(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
-        let found = data as *mut Option<CXCursor>;
+        let state = data as *mut (CXCursorKind, Option<CXCursor>);
         unsafe {
-            if let Some(r) = find_enum_ref(c) {
-                *found = Some(r);
+            if let Some(r) = find_ref_of_kind(c, (*state).0) {
+                (*state).1 = Some(r);
                 return CXChildVisit_Break;
             }
         }
         CXChildVisit_Continue
     }
-    let mut found: Option<CXCursor> = None;
-    clang_visitChildren(cursor, walk, &mut found as *mut _ as CXClientData);
-    found
+    let mut state: (CXCursorKind, Option<CXCursor>) = (target, None);
+    clang_visitChildren(cursor, walk, &mut state as *mut _ as CXClientData);
+    state.1
 }
 
 /// Peel implicit casts / parens down to the interesting expression.
@@ -437,7 +500,7 @@ unsafe fn const_args_of(call: CXCursor) -> Vec<ConstArgOut> {
     let mut out = Vec::new();
     for i in 0..n.min(8) {
         let arg = clang_Cursor_getArgument(call, i as c_uint);
-        if let Some(e) = find_enum_ref(arg) {
+        if let Some(e) = find_ref_of_kind(arg, CXCursor_EnumConstantDecl) {
             out.push(ConstArgOut {
                 index: i as u32,
                 name: String::new(),
@@ -492,6 +555,11 @@ struct PendingSite {
     /// USR of a virtual callee: callee_candidates is finalized after the TU
     /// walk from the override counts (1 + in-TU overriding definitions).
     virtual_usr: Option<String>,
+    /// USR of the enclosing function of a mongoose `mg_match` route match:
+    /// the site is kept only when that function is a registered event
+    /// handler (decided after the TU walk; a handler is usually defined
+    /// before the `mg_http_listen` call that registers it).
+    handler_gate: Option<String>,
 }
 
 struct WalkState {
@@ -504,6 +572,9 @@ struct WalkState {
     /// base-method USR -> number of overriding definitions seen in this TU.
     override_counts: HashMap<String, u32>,
     pending: Vec<PendingSite>,
+    /// USRs of the functions this TU passes to `mg_http_listen` as the event
+    /// handler.
+    http_handlers: HashSet<String>,
     calls_unresolved: u32,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
@@ -511,6 +582,9 @@ struct WalkState {
     /// flag is set mechanically: a site whose offset falls inside one of
     /// these ranges sits in an expansion.
     macro_ranges: HashMap<String, Vec<(u32, u32)>>,
+    /// Appended to every TU's args: the engine's own needs (the vendored
+    /// bundle's `-resource-dir`), after the compile db's flags so they win.
+    engine_args: Vec<String>,
 }
 
 impl WalkState {
@@ -651,6 +725,8 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let client_type: String;
     let mut receiver = String::new();
     let mut virtual_usr: Option<String> = None;
+    let mut handler_gate: Option<String> = None;
+    let site_kind: &'static str;
 
     if callee_resolved {
         let ckind = clang_getCursorKind(callee);
@@ -660,10 +736,30 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         }
         match ckind {
             k if k == CXCursor_FunctionDecl => {
-                let Some(family) = c_family(&method) else {
+                if let Some((family, kind)) = c_identity(&method) {
+                    client_type = family.to_string();
+                    site_kind = kind;
+                } else if method == "mg_match" {
+                    // mongoose's glob matcher is a route match only when it
+                    // matches the request URI inside an event handler. The
+                    // handler half is decided after the TU walk.
+                    let Some(f) = st.fn_stack.last().copied() else {
+                        return;
+                    };
+                    let matches_uri = clang_Cursor_getNumArguments(call) > 0
+                        && find_ref_of_kind(clang_Cursor_getArgument(call, 0), CXCursor_FieldDecl)
+                            .is_some_and(|field| {
+                                cx_string(clang_getCursorSpelling(field)) == "uri"
+                            });
+                    if !matches_uri {
+                        return;
+                    }
+                    handler_gate = Some(cx_string(clang_getCursorUSR(f)));
+                    client_type = MONGOOSE_MESSAGE.to_string();
+                    site_kind = SITE_KIND_SERVER_ENTRY;
+                } else {
                     return;
-                };
-                client_type = family.to_string();
+                }
             }
             k if k == CXCursor_CXXMethod => {
                 if !st.compile_db_mode {
@@ -688,6 +784,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     return;
                 }
                 client_type = type_name;
+                site_kind = "";
                 if is_virtual {
                     virtual_usr = Some(cx_string(clang_getCursorUSR(callee)));
                 }
@@ -706,13 +803,14 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
-        let Some(family) = c_family(&method) else {
+        let Some((family, kind)) = c_identity(&method) else {
             if method.is_empty() {
                 st.calls_unresolved += 1;
             }
             return;
         };
         client_type = family.to_string();
+        site_kind = kind;
     } else {
         // Compile-db mode with an unresolved callee: the uninstantiated
         // template's dependent call lands here. Counted, never guessed.
@@ -722,6 +820,13 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
 
     if method.is_empty() {
         return;
+    }
+    if method == "mg_http_listen" && clang_Cursor_getNumArguments(call) > 2 {
+        // The event handler this listener dispatches to (argument 2).
+        if let Some(f) = find_ref_of_kind(clang_Cursor_getArgument(call, 2), CXCursor_FunctionDecl)
+        {
+            st.http_handlers.insert(cx_string(clang_getCursorUSR(f)));
+        }
     }
 
     let (symbol, enclosing_body) = match st.fn_stack.last().copied() {
@@ -758,8 +863,10 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
             lang: "c_cpp",
             const_args,
             macro_expansion,
+            site_kind,
         },
         virtual_usr,
+        handler_gate,
     });
 }
 
@@ -773,6 +880,7 @@ unsafe fn walk_tu(
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
+        .chain(st.engine_args.iter())
         .filter_map(|a| CString::new(a.as_bytes()).ok())
         .collect();
     let arg_ptrs: Vec<*const std::os::raw::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
@@ -800,6 +908,7 @@ unsafe fn walk_tu(
     st.fn_stack.clear();
     st.override_counts.clear();
     st.pending.clear();
+    st.http_handlers.clear();
     st.macro_ranges.clear();
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
@@ -809,10 +918,16 @@ unsafe fn walk_tu(
     );
     clang_visitChildren(root_cursor, visitor, st as *mut WalkState as CXClientData);
     // Finalize the mid tier: a virtual callee's ambiguity is 1 (its own
-    // definition) + the overriding definitions this TU declares.
+    // definition) + the overriding definitions this TU declares. A gated
+    // mongoose route match survives only inside a registered event handler.
     let sites = st
         .pending
         .drain(..)
+        .filter(|p| {
+            p.handler_gate
+                .as_ref()
+                .is_none_or(|usr| st.http_handlers.contains(usr))
+        })
         .map(|mut p| {
             if let Some(usr) = p.virtual_usr {
                 p.site.provenance.callee_candidates =
@@ -866,7 +981,7 @@ fn walk_no_db(root: &Path) -> (Vec<PathBuf>, u32) {
 
 /// Emit the packet stream for `root` to stdout.
 pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
-    load_engine().map_err(|e| anyhow::anyhow!(e))?;
+    let engine = load_engine().map_err(|e| anyhow::anyhow!(e))?;
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("cannot resolve --root {}: {e}", root.display()))?;
@@ -898,9 +1013,11 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         fn_stack: Vec::new(),
         override_counts: HashMap::new(),
         pending: Vec::new(),
+        http_handlers: HashSet::new(),
         calls_unresolved: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
+        engine_args: engine.source.parse_args(),
     };
 
     let stdout = std::io::stdout();
@@ -1008,5 +1125,27 @@ mod tests {
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
         assert_eq!(c_family("printf"), None);
+    }
+
+    #[test]
+    fn server_family_names_the_registrations_and_nothing_else() {
+        assert_eq!(
+            server_family("mg_set_request_handler"),
+            Some("civetweb.mg_context")
+        );
+        assert_eq!(server_family("mg_http_listen"), Some("mongoose.mg_mgr"));
+        assert_eq!(
+            server_family("mg_http_match_uri"),
+            Some("mongoose.mg_http_message")
+        );
+        // mg_match is a general glob matcher: it is a route only under the
+        // event-handler gate, never by name alone.
+        assert_eq!(server_family("mg_match"), None);
+        // Plain listeners and starts carry no HTTP route surface.
+        assert_eq!(server_family("mg_listen"), None);
+        assert_eq!(server_family("mg_start"), None);
+        // The two tables are disjoint: a client call is never a server entry.
+        assert_eq!(server_family("curl_easy_perform"), None);
+        assert_eq!(c_family("mg_http_listen"), None);
     }
 }

@@ -37,8 +37,9 @@ use crate::embedded_helpers;
 use crate::hook;
 use crate::hook::Status;
 use crate::{
-    detect_languages, detect_unsupported, embedded_for, find_on_path, language_is_incidental,
-    missing_helper_hint, node_path_for, resolve_helper, Config, HelperKind, Lang,
+    detect_languages, detect_unsupported, embedded_for, find_on_path, helper_drift,
+    language_is_incidental, missing_helper_hint, node_path_for, resolve_helper, Config, HelperKind,
+    Lang,
 };
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
@@ -398,7 +399,12 @@ fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
                 // THE SLOT IS THE POINT. "goindex resolved" is not a useful
                 // sentence; "goindex resolved from PATH when a bundled one
                 // exists" is the whole diagnosis.
-                let where_from = format!("{} ({})", h.path.display(), h.source);
+                // And when that file is not the build this binary ships, the
+                // same slot says so (po-8ozxg).
+                let drift = helper_drift(lang, &h)
+                    .map(|d| format!("; helper drift: {d}"))
+                    .unwrap_or_default();
+                let where_from = format!("{} ({}){drift}", h.path.display(), h.source);
                 match runtime_for(h.kind) {
                     // Native: no interpreter, but NOT "no runtime prereq" —
                     // probe what the scan will actually need (po-av01j.206).
@@ -799,7 +805,13 @@ fn apply_fixes(root: &Path) {
             rvl_cache::Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX),
         ) {
             let outcome = rvl_cache::sync(&store, &fetcher, &keyset, cfg.offline);
-            eprintln!("doctor --fix: spec cache: {outcome:?}");
+            match outcome {
+                rvl_cache::SyncOutcome::NotPublished { url } => eprintln!(
+                    "doctor --fix: spec cache: {}",
+                    rvl_cache::not_published_message(&url)
+                ),
+                outcome => eprintln!("doctor --fix: spec cache: {outcome:?}"),
+            }
         }
         acted = true;
     }

@@ -158,14 +158,16 @@ cargo build -p rvl --bin cindex --bin rustindex   # so the C/C++ e2e runs instea
 cargo test --workspace
 
 cd helpers/goindex && go mod verify && go vet ./... && go test ./...
-go run . -packet-schema                           # must print a schema version
+go run . -packet-schema                           # must print a schema version, then a content version
 ```
 
 Two of those are worth understanding rather than just satisfying. Building
 `cindex` matters because the C/C++ end-to-end tests skip themselves when the
 helper is absent, and a helper the suite never builds is a lane the suite
 never covers. `-packet-schema` must be printable without loading anything,
-because a consumer negotiates on that number before paying for a load.
+because a consumer negotiates on that number before paying for a load. Its
+second line, `content-version`, identifies the build of the helper, and the
+scan uses it to warn when the helper it found is not the one it ships.
 
 CI also greps the whole tree for an internal codename and fails the build if
 it appears anywhere, including in comments and docs. The product is Revelara

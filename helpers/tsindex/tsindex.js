@@ -30,6 +30,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -87,6 +88,20 @@ if (!ts || typeof ts.createProgram !== 'function' || !ts.sys) {
 // macro_expansion (always false for TypeScript, which has no macros;
 // mechanical for C/C++). v2 is a strict superset of v1.
 const PACKET_SCHEMA = 2;
+
+// contentVersion is the second line of the --packet-schema reply: which
+// tsindex this is. The schema integer says what SHAPE the stream has. It does
+// not move when the helper learns a new client surface, so a week-old tsindex
+// and today's answer the same "2" and scan differently. This is the first 12
+// hex digits of the sha256 of this file. rvl computes the same value for the
+// copy it ships and warns when the helper it found is a different one.
+function contentVersion() {
+  return crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(__filename))
+    .digest('hex')
+    .slice(0, 12);
+}
 
 // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes and
 // pyindex's MAX_SNIPPET_BYTES. A pathologically long function body should not
@@ -518,23 +533,61 @@ const NODE_BUILTINS = new Set(require('module').builtinModules);
 // `@app/db` would invent one. Reset per run (runRetrieve), because the test
 // harness drives several roots in one process.
 //
-// Read off the built program's options, which means aliases declared only in
-// a tsconfig this one `extends` are NOT seen: `readConfigFile` +
-// `parseJsonConfigFileContent` does not follow `extends` (a pre-existing
-// property of buildProgram, not of this pass). Such a specifier is attributed
-// to a package named after the alias, which matches no spec and abstains
-// downstream as no_spec -- noise, never a wrong verdict.
+// Read off the built program's options AND every tsconfig.json under the root
+// (see workspacePathAliases): monorepos declare `paths` per workspace, and the
+// root tsconfig -- the only one the program is built from -- often has none.
+// `extends` is followed in both, by parseJsonConfigFileContent.
 let _pathAliases = [];
-// Alias-shaped specifiers this run declined to attribute, for the abstain.
+// Specifiers this run declined to attribute, for the abstain: path aliases the
+// chase could not follow into source, and wildcard re-exports of a package.
 let _unmappableSpecifiers = new Set();
 // Specifiers this run DID attribute to a package. The two together are what
 // says whether syntax could see anything at all.
 let _mappedSpecifiers = new Set();
 
-function resetSyntacticState(options) {
-  _pathAliases = options && options.paths ? Object.keys(options.paths) : [];
+function resetSyntacticState(options, root) {
+  const aliases = new Set(options && options.paths ? Object.keys(options.paths) : []);
+  if (root) for (const a of workspacePathAliases(root)) aliases.add(a);
+  _pathAliases = [...aliases];
   _unmappableSpecifiers = new Set();
   _mappedSpecifiers = new Set();
+}
+
+// Directories neither workspace walk descends into: installed and vendored
+// trees, VCS state and build output.
+const WORKSPACE_WALK_SKIP = new Set([
+  'node_modules', '.git', 'dist', 'build', 'out', 'target', 'vendor',
+]);
+
+// workspacePathAliases collects the `paths` patterns of every tsconfig.json
+// under root, to the same depth and with the same skips as
+// missingDependencyTrees. Only the OPTIONS are wanted, so the host lists no
+// files: parsing must not glob a workspace's whole `include` for each config.
+function workspacePathAliases(root) {
+  const host = Object.assign({}, ts.sys, { readDirectory: () => [] });
+  const skip = WORKSPACE_WALK_SKIP;
+  const out = [];
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.isFile() && e.name === 'tsconfig.json')) {
+      const cfg = ts.readConfigFile(path.join(dir, 'tsconfig.json'), ts.sys.readFile);
+      if (cfg.config) {
+        const parsed = ts.parseJsonConfigFileContent(cfg.config, host, dir);
+        out.push(...Object.keys(parsed.options.paths || {}));
+      }
+    }
+    for (const e of entries) {
+      if (e.isDirectory() && !skip.has(e.name)) walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  walk(root, 0);
+  return out;
 }
 
 // A tsconfig path pattern holds at most one `*`, per the TypeScript contract.
@@ -563,19 +616,18 @@ function matchesPathAlias(spec) {
 // a `#` subpath import, or a tsconfig path alias. Subpaths are stripped the
 // same way `packageFromImport` strips them, so the two agree on the key.
 //
-// It also RECORDS what it saw, deliberately: every specifier syntax considers
-// passes through here exactly once per use, so this is the one place that can
-// say whether the run attributed anything at all -- which is what the abstain
-// in main() turns on.
+// It also RECORDS each package it attributes, deliberately: every specifier
+// syntax considers passes through here exactly once per use, so this is the
+// one place that can say whether the run attributed anything at all -- which
+// is what the abstain in main() turns on. A path alias is NOT recorded as
+// unmappable here: it may land on in-repo source that aliasTarget can follow,
+// so only a chase that fails (noteUnfollowable) records it.
 function externalPackageOf(spec) {
   if (!spec) return null;
   if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) return null;
   const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
   if (NODE_BUILTINS.has(bare) || NODE_BUILTINS.has(bare.split('/')[0])) return null;
-  if (matchesPathAlias(spec)) {
-    _unmappableSpecifiers.add(spec);
-    return null;
-  }
+  if (matchesPathAlias(spec)) return null;
   const parts = spec.split('/');
   let pkg;
   if (spec.startsWith('@')) {
@@ -589,49 +641,127 @@ function externalPackageOf(spec) {
   return pkg;
 }
 
-// importBindingOf reports how a symbol was bound by an import of an external
-// package: `{pkg, name, kind}` with kind `named` | `default` | `namespace`.
-// `name` is the EXPORTED name for a named import (`{ Pool as P }` is still
-// `Pool`, which is what the checker would have reported) and the local name
+// importBindingOf reports how a symbol was bound by an import -- or a
+// re-export (`export { Pool as PgPool } from 'pg'`) -- of an external package:
+// `{pkg, name, kind}` with kind `named` | `default` | `namespace`. `name` is
+// the EXPORTED name for a named binding (`{ Pool as P }` is still `Pool`,
+// which is what the checker would have reported) and the local name
 // otherwise, because a default export's own name is not written anywhere else.
 function importBindingOf(sym) {
   if (!sym || !sym.declarations) return null;
   for (const decl of sym.declarations) {
     let kind = null;
     let name = '';
-    let spec = null;
-    if (ts.isImportSpecifier(decl)) {
-      kind = 'named';
-      name = (decl.propertyName || decl.name).text;
+    if (ts.isImportSpecifier(decl) || ts.isExportSpecifier(decl)) {
+      const exported = (decl.propertyName || decl.name).text;
+      kind = exported === 'default' ? 'default' : 'named';
+      name = kind === 'default' ? decl.name.text : exported;
     } else if (ts.isImportClause(decl)) {
       kind = 'default';
       name = decl.name ? decl.name.text : '';
-    } else if (ts.isNamespaceImport(decl)) {
-      kind = 'namespace';
-      name = decl.name.text;
     } else if (
-      ts.isImportEqualsDeclaration(decl) &&
-      ts.isExternalModuleReference(decl.moduleReference) &&
-      ts.isStringLiteral(decl.moduleReference.expression)
+      ts.isNamespaceImport(decl) ||
+      ts.isNamespaceExport(decl) ||
+      ts.isImportEqualsDeclaration(decl)
     ) {
-      // `import fsx = require('fs-extra')`, the TS form of a CommonJS import.
+      // `import fsx = require('fs-extra')` is the TS form of a CommonJS import.
       kind = 'namespace';
       name = decl.name.text;
-      spec = decl.moduleReference.expression.text;
     } else {
       continue;
     }
-    if (spec === null) {
-      let imp = decl;
-      while (imp && !ts.isImportDeclaration(imp)) imp = imp.parent;
-      if (!imp || !ts.isStringLiteral(imp.moduleSpecifier)) continue;
-      spec = imp.moduleSpecifier.text;
-    }
-    const pkg = externalPackageOf(spec);
+    const spec = moduleSpecifierOf(decl);
+    const pkg = spec ? externalPackageOf(spec.text) : null;
     if (!pkg) continue;
     return { pkg, name, kind };
   }
   return null;
+}
+
+// moduleSpecifierOf is the string literal an import or re-export declaration
+// names, or null (a local `export { x }`, or a non-module `import x = N.y`).
+function moduleSpecifierOf(decl) {
+  if (ts.isImportEqualsDeclaration(decl)) {
+    const ref = decl.moduleReference;
+    return ts.isExternalModuleReference(ref) && ts.isStringLiteral(ref.expression)
+      ? ref.expression
+      : null;
+  }
+  let n = decl;
+  while (n && !ts.isImportDeclaration(n) && !ts.isExportDeclaration(n)) n = n.parent;
+  return n && n.moduleSpecifier && ts.isStringLiteral(n.moduleSpecifier) ? n.moduleSpecifier : null;
+}
+
+// aliasTarget follows an import/export alias THROUGH THE REPO'S OWN MODULES
+// (po-pk3fp.10): `import { pool } from './db'`, a barrel's
+// `export { Pool as PgPool } from 'pg'`, `export default pool`. The checker
+// resolves each hop whether or not node_modules exists, because these modules
+// are in the program -- only the last hop, into the package, is missing.
+//
+// Returns `{bind}` when the chain ends at an external package's import or
+// re-export, `{sym}` when it ends at a local declaration the caller can read
+// (a variable, a parameter, an `export default <expr>`), and null when a hop
+// cannot be followed, which noteUnfollowable records.
+function aliasTarget(sym, checker) {
+  let cur = sym;
+  for (let hop = 0; cur && hop < 8; hop++) {
+    const bind = importBindingOf(cur);
+    if (bind) return { bind };
+    if (!(cur.flags & ts.SymbolFlags.Alias)) return { sym: cur };
+    let next;
+    try {
+      next = checker.getImmediateAliasedSymbol(cur);
+    } catch (_e) {
+      next = undefined;
+    }
+    if (!next || next === cur || !next.declarations || next.declarations.length === 0) {
+      noteUnfollowable(cur, checker);
+      return null;
+    }
+    cur = next;
+  }
+  return null;
+}
+
+// noteUnfollowable names what stopped a chase, when it is one of the two
+// things only package CONTENTS could cross: a tsconfig path alias with no
+// in-repo source behind it, or a local module whose `export * from '<pkg>'`
+// might (or might not) be where the name comes from. Guessing the package in
+// the second case would be right beside one `export *` and wrong beside two,
+// so the receiver stays unattributed and the re-export is named instead.
+function noteUnfollowable(sym, checker) {
+  for (const decl of sym.declarations || []) {
+    const spec = moduleSpecifierOf(decl);
+    if (!spec) continue;
+    if (matchesPathAlias(spec.text)) {
+      _unmappableSpecifiers.add(spec.text);
+    } else {
+      const mod = symbolAt(spec, checker);
+      for (const pkg of packageStarExports(mod && mod.valueDeclaration, checker, new Set())) {
+        _unmappableSpecifiers.add(`export * from '${pkg}'`);
+      }
+    }
+  }
+}
+
+// packageStarExports lists the external specifiers a local module re-exports
+// with `export *`, following local `export * from './x'` chains.
+function packageStarExports(sf, checker, seen) {
+  if (!sf || !ts.isSourceFile(sf) || seen.has(sf)) return [];
+  seen.add(sf);
+  const out = [];
+  for (const st of sf.statements) {
+    if (!ts.isExportDeclaration(st) || st.exportClause) continue;
+    if (!st.moduleSpecifier || !ts.isStringLiteral(st.moduleSpecifier)) continue;
+    const text = st.moduleSpecifier.text;
+    if (text.startsWith('.') || text.startsWith('/')) {
+      const mod = symbolAt(st.moduleSpecifier, checker);
+      out.push(...packageStarExports(mod && mod.valueDeclaration, checker, seen));
+    } else if (!NODE_BUILTINS.has(text.replace(/^node:/, ''))) {
+      out.push(text);
+    }
+  }
+  return out;
 }
 
 function symbolAt(node, checker) {
@@ -661,7 +791,16 @@ function syntacticQualifiedName(entity, checker) {
     }
   }
   if (!ts.isIdentifier(root)) return '';
-  const bind = importBindingOf(symbolAt(root, checker));
+  // `db.Pool` on a LOCAL namespace import names a re-export inside ./db, which
+  // the checker can find even though the package it points at is missing.
+  if (trail.length > 0) {
+    const whole = aliasTarget(symbolAt(entity, checker), checker);
+    if (whole && whole.bind && whole.bind.kind !== 'namespace') {
+      return whole.bind.pkg + '.' + whole.bind.name;
+    }
+  }
+  const target = aliasTarget(symbolAt(root, checker), checker);
+  const bind = target && target.bind;
   if (!bind) return '';
   // `pg.Pool` through a namespace import: the package comes from the import,
   // the type name from what was written after it.
@@ -720,12 +859,19 @@ function syntacticClientType(node, checker, depth) {
   // giving up.
   const sym = symbolAt(node, checker);
   if (!sym) return chainRootPackage(node, checker, depth);
+  // Through the repo's own modules to where the receiver was really bound.
+  const target = aliasTarget(sym, checker);
+  if (!target) return chainRootPackage(node, checker, depth);
   // The receiver IS the import: a module object or namespace. Its type name
   // lives in the package, so the bare import path is the most this can say.
-  const bind = importBindingOf(sym);
+  const bind = target.bind;
   if (bind) return bind.kind === 'named' ? bind.pkg + '.' + bind.name : bind.pkg;
 
-  const decl = typedDeclarationOf(sym);
+  const decls = target.sym.declarations || [];
+  // `export default new Redis()`, reached from `import cache from './clients'`.
+  const assigned = decls.find((d) => ts.isExportAssignment(d));
+  if (assigned) return syntacticClientType(assigned.expression, checker, depth + 1);
+  const decl = typedDeclarationOf(target.sym);
   if (!decl) return chainRootPackage(node, checker, depth);
   // An annotation is the strongest signal and the one that reproduces the
   // checker's key: `private db: Pool` -> pg.Pool.
@@ -813,6 +959,25 @@ function _computeReturnsThenable(call, checker) {
   } catch (_e) {
     return true;
   }
+}
+
+// awaitedInSource is the medium-tier stand-in for callReturnsThenable, which
+// needs the package's declarations: the source's own statement that a call is
+// asynchronous. Its result is awaited, chained with `.then`, or returned from
+// an async function -- `return client.chat.completions.create(...)`, which
+// carries no I/O verb and is the LLM invocation surface. A synchronous builder
+// (`z.object()`, `axios.create()`, `express.Router()`) is none of these.
+function awaitedInSource(call) {
+  let n = call;
+  while (n.parent && ts.isParenthesizedExpression(n.parent)) n = n.parent;
+  const p = n.parent;
+  if (!p) return false;
+  if (ts.isAwaitExpression(p)) return true;
+  if (ts.isPropertyAccessExpression(p) && p.expression === n && p.name.text === 'then') return true;
+  let fn = null;
+  if (ts.isReturnStatement(p)) fn = enclosingFunction(p).node;
+  else if (ts.isArrowFunction(p) && p.body === n) fn = p;
+  return !!(fn && fn.modifiers && fn.modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
 }
 
 // checkerClientType is the primary resolver: the TypeChecker's answer, or null
@@ -1247,10 +1412,10 @@ function siteKey(rec) {
 function runRetrieve(root, snapshot, filesArg, includeTests) {
   const program = buildProgram(root);
   const checker = program.getTypeChecker();
-  // Syntactic attribution reads the program's own `paths`, so a tsconfig-less
-  // repo simply has no aliases. Reset per run rather than per process: the
+  // Syntactic attribution reads the program's `paths` plus every workspace
+  // tsconfig's, so a repo with no tsconfig anywhere simply has no aliases. Reset per run rather than per process: the
   // test harness drives several roots in one node.
-  resetSyntacticState(program.getCompilerOptions());
+  resetSyntacticState(program.getCompilerOptions(), root);
   const rootReal = fs.realpathSync(root);
 
   const relPathOf = (abs) => {
@@ -1396,7 +1561,8 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
   repoConfig.dependency_trees_uninstalled = uninstalled.length;
   repoConfig.dependency_trees_uninstalled_paths = [...uninstalled].sort();
   // Import specifiers syntax could not map to a package: tsconfig path
-  // aliases, which name a workspace directory rather than an npm package.
+  // aliases with no in-repo source behind them, and wildcard re-exports of a
+  // package (`export * from 'ioredis'`), whose names only its contents list.
   repoConfig.unmappable_specifiers = [..._unmappableSpecifiers].sort();
   return {
     records,
@@ -1621,14 +1787,15 @@ function siteFromCall(node, sf, relPath, snapshot, checker, program, rootReal, r
     // the file, which is precisely the zod/knex builder flood it was written
     // to stop (on infisical, 99.5% of resolved sites carried no I/O verb and
     // zod + knex builders were 86.5% of those). A gate that cannot evaluate
-    // must not wave things through: at `medium` a named I/O verb is required.
+    // must not wave things through: at `medium` the SOURCE has to say the
+    // call is asynchronous instead (awaitedInSource, po-pk3fp.10), or carry a
+    // named I/O verb.
     const namedIO = STRONG_IO_METHODS.has(method) || WEAK_IO_METHODS.has(method);
-    if (
-      namedIO ||
-      isJobRegistration(clientType, method) ||
-      (typeTier === 'high' &&
-        callReturnsThenable(node, checker, clientType + '.' + method))
-    ) {
+    const awaitable =
+      typeTier === 'high'
+        ? callReturnsThenable(node, checker, clientType + '.' + method)
+        : awaitedInSource(node);
+    if (namedIO || isJobRegistration(clientType, method) || awaitable) {
       emit = true;
       tier = typeTier;
     }
@@ -1903,7 +2070,7 @@ function hasNodeModulesUpTo(dir, root) {
 }
 
 function missingDependencyTrees(root) {
-  const skip = new Set(['node_modules', '.git', 'dist', 'build', 'out', 'target', 'vendor']);
+  const skip = WORKSPACE_WALK_SKIP;
   const missing = [];
   const walk = (dir, depth) => {
     if (depth > 4) return;
@@ -1949,7 +2116,9 @@ function main(argv) {
 
   // Let a consumer negotiate the contract before paying for a load.
   if (args.packetSchema) {
-    writeStdoutSync(String(PACKET_SCHEMA) + '\n');
+    writeStdoutSync(
+      String(PACKET_SCHEMA) + '\n' + 'content-version ' + contentVersion() + '\n'
+    );
     return 0;
   }
 
@@ -1980,13 +2149,21 @@ function main(argv) {
     // for what it recovered that way, and carries the dependency state on its
     // repo_config record so the degradation is never silent.
     //
-    // What syntax genuinely cannot cross is a tsconfig PATH ALIAS: `@app/db`
-    // names a workspace directory, and following it needs the package contents
-    // this tree does not have. When aliases are the only external imports
-    // there is nothing left to recover, and the original argument applies
-    // unchanged -- so that case still abstains, and names the aliases, which
-    // is the only actionable thing to say about it. Exit 3 is the helper
-    // ABSTAIN code rvl reads (po-av01j.102), surfacing as a COVERAGE line.
+    // What syntax genuinely cannot cross is a tsconfig PATH ALIAS with no
+    // in-repo source behind it, and a local `export * from '<pkg>'` whose
+    // names only the package contents list (po-pk3fp.10). When those are the
+    // only external imports there is nothing left to recover, and the
+    // original argument applies unchanged -- so that case still abstains, and
+    // names them, which is the only actionable thing to say about it. Exit 3
+    // is the helper ABSTAIN code rvl reads (po-av01j.102), surfacing as a
+    // COVERAGE line.
+    //
+    // The install it then asks for is the SCRIPT-FREE one (po-av01j.170).
+    // Type resolution needs the packages' declaration files and nothing an
+    // install script builds, so a plain `npm ci` is both more than the scan
+    // needs and less likely to work: it exits 1 on a repo whose native
+    // dependency cannot build on the user's toolchain, and it runs code from
+    // every package in the tree for someone who only asked for a scan.
     const { records, repoConfig, attribution } = runRetrieve(
       root,
       snapshot,
@@ -2001,14 +2178,20 @@ function main(argv) {
       process.stderr.write(
         `tsindex: ${repoConfig.dependency_trees_uninstalled} workspace(s) declare ` +
           `dependencies but have no installed node_modules, and every external ` +
-          `import goes through a tsconfig path alias ` +
+          `import goes through a tsconfig path alias or a wildcard re-export ` +
           `(${attribution.unmappable.slice(0, 3).join(', ')}` +
-          `${attribution.unmappable.length > 3 ? ', ...' : ''}), which names a ` +
-          `workspace directory rather than a package. Nothing here can be ` +
+          `${attribution.unmappable.length > 3 ? ', ...' : ''}), which only the ` +
+          `package contents can resolve. Nothing here can be ` +
           `attributed to a package without the installed tree, so tsindex ` +
           `abstains rather than reporting a near-empty scan as a complete one. ` +
-          `Install dependencies (npm ci / pnpm install --frozen-lockfile / ` +
-          `yarn install --immutable) and re-run.\n`,
+          `Install dependencies without their install scripts ` +
+          `(npm ci --ignore-scripts / pnpm install --frozen-lockfile ` +
+          `--ignore-scripts / yarn install --immutable --mode=skip-build) and ` +
+          `re-run: tsindex reads node_modules only to resolve types and runs ` +
+          `no package code, so native modules need not build. If the scan ` +
+          `still abstains because a package generates its types at install, ` +
+          `use the plain form (npm ci / pnpm install --frozen-lockfile / ` +
+          `yarn install --immutable).\n`,
       );
       return 3;
     }

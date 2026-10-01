@@ -6,6 +6,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// Locate the `cindex` executable.
 ///
 /// It is NOT a bin of this package — it is a bin of `rvl`
@@ -40,9 +49,7 @@ fn bin() -> Command {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join(name)
+    manifest_dir().join("testdata").join(name)
 }
 
 /// True when the runtime engine loads; otherwise logs a SKIP line.
@@ -320,6 +327,101 @@ fn no_db_fallback_is_the_extern_c_allowlist_at_low_tier() {
 }
 
 #[test]
+fn server_fixture_emits_civetweb_and_mongoose_registrations_as_server_entries() {
+    if !engine_available(
+        "server_fixture_emits_civetweb_and_mongoose_registrations_as_server_entries",
+    ) {
+        return;
+    }
+    let (sites, _records) = retrieve(&fixture("fixture-server"), &[]);
+    // Nothing in this fixture is a G1 client call: every record is a G2 entry.
+    for s in &sites {
+        assert_eq!(s["site_kind"], "server_entry", "site_kind stamp: {s}");
+        assert_eq!(s["provenance"]["client_type_resolved"], true, "{s}");
+    }
+
+    // civetweb: both registrations, the literal path in const_args, the
+    // dynamic one emitted WITHOUT a path (the lane abstains on it).
+    let civet = sites_with_method(&sites, "mg_set_request_handler");
+    assert_eq!(civet.len(), 2, "both civetweb registrations: {sites:?}");
+    let has_path = |s: &serde_json::Value, path: &str| {
+        s["const_args"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|c| c["value"] == format!("{path:?}")))
+    };
+    let health = civet
+        .iter()
+        .find(|s| has_path(s, "/healthz"))
+        .expect("the /healthz registration carries its literal path");
+    assert_eq!(health["client_type"], "civetweb.mg_context");
+    assert_eq!(health["symbol"], "serve");
+    assert_eq!(health["file_path"], "src/civet.c");
+    let dynamic = civet.iter().find(|s| !has_path(s, "/healthz")).unwrap();
+    assert!(
+        !dynamic["snippet"].as_str().unwrap().contains('"'),
+        "the dynamic registration carries no literal path: {dynamic}"
+    );
+
+    // mongoose: the listener registration.
+    let listens = sites_with_method(&sites, "mg_http_listen");
+    assert_eq!(listens.len(), 1, "the listener registration: {sites:?}");
+    assert_eq!(listens[0]["client_type"], "mongoose.mg_mgr");
+
+    // mongoose: route matches inside the REGISTERED event handler.
+    let uri_matches = sites_with_method(&sites, "mg_http_match_uri");
+    assert_eq!(uri_matches.len(), 1, "{sites:?}");
+    assert_eq!(uri_matches[0]["client_type"], "mongoose.mg_http_message");
+    assert!(has_path(uri_matches[0], "/api/users"), "{}", uri_matches[0]);
+
+    let matches = sites_with_method(&sites, "mg_match");
+    assert_eq!(
+        matches.len(),
+        1,
+        "only the uri match inside the registered handler is a route \
+         (not the method match, not the match outside a handler): {matches:?}"
+    );
+    assert_eq!(matches[0]["symbol"], "ev_handler");
+    assert_eq!(matches[0]["client_type"], "mongoose.mg_http_message");
+    assert!(
+        matches[0]["snippet"]
+            .as_str()
+            .is_some_and(|s| s.contains("\"/api/health\"")),
+        "the route path rides the snippet: {}",
+        matches[0]
+    );
+}
+
+#[test]
+fn g1_packets_carry_no_site_kind_key() {
+    if !engine_available("g1_packets_carry_no_site_kind_key") {
+        return;
+    }
+    // Absent means the classic G1 call site; the key must not appear at all,
+    // so pre-existing G1 streams stay byte-identical.
+    let (sites, _) = retrieve(&fixture("fixture-c"), &[]);
+    assert!(!sites.is_empty());
+    for s in &sites {
+        assert!(
+            s.get("site_kind").is_none(),
+            "G1 site grew a site_kind: {s}"
+        );
+    }
+}
+
+#[test]
+fn no_db_server_entry_is_emitted_at_low_tier() {
+    if !engine_available("no_db_server_entry_is_emitted_at_low_tier") {
+        return;
+    }
+    let (sites, _) = retrieve(&fixture("fixture-nodb"), &[]);
+    let regs = sites_with_method(&sites, "mg_set_request_handler");
+    assert_eq!(regs.len(), 1, "{sites:?}");
+    assert_eq!(regs[0]["site_kind"], "server_entry");
+    assert_eq!(regs[0]["client_type"], "civetweb.mg_context");
+    assert_eq!(regs[0]["provenance"]["client_type_resolved"], false);
+}
+
+#[test]
 fn files_filter_restricts_emission_to_the_named_files() {
     if !engine_available("files_filter_restricts_emission_to_the_named_files") {
         return;
@@ -351,4 +453,119 @@ fn unparseable_tus_are_counted_never_guessed() {
     let st = stats(&records);
     assert_eq!(st["tus_total"], 1);
     assert_eq!(st["tus_failed"], 1);
+}
+
+/// The built `cindex` installed in `<tmp>/bin`, with a vendored bundle beside
+/// it whose "library" is not a library. Needs no libclang on the machine.
+///
+/// The executable is a hard link, not a copy: a copy is open for writing while
+/// it is made, and a child forked by another test thread in that window holds
+/// the write descriptor until its own exec, so running the copy fails with
+/// "Text file busy" (po-jz4qz). A symlink would not do, because `cindex`
+/// finds its bundle beside its resolved path. The temp directory is under the
+/// profile directory so that the link never crosses a filesystem.
+fn install_with_broken_bundle() -> (tempfile::TempDir, PathBuf) {
+    let built = bin_path();
+    let tmp = tempfile::tempdir_in(built.parent().expect("target/<profile> directory")).unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let bundle = bin_dir.join("libclang");
+    std::fs::create_dir_all(bundle.join("include")).unwrap();
+    let lib = if cfg!(target_os = "macos") {
+        "libclang.dylib"
+    } else {
+        "libclang.so"
+    };
+    std::fs::write(bundle.join(lib), b"not a shared object").unwrap();
+    let exe = bin_dir.join(built.file_name().expect("cindex file name"));
+    std::fs::hard_link(&built, &exe).unwrap();
+    (tmp, exe)
+}
+
+/// The vendored bundle beside the executable is what loads (po-av01j.49),
+/// ahead of any system libclang: with a bundle whose library is garbage the
+/// probe must FAIL and name the bundle, even on a machine where the system
+/// search would have succeeded. Falling through to the system clang would
+/// make release scans depend on the machine again.
+#[test]
+fn engine_check_loads_the_vendored_bundle_before_the_system_libclang() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env_remove("LIBCLANG_PATH")
+        .output()
+        .expect("run the installed cindex");
+    assert!(
+        !out.status.success(),
+        "a broken vendored bundle must not be bypassed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    let bundle = exe
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("libclang");
+    assert!(
+        err.contains(&bundle.display().to_string()),
+        "the error must name the bundle it tried: {err}"
+    );
+}
+
+/// LIBCLANG_PATH stays the operator's override, bundle or not.
+#[test]
+fn libclang_path_overrides_the_vendored_bundle() {
+    let (_tmp, exe) = install_with_broken_bundle();
+    let out = Command::new(&exe)
+        .arg("--engine-check")
+        .env("LIBCLANG_PATH", "/nonexistent/po-av01j.49")
+        .output()
+        .expect("run the installed cindex");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("vendored"),
+        "LIBCLANG_PATH was set, so the bundle must not be consulted: {err}"
+    );
+}
+
+/// The installed executable must run at once while other threads fork
+/// (po-jz4qz). A forked child holds every descriptor of its parent until its
+/// own exec; if the install opens the executable for writing, the kernel
+/// refuses to run it during that window ("Text file busy").
+#[test]
+fn bundle_install_is_executable_at_once_while_other_threads_fork() {
+    const INSTALLERS: usize = 4;
+    const ROUNDS_PER_INSTALLER: usize = 50;
+    const FORKERS: usize = 8;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..FORKERS {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    bin().arg("--packet-schema").output().expect("run cindex");
+                }
+            });
+        }
+        let installers: Vec<_> = (0..INSTALLERS)
+            .map(|_| {
+                s.spawn(|| {
+                    for round in 0..ROUNDS_PER_INSTALLER {
+                        let (_tmp, exe) = install_with_broken_bundle();
+                        if let Err(e) = Command::new(&exe).arg("--packet-schema").output() {
+                            return Err(format!("round {round}: {e}"));
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        let results: Vec<_> = installers.into_iter().map(|h| h.join()).collect();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in results {
+            r.expect("installer thread")
+                .unwrap_or_else(|e| panic!("the installed cindex did not run: {e}"));
+        }
+    });
 }

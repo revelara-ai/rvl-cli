@@ -506,7 +506,7 @@ func main() {
 
 	// Lets a consumer negotiate before paying for a load.
 	if *schemaOnly {
-		fmt.Println(PacketSchema)
+		fmt.Print(handshake())
 		return
 	}
 

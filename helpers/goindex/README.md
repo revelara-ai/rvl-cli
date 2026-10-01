@@ -7,6 +7,12 @@ helper decides nothing about reliability, it only says what the code is.
     goindex -root <repo> -retrieve -files a.go,b.go     # incremental reload
     goindex -packet-schema                              # negotiate before loading
 
+`-packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of the helper's Go sources, which the binary embeds. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 Every emitted record carries:
 
 - `packet_schema` — the contract version (currently `2`). rvl absorbs

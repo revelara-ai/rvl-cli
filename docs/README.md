@@ -23,6 +23,7 @@ end.
 | --- | --- |
 | [The `--out` document contract](out-contract.md) | The machine-readable scan document (`rvl-scan/v1`) consumed by orchestrators; the external spec for `crates/rvl/src/out_doc.rs`. |
 | [Releasing](releasing.md) | Cutting a release, and how each retriever helper is packaged. |
+| [Test packets](test-packets.md) | Why hand-authored `--retrieved` test packets must be bound to a live helper run, and the per-lane audit. |
 
 The repository's top-level [README](../README.md) covers building, testing,
 workspace layout, and where a change goes.

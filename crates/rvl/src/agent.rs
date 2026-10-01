@@ -283,6 +283,18 @@ pub trait Adapter: Send {
     fn invoke(&self, prompt: &str) -> anyhow::Result<String>;
 }
 
+/// A shared adapter is still an adapter: the manual blend (`blend.rs`) sends
+/// several chunks through one resolved agent, and `adjudicate` moves its
+/// adapter into the budget thread.
+impl<A: Adapter + Sync + ?Sized> Adapter for std::sync::Arc<A> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn invoke(&self, prompt: &str) -> anyhow::Result<String> {
+        (**self).invoke(prompt)
+    }
+}
+
 /// Shell-out adapter: runs `argv... <prompt>` headless, captures stdout.
 /// The prompt rides as the final argument (batched sites are small by
 /// construction — see [`MAX_BATCH_SITES`]); stdin is closed.
@@ -648,6 +660,29 @@ pub fn render_agent_block(
             "2"
         )
     );
+    o.push_str(&render_verdict_lines(adj, outcome, truncated, color));
+    o
+}
+
+/// The body of an agent block under any header: failure lines, cleared and
+/// warned sites, and what stays undecided. Shared by the hook block above and
+/// the manual blend block (`blend.rs`), so the two can never word a verdict
+/// differently.
+pub fn render_verdict_lines(
+    adj: &Adjudication,
+    outcome: &Outcome,
+    truncated: usize,
+    color: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let paint = |s: &str, code: &str| {
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+    let mut o = String::new();
     if outcome.timed_out {
         let _ = writeln!(
             o,

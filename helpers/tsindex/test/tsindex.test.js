@@ -12,6 +12,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
+const crypto = require('node:crypto');
 
 const HERE = __dirname;
 const TSINDEX = path.join(HERE, '..', 'tsindex.js');
@@ -42,8 +43,23 @@ function repoConfig(...extra) {
 }
 
 test('--packet-schema prints 2', () => {
-  const out = run('--packet-schema').trim();
-  assert.strictEqual(out, '2');
+  // Line 1 stays the bare schema integer, so a consumer that reads only the
+  // first line of the reply keeps working.
+  const out = run('--packet-schema');
+  assert.strictEqual(out.split('\n')[0], '2');
+});
+
+test('--packet-schema reports this file\'s content version', () => {
+  // The handshake (po-8ozxg): rvl compares this value against the copy it
+  // ships, and computes it for a script by hashing the file. The two must be
+  // the same number or every tsindex reads as drifted.
+  const want = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(TSINDEX))
+    .digest('hex')
+    .slice(0, 12);
+  const out = run('--packet-schema');
+  assert.strictEqual(out.split('\n')[1], 'content-version ' + want);
 });
 
 test('retrieval emits records, each with schema and site_key', () => {
@@ -229,8 +245,9 @@ test('an unresolved receiver still emits a STRONG verb at low confidence', () =>
 
 test('construction of a resolved client is retrievable', () => {
   const records = retrieveRecords();
+  // service.ts constructs its pool in-file; crossmodule.ts imports one.
   const pool = records.find(
-    (r) => r.client_type === 'pg.Pool' && r.func === 'query',
+    (r) => r.client_type === 'pg.Pool' && r.func === 'query' && r.file_path === 'src/service.ts',
   );
   assert.ok(pool, 'expected the pool.query site');
   const sources = pool.client_construction.map((c) => c.source);
@@ -1033,4 +1050,247 @@ test('path aliases beside real imports do not poison the run', () => {
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// --- following the repo's OWN modules without node_modules (po-pk3fp.10) ---
+//
+// A client is usually constructed in one module and imported everywhere else,
+// so the specifier at the call site is `./db`, not `pg`. The TypeChecker
+// follows that import whether or not node_modules exists -- the repo's own
+// modules are in the program -- and syntax has to follow it too, through
+// named exports, barrels and default exports, down to the import of the
+// package that names the type.
+
+function writeTree(t, prefix, files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), typeof body === 'string' ? body : JSON.stringify(body));
+  }
+  return dir;
+}
+
+test('a client imported from a sibling module keeps its key on an uninstalled tree', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const keysIn = (sites) =>
+    sites
+      .filter((r) => r.file_path === 'src/crossmodule.ts')
+      .map((r) => r.site_key)
+      .sort();
+  const want = keysIn(retrieveRecords());
+  // Named export, namespace import, barrel re-export, default export of a
+  // construction, and a type re-exported under another name.
+  assert.strictEqual(want.length, 5, JSON.stringify(want));
+  assert.deepStrictEqual(keysIn(retrieveFrom(dir).sites), want);
+});
+
+test('an awaited SDK call keeps its site on an uninstalled tree', (t) => {
+  const dir = fixtureWithoutNodeModules(t);
+  const { sites } = retrieveFrom(dir);
+  // `client.chat.completions.create(...)` carries no I/O verb, so the installed
+  // run admits it through the checker's awaitability test, which cannot run
+  // without the package. The source says the same thing syntactically: the
+  // call's result is awaited or returned from an async function. The member
+  // type (`Completions`) lives in the package, so the key is one level coarser.
+  const creates = sites.filter((r) => r.func === 'create' && r.client_type === 'openai');
+  assert.deepStrictEqual(
+    creates.map((r) => `${r.file_path}:${r.line_number}`).sort(),
+    ['src/emitters.ts:58', 'src/llm.ts:11'],
+    JSON.stringify(sites.map((r) => [r.client_type, r.func, r.file_path, r.line_number])),
+  );
+  for (const r of creates) assert.strictEqual(r.provenance.confidence_tier, 'medium');
+});
+
+test('a wildcard re-export of a package is named, never guessed', (t) => {
+  // `export * from 'ioredis'` in a local barrel: whether `Redis` comes from
+  // ioredis is a fact about the package's CONTENTS, which the tree does not
+  // have. Guessing would be right here and wrong beside a second `export *`,
+  // so the receiver stays unattributed and the specifier is named.
+  const dir = writeTree(t, 'tsx-star-', {
+    'package.json': { name: 's', dependencies: { pg: '^8', ioredis: '^5' } },
+    'src/clients.ts': "export * from 'ioredis';\n",
+    'src/use.ts':
+      "import { Pool } from 'pg';\n" +
+      "import { Redis } from './clients';\n" +
+      'const pool = new Pool();\n' +
+      'const redis = new Redis();\n' +
+      "export async function go() { return [await pool.query('x'), await redis.get('k')]; }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.client_type}.${r.func}`),
+    ['pg.Pool.query'],
+    JSON.stringify(sites.map((r) => [r.client_type, r.func])),
+  );
+  assert.deepStrictEqual(cfg.unmappable_specifiers, ["export * from 'ioredis'"]);
+});
+
+test('a tree reachable only through wildcard re-exports abstains and names them', (t) => {
+  const dir = writeTree(t, 'tsx-staronly-', {
+    'package.json': { name: 's', dependencies: { ioredis: '^5' } },
+    'src/clients.ts': "export * from 'ioredis';\n",
+    'src/use.ts':
+      "import { Redis } from './clients';\n" +
+      'const redis = new Redis();\n' +
+      "export async function go() { return redis.get('k'); }\n",
+  });
+  let err;
+  try {
+    run('--retrieve', '--root', dir);
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, 'expected the abstain exit');
+  assert.strictEqual(err.status, 3, String(err.stderr));
+  assert.match(String(err.stderr), /export \* from 'ioredis'/);
+});
+
+test('path aliases declared in a nested workspace tsconfig are unmappable', (t) => {
+  // Monorepos declare `paths` per workspace. An alias the root tsconfig does
+  // not know is otherwise attributed to a package named `~`, which counts as
+  // attributed and can hold off the abstain on a tree that resolved nothing.
+  const dir = writeTree(t, 'tsx-nested-', {
+    'package.json': { name: 'root', private: true },
+    'packages/api/package.json': { name: 'api', dependencies: { pg: '^8' } },
+    'packages/api/tsconfig.json': {
+      compilerOptions: { baseUrl: '.', paths: { '~/*': ['src/*'] } },
+    },
+    'packages/api/src/use.ts':
+      "import { db } from '~/db';\nexport async function go() { return db.query('x'); }\n",
+  });
+  let err;
+  try {
+    run('--retrieve', '--root', dir);
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, 'every external import is an alias, so this must abstain');
+  assert.strictEqual(err.status, 3, String(err.stderr));
+  assert.match(String(err.stderr), /~\/db/);
+});
+
+test('a path alias from an extended tsconfig is honored', (t) => {
+  const dir = writeTree(t, 'tsx-extends-', {
+    'package.json': { name: 'e', dependencies: { pg: '^8' } },
+    'tsconfig.base.json': {
+      compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+    },
+    'tsconfig.json': { extends: './tsconfig.base.json', include: ['src/**/*.ts'] },
+    'src/use.ts':
+      "import { Pool } from 'pg';\n" +
+      "import { helper } from '@app/db';\n" +
+      'const pool = new Pool();\n' +
+      "export async function go() { return [await pool.query('x'), await helper.query('y')]; }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(sites.map((r) => `${r.client_type}.${r.func}`), ['pg.Pool.query']);
+  assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
+});
+
+test('a path alias onto in-repo source resolves through it', (t) => {
+  // The alias names a workspace directory, and that directory is right here:
+  // it is the package CONTENTS that are missing, not the repo's own source.
+  // Following the alias into it is what the checker does too.
+  const dir = writeTree(t, 'tsx-inrepo-', {
+    'package.json': { name: 'i', dependencies: { pg: '^8' } },
+    'tsconfig.json': {
+      compilerOptions: { baseUrl: '.', paths: { '@app/*': ['packages/*/src'] } },
+    },
+    'packages/db/src/index.ts': "import { Pool } from 'pg';\nexport const pool = new Pool();\n",
+    'src/use.ts':
+      "import { pool } from '@app/db';\nexport async function go() { return pool.query('x'); }\n",
+  });
+  const { sites, cfg } = retrieveFrom(dir);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.file_path}:${r.client_type}.${r.func}`),
+    ['src/use.ts:pg.Pool.query'],
+    JSON.stringify(sites.map((r) => [r.file_path, r.client_type, r.func])),
+  );
+  assert.deepStrictEqual(cfg.unmappable_specifiers, []);
+});
+
+// --- the abstain's install advice (po-av01j.170) ---
+//
+// tsindex reads node_modules for TYPE RESOLUTION only: it never loads or runs
+// a package. So the install it asks for must not be one that runs every
+// package's install scripts. A plain `npm ci` fails outright on a repo whose
+// native dependency cannot build on the user's toolchain (Online Boutique's
+// `pprof` on node 24), and asks someone who only wants a SCAN to execute
+// code from hundreds of packages.
+
+// A tree that abstains (its only external import is a wildcard re-export)
+// beside the package it depends on, whose install script cannot succeed.
+function treeWithUnbuildableDependency(t) {
+  const dir = writeTree(t, 'tsx-native-', {
+    'dep/package.json': {
+      name: 'nativeclient',
+      version: '1.0.0',
+      types: 'index.d.ts',
+      scripts: { install: 'node -e "process.exit(1)"' },
+    },
+    'dep/index.d.ts': 'export class Client { query(sql: string): Promise<string>; }\n',
+    'app/package.json': { name: 'app', dependencies: { nativeclient: 'file:../dep' } },
+    'app/src/clients.ts': "export * from 'nativeclient';\n",
+    'app/src/use.ts':
+      "import { Client } from './clients';\n" +
+      'const client = new Client();\n' +
+      "export async function go() { return client.query('SELECT 1'); }\n",
+  });
+  return path.join(dir, 'app');
+}
+
+function abstainMessage(root) {
+  try {
+    run('--retrieve', '--root', root);
+  } catch (e) {
+    assert.strictEqual(e.status, 3, String(e.stderr));
+    return String(e.stderr);
+  }
+  return assert.fail('expected the abstain exit');
+}
+
+test('the abstain advises the script-free install first, and says why', (t) => {
+  const msg = abstainMessage(treeWithUnbuildableDependency(t));
+  for (const form of [
+    'npm ci --ignore-scripts',
+    'pnpm install --frozen-lockfile --ignore-scripts',
+    'yarn install --immutable --mode=skip-build',
+  ]) {
+    assert.ok(msg.includes(form), `the abstain must name \`${form}\`: ${msg}`);
+  }
+  // The reason, in one line: what makes skipping the scripts safe to advise.
+  assert.match(msg, /only to resolve types/);
+  // The plain form survives as the FALLBACK, after the script-free one.
+  const plain = msg.search(/npm ci(?! --ignore-scripts)/);
+  assert.ok(plain > msg.indexOf('npm ci --ignore-scripts'), msg);
+});
+
+test('a script-free install resolves the abstain where the plain install fails', (t) => {
+  const app = treeWithUnbuildableDependency(t);
+  const npm = (...args) => {
+    try {
+      execFileSync(
+        'npm',
+        ['install', '--install-links', '--offline', '--no-audit', '--no-fund', ...args],
+        { cwd: app, encoding: 'utf8', stdio: 'pipe' },
+      );
+      return 0;
+    } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      return e.status;
+    }
+  };
+  const plain = npm();
+  if (plain === null) return t.skip('npm is not on PATH');
+  assert.notStrictEqual(plain, 0, 'the dependency must fail to build for this to prove anything');
+  abstainMessage(app);
+
+  assert.strictEqual(npm('--ignore-scripts'), 0);
+  const { sites, cfg } = retrieveFrom(app);
+  assert.deepStrictEqual(
+    sites.map((r) => `${r.client_type}.${r.func}`),
+    ['nativeclient.Client.query'],
+  );
+  assert.strictEqual(cfg.dependency_trees_uninstalled, 0);
 });

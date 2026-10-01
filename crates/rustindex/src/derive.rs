@@ -865,6 +865,8 @@ pub fn derive(
             test_files_skipped_paths: Vec::new(),
             // rustindex does not measure a retrieval denominator yet.
             retrieval: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
         },
     }
 }

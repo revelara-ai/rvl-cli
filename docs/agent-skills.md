@@ -24,6 +24,12 @@ installs keep working offline (`RVL_OFFLINE=1` or a network failure fall back
 to the verified cached copy). This surface only downloads; it never uploads
 anything.
 
+The server filters the content by your organization's intelligence tier, so
+the cached copy belongs to the API key and server that fetched it. An online
+install with a different key or server fetches again, also when the served
+version is the same. An offline install uses the cached copy and prints a
+warning when a different key or server fetched it.
+
 Verification is fail-closed: a server with no signing key configured (a
 self-hosted deployment, typically) refuses the install rather than installing
 unverified content. Set **`RVL_ALLOW_UNSIGNED_PLUGIN=1`** to opt out — the

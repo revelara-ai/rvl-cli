@@ -1,0 +1,53 @@
+# Reference job: rvl as the authoritative gate. Copy to
+# .github/workflows/rvl-gate.yml and mark the `rvl-gate` check as required in
+# the branch protection rule (or ruleset) for your default branch.
+#
+# A pre-commit hook judges the working tree and can be skipped with
+# `git commit --no-verify`. This job judges a commit: the pull request's merge
+# ref, and the merge queue's candidate when you use one. That is the content
+# that lands, so this check is the guard and the hook is the fast path.
+name: rvl-gate
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  rvl-gate:
+    runs-on: ubuntu-latest
+    steps:
+      # On pull_request this checks out refs/pull/N/merge: the PR head merged
+      # with the current base, not the PR head alone. Full history, so the
+      # base ref that --changed-only diverges from is reachable.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Put `rvl` on PATH here, pinned to a version. See "Install" in the rvl
+      # README for the supported channels.
+
+      # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
+      # lane that could not read the code. Both fail the job. A pull_request
+      # event exports GITHUB_BASE_REF; a merge_group event does not, so the
+      # base is passed in.
+      - name: Gate the change
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+          RVL_BASE_REF: ${{ github.event.merge_group.base_sha }}
+        run: rvl scan . --incremental --changed-only --strict
+
+      # The coverage assertion: every lane rvl claimed to scan read at least
+      # one site. A full scan, because the incremental path has no roll-call.
+      # Exit 3 is tolerated here: this step asks "was the code read", and the
+      # step above already gave the verdict on the change.
+      - name: Assert coverage
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: |
+          rvl scan . --strict --out findings.json || [ "$?" -eq 3 ]
+          jq -e '.coverage.lang_status
+                 | all(.state == "scanned" and ((.detail | tonumber?) // 0) > 0)' \
+            findings.json

@@ -35,6 +35,7 @@
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import sys
@@ -477,11 +478,25 @@ class FileIndex:
             return "", False
         return "", False
 
-    def constructions_for(self, recv, recv_str, client_type):
-        """Construction snippets bearing on this receiver, capped."""
+    def constructions_for(self, recv, recv_str, client_type, func_node=None):
+        """Construction snippets bearing on this receiver, capped.
+
+        A bare-name receiver constructed inside the enclosing function is a
+        LOCAL of it, so only that function's constructions reach the call: a
+        same-named variable in another function is a different object, and
+        attaching its construction made an unbounded `queue.Queue()` and a
+        bounded one indistinguishable at their `put` sites (po-av01j.231). A
+        name the function does not construct is the module's and keeps every
+        construction of it.
+        """
         out = []
         if isinstance(recv, ast.Name) and recv.id in self.ctor_by_var:
             out = self.ctor_by_var[recv.id]
+            if func_node is not None:
+                first = func_node.lineno
+                last = getattr(func_node, "end_lineno", None) or first
+                local = [c for c in out if first <= c["line"] <= last]
+                out = local or out
         elif recv_str in self.ctor_by_selfattr:
             out = self.ctor_by_selfattr[recv_str]
         elif (isinstance(recv, ast.Attribute)
@@ -806,7 +821,8 @@ def retrieve_file(abs_path, file_path, snapshot):
         line = node.lineno
         snippet = _segment(source, node)
         body = _segment(source, func_node) if func_node is not None else ""
-        constructions = idx.constructions_for(recv, recv_str, client_type)
+        constructions = idx.constructions_for(
+            recv, recv_str, client_type, func_node)
 
         record = {
             "packet_schema": PACKET_SCHEMA,
@@ -1050,6 +1066,19 @@ def emit_stats(snapshot, stats, n_sites, out=sys.stdout):
 # CLI
 # ---------------------------------------------------------------------------
 
+def content_version():
+    """The second line of the --packet-schema reply: which pyindex this is.
+
+    The schema integer says what SHAPE the stream has. It does not move when
+    the helper learns a new client surface, so a week-old pyindex and today's
+    answer the same "2" and scan differently. This is the first 12 hex digits
+    of the sha256 of this file. rvl computes the same value for the copy it
+    ships and warns when the helper it found is a different one.
+    """
+    with open(os.path.abspath(__file__), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pyindex",
@@ -1079,6 +1108,7 @@ def main(argv=None):
     # Lets a consumer negotiate the contract before paying for a load.
     if args.packet_schema:
         print(PACKET_SCHEMA)
+        print("content-version " + content_version())
         return 0
 
     if args.retrieve:

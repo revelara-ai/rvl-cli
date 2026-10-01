@@ -33,6 +33,18 @@
 //!     local-action rule).
 //!   * `resource.lifecycle.prevent_destroy` — explicit, else the documented
 //!     `false`.
+//!   * the RESOURCE-ATTRIBUTE lane (po-pk3fp.13) — a fixed table
+//!     ([`RESOURCE_ATTRS`]) of attributes the control frames ask about, each
+//!     with the provider-documented default for an absent attribute:
+//!     `resource.aws_db_instance.backup_retention_period` (`0`),
+//!     `resource.aws_rds_cluster.backup_retention_period` (`1`), and
+//!     `resource.google_sql_database_instance.backup_configuration.enabled` /
+//!     `.point_in_time_recovery_enabled` (`false`). No other resource
+//!     attribute is read. A `dynamic` block on the path is Unresolvable.
+//!   * `terraform.module-kind` (`root` | `reusable` | `indeterminate`) and,
+//!     for roots only, `terraform.root-backend` — the same fact as
+//!     `terraform.backend`, emitted where a missing backend is a finding and
+//!     nowhere else (see [`emit_module_kinds`]).
 //!
 //! Variable references resolve ONE hop and only to literals: a value that is
 //! exactly `var.x` consults the module directory's `variable "x"` default,
@@ -84,12 +96,33 @@ impl ConfigRetriever for Terraform {
         for f in files {
             dirs.entry(dir_of(&f.0)).or_default().push(f);
         }
-        for (_dir, mut group) in dirs {
+        // Whether a module is a root or a reusable one depends on who calls
+        // it, so the kind is settled only after every directory is read.
+        let mut modules: Vec<ModuleFacts> = Vec::new();
+        for (dir, mut group) in dirs {
             group.sort_by(|a, b| a.0.cmp(&b.0));
-            retrieve_dir(&group, snapshot_id, &mut out);
+            modules.extend(retrieve_dir(dir, &group, snapshot_id, &mut out));
         }
+        emit_module_kinds(&modules, snapshot_id, &mut out);
         out
     }
+}
+
+/// The repo-relative directory a LOCAL module source names, resolved against
+/// the calling module's directory. `None` when the path climbs out of the
+/// repo: nothing committed here says what is there.
+fn local_module_dir(caller_dir: &str, source: &str) -> Option<String> {
+    let mut parts: Vec<&str> = caller_dir.split('/').filter(|p| !p.is_empty()).collect();
+    for seg in source.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            seg => parts.push(seg),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// The directory part of a repo-relative path ("" for the repo root).
@@ -691,8 +724,168 @@ struct ProviderFact {
     key_path: String,
 }
 
+/// One documented fact about a resource type: the resource-attribute lane
+/// (po-pk3fp.13). A TABLE, not a generic attribute dump: every row is a key a
+/// control frame asks about, with the default the provider documents for an
+/// absent attribute. Anything not listed here is never read.
+struct ResourceAttr {
+    resource_type: &'static str,
+    packet_key: &'static str,
+    /// Nested blocks from the resource body down to the attribute.
+    blocks: &'static [&'static str],
+    attr: &'static str,
+    default: &'static str,
+    /// An attribute whose presence means this fact does not describe the
+    /// resource, so no packet is emitted.
+    unless_attr: Option<&'static str>,
+}
+
+const RESOURCE_ATTRS: &[ResourceAttr] = &[
+    // RC-030 / RC-054: 0 disables automated backups, and with them
+    // point-in-time recovery. A read replica is excluded: its source carries
+    // the backup posture, and the documented 0 would flag every replica.
+    ResourceAttr {
+        resource_type: "aws_db_instance",
+        packet_key: "resource.aws_db_instance.backup_retention_period",
+        blocks: &[],
+        attr: "backup_retention_period",
+        default: "0",
+        unless_attr: Some("replicate_source_db"),
+    },
+    ResourceAttr {
+        resource_type: "aws_rds_cluster",
+        packet_key: "resource.aws_rds_cluster.backup_retention_period",
+        blocks: &[],
+        attr: "backup_retention_period",
+        default: "1",
+        unless_attr: None,
+    },
+    ResourceAttr {
+        resource_type: "google_sql_database_instance",
+        packet_key: "resource.google_sql_database_instance.backup_configuration.enabled",
+        blocks: &["settings", "backup_configuration"],
+        attr: "enabled",
+        default: "false",
+        unless_attr: None,
+    },
+    ResourceAttr {
+        resource_type: "google_sql_database_instance",
+        packet_key: "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
+        blocks: &["settings", "backup_configuration"],
+        attr: "point_in_time_recovery_enabled",
+        default: "false",
+        unless_attr: None,
+    },
+];
+
+/// What a walk down a resource body for one [`ResourceAttr`] found.
+enum AttrLookup<'a> {
+    Found(&'a Value),
+    /// Decidably not authored: the documented default governs.
+    Absent,
+    /// A `dynamic` block stands where the path continues. Whether it renders
+    /// the block at all needs evaluation, so the default would be a guess.
+    Dynamic,
+}
+
+fn lookup_attr<'a>(body: &'a [Item], blocks: &[&str], attr: &str) -> AttrLookup<'a> {
+    let mut body = body;
+    for block in blocks {
+        if get_blocks(body, "dynamic").any(|d| d.labels.first().is_some_and(|l| l == block)) {
+            return AttrLookup::Dynamic;
+        }
+        match get_blocks(body, block).next() {
+            Some(b) => body = &b.body,
+            None => return AttrLookup::Absent,
+        }
+    }
+    match get_attr(body, attr) {
+        Some(v) => AttrLookup::Found(v),
+        None => AttrLookup::Absent,
+    }
+}
+
+/// What [`retrieve_dir`] learned about one module directory that only the
+/// whole claim can turn into a module kind.
+struct ModuleFacts {
+    dir: String,
+    /// The file module-level packets anchor to.
+    anchor: String,
+    /// The first sign this directory is applied directly: (file, key path).
+    root_signal: Option<(String, String)>,
+    /// The `terraform.backend` fact, re-emitted as `terraform.root-backend`
+    /// when the module turns out to be a root.
+    backend: ConfigPacket,
+    /// Local module calls made from here: (file, key path, target directory).
+    local_calls: Vec<(String, String, String)>,
+}
+
+/// Emit `terraform.module-kind` for every module, and `terraform.root-backend`
+/// for the roots (RC-016).
+///
+/// `terraform.backend = local` is a finding only where state is actually
+/// kept, and a reusable module legitimately declares no backend. So:
+///
+///   * called through a local `source` from another directory → `reusable`.
+///     This outranks every root signal: a legacy child module that configures
+///     its own provider is still a child.
+///   * otherwise a backend/cloud block, a provider configuration block, or an
+///     auto-loaded tfvars file → `root`. Terraform's own guidance is that a
+///     shared module declares no provider configuration.
+///   * neither → `indeterminate`, and NO root-backend packet: abstaining
+///     beats flagging a published module for lacking a backend.
+fn emit_module_kinds(modules: &[ModuleFacts], snapshot_id: &str, out: &mut Retrieved) {
+    // Target directory → the first call that names it from ANOTHER directory.
+    let mut callers: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
+    for m in modules {
+        for (file, key_path, target) in &m.local_calls {
+            if *target != m.dir {
+                callers.entry(target).or_insert((file, key_path));
+            }
+        }
+    }
+    for m in modules {
+        let (kind, step) = match (callers.get(m.dir.as_str()), &m.root_signal) {
+            (Some((file, key_path)), _) => {
+                ("reusable", ProvenanceStep::new(file, key_path, "explicit"))
+            }
+            (None, Some((file, key_path))) => {
+                ("root", ProvenanceStep::new(file, key_path, "explicit"))
+            }
+            (None, None) => (
+                "indeterminate",
+                ProvenanceStep::new(&m.anchor, "provider / backend / tfvars", "absent"),
+            ),
+        };
+        out.packets.push(ConfigPacket {
+            snapshot_id: snapshot_id.to_string(),
+            format: "terraform".to_string(),
+            file_path: m.anchor.clone(),
+            line: 0,
+            unit: "module".to_string(),
+            key: crate::key_ledger::declared("terraform", "terraform.module-kind"),
+            resolved_value: Some(kind.to_string()),
+            resolution: Resolution::AsAuthored,
+            provenance: vec![step],
+        });
+        if kind == "root" {
+            out.packets.push(ConfigPacket {
+                key: crate::key_ledger::declared("terraform", "terraform.root-backend"),
+                ..m.backend.clone()
+            });
+        }
+    }
+}
+
 /// Retrieve one module directory: `group` is path-sorted (rel, contents).
-fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrieved) {
+/// Returns the facts the module-kind pass needs, or `None` when the directory
+/// is not a module.
+fn retrieve_dir(
+    dir: &str,
+    group: &[&(String, String)],
+    snapshot_id: &str,
+    out: &mut Retrieved,
+) -> Option<ModuleFacts> {
     // Partition and parse. tfvars overlay order is the documented one:
     // terraform.tfvars first, then *.auto.tfvars lexically, later wins.
     let mut parsed_tf: Vec<(&str, Vec<Item>)> = Vec::new();
@@ -715,9 +908,13 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
             Err(()) => out.unparseable += 1,
         }
     }
+    let mut tfvars_signal: Option<(String, String)> = None;
     for (rel, contents) in tfvars_files {
         match parse_file(contents) {
             Ok(items) => {
+                // Auto-loaded values apply only to the module terraform is
+                // run in, so their presence marks a root.
+                tfvars_signal.get_or_insert_with(|| (rel.clone(), "tfvars".to_string()));
                 for it in items {
                     if let Item::Attr(name, v) = it {
                         let lit = match v {
@@ -732,7 +929,7 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
         }
     }
     if parsed_tf.is_empty() {
-        return; // a directory of only tfvars is not a module
+        return None; // a directory of only tfvars is not a module
     }
 
     // Variable declarations (first wins across path-sorted files).
@@ -766,7 +963,7 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
         file_path: file.to_string(),
         line: 0,
         unit: unit.to_string(),
-        key: key.to_string(),
+        key: crate::key_ledger::declared("terraform", key),
         resolved_value: value,
         resolution,
         provenance,
@@ -822,23 +1019,25 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
             .next()
             .map(|_| (*rel, "cloud".to_string(), false))
     });
-    match backend {
+    let mut root_signal: Option<(String, String)> = None;
+    let backend_packet = match backend {
         Some((rel, ty, is_backend)) => {
             let key_path = if is_backend {
                 format!("terraform.backend.{ty}")
             } else {
                 "terraform.cloud".to_string()
             };
-            out.packets.push(packet(
+            root_signal = Some((rel.to_string(), key_path.clone()));
+            packet(
                 rel,
                 "module",
                 "terraform.backend",
                 Some(ty),
                 Resolution::AsAuthored,
                 vec![ProvenanceStep::new(rel, &key_path, "explicit")],
-            ));
+            )
         }
-        None => out.packets.push(packet(
+        None => packet(
             anchor,
             "module",
             "terraform.backend",
@@ -848,8 +1047,9 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
                 ProvenanceStep::new(anchor, "terraform.backend", "absent"),
                 ProvenanceStep::new("", "backend", "platform-default"),
             ],
-        )),
-    }
+        ),
+    };
+    out.packets.push(backend_packet.clone());
 
     // provider.version-constraint: required_providers is authoritative; a
     // legacy `provider` block's `version` attribute only fills gaps.
@@ -887,6 +1087,9 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
             let Some(name) = b.labels.first() else {
                 continue;
             };
+            // A provider CONFIGURATION block: what a root module carries
+            // and a shared module is documented not to.
+            root_signal.get_or_insert_with(|| (rel.to_string(), format!("provider.{name}")));
             if providers.contains_key(name) {
                 continue;
             }
@@ -929,6 +1132,9 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
             )),
         }
     }
+
+    let root_signal = root_signal.or(tfvars_signal);
+    let mut local_calls: Vec<(String, String, String)> = Vec::new();
 
     // Module calls: source identity + class, and the pin facts by class.
     for (rel, items) in &parsed_tf {
@@ -1042,8 +1248,15 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
                     ));
                 }
                 // Local modules are repo-pinned by construction (their
-                // directory is walked like any other); other sources carry
-                // no pin identity this subset can vouch for.
+                // directory is walked like any other); the call is recorded
+                // because it is what makes the target a reusable module.
+                "local" => {
+                    if let Some(target) = local_module_dir(dir, &source) {
+                        local_calls.push((rel.to_string(), source_path.clone(), target));
+                    }
+                }
+                // Other sources carry no pin identity this subset can vouch
+                // for.
                 _ => {}
             }
         }
@@ -1087,8 +1300,49 @@ fn retrieve_dir(group: &[&(String, String)], snapshot_id: &str, out: &mut Retrie
                     ],
                 )),
             }
+
+            // The resource-attribute lane: only the rows of RESOURCE_ATTRS.
+            for row in RESOURCE_ATTRS.iter().filter(|r| r.resource_type == ty) {
+                if row
+                    .unless_attr
+                    .is_some_and(|a| get_attr(&b.body, a).is_some())
+                {
+                    continue;
+                }
+                let key_path = std::iter::once(format!("resource.{ty}.{name}"))
+                    .chain(row.blocks.iter().map(|s| s.to_string()))
+                    .chain(std::iter::once(row.attr.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let (value, resolution, prov) = match lookup_attr(&b.body, row.blocks, row.attr) {
+                    AttrLookup::Found(v) => resolve_value(rel, &key_path, v, &vars),
+                    AttrLookup::Absent => (
+                        Some(row.default.to_string()),
+                        Resolution::PlatformDefault,
+                        vec![
+                            ProvenanceStep::new(rel, &key_path, "absent"),
+                            ProvenanceStep::new("", row.attr, "platform-default"),
+                        ],
+                    ),
+                    AttrLookup::Dynamic => (
+                        None,
+                        Resolution::Unresolvable,
+                        vec![ProvenanceStep::new(rel, &key_path, "expression")],
+                    ),
+                };
+                out.packets
+                    .push(packet(rel, &unit, row.packet_key, value, resolution, prov));
+            }
         }
     }
+
+    Some(ModuleFacts {
+        dir: dir.to_string(),
+        anchor: anchor.to_string(),
+        root_signal,
+        backend: backend_packet,
+        local_calls,
+    })
 }
 
 #[cfg(test)]
@@ -1351,6 +1605,251 @@ module "local" {
                 .as_deref(),
             Some("cloud")
         );
+    }
+
+    // --- the resource-attribute lane (po-pk3fp.13) ---
+
+    #[test]
+    fn rds_backup_retention_is_authored_or_the_documented_default() {
+        let got = one(&[(
+            "db.tf",
+            "resource \"aws_db_instance\" \"main\" {\n  backup_retention_period = 7\n}\n\
+             resource \"aws_db_instance\" \"bare\" {\n  engine = \"postgres\"\n}\n\
+             resource \"aws_rds_cluster\" \"aurora\" {}\n",
+        )]);
+        let key = "resource.aws_db_instance.backup_retention_period";
+        let set = find(&got, "resource:aws_db_instance.main", key);
+        assert_eq!(set.resolved_value.as_deref(), Some("7"));
+        assert_eq!(set.resolution, Resolution::AsAuthored);
+        assert_eq!(
+            set.provenance[0].key_path,
+            "resource.aws_db_instance.main.backup_retention_period"
+        );
+        let bare = find(&got, "resource:aws_db_instance.bare", key);
+        assert_eq!(
+            bare.resolved_value.as_deref(),
+            Some("0"),
+            "the provider documents 0: no automated backups"
+        );
+        assert_eq!(bare.resolution, Resolution::PlatformDefault);
+        assert_eq!(bare.provenance.last().unwrap().role, "platform-default");
+        let aurora = find(
+            &got,
+            "resource:aws_rds_cluster.aurora",
+            "resource.aws_rds_cluster.backup_retention_period",
+        );
+        assert_eq!(aurora.resolved_value.as_deref(), Some("1"));
+        assert_eq!(aurora.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn a_resource_attribute_resolves_one_hop_through_a_variable() {
+        let got = one(&[
+            (
+                "db.tf",
+                "resource \"aws_db_instance\" \"main\" {\n  backup_retention_period = var.retention\n}\n",
+            ),
+            (
+                "variables.tf",
+                "variable \"retention\" {\n  default = 14\n}\n",
+            ),
+        ]);
+        let p = find(
+            &got,
+            "resource:aws_db_instance.main",
+            "resource.aws_db_instance.backup_retention_period",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some("14"));
+        assert_eq!(p.provenance.last().unwrap().role, "default");
+    }
+
+    #[test]
+    fn a_read_replica_emits_no_backup_retention_packet() {
+        // A replica's own retention is not the backup posture of the data:
+        // the source instance carries it. Emitting the documented 0 here
+        // would flag every replica.
+        let got = one(&[(
+            "db.tf",
+            "resource \"aws_db_instance\" \"replica\" {\n  replicate_source_db = aws_db_instance.main.identifier\n}\n",
+        )]);
+        assert!(
+            !got.packets
+                .iter()
+                .any(|p| p.key == "resource.aws_db_instance.backup_retention_period"),
+            "{:#?}",
+            got.packets
+        );
+    }
+
+    #[test]
+    fn cloud_sql_backup_facts_read_through_nested_blocks() {
+        let enabled = "resource.google_sql_database_instance.backup_configuration.enabled";
+        let pitr = "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled";
+        let got = one(&[(
+            "sql.tf",
+            "resource \"google_sql_database_instance\" \"main\" {\n  settings {\n    tier = \"db-f1-micro\"\n    backup_configuration {\n      enabled = true\n    }\n  }\n}\n\
+             resource \"google_sql_database_instance\" \"bare\" {\n  settings {\n    tier = \"db-f1-micro\"\n  }\n}\n",
+        )]);
+        let unit = "resource:google_sql_database_instance.main";
+        let e = find(&got, unit, enabled);
+        assert_eq!(e.resolved_value.as_deref(), Some("true"));
+        assert_eq!(e.resolution, Resolution::AsAuthored);
+        assert_eq!(
+            e.provenance[0].key_path,
+            "resource.google_sql_database_instance.main.settings.backup_configuration.enabled"
+        );
+        let p = find(&got, unit, pitr);
+        assert_eq!(p.resolved_value.as_deref(), Some("false"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+        let bare = find(&got, "resource:google_sql_database_instance.bare", enabled);
+        assert_eq!(bare.resolved_value.as_deref(), Some("false"));
+        assert_eq!(bare.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn a_dynamic_block_on_the_path_is_unresolvable_never_the_default() {
+        // `dynamic "backup_configuration"` may or may not render the block;
+        // answering with the documented default would be a guess.
+        let got = one(&[(
+            "sql.tf",
+            "resource \"google_sql_database_instance\" \"main\" {\n  settings {\n    dynamic \"backup_configuration\" {\n      for_each = var.backups\n      content {\n        enabled = true\n      }\n    }\n  }\n}\n",
+        )]);
+        let p = find(
+            &got,
+            "resource:google_sql_database_instance.main",
+            "resource.google_sql_database_instance.backup_configuration.enabled",
+        );
+        assert_eq!(p.resolved_value, None);
+        assert_eq!(p.resolution, Resolution::Unresolvable);
+        assert_eq!(p.provenance.last().unwrap().role, "expression");
+    }
+
+    #[test]
+    fn resources_outside_the_attribute_table_emit_no_attribute_packets() {
+        let got = one(&[(
+            "main.tf",
+            "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"logs\"\n}\n",
+        )]);
+        let keys: Vec<&str> = got
+            .packets
+            .iter()
+            .filter(|p| p.unit == "resource:aws_s3_bucket.logs")
+            .map(|p| p.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["resource.lifecycle.prevent_destroy"]);
+    }
+
+    // --- root vs reusable modules (po-pk3fp.13, RC-016) ---
+
+    fn module_kind(got: &Retrieved, file: &str) -> String {
+        got.packets
+            .iter()
+            .find(|p| p.key == "terraform.module-kind" && p.file_path == file)
+            .unwrap_or_else(|| panic!("no module-kind anchored at {file} in {:#?}", got.packets))
+            .resolved_value
+            .clone()
+            .unwrap()
+    }
+
+    fn root_backend<'a>(got: &'a Retrieved, file: &str) -> Option<&'a ConfigPacket> {
+        got.packets
+            .iter()
+            .find(|p| p.key == "terraform.root-backend" && p.file_path == file)
+    }
+
+    #[test]
+    fn a_provider_block_marks_a_root_module_and_its_missing_backend_is_judgeable() {
+        let got = one(&[(
+            "envs/prod/main.tf",
+            "provider \"aws\" {\n  region = \"us-east-1\"\n}\nresource \"a\" \"b\" {}\n",
+        )]);
+        assert_eq!(module_kind(&got, "envs/prod/main.tf"), "root");
+        let be = root_backend(&got, "envs/prod/main.tf").expect("a root module emits root-backend");
+        assert_eq!(be.resolved_value.as_deref(), Some("local"));
+        assert_eq!(be.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn a_backend_block_or_an_auto_loaded_tfvars_file_marks_a_root_module() {
+        let backend = one(&[(
+            "versions.tf",
+            "terraform {\n  backend \"gcs\" {\n    bucket = \"state\"\n  }\n}\n",
+        )]);
+        assert_eq!(module_kind(&backend, "versions.tf"), "root");
+        let be = root_backend(&backend, "versions.tf").unwrap();
+        assert_eq!(be.resolved_value.as_deref(), Some("gcs"));
+        assert_eq!(be.resolution, Resolution::AsAuthored);
+
+        let tfvars = one(&[
+            ("stack/main.tf", "resource \"a\" \"b\" {}\n"),
+            ("stack/terraform.tfvars", "region = \"us-east-1\"\n"),
+        ]);
+        assert_eq!(module_kind(&tfvars, "stack/main.tf"), "root");
+        assert!(root_backend(&tfvars, "stack/main.tf").is_some());
+    }
+
+    #[test]
+    fn a_locally_called_module_is_reusable_and_emits_no_root_backend() {
+        // The migration-257 abstention: a reusable module legitimately has no
+        // backend, so `terraform.backend = local` there is not a finding.
+        let got = one(&[
+            (
+                "examples/basic/main.tf",
+                "provider \"aws\" {}\nmodule \"vpc\" {\n  source = \"../..\"\n}\n",
+            ),
+            ("main.tf", "resource \"aws_vpc\" \"this\" {}\n"),
+            (
+                "modules/subnet/main.tf",
+                "provider \"aws\" {}\nresource \"aws_subnet\" \"this\" {}\n",
+            ),
+            (
+                "outputs.tf",
+                "module \"subnet\" {\n  source = \"./modules/subnet\"\n}\n",
+            ),
+        ]);
+        assert_eq!(module_kind(&got, "main.tf"), "reusable");
+        assert!(root_backend(&got, "main.tf").is_none());
+        // Being called outranks a provider block: a legacy child module that
+        // configures its own provider is still a child.
+        assert_eq!(module_kind(&got, "modules/subnet/main.tf"), "reusable");
+        assert!(root_backend(&got, "modules/subnet/main.tf").is_none());
+        assert_eq!(module_kind(&got, "examples/basic/main.tf"), "root");
+        // terraform.backend itself is unchanged for every module.
+        assert_eq!(
+            got.packets
+                .iter()
+                .filter(|p| p.key == "terraform.backend")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_module_with_no_signal_either_way_is_indeterminate() {
+        let got = one(&[("main.tf", "resource \"a\" \"b\" {}\n")]);
+        assert_eq!(module_kind(&got, "main.tf"), "indeterminate");
+        assert!(
+            root_backend(&got, "main.tf").is_none(),
+            "no root signal, no root-backend: abstaining beats flagging a reusable module"
+        );
+    }
+
+    #[test]
+    fn local_module_paths_normalize_against_the_calling_directory() {
+        assert_eq!(
+            local_module_dir("envs/prod", "../../modules/vpc"),
+            Some("modules/vpc".into())
+        );
+        assert_eq!(
+            local_module_dir("", "./modules/vpc"),
+            Some("modules/vpc".into())
+        );
+        assert_eq!(
+            local_module_dir("examples/basic", "../.."),
+            Some(String::new())
+        );
+        assert_eq!(local_module_dir("a", "./b//sub"), Some("a/b/sub".into()));
+        assert_eq!(local_module_dir("", "../outside"), None, "escapes the repo");
     }
 
     #[test]

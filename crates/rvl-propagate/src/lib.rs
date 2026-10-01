@@ -12,7 +12,7 @@
 
 use rvl_core::{ConstArg, CtxEvidence, Site, Snippet, Verdict};
 use rvl_spec::{
-    client_family, spec_gate, Bounds, ConfigSpec, DefaultBound, Family, Mechanism, Scope,
+    spec_gate, ApiSpec, Bounds, CapacityArg, ConfigSpec, DefaultBound, Family, Mechanism, Scope,
     ServedBound, SpecCache,
 };
 use std::collections::HashMap;
@@ -83,6 +83,22 @@ fn snippet_timeout_arg(call: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// Whether the value text [`snippet_timeout_arg`] returned shows a literal: a
+/// number (`5`, `2.5`, the `10` of `10 * time.Second`), a quoted string, or
+/// the first element of a tuple (`(3, 10)`). Anything else -- a name, an
+/// attribute, a call, nothing at all -- is an expression whose value the text
+/// does not show.
+fn snippet_value_is_literal(value: &str) -> bool {
+    let v = value.trim_start_matches(['(', '[']);
+    let v = v.strip_prefix(['-', '+']).unwrap_or(v);
+    let mut chars = v.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() || c == '"' || c == '\'' => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 /// A schema-v2 constant argument whose KEYWORD NAME says it is a timeout.
 /// Name-keyed only: a bare positional constant says nothing about being a
 /// timeout — that would take the API's signature, which is spec knowledge.
@@ -97,20 +113,76 @@ fn const_timeout_arg(site: &Site) -> Option<&ConstArg> {
 /// A decorator or annotation carrying a time bound. Looks at the decorators the
 /// retriever reported on chain roots and at the enclosing source, since a
 /// decorator sits textually above the function it bounds.
-fn has_bounding_decorator(site: &Site) -> bool {
-    const KEYS: [&str; 4] = ["time_limit", "soft_time_limit", "timeout", "deadline"];
+fn has_bounding_decorator(site: &Site, specs: &SpecCache) -> bool {
     let decorated = site
         .provenance
         .chain_roots
         .iter()
         .flat_map(|r| r.decorators.iter())
-        .any(|d| KEYS.iter().any(|k| d.contains(k)));
+        .any(|d| decorator_bounds(d, specs));
     decorated
         || site
             .enclosing_function_body
             .lines()
             .take_while(|l| l.trim_start().starts_with('@') || l.trim().is_empty())
-            .any(|l| KEYS.iter().any(|k| l.contains(k)))
+            .any(|l| decorator_bounds(l, specs))
+}
+
+/// Whether one decorator's text carries a time bound.
+///
+/// Any identifier mentioning a bound key credits one, as before, with ONE
+/// exception (po-av01j.58): a key given a value that a decorator spec for this
+/// decorator declares as "no bound". `@shared_task(time_limit=0)` switches
+/// celery's limit off, and crediting the key's mere presence was the same
+/// value-blind false pass po-av01j.25 removed from the call-arg path. Which
+/// values mean that is library knowledge, read off the decorator's own spec
+/// and never decided here: with no spec, every value credits as it did.
+///
+/// A disabled limit only withholds the credit. The decorator is ambient
+/// context, and the call may still carry a bound of its own, so the search
+/// goes on rather than calling the site unbounded.
+fn decorator_bounds(deco: &str, specs: &SpecCache) -> bool {
+    const KEYS: [&str; 4] = ["time_limit", "soft_time_limit", "timeout", "deadline"];
+    let text = deco.trim_start();
+    let callable = text
+        .trim_start_matches('@')
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    let mut rest = text;
+    while let Some(at) = rest.find(is_ident_char) {
+        let tail = &rest[at..];
+        let len = tail.find(|c| !is_ident_char(c)).unwrap_or(tail.len());
+        let (ident, after) = tail.split_at(len);
+        rest = after;
+        if !KEYS.iter().any(|k| ident.contains(k)) {
+            continue;
+        }
+        let disabled = KEYS.contains(&ident)
+            && keyword_value(after).is_some_and(|v| {
+                !v.is_empty() && specs.decorator_is_unbounded_sentinel(callable, v)
+            });
+        if !disabled {
+            return true;
+        }
+    }
+    false
+}
+
+/// The value a keyword argument is given, when `after` (the text following
+/// its name) opens with `=` or `:`: the token up to whitespace or an
+/// argument/call delimiter. None when the name is not being assigned.
+fn keyword_value(after: &str) -> Option<&str> {
+    let rest = after.trim_start();
+    let rest = rest
+        .strip_prefix('=')
+        .filter(|r| !r.starts_with('='))
+        .or_else(|| rest.strip_prefix(':').filter(|r| !r.starts_with(':')))?
+        .trim_start();
+    let end = rest
+        .find(|c: char| c.is_whitespace() || "),;]}".contains(c))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -398,6 +470,181 @@ fn is_served_request_root(site: &Site) -> bool {
         .any(|r| r.signature.contains("http.ResponseWriter"))
 }
 
+/// What one construction gives the spec's capacity argument.
+enum Capacity {
+    /// A positive integer literal: the receiver can fill, so the call blocks.
+    Finite,
+    /// Absent, zero or negative: no limit. Carries how it was written, for
+    /// the reason (`no maxsize`, `maxsize=0`).
+    Unbounded(String),
+    /// The constructor call or the argument's value could not be read.
+    Unreadable,
+}
+
+/// The top-level arguments of the first call to `name` in `src`, or `None`
+/// when `src` shows no such call or the call does not close. Brackets and
+/// string literals are skipped, so a comma inside either splits nothing.
+fn call_args<'a>(src: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let mut from = 0;
+    let open = loop {
+        let start = from + src[from..].find(name)?;
+        let end = start + name.len();
+        from = end;
+        if src[..start].chars().next_back().is_some_and(is_ident_char) {
+            continue;
+        }
+        let rest = &src[end..];
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('(') {
+            break end + (rest.len() - trimmed.len()) + 1;
+        }
+    };
+    let body = &src[open..];
+    let mut args = Vec::new();
+    let (mut depth, mut arg_start) = (0i32, 0);
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, ch) in body.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ')' => {
+                args.push(&body[arg_start..i]);
+                return Some(args);
+            }
+            ',' if depth == 0 => {
+                args.push(&body[arg_start..i]);
+                arg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read the capacity argument off one construction snippet.
+///
+/// The snippet carries the constructed TYPE in `symbol` and the statement in
+/// `source` (`q = queue.Queue(maxsize=10)`, or `q = Queue(10)` under a `from`
+/// import), so the constructor is the type's last path segment. Only an
+/// integer literal is read as a capacity: a name, an expression, or a `*`/`**`
+/// expansion that may carry the argument is unreadable, and the site abstains
+/// on it rather than guessing in either direction.
+fn capacity_of(c: &Snippet, arg: &CapacityArg) -> Capacity {
+    let ctor = c.symbol.rsplit('.').next().unwrap_or(&c.symbol);
+    if ctor.is_empty() {
+        return Capacity::Unreadable;
+    }
+    let Some(args) = call_args(&c.source, ctor) else {
+        return Capacity::Unreadable;
+    };
+    let mut value = None;
+    let mut position = 0;
+    for a in args.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        if a.starts_with('*') {
+            return Capacity::Unreadable;
+        }
+        let keyword = a.split_once('=').filter(|(k, v)| {
+            let k = k.trim();
+            !k.is_empty() && k.chars().all(is_ident_char) && !v.starts_with('=')
+        });
+        match keyword {
+            Some((k, v)) if k.trim() == arg.name => value = Some(v.trim()),
+            Some(_) => {}
+            // With no declared position a positional argument cannot be
+            // placed, and it may be the capacity.
+            None if arg.position.is_none() => return Capacity::Unreadable,
+            None => {
+                if arg.position == Some(position) {
+                    value = Some(a);
+                }
+                position += 1;
+            }
+        }
+    }
+    let Some(v) = value else {
+        return Capacity::Unbounded(format!("no {}", arg.name));
+    };
+    match v.replace('_', "").parse::<i64>() {
+        Ok(n) if n > 0 => Capacity::Finite,
+        Ok(_) => Capacity::Unbounded(format!("{}={v}", arg.name)),
+        Err(_) => Capacity::Unreadable,
+    }
+}
+
+/// Whether the call's premise -- a receiver that can fill -- holds at a site.
+enum CanBlock {
+    /// A construction gives the receiver a finite capacity: judge as usual.
+    Yes,
+    /// Every construction that reaches the receiver is unbounded.
+    No(String),
+    /// Not known; the reason says what was missing.
+    Unknown(String),
+}
+
+/// Read a spec's capacity precondition against the site's constructions
+/// (po-av01j.231).
+///
+/// `queue.Queue.put` blocks "if the queue is full", and a queue built with no
+/// `maxsize` is never full. One finite construction among those reaching the
+/// receiver is enough for the call to block. Clearing the site takes every
+/// one of them unbounded, and a construction that was not traced to the
+/// receiver, was not found, or whose capacity is not a literal leaves the
+/// question open: ignorance is not evidence, in either direction.
+fn can_block(site: &Site, spec: &ApiSpec, arg: &CapacityArg) -> CanBlock {
+    let premise = format!(
+        "{} blocks only on a {} with a finite {}",
+        spec.method, spec.type_name, arg.name
+    );
+    if site.client_construction_scope == rvl_core::CONSTRUCTION_SCOPE_TYPE {
+        return CanBlock::Unknown(format!(
+            "{premise}, and the construction that reaches this call was not traced"
+        ));
+    }
+    let Some(first) = site.client_construction.first() else {
+        return CanBlock::Unknown(format!(
+            "{premise}, and the construction of this one was not found"
+        ));
+    };
+    let mut unbounded = None;
+    let mut unreadable = None;
+    for c in &site.client_construction {
+        match capacity_of(c, arg) {
+            Capacity::Finite => return CanBlock::Yes,
+            Capacity::Unbounded(how) => {
+                unbounded.get_or_insert((how, c));
+            }
+            Capacity::Unreadable => {
+                unreadable.get_or_insert(c);
+            }
+        }
+    }
+    if let Some(c) = unreadable {
+        return CanBlock::Unknown(format!(
+            "{premise}, and its {} could not be read from the construction{}",
+            arg.name,
+            cite(c)
+        ));
+    }
+    let (how, c) = unbounded.unwrap_or_else(|| (format!("no {}", arg.name), first));
+    CanBlock::No(format!(
+        "cannot block: unbounded queue ({} constructed with {how}{})",
+        spec.type_name,
+        cite(c)
+    ))
+}
+
 /// Apply the specs to one site.
 pub fn propagate(
     site: &Site,
@@ -406,6 +653,47 @@ pub fn propagate(
     // Repo-level client bounds, resolved per I/O family. A call is broadened
     // only by its OWN family's bound (po-3t3oj.34), so one client's timeout can
     // never mask another family's unbounded calls.
+    client: &HashMap<Family, ServedBound>,
+) -> Finding {
+    let finding = judge(site, specs, served, client);
+    // The capacity precondition is read AFTER the judgment, and only over a
+    // site the judgment decided from evidence. A verdict the gates forced
+    // (no spec, non-blocking, wrong site kind, low confidence) never reached
+    // the question of a bound, and stays exactly as it was.
+    if !matches!(finding.verdict, Verdict::Violates | Verdict::Satisfies) {
+        return finding;
+    }
+    let Some((spec, arg)) = specs
+        .api(&site.api_key())
+        .and_then(|s| s.capacity_arg.as_ref().map(|a| (s, a)))
+    else {
+        return finding;
+    };
+    match can_block(site, spec, arg) {
+        CanBlock::Yes => finding,
+        // Not a flavour of Satisfies, even when the call carries a timeout:
+        // nothing is being bounded, because nothing can block.
+        CanBlock::No(reason) => Finding {
+            verdict: Verdict::NotApplicable,
+            reason,
+            ..finding
+        },
+        // A bound found is a bound whichever queue this is. A violation is
+        // not: it asserts the call can block, which is the unknown.
+        CanBlock::Unknown(reason) if finding.verdict == Verdict::Violates => Finding {
+            verdict: Verdict::Abstain,
+            reason,
+            ..finding
+        },
+        CanBlock::Unknown(_) => finding,
+    }
+}
+
+/// The deadline judgment for one site, before any capacity precondition.
+fn judge(
+    site: &Site,
+    specs: &SpecCache,
+    served: &ServedBound,
     client: &HashMap<Family, ServedBound>,
 ) -> Finding {
     let id = site.id();
@@ -512,6 +800,7 @@ pub fn propagate(
     let mut served_unresolved = false;
     let mut client_unresolved = false;
     let mut untraced_family = false;
+    let mut construction_unresolved = false;
     // An exact-type config spec for this client that names no bounding
     // field, so the site could not check it.
     let mut config_unresolved: Option<String> = None;
@@ -576,7 +865,7 @@ pub fn propagate(
     if has_session_bound(&scope_src) && !has_session_bound(&site.snippet) {
         whole.push("database session bound set in scope".into());
     }
-    if has_bounding_decorator(site) {
+    if has_bounding_decorator(site, specs) {
         whole.push("bounding decorator on the enclosing function".into());
     }
     for m in &spec.bounded_by {
@@ -631,15 +920,20 @@ pub fn propagate(
                     // Its provenance is weaker (snippet text, not a resolved
                     // constant) and the reason says so.
                     //
-                    // A NON-CONSTANT argument (`timeout=cfg.Timeout`) still
-                    // credits a bound here, as it always has. Whether it should
-                    // abstain instead under a sentinel-declaring spec is a
-                    // large population and a measurable precision swing, so it
-                    // is gated on the eval set rather than assumed: po-av01j.59.
+                    // A NON-CONSTANT argument (`timeout=self.timeout`,
+                    // `{ timeout: opts.t }`) is a name, not a value. Under a
+                    // spec that declares sentinels it is the same ignorance as
+                    // the unfolded const_arg above and abstains the same way
+                    // (po-av01j.59); a spec that declares none still credits
+                    // it, as it always has.
                     if !value.is_empty() && spec.is_unbounded_sentinel(&value) {
                         unbounded.push(format!(
                             "the timeout argument at the call is the spec-declared unbounded sentinel {key}={value} (snippet text)"
                         ));
+                    } else if !spec.unbounded_sentinels.is_empty()
+                        && !snippet_value_is_literal(&value)
+                    {
+                        value_unresolved = true;
                     } else {
                         whole.push("timeout argument at the call".into());
                     }
@@ -666,6 +960,10 @@ pub fn propagate(
                 let before = whole.len() + phase.len() + unbounded.len();
                 let scope = site.client_construction_scope.as_str();
                 let untraced = scope == rvl_core::CONSTRUCTION_SCOPE_TYPE;
+                // The receiver was traced to a value built where the
+                // retriever cannot read: no construction is attached, and
+                // finding none is not evidence that the client is unbounded.
+                construction_unresolved = scope == rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED;
                 // Both exact paths read the spec against the constructions
                 // the retriever attached to the site: the type match alone
                 // proved nothing when the bound is an optional field
@@ -717,13 +1015,16 @@ pub fn propagate(
                 // reading the value, so broadening would re-credit it.
                 // Nor is a call whose construction the retriever traced: the
                 // client that reaches it is known, and another client of the
-                // family bounds nothing about it.
+                // family bounds nothing about it. The same holds for a
+                // client built outside the repository.
                 if whole.len() + phase.len() + unbounded.len() == before
                     && config_unresolved.is_none()
                     && scope != rvl_core::CONSTRUCTION_SCOPE_RECEIVER
+                    && !construction_unresolved
                 {
-                    if let Some(bound) =
-                        client_family(&site.client_type).and_then(|f| client.get(&f))
+                    if let Some(bound) = specs
+                        .call_family(spec, &site.client_type)
+                        .and_then(|f| client.get(&f))
                     {
                         match bound {
                             // Untraced: the family bound is another client's.
@@ -798,6 +1099,19 @@ pub fn propagate(
             reason,
         };
     }
+    // The client is a dependency's value (po-av01j.232): cli/cli sends its
+    // requests on a client go-gh builds, under context.Background(). Whether
+    // that client carries a Timeout is written in the dependency, so the
+    // call is neither passed on the type nor failed on the missing field.
+    if construction_unresolved {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::Abstain,
+            reason: "the client that reaches this call is built outside this repository, \
+                     so its bound cannot be read here"
+                .into(),
+        };
+    }
     // Resolved sentinel with nothing else bounding the call: decided, and
     // stronger than the phase-only case below, because the value is not merely
     // a partial bound -- it is the bound switched off.
@@ -858,7 +1172,8 @@ mod tests {
     use super::*;
     use rvl_core::{Provenance, RootFact, Snippet};
     use rvl_spec::{
-        ApiSpec, Blocking, BlockingIntent, ConfigSpec, DefaultBound, Scope, ScopeSpec, SpecFile,
+        ApiSpec, Blocking, BlockingIntent, ConfigSpec, DecoratorSpec, DefaultBound, Scope,
+        ScopeSpec, SpecFile,
     };
     use std::collections::HashMap;
 
@@ -888,12 +1203,15 @@ mod tests {
                 unbounded_sentinels,
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs,
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -925,12 +1243,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -965,12 +1286,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: intent,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1165,12 +1489,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -1250,6 +1577,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared: false,
+            family: None,
         }
     }
 
@@ -1297,12 +1625,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs,
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         })
     }
 
@@ -1322,6 +1653,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared: false,
+            family: None,
         }
     }
 
@@ -1430,6 +1762,39 @@ mod tests {
     }
 
     #[test]
+    fn a_client_built_outside_the_repo_abstains_never_violates() {
+        // The receiver was traced to a dependency's call result: no
+        // construction is readable, and that is not evidence of no bound.
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED);
+        s.client_construction.clear();
+        // Another HTTP client the repo bounds says nothing about this one.
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &client,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(f.reason.contains("outside this repository"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_deadline_in_scope_bounds_a_client_built_outside_the_repo() {
+        let mut s = scoped(http_do_site(""), rvl_core::CONSTRUCTION_SCOPE_UNRESOLVED);
+        s.client_construction.clear();
+        s.enclosing_function_body =
+            "ctx, cancel := context.WithTimeout(ctx, time.Second)\nc.Do(req)".into();
+        let f = propagate(
+            &s,
+            &http_do_cache(vec![http_client_cfg(Bounds::WholeCall, &["Timeout"])]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
     fn an_untraced_sentinel_abstains_never_violates() {
         // Timeout: 0 on some other client of the type says nothing about this one.
         let mut cfg = http_client_cfg(Bounds::WholeCall, &["Timeout"]);
@@ -1490,12 +1855,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         }));
         let f = propagate(&s, &cache, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
@@ -1596,6 +1964,7 @@ mod tests {
                     default_bound: DefaultBound::Unknown,
                     unbounded_sentinels: vec![],
                     declared: false,
+                    family: None,
                 },
             ]),
             &ServedBound::None,
@@ -1863,12 +2232,15 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -1887,6 +2259,57 @@ mod tests {
         let client = HashMap::from([(Family::Database, ServedBound::Agreed(Bounds::WholeCall))]);
         let f = propagate(&s, &cache, &ServedBound::None, &client);
         assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    // A ClientConfig-bounded call on a type the keyword classifier misses.
+    fn untyped_db_call(family: Option<Family>) -> (Site, SpecCache) {
+        let (mut site, _) = db_call();
+        site.client_type = "orm.Repository".into();
+        let cache = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "orm.Repository".into(),
+                method: "query".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::ClientConfig],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+                family,
+                capacity_arg: None,
+            }],
+            ..Default::default()
+        });
+        (site, cache)
+    }
+
+    #[test]
+    fn an_authored_family_broadens_a_call_the_keywords_miss() {
+        let client = HashMap::from([(Family::Database, ServedBound::Agreed(Bounds::WholeCall))]);
+        // Untagged, a bare `Repository` has no family: still a finding.
+        let (s, cache) = untyped_db_call(None);
+        assert_eq!(
+            propagate(&s, &cache, &ServedBound::None, &client).verdict,
+            Verdict::Violates
+        );
+        // Tagged `database`, the Database family's bound reaches it.
+        let (s, cache) = untyped_db_call(Some(Family::Database));
+        let f = propagate(&s, &cache, &ServedBound::None, &client);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn an_authored_family_keeps_the_immich_guard() {
+        // The tag names ONE family; another family's bound still masks nothing.
+        let (s, cache) = untyped_db_call(Some(Family::Database));
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        assert_eq!(
+            propagate(&s, &cache, &ServedBound::None, &client).verdict,
+            Verdict::Violates
+        );
     }
 
     #[test]
@@ -2191,6 +2614,79 @@ mod tests {
         assert!(f.reason.contains("did not resolve"), "{}", f.reason);
     }
 
+    /// The v1 fallback over one snippet, under a spec declaring `sentinels`.
+    fn fallback(snippet: &str, sentinels: &[&str]) -> Finding {
+        let mut s = site();
+        s.snippet = snippet.into();
+        propagate(
+            &s,
+            &cache_with_sentinels(
+                vec![Mechanism::CallArg],
+                vec![],
+                sentinels.iter().map(|v| v.to_string()).collect(),
+            ),
+            &ServedBound::None,
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_abstains_under_a_sentinel_declaring_spec() {
+        // po-av01j.59: `timeout=self.timeout` is a name, not a value. On an
+        // API where some values of that argument mean no bound, a value the
+        // lane cannot see is undecidable, so it routes to a human like the
+        // unfolded const_arg does -- and never to a violation.
+        for snippet in [
+            "pool.Query(sql, timeout=self.timeout)",
+            "queue.add('rebuild', data, { timeout: opts.t })",
+            "pool.Query(sql, timeout=get_timeout())",
+            "pool.Query(sql, timeout=)",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Abstain, "{snippet}: {}", f.reason);
+            assert!(f.reason.contains("did not resolve"), "{}", f.reason);
+        }
+    }
+
+    #[test]
+    fn a_non_constant_timeout_argument_still_satisfies_without_declared_sentinels() {
+        // The parity guard: a spec that declares no sentinels says no value of
+        // the argument turns the bound off, so the v1 heuristic is untouched.
+        let f = fallback("pool.Query(sql, timeout=self.timeout)", &[]);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_literal_timeout_in_snippet_text_still_satisfies_under_a_sentinel_declaring_spec() {
+        // TypeScript reports no keyword names, so `{ timeout: 5000 }` only ever
+        // reaches the fallback. Text that shows a real value is a bound.
+        for snippet in [
+            "queue.add('rebuild', data, { timeout: 5000 })",
+            "pool.Query(sql, timeout=2.5)",
+            "pool.Query(sql, timeout=(3, 10))",
+            "pool.Query(sql, timeout='5s')",
+        ] {
+            let f = fallback(snippet, &["None", "0"]);
+            assert_eq!(f.verdict, Verdict::Satisfies, "{snippet}: {}", f.reason);
+        }
+    }
+
+    #[test]
+    fn an_independent_bound_outranks_a_non_constant_timeout_argument() {
+        let mut s = site();
+        s.snippet = "pool.Query(sql, timeout=self.timeout)".into();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=120)\ndef sync():\n    pool.Query(sql, timeout=self.timeout)"
+                .into();
+        let f = propagate(
+            &s,
+            &cache_with_sentinels(vec![Mechanism::CallArg], vec![], vec!["None".into()]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
     #[test]
     fn an_independent_bound_outranks_a_sentinel_no_false_positive() {
         // A sentinel says the call's OWN timeout is off, not that nothing
@@ -2236,12 +2732,15 @@ mod tests {
                 unbounded_sentinels: vec!["None".into()],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             scopes: vec![],
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            decorators: vec![],
         });
         let client = HashMap::from([(
             Family::Database,
@@ -2327,6 +2826,7 @@ mod tests {
                 default_bound: DefaultBound::Unknown,
                 unbounded_sentinels: vec![],
                 declared: false,
+                family: None,
             }],
         );
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
@@ -2346,6 +2846,96 @@ mod tests {
             propagate(&s, &specs, &ServedBound::None, &HashMap::new()).verdict,
             Verdict::Satisfies
         );
+    }
+
+    /// The Decorator-mechanism cache plus a celery decorator spec declaring
+    /// `0` and `None` as the values that switch a task's limit off
+    /// (po-av01j.58).
+    fn cache_with_celery_decorator_spec() -> SpecCache {
+        let mut specs = cache(vec![Mechanism::Decorator], vec![]);
+        specs.merge(SpecCache::from_file(SpecFile {
+            decorators: vec![DecoratorSpec {
+                identity: "celery.shared_task".into(),
+                names: vec!["shared_task".into(), "task".into()],
+                unbounded_sentinels: vec!["0".into(), "None".into()],
+                confidence: 0.9,
+                rationale: String::new(),
+            }],
+            ..Default::default()
+        }));
+        specs
+    }
+
+    fn credits_decorator(s: &Site, specs: &SpecCache) -> bool {
+        propagate(s, specs, &ServedBound::None, &HashMap::new())
+            .reason
+            .contains("bounding decorator")
+    }
+
+    #[test]
+    fn a_decorator_limit_set_to_a_declared_sentinel_is_not_a_bound() {
+        // po-av01j.58: @shared_task(time_limit=0) and time_limit=None switch
+        // celery's limit OFF. Crediting the key's mere presence is the same
+        // value-blind false pass po-av01j.25 removed from the call-arg path.
+        let specs = cache_with_celery_decorator_spec();
+        for deco in [
+            "@shared_task(time_limit=0)",
+            "@shared_task(time_limit=None)",
+            "@app.task(bind=True, time_limit = 0, soft_time_limit=None)",
+        ] {
+            let mut s = site();
+            s.enclosing_function_body = format!("{deco}\ndef build_report():\n    db.query()");
+            let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
+            assert_ne!(f.verdict, Verdict::Satisfies, "{deco}: {}", f.reason);
+            assert!(
+                !f.reason.contains("bounding decorator"),
+                "{deco}: {}",
+                f.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_retriever_reported_decorator_is_value_aware_too() {
+        let specs = cache_with_celery_decorator_spec();
+        let mut s = site();
+        s.provenance.chain_roots = vec![RootFact {
+            decorators: vec!["@shared_task(time_limit=0)".into()],
+            ..Default::default()
+        }];
+        assert!(!credits_decorator(&s, &specs));
+        s.provenance.chain_roots[0].decorators = vec!["@shared_task(time_limit=120)".into()];
+        assert!(credits_decorator(&s, &specs));
+    }
+
+    #[test]
+    fn one_real_limit_on_the_decorator_still_bounds_the_task() {
+        // A soft limit of 60s is a real bound even when the hard limit is off.
+        let specs = cache_with_celery_decorator_spec();
+        let mut s = site();
+        s.enclosing_function_body =
+            "@shared_task(time_limit=0, soft_time_limit=60)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &specs));
+        // An unresolved value is not a sentinel: a name proves nothing either
+        // way, and the pre-.58 answer stands.
+        s.enclosing_function_body =
+            "@shared_task(time_limit=settings.LIMIT)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &specs));
+    }
+
+    #[test]
+    fn without_a_decorator_spec_a_sentinel_value_still_credits_as_before() {
+        // Which values disable a bound is library knowledge. No spec, no
+        // knowledge: propagation hard-codes nothing and behaves as it did.
+        let mut s = site();
+        s.enclosing_function_body = "@shared_task(time_limit=0)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(
+            &s,
+            &cache(vec![Mechanism::Decorator], vec![])
+        ));
+        // And a spec for a DIFFERENT decorator does not reach this one.
+        s.enclosing_function_body = "@retry(timeout=0)\ndef f():\n    db.query()".into();
+        assert!(credits_decorator(&s, &cache_with_celery_decorator_spec()));
     }
 
     #[test]
@@ -2447,6 +3037,8 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
             }],
             configs: vec![],
             config_keys: vec![],
@@ -2458,6 +3050,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: "local tooling fails open".into(),
             }],
+            decorators: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
@@ -2496,5 +3089,240 @@ mod tests {
             propagate(&site(), &specs, &conflict, &HashMap::new()).verdict,
             Verdict::Violates
         );
+    }
+
+    // --- capacity precondition: a put on an unbounded queue (po-av01j.231) ---
+
+    /// The served `queue.Queue.put` spec, plus the capacity argument: blocking,
+    /// bounded by its own `timeout=`, `None` meaning no bound.
+    fn queue_cache(capacity_arg: Option<rvl_spec::CapacityArg>) -> SpecCache {
+        SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "queue.Queue".into(),
+                method: "put".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::CallArg],
+                confidence: 1.0,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec!["None".into()],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg,
+            }],
+            configs: vec![],
+            scopes: vec![],
+            config_keys: vec![],
+            server: vec![],
+            emissions: vec![],
+            decorators: vec![],
+        })
+    }
+
+    fn maxsize() -> Option<rvl_spec::CapacityArg> {
+        Some(rvl_spec::CapacityArg {
+            name: "maxsize".into(),
+            position: Some(0),
+        })
+    }
+
+    /// `q.put(x)` with the given construction statements traced to `q`.
+    fn put_site(constructions: &[&str]) -> Site {
+        Site {
+            file_path: "client.py".into(),
+            line_number: 418,
+            method: "put".into(),
+            client_type: "queue.Queue".into(),
+            snippet: "q.put(x)".into(),
+            client_construction: constructions
+                .iter()
+                .enumerate()
+                .map(|(i, src)| Snippet {
+                    file: "client.py".into(),
+                    line: 54 + i as u32,
+                    symbol: "queue.Queue".into(),
+                    source: (*src).into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn put(constructions: &[&str]) -> Finding {
+        propagate(
+            &put_site(constructions),
+            &queue_cache(maxsize()),
+            &ServedBound::None,
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn put_on_a_queue_built_with_no_maxsize_cannot_block() {
+        let f = put(&["q = queue.Queue()"]);
+        assert_eq!(f.verdict, Verdict::NotApplicable);
+        assert_eq!(
+            f.reason,
+            "cannot block: unbounded queue (queue.Queue constructed with no maxsize at client.py:54)"
+        );
+    }
+
+    #[test]
+    fn a_zero_or_negative_maxsize_is_unbounded_too() {
+        for src in [
+            "q = queue.Queue(maxsize=0)",
+            "q = queue.Queue(0)",
+            "q = Queue(-1)",
+            "self._q: Queue = Queue( maxsize = -1 )",
+        ] {
+            let f = put(&[src]);
+            assert_eq!(f.verdict, Verdict::NotApplicable, "{src}");
+            assert!(
+                f.reason.starts_with("cannot block: unbounded queue"),
+                "{src}"
+            );
+        }
+        assert_eq!(
+            put(&["q = queue.Queue(maxsize=0)"]).reason,
+            "cannot block: unbounded queue (queue.Queue constructed with maxsize=0 at client.py:54)"
+        );
+    }
+
+    /// The other half of the pair: a real capacity leaves the site exactly as
+    /// it was, byte for byte.
+    #[test]
+    fn put_on_a_bounded_queue_with_no_timeout_still_violates() {
+        for src in [
+            "q = queue.Queue(maxsize=10)",
+            "q = queue.Queue(10)",
+            "q = Queue(1_000)",
+        ] {
+            let f = put(&[src]);
+            assert_eq!(f.verdict, Verdict::Violates, "{src}");
+            assert_eq!(
+                f.reason, "no bound anywhere and the search was complete",
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bounded_queue_with_a_timeout_still_satisfies() {
+        let mut s = put_site(&["q = queue.Queue(maxsize=10)"]);
+        s.snippet = "q.put(x, timeout=5)".into();
+        let f = propagate(
+            &s,
+            &queue_cache(maxsize()),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn a_put_whose_construction_was_not_found_abstains() {
+        let f = put(&[]);
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert_eq!(
+            f.reason,
+            "put blocks only on a queue.Queue with a finite maxsize, and the construction of this one was not found"
+        );
+    }
+
+    /// goindex's `type` scope: the constructions are candidates of the type
+    /// found elsewhere, so they say nothing about this receiver.
+    #[test]
+    fn an_untraced_construction_abstains_rather_than_clearing_the_site() {
+        let mut s = put_site(&["q = queue.Queue()"]);
+        s.client_construction_scope = rvl_core::CONSTRUCTION_SCOPE_TYPE.into();
+        let f = propagate(
+            &s,
+            &queue_cache(maxsize()),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+    }
+
+    #[test]
+    fn a_maxsize_that_is_not_a_literal_abstains() {
+        for src in [
+            "q = queue.Queue(maxsize=n)",
+            "q = queue.Queue(cfg.size)",
+            "q = queue.Queue(*args)",
+            "q = queue.Queue(**opts)",
+            "q = make_queue()",
+        ] {
+            let f = put(&[src]);
+            assert_eq!(f.verdict, Verdict::Abstain, "{src}");
+        }
+    }
+
+    /// Several constructions reach the receiver. One finite capacity among
+    /// them is enough for the call to block, so the site is judged as usual;
+    /// an unreadable one beside unbounded ones leaves the question open.
+    #[test]
+    fn several_constructions_clear_the_site_only_when_all_are_unbounded() {
+        assert_eq!(
+            put(&["q = queue.Queue()", "q = queue.Queue(maxsize=0)"]).verdict,
+            Verdict::NotApplicable
+        );
+        assert_eq!(
+            put(&["q = queue.Queue()", "q = queue.Queue(maxsize=10)"]).verdict,
+            Verdict::Violates
+        );
+        assert_eq!(
+            put(&["q = queue.Queue()", "q = queue.Queue(maxsize=n)"]).verdict,
+            Verdict::Abstain
+        );
+    }
+
+    /// An unbounded queue cannot block whatever the call passes: the timeout
+    /// is not what resolves it, so the site is not credited with a bound.
+    #[test]
+    fn an_unbounded_queue_is_not_applicable_even_with_a_timeout_argument() {
+        let mut s = put_site(&["q = queue.Queue()"]);
+        s.snippet = "q.put(x, timeout=None)".into();
+        let f = propagate(
+            &s,
+            &queue_cache(maxsize()),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable);
+    }
+
+    /// The pair that proves the field is what changes the verdict: the same
+    /// site under the spec as served today is untouched.
+    #[test]
+    fn a_spec_without_capacity_arg_judges_the_site_as_before() {
+        for srcs in [&["q = queue.Queue()"][..], &[][..]] {
+            let f = propagate(
+                &put_site(srcs),
+                &queue_cache(None),
+                &ServedBound::None,
+                &HashMap::new(),
+            );
+            assert_eq!(f.verdict, Verdict::Violates);
+            assert_eq!(f.reason, "no bound anywhere and the search was complete");
+        }
+    }
+
+    /// A keyword-only capacity is never read from a positional argument.
+    #[test]
+    fn a_capacity_arg_with_no_position_ignores_positional_arguments() {
+        let specs = queue_cache(Some(rvl_spec::CapacityArg {
+            name: "maxsize".into(),
+            position: None,
+        }));
+        let f = propagate(
+            &put_site(&["q = queue.Queue(10)"]),
+            &specs,
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
     }
 }
