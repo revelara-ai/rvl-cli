@@ -12,8 +12,8 @@
 
 use rvl_core::{ConstArg, CtxEvidence, Site, Snippet, Verdict};
 use rvl_spec::{
-    client_family, spec_gate, ApiSpec, Bounds, CapacityArg, ConfigSpec, DefaultBound, Family,
-    Mechanism, Scope, ServedBound, SpecCache,
+    spec_gate, ApiSpec, Bounds, CapacityArg, ConfigSpec, DefaultBound, Family, Mechanism, Scope,
+    ServedBound, SpecCache,
 };
 use std::collections::HashMap;
 
@@ -945,8 +945,9 @@ fn judge(
                     && scope != rvl_core::CONSTRUCTION_SCOPE_RECEIVER
                     && !construction_unresolved
                 {
-                    if let Some(bound) =
-                        client_family(&site.client_type).and_then(|f| client.get(&f))
+                    if let Some(bound) = specs
+                        .call_family(spec, &site.client_type)
+                        .and_then(|f| client.get(&f))
                     {
                         match bound {
                             // Untraced: the family bound is another client's.
@@ -1124,6 +1125,7 @@ mod tests {
                 unbounded_sentinels,
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs,
@@ -1162,6 +1164,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -1203,6 +1206,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: intent,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -1404,6 +1408,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -1490,6 +1495,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared: false,
+            family: None,
         }
     }
 
@@ -1537,6 +1543,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs,
@@ -1563,6 +1570,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared: false,
+            family: None,
         }
     }
 
@@ -1764,6 +1772,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -1871,6 +1880,7 @@ mod tests {
                     default_bound: DefaultBound::Unknown,
                     unbounded_sentinels: vec![],
                     declared: false,
+                    family: None,
                 },
             ]),
             &ServedBound::None,
@@ -2138,6 +2148,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -2163,6 +2174,57 @@ mod tests {
         let client = HashMap::from([(Family::Database, ServedBound::Agreed(Bounds::WholeCall))]);
         let f = propagate(&s, &cache, &ServedBound::None, &client);
         assert_eq!(f.verdict, Verdict::Satisfies);
+    }
+
+    // A ClientConfig-bounded call on a type the keyword classifier misses.
+    fn untyped_db_call(family: Option<Family>) -> (Site, SpecCache) {
+        let (mut site, _) = db_call();
+        site.client_type = "orm.Repository".into();
+        let cache = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "orm.Repository".into(),
+                method: "query".into(),
+                blocking: Blocking::Yes,
+                bounded_by: vec![Mechanism::ClientConfig],
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+                family,
+                capacity_arg: None,
+            }],
+            ..Default::default()
+        });
+        (site, cache)
+    }
+
+    #[test]
+    fn an_authored_family_broadens_a_call_the_keywords_miss() {
+        let client = HashMap::from([(Family::Database, ServedBound::Agreed(Bounds::WholeCall))]);
+        // Untagged, a bare `Repository` has no family: still a finding.
+        let (s, cache) = untyped_db_call(None);
+        assert_eq!(
+            propagate(&s, &cache, &ServedBound::None, &client).verdict,
+            Verdict::Violates
+        );
+        // Tagged `database`, the Database family's bound reaches it.
+        let (s, cache) = untyped_db_call(Some(Family::Database));
+        let f = propagate(&s, &cache, &ServedBound::None, &client);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn an_authored_family_keeps_the_immich_guard() {
+        // The tag names ONE family; another family's bound still masks nothing.
+        let (s, cache) = untyped_db_call(Some(Family::Database));
+        let client = HashMap::from([(Family::Http, ServedBound::Agreed(Bounds::WholeCall))]);
+        assert_eq!(
+            propagate(&s, &cache, &ServedBound::None, &client).verdict,
+            Verdict::Violates
+        );
     }
 
     #[test]
@@ -2512,6 +2574,7 @@ mod tests {
                 unbounded_sentinels: vec!["None".into()],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -2604,6 +2667,7 @@ mod tests {
                 default_bound: DefaultBound::Unknown,
                 unbounded_sentinels: vec![],
                 declared: false,
+                family: None,
             }],
         );
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
@@ -2724,6 +2788,7 @@ mod tests {
                 unbounded_sentinels: vec![],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg: None,
             }],
             configs: vec![],
@@ -2794,6 +2859,7 @@ mod tests {
                 unbounded_sentinels: vec!["None".into()],
                 default_bound: DefaultBound::Unknown,
                 blocking_intent: BlockingIntent::Incidental,
+                family: None,
                 capacity_arg,
             }],
             configs: vec![],

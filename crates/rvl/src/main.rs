@@ -3018,6 +3018,7 @@ fn findings_from_sites(
                         default_bound: rvl_spec::DefaultBound::Unknown,
                         unbounded_sentinels: vec![],
                         declared: true,
+                        family: None,
                     })
                     .collect(),
             };
