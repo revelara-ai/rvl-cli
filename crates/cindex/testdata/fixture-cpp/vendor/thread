@@ -1,0 +1,30 @@
+// Vendored STUB of <thread>: just enough of std::thread / std::jthread for
+// the fixture to parse hermetically, with the real constructor shapes
+// (default, callable + args, move; copy deleted).
+#ifndef FIXTURE_STD_THREAD
+#define FIXTURE_STD_THREAD
+
+namespace std {
+
+class thread {
+ public:
+  thread() noexcept {}
+  template <typename F, typename... Args>
+  explicit thread(F &&f, Args &&...args) {}
+  thread(thread &&other) noexcept {}
+  thread(const thread &) = delete;
+  void join() {}
+  void detach() {}
+};
+
+class jthread {
+ public:
+  jthread() noexcept {}
+  template <typename F, typename... Args>
+  explicit jthread(F &&f, Args &&...args) {}
+  jthread(jthread &&other) noexcept {}
+};
+
+}  // namespace std
+
+#endif  // FIXTURE_STD_THREAD
