@@ -102,6 +102,17 @@ pub struct OutLang {
 }
 
 #[derive(Serialize)]
+pub struct OutLangCoverage {
+    pub lang: String,
+    pub resolved: usize,
+    pub total: usize,
+    pub no_spec: usize,
+    /// The resolved rate is ~0 and missing specs are why: the corpus, not the
+    /// scanner, is the lever for this language. A hint, never a gate.
+    pub corpus_gap: bool,
+}
+
+#[derive(Serialize)]
 pub struct OutRetriever {
     pub lang: String,
     pub path: String,
@@ -143,6 +154,8 @@ pub struct OutCoverage {
     pub test_files_skipped: usize,
     pub degraded_note: Option<String>,
     pub lang_status: Vec<OutLang>,
+    /// Resolved and no-spec counts per language (po-5csvg). Additive.
+    pub by_language: Vec<OutLangCoverage>,
     pub retrievers: Vec<OutRetriever>,
     pub degraded: Vec<OutDegraded>,
     pub config: Option<OutConfig>,
@@ -253,6 +266,19 @@ pub fn build(
                     lang: s.lang.clone(),
                     state: lang_state_str(s.state),
                     detail: s.detail.clone(),
+                })
+                .collect(),
+            by_language: coverage
+                .by_lang
+                .iter()
+                .map(|l| OutLangCoverage {
+                    lang: l.lang.clone(),
+                    resolved: l.resolved,
+                    total: l.total,
+                    no_spec: l.no_spec,
+                    // The ladder prints no lever line under an empty corpus;
+                    // the document must not say otherwise.
+                    corpus_gap: !coverage.empty_api_corpus && l.corpus_is_the_lever(),
                 })
                 .collect(),
             retrievers: coverage
@@ -375,6 +401,34 @@ mod tests {
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
+    /// The per-language split reaches the document, with the same corpus-gap
+    /// call the ladder's lever line makes (po-5csvg).
+    #[test]
+    fn by_language_carries_the_split_and_the_corpus_gap() {
+        let lc = |lang: &str, resolved, total, no_spec| render::LangCoverage {
+            lang: lang.into(),
+            resolved,
+            total,
+            no_spec,
+        };
+        let mut cov = render::Coverage {
+            by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+            ..Default::default()
+        };
+        let doc = build(&[], &cov, None, &[], &[], None, false);
+        let v = serde_json::to_value(&doc.coverage.by_language).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"lang": "Go", "resolved": 900, "total": 1000, "no_spec": 100, "corpus_gap": false},
+                {"lang": "Python", "resolved": 0, "total": 7184, "no_spec": 5173, "corpus_gap": true},
+            ])
+        );
+        cov.empty_api_corpus = true;
+        let doc = build(&[], &cov, None, &[], &[], None, false);
+        assert!(!doc.coverage.by_language[1].corpus_gap);
     }
 
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE

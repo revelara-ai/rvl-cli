@@ -161,6 +161,7 @@ Three things about severity:
   47/91 API surfaces resolved (51%)
   12 abstain — 8 no spec · 2 unresolved bounds · 1 need per-site judge · 1 other
   3 sites block by design — uvicorn.run (server main loop) — waiting is the contract, so no deadline is expected
+  by language: Go 47/51 resolved (0 no spec) · Python 0/40 resolved (8 no spec)
 ```
 
 The scanner reports what it did not decide, and why. Exit 0 means "nothing
@@ -170,6 +171,14 @@ difference shows up. Each abstain names what would close it:
 - `no spec`: no ruleset entry for that API yet. These are what the Revelara
   spec factory mints next (see [Privacy](#privacy) for what a shape-only
   report is).
+  The `by language` line splits the resolved and `no spec` counts by the
+  language of the file each site is in, and it prints when sites came from
+  two or more languages. When a language resolves almost nothing (under 5%
+  of at least 20 sites) and `no spec` is the cause of most of it, a further
+  line says so: `Python: 0/7184 resolved — the spec corpus carries no specs
+  matching this language's ecosystem`. That is a statement about the
+  ruleset, not about your code or the scanner. It is a hint and never
+  changes the verdict.
 - `unresolved bounds`: the call may be bounded in a way no retrieval can
   see, or its client's config spec names no field the scan can check
   (see [Client constructions and config specs](retrievers.md#client-constructions-and-config-specs)).
