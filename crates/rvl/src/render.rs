@@ -88,6 +88,36 @@ pub struct Finding {
     pub gate_exempt: bool,
 }
 
+/// The git operation a blocking verdict stops (po-av01j.207). The verdict line
+/// and the bypass hint are shared by both hooks and said "commit" on a push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatedOperation {
+    #[default]
+    Commit,
+    Push,
+}
+
+impl GatedOperation {
+    /// The operation a `--hook <name>` gates. Only pre-push selects `Push`:
+    /// no hook, pre-commit, and an unrecognized name keep the commit wording,
+    /// which is what a scan at a keyboard is asking about.
+    pub fn from_hook(hook: Option<&str>) -> Self {
+        match hook {
+            Some(h) if h.eq_ignore_ascii_case("pre-push") || h.eq_ignore_ascii_case("pre_push") => {
+                GatedOperation::Push
+            }
+            _ => GatedOperation::Commit,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatedOperation::Commit => "commit",
+            GatedOperation::Push => "push",
+        }
+    }
+}
+
 /// Coverage summary for the coverage section.
 ///
 /// `resolved` counts every site the scanner reached a conclusion on: a bounded
@@ -101,6 +131,9 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// What a blocking verdict stops. Rides here because every ladder call
+    /// already carries a `Coverage`, and the default keeps the commit wording.
+    pub operation: GatedOperation,
     /// `rvl scan --blend` ran and its agent half did not answer for every
     /// undecided runtime site (po-av01j.205): vetoed, no agent, timed out,
     /// failed, malformed, or over the cap. Carries the reason. The footer
@@ -174,9 +207,85 @@ pub struct Coverage {
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
     pub empty_api_corpus: bool,
+    /// Resolved and no-spec counts per language (po-5csvg), in first-seen
+    /// order. The aggregate lines above cannot say WHICH language the no-spec
+    /// sites belong to, and that is the fact that names the lever.
+    pub by_lang: Vec<LangCoverage>,
     /// The repo-structure lane's verdict counts (po-av01j.28). `None` when
     /// the lane did not run, which renders no line at all.
     pub structure: Option<StructureCoverage>,
+}
+
+/// One language's share of the resolved line (po-5csvg). The language is the
+/// one whose retriever read the site's file, so the split agrees with the
+/// roll-call's site counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LangCoverage {
+    pub lang: String,
+    pub resolved: usize,
+    pub total: usize,
+    /// Sites that abstained for want of a spec. The other abstain levers are
+    /// not split per language: only this one is a statement about the corpus.
+    pub no_spec: usize,
+}
+
+impl LangCoverage {
+    /// Below this many sites a zero is not evidence about an ecosystem.
+    const LEVER_MIN_SITES: usize = 20;
+
+    /// The resolved rate is ~0 AND missing specs are why: under 5% resolved,
+    /// over enough sites to mean something, with no-spec the majority outcome.
+    /// The last clause keeps the corpus from being blamed for a zero that
+    /// unresolved bounds caused. A coverage HINT, never a gate.
+    pub fn corpus_is_the_lever(&self) -> bool {
+        self.total >= Self::LEVER_MIN_SITES
+            && self.resolved * 20 < self.total
+            && self.no_spec * 2 > self.total
+    }
+}
+
+/// The per-language split and its lever lines (po-5csvg). The onyx dogfood
+/// printed "Python 7184 sites" and "5173 no spec" and never connected them: a
+/// language whose no-spec rate is ~100% says the CORPUS has nothing for that
+/// ecosystem, and the reader had to join the two lines by hand to learn it.
+pub fn render_lang_coverage(cov: &Coverage, color: bool) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    // One language: the split would only restate the aggregate line above it.
+    if cov.by_lang.len() > 1 {
+        let parts: Vec<String> = cov
+            .by_lang
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} {}/{} resolved ({} no spec)",
+                    l.lang, l.resolved, l.total, l.no_spec
+                )
+            })
+            .collect();
+        let line = format!("  by language: {}", parts.join(" \u{00b7} "));
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
+    // An empty commercial cache has its own line and it is the truer one: the
+    // corpus is empty for every language, which is a sync problem and not a
+    // per-ecosystem gap.
+    if cov.empty_api_corpus {
+        return o;
+    }
+    // Yellow, like the other lines that change what the percentage means.
+    for l in cov.by_lang.iter().filter(|l| l.corpus_is_the_lever()) {
+        let line = format!(
+            "  {}: {}/{} resolved \u{2014} the spec corpus carries {} specs matching this \
+             language's ecosystem ({} no spec); minting them is the coverage lever here",
+            l.lang,
+            l.resolved,
+            l.total,
+            if l.resolved == 0 { "no" } else { "almost no" },
+            l.no_spec
+        );
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
+    }
+    o
 }
 
 /// How the repo-structure controls came out, one verdict per control. Only
@@ -662,6 +771,7 @@ pub fn render_ladder(
             );
             let _ = writeln!(o, "{}", paint(&bline, "2", color));
         }
+        o.push_str(&render_lang_coverage(&cov, color));
     }
     // Outside the branch on purpose. A degraded language is the reason the G1
     // lane can be empty, so it must be reported precisely when total == 0; and
@@ -876,10 +986,11 @@ pub fn render_ladder(
     } else {
         let _ = writeln!(
             o,
-            "{} blocked \u{2014} fix or suppress {} blocking finding{} to commit",
+            "{} blocked \u{2014} fix or suppress {} blocking finding{} to {}",
             paint("\u{2717}", "31", color),
             blocking.len(),
-            if blocking.len() == 1 { "" } else { "s" }
+            if blocking.len() == 1 { "" } else { "s" },
+            cov.operation.as_str()
         );
     }
     o
@@ -889,7 +1000,7 @@ pub fn render_ladder(
 /// the class hits) is the one severity signal available without a class judge.
 /// It is EXPOSURE, not criticality -- reported as such so the reader is never
 /// told a severity we didn't actually judge.
-fn exposure_tier(site_count: usize) -> &'static str {
+pub(crate) fn exposure_tier(site_count: usize) -> &'static str {
     if site_count >= 100 {
         "high"
     } else if site_count >= 10 {

@@ -6686,6 +6686,64 @@ fn pre_push_gates_on_the_pushed_range_not_the_working_tree() {
         !stdout.contains("legacy.py"),
         "and the already-pushed file must stay out of scope: {stdout}"
     );
+    // The verdict and the bypass hint name the operation that was stopped
+    // (po-av01j.207): both said "commit" here, to someone running `git push`.
+    assert!(
+        stdout.contains("blocking finding to push") && stdout.contains("push blocked; use"),
+        "a blocked pre-push must say push: {stdout}"
+    );
+    assert!(
+        !stdout.contains("to commit") && !stdout.contains("commit blocked"),
+        "a blocked pre-push must not talk about a commit: {stdout}"
+    );
+}
+
+/// The pre-commit half of po-av01j.207: the same block under `--hook
+/// pre-commit` keeps saying commit.
+#[test]
+fn a_blocked_pre_commit_says_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(
+        root.join("new_leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "new_leak.py"]);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a staged secret must block the commit:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("blocking finding to commit") && stdout.contains("commit blocked; use"),
+        "a blocked pre-commit must say commit: {stdout}"
+    );
+    assert!(
+        !stdout.contains("to push") && !stdout.contains("push blocked"),
+        "a blocked pre-commit must not talk about a push: {stdout}"
+    );
 }
 
 /// NOT A GIT REPO: refuse, loudly. Falling back to a whole-repo gate is the

@@ -377,10 +377,37 @@ pub struct UndecidedSite {
     pub reason: String,
 }
 
+/// Batch priority of a scope, lowest first: a runtime site is on a request
+/// path, a test_support site never is, so under the cap the test file is the
+/// one that waits.
+fn scope_rank(scope: rvl_core::ScopeClass) -> u8 {
+    match scope {
+        rvl_core::ScopeClass::Runtime => 0,
+        rvl_core::ScopeClass::Migration => 1,
+        rvl_core::ScopeClass::Backfill => 2,
+        rvl_core::ScopeClass::DevOnly => 3,
+        rvl_core::ScopeClass::TestSupport => 4,
+    }
+}
+
+/// Batch priority of an exposure tier, highest exposure first.
+fn exposure_rank(class_site_count: usize) -> u8 {
+    match crate::render::exposure_tier(class_site_count) {
+        "high" => 0,
+        "medium" => 1,
+        _ => 2,
+    }
+}
+
 /// Select the delta-scoped undecided batch: findings the engine did not
 /// resolve, on sites whose file is in this run's CHANGED set, capped at
 /// [`MAX_BATCH_SITES`]. Returns the batch plus how many overflowed the cap
 /// (they stay undecided; the block reports the truncation).
+///
+/// The cap cuts the LEAST consequential sites, not whichever came last: the
+/// set is ordered by scope (see [`scope_rank`]), then by exposure, then by
+/// path, line and site key, so the batch is the same for the same input in
+/// any order.
 pub fn delta_undecided(
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
@@ -388,10 +415,31 @@ pub fn delta_undecided(
 ) -> (Vec<UndecidedSite>, usize) {
     let changed: std::collections::HashSet<&str> =
         changed_files.iter().map(String::as_str).collect();
-    let mut all: Vec<UndecidedSite> = findings
+    // Exposure is the blast radius of the site's API class over the WHOLE
+    // scan, not just the delta: the same signal the findings block reports.
+    let mut class_sites: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for s in sites {
+        *class_sites.entry(s.api_key()).or_default() += 1;
+    }
+    let mut undecided: Vec<(&rvl_propagate::Finding, &rvl_core::Site)> = findings
         .iter()
         .zip(sites.iter())
         .filter(|(f, s)| !f.verdict.is_resolved() && changed.contains(s.file_path.as_str()))
+        .collect();
+    undecided.sort_by_cached_key(|(_, s)| {
+        (
+            scope_rank(s.scope()),
+            exposure_rank(class_sites.get(&s.api_key()).copied().unwrap_or(1)),
+            s.file_path.clone(),
+            s.line_number,
+            s.site_key(),
+        )
+    });
+    let truncated = undecided.len().saturating_sub(MAX_BATCH_SITES);
+    undecided.truncate(MAX_BATCH_SITES);
+    let all = undecided
+        .into_iter()
         .map(|(f, s)| UndecidedSite {
             site_key: s.site_key(),
             file_line: format!("{}:{}", s.file_path, s.line_number),
@@ -400,8 +448,6 @@ pub fn delta_undecided(
             reason: f.reason.clone(),
         })
         .collect();
-    let truncated = all.len().saturating_sub(MAX_BATCH_SITES);
-    all.truncate(MAX_BATCH_SITES);
     (all, truncated)
 }
 
@@ -1146,6 +1192,108 @@ scanner:
         let (batch, truncated) = delta_undecided(&findings, &sites, &["f.go".to_string()]);
         assert_eq!(batch.len(), MAX_BATCH_SITES);
         assert_eq!(truncated, 3);
+    }
+
+    /// `k` test_support sites listed BEFORE `MAX_BATCH_SITES` runtime sites:
+    /// iteration order would hand the test files the first slots.
+    fn mixed_scope_input(k: usize) -> (Vec<rvl_propagate::Finding>, Vec<rvl_core::Site>) {
+        let mut sites: Vec<_> = (0..k)
+            .map(|i| core_site("a/client_test.go", i as u32 + 1, "x.X", "Do"))
+            .collect();
+        sites.extend(
+            (0..MAX_BATCH_SITES).map(|i| core_site("z/client.go", i as u32 + 1, "x.X", "Do")),
+        );
+        let findings = sites.iter().map(|_| abstain_finding("no spec")).collect();
+        (findings, sites)
+    }
+
+    fn mixed_scope_changed() -> Vec<String> {
+        vec!["a/client_test.go".to_string(), "z/client.go".to_string()]
+    }
+
+    #[test]
+    fn runtime_sites_keep_their_slots_and_test_support_is_truncated() {
+        let k = 4;
+        let (findings, sites) = mixed_scope_input(k);
+        let (batch, truncated) = delta_undecided(&findings, &sites, &mixed_scope_changed());
+        assert_eq!(truncated, k);
+        let sent: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
+        for i in 1..=MAX_BATCH_SITES {
+            let want = format!("z/client.go:{i}");
+            assert!(sent.contains(&want.as_str()), "{want} lost its slot");
+        }
+        assert!(
+            !sent.iter().any(|fl| fl.starts_with("a/client_test.go")),
+            "a test_support site took a runtime slot: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn batch_orders_scopes_runtime_first_and_test_support_last() {
+        let sites = vec![
+            core_site("pkg/client_test.go", 1, "x.X", "Do"),
+            core_site("scripts/seed.go", 1, "x.X", "Do"),
+            core_site("jobs/backfill.go", 1, "x.X", "Do"),
+            core_site("db/migrations/001.go", 1, "x.X", "Do"),
+            core_site("pkg/client.go", 1, "x.X", "Do"),
+        ];
+        let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
+        let changed: Vec<String> = sites.iter().map(|s| s.file_path.clone()).collect();
+        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        let order: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "pkg/client.go:1",
+                "db/migrations/001.go:1",
+                "jobs/backfill.go:1",
+                "scripts/seed.go:1",
+                "pkg/client_test.go:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_honours_repo_scope_evidence_over_the_path() {
+        // A declared build hook looks like runtime by path; the evidence says
+        // dev_only, so the true runtime site goes first.
+        let mut hook = core_site("a/hatch_build.py", 1, "x.X", "Do");
+        hook.scope_override = Some(rvl_core::ScopeClass::DevOnly);
+        let sites = vec![hook, core_site("b/client.py", 1, "x.X", "Do")];
+        let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
+        let changed: Vec<String> = sites.iter().map(|s| s.file_path.clone()).collect();
+        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        assert_eq!(batch[0].file_line, "b/client.py:1");
+    }
+
+    #[test]
+    fn within_a_scope_higher_exposure_goes_first_then_path_and_line() {
+        // `wide.W.Do` has 10 sites in the scan (medium exposure), most of them
+        // outside the delta; `rare.R.Do` has one (low).
+        let mut sites = vec![
+            core_site("a.go", 20, "rare.R", "Do"),
+            core_site("a.go", 3, "rare.R2", "Do"),
+            core_site("b.go", 1, "wide.W", "Do"),
+        ];
+        sites.extend((0..9).map(|i| core_site("unchanged.go", i, "wide.W", "Do")));
+        let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
+        let changed = vec!["a.go".to_string(), "b.go".to_string()];
+        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        let order: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
+        // Lines sort as numbers: 3 before 20.
+        assert_eq!(order, vec!["b.go:1", "a.go:3", "a.go:20"]);
+    }
+
+    #[test]
+    fn batch_order_is_stable_across_runs_and_input_order() {
+        let (findings, sites) = mixed_scope_input(3);
+        let changed = mixed_scope_changed();
+        let first = delta_undecided(&findings, &sites, &changed);
+        let second = delta_undecided(&findings, &sites, &changed);
+        assert_eq!(first, second);
+        let rev_sites: Vec<_> = sites.iter().rev().cloned().collect();
+        let rev_findings: Vec<_> = findings.iter().rev().cloned().collect();
+        assert_eq!(delta_undecided(&rev_findings, &rev_sites, &changed), first);
     }
 
     #[test]
