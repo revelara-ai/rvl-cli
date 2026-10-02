@@ -3,5 +3,10 @@
     "directory": ".",
     "arguments": ["c++", "-std=c++17", "-Ivendor", "-c", "src/service.cpp"],
     "file": "src/service.cpp"
+  },
+  {
+    "directory": ".",
+    "arguments": ["c++", "-std=c++20", "-Ivendor", "-c", "src/workers.cpp"],
+    "file": "src/workers.cpp"
   }
 ]
