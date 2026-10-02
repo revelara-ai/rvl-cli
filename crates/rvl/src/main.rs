@@ -2495,9 +2495,9 @@ fn repo_relative(root: &Path, file: &Path) -> String {
 
 /// The language whose helper retrieves a given source file, by extension. A
 /// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
-/// C/C++ HEADERS map to no helper: which TUs a changed header invalidates
-/// needs the include graph, so header edits ride the full-rescan path rather
-/// than guessing an incremental subset (follow-up bead under po-av01j.12).
+/// C/C++ HEADERS map to no helper: a header is never retrieved on its own.
+/// A changed header instead invalidates the TUs that include it, through the
+/// include graph cindex reports and the packet index stores (po-av01j.53).
 fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
@@ -2510,6 +2510,77 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
+}
+
+/// Is this a C/C++ header? No helper retrieves one directly (see
+/// [`lang_of_path`]); it reaches the scan through the TUs that include it.
+fn is_c_header(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("h" | "hh" | "hpp" | "hxx")
+    )
+}
+
+/// The candidate list for a reindex, with every TU the index knows to
+/// include a listed C/C++ header appended. A caller that names changed files
+/// (`index reindex --files`, the background warm behind a commit) names the
+/// header, and no scan reads a header's own entry; the packets that a header
+/// edit changes live in its TUs' shards.
+///
+/// A header no indexed TU includes brings in nothing. That is not a gap: a
+/// TU with no entry is not reused by the next warm scan either.
+fn with_header_dependents(
+    index: &rvl_index::PacketIndex,
+    mut candidates: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut listed: std::collections::HashSet<PathBuf> =
+        candidates.iter().map(|c| canon(c)).collect();
+    for i in 0..candidates.len() {
+        if !is_c_header(&candidates[i]) {
+            continue;
+        }
+        for tu in index.dependents(&candidates[i])? {
+            if listed.insert(canon(&tu)) {
+                candidates.push(tu);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// The packets one file's index entry holds: the sites located in the file
+/// and, for a C/C++ TU, the sites located in the headers it includes (an
+/// inline function's call sits at the header's path, and a header has no
+/// entry of its own to carry it). Several TUs that share a header each hold
+/// its sites; `merge_on_site_key` reports each once.
+fn shard_of(
+    rel: &str,
+    sites: &[rvl_core::Site],
+    includes: Option<&std::collections::HashSet<&str>>,
+) -> Vec<rvl_core::Site> {
+    sites
+        .iter()
+        .filter(|s| {
+            s.file_path == rel || includes.is_some_and(|i| i.contains(s.file_path.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The include graph a stream carried, as TU -> the headers it includes.
+fn includes_by_tu(
+    cfg: &rvl_core::RepoConfig,
+) -> std::collections::HashMap<&str, std::collections::HashSet<&str>> {
+    cfg.tu_includes
+        .iter()
+        .map(|t| {
+            (
+                t.file.as_str(),
+                t.includes.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect()
 }
 
 /// Split the resolved and no-spec counts by language (po-5csvg). The language
@@ -4271,7 +4342,9 @@ fn incremental_sites<F>(
 where
     F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
 {
-    let plan = index.plan_reload(candidates);
+    // A C/C++ entry must say which headers it saw; one that predates that
+    // record is retrieved again rather than trusted (po-av01j.53).
+    let plan = index.plan_reload_with(candidates, |f| lang_of_path(f) == Some(Lang::CCpp));
     let reparsed_files: Vec<String> = plan
         .changed
         .iter()
@@ -4290,7 +4363,7 @@ where
     };
     for f in &plan.unchanged {
         let h = rvl_index::hash_file(f)?;
-        if let Some(cached) = index.lookup(f, &h)? {
+        if let Some(cached) = index.planned(f, &h)? {
             if cached.test_skipped {
                 count_skip(f);
             }
@@ -4326,6 +4399,7 @@ where
     // make the next run skip it.
     let degraded = rr.degraded_note.is_some();
     let mut indexed = 0usize;
+    let includes = includes_by_tu(&rr.repo_cfg);
     if !degraded {
         for f in &plan.changed {
             // po-av01j.209: a file whose LANGUAGE degraded was never read, so
@@ -4345,14 +4419,14 @@ where
                 indexed += 1;
                 continue;
             }
-            let for_file: Vec<rvl_core::Site> = rr
-                .sites
-                .iter()
-                .filter(|s| s.file_path == rel)
-                .cloned()
-                .collect();
+            // The per-TU shard: for a C/C++ TU, its own sites plus those in
+            // the headers it includes, invalidated by a change to any of them.
+            let headers = includes.get(rel.as_str());
+            let deps: Vec<PathBuf> = headers
+                .map(|hs| hs.iter().map(|h| root.join(h)).collect())
+                .unwrap_or_default();
             let h = rvl_index::hash_file(f)?;
-            index.put(f, &h, &for_file)?;
+            index.put_with_deps(f, &h, &shard_of(&rel, &rr.sites, headers), &deps)?;
             indexed += 1;
         }
     }
@@ -4662,18 +4736,30 @@ fn run_index_build(
         let stream = std::fs::read_to_string(&retrieved)?;
         let (sites, cfg, skipped) = rvl_core::parse_stream(&stream);
         // Group by originating file so each entry is keyed by that
-        // file's current content hash.
+        // file's current content hash. A C/C++ TU that reported its includes
+        // is one group with the sites of its headers, and records them as
+        // dependencies (po-av01j.53).
+        let includes = includes_by_tu(&cfg);
         let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
             std::collections::BTreeMap::new();
+        for (tu, headers) in &includes {
+            by_file.insert(tu.to_string(), shard_of(tu, &sites, Some(headers)));
+        }
         for s in sites {
-            by_file.entry(s.file_path.clone()).or_default().push(s);
+            if !includes.contains_key(s.file_path.as_str()) {
+                by_file.entry(s.file_path.clone()).or_default().push(s);
+            }
         }
         let (mut indexed, mut missing) = (0usize, 0usize);
         for (file, packets) in by_file {
             let path = PathBuf::from(&file);
+            let deps: Vec<PathBuf> = includes
+                .get(file.as_str())
+                .map(|hs| hs.iter().map(PathBuf::from).collect())
+                .unwrap_or_default();
             match rvl_index::hash_file(&path) {
                 Ok(h) => {
-                    idx.put(&path, &h, &packets)?;
+                    idx.put_with_deps(&path, &h, &packets, &deps)?;
                     indexed += 1;
                 }
                 // The stream can name files this checkout does not
@@ -4714,6 +4800,7 @@ fn run_index_build(
             .collect(),
         None => walk_source_files(&root),
     };
+    let candidates = with_header_dependents(&idx, candidates)?;
     anyhow::ensure!(
         !candidates.is_empty(),
         "no supported source files under {}; nothing to index",
@@ -8559,8 +8646,8 @@ mod tests {
         assert_eq!(lang_of_path(Path::new("src/io.cc")), Some(Lang::CCpp));
         assert_eq!(lang_of_path(Path::new("src/io.cpp")), Some(Lang::CCpp));
         assert_eq!(lang_of_path(Path::new("src/io.cxx")), Some(Lang::CCpp));
-        // Headers map to no helper: invalidating the right TUs needs the
-        // include graph (follow-up), so header edits take the full-rescan path.
+        // Headers map to no helper: a header edit reaches the scan through
+        // the TUs that include it (the include graph in the packet index).
         assert_eq!(lang_of_path(Path::new("src/io.h")), None);
         assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
     }
@@ -8871,6 +8958,108 @@ mod tests {
         assert_eq!(scan2.reused_files, 2, "both files now reused");
         assert_eq!(scan2.retrieved_files, 0);
         assert_eq!(calls2.get(), 0, "no helper run when nothing changed");
+    }
+
+    /// A fake cindex for the header tests: one site per changed TU, plus
+    /// the site inside `api.h` and the include edge when the TU is `a.c`.
+    fn fake_c_retrieve(root: &Path, changed: &[PathBuf]) -> RetrieveResult {
+        let mut rr = RetrieveResult::default();
+        for c in changed {
+            let rel = repo_relative(root, c);
+            let includes = if rel == "a.c" {
+                rr.sites.push(site_at("api.h", 2, "posix.socket", "send"));
+                vec!["api.h".to_string()]
+            } else {
+                Vec::new()
+            };
+            rr.sites.push(site_at(&rel, 1, "libcurl.CURL", "perform"));
+            rr.repo_cfg.tu_includes.push(rvl_core::TuIncludes {
+                file: rel,
+                includes,
+            });
+        }
+        rr
+    }
+
+    /// po-av01j.53: a header edit leaves the TU's own bytes unchanged, so
+    /// the hash gate alone reused a stale shard. The TU's entry records the
+    /// headers it includes, and holds the sites located in them.
+    #[test]
+    fn a_header_edit_re_retrieves_only_the_tus_that_include_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        std::fs::write(dir.path().join("a.c"), "#include \"api.h\"\n").unwrap();
+        std::fs::write(dir.path().join("b.c"), "int b;\n").unwrap();
+        std::fs::write(dir.path().join("api.h"), "int f(void);\n").unwrap();
+        let candidates = walk_source_files(dir.path());
+        assert_eq!(candidates.len(), 2, "a header is not a candidate itself");
+
+        let cold = incremental_sites(&idx, dir.path(), &candidates, |changed| {
+            Ok(fake_c_retrieve(dir.path(), changed))
+        })
+        .unwrap();
+        assert_eq!(cold.retrieved_files, 2);
+        assert_eq!(cold.sites.len(), 3);
+
+        // Warm, nothing changed: no helper run, and the site inside the
+        // header is still reported, out of a.c's shard.
+        let warm = incremental_sites(&idx, dir.path(), &candidates, |_| {
+            panic!("nothing changed, the helper must not run")
+        })
+        .unwrap();
+        assert_eq!(warm.reused_files, 2);
+        assert!(warm.sites.iter().any(|s| s.file_path == "api.h"));
+        assert_eq!(warm.sites.len(), 3);
+
+        // The header changes. Only a.c includes it, so only a.c is re-parsed.
+        std::fs::write(dir.path().join("api.h"), "long f(void);\n").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let edited = incremental_sites(&idx, dir.path(), &candidates, |changed| {
+            asked.borrow_mut().extend(
+                changed
+                    .iter()
+                    .map(|c| repo_relative(dir.path(), c))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(fake_c_retrieve(dir.path(), changed))
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), vec!["a.c".to_string()]);
+        assert_eq!(edited.reused_files, 1);
+        assert_eq!(edited.sites.len(), 3);
+    }
+
+    /// `index reindex --files` is what the background warm runs. A header in
+    /// that list maps to the TUs the index knows include it.
+    #[test]
+    fn a_header_in_the_reindex_list_brings_in_the_tus_that_include_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let a = dir.path().join("a.c");
+        let b = dir.path().join("b.c");
+        let header = dir.path().join("api.h");
+        for f in [&a, &b, &header] {
+            std::fs::write(f, "x\n").unwrap();
+        }
+        idx.put_with_deps(
+            &a,
+            &rvl_index::hash_file(&a).unwrap(),
+            &[],
+            std::slice::from_ref(&header),
+        )
+        .unwrap();
+        idx.put(&b, &rvl_index::hash_file(&b).unwrap(), &[])
+            .unwrap();
+
+        let got = with_header_dependents(&idx, vec![header.clone()]).unwrap();
+        assert_eq!(got, vec![header.clone(), a.canonicalize().unwrap()]);
+        // A source file brings in nothing, and nothing is listed twice.
+        let got = with_header_dependents(&idx, vec![a.canonicalize().unwrap(), header]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            with_header_dependents(&idx, vec![b.clone()]).unwrap(),
+            vec![b]
+        );
     }
 
     /// One language's record becomes one line, named for the lane, and a

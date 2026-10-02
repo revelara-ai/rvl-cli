@@ -129,15 +129,43 @@ emitted, stamped `client_type_resolved: false`:
 
 Everything else abstains. **C++ without a db is a documented abstention
 class** — a flagless C++ parse is guesswork — counted in
-`cpp_files_skipped_no_db`. POSIX `read`/`write` are deliberately OFF the
-allowlist even in db mode: telling a socket fd from a file fd needs dataflow
-(follow-up bead), and a wrong guess multiplies.
+`cpp_files_skipped_no_db`.
+
+### POSIX `read`/`write`: local fd dataflow (po-av01j.53)
+
+`read` and `write` are not on the identity allowlist, because a socket fd and
+a file fd share them. They are emitted as `posix.socket` only when the fd has
+socket evidence **inside the enclosing function**:
+
+- the first argument is a local variable or a parameter of that function, and
+- the function assigns it the result of `socket`/`accept`/`accept4`, or passes
+  it as the first argument to a socket-only call (`connect`, `bind`, `listen`,
+  `send`, `recv`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`,
+  `getsockopt`, `getpeername`, `getsockname`, `shutdown`), and
+- nothing in the function assigns it a file fd (`open`, `openat`, `creat`,
+  `fileno`, `dup`, `dup2`).
+
+The analysis is flow-insensitive and does not cross function boundaries. A
+struct member (`conn->fd`), a global, a call result, a bare parameter with no
+socket use in the function, and a variable that holds a socket and a file at
+different points all abstain. Each abstention is counted in
+`retrieval_stats.fd_calls_abstained`; none is guessed at, because a wrong
+guess would stamp every file read in the repo as network I/O.
 
 ## What it emits
 
-One JSON object per line (JSONL) to stdout: Site packets plus one
+One JSON object per line (JSONL) to stdout: Site packets, one
+`{"kind":"tu_includes", ...}` record per parsed TU, and one
 `{"kind":"retrieval_stats", ...}` record (consumers route unknown kinds away
-from Site parsing, so the stats record is additive). Every site carries the
+from Site parsing, so these records are additive).
+
+A `tu_includes` record is one TU's edges in the include graph:
+`{"kind":"tu_includes","file":"src/net.c","includes":["include/proto.h", ...]}`.
+`includes` lists the in-repo files the TU includes, transitively, as
+repo-relative sorted paths. Headers outside the repo are not listed. rvl
+stores the list in its packet index (see "Performance posture").
+
+Every site carries the
 schema-v2 contract fields (`packet_schema: 2`, agreeing with
 `rvl_core::PACKET_SCHEMA` and the other helpers):
 
@@ -274,16 +302,28 @@ The civetweb C++ wrapper (`CivetServer::addHandler`) is not inventoried.
 
 ## Performance posture
 
-What is implemented now vs deliberately documented for later:
-
-- **Now:** per-TU parse with exact flags; deterministic TU order; site dedup;
+- **Per-TU parse** with exact flags; deterministic TU order; site dedup;
   `--files` filtering re-parses only the named TUs (compile-db entries or
-  no-db `.c` files). Incremental scans ride rvl's existing hash-gate.
-- **Documented, follow-up beads:** per-TU index shards built at `index init`
-  + preamble-cached re-parse (clang's preamble makes header-heavy TUs cheap
-  on re-parse), background re-index via the existing detached-reindex
-  pattern, and header→TU invalidation (a changed `.h` maps to no helper
-  today, so header edits take the full-rescan path rather than guessing).
+  no-db `.c` files).
+- **Per-TU index shards (po-av01j.53).** rvl's packet index holds one entry
+  per TU: the sites in the TU's source file plus the sites in the headers it
+  includes (an inline function's call sits at the header's path). The entry
+  records the content hash of the TU and of every header in its `tu_includes`
+  record. `rvl index init` builds the shards; a warm scan reuses each one
+  whose TU and headers are unchanged, without running this helper.
+- **Header→TU invalidation (po-av01j.53).** A changed header makes stale
+  exactly the TUs whose `tu_includes` record names it, and the next warm scan
+  re-parses those. A header that cannot be read counts as changed. An index
+  entry for a C/C++ file written before the include graph existed is
+  re-parsed once.
+- **Background re-index.** `rvl index reindex --detach --files <changed>` (the
+  existing detached-reindex pattern) accepts a header in the list and adds the
+  TUs the index knows to include it.
+- **Not implemented: preamble-cached re-parse.** A clang preamble lives inside
+  one libclang process, and the C API cannot save it to disk. This helper is a
+  one-shot process that parses each TU once, so a preamble would never be
+  reused. It becomes useful only if the helper becomes a long-lived process,
+  which is a separate decision.
 
 ## Tests
 

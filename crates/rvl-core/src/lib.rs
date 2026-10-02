@@ -626,6 +626,15 @@ pub struct RepoConfig {
     /// Concatenated by [`RepoConfig::absorb`], repeats included.
     #[serde(default)]
     pub dependency_trees_uninstalled_paths: Vec<String>,
+    /// The include graph, one edge list per parsed translation unit
+    /// (po-av01j.53). Only cindex reports it, as `tu_includes` records
+    /// that [`parse_stream`] collects here. The packet index stores each
+    /// list beside the TU's packets, so a changed header invalidates the
+    /// TUs that include it. Concatenated by [`RepoConfig::absorb`]. Left off
+    /// the wire when empty, so the `repo_config` the other helpers write is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tu_includes: Vec<TuIncludes>,
     /// The retrieval denominator per language (po-av01j.219). Additive within
     /// v2: a helper that predates it, or does not measure it, leaves it empty
     /// and COVERAGE says nothing rather than inventing a number.
@@ -637,6 +646,16 @@ pub struct RepoConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub retrieval: Vec<RetrievalCensus>,
+}
+
+/// The in-repo files one translation unit includes, transitively. Paths are
+/// repo-relative and forward-slashed, like a site's `file_path`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuIncludes {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub includes: Vec<String>,
 }
 
 /// How many call sites one language's extractor RETRIEVED out of the ones
@@ -708,6 +727,7 @@ impl RepoConfig {
         self.dependency_trees_uninstalled += other.dependency_trees_uninstalled;
         self.dependency_trees_uninstalled_paths
             .extend(other.dependency_trees_uninstalled_paths);
+        self.tu_includes.extend(other.tu_includes);
     }
 
     /// How many dependency trees ONE helper's stream reported uninstalled.
@@ -782,6 +802,10 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 if let Some(paths) = v.get("test_files_skipped_paths").and_then(|p| p.as_array()) {
                     cfg.test_files_skipped_paths
                         .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
+                }
+            } else if kind == "tu_includes" {
+                if let Ok(edges) = serde_json::from_value::<TuIncludes>(v) {
+                    cfg.tu_includes.push(edges);
                 }
             }
             continue;
@@ -1076,6 +1100,35 @@ mod tests {
             cfg.test_files_skipped_paths,
             vec!["e2e/login.ts", "tests/test_a.py", "conftest.py"]
         );
+    }
+
+    /// cindex writes one `tu_includes` record per parsed TU (po-av01j.53).
+    /// They are carried on the repo-scoped record, concatenated across
+    /// helper runs, and never fall through into Site parsing.
+    #[test]
+    fn tu_includes_records_are_carried_and_merged_across_records() {
+        let a = r#"{"packet_schema":2,"kind":"tu_includes","snapshot_id":"x","lang":"c_cpp","file":"src/a.c","includes":["include/api.h"]}"#;
+        let b = r#"{"packet_schema":2,"kind":"tu_includes","snapshot_id":"x","lang":"c_cpp","file":"src/b.c","includes":[]}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!("{a}\n{b}\n"));
+        assert!(sites.is_empty());
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            cfg.tu_includes,
+            vec![
+                TuIncludes {
+                    file: "src/a.c".to_string(),
+                    includes: vec!["include/api.h".to_string()],
+                },
+                TuIncludes {
+                    file: "src/b.c".to_string(),
+                    includes: Vec::new(),
+                },
+            ]
+        );
+        let mut merged = RepoConfig::default();
+        merged.absorb(cfg.clone());
+        merged.absorb(cfg);
+        assert_eq!(merged.tu_includes.len(), 4);
     }
 
     /// tsindex reports the workspaces it resolved from import syntax on its

@@ -1317,6 +1317,7 @@ mod tests {
             retrieval: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 
@@ -1434,6 +1435,7 @@ mod tests {
             retrieval: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 
