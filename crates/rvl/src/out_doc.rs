@@ -444,7 +444,7 @@ mod tests {
             by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
             ..Default::default()
         };
-        let doc = build(&[], &cov, None, &[], &[], None, false);
+        let doc = build(&[], &cov, None, &[], &[], None, None, false);
         let v = serde_json::to_value(&doc.coverage.by_language).unwrap();
         assert_eq!(
             v,
@@ -454,7 +454,7 @@ mod tests {
             ])
         );
         cov.empty_api_corpus = true;
-        let doc = build(&[], &cov, None, &[], &[], None, false);
+        let doc = build(&[], &cov, None, &[], &[], None, None, false);
         assert!(!doc.coverage.by_language[1].corpus_gap);
     }
 
