@@ -580,6 +580,153 @@ fn unparseable_tus_are_counted_never_guessed() {
     assert_eq!(st["tus_failed"], 1);
 }
 
+/// G4 aggregates only: the packets stamped `site_kind: "emission_point"`.
+fn emission_sites(sites: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    sites
+        .iter()
+        .filter(|s| s["site_kind"].as_str() == Some("emission_point"))
+        .collect()
+}
+
+/// The one aggregate for (enclosing function, framework), or a panic that
+/// shows the whole stream.
+fn emission_for<'a>(
+    sites: &'a [serde_json::Value],
+    symbol: &str,
+    client_type: &str,
+) -> &'a serde_json::Value {
+    let hits: Vec<_> = emission_sites(sites)
+        .into_iter()
+        .filter(|s| s["symbol"] == symbol && s["client_type"] == client_type)
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one {client_type} aggregate for {symbol}: {sites:?}"
+    );
+    hits[0]
+}
+
+/// The value of a named `const_args` entry on an aggregate.
+fn aggregate_arg<'a>(site: &'a serde_json::Value, name: &str) -> &'a str {
+    let arg = site["const_args"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["name"] == name))
+        .unwrap_or_else(|| panic!("const_args entry {name}: {site}"));
+    assert_eq!(
+        arg["how"], "aggregate",
+        "{name} rides as an aggregate: {site}"
+    );
+    arg["value"].as_str().expect("a string value")
+}
+
+#[test]
+fn syslog_calls_make_one_emission_aggregate_per_function() {
+    if !engine_available("syslog_calls_make_one_emission_aggregate_per_function") {
+        return;
+    }
+    let (sites, _) = retrieve(&fixture("fixture-emission"), &["src/daemon.c"]);
+
+    let serve = emission_for(&sites, "serve", "posix.syslog");
+    assert_eq!(serve["func"], "syslog");
+    assert_eq!(serve["file_path"], "src/daemon.c");
+    assert_eq!(aggregate_arg(serve, "emission_category"), "log");
+    assert_eq!(
+        aggregate_arg(serve, "emission_count"),
+        "2",
+        "both syslog calls in serve ride ONE packet"
+    );
+    assert_eq!(serve["macro_expansion"], false);
+    assert_eq!(serve["provenance"]["client_type_resolved"], true);
+    assert_eq!(serve["packet_schema"], 2);
+    assert_eq!(serve["lang"], "c_cpp");
+    assert!(
+        serve["snippet"]
+            .as_str()
+            .is_some_and(|s| s.contains("serving fd")),
+        "the snippet is the function's FIRST emission call: {serve}"
+    );
+    assert_eq!(
+        serve["site_key"].as_str(),
+        Some(format!("src/daemon.c:{}:posix.syslog:syslog", serve["line_number"]).as_str())
+    );
+
+    // openlog/closelog configure the logger; `quiet` and `main` emit nothing.
+    assert_eq!(
+        emission_sites(&sites).len(),
+        1,
+        "only serve emits: {sites:?}"
+    );
+}
+
+#[test]
+fn spdlog_and_glog_aggregate_per_function_and_framework() {
+    if !engine_available("spdlog_and_glog_aggregate_per_function_and_framework") {
+        return;
+    }
+    let (sites, _) = retrieve(&fixture("fixture-emission"), &["src/service.cpp"]);
+
+    // Two member calls plus one SPDLOG_ERROR macro, which expands to
+    // logger::log: three calls, one packet, and the macro flag is set because
+    // one of the counted calls sits in a recorded expansion.
+    let spd = emission_for(&sites, "handle", "spdlog::logger");
+    assert_eq!(aggregate_arg(spd, "emission_category"), "log");
+    assert_eq!(aggregate_arg(spd, "emission_count"), "3");
+    assert_eq!(spd["func"], "info", "named for the first emission call");
+    assert_eq!(spd["macro_expansion"], true);
+
+    // glog: each LOG(severity) statement is one `LogMessage::stream()` call,
+    // however many `<<` follow it.
+    let glog = emission_for(&sites, "handle", "google::LogMessage");
+    assert_eq!(aggregate_arg(glog, "emission_category"), "log");
+    assert_eq!(aggregate_arg(glog, "emission_count"), "2");
+    assert_eq!(glog["macro_expansion"], true);
+    assert!(
+        glog["snippet"]
+            .as_str()
+            .is_some_and(|s| s.contains("LOG(INFO)")),
+        "the snippet is the macro as written: {glog}"
+    );
+
+    // The free functions forward to the default logger: same framework.
+    let startup = emission_for(&sites, "startup", "spdlog::logger");
+    assert_eq!(aggregate_arg(startup, "emission_count"), "1");
+    assert_eq!(startup["macro_expansion"], false);
+
+    // Configuration calls (set_level, flush) are not emissions, and
+    // `app::syslog` is a user function, not the libc logger.
+    assert_eq!(
+        emission_sites(&sites).len(),
+        3,
+        "handle x2 frameworks + startup, nothing from quiet: {sites:?}"
+    );
+    assert!(!sites.iter().any(|s| s["symbol"] == "quiet"));
+
+    // site_key stays unique with aggregates on the stream.
+    let mut keys: Vec<&str> = sites
+        .iter()
+        .filter_map(|s| s["site_key"].as_str())
+        .collect();
+    let total = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), total, "site_key must be unique: {sites:?}");
+}
+
+#[test]
+fn no_db_syslog_aggregates_at_low_tier() {
+    if !engine_available("no_db_syslog_aggregates_at_low_tier") {
+        return;
+    }
+    let (sites, _) = retrieve(&fixture("fixture-nodb"), &[]);
+    let note = emission_for(&sites, "note", "posix.syslog");
+    assert_eq!(aggregate_arg(note, "emission_count"), "2");
+    assert_eq!(
+        note["provenance"]["client_type_resolved"], false,
+        "no-db packets are LOW tier: {note}"
+    );
+}
+
 /// Write a one-file no-db C repo and retrieve it.
 fn retrieve_c_source(src: &str) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let dir = tempfile::tempdir().unwrap();

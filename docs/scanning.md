@@ -219,6 +219,20 @@ difference shows up. Each abstain names what would close it:
 Sites that resolved correctly to no finding, like a server main loop that
 blocks by design, are named so you can challenge the call if you disagree.
 
+The resolved percentage is measured over the call sites the retriever chose
+to look at, not over every call in the repo. For Go, COVERAGE prints the
+second denominator next to it:
+
+```
+  go retrieval: 118 candidate call sites of 25263 resolved calls (0.5%) · known I/O not retrieved: io.ReadAll 10
+```
+
+`resolved calls` is every call in non-test code whose target the type checker
+resolved, and most of those calls are not I/O. `known I/O not retrieved`
+counts calls that are I/O but that the retriever's tables do not collect yet,
+so they are in no other number in the report. The line is yellow when that
+count is not zero. `--out` carries the same numbers as `coverage.retrieval`.
+
 Test code is not scanned for API surfaces. The Python and TypeScript
 retrievers skip test paths (`tests/`, `e2e/`, `*.test.ts`, `conftest.py`,
 the Playwright, Cypress, Vitest and Jest config files, and the rest of the

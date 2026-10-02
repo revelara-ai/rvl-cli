@@ -2762,6 +2762,10 @@ struct RetrievedStream {
     status: Vec<render::LangStatus>,
     /// Which helper file ran per language and how it was found (po-vd7ii).
     retrievers: Vec<render::RetrieverInfo>,
+    /// The retrieval denominator each helper reported (po-av01j.219), read
+    /// off its repo-scoped record. Empty for a helper that does not measure
+    /// one.
+    retrieval: Vec<rvl_core::RetrievalCensus>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -2810,6 +2814,8 @@ fn resolve_packet_stream(
             // roll-call stays empty rather than inventing one.
             status: Vec::new(),
             retrievers: Vec::new(),
+            // A captured stream carries its census on the same record.
+            retrieval: cfg.retrieval,
         });
     }
     let langs = detect_languages(path);
@@ -2832,6 +2838,7 @@ fn resolve_packet_stream(
             dependencies_uninstalled: Vec::new(),
             total_failure: None,
             retrievers: Vec::new(),
+            retrieval: Vec::new(),
             status: detect_unsupported(path)
                 .into_iter()
                 .map(|(name, count)| render::LangStatus {
@@ -2898,6 +2905,7 @@ fn resolve_packet_stream(
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
     let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
+    let mut retrieval: Vec<rvl_core::RetrievalCensus> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -2946,6 +2954,7 @@ fn resolve_packet_stream(
                 // reason (po-pk3fp.15).
                 dependencies_uninstalled
                     .extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
+                retrieval.extend(cfg.retrieval.clone());
                 let skipped = cfg.test_files_skipped;
                 if skipped > 0 {
                     test_files_skipped.push(render::TestFilesSkipped {
@@ -3007,6 +3016,7 @@ fn resolve_packet_stream(
         status,
         degraded,
         retrievers,
+        retrieval,
     })
 }
 
@@ -3645,6 +3655,7 @@ fn run_scan(
             false,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             // The full path takes no `--hook`.
             render::GatedOperation::Commit,
         );
@@ -3696,6 +3707,7 @@ fn run_scan(
         stream.generated_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
+        stream.retrieval.clone(),
         stream.dependencies_uninstalled.clone(),
         render::GatedOperation::Commit,
     )
@@ -3827,6 +3839,8 @@ fn render_scan_output(
     empty_api_corpus: bool,
     // Test files the retrievers declined to read, per language.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    // The retrieval denominator per language (po-av01j.219).
+    retrieval: Vec<rvl_core::RetrievalCensus>,
     // Workspaces scanned without their installed dependencies, per language.
     dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
     // What a blocking verdict stops, so the verdict and the bypass hint say
@@ -3849,6 +3863,7 @@ fn render_scan_output(
         degraded_note,
         lang_status,
         retrievers,
+        retrieval,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -5168,6 +5183,10 @@ fn run_scan_incremental(
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
+        // Present only when this pass ran a helper that measures it: the
+        // census is whole-repo, but a pass that re-parsed no file of that
+        // language has none to report, and says nothing rather than zero.
+        scan.repo_cfg.retrieval.clone(),
         scan.dependencies_uninstalled.clone(),
         render::GatedOperation::from_hook(hook),
     )
@@ -7612,6 +7631,24 @@ mod tests {
                 "unjudged must never block"
             );
         }
+    }
+
+    /// po-av01j.219: the retrieval census rides the helper's repo_config, and
+    /// must survive into the stream that feeds COVERAGE rather than being
+    /// parsed and dropped like every other repo-scoped field once was.
+    #[test]
+    fn a_retrieved_stream_carries_its_retrieval_census() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &p,
+            r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"go","calls_resolved":900,"candidates":40,"unretrieved":{"io.ReadAll":3}}]}"#,
+        )
+        .unwrap();
+        let stream = resolve_packet_stream(Some(p.as_path()), dir.path(), false, false).unwrap();
+        assert_eq!(stream.retrieval.len(), 1);
+        assert_eq!(stream.retrieval[0].candidates, 40);
+        assert_eq!(stream.retrieval[0].unretrieved.get("io.ReadAll"), Some(&3));
     }
 
     #[test]
