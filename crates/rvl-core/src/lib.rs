@@ -568,6 +568,17 @@ pub struct ConfigFact {
     pub type_name: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub fields: Vec<String>,
+    /// The subset of `fields` the construction sets to a constant zero.
+    /// `http.Client{Timeout: 0}` names Timeout and bounds nothing, so a field
+    /// listed here is evidence of no bound. Additive: a helper that does not
+    /// evaluate values leaves it empty, and a non-constant value is never
+    /// listed (unknown is not zero).
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub zero_fields: Vec<String>,
     #[serde(default)]
     pub file: String,
     #[serde(default)]

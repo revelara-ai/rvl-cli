@@ -23,6 +23,7 @@
 //! worst available failure shape. The missing-target error below is the root
 //! enabler and is fixed with it.
 
+use crate::render::GatedOperation;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -236,10 +237,12 @@ pub fn run_force_next(target: Option<&Path>) -> ExitCode {
 
 /// The hint printed under a blocked ladder. Both override paths are consumed
 /// by the next scan in this repo; `--no-verify` is the UNAUDITED alternative
-/// this exists to keep people away from.
-pub fn force_through_hint() -> String {
+/// this exists to keep people away from. Names the operation that was
+/// stopped, so the hint does not read as if it applied to a different one.
+pub fn force_through_hint(operation: GatedOperation) -> String {
     format!(
-        "commit blocked; use RVL_FORCE=1 or '{BIN} scan force-next' to override",
+        "{op} blocked; use RVL_FORCE=1 or '{BIN} scan force-next' to override",
+        op = operation.as_str(),
         BIN = rvl_data::BIN
     )
 }
@@ -330,6 +333,20 @@ mod tests {
         assert!(!marker_present(&root));
         // Idempotent: consuming a missing marker is not an error.
         consume_force_marker(&root).expect("second consume is a no-op");
+    }
+
+    /// The hint names the operation that was stopped (po-av01j.207): it read
+    /// "commit blocked" under the pre-push hook.
+    #[test]
+    fn hint_names_the_blocked_operation() {
+        let commit = force_through_hint(GatedOperation::Commit);
+        assert!(
+            commit.starts_with("commit blocked; use RVL_FORCE=1"),
+            "{commit}"
+        );
+        let push = force_through_hint(GatedOperation::Push);
+        assert!(push.starts_with("push blocked; use RVL_FORCE=1"), "{push}");
+        assert!(!push.contains("commit"), "{push}");
     }
 
     /// The audit trail is append-only JSONL naming the mechanism.

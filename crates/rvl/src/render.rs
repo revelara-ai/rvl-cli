@@ -88,6 +88,36 @@ pub struct Finding {
     pub gate_exempt: bool,
 }
 
+/// The git operation a blocking verdict stops (po-av01j.207). The verdict line
+/// and the bypass hint are shared by both hooks and said "commit" on a push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatedOperation {
+    #[default]
+    Commit,
+    Push,
+}
+
+impl GatedOperation {
+    /// The operation a `--hook <name>` gates. Only pre-push selects `Push`:
+    /// no hook, pre-commit, and an unrecognized name keep the commit wording,
+    /// which is what a scan at a keyboard is asking about.
+    pub fn from_hook(hook: Option<&str>) -> Self {
+        match hook {
+            Some(h) if h.eq_ignore_ascii_case("pre-push") || h.eq_ignore_ascii_case("pre_push") => {
+                GatedOperation::Push
+            }
+            _ => GatedOperation::Commit,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatedOperation::Commit => "commit",
+            GatedOperation::Push => "push",
+        }
+    }
+}
+
 /// Coverage summary for the coverage section.
 ///
 /// `resolved` counts every site the scanner reached a conclusion on: a bounded
@@ -101,6 +131,9 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// What a blocking verdict stops. Rides here because every ladder call
+    /// already carries a `Coverage`, and the default keeps the commit wording.
+    pub operation: GatedOperation,
     /// `rvl scan --blend` ran and its agent half did not answer for every
     /// undecided runtime site (po-av01j.205): vetoed, no agent, timed out,
     /// failed, malformed, or over the cap. Carries the reason. The footer
@@ -923,10 +956,11 @@ pub fn render_ladder(
     } else {
         let _ = writeln!(
             o,
-            "{} blocked \u{2014} fix or suppress {} blocking finding{} to commit",
+            "{} blocked \u{2014} fix or suppress {} blocking finding{} to {}",
             paint("\u{2717}", "31", color),
             blocking.len(),
-            if blocking.len() == 1 { "" } else { "s" }
+            if blocking.len() == 1 { "" } else { "s" },
+            cov.operation.as_str()
         );
     }
     o

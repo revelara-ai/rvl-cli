@@ -324,6 +324,13 @@ A blocked commit prints what to do:
 commit blocked; use RVL_FORCE=1 or 'rvl scan force-next' to override
 ```
 
+Under the pre-push hook the same two lines name the push:
+
+```
+✗ blocked — fix or suppress 1 blocking finding to push
+push blocked; use RVL_FORCE=1 or 'rvl scan force-next' to override
+```
+
 ## Suppressing, bounding, waiving
 
 - `rvl suppress <id> --reason "..." [--expires YYYY-MM-DD]` appends a

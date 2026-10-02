@@ -26,6 +26,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"go/constant"
 	"io"
 	"io/fs"
 	"go/ast"
@@ -745,16 +746,20 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, cen
 				file, line := rel(p, cl)
 				litsByType[key] = append(litsByType[key],
 					Snippet{File: file, Line: line, Symbol: key, Source: src.text(p, cl, cl)})
-				var fields []string
+				var fields, zeroFields []string
 				for _, el := range cl.Elts {
 					if kv, ok := el.(*ast.KeyValueExpr); ok {
 						if id, ok := kv.Key.(*ast.Ident); ok {
 							fields = append(fields, id.Name)
+							if isConstantZero(p.TypesInfo, kv.Value) {
+								zeroFields = append(zeroFields, id.Name)
+							}
 						}
 					}
 				}
 				if len(fields) > 0 {
 					configFacts = append(configFacts, ConfigFact{Type: key, Fields: fields,
+						ZeroFields: zeroFields,
 						File: file, Line: line, Source: src.text(p, cl, cl)})
 				}
 				return true
@@ -1135,9 +1140,28 @@ type RepoConfig struct {
 type ConfigFact struct {
 	Type   string   `json:"type"`
 	Fields []string `json:"fields"`
+	// ZeroFields is the subset of Fields set to a constant zero.
+	// `http.Client{Timeout: 0}` names Timeout and sets no timeout, so the
+	// name alone is not evidence of a bound.
+	ZeroFields []string `json:"zero_fields,omitempty"`
 	File   string   `json:"file"`
 	Line   int      `json:"line"`
 	Source string   `json:"source"`
+}
+
+// isConstantZero reports whether the type checker folded e to a numeric
+// zero: `0`, `0 * time.Second`, a named zero constant. A value it could not
+// fold is unknown, and unknown is never reported as zero.
+func isConstantZero(info *types.Info, e ast.Expr) bool {
+	tv, ok := info.Types[e]
+	if !ok || tv.Value == nil {
+		return false
+	}
+	switch tv.Value.Kind() {
+	case constant.Int, constant.Float:
+		return constant.Sign(tv.Value) == 0
+	}
+	return false
 }
 
 // filterToFiles keeps only sites from the named files (exact path match,

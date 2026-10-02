@@ -99,6 +99,7 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
 fn cov() -> Coverage {
     Coverage {
         blend_incomplete: None,
+        operation: GatedOperation::Commit,
         retrievers: vec![],
         empty_api_corpus: false,
         structure: None,
@@ -157,6 +158,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
     ];
     let cov = Coverage {
         blend_incomplete: None,
+        operation: GatedOperation::Commit,
         retrievers: vec![],
         empty_api_corpus: false,
         structure: None,
@@ -220,6 +222,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
         &findings,
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -266,6 +269,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -303,6 +307,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
         &findings,
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -336,6 +341,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
         &[f("b", "high", "surface", 1)],
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -368,6 +374,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
         &[f("b", "high", "surface", 1)],
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -405,6 +412,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
         &[f("b", "high", "surface", 2)],
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -507,6 +515,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         &[],
         Coverage {
             blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
             structure: None,
@@ -550,6 +559,7 @@ fn empty_config_coverage_renders_nothing_extra() {
             &[],
             Coverage {
                 blend_incomplete: None,
+                operation: GatedOperation::Commit,
                 retrievers: vec![],
                 empty_api_corpus: false,
                 structure: None,
@@ -1225,4 +1235,34 @@ fn a_complete_blend_keeps_the_clean_verdict() {
     let out = render_ladder(&[], cov, None, "0.1s", false);
     assert!(out.contains("commit clean"), "{out}");
     assert!(!out.contains("NOT A BLENDED RESULT"), "{out}");
+}
+
+// --- the verdict names the gated operation (po-av01j.207) ---
+// The blocked line said "to commit" under the pre-push hook too, at the moment
+// someone is working out why their push stopped.
+#[test]
+fn blocked_verdict_names_the_operation_the_hook_gates() {
+    let findings = vec![f("b1", "high", "surface", 0)];
+    let out = render_ladder(&findings, cov(), None, "0.1s", false);
+    assert!(out.contains("1 blocking finding to commit"), "{out}");
+
+    let push = Coverage {
+        operation: GatedOperation::Push,
+        ..cov()
+    };
+    let out = render_ladder(&findings, push, None, "0.1s", false);
+    assert!(out.contains("1 blocking finding to push"), "{out}");
+    assert!(!out.contains("to commit"), "{out}");
+}
+
+#[test]
+fn gated_operation_follows_the_hook_name() {
+    for hook in ["pre-push", "pre_push", "PRE-PUSH"] {
+        assert_eq!(GatedOperation::from_hook(Some(hook)), GatedOperation::Push);
+    }
+    // No hook, pre-commit, and a typo all keep the commit wording: a scan at
+    // a keyboard is asking "can I commit this".
+    for hook in [None, Some("pre-commit"), Some("pre-psuh")] {
+        assert_eq!(GatedOperation::from_hook(hook), GatedOperation::Commit);
+    }
 }

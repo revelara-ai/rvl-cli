@@ -3548,6 +3548,8 @@ fn run_scan(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            // The full path takes no `--hook`.
+            render::GatedOperation::Commit,
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
@@ -3599,6 +3601,7 @@ fn run_scan(
         stream.test_files_skipped.clone(),
         stream.retrieval.clone(),
         stream.dependencies_uninstalled.clone(),
+        render::GatedOperation::Commit,
     )
 }
 
@@ -3732,6 +3735,9 @@ fn render_scan_output(
     retrieval: Vec<rvl_core::RetrievalCensus>,
     // Workspaces scanned without their installed dependencies, per language.
     dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
+    // What a blocking verdict stops, so the verdict and the bypass hint say
+    // "push" under the pre-push hook (po-av01j.207).
+    operation: render::GatedOperation,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -3739,6 +3745,7 @@ fn render_scan_output(
     // per-site judge. Reason strings are the propagation layer's output contract.
     let resolved = findings.iter().filter(|f| f.verdict.is_resolved()).count();
     let mut coverage = render::Coverage {
+        operation,
         resolved,
         total: sites.len(),
         generated_skipped,
@@ -3887,7 +3894,7 @@ fn render_scan_output(
         // Name the AUDITED way through (po-av01j.182). Without this line the
         // only bypass a blocked committer can find is `--no-verify`, which
         // skips every hook and leaves no record; the force-through leaves one.
-        println!("{}", force::force_through_hint());
+        println!("{}", force::force_through_hint(operation));
         return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
@@ -5056,6 +5063,7 @@ fn run_scan_incremental(
         // language has none to report, and says nothing rather than zero.
         scan.repo_cfg.retrieval.clone(),
         scan.dependencies_uninstalled.clone(),
+        render::GatedOperation::from_hook(hook),
     )
 }
 
