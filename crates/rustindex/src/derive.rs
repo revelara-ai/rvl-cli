@@ -847,6 +847,7 @@ pub fn derive(
             facts.push(ConfigFact {
                 type_name: c.type_name.clone(),
                 fields: vec![field.clone()],
+                zero_fields: Vec::new(),
                 file: c.file.clone(),
                 line: c.line,
                 source: c.source.clone(),

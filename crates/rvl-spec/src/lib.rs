@@ -1138,9 +1138,15 @@ impl SpecCache {
             // corroborated by any construction, so it is no basis for
             // broadening either; one that names fields is corroborated only
             // by a construction that sets one of them. A literal
-            // that set only `Transport` is not a whole-call timeout.
+            // that set only `Transport` is not a whole-call timeout, and
+            // neither is one that set `Timeout: 0`: a zero duration is the
+            // field's "no timeout", so it counts as unset (po-xtoe4).
             if spec.names_no_bounding_field()
-                || (!spec.fields.is_empty() && !c.fields.iter().any(|f| spec.fields.contains(f)))
+                || (!spec.fields.is_empty()
+                    && !c
+                        .fields
+                        .iter()
+                        .any(|f| spec.fields.contains(f) && !c.zero_fields.contains(f)))
             {
                 continue;
             }
@@ -1607,6 +1613,43 @@ mod tests {
         assert_eq!(
             c.client_bound_by_family(&repo_with(&[("net/http.Client", &["Timeout"])]))
                 .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+    }
+
+    #[test]
+    fn a_named_field_set_to_zero_is_not_a_basis_for_family_broadening() {
+        let c = cache_of(vec![cfg(
+            Bounds::WholeCall,
+            Scope::ThisClient,
+            &["Timeout"],
+            false,
+        )]);
+        let repo_zeroing = |fields: &[&str], zero: &[&str]| {
+            let mut r = repo_with(&[("net/http.Client", fields)]);
+            r.constructions[0].zero_fields = zero.iter().map(|f| f.to_string()).collect();
+            r
+        };
+        // `http.Client{Timeout: 0}` is Go's "no timeout": the field is named
+        // and nothing is bounded, so no sibling may borrow a bound from it.
+        assert_eq!(
+            c.client_bound_by_family(&repo_zeroing(&["Timeout"], &["Timeout"]))
+                .get(&Family::Http),
+            None
+        );
+        // A zero on some other field takes nothing from a real Timeout.
+        assert_eq!(
+            c.client_bound_by_family(&repo_zeroing(&["Timeout", "MaxRetries"], &["MaxRetries"]))
+                .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+        // The zeroed literal neither vouches nor vetoes: a second literal of
+        // the same type with a real Timeout still carries the family.
+        let mut both = repo_zeroing(&["Timeout"], &["Timeout"]);
+        both.constructions
+            .extend(repo_with(&[("net/http.Client", &["Timeout"])]).constructions);
+        assert_eq!(
+            c.client_bound_by_family(&both).get(&Family::Http),
             Some(&ServedBound::Agreed(Bounds::WholeCall))
         );
     }
