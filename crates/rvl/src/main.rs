@@ -2512,6 +2512,43 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
     }
 }
 
+/// Split the resolved and no-spec counts by language (po-5csvg). The language
+/// is the one whose retriever reads the site's file, the same mapping the
+/// roll-call's site counts come from; spec identity carries no language, and
+/// the file does not need one guessed from a `client_type` namespace.
+/// `findings` and `sites` are index-aligned, as `out_doc::build` relies on.
+fn lang_coverage(
+    findings: &[rvl_propagate::Finding],
+    sites: &[rvl_core::Site],
+) -> Vec<render::LangCoverage> {
+    let mut out: Vec<render::LangCoverage> = Vec::new();
+    for (f, s) in findings.iter().zip(sites.iter()) {
+        let lang = match lang_of_path(Path::new(&s.file_path)) {
+            Some(l) => l.to_string(),
+            None => "other".to_string(),
+        };
+        let i = match out.iter().position(|l| l.lang == lang) {
+            Some(i) => i,
+            None => {
+                out.push(render::LangCoverage {
+                    lang,
+                    resolved: 0,
+                    total: 0,
+                    no_spec: 0,
+                });
+                out.len() - 1
+            }
+        };
+        out[i].total += 1;
+        if f.verdict.is_resolved() {
+            out[i].resolved += 1;
+        } else if f.reason.starts_with("no spec") {
+            out[i].no_spec += 1;
+        }
+    }
+    out
+}
+
 /// Normalize a repo-relative path for delta comparison: strip a leading `./`
 /// and collapse backslashes, so a "./" on one side of the comparison cannot
 /// silently drop every finding.
@@ -3756,6 +3793,7 @@ fn render_scan_output(
         ..Default::default()
     };
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
+    coverage.by_lang = lang_coverage(findings, sites);
     coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
     coverage.structure =
         render::StructureCoverage::from_verdicts(structure_rows.iter().map(|r| r.verdict.as_str()));
@@ -8650,6 +8688,48 @@ mod tests {
             method: method.into(),
             ..Default::default()
         }
+    }
+
+    // po-5csvg: the split is by the language whose retriever reads the file,
+    // so it lines up with the roll-call, and only a no-spec abstain counts
+    // toward the corpus lever.
+    #[test]
+    fn lang_coverage_splits_resolved_and_no_spec_by_file_language() {
+        let fnd = |verdict, reason: &str| rvl_propagate::Finding {
+            site_id: String::new(),
+            verdict,
+            reason: reason.into(),
+        };
+        let sites = vec![
+            site_at("svc/a.go", 1, "http.Client", "Do"),
+            site_at("app/b.py", 2, "requests", "get"),
+            site_at("app/c.py", 3, "httpx", "get"),
+            site_at("svc/d.go", 4, "http.Client", "Do"),
+            site_at("app/e.py", 5, "redis.Redis", "get"),
+            site_at("tpl/f.tmpl", 6, "x", "y"),
+        ];
+        let findings = vec![
+            fnd(rvl_core::Verdict::Violates, "unbounded"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for requests.get"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for httpx.get"),
+            fnd(rvl_core::Verdict::NotApplicable, "non-blocking"),
+            fnd(rvl_core::Verdict::Abstain, "search truncated at depth 3"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for x.y"),
+        ];
+        let lc = |lang: &str, resolved, total, no_spec| render::LangCoverage {
+            lang: lang.into(),
+            resolved,
+            total,
+            no_spec,
+        };
+        assert_eq!(
+            lang_coverage(&findings, &sites),
+            vec![
+                lc("Go", 2, 2, 0),
+                lc("Python", 0, 3, 2),
+                lc("other", 0, 1, 1)
+            ]
+        );
     }
 
     #[test]

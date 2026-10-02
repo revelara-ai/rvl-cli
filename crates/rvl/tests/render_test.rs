@@ -98,6 +98,7 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
 /// it, so one fully-resolved value serves.
 fn cov() -> Coverage {
     Coverage {
+        by_lang: vec![],
         blend_incomplete: None,
         operation: GatedOperation::Commit,
         retrievers: vec![],
@@ -156,6 +157,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         f("hidden", "low", "low_value", 0),
     ];
     let cov = Coverage {
+        by_lang: vec![],
         blend_incomplete: None,
         operation: GatedOperation::Commit,
         retrievers: vec![],
@@ -219,6 +221,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
     let out = render_ladder(
         &findings,
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -265,6 +268,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
     let out = render_ladder(
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -302,6 +306,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
     let out = render_ladder(
         &findings,
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -335,6 +340,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let out = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -367,6 +373,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let colored = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -404,6 +411,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     let out = render_ladder(
         &[f("b", "high", "surface", 2)],
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -506,6 +514,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
     let out = render_ladder(
         &[],
         Coverage {
+            by_lang: vec![],
             blend_incomplete: None,
             operation: GatedOperation::Commit,
             retrievers: vec![],
@@ -549,6 +558,7 @@ fn empty_config_coverage_renders_nothing_extra() {
         render_ladder(
             &[],
             Coverage {
+                by_lang: vec![],
                 blend_incomplete: None,
                 operation: GatedOperation::Commit,
                 retrievers: vec![],
@@ -1078,6 +1088,151 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
     );
+}
+
+// --- per-language coverage split and lever (po-5csvg) ---
+//
+// The onyx dogfood printed "Python 7184 sites" and "5173 no spec" on separate
+// lines and left the reader to join them. A language whose no-spec rate is
+// ~100% is a statement about the CORPUS, not about the scanner, and the
+// coverage block has to say so itself.
+
+fn lc(lang: &str, resolved: usize, total: usize, no_spec: usize) -> LangCoverage {
+    LangCoverage {
+        lang: lang.into(),
+        resolved,
+        total,
+        no_spec,
+    }
+}
+
+#[test]
+fn coverage_splits_resolved_and_no_spec_per_language() {
+    let cov = Coverage {
+        resolved: 900,
+        total: 8184,
+        abstain_no_spec: 5273,
+        abstain_bounds: 2011,
+        by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("by language: Go 900/1000 resolved (100 no spec) \u{00b7} Python 0/7184 resolved (5173 no spec)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_language_with_nothing_resolved_names_the_corpus_as_the_lever() {
+    let cov = Coverage {
+        resolved: 900,
+        total: 8184,
+        abstain_no_spec: 5273,
+        abstain_bounds: 2011,
+        by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains(
+            "Python: 0/7184 resolved \u{2014} the spec corpus carries no specs matching this language's ecosystem"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Go: 900/1000"),
+        "a healthy language gets no lever line: {out}"
+    );
+}
+
+// "~0", not only an exact zero: a handful of stdlib hits in thousands of sites
+// is the same corpus statement. The wording must not claim "no specs" though.
+#[test]
+fn a_near_zero_resolved_rate_is_named_without_claiming_an_exact_zero() {
+    let cov = Coverage {
+        resolved: 12,
+        total: 7184,
+        abstain_no_spec: 7172,
+        by_lang: vec![lc("Python", 12, 7184, 7172)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("Python: 12/7184 resolved \u{2014} the spec corpus carries almost no specs matching this language's ecosystem"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("by language:"),
+        "one language: the split would only restate the aggregate line: {out}"
+    );
+}
+
+// The sentence blames the corpus, so it may only print when no-spec IS the
+// cause. Zero resolved because every bound was unresolvable is another lever.
+#[test]
+fn no_corpus_lever_when_the_zero_is_not_a_no_spec_zero() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 400,
+        abstain_no_spec: 10,
+        abstain_bounds: 390,
+        by_lang: vec![lc("Python", 0, 400, 10)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("spec corpus carries"), "{out}");
+}
+
+// Three sites with nothing resolved is not evidence about an ecosystem.
+#[test]
+fn no_corpus_lever_for_a_handful_of_sites() {
+    let cov = Coverage {
+        resolved: 50,
+        total: 53,
+        abstain_no_spec: 3,
+        by_lang: vec![lc("Go", 50, 50, 0), lc("Python", 0, 3, 3)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("spec corpus carries"), "{out}");
+    assert!(out.contains("Python 0/3 resolved (3 no spec)"), "{out}");
+}
+
+// An empty commercial cache already has its own line, and it is the truer one:
+// the corpus is empty for EVERY language, which is a sync problem and not a
+// per-ecosystem minting gap.
+#[test]
+fn no_corpus_lever_when_the_whole_api_corpus_is_empty() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 500,
+        abstain_no_spec: 500,
+        empty_api_corpus: true,
+        by_lang: vec![lc("Python", 0, 500, 500)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("0 API specs in the commercial spec cache"),
+        "{out}"
+    );
+    assert!(!out.contains("spec corpus carries"), "{out}");
+}
+
+// A hint, never a gate: the footer verdict is unchanged by the lever line.
+#[test]
+fn the_corpus_lever_does_not_change_the_verdict() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 7184,
+        abstain_no_spec: 7184,
+        by_lang: vec![lc("Python", 0, 7184, 7184)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("spec corpus carries"), "{out}");
+    assert!(out.contains("commit clean"), "{out}");
 }
 
 // --- dependency trees not installed (po-pk3fp.15) ---
