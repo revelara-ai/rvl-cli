@@ -56,6 +56,10 @@ The orchestrator uses it to:
     "dependency_trees_uninstalled": 0,
     "degraded_note": null,
     "lang_status": [ { "lang": "go", "state": "scanned", "detail": "1240" } ],
+    "by_language": [
+      { "lang": "Go", "resolved": 1614, "total": 1780, "no_spec": 90,
+        "corpus_gap": false }
+    ],
     "retrievers": [ { "lang": "go", "path": "...", "source": "bundled" } ],
     "degraded": [
       { "lang": "python", "abstained": false, "not_installed": true,
@@ -121,6 +125,11 @@ The orchestrator uses it to:
     otherwise. `partial` means the helper ran but some units parsed only
     partly (for C/C++, usually a header that is not installed), so the site
     count is a floor: `detail` reads `<n> sites, INCOMPLETE: <why>`.
+  - `by_language[]`: `resolved`, `total` and `no_spec` split by the language
+    of the file each site is in (`other` when no retriever claims the
+    extension). `corpus_gap` is true when the language resolves almost
+    nothing and missing specs are the cause: the ruleset has no specs for
+    that ecosystem. It is a hint, and it never changes `exit`.
   - `retrievers[]`: which helper served each lane and from which resolution
     slot.
   - `degraded[]`: one row per degraded lane (`lang`, `abstained`,
