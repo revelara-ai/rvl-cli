@@ -40,5 +40,15 @@ Every emitted record carries:
 - `macro_expansion` (v2) — whether the site sits inside a macro expansion.
   Always `false` for Go (no macros); mechanical for C/C++ retrievers.
 
+The candidate-extractor tables -- the G1 I/O method names and the G4 emission
+framework list -- are corpus data in `extractor_corpus.json`, embedded at build
+time, not code constants (po-av01j.219). Its `known_unretrieved` list names I/O
+the tables deliberately do not retrieve (`io.ReadAll`), and every `-retrieve`
+run counts those calls on the `repo_config` record's `retrieval` census beside
+`candidates` (call sites emitted) and `calls_resolved` (every call whose callee
+type-resolved). That census is the retrieval denominator: coverage is
+resolution over what these tables retrieve, and the census is how much they
+retrieve. It is computed before any `-files` filter, so it is always whole-repo.
+
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.

@@ -626,6 +626,39 @@ pub struct RepoConfig {
     /// Concatenated by [`RepoConfig::absorb`], repeats included.
     #[serde(default)]
     pub dependency_trees_uninstalled_paths: Vec<String>,
+    /// The retrieval denominator per language (po-av01j.219). Additive within
+    /// v2: a helper that predates it, or does not measure it, leaves it empty
+    /// and COVERAGE says nothing rather than inventing a number.
+    /// Not serialized when empty, so a helper that does not measure it
+    /// (rustindex) emits the same record it always did.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub retrieval: Vec<RetrievalCensus>,
+}
+
+/// How many call sites one language's extractor RETRIEVED out of the ones
+/// that exist (po-av01j.219).
+///
+/// Resolution coverage is measured over retrieved sites only, and the
+/// extractor tables decide what is retrieved -- so "94% resolved" can be a
+/// statement about the tables rather than the repo. This is the other
+/// denominator. `calls_resolved` is crude by design (every call whose callee
+/// the type checker resolved, most of them not I/O); `unretrieved` is the
+/// sharp half: calls the helper's corpus knows are I/O and its tables do not
+/// retrieve, keyed by surface (`io.ReadAll`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalCensus {
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub calls_resolved: usize,
+    #[serde(default)]
+    pub candidates: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub unretrieved: std::collections::BTreeMap<String, usize>,
 }
 
 impl RepoConfig {
@@ -664,6 +697,14 @@ impl RepoConfig {
         self.test_files_skipped += other.test_files_skipped;
         self.test_files_skipped_paths
             .extend(other.test_files_skipped_paths);
+        // REPLACED per language, never summed: each helper run reports the
+        // whole repo, and a batched stream repeats it once per batch.
+        for census in other.retrieval {
+            match self.retrieval.iter_mut().find(|r| r.lang == census.lang) {
+                Some(slot) => *slot = census,
+                None => self.retrieval.push(census),
+            }
+        }
         self.dependency_trees_uninstalled += other.dependency_trees_uninstalled;
         self.dependency_trees_uninstalled_paths
             .extend(other.dependency_trees_uninstalled_paths);
@@ -976,6 +1017,35 @@ mod tests {
         let (_, cfg, _) = parse_stream(&format!("{go}\n{zero}\n"));
         assert_eq!(cfg.constructions.len(), 1);
         assert_eq!(cfg.snapshot_id, "x");
+    }
+
+    /// po-av01j.219: goindex's retrieval census rides its `repo_config`.
+    /// Every run reports the WHOLE repo (goindex loads every module whatever
+    /// `--files` says), so a batched stream carrying the same language twice
+    /// must REPLACE, not sum -- summing would double the denominator -- while
+    /// a second language accumulates beside it.
+    #[test]
+    fn retrieval_census_rides_repo_config_and_replaces_per_language() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"go","calls_resolved":900,"candidates":40,"unretrieved":{"io.ReadAll":3}}]}"#;
+        let other = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"typescript","calls_resolved":10,"candidates":2,"unretrieved":{}}]}"#;
+        let old = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!(
+            "{go}
+{other}
+{go}
+{old}
+"
+        ));
+        assert!(sites.is_empty());
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.retrieval.len(), 2, "{:?}", cfg.retrieval);
+        let g = cfg.retrieval.iter().find(|r| r.lang == "go").unwrap();
+        assert_eq!(
+            (g.calls_resolved, g.candidates),
+            (900, 40),
+            "batches must not sum"
+        );
+        assert_eq!(g.unretrieved.get("io.ReadAll"), Some(&3));
     }
 
     /// The test-file skip count rides whichever repo-scoped

@@ -35,9 +35,9 @@ import (
 // siteKindEmission mirrors rvl_core::SITE_KIND_EMISSION.
 const siteKindEmission = "emission_point"
 
-// emissionFramework classifies a callee's PACKAGE into an emission category.
-// The framework list is the candidate extractor (like ioMethods for G1): it
-// decides what gets inventoried, never what a match means.
+// The framework list (emissionFramework, in corpus.go) is the candidate
+// extractor (like ioMethods for G1): it decides what gets inventoried, never
+// what a match means. It lives in extractor_corpus.json (po-av01j.219).
 // COVERAGE HERE IS A FALSE-POSITIVE SURFACE, not just missing inventory
 // (po-av01j.142). The recover_block swallow fact is "recovers and emits
 // NOTHING RECOGNIZED", so a logger this list does not know turns correct code
@@ -46,36 +46,6 @@ const siteKindEmission = "emission_point"
 // package was missing too, which is the most common logging call in Go.
 // Adding a framework can only ever REMOVE false swallows, never invent a
 // finding.
-func emissionFramework(pkgPath string) (string, bool) {
-	switch {
-	case pkgPath == "log/slog" || strings.HasPrefix(pkgPath, "log/slog/"):
-		return "log", true
-	// The standard library logger. Exact match: HasPrefix("log") would also
-	// swallow log/slog above and any other log/* subpackage.
-	case pkgPath == "log":
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/hashicorp/go-hclog"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "k8s.io/klog"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/go-kit/log"),
-		strings.HasPrefix(pkgPath, "github.com/go-kit/kit/log"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/golang/glog"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "go.uber.org/zap"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/sirupsen/logrus"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/rs/zerolog"):
-		return "log", true
-	case strings.HasPrefix(pkgPath, "github.com/getsentry/sentry-go"):
-		return "error_capture", true
-	case strings.HasPrefix(pkgPath, "go.opentelemetry.io/otel"):
-		return "trace", true
-	}
-	return "", false
-}
 
 // Emit-verb allowlists per category: a framework package also exports
 // non-emitting surface (zap's With/Named, otel's propagators) that must not

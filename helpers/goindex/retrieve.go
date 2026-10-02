@@ -600,7 +600,11 @@ var lastRepoConfig RepoConfig
 // The `loaded` result separates a module that HELD no Go from one that could
 // not be READ. False with a nil error means the module matched no packages --
 // it is EMPTY, and the caller must carry on to the next module (po-pk3fp.12).
-func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loaded bool, err error) {
+//
+// The census is this module's retrieval denominator (see RetrievalCensus),
+// counted in the same walk that emits the sites so the two cannot disagree
+// about which functions were visited.
+func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, census RetrievalCensus, loaded bool, err error) {
 	pkgs, err := packages.Load(loadConfig(moduleDir), "./...")
 	// A LOAD THAT FAILED IS NOT A SCAN THAT FOUND NOTHING (po-av01j.209).
 	// This arm used to print "load failed:" and return nil, and main then
@@ -612,7 +616,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// returned packages that carry no type information: in both of those Go
 	// source EXISTS and was not read, so both stay errors.
 	if err != nil {
-		return nil, false, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
+		return nil, census, false, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
 	}
 	// ...BUT NEITHER IS AN EMPTY MODULE A LOAD THAT FAILED (po-pk3fp.12).
 	// This arm used to error too, on the reasoning that it was the same fact
@@ -622,7 +626,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// Treating it as a failure cost dolt its entire Go lane, because proto/
 	// sorts before the go/ module that holds all 201 of the product packages.
 	if len(pkgs) == 0 {
-		return nil, false, nil
+		return nil, census, false, nil
 	}
 	usable := 0
 	for _, p := range pkgs {
@@ -631,7 +635,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 		}
 	}
 	if usable == 0 {
-		return nil, false, fmt.Errorf(
+		return nil, census, false, fmt.Errorf(
 			"go/packages returned %d package(s) under %s but none carried type information, "+
 				"so no Go source was analysed", len(pkgs), moduleDir)
 	}
@@ -868,6 +872,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	lastRepoConfig = RepoConfig{Kind: "repo_config", Snapshot: name, Constructions: append(lastRepoConfig.Constructions, configFacts...)}
 
 	var out []RetrievedSite
+	census = newRetrievalCensus()
 	for _, p := range pkgs {
 		if p.TypesInfo == nil {
 			continue
@@ -912,6 +917,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						return true
 					}
 					callee, _ := info.Uses[sel.Sel].(*types.Func)
+					if callee != nil {
+						census.CallsResolved++
+					}
 					// G2 server-entry registrations are checked FIRST: chi's
 					// r.Get would otherwise collide with the G1 ioMethods
 					// gate and emit a route registration as a client call. A
@@ -930,6 +938,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 							SiteKind:   siteKindServerEntry,
 							Prov:       Provenance{ClientTypeKnown: true},
 						})
+						census.Candidates++
 						return true
 					}
 					if callee == nil {
@@ -939,6 +948,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					// I/O call (G1); anything else is not a site.
 					jobType := jobFrameworkType(callee)
 					if jobType == "" && !ioMethods[callee.Name()] {
+						if surface, known := knownUnretrieved(callee); known {
+							census.Unretrieved[surface]++
+						}
 						return true
 					}
 					if jobType == "" && len(c.Args) == 0 && (callee.Name() == "Query" ||
@@ -1099,6 +1111,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						rs.ConstructionScope = "type"
 					}
 					out = append(out, rs)
+					census.Candidates++
 					return true
 				})
 			}
@@ -1107,7 +1120,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)
-	return out, true, nil
+	return out, census, true, nil
 }
 
 // RepoConfig is repo-scoped, not site-scoped, and that is the point. An
@@ -1119,6 +1132,9 @@ type RepoConfig struct {
 	Kind          string        `json:"kind"`
 	Snapshot      string        `json:"snapshot_id"`
 	Constructions []ConfigFact  `json:"constructions"`
+	// The retrieval denominator (po-av01j.219), whole-repo: computed before
+	// any --files filter, because goindex loads every module either way.
+	Retrieval []RetrievalCensus `json:"retrieval"`
 }
 
 type ConfigFact struct {
@@ -1271,6 +1287,16 @@ type moduleScan struct {
 	Empty      []string // modules that matched no packages at all
 	FailedDir  string   // the module behind Err, named so the operator can go there
 	Err        error    // the FIRST genuine load failure, if any
+	Census     RetrievalCensus // summed over the Loaded modules
+}
+
+// repoConfigFor is the repo-scoped record for one run: the construction facts
+// every module contributed, and the run's retrieval census.
+func repoConfigFor(scan moduleScan, name string) RepoConfig {
+	rc := lastRepoConfig
+	rc.Kind, rc.Snapshot = "repo_config", name
+	rc.Retrieval = []RetrievalCensus{scan.Census}
+	return rc
 }
 
 // runRetrieveAll loads every discovered module and returns their sites with
@@ -1287,10 +1313,10 @@ type moduleScan struct {
 // going after a genuine error too, but only to finish counting: the error is
 // retained and main still treats it as fatal.
 func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
-	scan := moduleScan{Discovered: discoverModules(root)}
+	scan := moduleScan{Discovered: discoverModules(root), Census: newRetrievalCensus()}
 	var all []RetrievedSite
 	for _, m := range scan.Discovered {
-		sites, loaded, err := runRetrieveModule(m, root, name)
+		sites, census, loaded, err := runRetrieveModule(m, root, name)
 		switch {
 		case err != nil:
 			if scan.Err == nil {
@@ -1301,6 +1327,7 @@ func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
 		default:
 			scan.Loaded = append(scan.Loaded, m)
 			all = append(all, sites...)
+			scan.Census.add(census)
 		}
 	}
 	return all, scan
