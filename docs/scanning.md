@@ -431,6 +431,9 @@ new endpoints, keys, or data flows. Consent is off by default at every
 layer and every layer must say yes; `RVL_NO_AGENT=1` is a hard kill switch.
 The hook makes one batched invocation per run, capped at 10 sites; a
 timeout or malformed output fails open and the sites stay undecided.
+When more than 10 sites are undecided, the batch takes runtime sites first,
+then migration, backfill, dev-only, and test-support sites; inside a scope,
+the API with the most call sites goes first.
 Verdicts are asymmetric: `satisfies` clears a site, while `violates` is an
 agent-tagged warning. Blocking stays deterministic-only unless the repo
 commits `scanner.agent_verdicts: gate`. Agent verdicts never enter the eval

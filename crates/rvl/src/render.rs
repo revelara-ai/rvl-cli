@@ -923,7 +923,7 @@ pub fn render_ladder(
 /// the class hits) is the one severity signal available without a class judge.
 /// It is EXPOSURE, not criticality -- reported as such so the reader is never
 /// told a severity we didn't actually judge.
-fn exposure_tier(site_count: usize) -> &'static str {
+pub(crate) fn exposure_tier(site_count: usize) -> &'static str {
     if site_count >= 100 {
         "high"
     } else if site_count >= 10 {
