@@ -1644,11 +1644,12 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
         stdout.contains("RC-001"),
         "the seed spec's control rides into the ladder: {stdout}"
     );
-    // The sloth file contributes packets (unspecced: abstentions), and the
-    // alertmanager config is identified without being inventoried.
+    // The sloth file and the alertmanager config contribute packets
+    // (unspecced: abstentions). Alertmanager is an inventoried family
+    // (po-av01j.39), so it is no longer sighted as an unsupported format.
     assert!(
-        stdout.contains("unsupported config formats sighted: alertmanager (1)"),
-        "alertmanager identity sighting: {stdout}"
+        !stdout.contains("unsupported config formats sighted"),
+        "alertmanager is a supported format: {stdout}"
     );
 }
 
