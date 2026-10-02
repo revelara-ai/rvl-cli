@@ -125,6 +125,7 @@ emitted, stamped `client_type_resolved: false`:
 - `redis*` (connect/command families) → `hiredis.redisContext`
 - POSIX socket verbs `connect`/`send`/`recv`/`sendto`/`recvfrom`/
   `sendmsg`/`recvmsg` → `posix.socket`
+- `pthread_create` → `posix.pthread` (a G3 `background_job` registration)
 
 Everything else abstains. **C++ without a db is a documented abstention
 class** — a flagless C++ parse is guesswork — counted in
@@ -158,6 +159,9 @@ schema-v2 contract fields (`packet_schema: 2`, agreeing with
 - `callers` / `callees` / `client_construction` — **empty in v1** (pyindex
   precedent): cross-TU graph walking is future work and the keys keep the
   shape stable.
+- `site_kind` — absent for a classic G1 client-call site, `"background_job"`
+  for a G3 thread-start registration, `"server_entry"` for a G2 handler
+  registration, `"emission_point"` for a G4 aggregate (all below).
 - `lang` — `"c_cpp"`.
 
 ### G4 emission-point aggregates
@@ -191,6 +195,33 @@ other helpers follow).
   initializer), and a call with a dependent callee in an uninstantiated
   template (counted in `calls_unresolved`, as for G1). Calls inside a lambda
   count toward the enclosing named function.
+
+## G3 background-job sites (po-av01j.51)
+
+A call that STARTS a thread is emitted as a `site_kind: "background_job"`
+packet, on the same stream and with the same fields as a G1 site. A spec
+governs it only when it declares `site_kinds: ["background_job"]`, so a G1
+spec never decides a thread start.
+
+| Registration | `client_type` | `func` | Mode |
+| --- | --- | --- | --- |
+| `pthread_create(...)` | `posix.pthread` | `pthread_create` | compile db (high tier) and no-db allowlist (low tier) |
+| `std::thread t(f, ...)` / `std::thread(f).detach()` / `new std::thread(f)` | `std::thread` | `thread` | compile db only |
+| `std::jthread t(f, ...)` | `std::jthread` | `jthread` | compile db only |
+
+**Registrations only.** The retriever reports where the thread starts. It
+does not analyze the loop the thread runs, so whether the thread is a
+long-lived worker is a judgment for the spec layer (the seed specs answer
+`depends`). Deliberately not emitted:
+
+- The default constructor (`std::thread t;`) starts nothing, and a copy or
+  move constructor only transfers a thread that already runs.
+- `pthread_join` / `pthread_detach` / `join()` / `detach()` are lifecycle
+  calls, not registrations.
+- A thread constructed inside a library header
+  (`std::vector<std::thread>::emplace_back(f)`) sits in a system header:
+  documented abstention. `std::async` and thread-pool libraries are not
+  covered.
 
 ## C/C++ typing tiers
 

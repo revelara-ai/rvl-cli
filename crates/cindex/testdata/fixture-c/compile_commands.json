@@ -3,5 +3,10 @@
     "directory": ".",
     "command": "cc -Ivendor -c src/main.c",
     "file": "src/main.c"
+  },
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -c src/workers.c",
+    "file": "src/workers.c"
   }
 ]

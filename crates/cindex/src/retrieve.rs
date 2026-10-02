@@ -111,6 +111,7 @@ struct SiteOut {
     macro_expansion: bool,
     /// "" = a classic G1 client call (the key is omitted, so G1 packets are
     /// unchanged); [`SITE_KIND_SERVER_ENTRY`] = a G2 handler registration;
+    /// [`SITE_KIND_BACKGROUND_JOB`] = a G3 thread-start registration;
     /// [`SITE_KIND_EMISSION`] = a G4 aggregate.
     #[serde(skip_serializing_if = "str::is_empty")]
     site_kind: &'static str,
@@ -362,6 +363,19 @@ fn c_family(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The `site_kind` a G3 registration carries (the cross-helper contract value).
+const SITE_KIND_BACKGROUND_JOB: &str = "background_job";
+
+/// The C free-function G3 set: calls that START a background thread, mapped
+/// to their client type. Registrations only — the retriever reports where a
+/// thread starts and never analyzes the loop it runs.
+fn c_job_family(name: &str) -> Option<&'static str> {
+    match name {
+        "pthread_create" => Some("posix.pthread"),
+        _ => None,
+    }
+}
+
 /// Mirrors `rvl_core::SITE_KIND_SERVER_ENTRY`.
 const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
@@ -385,12 +399,16 @@ fn server_family(name: &str) -> Option<&'static str> {
 /// `mg_match`): the request message whose URI is matched.
 const MONGOOSE_MESSAGE: &str = "mongoose.mg_http_message";
 
-/// (client type, site kind) of a C free function on either identity table.
+/// (client type, site kind) of a C free function on any identity table.
 fn c_identity(name: &str) -> Option<(&'static str, &'static str)> {
     c_family(name)
         .map(|f| (f, ""))
         .or_else(|| server_family(name).map(|f| (f, SITE_KIND_SERVER_ENTRY)))
+        .or_else(|| c_job_family(name).map(|f| (f, SITE_KIND_BACKGROUND_JOB)))
 }
+
+/// C++ types whose construction WITH a callable starts a background thread.
+const THREAD_TYPES: &[&str] = &["std::thread", "std::jthread"];
 
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
@@ -914,7 +932,28 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     }
                 }
             }
-            _ => return, // constructors, destructors, conversions: not G1 calls
+            k if k == CXCursor_Constructor => {
+                // G3: constructing a thread type WITH a callable is the
+                // registration. The default constructor starts nothing and a
+                // copy/move only transfers a thread that already runs. A
+                // thread built inside a library header (`emplace_back`) sits
+                // in a system header and is a documented abstention.
+                if !st.compile_db_mode {
+                    return; // C++ without a db is a documented abstention
+                }
+                let class_cur = clang_getCursorSemanticParent(callee);
+                let type_name = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
+                if !THREAD_TYPES.contains(&type_name.as_str())
+                    || clang_Cursor_getNumArguments(call) < 1
+                    || clang_CXXConstructor_isCopyConstructor(callee) != 0
+                    || clang_CXXConstructor_isMoveConstructor(callee) != 0
+                {
+                    return;
+                }
+                client_type = type_name;
+                site_kind = SITE_KIND_BACKGROUND_JOB;
+            }
+            _ => return, // other constructors, destructors, conversions: not sites
         }
     } else if !st.compile_db_mode {
         // No-db mode: an unresolved callee still SPELLS its name on the call
@@ -1460,6 +1499,20 @@ mod tests {
             emission_framework(true, "std::stringstream", "stream"),
             None
         );
+    }
+
+    #[test]
+    fn c_identity_keeps_thread_starts_off_the_g1_table() {
+        assert_eq!(c_identity("PQexec"), Some(("libpq.PGconn", "")));
+        assert_eq!(
+            c_identity("pthread_create"),
+            Some(("posix.pthread", SITE_KIND_BACKGROUND_JOB))
+        );
+        // A thread start is a G3 registration, never a classic G1 call site.
+        assert_eq!(c_family("pthread_create"), None);
+        // Lifecycle calls around the thread are not registrations.
+        assert_eq!(c_identity("pthread_join"), None);
+        assert_eq!(c_identity("pthread_detach"), None);
     }
 
     #[test]

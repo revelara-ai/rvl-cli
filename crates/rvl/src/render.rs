@@ -174,6 +174,40 @@ pub struct Coverage {
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
     pub empty_api_corpus: bool,
+    /// The repo-structure lane's verdict counts (po-av01j.28). `None` when
+    /// the lane did not run, which renders no line at all.
+    pub structure: Option<StructureCoverage>,
+}
+
+/// How the repo-structure controls came out, one verdict per control. Only
+/// violations reach the ladder, so without this line a reader cannot tell a
+/// lane that found nothing from one that abstained on everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StructureCoverage {
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    pub not_applicable: usize,
+}
+
+impl StructureCoverage {
+    /// Count wire-string verdicts. `None` for no rows: the lane did not run.
+    pub fn from_verdicts<'a>(verdicts: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut c = Self::default();
+        for v in verdicts {
+            match v {
+                "violates" => c.violates += 1,
+                "satisfies" => c.satisfies += 1,
+                "not_applicable" => c.not_applicable += 1,
+                _ => c.abstain += 1,
+            }
+        }
+        (c.total() > 0).then_some(c)
+    }
+
+    pub fn total(&self) -> usize {
+        self.violates + self.satisfies + self.abstain + self.not_applicable
+    }
 }
 
 /// The one-line per-language roll-call. Rendered whenever anything was seen, so
@@ -652,6 +686,24 @@ pub fn render_ladder(
     }
     o.push_str(&render_lang_status(&cov, color));
     o.push_str(&render_coverage_degradations(&cov, color));
+    if let Some(sc) = &cov.structure {
+        let parts: Vec<String> = [
+            (sc.violates, "violates"),
+            (sc.satisfies, "satisfied"),
+            (sc.abstain, "abstain"),
+            (sc.not_applicable, "not applicable"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+        let sline = format!(
+            "  structure: {} repo controls \u{2014} {}",
+            sc.total(),
+            parts.join(" \u{00b7} ")
+        );
+        let _ = writeln!(o, "{}", paint(&sline, "2", color));
+    }
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
             let pct = 100 * cc.resolved / cc.total.max(1);
@@ -1159,6 +1211,56 @@ mod empty_api_corpus_tests {
         };
         let out = render_ladder(&[], cov, None, "0.1s", false);
         assert!(!out.contains("0 API specs"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod structure_coverage_tests {
+    use super::*;
+
+    /// The ladder shows structure VIOLATIONS only, so COVERAGE is where the
+    /// satisfied and abstained controls stay visible (po-av01j.28).
+    #[test]
+    fn the_coverage_block_summarizes_the_structure_lane() {
+        let structure = StructureCoverage::from_verdicts(
+            [
+                "violates",
+                "satisfies",
+                "satisfies",
+                "abstain",
+                "not_applicable",
+                "abstain",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            structure,
+            Some(StructureCoverage {
+                violates: 1,
+                satisfies: 2,
+                abstain: 2,
+                not_applicable: 1,
+            })
+        );
+        let cov = Coverage {
+            structure,
+            ..Default::default()
+        };
+        let out = render_ladder(&[], cov, None, "0.1s", false);
+        assert!(
+            out.contains(
+                "  structure: 6 repo controls \u{2014} 1 violates \u{00b7} 2 satisfied \u{00b7} \
+                 2 abstain \u{00b7} 1 not applicable"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_scan_without_the_structure_lane_renders_no_structure_line() {
+        assert_eq!(StructureCoverage::from_verdicts(std::iter::empty()), None);
+        let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+        assert!(!out.contains("structure:"), "{out}");
     }
 }
 

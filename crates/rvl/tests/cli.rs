@@ -174,6 +174,57 @@ fn write_scan_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path:
     (packets, specs)
 }
 
+/// po-av01j.28: the structure lane's verdicts reach `--out` as their own
+/// array, every control included, and the call-site fields do not move.
+#[test]
+fn scan_out_carries_the_structure_lane_in_its_own_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets).unwrap();
+    stream.push_str(
+        r#"{"kind":"repo_structure","snapshot_id":"fixture","ecosystems":[],"walk_complete":true}"#,
+    );
+    stream.push('\n');
+    std::fs::write(&packets, stream).unwrap();
+    let out_path = dir.path().join("scan.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("structure: 6 repo controls"),
+        "COVERAGE must summarize the structure lane: {stdout}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = doc["structure"].as_array().expect("structure array");
+    assert_eq!(rows.len(), 6, "one row per control: {rows:?}");
+    for r in rows {
+        assert_eq!(r["site_id"], "repo");
+        assert_eq!(r["snapshot_id"], "fixture");
+        assert!(r["class"]
+            .as_str()
+            .unwrap()
+            .starts_with("repo_structure.RC-"));
+    }
+    assert_eq!(doc["coverage"]["structure"]["total"], 6);
+    // The call-site lane is exactly what it was without the record.
+    assert_eq!(doc["sites"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["coverage"]["total"], 2);
+    assert!(doc["undecided"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|u| !u["class"].as_str().unwrap().starts_with("repo_structure.")));
+}
+
 #[test]
 fn scan_with_specs_file_emits_findings_and_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -1644,11 +1695,12 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
         stdout.contains("RC-001"),
         "the seed spec's control rides into the ladder: {stdout}"
     );
-    // The sloth file contributes packets (unspecced: abstentions), and the
-    // alertmanager config is identified without being inventoried.
+    // The sloth file and the alertmanager config contribute packets
+    // (unspecced: abstentions). Alertmanager is an inventoried family
+    // (po-av01j.39), so it is no longer sighted as an unsupported format.
     assert!(
-        stdout.contains("unsupported config formats sighted: alertmanager (1)"),
-        "alertmanager identity sighting: {stdout}"
+        !stdout.contains("unsupported config formats sighted"),
+        "alertmanager is a supported format: {stdout}"
     );
 }
 
@@ -2562,6 +2614,55 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
     assert!(
         stdout.contains("RC-022"),
         "the hiredis retry class must surface control-mapped: {stdout}"
+    );
+}
+
+/// C G3 e2e (po-av01j.51): the `pthread_create` registration cindex emits as
+/// a background_job site is decided by the job-altitude seed spec and by
+/// nothing else. The seed is `depends` (the retriever does no loop-body
+/// analysis), so the site routes to per-site judgment.
+#[test]
+fn scan_decides_c_background_job_sites_end_to_end() {
+    let Some(cindex) = cindex_helper("scan_decides_c_background_job_sites_end_to_end") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-c");
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(manifest.join("tests/fixtures/c_seed_specs.json"))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        scan_reached_a_verdict(&out) || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone();
+    let workers = verdicts_for(&rows, "src/workers.c");
+    assert_eq!(workers.len(), 1, "one registration site: {workers:?}");
+    assert!(
+        workers[0].0 == "abstain" && workers[0].1.contains("depends"),
+        "the thread start must abstain on the depends spec: {workers:?}"
     );
 }
 

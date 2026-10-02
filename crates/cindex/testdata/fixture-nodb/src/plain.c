@@ -6,6 +6,7 @@
 int use_curl(void *h) {
   curl_easy_perform(h); /* allowlisted: emitted, low tier */
   helper_step(h);       /* NOT allowlisted: never emitted */
+  pthread_create(h, 0, 0, 0); /* allowlisted G3 registration, low tier */
   return 0;
 }
 
