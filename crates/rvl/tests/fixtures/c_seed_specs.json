@@ -1,5 +1,5 @@
 {
-  "_comment": "SEED / test-grade C/C++ G1 spec corpus (po-av01j.12): RC-019 timeout judgments at the C identities cindex emits. Hand-authored, sufficient for the e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review, and the C/C++ gate set (compile-db gate population) is minted HITL - see the gate-set bead under po-av01j. The CURLOPT_TIMEOUT-class enum discrimination rides schema-v2 const_args as retrieval evidence; consuming it in judgment (a setopt-with-CURLOPT_TIMEOUT bounding the handle's perform) is spec-factory work, deliberately not hand-coded here.",
+  "_comment": "SEED / test-grade C/C++ spec corpus (po-av01j.12): RC-019 timeout judgments at the C identities cindex emits, plus the G3 job-altitude entries (po-av01j.51, site_kinds:[background_job]) for the thread-start registrations. Hand-authored, sufficient for the e2e tests only; the PRODUCTION corpus is authored through the LLM spec factory with human review, and the C/C++ gate set (compile-db gate population) is minted HITL - see the gate-set bead under po-av01j. The CURLOPT_TIMEOUT-class enum discrimination rides schema-v2 const_args as retrieval evidence; consuming it in judgment (a setopt-with-CURLOPT_TIMEOUT bounding the handle's perform) is spec-factory work, deliberately not hand-coded here.",
   "apis": [
     {
       "type": "libcurl.CURL",
@@ -64,6 +64,26 @@
       "bounded_by": ["client_config"],
       "confidence": 0.85,
       "rationale": "SEED RC-019: a blocking recv(2); SO_RCVTIMEO bounds it"
+    },
+    {
+      "type": "posix.pthread",
+      "method": "pthread_create",
+      "site_count": 1,
+      "blocking": "depends",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060 (po-av01j.51): pthread_create starts a thread that runs unattended; the retriever reports the registration and not the loop body, so whether it is a long-lived worker that mutates shared stores needs per-site judgment",
+      "site_kinds": ["background_job"]
+    },
+    {
+      "type": "std::thread",
+      "method": "thread",
+      "site_count": 1,
+      "blocking": "depends",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "SEED RC-060 (po-av01j.51): constructing a std::thread with a callable starts a thread that runs unattended; whether it is a long-lived worker loop needs per-site judgment",
+      "site_kinds": ["background_job"]
     }
   ],
   "configs": []

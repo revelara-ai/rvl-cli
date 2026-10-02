@@ -977,23 +977,51 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
         .collect()
 }
 
-/// The ladder findings for this scan's repo-structure lane. Live scans
-/// inventory the tree directly; a `--retrieved` scan has no tree, so the
-/// facts come from the `repo_structure` record riding the prebuilt stream
-/// (absent record = no facts = no findings, honestly).
-fn resolve_structure_findings(
-    retrieved: Option<&Path>,
-    stream: &str,
-    path: &Path,
-) -> Vec<render::Finding> {
+/// What the repo-structure lane produced for one scan: the ladder rows
+/// (violations only) and the `--out` eval rows (every control's verdict).
+#[derive(Default)]
+struct StructureLane {
+    ladder: Vec<render::Finding>,
+    rows: Vec<out_doc::OutSite>,
+}
+
+/// Run this scan's repo-structure lane. Live scans inventory the tree
+/// directly; a `--retrieved` scan has no tree, so the facts come from the
+/// `repo_structure` record riding the prebuilt stream (absent record = no
+/// facts = no findings and no rows, honestly).
+fn resolve_structure_lane(retrieved: Option<&Path>, stream: &str, path: &Path) -> StructureLane {
     let facts = if retrieved.is_some() {
         rvl_structure::parse_record(stream)
     } else {
         Some(rvl_structure::retrieve(path, &snapshot_name(path)))
     };
-    facts
-        .map(|f| structure_to_findings(&rvl_structure::evaluate(&f)))
-        .unwrap_or_default()
+    let Some(facts) = facts else {
+        return StructureLane::default();
+    };
+    let verdicts = rvl_structure::evaluate(&facts);
+    StructureLane {
+        ladder: structure_to_findings(&verdicts),
+        rows: verdicts
+            .iter()
+            .map(|f| out_doc::OutSite {
+                site_id: out_doc::STRUCTURE_SITE_ID.to_string(),
+                snapshot_id: facts.snapshot_id.clone(),
+                verdict: f.verdict.as_str().to_string(),
+                reason: f.reason.clone(),
+                class: format!("repo_structure.{}", f.control),
+            })
+            .collect(),
+    }
+}
+
+/// The ladder findings alone, for `explain`/`suppress`, which resolve an id
+/// against a fresh scan and never write an `--out` document.
+fn resolve_structure_findings(
+    retrieved: Option<&Path>,
+    stream: &str,
+    path: &Path,
+) -> Vec<render::Finding> {
+    resolve_structure_lane(retrieved, stream, path).ladder
 }
 
 // --- G2 server-entry lane (po-av01j.3) ---
@@ -3486,7 +3514,7 @@ fn run_scan(
     if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
         // Content-only repo: no packet stream exists, so the structure lane
         // inventories the live tree directly (same as the incremental path).
-        let structure = resolve_structure_findings(None, "", path);
+        let structure = resolve_structure_lane(None, "", path);
         // The G6 config lane runs here too (po-av01j.31): a pure
         // terraform/.env tree is the repo it was built for. It needs the spec
         // cache, so resolve it through the same loader the full path uses,
@@ -3528,7 +3556,8 @@ fn run_scan(
             &citems,
             &[],
             specs.as_ref(),
-            &structure,
+            &structure.ladder,
+            &structure.rows,
             lane.as_ref(),
             None,
             // No language, so no call site the blend could be asked about.
@@ -3561,7 +3590,10 @@ fn run_scan(
     items.extend(citems);
     // Structure + server-entry lanes join the ladder at the same seam: both
     // are control-mapped advisory findings outside the per-class triage.
-    let mut structure = resolve_structure_findings(retrieved, &stream.text, path);
+    let StructureLane {
+        ladder: mut structure,
+        rows: structure_rows,
+    } = resolve_structure_lane(retrieved, &stream.text, path);
     structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
@@ -3574,6 +3606,7 @@ fn run_scan(
         &sites,
         Some(&specs),
         &structure,
+        &structure_rows,
         Some(&lane),
         None,
         blended.as_ref(),
@@ -3691,6 +3724,10 @@ fn render_scan_output(
     // `None` only on the content-only path when no spec cache is loadable.
     specs: Option<&rvl_spec::SpecCache>,
     structure: &[render::Finding],
+    // The structure lane's eval rows for `--out`, every control's verdict
+    // (po-av01j.28). Empty when the lane did not run. `structure` above
+    // also carries the server-entry rows, so the two are not the same list.
+    structure_rows: &[out_doc::OutSite],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
     // `scan --blend` (po-av01j.205); None when not requested.
@@ -3751,6 +3788,8 @@ fn render_scan_output(
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
     coverage.by_lang = lang_coverage(findings, sites);
     coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
+    coverage.structure =
+        render::StructureCoverage::from_verdicts(structure_rows.iter().map(|r| r.verdict.as_str()));
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
@@ -3821,6 +3860,7 @@ fn render_scan_output(
             config.map(|lane| &lane.coverage),
             findings,
             sites,
+            structure_rows,
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
@@ -4953,10 +4993,13 @@ fn run_scan_incremental(
     // dropped rather than shown: telling someone their one-line docs edit
     // failed because the repo has no JS tests is the disproportionality this
     // flag exists to remove.
-    let mut structure = if changed_only {
-        Vec::new()
+    let StructureLane {
+        ladder: mut structure,
+        rows: structure_rows,
+    } = if changed_only {
+        StructureLane::default()
     } else {
-        resolve_structure_findings(None, "", path)
+        resolve_structure_lane(None, "", path)
     };
     structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
@@ -5015,6 +5058,7 @@ fn run_scan_incremental(
         &sites,
         Some(&specs),
         &structure,
+        &structure_rows,
         Some(&lane),
         hook_agent.as_ref(),
         blended.as_ref(),
@@ -7921,6 +7965,55 @@ mod tests {
             fs.iter().any(|f| f.control == "RC-033"),
             "an untested live tree must surface RC-033: {fs:?}"
         );
+    }
+
+    /// po-av01j.28: the `--out` rows carry EVERY control's verdict, not just
+    /// the violations the ladder shows, under one repo-level site id.
+    #[test]
+    fn structure_lane_emits_one_eval_row_per_control() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.go")),
+                "package x\nfunc F() {}\n",
+            )
+            .unwrap();
+        }
+        let lane = resolve_structure_lane(None, "", dir.path());
+        let classes: Vec<&str> = lane.rows.iter().map(|r| r.class.as_str()).collect();
+        assert_eq!(
+            classes,
+            [
+                "repo_structure.RC-033",
+                "repo_structure.RC-057",
+                "repo_structure.RC-058",
+                "repo_structure.RC-034",
+                "repo_structure.RC-070",
+                "repo_structure.RC-006",
+            ]
+        );
+        let snapshot = snapshot_name(dir.path());
+        for r in &lane.rows {
+            assert_eq!(r.site_id, out_doc::STRUCTURE_SITE_ID);
+            assert_eq!(r.snapshot_id, snapshot);
+            assert!(!r.reason.is_empty(), "every verdict states why: {r:?}");
+        }
+        assert_eq!(lane.rows[0].verdict, "violates");
+        // The ladder keeps its violations-only view of the same verdicts.
+        let violating = lane.rows.iter().filter(|r| r.verdict == "violates").count();
+        assert_eq!(lane.ladder.len(), violating);
+        assert!(violating < lane.rows.len(), "non-violations are rows too");
+    }
+
+    #[test]
+    fn retrieved_stream_without_a_record_yields_no_structure_rows() {
+        let lane = resolve_structure_lane(
+            Some(Path::new("prebuilt.jsonl")),
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+            Path::new("."),
+        );
+        assert!(lane.rows.is_empty(), "no record, no rows: {:?}", lane.rows);
     }
 
     #[test]
