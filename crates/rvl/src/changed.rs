@@ -23,9 +23,10 @@
 //!
 //! SCOPE OF THE FIX: this resolves the changed PATH SET from git. The bytes
 //! the retrievers read are still the working tree's, so a file that is staged
-//! and then further edited is judged in its working-tree form. See
-//! `ChangedSet::dirty`, which detects exactly that case and lets the caller
-//! say so out loud rather than leaving it silent.
+//! and then further edited would be judged in its working-tree form. See
+//! `ChangedSet::dirty`, which detects exactly that case; the pre-commit scan
+//! refuses it (po-io8sk.3) rather than print a verdict for bytes that are not
+//! the ones being committed.
 
 use anyhow::Context as _;
 use std::collections::BTreeSet;
@@ -86,7 +87,7 @@ pub struct ChangedSet {
     pub source: String,
     /// Pre-commit only: staged files that ALSO carry unstaged working-tree
     /// edits. The retrievers read the working tree, so for these the content
-    /// judged is not exactly the content committed. Reported, never silent.
+    /// judged would not be the content committed. The scan refuses them.
     pub dirty: Vec<String>,
 }
 

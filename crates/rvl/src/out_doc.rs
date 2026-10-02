@@ -53,6 +53,10 @@ pub struct OutDoc {
     /// The hook-adjudication agent block verbatim when `--hook` ran; null
     /// otherwise. Provenance-tagged and separate, exactly as rendered.
     pub hook_agent: Option<String>,
+    /// `scan --blend` status (po-av01j.205): complete or not, why, counts,
+    /// and the BLEND block verbatim. Null when `--blend` was not given. A
+    /// status report, not findings: engine rows above are never rewritten.
+    pub blend: Option<crate::blend::BlendSummary>,
 }
 
 /// One per-site eval row. Field names match the old top-level array (and the
@@ -117,6 +121,9 @@ pub struct OutRetriever {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// How this helper differs from the build this binary ships, when it does
+    /// and a shipped sibling exists to compare against (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +139,9 @@ pub struct OutConfigAbstain {
     pub no_spec: usize,
     pub outside_repo: usize,
     pub other: usize,
+    /// Unjudged by design (the key ledger's vocabulary-only marker): not a
+    /// lever, and never part of `no_spec` or `no_spec_keys`.
+    pub vocabulary_only: usize,
 }
 
 #[derive(Serialize)]
@@ -152,6 +162,11 @@ pub struct OutCoverage {
     /// Test files the retrievers skipped, summed across languages
     ///; the per-language split is in the COVERAGE block.
     pub test_files_skipped: usize,
+    /// Workspaces scanned without their installed dependencies, summed
+    /// across languages (po-pk3fp.15). Non-zero means those lanes resolved
+    /// client types from import syntax; the per-language split is in the
+    /// COVERAGE block.
+    pub dependency_trees_uninstalled: usize,
     pub degraded_note: Option<String>,
     pub lang_status: Vec<OutLang>,
     /// Resolved and no-spec counts per language (po-5csvg). Additive.
@@ -179,6 +194,7 @@ pub struct OutUndecided {
 fn lang_state_str(s: render::LangState) -> String {
     match s {
         render::LangState::Scanned => "scanned",
+        render::LangState::Partial => "partial",
         render::LangState::Abstained => "abstained",
         render::LangState::Failed => "failed",
         render::LangState::Unsupported => "unsupported",
@@ -196,6 +212,7 @@ pub fn build(
     propagated: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
     hook_agent_block: Option<&str>,
+    blend: Option<&crate::blend::BlendSummary>,
     blocked: bool,
 ) -> OutDoc {
     let findings = ladder
@@ -258,6 +275,11 @@ pub fn build(
             },
             generated_skipped: coverage.generated_skipped,
             test_files_skipped: coverage.test_files_skipped.iter().map(|t| t.count).sum(),
+            dependency_trees_uninstalled: coverage
+                .dependencies_uninstalled
+                .iter()
+                .map(|d| d.count)
+                .sum(),
             degraded_note: coverage.degraded_note.clone(),
             lang_status: coverage
                 .lang_status
@@ -288,6 +310,7 @@ pub fn build(
                     lang: r.lang.clone(),
                     path: r.path.clone(),
                     source: r.source.clone(),
+                    drift: r.drift.clone(),
                 })
                 .collect(),
             degraded: coverage
@@ -307,6 +330,7 @@ pub fn build(
                     no_spec: c.abstain_no_spec,
                     outside_repo: c.abstain_outside_repo,
                     other: c.abstain_other,
+                    vocabulary_only: c.vocabulary_only,
                 },
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
                 unparseable_files: c.unparseable_files,
@@ -316,6 +340,7 @@ pub fn build(
         undecided,
         covered_classes: covered.into_iter().collect(),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
+        blend: blend.cloned(),
     }
 }
 
@@ -350,6 +375,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             blocked,
         );
@@ -397,6 +423,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             false,
         );

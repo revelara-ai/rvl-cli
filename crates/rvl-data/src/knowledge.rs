@@ -190,12 +190,13 @@ pub enum KnowledgeCmd {
     },
     /// Show knowledge base health statistics
     Health {
-        /// ACCEPTED AND IGNORED, for rvl-cli parity: rvl-cli's `knowledge
-        /// health` takes no arguments at all and prints its fixed table, so
-        /// `--format=json` there is silently ignored and exits 0. Rejecting
-        /// it here would turn a working (if pointless) rvl-cli invocation
-        /// into exit 2 (po-av01j.185 item 8). There is no JSON rendering to
-        /// select — rvl-cli has none either.
+        // rvl-cli parity: rvl-cli's `knowledge health` takes no arguments
+        // at all and prints its fixed table, so `--format=json` there is
+        // silently ignored and exits 0. Rejecting it here would turn a
+        // working (if pointless) rvl-cli invocation into exit 2
+        // (po-av01j.185 item 8).
+        /// ACCEPTED AND IGNORED, for compatibility: the output is always the
+        /// fixed table. There is no JSON rendering to select.
         #[arg(long)]
         format: Option<String>,
     },
@@ -1732,10 +1733,17 @@ fn write_pattern_item(out: &mut String, p: &Pattern) {
 mod tests {
     use super::*;
 
+    /// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+    /// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+    /// carries the compile-time path of whichever checkout built it, which may be gone.
+    fn manifest_dir() -> std::path::PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+            .into()
+    }
+
     fn testdata(name: &str) -> Vec<u8> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata")
-            .join(name);
+        let p = manifest_dir().join("testdata").join(name);
         std::fs::read(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
     }
 

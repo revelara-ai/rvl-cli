@@ -342,7 +342,8 @@ fn risk_list_json_is_raw_body_passthrough() {
     let raw = r#"{"total":1,"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":5,"status":"applicable","linked_services":[]}],"page":1,"limit":50}"#;
     let server = MockServer::start(vec![("GET /api/v1/risks?limit=50", 200, raw)]);
     let out =
-        rvl_data::risk::list_output(&server.client(), None, None, None, 50, Some("json")).unwrap();
+        rvl_data::risk::list_output(&server.client(), None, None, None, None, 50, Some("json"))
+            .unwrap();
     assert_eq!(out, format!("{raw}\n"));
 }
 
@@ -359,11 +360,138 @@ fn risk_list_encodes_filters_like_go_url_values() {
         Some("applicable"),
         Some("fault_tolerance"),
         Some("a&b"),
+        None,
         1000,
         None,
     )
     .unwrap();
     assert_eq!(out, "No risks found.\n");
+}
+
+// --- risk list/ready --team (po-av01j.221, server half po-av01j.201) ---
+
+/// The server's answer to a slug it does not know: 400 validation_error,
+/// naming the slugs it does know (server commit 7c90e5dd).
+const UNKNOWN_TEAM_400: &str = r#"{"error":"validation_error","message":"unknown team \"paymnets\"; known team slugs: checkout, payments"}"#;
+
+#[test]
+fn risk_list_team_is_sent_as_the_team_query_param() {
+    let raw = r#"{"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":5,"status":"applicable","linked_services":[]}],"total":1,"page":1,"limit":1000}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000&status=applicable&team=pay%26ments",
+        200,
+        raw,
+    )]);
+    let out = rvl_data::risk::list_output(
+        &server.client(),
+        Some("applicable"),
+        None,
+        None,
+        Some("pay&ments"),
+        1000,
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("R-1"), "{out}");
+}
+
+#[test]
+fn risk_list_unknown_team_surfaces_the_server_message_and_fails() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000&team=paymnets",
+        400,
+        UNKNOWN_TEAM_400,
+    )]);
+    let f = rvl_data::risk::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        Some("paymnets"),
+        1000,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg
+            .contains(r#"unknown team "paymnets"; known team slugs: checkout, payments"#),
+        "{}",
+        f.msg
+    );
+}
+
+#[test]
+fn risk_list_known_team_with_no_risks_is_an_empty_list_not_an_error() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000&team=checkout",
+        200,
+        r#"{"risks":[],"total":0,"page":1,"limit":1000}"#,
+    )]);
+    let out = rvl_data::risk::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        Some("checkout"),
+        1000,
+        None,
+    )
+    .unwrap();
+    assert_eq!(out, "No risks found.\n");
+}
+
+#[test]
+fn risk_ready_team_is_sent_and_an_unknown_team_fails() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/risks?limit=1000&sort_by=score&sort_order=desc&team=checkout",
+            200,
+            r#"{"risks":[],"total":0,"page":1,"limit":1000}"#,
+        ),
+        (
+            "GET /api/v1/risks?limit=1000&sort_by=score&sort_order=desc&team=paymnets",
+            400,
+            UNKNOWN_TEAM_400,
+        ),
+    ]);
+    let out =
+        rvl_data::risk::ready_output(&server.client(), None, None, Some("checkout"), 10, None)
+            .unwrap();
+    assert_eq!(out, "No unresolved risks ready for remediation.\n");
+    let f = rvl_data::risk::ready_output(&server.client(), None, None, Some("paymnets"), 10, None)
+        .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg.contains("known team slugs: checkout, payments"),
+        "{}",
+        f.msg
+    );
+}
+
+/// `risk ready --format=json` filters and re-wraps, but every other risk JSON
+/// path passes the server body through. A field the server adds (here
+/// `owning_team`, and `narrative`, which the old 13-field struct dropped)
+/// must reach the output, as must an empty value the struct would have
+/// omitted.
+#[test]
+fn risk_ready_json_keeps_every_field_the_server_sends() {
+    let raw = r#"{"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":90,"status":"applicable","owning_team":{"slug":"checkout","name":"Checkout"},"narrative":"n","control_codes":[],"graph_multiplier":1.5},{"id":"b","risk_code":"R-2","title":"U","category":"c","score":80,"status":"accepted"}],"total":2,"page":1,"limit":1000}"#;
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000&sort_by=score&sort_order=desc",
+        200,
+        raw,
+    )]);
+    let out =
+        rvl_data::risk::ready_output(&server.client(), None, None, None, 10, Some("json")).unwrap();
+    let got: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let want_risk: serde_json::Value = serde_json::from_str(
+        r#"{"id":"a","risk_code":"R-1","title":"T","category":"c","score":90,"status":"applicable","owning_team":{"slug":"checkout","name":"Checkout"},"narrative":"n","control_codes":[],"graph_multiplier":1.5}"#,
+    )
+    .unwrap();
+    assert_eq!(got["risks"], serde_json::json!([want_risk]), "{out}");
+    assert_eq!(got["total"], 1);
+    assert_eq!(got["limit"], 10);
 }
 
 #[test]
@@ -682,8 +810,8 @@ fn feedback_submit_server_error_names_the_category_noun() {
 #[test]
 fn auth_error_message_matches_rvl_cli_401_contract() {
     let server = MockServer::start(vec![("GET /api/v1/risks?limit=1000", 401, "{}")]);
-    let f =
-        rvl_data::risk::list_output(&server.client(), None, None, None, 1000, None).unwrap_err();
+    let f = rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None)
+        .unwrap_err();
     assert_eq!(f.code, 1);
     assert!(
         f.msg

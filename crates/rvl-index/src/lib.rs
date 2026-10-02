@@ -14,9 +14,10 @@
 //!   failed job.
 
 use anyhow::Context;
-use redb::ReadableTableMetadata;
+use redb::{ReadableDatabase, ReadableTableMetadata};
 use rvl_core::Site;
 use rvl_core::BIN;
+use rvl_core::PACKET_SCHEMA;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -43,9 +44,11 @@ pub fn site_key(site: &Site) -> String {
 /// What a warm pre-commit pass decided to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReloadPlan {
-    /// Files whose content hash matches the index: packets are reused.
+    /// Files whose content hash matches an index entry written under the
+    /// current packet contract: packets are reused.
     pub unchanged: Vec<PathBuf>,
-    /// Files that must be re-retrieved (changed, new, or never indexed).
+    /// Files that must be re-retrieved (changed, new, never indexed, or
+    /// indexed under another packet contract version).
     pub changed: Vec<PathBuf>,
 }
 
@@ -59,15 +62,30 @@ pub trait Retriever {
 /// The persistent index: path -> (content hash, packets retrieved from it).
 pub struct PacketIndex {
     db: redb::Database,
+    rebuilt_from_old_format: bool,
 }
 
-/// path -> JSON {hash, sites}. One table keeps the store trivially
-/// forward-compatible: a schema change is a new value shape, not a migration.
+/// path -> JSON {hash, packet_schema, sites}. One table keeps the store
+/// trivially forward-compatible: a schema change is a new value shape, not a
+/// migration. The value shape decoding is not the same as the packets being
+/// current, which is what `Entry::packet_schema` is for.
 const ENTRIES: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("entries");
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Entry {
     hash: String,
+    /// The packet contract version ([`PACKET_SCHEMA`]) the sites were
+    /// retrieved under. The content hash only says the file has not changed;
+    /// an entry written before a packet field existed would otherwise serve
+    /// sites without it until the file is next edited. Any other version,
+    /// older or newer, is a miss (po-av01j.67). Defaults to 0, older than
+    /// every real version, so an entry written before the stamp is a miss
+    /// too.
+    ///
+    /// The stamp is only as good as the constant: a field added to the
+    /// contract WITHOUT a version bump is not noticed here.
+    #[serde(default)]
+    packet_schema: u32,
     /// The helper declined to read this file as test material.
     /// Indistinguishable from scanned-with-zero-packets without the flag,
     /// and a warm scan needs the distinction to report the repository-wide
@@ -124,15 +142,21 @@ impl PacketIndex {
     /// the lock for a few milliseconds throws away the whole reindex
     /// (po-l3jo5).
     ///
-    /// Only `DatabaseAlreadyOpen` is retried. A storage error or a required
-    /// format upgrade will not resolve itself, and retrying one for a minute
-    /// only delays the report.
+    /// Only `DatabaseAlreadyOpen` is retried. A storage error will not
+    /// resolve itself, and retrying one for a minute only delays the report.
+    ///
+    /// An index in an older on-disk format (one written by redb 2, which
+    /// redb 4 refuses to open) is deleted and created afresh. The index is a
+    /// content-hash cache, so nothing is lost but warmth, and the next scan
+    /// refills it. The rebuild is recorded, never silent: see
+    /// [`PacketIndex::rebuilt_from_old_format`] (po-av01j.210).
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let started = Instant::now();
         let mut backoff = Duration::from_millis(25);
+        let mut rebuilt_from_old_format = false;
         let db = loop {
             match redb::Database::create(path) {
                 Ok(db) => break db,
@@ -146,6 +170,14 @@ impl PacketIndex {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(250));
                 }
+                // Once only: a second refusal after the delete is a real
+                // fault, and looping on it would never end.
+                Err(redb::DatabaseError::UpgradeRequired(_)) if !rebuilt_from_old_format => {
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("removing old-format packet index at {}", path.display())
+                    })?;
+                    rebuilt_from_old_format = true;
+                }
                 Err(e) => {
                     return Err(anyhow::Error::new(e))
                         .with_context(|| format!("opening packet index at {}", path.display()))
@@ -158,7 +190,10 @@ impl PacketIndex {
             let _ = tx.open_table(ENTRIES)?;
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            rebuilt_from_old_format,
+        })
     }
 
     /// Record the packets retrieved from `file` at content hash `hash`.
@@ -167,6 +202,7 @@ impl PacketIndex {
             file,
             Entry {
                 hash: hash.to_string(),
+                packet_schema: PACKET_SCHEMA,
                 test_skipped: false,
                 sites: sites.to_vec(),
             },
@@ -181,6 +217,7 @@ impl PacketIndex {
             file,
             Entry {
                 hash: hash.to_string(),
+                packet_schema: PACKET_SCHEMA,
                 test_skipped: true,
                 sites: Vec::new(),
             },
@@ -207,21 +244,31 @@ impl PacketIndex {
         Ok(Some(serde_json::from_str(raw.value())?))
     }
 
-    /// Packets stored for `file`, if the stored hash matches `hash`.
+    /// Packets stored for `file`, if the stored hash matches `hash` and the
+    /// entry was written under the current packet contract.
     pub fn get(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Vec<Site>>> {
         Ok(self.lookup(file, hash)?.map(|e| e.sites))
     }
 
     /// What the index holds for `file` at `hash`: its packets and whether it
-    /// was skipped as test material rather than scanned.
+    /// was skipped as test material rather than scanned. An entry written
+    /// under another packet contract version is a miss, so the caller
+    /// re-retrieves the file and overwrites the entry.
     pub fn lookup(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
         Ok(self
             .entry(file)?
-            .filter(|e| e.hash == hash)
+            .filter(|e| e.hash == hash && e.packet_schema == PACKET_SCHEMA)
             .map(|e| Indexed {
                 sites: e.sites,
                 test_skipped: e.test_skipped,
             }))
+    }
+
+    /// True when opening found an index in an older on-disk format and
+    /// replaced it with an empty one. Callers report it, so that a cold
+    /// scan after an upgrade has a stated cause.
+    pub fn rebuilt_from_old_format(&self) -> bool {
+        self.rebuilt_from_old_format
     }
 
     /// Number of indexed files.

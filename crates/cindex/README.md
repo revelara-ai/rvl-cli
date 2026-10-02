@@ -99,6 +99,17 @@ generating the db is user-run tooling (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 - **A TU that fails to parse is COUNTED, never guessed at**: the
   `retrieval_stats` record carries `tus_total` / `tus_parsed` / `tus_failed`,
   and coverage claims stop at what actually parsed.
+- **A TU that parses with errors is COUNTED as incomplete** (po-av01j.138).
+  Clang recovers from an error by dropping the construct: with
+  `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as a
+  multiplication of undeclared identifiers and the statement vanishes, calls
+  and all, leaving no call expression to count. So `tus_parsed` includes
+  `tus_incomplete` (TUs with any error diagnostic, paths in
+  `tus_incomplete_paths`), and `includes_missing` / `decls_unresolved` say
+  why. An incomplete TU still emits the sites that DID resolve, but its zero
+  is never reported as a clean one: `rvl scan` shows the lane as `partial`.
+  `calls_callee_unresolved` counts only calls clang formed whose callee did
+  not resolve; it is not a completeness claim (it was `calls_unresolved`).
 - Files not listed in the db are not scanned: the gate population for C/C++
   is compile-db repos (expansion gate protocol, po-ae75b.2).
 
@@ -160,7 +171,7 @@ The hardest typing story in the inventory, split into explicit tiers:
 | C++ member call, strong I/O verb (`execute`, `perform`, `request`, …) | emitted at the receiver's declared type | `client_type_resolved: true` |
 | C++ member call, weak verb (`get`, `send`, `query`, …) on an out-of-repo (third-party) type | emitted | `client_type_resolved: true` |
 | **Virtual dispatch** (weak or strong verb) | emitted at the STATIC interface identity | **mid tier:** `provenance.callee_candidates` = 1 + overriding definitions in the TU (>1 = ambiguous dispatch) |
-| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_unresolved`, never guessed | — |
+| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_callee_unresolved`, never guessed | — |
 | Weak verb on an in-repo, non-virtual type | not emitted (noise floor) | — |
 | No-db `.c` allowlist match | emitted | LOW: `client_type_resolved: false` |
 
@@ -169,6 +180,34 @@ the spec question ("does `Backend::fetch` block?") governs every implementer,
 which is exactly the mid-confidence semantics the gate protocol quarantines.
 Uninstantiated templates have no types to ask about — abstention, documented,
 counted.
+
+## G2 server entries: civetweb and mongoose (po-av01j.50)
+
+HTTP handler registrations of the embedded C servers ride the same stream,
+stamped `site_kind: "server_entry"`. rvl routes them to the G2 server-entry
+lane (`rvl_propagate::server_entry`) and never to the G1 client-call lane.
+G1 packets carry no `site_kind` key at all. The set is identity-driven like
+the G1 allowlist, and it is emitted in no-db mode too (LOW tier):
+
+| Call | `client_type` | Route path |
+| --- | --- | --- |
+| `mg_set_request_handler(ctx, uri, handler, cbdata)` (civetweb) | `civetweb.mg_context` | a literal `uri` rides `const_args` (index 1) |
+| `mg_http_listen(mgr, url, fn, fn_data)` (mongoose) | `mongoose.mg_mgr` | none: this is the listener, its routes live in `fn` |
+| `mg_http_match_uri(hm, glob)` (mongoose) | `mongoose.mg_http_message` | a literal `glob` rides `const_args` (index 1) |
+| `mg_match(hm->uri, mg_str(glob), caps)` (mongoose) | `mongoose.mg_http_message` | the literal rides `snippet` |
+
+`mg_match` is mongoose's general glob matcher, so it is gated two ways, both
+mechanical: its first argument must read a field named `uri`, and its
+enclosing function must be one that the same TU passes to `mg_http_listen`
+as the event handler. A method match, or a match outside a registered
+handler, is not emitted. The gate needs resolved declarations, so it does
+not apply in no-db mode.
+
+A mongoose server has no closed route table: the event handler can dispatch
+by `strcmp`, or in another TU. The listener registration therefore stays a
+route registration with no resolvable path, and the lane can find a mongoose
+health endpoint (RC-020 satisfied) but never asserts that one is absent.
+The civetweb C++ wrapper (`CivetServer::addHandler`) is not inventoried.
 
 ## Performance posture
 
@@ -192,6 +231,7 @@ Golden packet tests run the built helper over the
 checked-in fixtures (`testdata/fixture-c`, `fixture-cpp`, `fixture-nodb`)
 and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
-accounting. Engine-dependent tests skip (loudly) without libclang; the pure
+accounting. `testdata/fixture-server` pins the civetweb/mongoose G2
+server entries and the `mg_match` event-handler gate. Engine-dependent tests skip (loudly) without libclang; the pure
 compile-db plumbing (shell splitting, arg filtering, the allowlist) is unit
 tested and always runs.

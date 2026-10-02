@@ -109,6 +109,10 @@ struct SiteOut {
     lang: &'static str,
     const_args: Vec<ConstArgOut>,
     macro_expansion: bool,
+    /// "" = a classic G1 client call (the key is omitted, so G1 packets are
+    /// unchanged); [`SITE_KIND_SERVER_ENTRY`] = a G2 handler registration.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    site_kind: &'static str,
 }
 
 /// Repo-scoped retrieval accounting. Rides the same stream tagged by `kind`;
@@ -122,13 +126,37 @@ struct StatsOut {
     /// "compile_db" | "allowlist"
     mode: &'static str,
     tus_total: u32,
+    /// TUs libclang returned an AST for. INCLUDES the incomplete ones below:
+    /// `tus_parsed - tus_incomplete` is the count of genuinely clean parses.
     tus_parsed: u32,
     /// TUs that failed to parse: counted and documented, never guessed at.
     tus_failed: u32,
-    /// Call expressions whose callee could not be resolved (template-dependent
-    /// callees in uninstantiated templates are the dominant class): documented
-    /// abstentions, never guesses.
-    calls_unresolved: u32,
+    /// Parsed TUs whose parse raised at least one error (po-av01j.138). Clang
+    /// recovers from an error by DROPPING the construct it could not build:
+    /// with `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as
+    /// a multiplication of two undeclared identifiers and the whole statement
+    /// vanishes, call and all. No call expression is left to count, so the
+    /// only record of the loss is the diagnostic. A zero from one of these
+    /// TUs is not a complete zero.
+    tus_incomplete: u32,
+    /// Repo-relative paths behind `tus_incomplete`, sorted.
+    tus_incomplete_paths: Vec<String>,
+    /// `#include` directives that resolved to no file, summed over TUs. The
+    /// usual cause: the repo is scanned without its -dev packages installed.
+    includes_missing: u32,
+    /// Error diagnostics naming an identifier with no visible declaration
+    /// (undeclared identifier or function, unknown type name). Each marks a
+    /// construct clang may have dropped, and every call inside it with it.
+    decls_unresolved: u32,
+    /// Call expressions clang DID form whose callee did not resolve
+    /// (template-dependent callees in uninstantiated templates are the
+    /// dominant class): documented abstentions, never guesses. NOT a
+    /// completeness claim: a call lost to recovery never becomes a call
+    /// expression and so can never be counted here. That is why this was
+    /// renamed from `calls_unresolved`, which read as "no call went
+    /// unresolved" when the parse had silently dropped calls
+    /// (po-av01j.138); `decls_unresolved` and `tus_incomplete` count those.
+    calls_callee_unresolved: u32,
     /// C++ sources seen in no-db mode: a flagless C++ parse is guesswork, so
     /// they are skipped and counted (documented abstention class).
     cpp_files_skipped_no_db: u32,
@@ -333,6 +361,36 @@ fn c_family(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Mirrors `rvl_core::SITE_KIND_SERVER_ENTRY`.
+const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
+
+/// The C free-function G2 candidate set: HTTP handler registrations of the
+/// embedded servers, mapped to their framework identity. Identity-driven like
+/// [`c_family`]: each name is a unique unmangled identifier of ONE library
+/// (civetweb and mongoose share the `mg_` prefix, not these names).
+/// RETRIEVAL, not judgement: which path is a health endpoint is the lane's
+/// question. `mg_match` is deliberately ABSENT: it is mongoose's general glob
+/// matcher and is a route only under the event-handler gate in `handle_call`.
+fn server_family(name: &str) -> Option<&'static str> {
+    match name {
+        "mg_set_request_handler" => Some("civetweb.mg_context"),
+        "mg_http_listen" => Some("mongoose.mg_mgr"),
+        "mg_http_match_uri" => Some(MONGOOSE_MESSAGE),
+        _ => None,
+    }
+}
+
+/// The identity of a mongoose route match (`mg_http_match_uri`, gated
+/// `mg_match`): the request message whose URI is matched.
+const MONGOOSE_MESSAGE: &str = "mongoose.mg_http_message";
+
+/// (client type, site kind) of a C free function on either identity table.
+fn c_identity(name: &str) -> Option<(&'static str, &'static str)> {
+    c_family(name)
+        .map(|f| (f, ""))
+        .or_else(|| server_family(name).map(|f| (f, SITE_KIND_SERVER_ENTRY)))
+}
+
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
 const STRONG_VERBS: &[&str] = &[
@@ -403,27 +461,29 @@ unsafe fn first_child(cursor: CXCursor) -> Option<CXCursor> {
     out
 }
 
-/// Depth-first search for a DeclRefExpr referencing an enum constant.
-unsafe fn find_enum_ref(cursor: CXCursor) -> Option<CXCursor> {
-    if clang_getCursorKind(cursor) == CXCursor_DeclRefExpr {
+/// Depth-first search for the declaration of kind `target` that a
+/// DeclRefExpr or MemberRefExpr under `cursor` references.
+unsafe fn find_ref_of_kind(cursor: CXCursor, target: CXCursorKind) -> Option<CXCursor> {
+    let kind = clang_getCursorKind(cursor);
+    if kind == CXCursor_DeclRefExpr || kind == CXCursor_MemberRefExpr {
         let r = clang_getCursorReferenced(cursor);
-        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == CXCursor_EnumConstantDecl {
+        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == target {
             return Some(r);
         }
     }
     extern "C" fn walk(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
-        let found = data as *mut Option<CXCursor>;
+        let state = data as *mut (CXCursorKind, Option<CXCursor>);
         unsafe {
-            if let Some(r) = find_enum_ref(c) {
-                *found = Some(r);
+            if let Some(r) = find_ref_of_kind(c, (*state).0) {
+                (*state).1 = Some(r);
                 return CXChildVisit_Break;
             }
         }
         CXChildVisit_Continue
     }
-    let mut found: Option<CXCursor> = None;
-    clang_visitChildren(cursor, walk, &mut found as *mut _ as CXClientData);
-    found
+    let mut state: (CXCursorKind, Option<CXCursor>) = (target, None);
+    clang_visitChildren(cursor, walk, &mut state as *mut _ as CXClientData);
+    state.1
 }
 
 /// Peel implicit casts / parens down to the interesting expression.
@@ -464,7 +524,7 @@ unsafe fn const_args_of(call: CXCursor) -> Vec<ConstArgOut> {
     let mut out = Vec::new();
     for i in 0..n.min(8) {
         let arg = clang_Cursor_getArgument(call, i as c_uint);
-        if let Some(e) = find_enum_ref(arg) {
+        if let Some(e) = find_ref_of_kind(arg, CXCursor_EnumConstantDecl) {
             out.push(ConstArgOut {
                 index: i as u32,
                 name: String::new(),
@@ -519,6 +579,11 @@ struct PendingSite {
     /// USR of a virtual callee: callee_candidates is finalized after the TU
     /// walk from the override counts (1 + in-TU overriding definitions).
     virtual_usr: Option<String>,
+    /// USR of the enclosing function of a mongoose `mg_match` route match:
+    /// the site is kept only when that function is a registered event
+    /// handler (decided after the TU walk; a handler is usually defined
+    /// before the `mg_http_listen` call that registers it).
+    handler_gate: Option<String>,
 }
 
 struct WalkState {
@@ -531,7 +596,13 @@ struct WalkState {
     /// base-method USR -> number of overriding definitions seen in this TU.
     override_counts: HashMap<String, u32>,
     pending: Vec<PendingSite>,
-    calls_unresolved: u32,
+    /// USRs of the functions this TU passes to `mg_http_listen` as the event
+    /// handler.
+    http_handlers: HashSet<String>,
+    calls_callee_unresolved: u32,
+    /// Per-TU count of `#include` directives that resolved to no file,
+    /// collected in the preprocessing pass.
+    tu_includes_missing: u32,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
     /// detailed preprocessing record in a first pass. The v2 `macro_expansion`
@@ -606,7 +677,8 @@ extern "C" fn visitor(
 }
 
 /// Pass 1: collect macro-expansion ranges from the detailed preprocessing
-/// record. Purely mechanical evidence for the v2 `macro_expansion` flag.
+/// record (purely mechanical evidence for the v2 `macro_expansion` flag), and
+/// count the `#include` directives that resolved to no file.
 extern "C" fn macro_visitor(
     cursor: CXCursor,
     _parent: CXCursor,
@@ -624,6 +696,10 @@ extern "C" fn macro_visitor(
                     .or_default()
                     .push((s_off, e_off + 1));
             }
+        } else if clang_getCursorKind(cursor) == CXCursor_InclusionDirective
+            && clang_getIncludedFile(cursor).is_null()
+        {
+            st.tu_includes_missing += 1;
         }
     }
     CXChildVisit_Continue
@@ -681,6 +757,8 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let client_type: String;
     let mut receiver = String::new();
     let mut virtual_usr: Option<String> = None;
+    let mut handler_gate: Option<String> = None;
+    let site_kind: &'static str;
 
     if callee_resolved {
         let ckind = clang_getCursorKind(callee);
@@ -690,10 +768,30 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         }
         match ckind {
             k if k == CXCursor_FunctionDecl => {
-                let Some(family) = c_family(&method) else {
+                if let Some((family, kind)) = c_identity(&method) {
+                    client_type = family.to_string();
+                    site_kind = kind;
+                } else if method == "mg_match" {
+                    // mongoose's glob matcher is a route match only when it
+                    // matches the request URI inside an event handler. The
+                    // handler half is decided after the TU walk.
+                    let Some(f) = st.fn_stack.last().copied() else {
+                        return;
+                    };
+                    let matches_uri = clang_Cursor_getNumArguments(call) > 0
+                        && find_ref_of_kind(clang_Cursor_getArgument(call, 0), CXCursor_FieldDecl)
+                            .is_some_and(|field| {
+                                cx_string(clang_getCursorSpelling(field)) == "uri"
+                            });
+                    if !matches_uri {
+                        return;
+                    }
+                    handler_gate = Some(cx_string(clang_getCursorUSR(f)));
+                    client_type = MONGOOSE_MESSAGE.to_string();
+                    site_kind = SITE_KIND_SERVER_ENTRY;
+                } else {
                     return;
-                };
-                client_type = family.to_string();
+                }
             }
             k if k == CXCursor_CXXMethod => {
                 if !st.compile_db_mode {
@@ -718,6 +816,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     return;
                 }
                 client_type = type_name;
+                site_kind = "";
                 if is_virtual {
                     virtual_usr = Some(cx_string(clang_getCursorUSR(callee)));
                 }
@@ -736,22 +835,30 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
-        let Some(family) = c_family(&method) else {
+        let Some((family, kind)) = c_identity(&method) else {
             if method.is_empty() {
-                st.calls_unresolved += 1;
+                st.calls_callee_unresolved += 1;
             }
             return;
         };
         client_type = family.to_string();
+        site_kind = kind;
     } else {
         // Compile-db mode with an unresolved callee: the uninstantiated
         // template's dependent call lands here. Counted, never guessed.
-        st.calls_unresolved += 1;
+        st.calls_callee_unresolved += 1;
         return;
     }
 
     if method.is_empty() {
         return;
+    }
+    if method == "mg_http_listen" && clang_Cursor_getNumArguments(call) > 2 {
+        // The event handler this listener dispatches to (argument 2).
+        if let Some(f) = find_ref_of_kind(clang_Cursor_getArgument(call, 2), CXCursor_FunctionDecl)
+        {
+            st.http_handlers.insert(cx_string(clang_getCursorUSR(f)));
+        }
     }
 
     let (symbol, enclosing_body) = match st.fn_stack.last().copied() {
@@ -788,9 +895,55 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
             lang: "c_cpp",
             const_args,
             macro_expansion,
+            site_kind,
         },
         virtual_usr,
+        handler_gate,
     });
+}
+
+/// Is this diagnostic about an identifier with no visible declaration? The
+/// libclang C API exposes no diagnostic IDs, so the stable message stems are
+/// matched. A miss here only lowers `decls_unresolved`: the TU is still
+/// marked incomplete by its error count.
+fn is_undeclared_diagnostic(message: &str) -> bool {
+    const STEMS: &[&str] = &[
+        "undeclared identifier",
+        "call to undeclared function",
+        "implicit declaration of function",
+        "unknown type name",
+        "no type named",
+        "no member named",
+        "no template named",
+    ];
+    STEMS.iter().any(|stem| message.contains(stem))
+}
+
+/// What one parsed TU produced: its sites, plus the evidence of how complete
+/// the parse was (po-av01j.138).
+struct TuOutcome {
+    sites: Vec<SiteOut>,
+    /// Error or fatal diagnostics raised by the parse.
+    errors: u32,
+    includes_missing: u32,
+    decls_unresolved: u32,
+}
+
+/// Count the parse's error-severity diagnostics, and the subset that name an
+/// undeclared identifier.
+unsafe fn error_diagnostics(tu: CXTranslationUnit) -> (u32, u32) {
+    let (mut errors, mut undeclared) = (0u32, 0u32);
+    for i in 0..clang_getNumDiagnostics(tu) {
+        let d = clang_getDiagnostic(tu, i);
+        if clang_getDiagnosticSeverity(d) >= CXDiagnostic_Error {
+            errors += 1;
+            if is_undeclared_diagnostic(&cx_string(clang_getDiagnosticSpelling(d))) {
+                undeclared += 1;
+            }
+        }
+        clang_disposeDiagnostic(d);
+    }
+    (errors, undeclared)
 }
 
 /// Parse one TU and drain its sites. Returns None when the TU fails to parse.
@@ -799,7 +952,7 @@ unsafe fn walk_tu(
     file: &Path,
     args: &[String],
     st: &mut WalkState,
-) -> Option<Vec<SiteOut>> {
+) -> Option<TuOutcome> {
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
@@ -831,7 +984,9 @@ unsafe fn walk_tu(
     st.fn_stack.clear();
     st.override_counts.clear();
     st.pending.clear();
+    st.http_handlers.clear();
     st.macro_ranges.clear();
+    st.tu_includes_missing = 0;
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
         root_cursor,
@@ -840,10 +995,16 @@ unsafe fn walk_tu(
     );
     clang_visitChildren(root_cursor, visitor, st as *mut WalkState as CXClientData);
     // Finalize the mid tier: a virtual callee's ambiguity is 1 (its own
-    // definition) + the overriding definitions this TU declares.
+    // definition) + the overriding definitions this TU declares. A gated
+    // mongoose route match survives only inside a registered event handler.
     let sites = st
         .pending
         .drain(..)
+        .filter(|p| {
+            p.handler_gate
+                .as_ref()
+                .is_none_or(|usr| st.http_handlers.contains(usr))
+        })
         .map(|mut p| {
             if let Some(usr) = p.virtual_usr {
                 p.site.provenance.callee_candidates =
@@ -852,8 +1013,14 @@ unsafe fn walk_tu(
             p.site
         })
         .collect();
+    let (errors, decls_unresolved) = error_diagnostics(tu);
     clang_disposeTranslationUnit(tu);
-    Some(sites)
+    Some(TuOutcome {
+        sites,
+        errors,
+        includes_missing: st.tu_includes_missing,
+        decls_unresolved,
+    })
 }
 
 /// Bounded walk for no-db mode: `.c` sources parsed with the allowlist tier,
@@ -929,7 +1096,9 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         fn_stack: Vec::new(),
         override_counts: HashMap::new(),
         pending: Vec::new(),
-        calls_unresolved: 0,
+        http_handlers: HashSet::new(),
+        calls_callee_unresolved: 0,
+        tu_includes_missing: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
         engine_args: engine.source.parse_args(),
@@ -939,6 +1108,8 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut seen_keys: HashSet<String> = HashSet::new();
     let (mut tus_total, mut tus_parsed, mut tus_failed) = (0u32, 0u32, 0u32);
+    let (mut includes_missing, mut decls_unresolved) = (0u32, 0u32);
+    let mut tus_incomplete_paths: Vec<String> = Vec::new();
 
     let index = unsafe { clang_createIndex(0, 0) };
     let mut jobs = jobs;
@@ -957,9 +1128,18 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
             continue;
         }
         match unsafe { walk_tu(index, &job.file, &job.args, &mut st) } {
-            Some(sites) => {
+            Some(tu) => {
                 tus_parsed += 1;
-                for s in sites {
+                includes_missing += tu.includes_missing;
+                decls_unresolved += tu.decls_unresolved;
+                // An incomplete TU still emits the sites that DID resolve:
+                // they are real evidence, and dropping them would turn a
+                // partial answer into a bigger false negative. What it must
+                // never do is count as a clean parse.
+                if tu.errors > 0 || tu.includes_missing > 0 {
+                    tus_incomplete_paths.push(rel.clone());
+                }
+                for s in tu.sites {
                     // A header included by many TUs re-emits its sites; the
                     // stream carries each site_key once.
                     if seen_keys.insert(s.site_key.clone()) {
@@ -971,6 +1151,7 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         }
     }
     unsafe { clang_disposeIndex(index) };
+    tus_incomplete_paths.sort();
 
     let stats = StatsOut {
         kind: "retrieval_stats",
@@ -985,7 +1166,11 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         tus_total,
         tus_parsed,
         tus_failed,
-        calls_unresolved: st.calls_unresolved,
+        tus_incomplete: tus_incomplete_paths.len() as u32,
+        tus_incomplete_paths,
+        includes_missing,
+        decls_unresolved,
+        calls_callee_unresolved: st.calls_callee_unresolved,
         cpp_files_skipped_no_db: cpp_skipped,
     };
     writeln!(out, "{}", serde_json::to_string(&stats)?)?;
@@ -1031,6 +1216,22 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_diagnostics_are_recognized_and_other_errors_are_not() {
+        for m in [
+            "use of undeclared identifier 'CURL'",
+            "call to undeclared function 'curl_easy_init'; ISO C99 and later do not support implicit function declarations",
+            "implicit declaration of function 'foo' is invalid in C99",
+            "unknown type name 'CURL'",
+            "no type named 'Stub' in namespace 'rpc'",
+            "no member named 'perform' in 'Client'",
+        ] {
+            assert!(is_undeclared_diagnostic(m), "{m}");
+        }
+        assert!(!is_undeclared_diagnostic("'curl/curl.h' file not found"));
+        assert!(!is_undeclared_diagnostic("expected ';' after expression"));
+    }
+
+    #[test]
     fn c_family_covers_the_curated_allowlist_and_nothing_else() {
         assert_eq!(c_family("curl_easy_perform"), Some("libcurl.CURL"));
         assert_eq!(c_family("PQexec"), Some("libpq.PGconn"));
@@ -1040,5 +1241,27 @@ mod tests {
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
         assert_eq!(c_family("printf"), None);
+    }
+
+    #[test]
+    fn server_family_names_the_registrations_and_nothing_else() {
+        assert_eq!(
+            server_family("mg_set_request_handler"),
+            Some("civetweb.mg_context")
+        );
+        assert_eq!(server_family("mg_http_listen"), Some("mongoose.mg_mgr"));
+        assert_eq!(
+            server_family("mg_http_match_uri"),
+            Some("mongoose.mg_http_message")
+        );
+        // mg_match is a general glob matcher: it is a route only under the
+        // event-handler gate, never by name alone.
+        assert_eq!(server_family("mg_match"), None);
+        // Plain listeners and starts carry no HTTP route surface.
+        assert_eq!(server_family("mg_listen"), None);
+        assert_eq!(server_family("mg_start"), None);
+        // The two tables are disjoint: a client call is never a server entry.
+        assert_eq!(server_family("curl_easy_perform"), None);
+        assert_eq!(c_family("mg_http_listen"), None);
     }
 }

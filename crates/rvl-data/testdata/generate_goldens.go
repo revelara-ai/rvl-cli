@@ -128,49 +128,26 @@ func main() {
 	must(os.MkdirAll(dir, 0755))
 
 	// ---- 1. risk ready: input list body -> wrapped MarshalIndent + "\n" ----
-	// Input deliberately includes: unknown fields (dropped), HTML-escaping
-	// bait (& < >), a non-applicable risk (filtered), missing linked_services
-	// (null), unicode, and more applicable risks than --limit=2.
+	// po-av01j.221: each risk is carried as the server sent it
+	// (json.RawMessage), not re-marshaled through the narrow Risk struct, so
+	// a field the server adds is never silently dropped. Only the wrapper is
+	// rebuilt. Input deliberately includes: a field the old struct dropped
+	// (narrative, kept now), HTML-escaping bait (& < >), a non-applicable risk
+	// (filtered), missing linked_services (stays missing), unicode, and more
+	// applicable risks than --limit=2.
 	readyInput := []byte(`{"risks":[
 	  {"id":"11111111-1111-1111-1111-111111111111","risk_code":"R-001","title":"DB <primary> & replica lag","category":"data_management","score":88,"status":"applicable","linked_services":["checkout-api","billing"],"control_codes":["RC-018"],"last_seen_at":"2026-08-01T10:00:00Z","narrative":"dropped-by-cli","uca_type":"not_provided"},
 	  {"id":"22222222-2222-2222-2222-222222222222","risk_code":"R-002","title":"Retry storm étude","category":"fault_tolerance","score":70,"status":"accepted","linked_services":["api"]},
 	  {"id":"33333333-3333-3333-3333-333333333333","risk_code":"R-003","title":"No timeout","category":"fault_tolerance","score":65,"status":"applicable"},
 	  {"id":"44444444-4444-4444-4444-444444444444","risk_code":"R-004","title":"Low priority","category":"monitoring","score":10,"status":"applicable","linked_services":[]}
 	],"total":4,"page":1,"limit":1000}`)
-	var resp ListRisksResponse
-	must(json.Unmarshal(readyInput, &resp))
-	var ready []Risk
-	for _, r := range resp.Risks {
-		if r.Status == "applicable" {
-			ready = append(ready, r)
-		}
-	}
-	limit := 2
-	out := ready
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	wrapped := ListRisksResponse{Risks: out, Total: len(ready), Page: 1, Limit: limit}
-	jsonBytes, err := json.MarshalIndent(wrapped, "", "  ")
-	must(err)
 	write(dir, "ready_input.json", readyInput)
-	write(dir, "ready_golden.txt", append(jsonBytes, '\n')) // fmt.Println adds \n
+	write(dir, "ready_golden.txt", readyGolden(readyInput, 2))
 
 	// Empty ready set: nil slice marshals as null.
 	emptyIn := []byte(`{"risks":[{"id":"a","risk_code":"R-9","title":"t","category":"c","score":1,"status":"accepted","linked_services":null}],"total":1,"page":1,"limit":1000}`)
-	var resp2 ListRisksResponse
-	must(json.Unmarshal(emptyIn, &resp2))
-	var ready2 []Risk
-	for _, r := range resp2.Risks {
-		if r.Status == "applicable" {
-			ready2 = append(ready2, r)
-		}
-	}
-	wrapped2 := ListRisksResponse{Risks: ready2, Total: len(ready2), Page: 1, Limit: 10}
-	jb2, err := json.MarshalIndent(wrapped2, "", "  ")
-	must(err)
 	write(dir, "ready_empty_input.json", emptyIn)
-	write(dir, "ready_empty_golden.txt", append(jb2, '\n'))
+	write(dir, "ready_empty_golden.txt", readyGolden(emptyIn, 10))
 
 	// ---- 2. risk context compose ----
 	ctxBody := []byte(`{"risk":{"id":"x","risk_code":"R-001","title":"DB <primary> & replica","category":"data_management","score":88,"status":"applicable","linked_services":["a"]},"controls":[{"control":{"control_code":"RC-018","name":"Timeouts & retries","category":"fault_tolerance","type":"preventive"},"existing_evidence":[],"evidence_gaps":["code"]}],"knowledge":{"patterns":[],"procedures":[],"facts":[]},"score_factors":[{"description":"seen in 3 incidents","points":30,"source":"incidents"}],"graph_multiplier":{"value":1.25},"zeta":true}`)
@@ -233,4 +210,36 @@ func main() {
 	bb, err := json.Marshal(body)
 	must(err)
 	write(dir, "search_body_golden.txt", bb)
+}
+
+// readyGolden is `risk ready --format=json`: keep the applicable risks as
+// raw server objects, cap them at limit, and wrap them.
+func readyGolden(body []byte, limit int) []byte {
+	var resp struct {
+		Risks []json.RawMessage `json:"risks"`
+	}
+	must(json.Unmarshal(body, &resp))
+	var ready []json.RawMessage
+	for _, raw := range resp.Risks {
+		var r struct {
+			Status string `json:"status"`
+		}
+		must(json.Unmarshal(raw, &r))
+		if r.Status == "applicable" {
+			ready = append(ready, raw)
+		}
+	}
+	out := ready
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	wrapped := struct {
+		Risks []json.RawMessage `json:"risks"`
+		Total int               `json:"total"`
+		Page  int               `json:"page"`
+		Limit int               `json:"limit"`
+	}{out, len(ready), 1, limit}
+	b, err := json.MarshalIndent(wrapped, "", "  ")
+	must(err)
+	return append(b, '\n') // fmt.Println adds \n
 }

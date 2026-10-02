@@ -4,6 +4,10 @@ Releases are cut by pushing a v-prefixed semver tag (e.g. `v1.0.0`).
 [cargo-dist](https://github.com/axodotdev/cargo-dist) builds the release
 archives and publishes the Homebrew cask to `revelara-ai/homebrew-tap`.
 
+A change reaches `main` through a pull request. A maintainer's approval sends
+it to a merge queue, which runs CI on the change merged with the current
+`main` and merges it when that run is green.
+
 The dist configuration lives in `dist-workspace.toml`, and
 `.github/workflows/release.yml` is generated from it — edit the TOML and
 regenerate, never hand-edit the workflow. Two of its choices are load-bearing
