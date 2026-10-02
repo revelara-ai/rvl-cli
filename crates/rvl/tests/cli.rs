@@ -2617,6 +2617,55 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
     );
 }
 
+/// C G3 e2e (po-av01j.51): the `pthread_create` registration cindex emits as
+/// a background_job site is decided by the job-altitude seed spec and by
+/// nothing else. The seed is `depends` (the retriever does no loop-body
+/// analysis), so the site routes to per-site judgment.
+#[test]
+fn scan_decides_c_background_job_sites_end_to_end() {
+    let Some(cindex) = cindex_helper("scan_decides_c_background_job_sites_end_to_end") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-c");
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(manifest.join("tests/fixtures/c_seed_specs.json"))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        scan_reached_a_verdict(&out) || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone();
+    let workers = verdicts_for(&rows, "src/workers.c");
+    assert_eq!(workers.len(), 1, "one registration site: {workers:?}");
+    assert!(
+        workers[0].0 == "abstain" && workers[0].1.contains("depends"),
+        "the thread start must abstain on the depends spec: {workers:?}"
+    );
+}
+
 /// C G2, live end to end (po-av01j.50): cindex inventories the civetweb and
 /// mongoose registrations as server entries, rvl routes them to the G2 lane
 /// and keeps them out of the G1 site count. The fixture registers `/healthz`,

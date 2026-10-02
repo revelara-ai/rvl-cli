@@ -246,11 +246,11 @@ fn c_fixture_emits_the_planted_g1_sites_with_const_args_and_macro_flag() {
     assert!(sites_with_method(&sites, "curl_easy_cleanup").is_empty());
     assert!(sites_with_method(&sites, "curl_easy_init").is_empty());
 
-    // The stats record: one TU, parsed, compile-db mode.
+    // The stats record: both TUs (main.c, workers.c) parsed, compile-db mode.
     let st = stats(&records);
     assert_eq!(st["mode"], "compile_db");
-    assert_eq!(st["tus_total"], 1);
-    assert_eq!(st["tus_parsed"], 1);
+    assert_eq!(st["tus_total"], 2);
+    assert_eq!(st["tus_parsed"], 2);
     assert_eq!(st["tus_failed"], 0);
     // Every header resolves, so this is a genuinely clean parse, and the
     // stats must say so in the terms the missing-header case uses.
@@ -347,6 +347,107 @@ fn no_db_fallback_is_the_extern_c_allowlist_at_low_tier() {
     let st = stats(&records);
     assert_eq!(st["mode"], "allowlist");
     assert_eq!(st["cpp_files_skipped_no_db"], 1);
+    // The G3 registration rides the same allowlist, at the same low tier.
+    let threads = sites_with_method(&sites, "pthread_create");
+    assert_eq!(threads.len(), 1, "the allowlisted registration: {sites:?}");
+    assert_eq!(threads[0]["site_kind"], "background_job");
+    assert_eq!(threads[0]["provenance"]["client_type_resolved"], false);
+}
+
+/// G3 (po-av01j.51): `pthread_create` is a background-job REGISTRATION. The
+/// retriever reports where the thread starts and nothing about the loop it
+/// runs; the lifecycle calls around it are not sites, and the classic G1
+/// sites in the same repo carry no `site_kind` key.
+#[test]
+fn c_fixture_emits_pthread_create_as_a_background_job_site() {
+    if !engine_available("c_fixture_emits_pthread_create_as_a_background_job_site") {
+        return;
+    }
+    let (sites, _records) = retrieve(&fixture("fixture-c"), &[]);
+
+    let jobs: Vec<&serde_json::Value> = sites
+        .iter()
+        .filter(|s| s["site_kind"] == "background_job")
+        .collect();
+    assert_eq!(jobs.len(), 1, "one planted registration: {sites:?}");
+    let job = jobs[0];
+    assert_eq!(job["func"], "pthread_create");
+    assert_eq!(job["client_type"], "posix.pthread");
+    assert_eq!(job["file_path"], "src/workers.c");
+    assert_eq!(job["symbol"], "start_workers");
+    assert_eq!(job["provenance"]["client_type_resolved"], true);
+    assert_eq!(
+        job["site_key"],
+        format!(
+            "src/workers.c:{}:posix.pthread:pthread_create",
+            job["line_number"]
+        )
+    );
+
+    assert!(sites_with_method(&sites, "pthread_detach").is_empty());
+    assert!(sites_with_method(&sites, "pthread_join").is_empty());
+    // Every other site is a classic call site: the key is absent.
+    for s in sites.iter().filter(|s| s["func"] != "pthread_create") {
+        assert!(
+            s.get("site_kind").is_none(),
+            "classic sites carry no kind: {s}"
+        );
+    }
+}
+
+/// G3 (po-av01j.51): constructing a `std::thread` / `std::jthread` with a
+/// callable is the registration. The default constructor starts nothing and
+/// the move constructor transfers a thread that already runs, so neither is
+/// emitted.
+#[test]
+fn cpp_fixture_emits_std_thread_construction_as_background_job_sites() {
+    if !engine_available("cpp_fixture_emits_std_thread_construction_as_background_job_sites") {
+        return;
+    }
+    let (sites, _records) = retrieve(&fixture("fixture-cpp"), &[]);
+
+    let jobs: Vec<&serde_json::Value> = sites
+        .iter()
+        .filter(|s| s["site_kind"] == "background_job")
+        .collect();
+    let mut found: Vec<(&str, &str, &str)> = jobs
+        .iter()
+        .map(|s| {
+            (
+                s["symbol"].as_str().unwrap_or_default(),
+                s["client_type"].as_str().unwrap_or_default(),
+                s["func"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("start_joining", "std::jthread", "jthread"),
+            ("start_poller", "std::thread", "thread"),
+            ("start_temporary", "std::thread", "thread"),
+        ],
+        "exactly the three callable-carrying constructions: {jobs:?}"
+    );
+    for job in &jobs {
+        assert_eq!(job["file_path"], "src/workers.cpp");
+        assert_eq!(job["provenance"]["client_type_resolved"], true);
+        assert!(
+            job["snippet"]
+                .as_str()
+                .is_some_and(|s| s.contains("poll_forever")),
+            "the snippet carries the construction source: {job}"
+        );
+    }
+    assert!(
+        !sites.iter().any(|s| s["symbol"] == "not_registrations"),
+        "default and move construction start no thread: {sites:?}"
+    );
+    // The G1 sites of service.cpp are untouched by the new lane.
+    assert!(sites_with_method(&sites, "fetch")[0]
+        .get("site_kind")
+        .is_none());
 }
 
 #[test]
@@ -423,7 +524,8 @@ fn g1_packets_carry_no_site_kind_key() {
     // so pre-existing G1 streams stay byte-identical.
     let (sites, _) = retrieve(&fixture("fixture-c"), &[]);
     assert!(!sites.is_empty());
-    for s in &sites {
+    // (The fixture's one G3 thread start is not a G1 site and is stamped.)
+    for s in sites.iter().filter(|s| s["func"] != "pthread_create") {
         assert!(
             s.get("site_kind").is_none(),
             "G1 site grew a site_kind: {s}"
