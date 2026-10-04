@@ -51,7 +51,9 @@ Every record carries:
 - `provenance` — metadata about the SEARCH, not a claim about the code. At
   minimum `{client_type_resolved, callers_total, callers_included,
   callees_total, callees_included}`. `client_type_resolved` is the per-site
-  confidence signal.
+  confidence signal. A call site also carries `ancestry_depth_searched`,
+  `chain_roots`, `hit_depth_cap` and `hit_caller_budget` (see "The call
+  graph" below).
 - `const_args` (v2) — constant-valued arguments at the call site, as
   `{index, name, value, how}`. `index` is the zero-based position as written;
   `name` is the keyword (`timeout=5` → `"timeout"`), `""` for positional
@@ -62,7 +64,10 @@ Every record carries:
   `repr()`. Evidence, never a verdict.
 - `macro_expansion` (v2) — always `false` for Python (no macros); mechanical
   for C/C++ retrievers.
-- `callers`, `callees` — **empty arrays** (see below).
+- `callers`, `callees` — the in-repo functions above and below the enclosing
+  function, as `{file, line, symbol, source}` snippets (see "The call graph"
+  below). Empty for a site at module scope, and on server-entry, emission
+  and decorator-registration records.
 - `lang` — `"python"`.
 
 ## The `retrieval_stats` record (one per run)
@@ -143,13 +148,78 @@ method in neither set and is never emitted. This is a small, conservative
 allowlist that favours a resolvable, meaningful set over indexing every
 attribute call in the file.
 
-## callers/callees are empty in v1
+## The call graph: callers, callees and chain roots
 
-This helper reads a single file's imports and local assignments; it does not
-build a cross-module call graph. The `callers` and `callees` keys are emitted as
-empty arrays so the packet shape is stable and a later version can fill them
-without a schema bump. Graph walking (goindex's upward ancestry + downward
-callees) is out of scope for v1.
+pyindex builds one call graph over the whole tree and gives each call site
+(and each background-job call site) the same three things goindex gives a Go
+site:
+
+- `callers` — the functions that reach the enclosing function, nearest
+  first: its direct callers, then theirs, breadth-first. At most 4 are
+  emitted; `provenance.callers_total` counts all that the walk found.
+- `callees` — the in-repo functions the enclosing function calls directly,
+  in call order. At most 4 are emitted; `provenance.callees_total` counts
+  them all.
+- `provenance.chain_roots` — the functions the upward walk stopped at
+  because nothing calls them. Each root carries structural facts, never a
+  classification: `symbol` (the qualified name, `Syncer.sync_all`),
+  `package` (the dotted module), `signature`, `doc` (the summary line of the
+  docstring), `exported` (no leading underscore), `in_package_main` (the
+  module has an `if __name__ == "__main__":` guard, or is `__main__.py`),
+  `referenced_as_value` (how often the function is named without being
+  called: passed to a router, a scheduler, a thread) and `decorators` (raw
+  source). Whether a root is a real entrypoint is a judgment and stays
+  downstream.
+
+The walk reports where it stopped short. `hit_depth_cap` is true when it
+reached 12 levels with callers still to follow, and `hit_caller_budget` is
+true when it found more callers than it emitted. `ancestry_depth_searched`
+is how many levels it walked. rvl reasons from "no bound found" only when
+neither flag is set.
+
+### What makes an edge
+
+Python has no type checker to ask, so an edge exists only where the callee
+expression resolves structurally to exactly one definition in the tree:
+
+| Call | Resolves to |
+| --- | --- |
+| `foo()` | a def nested in an enclosing function, a module-level def, or an imported name |
+| `mod.foo()` | a top-level def of an imported module. Re-exports are followed. |
+| `self.foo()`, `cls.foo()` | a method on the enclosing class, or on an in-repo base class |
+| `Cls.foo()` | the same lookup, by class |
+| `obj.foo()` | a method of `Cls`, where `obj = Cls(...)` in the same function or at module scope, or `self.obj = Cls(...)` in the same class |
+| `Cls()` | `Cls.__init__`, when the tree defines one |
+| `Cls().foo()` | a method on the value constructed in place |
+
+Everything else makes **no edge**: a method on a parameter, a callable
+taken out of a dict, `super().foo()`, a name that a parameter or a local
+shadows. pyindex does not match by name. A caller's source is read downstream
+as in scope of the site, so a guessed caller is evidence for a chain that
+may not exist. The cost is the other direction: a function that is only
+reached dynamically is reported as a chain root, with
+`referenced_as_value` and `decorators` as the facts that say so.
+
+Imports resolve to files as follows. A relative import (`from .gateway
+import x`) is counted up from the importing module's package. An absolute
+import matches a module by its full dotted path from `--root`, or by a
+suffix of it when the directory above is not a package (`src/app/x.py`
+imports as `app.x`). When two files can answer to one import, or the name
+is a standard-library module with no exact match, the import resolves to
+nothing. A function that calls itself is not counted as its own caller.
+
+### Scope of the graph
+
+- Test paths are not in the graph unless `--include-tests` is given, so a
+  test is never a caller of production code by default.
+- With `--files`, packets and `retrieval_stats` cover the listed files
+  only, but the graph still spans the whole tree: a reloaded file gets the
+  packets a full run gives it. A file outside `--files` that does not
+  parse loses its own edges and is not counted as a failure.
+- The Go-only context facts (`direct_callers`,
+  `direct_callers_passing_bounded_ctx`, `ancestors_traced`,
+  `ancestors_with_deadline`) are not emitted. They describe a
+  `context.Context` data flow that Python does not have.
 
 ## Tests
 
@@ -157,6 +227,9 @@ callees) is out of scope for v1.
 tests assert the two properties every consumer depends on — schema stamped and
 site_key unique + well-formed — plus that a known client resolves, that a
 construction/timeout is retrievable, and that noise calls are not emitted.
+`testdata/fixture_graph/` is a small package with a known multi-hop call
+chain (`main -> run_once -> sync_user -> fetch_profile`) for the call-graph
+tests.
 `testdata/fixture_tests/` holds one file per test-path convention beside
 three production files, for the tests that pin what is skipped, what is
 counted and named, and what `--include-tests` restores.
