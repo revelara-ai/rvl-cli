@@ -28,11 +28,24 @@ installers = []
 # .github/workflows/publish-cask.yml as a reusable workflow after `host`, with
 # the plan manifest passed in and secrets inherited.
 publish-jobs = ["./publish-cask"]
+# Supply chain (po-fao1r). Each release carries a CycloneDX SBOM of the Rust
+# dependency tree as a release asset (rvl.cdx.xml), built by cargo-cyclonedx in
+# the global-artifacts job. It lists crates only: goindex's Go modules and the
+# vendored libclang are in the archive and not in the SBOM.
+cargo-cyclonedx = true
+# SLSA Build Level 3 provenance for every release asset, published on the
+# release as rvl.intoto.jsonl by .github/workflows/slsa-provenance.yml (see
+# that file for why it is post-announce and not a publish job). This and not
+# dist's `github-attestations`, which stores an attestation in GitHub's API
+# and publishes no file with the release.
+post-announce-jobs = ["./slsa-provenance"]
 # Publish jobs default to id-token+packages write and NOTHING else, which means
 # `contents: none` and a failing `actions/checkout` of this repo. The cask job
 # needs to read this repo (for ci/render-cask.sh) and nothing more; it reaches
-# the tap with a PAT, not GITHUB_TOKEN.
-github-custom-job-permissions = { "publish-cask" = { contents = "read" } }
+# the tap with a PAT, not GITHUB_TOKEN. The provenance job needs exactly what
+# slsa-github-generator documents: read the run, an OIDC token to sign with,
+# and write access to upload the provenance to the release.
+github-custom-job-permissions = { "publish-cask" = { contents = "read" }, "slsa-provenance" = { actions = "read", id-token = "write", contents = "write" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests
