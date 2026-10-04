@@ -5880,6 +5880,8 @@ struct SkillsCtx {
     home: PathBuf,
     store: rvl_skills::store::SkillsStore,
     fetcher: rvl_skills::fetch::HttpFetcher,
+    trust: rvl_skills::trust::TrustStore,
+    trust_key: Option<String>,
     offline: bool,
     has_key: bool,
     allow_unsigned: bool,
@@ -5900,10 +5902,18 @@ impl SkillsCtx {
             base_url: cfg.base_url.clone(),
             org_key: cfg.org_key.clone(),
         };
+        // Beside config.yaml and never inside it: the shared-config contract
+        // keeps key material out of the config file.
+        let trust =
+            rvl_skills::trust::TrustStore::at(&home.join(".revelara").join("trusted_keys.json"));
         Ok(Self {
             home,
             store,
             fetcher,
+            trust,
+            trust_key: std::env::var(rvl_skills::trust::TRUST_ENV)
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             offline: cfg.offline,
             has_key: !cfg.org_key.is_empty(),
             allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED_PLUGIN").ok().as_deref() == Some("1"),
@@ -5916,6 +5926,9 @@ impl SkillsCtx {
         rvl_skills::flow::Env {
             store: &self.store,
             fetcher: &self.fetcher,
+            trust: &self.trust,
+            server: &self.fetcher.base_url,
+            trust_key: self.trust_key.clone(),
             home: &self.home,
             cache_scope: self.fetcher.cache_scope(),
             offline: self.offline,

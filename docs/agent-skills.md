@@ -36,6 +36,45 @@ unverified content. Set **`RVL_ALLOW_UNSIGNED_PLUGIN=1`** to opt out — the
 same variable name rvl-cli used, so existing self-hosted CI keeps working
 unchanged.
 
+### The signing key is trusted on first use
+
+The server serves the key that verifies its own content, so a signature alone
+does not protect you from a compromised server or connection. `rvl` therefore
+pins the key. The first verified install from a server records that server's
+Ed25519 key in `~/.revelara/trusted_keys.json`, one entry per server URL, and
+prints its fingerprint. Each later download must come with the same key.
+
+When the key is different, `rvl` installs nothing, leaves the cache and the
+installed skills as they were, and prints the two fingerprints:
+
+```text
+the plugin signing key for https://api.revelara.ai changed: expected sha256:1f0c…, got sha256:9ab2…
+```
+
+**Key rotation.** A rotation does not need a new `rvl` release. It needs one
+deliberate step on each machine:
+
+1. Get the new fingerprint from a source that is not the server itself, for
+   example Revelara support or the operator of your self-hosted server.
+2. Make sure that it is the same as the `got` fingerprint in the error.
+3. Run the install again with
+   **`RVL_TRUST_PLUGIN_SIGNING_KEY=<the new fingerprint>`**. `rvl` replaces
+   the pinned key and prints a warning with the old and the new fingerprint.
+
+The variable is accepted only when its value is the fingerprint of the key
+that the server serves. A value such as `1` trusts nothing. Unset it after
+the install.
+
+A server with a pinned key cannot go back to unsigned content:
+`RVL_ALLOW_UNSIGNED_PLUGIN=1` is refused for it. If you stopped signing on a
+self-hosted server, delete that server's entry from `trusted_keys.json`. A
+`trusted_keys.json` that `rvl` cannot parse stops the install; `rvl` does not
+treat it as empty.
+
+The first install has no earlier key to compare with. To check it, compare
+the printed fingerprint with one from the same kind of source. An offline install does not
+fetch a key and uses the cached copy, which was verified when it was fetched.
+
 ## The managed context block
 
 `rvl init` and `rvl plugin install`/`update` also maintain a **managed context
