@@ -28,10 +28,11 @@
 #   resolve are still emitted with `client_type: ""` and resolved=False -- a low
 #   tier for the panel, not a dropped site.
 #
-# callers/callees are empty in v1: this helper walks a single file's imports
-# and local assignments, it does not build a cross-module call graph. The keys
-# are emitted (as empty arrays) so the packet shape is stable and a later
-# version can fill them without a schema bump.
+# callers/callees and chain roots come from a call graph built over the whole
+# tree (see CallGraph below), by the same structural resolution as everything
+# else here: an edge exists only where a call resolves to exactly one in-repo
+# definition. A call that does not resolve makes no edge. The keys were emitted
+# as empty arrays in v1 so that filling them needed no schema bump.
 
 import argparse
 import ast
@@ -56,6 +57,18 @@ MAX_SNIPPET_BYTES = 2400
 
 # Construction snippets to include per site (mirrors goindex maxCtorsEmitted).
 MAX_CTORS_EMITTED = 2
+
+# Call-graph budgets, mirroring goindex's maxCallersEmitted, maxCalleesEmitted
+# and maxChainDepth. A walk that runs into one says so in provenance
+# (hit_caller_budget, hit_depth_cap): downstream only reasons from "no bound
+# found" when the search was complete.
+MAX_CALLERS_EMITTED = 4
+MAX_CALLEES_EMITTED = 4
+MAX_CHAIN_DEPTH = 12
+
+# How many import / constructor / base-class indirections one name resolution
+# follows before it gives up. Bounds re-export chains and import cycles.
+MAX_RESOLVE_HOPS = 6
 
 # ---------------------------------------------------------------------------
 # Client-detection heuristic.
@@ -707,6 +720,569 @@ def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
     return records
 
 
+# ---------------------------------------------------------------------------
+# Call graph (po-cafdn.3): callers, callees and chain roots.
+#
+# goindex resolves a call through the type checker. Python has none, so an
+# edge here exists only where the callee expression resolves STRUCTURALLY to
+# exactly one definition in this repository:
+#
+#   foo()            a def nested in an enclosing function, a module-level def,
+#                    or an imported name
+#   mod.foo()        an imported module's top-level def (re-exports followed)
+#   self.foo()       a method on the enclosing class or an in-repo base class
+#   Cls.foo()        the same lookup, by class
+#   obj.foo()        where `obj = Cls(...)` or `self.obj = Cls(...)`
+#   Cls()            Cls.__init__, when the repository defines one
+#   Cls().foo()      a method on a value constructed in place
+#
+# Everything else -- a method on a parameter, a callable pulled out of a dict,
+# an import two files could answer to -- makes NO edge. The retriever abstains
+# rather than match by name: a guessed caller is evidence for a chain that may
+# not exist, and its source is read downstream as in scope of the site.
+#
+# The walk upward is by graph proximity only, as in goindex: no content
+# inspection, no name matching. The functions it stops at because nothing
+# resolved calls them are reported with their structural facts (RootFact).
+# Whether a root is a real entrypoint is a judgement and stays downstream.
+# ---------------------------------------------------------------------------
+
+_STDLIB_MODULES = getattr(sys, "stdlib_module_names", frozenset())
+
+
+def _module_name(file_path):
+    """Dotted module path of a root-relative file: `a/b/c.py` -> `a.b.c`,
+    `a/b/__init__.py` -> `a.b`."""
+    parts = file_path[:-3].split("/") if file_path.endswith(".py") \
+        else file_path.split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _dotted(node):
+    """`a.b.c` for a pure Name/Attribute chain, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _callee(node):
+    """How a call names what it calls: (dotted, None) for a plain name or
+    attribute chain, (constructor, method) for a method called on a value
+    constructed in place (`Syncer(...).sync_all()`), else None."""
+    dotted = _dotted(node)
+    if dotted is not None:
+        return dotted, None
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Call):
+        ctor = _dotted(node.value.func)
+        if ctor is not None:
+            return ctor, node.attr
+    return None
+
+
+def _is_main_guard(node):
+    """`if __name__ == "__main__":`, written either way round."""
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+        return False
+    sides = [node.test.left] + list(node.test.comparators)
+    return (any(isinstance(x, ast.Name) and x.id == "__name__" for x in sides)
+            and any(isinstance(x, ast.Constant) and x.value == "__main__"
+                    for x in sides))
+
+
+def _signature(node):
+    try:
+        text = "def {}({})".format(node.name, ast.unparse(node.args))
+        if node.returns is not None:
+            text += " -> " + ast.unparse(node.returns)
+    except Exception:
+        text = "def {}(...)".format(node.name)
+    if isinstance(node, ast.AsyncFunctionDef):
+        text = "async " + text
+    return _cap(text)
+
+
+class _Span(object):
+    """Where a node sits in its file: what ast.get_source_segment reads, kept
+    after the node is gone."""
+
+    __slots__ = ("lineno", "col_offset", "end_lineno", "end_col_offset")
+
+    def __init__(self, node):
+        self.lineno = node.lineno
+        self.col_offset = node.col_offset
+        self.end_lineno = getattr(node, "end_lineno", None)
+        self.end_col_offset = getattr(node, "end_col_offset", None)
+
+
+class _Func(object):
+    """One function or method definition: a node of the call graph.
+
+    Its source and decorators are kept as spans and cut out of the module
+    source on demand: most functions are never emitted, and cutting a segment
+    costs a pass over the file."""
+
+    __slots__ = ("qualname", "module", "self_cls", "scopes", "locals",
+                 "span", "decorator_spans", "signature", "doc", "calls",
+                 "ref_as_value", "_snippet", "_root")
+
+    def snippet(self):
+        if self._snippet is None:
+            self._snippet = {
+                "file": self.module.file, "line": self.span.lineno,
+                "symbol": self.qualname,
+                "source": _segment(self.module.source, self.span)}
+        return self._snippet
+
+    def root(self):
+        """The RootFact. Read only after the graph is resolved, when
+        ref_as_value is final."""
+        if self._root is None:
+            name = self.qualname.rsplit(".", 1)[-1]
+            self._root = {
+                "symbol": self.qualname,
+                "package": self.module.name,
+                "signature": self.signature,
+                "doc": self.doc,
+                "exported": not name.startswith("_"),
+                "in_package_main": self.module.is_main,
+                "referenced_as_value": self.ref_as_value,
+                "decorators": ["@" + _segment(self.module.source, d)
+                               for d in self.decorator_spans],
+            }
+        return self._root
+
+
+class ModuleSummary(object):
+    """What the call graph keeps of one module once its AST is gone: the
+    definitions, the names that can reach another module, and every call and
+    value reference still in source form, resolved when all modules are in."""
+
+    def __init__(self, file_path, source, tree):
+        self.file = file_path
+        self.name = _module_name(file_path)
+        base = file_path.rsplit("/", 1)[-1]
+        self.is_package = base == "__init__.py"
+        # `python -m pkg` runs __main__.py; a __main__ guard marks a script.
+        self.is_main = base == "__main__.py" or any(
+            _is_main_guard(n) for n in tree.body)
+        self.functions = {}      # qualname -> _Func; a later def wins
+        self.all_functions = []  # every def, in source order
+        self.classes = {}        # qualname -> [base expression, dotted]
+        self.imports = {}        # bound name -> (module, member or None)
+        self.var_class = {}      # (function qualname or "", name) -> ctor
+        self.self_class = {}     # (class qualname, attribute) -> ctor
+        self.value_refs = {}     # (dotted, self_cls, scopes) -> count
+        self.by_pos = {}         # (line, column) of a def -> _Func
+        self.source = source
+        for node in tree.body:
+            self._visit(node, "", None, None, None, ())
+
+    def _import(self, node):
+        """Bind what an import statement names. Module-scoped and
+        last-write-wins wherever the statement sits, like FileIndex."""
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    self.imports[alias.asname] = (alias.name, None)
+                else:
+                    top = alias.name.split(".")[0]
+                    self.imports[top] = (top, None)
+            return
+        base = []
+        if node.level:
+            # Relative: counted up from this module's package.
+            package = self.name.split(".") if self.name else []
+            if not self.is_package:
+                package = package[:-1]
+            up = node.level - 1
+            if up > len(package):
+                return  # climbs out of the tree
+            base = package[:len(package) - up]
+        if node.module:
+            base = base + node.module.split(".")
+        parent = ".".join(base)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            bound = alias.asname or alias.name
+            if parent:
+                self.imports[bound] = (parent, alias.name)
+            else:
+                self.imports[bound] = (alias.name, None)
+
+    def _add_func(self, node, prefix, self_cls, scopes):
+        fn = _Func()
+        fn.qualname = prefix + node.name
+        fn.module = self
+        fn.self_cls = self_cls
+        fn.scopes = (fn.qualname,) + scopes
+        args = node.args
+        fn.locals = {a.arg for a in
+                     args.posonlyargs + args.args + args.kwonlyargs}
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None:
+                fn.locals.add(extra.arg)
+        fn.span = _Span(node)
+        fn.decorator_spans = [_Span(d) for d in node.decorator_list]
+        fn._snippet = fn._root = None
+        fn.signature = _signature(node)
+        # The summary line only: a root's docstring rides every packet whose
+        # chain reaches it.
+        fn.doc = _cap((ast.get_docstring(node) or "").split("\n", 1)[0])
+        fn.calls = []
+        fn.ref_as_value = 0
+        self.functions[fn.qualname] = fn
+        self.all_functions.append(fn)
+        self.by_pos[(node.lineno, node.col_offset)] = fn
+        return fn
+
+    def _bind(self, node, cls, func, self_cls):
+        """`x = Cls(...)` and `self.x = Cls(...)`: what a later `x.method()`
+        is a method of. Scoped to the function (or the module) that assigns."""
+        value = node.value
+        if not isinstance(value, ast.Call):
+            return
+        ctor = _dotted(value.func)
+        if ctor is None:
+            return
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for tgt in targets:
+            if isinstance(tgt, ast.Name):
+                if cls is None:  # a class-body name is a class attribute
+                    scope = func.qualname if func is not None else ""
+                    self.var_class[(scope, tgt.id)] = ctor
+            elif (isinstance(tgt, ast.Attribute) and self_cls is not None
+                  and isinstance(tgt.value, ast.Name)
+                  and tgt.value.id == "self"):
+                self.self_class[(self_cls, tgt.attr)] = ctor
+
+    def _visit(self, node, prefix, cls, func, self_cls, scopes):
+        """Walk one node. `prefix` is the qualname prefix for a def found
+        here, `cls` the class whose body this is (None inside a function),
+        `func` the innermost enclosing function, `self_cls` the class `self`
+        refers to, `scopes` the enclosing function qualnames, innermost
+        first."""
+        here = (prefix, cls, func, self_cls, scopes)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A decorator CALL and the argument defaults run in the scope
+            # that defines the function. A bare `@name` is the framework
+            # applying itself, reported on the root as source, not as a
+            # reference to `name`.
+            outer = [d for d in node.decorator_list if isinstance(d, ast.Call)]
+            outer += node.args.defaults
+            outer += [d for d in node.args.kw_defaults if d is not None]
+            for part in outer:
+                self._visit(part, *here)
+            fn = self._add_func(node, prefix, cls or self_cls, scopes)
+            for child in node.body:
+                self._visit(child, fn.qualname + ".", None, fn, fn.self_cls,
+                            fn.scopes)
+            return
+        if isinstance(node, ast.ClassDef):
+            qual = prefix + node.name
+            self.classes[qual] = [d for d in map(_dotted, node.bases) if d]
+            for part in (node.decorator_list + node.bases
+                         + [kw.value for kw in node.keywords]):
+                self._visit(part, *here)
+            for child in node.body:
+                self._visit(child, qual + ".", qual, func, self_cls, scopes)
+            return
+        if isinstance(node, ast.Call):
+            callee = _callee(node.func)
+            if callee is None or callee[1] is not None:
+                self._visit(node.func, *here)
+            if callee is not None and func is not None:
+                func.calls.append(callee)
+            for arg in node.args:
+                self._visit(arg, *here)
+            for kw in node.keywords:
+                self._visit(kw.value, *here)
+            return
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            if isinstance(node.ctx, ast.Load):
+                ref = _dotted(node)
+                if ref is not None:
+                    # Named but not called: handed to a router, a scheduler, a
+                    # thread. Counted on the definition it resolves to.
+                    key = (ref, self_cls, scopes)
+                    self.value_refs[key] = self.value_refs.get(key, 0) + 1
+                    return
+            elif isinstance(node, ast.Name) and func is not None:
+                func.locals.add(node.id)
+        elif isinstance(node, ast.arg):
+            # Reached for a lambda's parameters (a def's are read in
+            # _add_func): they shadow like any other local of the function.
+            if func is not None:
+                func.locals.add(node.arg)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            self._bind(node, cls, func, self_cls)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            self._import(node)
+            return
+        for child in ast.iter_child_nodes(node):
+            self._visit(child, *here)
+
+
+class CallGraph(object):
+    """Caller and callee edges over every module added, resolved once."""
+
+    def __init__(self):
+        self.modules = []
+        self.by_suffix = {}   # dotted suffix of a module name -> [module]
+        self.packages = set()  # module names that are packages
+        self.callers = {}     # _Func -> [_Func], in module path order
+        self.callees = {}     # _Func -> [_Func], in call order
+        self.pending = []     # (record, _Func) waiting for the walk
+
+    def add(self, summary):
+        self.modules.append(summary)
+
+    def wants(self, record, fn):
+        """Fill this record's ancestry once the graph is complete."""
+        self.pending.append((record, fn))
+
+    # -- name resolution -----------------------------------------------------
+    #
+    # An entity is ("func", _Func), ("class", module, qualname),
+    # ("instance", module, class qualname) or ("mod", dotted name).
+
+    def _find_module(self, name):
+        """The one module `name` imports, or None when no file or more than
+        one could answer to it."""
+        found = self.by_suffix.get(name, ())
+        for mod in found:
+            if mod.name == name:
+                return mod
+        if name.split(".", 1)[0] in _STDLIB_MODULES:
+            return None  # `import json` is not app/json.py
+        # A source root is not a package: `src/app/x.py` imports as `app.x`,
+        # but `app/x.py` inside package `app` never imports as `x`.
+        found = [m for m in found
+                 if m.name[:-len(name) - 1] not in self.packages]
+        return found[0] if len(found) == 1 else None
+
+    def _instance(self, mod, ctor, hops):
+        if hops > MAX_RESOLVE_HOPS:
+            return None
+        ent = self._resolve(mod, ctor, None, (), hops + 1)
+        if ent is not None and ent[0] == "class":
+            return ("instance", ent[1], ent[2])
+        return None
+
+    def _top(self, mod, name, hops):
+        """A module's top-level name."""
+        fn = mod.functions.get(name)
+        if fn is not None:
+            return ("func", fn)
+        if name in mod.classes:
+            return ("class", mod, name)
+        ctor = mod.var_class.get(("", name))
+        if ctor is not None:
+            return self._instance(mod, ctor, hops)
+        imp = mod.imports.get(name)
+        if imp is None or hops > MAX_RESOLVE_HOPS:
+            return None
+        parent, member = imp
+        if member is None:
+            return ("mod", parent)
+        return self._member(("mod", parent), member, hops + 1)
+
+    def _head(self, mod, name, self_cls, scopes, hops):
+        if self_cls is not None:
+            if name == "self":
+                return ("instance", mod, self_cls)
+            if name == "cls":
+                return ("class", mod, self_cls)
+        for scope in scopes:
+            nested = scope + "." + name
+            fn = mod.functions.get(nested)
+            if fn is not None:
+                return ("func", fn)
+            if nested in mod.classes:
+                return ("class", mod, nested)
+            owner = mod.functions.get(scope)
+            if owner is not None and name in owner.locals:
+                # A local or a parameter shadows the module's name. It is
+                # something only if this function constructed it.
+                ctor = mod.var_class.get((scope, name))
+                return self._instance(mod, ctor, hops) if ctor else None
+        return self._top(mod, name, hops)
+
+    def _method(self, mod, qual, name, hops, seen):
+        """`name` on class `qual` or the nearest in-repo base that has it."""
+        key = (mod.file, qual)
+        if key in seen or hops > MAX_RESOLVE_HOPS:
+            return None
+        seen.add(key)
+        fn = mod.functions.get(qual + "." + name)
+        if fn is not None:
+            return fn
+        for base in mod.classes.get(qual, ()):
+            ent = self._resolve(mod, base, None, (), hops + 1)
+            if ent is not None and ent[0] == "class":
+                fn = self._method(ent[1], ent[2], name, hops + 1, seen)
+                if fn is not None:
+                    return fn
+        return None
+
+    def _member(self, ent, name, hops):
+        kind = ent[0]
+        if kind == "mod":
+            mod = self._find_module(ent[1])
+            if mod is not None:
+                got = self._top(mod, name, hops)
+                if got is not None:
+                    return got
+            return ("mod", ent[1] + "." + name)
+        if kind == "func":
+            return None
+        _, mod, qual = ent
+        fn = self._method(mod, qual, name, hops, set())
+        if fn is not None:
+            return ("func", fn)
+        if kind == "class":
+            nested = qual + "." + name
+            return ("class", mod, nested) if nested in mod.classes else None
+        ctor = mod.self_class.get((qual, name))
+        return self._instance(mod, ctor, hops) if ctor else None
+
+    def _resolve(self, mod, dotted, self_cls, scopes, hops=0):
+        parts = dotted.split(".")
+        ent = self._head(mod, parts[0], self_cls, scopes, hops)
+        for part in parts[1:]:
+            if ent is None:
+                return None
+            ent = self._member(ent, part, hops)
+        return ent
+
+    def _call_target(self, fn, callee):
+        dotted, method = callee
+        ent = self._resolve(fn.module, dotted, fn.self_cls, fn.scopes)
+        if ent is None:
+            return None
+        if method is None and ent[0] == "func":
+            return ent[1]
+        if ent[0] == "class":
+            # Calling a class runs its __init__; `Cls().method` is a method
+            # of the instance that call returns.
+            return self._method(ent[1], ent[2], method or "__init__", 0, set())
+        return None
+
+    # -- edges ---------------------------------------------------------------
+
+    def resolve(self):
+        """Build the edges, once every module is in. Modules are taken in path
+        order, so a full run and a --files run see callers in the same
+        order."""
+        self.modules.sort(key=lambda m: m.file)
+        for mod in self.modules:
+            if mod.is_package:
+                self.packages.add(mod.name)
+            parts = mod.name.split(".")
+            for i in range(len(parts)):
+                self.by_suffix.setdefault(".".join(parts[i:]), []).append(mod)
+        for mod in self.modules:
+            for fn in mod.all_functions:
+                # A function that calls itself is not its own caller: one
+                # nothing else calls is still where its chain starts.
+                seen = {fn}
+                for callee in fn.calls:
+                    target = self._call_target(fn, callee)
+                    if target is None or target in seen:
+                        continue
+                    seen.add(target)
+                    self.callees.setdefault(fn, []).append(target)
+                    self.callers.setdefault(target, []).append(fn)
+            for (dotted, self_cls, scopes), n in mod.value_refs.items():
+                ent = self._resolve(mod, dotted, self_cls, scopes)
+                if ent is not None and ent[0] == "func":
+                    ent[1].ref_as_value += n
+
+    def ancestors(self, start):
+        """Walk callers upward, breadth-first, cycle-safe. Returns (callers by
+        proximity, depth searched, chain roots, hit the depth cap). The same
+        walk as goindex's ancestors()."""
+        seen = {start}
+        frontier = [start]
+        ordered, roots = [], []
+        depth = 0
+        while depth < MAX_CHAIN_DEPTH and frontier:
+            nxt = []
+            for cur in frontier:
+                callers = self.callers.get(cur)
+                if not callers:
+                    roots.append(cur)  # in the frontier once: `seen` dedupes
+                    continue
+                for caller in callers:
+                    if caller in seen:
+                        continue
+                    seen.add(caller)
+                    ordered.append(caller)
+                    nxt.append(caller)
+            frontier = nxt
+            depth += 1
+        return ordered, depth, roots, bool(frontier)
+
+    def attach(self):
+        """Fill callers, callees and search provenance on every waiting
+        record."""
+        self.resolve()
+        for record, fn in self.pending:
+            anc, depth, roots, hit_depth = self.ancestors(fn)
+            down = self.callees.get(fn, [])
+            callers = [f.snippet() for f in anc[:MAX_CALLERS_EMITTED]]
+            callees = [f.snippet() for f in down[:MAX_CALLEES_EMITTED]]
+            record["callers"] = callers
+            record["callees"] = callees
+            record["provenance"].update({
+                "callers_total": len(anc),
+                "callers_included": len(callers),
+                "callees_total": len(down),
+                "callees_included": len(callees),
+                "ancestry_depth_searched": depth,
+                "chain_roots": [f.root() for f in roots],
+                "hit_depth_cap": hit_depth,
+                "hit_caller_budget": len(anc) > len(callers),
+            })
+        self.pending = []
+
+
+def _parse(abs_path, file_path):
+    """(source, tree) for one file, or None when it could not be read or
+    parsed (reported on stderr)."""
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except (OSError, UnicodeDecodeError) as err:
+        print("skip {}: {}".format(file_path, err), file=sys.stderr)
+        return None
+    try:
+        tree = ast.parse(source, filename=abs_path)
+    except SyntaxError as err:
+        print("parse failed {}: {}".format(file_path, err), file=sys.stderr)
+        return None
+    return source, tree
+
+
+def _summarize(file_path, source, tree):
+    """The module's call-graph summary, or None when its AST nests deeper
+    than the walk can follow: the file then contributes no edges, and its
+    sites are still emitted."""
+    try:
+        return ModuleSummary(file_path, source, tree)
+    except RecursionError:
+        print("call graph skipped {}: expression nesting too deep"
+              .format(file_path), file=sys.stderr)
+        return None
+
+
 def _enclosing_functions(tree):
     """Map every AST node to the innermost enclosing FunctionDef/AsyncFunctionDef.
 
@@ -729,24 +1305,24 @@ def _enclosing_functions(tree):
     return mapping
 
 
-def retrieve_file(abs_path, file_path, snapshot):
+def retrieve_file(abs_path, file_path, snapshot, graph):
     """Parse one Python file and return a list of site records (dicts), or
     None when the file could not be read or parsed.
 
     None vs [] is the distinction the retrieval_stats record carries
     downstream (po-av01j.209): a file that FAILED is counted, never silently
-    collapsed into "parsed and empty"."""
-    try:
-        with open(abs_path, "r", encoding="utf-8") as fh:
-            source = fh.read()
-    except (OSError, UnicodeDecodeError) as err:
-        print("skip {}: {}".format(file_path, err), file=sys.stderr)
+    collapsed into "parsed and empty".
+
+    The module joins `graph`, and its call-site records wait there for their
+    callers and callees: CallGraph.attach() fills them once every module is
+    in."""
+    parsed = _parse(abs_path, file_path)
+    if parsed is None:
         return None
-    try:
-        tree = ast.parse(source, filename=abs_path)
-    except SyntaxError as err:
-        print("parse failed {}: {}".format(file_path, err), file=sys.stderr)
-        return None
+    source, tree = parsed
+    summary = _summarize(file_path, source, tree)
+    if summary is not None:
+        graph.add(summary)
 
     idx = FileIndex(source)
     idx.collect_imports(tree)
@@ -837,8 +1413,10 @@ def retrieve_file(abs_path, file_path, snapshot):
             "client_type": client_type,
             "snippet": snippet,
             "enclosing_function_body": body,
-            "callers": [],   # empty (no cross-module call graph yet)
-            "callees": [],   # empty
+            # Filled by CallGraph.attach() when the site has an enclosing
+            # function; a module-scope site has no ancestry to walk.
+            "callers": [],
+            "callees": [],
             "client_construction": constructions,
             # Schema v2: constant-valued arguments as evidence, and the macro
             # flag (Python has no macros; C/C++ sets it mechanically).
@@ -853,10 +1431,18 @@ def retrieve_file(abs_path, file_path, snapshot):
                 "callers_included": 0,
                 "callees_total": 0,
                 "callees_included": 0,
+                "ancestry_depth_searched": 0,
+                "chain_roots": [],
+                "hit_depth_cap": False,
+                "hit_caller_budget": False,
             },
             "lang": "python",
         }
         out.append(record)
+        if summary is not None and func_node is not None:
+            fn = summary.by_pos.get((func_node.lineno, func_node.col_offset))
+            if fn is not None:
+                graph.wants(record, fn)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
     # G4 emission inventory rides the same stream (po-av01j.5).
     out.extend(collect_emissions(tree, source, idx, enclosing, file_path, snapshot))
@@ -1008,6 +1594,8 @@ def run_retrieve(root, snapshot, files_arg, include_tests=False):
     "every file failed to parse".
     """
     records = []
+    graph = CallGraph()
+    seen = set()
     total = parsed = failed = 0
     # NAMED, not just counted: rvl's packet index flags each skipped file so
     # a warm scan can report the repository-wide number from reused entries.
@@ -1017,12 +1605,30 @@ def run_retrieve(root, snapshot, files_arg, include_tests=False):
             skipped.append(file_path)
             continue
         total += 1
-        got = retrieve_file(abs_path, file_path, snapshot)
+        seen.add(file_path)
+        got = retrieve_file(abs_path, file_path, snapshot, graph)
         if got is None:
             failed += 1
             continue
         parsed += 1
         records.extend(got)
+    if files_arg and graph.pending:
+        # The incremental path emits packets for the listed files only, but a
+        # caller lives wherever it lives: the graph still spans the tree, so a
+        # reloaded file gets the packets a full run would give it. The other
+        # files are read for their edges and nothing else. They are not in
+        # the stats, and one that fails to parse costs only its own edges.
+        for abs_path, file_path in discover(root, ""):
+            if file_path in seen:
+                continue
+            if not include_tests and is_test_path(file_path):
+                continue
+            neighbour = _parse(abs_path, file_path)
+            if neighbour is not None:
+                summary = _summarize(file_path, *neighbour)
+                if summary is not None:
+                    graph.add(summary)
+    graph.attach()
     return records, {
         "files_total": total,
         "files_parsed": parsed,

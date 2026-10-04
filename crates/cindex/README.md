@@ -184,8 +184,8 @@ schema-v2 contract fields (`packet_schema: 2`, agreeing with
   expansion range is flagged. No heuristics, no macro understanding.
 - `snippet`, `enclosing_function_body`, `symbol`, `receiver` — source-level
   provenance, extents read straight from the file.
-- `callers` / `callees` / `client_construction` — **empty in v1** (pyindex
-  precedent): cross-TU graph walking is future work and the keys keep the
+- `callers` / `callees` / `client_construction` — **empty in v1** (as they
+  were in pyindex's v1): cross-TU graph walking is future work and the keys keep the
   shape stable.
 - `site_kind` — absent for a classic G1 client-call site, `"background_job"`
   for a G3 thread-start registration, `"server_entry"` for a G2 handler
