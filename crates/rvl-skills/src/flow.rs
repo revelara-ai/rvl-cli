@@ -15,12 +15,21 @@ use crate::fetch::Fetcher;
 use crate::harness::{Harness, InstallReceipt};
 use crate::semver::semver_newer;
 use crate::store::{InstalledInfo, Meta, SkillsStore};
+use crate::trust::{fingerprint, Decision, TrustStore, TRUST_ENV};
 use crate::verify::verify_tarball;
 
 /// Everything an install/status pass needs, resolved once by the CLI layer.
 pub struct Env<'a> {
     pub store: &'a SkillsStore,
     pub fetcher: &'a dyn Fetcher,
+    /// Signing keys trusted on first use, one per server.
+    pub trust: &'a TrustStore,
+    /// Base URL of the server in use; the key under which its signing key
+    /// is trusted.
+    pub server: &'a str,
+    /// RVL_TRUST_PLUGIN_SIGNING_KEY: the fingerprint of a changed signing
+    /// key the user chose to trust.
+    pub trust_key: Option<String>,
     pub home: &'a Path,
     /// Fingerprint of the server + org key in use
     /// ([`crate::store::cache_scope`]); `None` when there is no key.
@@ -57,6 +66,8 @@ struct Acquired {
     version: String,
     from_cache: bool,
     warnings: Vec<String>,
+    /// Trust changes the fetch made, for [`InstallReport::notes`].
+    notes: Vec<String>,
 }
 
 /// Verify a cached slot's signature policy (sha256 was already re-checked
@@ -118,6 +129,7 @@ fn acquire_from_cache(env: &Env, editor: &str) -> anyhow::Result<Option<Acquired
         version: meta.version,
         from_cache: true,
         warnings,
+        notes: Vec::new(),
     }))
 }
 
@@ -125,6 +137,7 @@ fn acquire_from_cache(env: &Env, editor: &str) -> anyhow::Result<Option<Acquired
 /// fresh tarball. Nothing is written on any failure.
 fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
     let download = env.fetcher.fetch_tarball(editor)?;
 
     // Transport checksum (X-Checksum), mandatory by default.
@@ -146,15 +159,53 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
         ),
     }
 
-    // Integrity manifest signature, fail-closed.
+    // Integrity manifest signature, fail-closed. The server serves its own
+    // key, so the key is held to the one this server was first trusted
+    // with: a signature from any other key proves nothing.
     match env.fetcher.fetch_signing_key() {
         Ok(raw) => {
             let key = ed25519_dalek::VerifyingKey::from_bytes(&raw)?;
+            let decision = env
+                .trust
+                .decide(env.server, &raw, env.trust_key.as_deref())?;
             verify_tarball(&download.bytes, &key)
                 .map_err(|e| anyhow::anyhow!("integrity verification failed: {e}"))?;
+            // Pinned only now: a key that verified nothing is never trusted.
+            let fp = fingerprint(&raw);
+            match decision {
+                Decision::Known => {}
+                Decision::FirstUse => {
+                    env.trust.pin(env.server, &raw)?;
+                    notes.push(format!(
+                        "trusted the plugin signing key for {} on first use: {fp}",
+                        env.server
+                    ));
+                }
+                Decision::Replaced { previous } => {
+                    env.trust.pin(env.server, &raw)?;
+                    warnings.push(format!(
+                        "replaced the trusted plugin signing key for {}: was {previous}, \
+                         now {fp} ({TRUST_ENV})",
+                        env.server
+                    ));
+                }
+            }
             key_hex = Some(hex::encode(raw));
         }
         Err(e) if env.allow_unsigned => {
+            // A server that signed before does not get to stop: dropping
+            // the key is the cheapest way around the pin.
+            if let Some(pinned) = env.trust.pinned(env.server)? {
+                anyhow::bail!(
+                    "{} served no signing key ({e}), but it signed its content before \
+                     (trusted key {}). Nothing was installed, and \
+                     RVL_ALLOW_UNSIGNED_PLUGIN=1 does not apply to a server with a trusted \
+                     key. If the server no longer signs, remove its entry from {}",
+                    env.server,
+                    fingerprint(&pinned),
+                    env.trust.path().display()
+                );
+            }
             warnings.push(format!(
                 "installing without signature verification (RVL_ALLOW_UNSIGNED_PLUGIN=1): {e}"
             ));
@@ -182,6 +233,7 @@ fn acquire_fresh(env: &Env, editor: &str) -> anyhow::Result<Acquired> {
         version: download.version,
         from_cache: false,
         warnings,
+        notes,
     })
 }
 
@@ -238,7 +290,7 @@ pub fn install_one(env: &Env, harness: &dyn Harness) -> anyhow::Result<InstallRe
     // experimental.enableAgents). A failure is a warning, never a failed
     // install: the skills are already on disk.
     let mut warnings = acquired.warnings;
-    let mut notes = Vec::new();
+    let mut notes = acquired.notes;
     match harness.post_install(env.home) {
         Ok(Some(note)) => notes.push(note),
         Ok(None) => {}
@@ -301,7 +353,7 @@ pub fn install_one_project(
         receipt,
         from_cache: acquired.from_cache,
         warnings: acquired.warnings,
-        notes: Vec::new(),
+        notes: acquired.notes,
     })
 }
 
@@ -530,7 +582,7 @@ mod tests {
     use super::*;
     use crate::fetch::TarballDownload;
     use crate::harness::by_name;
-    use crate::verify::testutil::build_signed_tarball;
+    use crate::verify::testutil::{build_signed_tarball, build_tarball_with_key};
     use std::cell::Cell;
 
     const SKILL: &[u8] = b"---\nname: rvl-scan\n---\nScan.\n";
@@ -593,22 +645,31 @@ mod tests {
         }
     }
 
+    const SERVER: &str = "https://api.example.test";
+
     struct Fixture {
         home: tempfile::TempDir,
         cache: tempfile::TempDir,
+        trust: TrustStore,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let trust = TrustStore::at(&home.path().join(".revelara/trusted_keys.json"));
             Self {
-                home: tempfile::tempdir().unwrap(),
+                home,
                 cache: tempfile::tempdir().unwrap(),
+                trust,
             }
         }
         fn env<'a>(&'a self, store: &'a SkillsStore, fetcher: &'a dyn Fetcher) -> Env<'a> {
             Env {
                 store,
                 fetcher,
+                trust: &self.trust,
+                server: SERVER,
+                trust_key: None,
                 home: self.home.path(),
                 cache_scope: Some("org-a".to_string()),
                 offline: false,
@@ -620,6 +681,12 @@ mod tests {
 
     fn signed_fixture(version: &str) -> (Vec<u8>, ed25519_dalek::VerifyingKey) {
         build_signed_tarball(version, &[("rvl-scan/SKILL.md", SKILL)])
+    }
+
+    /// Every fixture is signed by a fresh key; this one also ships other
+    /// content, so a test can tell which tarball reached the harness.
+    fn other_signed_fixture(version: &str) -> (Vec<u8>, ed25519_dalek::VerifyingKey) {
+        build_signed_tarball(version, &[("rvl-scan/SKILL.md", b"other\n")])
     }
 
     #[test]
@@ -872,6 +939,154 @@ mod tests {
         let err = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "got: {err}");
         assert!(store.load("codex").unwrap().is_none());
+    }
+
+    #[test]
+    fn first_install_pins_the_signing_key_and_says_so() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = signing.verifying_key();
+        let files: &[(&str, &[u8])] = &[("rvl-scan/SKILL.md", SKILL)];
+        let tarball = build_tarball_with_key("0.2.0", files, &signing, files);
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+
+        let report = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap();
+        assert_eq!(fx.trust.pinned(SERVER).unwrap(), Some(key.to_bytes()));
+        let fp = fingerprint(&key.to_bytes());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("first use") && n.contains(&fp)),
+            "got: {:?}",
+            report.notes
+        );
+
+        // The same key on a later fetch is silent.
+        let tarball = build_tarball_with_key("0.3.0", files, &signing, files);
+        let fetcher = MockFetcher::serving("0.3.0", tarball, key);
+        let env = fx.env(&store, &fetcher);
+        let report = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap();
+        assert!(!report.from_cache);
+        assert!(report.notes.is_empty(), "got: {:?}", report.notes);
+        assert!(report.warnings.is_empty(), "got: {:?}", report.warnings);
+    }
+
+    #[test]
+    fn a_key_that_does_not_verify_the_content_is_never_pinned() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, _) = signed_fixture("0.2.0");
+        let (_, other_key) = other_signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, other_key);
+        let env = fx.env(&store, &fetcher);
+
+        let err = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap_err();
+        assert!(err.to_string().contains("integrity verification failed"));
+        assert_eq!(fx.trust.pinned(SERVER).unwrap(), None);
+    }
+
+    #[test]
+    fn a_changed_signing_key_is_refused_and_leaves_everything_as_it_was() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        install_one(
+            &fx.env(&store, &fetcher),
+            by_name("codex").unwrap().as_ref(),
+        )
+        .unwrap();
+
+        // A validly signed tarball, but signed by a key this server never used.
+        let (evil, evil_key) = other_signed_fixture("0.3.0");
+        let fetcher = MockFetcher::serving("0.3.0", evil, evil_key);
+        let env = fx.env(&store, &fetcher);
+        let err = install_one(&env, by_name("codex").unwrap().as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&fingerprint(&key.to_bytes())), "got: {err}");
+        assert!(
+            err.contains(&fingerprint(&evil_key.to_bytes())),
+            "got: {err}"
+        );
+        assert!(err.contains(TRUST_ENV), "got: {err}");
+
+        assert_eq!(fx.trust.pinned(SERVER).unwrap(), Some(key.to_bytes()));
+        assert_eq!(
+            store.cached_meta("codex").map(|m| m.version).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            std::fs::read(fx.home.path().join(".agents/skills/rvl-scan/SKILL.md")).unwrap(),
+            SKILL
+        );
+    }
+
+    #[test]
+    fn naming_the_new_fingerprint_trusts_a_rotated_key() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        install_one(
+            &fx.env(&store, &fetcher),
+            by_name("codex").unwrap().as_ref(),
+        )
+        .unwrap();
+
+        let (rotated, new_key) = other_signed_fixture("0.3.0");
+        let fetcher = MockFetcher::serving("0.3.0", rotated, new_key);
+
+        // The old fingerprint, or a bare "1", is not consent to the new key.
+        let mut env = fx.env(&store, &fetcher);
+        env.trust_key = Some(fingerprint(&key.to_bytes()));
+        assert!(install_one(&env, by_name("codex").unwrap().as_ref()).is_err());
+        assert_eq!(fx.trust.pinned(SERVER).unwrap(), Some(key.to_bytes()));
+
+        env.trust_key = Some(fingerprint(&new_key.to_bytes()));
+        let report = install_one(&env, by_name("codex").unwrap().as_ref()).unwrap();
+        assert_eq!(report.version, "0.3.0");
+        assert_eq!(fx.trust.pinned(SERVER).unwrap(), Some(new_key.to_bytes()));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(&fingerprint(&key.to_bytes()))
+                    && w.contains(&fingerprint(&new_key.to_bytes()))),
+            "got: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn a_server_with_a_pinned_key_cannot_downgrade_to_unsigned() {
+        let fx = Fixture::new();
+        let store = SkillsStore::open(fx.cache.path()).unwrap();
+        let (tarball, key) = signed_fixture("0.2.0");
+        let fetcher = MockFetcher::serving("0.2.0", tarball, key);
+        install_one(
+            &fx.env(&store, &fetcher),
+            by_name("codex").unwrap().as_ref(),
+        )
+        .unwrap();
+
+        let (tarball, _) = other_signed_fixture("0.3.0");
+        let mut fetcher = MockFetcher::serving("0.3.0", tarball, key);
+        fetcher.key = Err("404 signing not configured".to_string());
+        let mut env = fx.env(&store, &fetcher);
+        env.allow_unsigned = true;
+        let err = install_one(&env, by_name("codex").unwrap().as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&fingerprint(&key.to_bytes())), "got: {err}");
+        assert!(err.contains("trusted_keys.json"), "got: {err}");
+        assert_eq!(
+            store.cached_meta("codex").map(|m| m.version).as_deref(),
+            Some("0.2.0")
+        );
     }
 
     #[test]

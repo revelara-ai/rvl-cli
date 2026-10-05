@@ -44,6 +44,7 @@ headless and CI use work with no config file at all.
 | `RVL_RUST_ANALYZER` | Path to the `rust-analyzer` binary the Rust lane drives (`RVL_RUST_ANALYZER_SHA256` optionally pins its checksum) |
 | `RVL_CACHE_DIR`, `RVL_INDEX_DIR`, `RVL_SKILLS_CACHE_DIR` | Relocate the spec cache, packet index, skills cache |
 | `RVL_ALLOW_UNSIGNED_PLUGIN=1` | Accept plugin content from a server with no signing key |
+| `RVL_TRUST_PLUGIN_SIGNING_KEY=<fingerprint>` | Trust a changed plugin signing key. The value must be the `sha256:…` fingerprint of the key the server serves; see [agent-skills](agent-skills.md#the-signing-key-is-trusted-on-first-use) |
 | `RVL_ALLOW_MISSING_CHECKSUM=1` | Accept a skills/plugin download whose server sent no transport-checksum header (self-hosted servers) |
 | `RVL_ALLOW_MISSING_HELPERS=1` | Scan the remaining lanes when a helper is absent |
 | `RVL_NO_AGENT=1` | Hard kill switch for hook-mode agent adjudication; overrides every opt-in |

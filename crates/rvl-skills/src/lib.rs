@@ -18,5 +18,6 @@ pub mod harness;
 /// in `rvl` are unchanged.
 pub use rvl_core::semver;
 pub mod store;
+pub mod trust;
 pub mod v1;
 pub mod verify;
