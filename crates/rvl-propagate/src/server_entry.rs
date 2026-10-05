@@ -369,6 +369,7 @@ mod tests {
             scopes: vec![],
             config_keys: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             server: vec![
                 ServerSpec {
                     control: "RC-020".into(),

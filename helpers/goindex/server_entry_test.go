@@ -16,8 +16,8 @@ func TestServerEntrySitesAreInventoriedFromTheFixture(t *testing.T) {
 		if s.SiteKind == siteKindServerEntry {
 			entries = append(entries, s)
 		} else {
-			// The fixture also exercises the G3/G4 lanes; only unknown kinds fail.
-			if s.SiteKind != "" && s.SiteKind != "background_job" && s.SiteKind != "emission_point" {
+			// The fixture also exercises the G3/G4 and unsized-construction lanes; only unknown kinds fail.
+			if s.SiteKind != "" && s.SiteKind != "background_job" && s.SiteKind != "emission_point" && s.SiteKind != siteKindUnsized {
 				t.Fatalf("unexpected site_kind %q on %s:%d", s.SiteKind, s.File, s.Line)
 			}
 			if s.SiteKind == "" {

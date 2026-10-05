@@ -3416,6 +3416,12 @@ fn findings_from_sites(
     // guards on site_kind — defense in depth for other stream consumers.)
     let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
         sites.into_iter().partition(|s| s.is_emission_point());
+    // Unsized-construction packets (a pool, queue, cache or whole-body read)
+    // ride the same stream and are not client-call surfaces either. Same
+    // partition, same reason; the construction-bounds lane consumes them
+    // below.
+    let (unsized_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_unsized_construction());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Commercial tier layered over the OSS baseline (po-scnmv.13): the
     // existing merge policy applies — higher confidence wins, judgment lanes
@@ -3456,6 +3462,7 @@ fn findings_from_sites(
                 config_keys: vec![],
                 server: vec![],
                 emissions: vec![],
+                construction_bounds: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -3518,6 +3525,14 @@ fn findings_from_sites(
         &emission_sites,
         cache.emission_specs(),
     ));
+    // Construction-bounds lane: a pool, queue, cache or whole-body read
+    // built with no bound in scope. Violations only, advisory, keyed
+    // `unsized.<class>`. With no construction-bound spec in the cache the
+    // lane judges nothing.
+    items.extend(unsized_items(
+        &unsized_sites,
+        cache.construction_bound_specs(),
+    ));
     Ok((
         findings,
         items,
@@ -3526,6 +3541,34 @@ fn findings_from_sites(
         server_findings,
         empty_api_corpus,
     ))
+}
+
+/// Map construction-bounds violations into triage items. The class key is
+/// (`unsized`, class), so the ladder renders `unsized.pool — <why>` and a
+/// waiver or `rvl suppress` matches on `unsized.pool`. The control comes from
+/// the spec that judged the construction.
+fn unsized_items(
+    unsized_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::ConstructionBoundSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_bounds::evaluate(unsized_sites, specs)
+        .into_iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "unsized".into(),
+                method: f.class,
+                reason: f.reason,
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            site_count: f.evidence.len().max(1),
+            example_sites: f.evidence.into_iter().take(3).collect(),
+            control: f.control,
+        })
+        .collect()
 }
 
 /// Map emission-lane violations into triage items. The class key is

@@ -226,7 +226,7 @@ The orchestrator uses it to:
   spec-lane findings it is the producing spec's identity
   (`client_type.method`, the waiver key, e.g. `net/http.Client.Do`); for
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
-  `emission.`, `repo_structure.`, `config.`). The server's precision arm
+  `emission.`, `unsized.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
 - Consumers MUST ignore unknown fields.
 
