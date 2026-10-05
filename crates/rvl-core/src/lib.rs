@@ -62,6 +62,38 @@ pub const CONST_ARG_EMISSION_CATEGORY: &str = "emission_category";
 /// must not produce tens of thousands of emission Sites).
 pub const CONST_ARG_EMISSION_COUNT: &str = "emission_count";
 
+/// The `site_kind` stamped on an unsized-construction packet: an object that
+/// takes a bound (a connection pool, a queue, a cache, a whole-body read) was
+/// built at this site. One packet per construction. Retrieval only: the
+/// packet lists the setters and options OBSERVED in the constructing
+/// function, and a `ConstructionBoundSpec` says which of them is a bound.
+pub const SITE_KIND_UNSIZED: &str = "unsized_construction";
+
+/// The `const_args` entry name carrying an unsized construction's class
+/// (`pool` | `queue` | `cache` | `read`), with `how: "aggregate"` like the
+/// emission entries.
+pub const CONST_ARG_BOUND_CLASS: &str = "bound_class";
+
+/// The `const_args` entry name present when the constructed value leaves the
+/// constructing function (it is returned, or was never given a local name),
+/// so a setter may run where the retriever did not look.
+pub const CONST_ARG_BOUND_ESCAPES: &str = "bound_escapes";
+
+/// The `const_args` entry name present when the retriever could not see
+/// every option the constructor was given (`Queue(**opts)`). A bound may be
+/// among the ones it could not see.
+pub const CONST_ARG_BOUND_OPAQUE: &str = "bound_opaque";
+
+/// [`ConstArg::how`] on a bound observation whose value is a NAME, not a
+/// value (`db.SetMaxOpenConns(cfg.Max)`). The bound is set; what it is set to
+/// is not known and is never resolved.
+pub const BOUND_HOW_NAME: &str = "name";
+
+/// [`ConstArg::how`] on a bound observation made on the same TYPE elsewhere
+/// in the repository, emitted only for a value that escapes. Like
+/// [`CONSTRUCTION_SCOPE_TYPE`], it may evidence an abstention, never a pass.
+pub const BOUND_HOW_TYPE: &str = "type";
+
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
 /// this, 821 of 1525 real production records failed to parse and the scanner
@@ -412,6 +444,40 @@ impl Site {
             .find(|a| a.name == CONST_ARG_EMISSION_COUNT)
             .and_then(|a| a.value.parse().ok())
             .unwrap_or(1)
+    }
+    /// An unsized-construction packet (a pool, queue, cache or whole-body
+    /// read whose bound the construction-bounds lane judges).
+    pub fn is_unsized_construction(&self) -> bool {
+        self.site_kind == SITE_KIND_UNSIZED
+    }
+    /// The construction's class (`pool` | `queue` | `cache` | `read`), read
+    /// from the [`CONST_ARG_BOUND_CLASS`] entry. `None` on every other kind
+    /// and on a malformed packet, where the caller abstains.
+    pub fn bound_class(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_BOUND_CLASS)
+            .map(|a| a.value.as_str())
+    }
+    /// Whether the constructed value leaves the constructing function: see
+    /// [`CONST_ARG_BOUND_ESCAPES`].
+    pub fn bound_escapes(&self) -> bool {
+        self.const_args
+            .iter()
+            .any(|a| a.name == CONST_ARG_BOUND_ESCAPES)
+    }
+    /// Whether some of the constructor's options were not visible to the
+    /// retriever: see [`CONST_ARG_BOUND_OPAQUE`].
+    pub fn bound_opaque(&self) -> bool {
+        self.const_args
+            .iter()
+            .any(|a| a.name == CONST_ARG_BOUND_OPAQUE)
+    }
+    /// The setters and options the retriever observed on this construction:
+    /// every `const_args` entry that is not one of the lane's own aggregate
+    /// entries.
+    pub fn bound_observations(&self) -> impl Iterator<Item = &ConstArg> {
+        self.const_args.iter().filter(|a| a.how != "aggregate")
     }
     /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
     /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
@@ -1390,6 +1456,39 @@ mod tests {
             Some(""),
             "a record predating the field must parse as a G1 call site"
         );
+    }
+
+    #[test]
+    fn unsized_construction_accessors_read_class_escape_and_observations() {
+        let arg = |name: &str, value: &str, how: &str| ConstArg {
+            name: name.into(),
+            value: value.into(),
+            how: how.into(),
+            ..Default::default()
+        };
+        let s = Site {
+            client_type: "database/sql.DB".into(),
+            site_kind: SITE_KIND_UNSIZED.into(),
+            const_args: vec![
+                arg(CONST_ARG_BOUND_CLASS, "pool", "aggregate"),
+                arg(CONST_ARG_BOUND_ESCAPES, "returned", "aggregate"),
+                arg("SetMaxOpenConns", "cfg.Max", BOUND_HOW_NAME),
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_unsized_construction() && !s.is_call_site() && !s.is_emission_point());
+        assert_eq!(s.bound_class(), Some("pool"));
+        assert!(s.bound_escapes());
+        let seen: Vec<&str> = s.bound_observations().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            seen,
+            ["SetMaxOpenConns"],
+            "aggregate entries are not observations"
+        );
+
+        let g1 = Site::default();
+        assert!(!g1.is_unsized_construction() && !g1.bound_escapes() && !g1.bound_opaque());
+        assert_eq!(g1.bound_class(), None);
     }
 
     #[test]

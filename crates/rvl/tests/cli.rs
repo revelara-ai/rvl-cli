@@ -2232,6 +2232,214 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
     assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
 }
 
+// --- construction-bounds lane (pool, queue, cache, whole-body read) ---
+
+/// A `--retrieved` stream carrying unsized-construction packets surfaces one
+/// advisory `unsized.<class>` item per class with an unbounded construction,
+/// under the control its spec names. A bound set through a non-constant is
+/// credited, and the packets stay out of the G1 site count and `--out` rows.
+#[test]
+fn scan_surfaces_unsized_constructions_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let unsized_packet = |line: u32, t: &str, class: &str, seen: &str| {
+        format!(
+            r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":{line},"symbol":"open","func":"New","client_type":{t:?},"site_kind":"unsized_construction","const_args":[{{"index":0,"name":"bound_class","value":{class:?},"how":"aggregate"}}{seen}],"lang":"go"}}"#
+        )
+    };
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        [
+            format!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            // A pool with no setter: unbounded.
+            unsized_packet(20, "database/sql.DB", "pool", ""),
+            // A pool bounded through a non-constant: a name, credited.
+            unsized_packet(
+                30,
+                "database/sql.DB",
+                "pool",
+                r#",{"index":0,"name":"SetMaxOpenConns","value":"cfg.Max","how":"name"}"#,
+            ),
+            // A read wrapped in a limiter: bounded, so no `unsized.read`.
+            unsized_packet(
+                40,
+                "io.ReadAll",
+                "read",
+                r#",{"index":0,"name":"io.LimitReader","value":"","how":"call"}"#,
+            ),
+            // A cache no spec names: not judged.
+            unsized_packet(50, "example.com/x.Cache", "cache", ""),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""construction_bounds":["#,
+        r#"{"type":"database/sql.DB","class":"pool","control":"RC-055","bounded_by":["SetMaxOpenConns"],"unbounded_values":["0"],"confidence":0.9,"rationale":"sql.DB opens connections without limit by default"},"#,
+        r#"{"type":"io.ReadAll","class":"read","control":"RC-067","bounded_by":["io.LimitReader","net/http.MaxBytesReader"],"confidence":0.9,"rationale":"ReadAll reads until EOF"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 2 connection pool(s)"),
+        "the unbounded pool must surface, and the named bound must be credited: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-055"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unsized.read") && !stdout.contains("unsized.cache"),
+        "a bounded read and an unspecced cache are not findings: {stdout}"
+    );
+    assert!(
+        !stdout.contains("cfg.Max"),
+        "a non-constant bound is a name, its value is never reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "construction-bound findings are advisory: {stdout}"
+    );
+    assert!(
+        stdout.contains("sites 1 "),
+        "unsized-construction packets leaked into the G1 site list: {stdout}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED construction-bound corpus (test-grade).
+fn construction_bound_seed_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("construction_bound_seed_specs.json")
+}
+
+/// Go, live end to end: goindex inventories the bounds fixture's pools, caches
+/// and whole-body reads, the seed specs judge them, and the ladder surfaces
+/// one advisory item per class. The counts pin the three rules that keep the
+/// lane honest: a non-constant bound is credited, a value that leaves the
+/// function with a setter on its type elsewhere is not a finding, and an
+/// unbuffered channel is not a queue.
+#[test]
+fn live_go_scan_surfaces_unsized_constructions() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let fixture = goindex_fixture().with_file_name("boundsfixture");
+    let out = bin()
+        .arg("scan")
+        .arg(fixture)
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    // Seven sql.Open calls: one unbounded in scope, two bounded (a literal
+    // and a name), four that leave the function and abstain.
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 7 connection pool(s)"),
+        "only the in-scope unbounded pool is a finding: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("1 of 3 cache(s)"),
+        "only the NoExpiration cache is a finding: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.read") && stdout.contains("2 of 5 whole-body read(s)"),
+        "the bare body and the bufio-wrapped body are findings, the three limited reads are not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unsized.queue"),
+        "make(chan T) is a rendezvous, not an unbounded queue: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "construction-bound findings are advisory: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories the bounds fixture's queues,
+/// pools and caches, and the seed specs judge them. The counts pin the rules:
+/// a literal 0 or None is "no limit", a non-constant is credited, `**opts` and
+/// a finite library default are not findings.
+#[test]
+fn live_python_scan_surfaces_unsized_constructions() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP live_python_scan_surfaces_unsized_constructions: no python3");
+        return;
+    }
+    let pyindex = helpers_dir().join("pyindex");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_bounds"))
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("unsized.queue") && stdout.contains("3 of 8 queue(s)"),
+        "Queue(), Queue(maxsize=0) and deque() are the unbounded queues: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 2 connection pool(s)"),
+        "the bare ConnectionPool() is the unbounded pool: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("2 of 3 cache(s)"),
+        "lru_cache(maxsize=None) and functools.cache are unbounded, bare lru_cache is not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("settings."),
+        "a non-constant bound is a name, its text is never reported as a value: {stdout}"
+    );
+}
+
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {

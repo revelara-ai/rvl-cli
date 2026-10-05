@@ -219,8 +219,9 @@ type RetrievedSite struct {
 	// client-call site; "server_entry" = an HTTP handler/route/middleware
 	// registration (G2, po-av01j.3); "background_job" = a G3 scheduler/queue
 	// registration or worker-loop entry (po-av01j.4); "emission_point" = a G4
-	// emission aggregate (po-av01j.5). Additive default-carrying field within
-	// the v2 packet train — not a schema bump.
+	// emission aggregate (po-av01j.5); "unsized_construction" = a pool, cache
+	// or whole-body read built here (bounds.go). Additive default-carrying
+	// field within the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
 }
 
@@ -1120,6 +1121,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, cen
 	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)
+	// Unsized-construction inventory: pools, caches and whole-body reads,
+	// stamped site_kind: "unsized_construction".
+	out = append(out, collectUnsized(pkgs, src, root, name)...)
 	return out, census, true, nil
 }
 

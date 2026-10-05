@@ -30,6 +30,7 @@ rvl-triage = { path = "../rvl-triage" }
 rvl-index = { path = "../rvl-index" }
 flate2 = { workspace = true }
 rvl-structure = { path = "../rvl-structure" }
+rvl-bounds = { path = "../rvl-bounds" }
 rvl-emission = { path = "../rvl-emission" }
 serde = { workspace = true }
 # Repo-evidence scope classification (po-av01j.173): `toml` reads the hatch

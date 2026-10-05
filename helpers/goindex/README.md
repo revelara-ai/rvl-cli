@@ -50,5 +50,11 @@ type-resolved). That census is the retrieval denominator: coverage is
 resolution over what these tables retrieve, and the census is how much they
 retrieve. It is computed before any `-files` filter, so it is always whole-repo.
 
+The same file holds `bound_constructors`: the functions whose calls are
+emitted as `site_kind: "unsized_construction"` packets (a connection pool, a
+cache, a read of a whole body). The packet lists the setters and options seen
+in the constructing function. It does not say which one is a bound. See
+"Unsized constructions" in `docs/retrievers.md`.
+
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.

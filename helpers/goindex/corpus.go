@@ -35,6 +35,7 @@ type extractorCorpus struct {
 	IOMethods          []string           `json:"io_methods"`
 	EmissionFrameworks []frameworkEntry   `json:"emission_frameworks"`
 	KnownUnretrieved   []unretrievedEntry `json:"known_unretrieved"`
+	BoundConstructors  []boundConstructor `json:"bound_constructors"`
 }
 
 // parseExtractorCorpus is strict: a malformed table would change what is
@@ -65,6 +66,11 @@ func parseExtractorCorpus(raw []byte) (extractorCorpus, error) {
 		if methods[u.Func] {
 			return c, fmt.Errorf("extractor corpus: %s.%s is in io_methods and known_unretrieved",
 				u.Package, u.Func)
+		}
+	}
+	for _, b := range c.BoundConstructors {
+		if !boundClasses[b.Class] || b.Package == "" || b.Func == "" {
+			return c, fmt.Errorf("extractor corpus: bad bound_constructors entry %+v", b)
 		}
 	}
 	return c, nil
