@@ -50,6 +50,12 @@ type-resolved). That census is the retrieval denominator: coverage is
 resolution over what these tables retrieve, and the census is how much they
 retrieve. It is computed before any `-files` filter, so it is always whole-repo.
 
+The same file holds `bound_constructors`: the functions whose calls are
+emitted as `site_kind: "unsized_construction"` packets (a connection pool, a
+cache, a read of a whole body). The packet lists the setters and options seen
+in the constructing function. It does not say which one is a bound. See
+"Unsized constructions" in `docs/retrievers.md`.
+
 A discarded error (`_ = f.Close()`, `n, _ := strconv.Atoi(s)`) rides the same
 stream as an aggregate with `site_kind: "misuse_shape"`: one packet per
 function and callee, with `misuse_class: discarded_error` and `misuse_count`

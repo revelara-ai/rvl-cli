@@ -197,6 +197,63 @@ module to every site using it, so one `Timeout`-bearing literal is evidence
 for every `http.Client` call in the repo. The reason names the file and line
 it came from.
 
+## Unsized constructions
+
+Some objects take a bound when they are built: a connection pool has a
+maximum size, a queue has a capacity, a cache has a size limit or an expiry,
+and a read of a whole body has a size limit. A retriever reports each such
+construction as one packet with `site_kind: "unsized_construction"`. The
+packet is not a call site. It is not counted in COVERAGE, and it is not a row
+in `--out`.
+
+The packet lists what the retriever saw, in `const_args`:
+
+| Entry | `how` | Meaning |
+| --- | --- | --- |
+| `bound_class` | `aggregate` | `pool`, `queue`, `cache`, or `read`. |
+| A constructor argument (`arg0`, or its keyword) or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
+| The same | `name` | The value is not a constant (`cfg.Max`). The packet carries the source text. The scanner credits it as a bound and never resolves it. |
+| A call that the argument of a read passes through (`io.LimitReader`) | `call` | Go reads only. |
+| A method called on the same type somewhere else in the module | `type` | Only on a value that leaves the function. |
+| `bound_escapes` | `aggregate` | The value leaves the constructing function: it is returned, stored, passed to a call, or has no name. |
+| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`). |
+
+A retriever does not decide which entry is a bound. A `construction_bounds`
+spec does. For one type and class, the spec gives the names that bound the
+object (`bounded_by`), the values that mean "no limit" (`unbounded_values`),
+whether the default of the library is finite (`default_bounded`), and the
+control. A construction that no spec names is not judged.
+
+The verdict for one construction:
+
+1. A name in `bounded_by` is seen in scope. If its value is a constant in
+   `unbounded_values`, the construction has no bound. If not, it is bounded.
+2. No such name is seen, and `default_bounded` is true. It is bounded.
+3. No such name is seen, and `bound_opaque` is present. The scanner abstains.
+4. No such name is seen, and the value stays in the function. It has no bound.
+5. No such name is seen, and the value leaves the function. If a `bounded_by`
+   name is called on the type somewhere else, the scanner abstains. If not, it
+   has no bound.
+
+A finding is advisory. It has the class `unsized.<class>` (`unsized.pool`),
+and the control that the spec gives. The scan reports one finding for each
+class and control, with at most five sites.
+
+| Retriever | Emits |
+| --- | --- |
+| `goindex` | `pool`: `database/sql` `Open`, `OpenDB`. `cache`: `github.com/patrickmn/go-cache` `New`. `read`: `io.ReadAll`, `io/ioutil.ReadAll`. The list is `bound_constructors` in `helpers/goindex/extractor_corpus.json`. |
+| `pyindex` | `queue`: the `queue` and `asyncio` queue classes, `multiprocessing.Queue`, `collections.deque`. `pool`: `redis.ConnectionPool`, `redis.BlockingConnectionPool`, `sqlalchemy.create_engine`, `psycopg_pool.ConnectionPool`. `cache`: `functools.lru_cache`, `functools.cache`. |
+| The other retrievers | Nothing yet. |
+
+Three limits:
+
+- `goindex` does not report `make(chan T)`. A Go channel with no capacity
+  blocks the sender until a receiver is ready. It is not an unbounded queue.
+- `pyindex` does not report reads. It has no receiver types, so it cannot tell
+  `response.read()` from a read that has a limit.
+- The retriever reads one function. For a value that leaves the function, the
+  only other evidence is a method call on the same type in the same module.
+
 ## What a retriever skips
 
 A retriever reads production code. Two kinds of file are left out, and
@@ -254,7 +311,12 @@ production call. A repo whose only `new Pool({ connectionTimeoutMillis })`
 lives under `tests/` used to have its production `pool.query` calls
 credited as bounded; it now abstains on them, which is the honest answer.
 
-`rvl scan --include-tests` lifts the skip for the Python and TypeScript
+A retriever is not started at all for a language that is found only in
+test material while another language is really present; the roll-call
+names it as `skipped`. See [scanning.md](scanning.md) for the rule.
+
+`rvl scan --include-tests` turns that language skip off and lifts the
+file skip for the Python and TypeScript
 lanes on a full scan (`goindex` is unchanged). It is refused together with
 `--incremental`: the packet index is built with the skip in place, so a warm
 scan could only honor the flag for the files it re-parsed and would report

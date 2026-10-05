@@ -974,6 +974,130 @@ def collect_misuse(tree, source, idx, enclosing, file_path, snapshot,
 
 
 # ---------------------------------------------------------------------------
+# Unsized-construction inventory.
+#
+# A queue, a connection pool or a cache was built here. One packet per
+# construction, on the SAME stream, stamped site_kind: "unsized_construction".
+# The retrieval/judgment split holds: the packet lists the constructor's
+# arguments as OBSERVED, and a construction-bound spec downstream says which
+# of them is a bound and which values of it mean "no limit".
+#
+# A constant is reported as a value. Anything else (maxsize=settings.max_jobs)
+# is reported with how: "name" -- its source text, never a resolved value.
+# Downstream credits a name as a bound and compares nothing against it.
+#
+# Detection is IMPORT-RESOLVED: the callee must resolve through this module's
+# imports to a table entry. A local name that only looks like one is skipped.
+#
+# Whole-body reads (`.read()`, `.objects.all()`) are deliberately not here:
+# without receiver types they cannot be told from a bounded or lazy read.
+# ---------------------------------------------------------------------------
+
+SITE_KIND_UNSIZED = "unsized_construction"
+
+# Dotted constructor -> class. Like STRONG_IO_METHODS this selects WHICH
+# sites to surface, never what they mean.
+_BOUND_CONSTRUCTORS = {
+    "queue.Queue": "queue",
+    "queue.LifoQueue": "queue",
+    "queue.PriorityQueue": "queue",
+    "asyncio.Queue": "queue",
+    "asyncio.LifoQueue": "queue",
+    "asyncio.PriorityQueue": "queue",
+    "multiprocessing.Queue": "queue",
+    "collections.deque": "queue",
+    "redis.ConnectionPool": "pool",
+    "redis.BlockingConnectionPool": "pool",
+    "sqlalchemy.create_engine": "pool",
+    "psycopg_pool.ConnectionPool": "pool",
+    "functools.lru_cache": "cache",
+    "functools.cache": "cache",
+}
+
+
+def _bound_observation(index, name, node, source, idx):
+    """One constructor argument as an observation: a value when it is a
+    constant, a NAME (its source text) when it is not."""
+    if isinstance(node, ast.Constant):
+        value, how = repr(node.value), "literal"
+    elif isinstance(node, ast.Name) and node.id in idx.const_by_name:
+        value, how = repr(idx.const_by_name[node.id]), "named_constant"
+    else:
+        value, how = _segment(source, node), "name"
+    return {"index": index, "name": name, "value": value, "how": how}
+
+
+def collect_unsized(tree, source, idx, enclosing, file_path, snapshot):
+    """Return the file's unsized-construction records."""
+    # (node the record sits on, constructor expression, call or None, symbol)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # `@lru_cache` with no call builds the cache with its defaults.
+            for dec in node.decorator_list:
+                if not isinstance(dec, ast.Call):
+                    found.append((dec, dec, None, node.name))
+        elif isinstance(node, ast.Call):
+            symbol = enclosing.get(id(node), ("", None))[0]
+            found.append((node, node.func, node, symbol))
+
+    records = []
+    for node, ctor, call, symbol in found:
+        ctype = idx.resolve_ctor(ctor)
+        cls = _BOUND_CONSTRUCTORS.get(ctype)
+        if cls is None:
+            continue
+        const_args = [{"index": 0, "name": "bound_class", "value": cls,
+                       "how": "aggregate"}]
+        opaque = []
+        pos = 0
+        for a in (call.args if call else []):
+            if isinstance(a, ast.Starred):
+                opaque.append(_segment(source, a))
+            else:
+                const_args.append(_bound_observation(
+                    pos, "arg{}".format(pos), a, source, idx))
+            pos += 1
+        for kw in (call.keywords if call else []):
+            if kw.arg is None:
+                opaque.append("**" + _segment(source, kw.value))
+            else:
+                const_args.append(_bound_observation(
+                    pos, kw.arg, kw.value, source, idx))
+            pos += 1
+        if opaque:
+            # Some options are not written out; a bound may be among them.
+            const_args.append({"index": 0, "name": "bound_opaque",
+                               "value": ", ".join(opaque), "how": "aggregate"})
+        records.append({
+            "site_kind": SITE_KIND_UNSIZED,
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": node.lineno,
+            "symbol": symbol,
+            "func": ctype.rsplit(".", 1)[-1],
+            "receiver": "",
+            "client_type": ctype,
+            "snippet": _segment(source, node),
+            "enclosing_function_body": "",
+            "callers": [],
+            "callees": [],
+            "client_construction": [],
+            "const_args": const_args,
+            "macro_expansion": False,
+            "provenance": {
+                "client_type_resolved": True,
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+            },
+            "lang": "python",
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Call graph (po-cafdn.3): callers, callees and chain roots.
 #
 # goindex resolves a call through the type checker. Python has none, so an
@@ -1704,6 +1828,8 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
     # Misuse-shape inventory: overbroad catches and async misuse.
     out.extend(collect_misuse(tree, source, idx, enclosing, file_path,
                               snapshot, swallowed))
+    # Unsized-construction inventory: queues, pools and caches.
+    out.extend(collect_unsized(tree, source, idx, enclosing, file_path, snapshot))
     return out
 
 

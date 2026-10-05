@@ -529,6 +529,47 @@ pub struct EmissionSpec {
     pub rationale: String,
 }
 
+/// A construction-bound spec: which setters and options BOUND an object of
+/// this type, for the unsized-construction lane (connection pools, queues,
+/// caches, whole-body reads).
+///
+/// The retriever reports what it saw in the constructing function
+/// (`SetMaxOpenConns`, `maxsize`, `io.LimitReader`). Only this spec says
+/// which of those names is a bound, which values of it mean "no limit", and
+/// which control a construction with no bound violates. A site whose type and
+/// class no spec names is not judged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstructionBoundSpec {
+    /// The identity the retriever stamped on the construction
+    /// (`database/sql.DB`, `queue.Queue`, `io.ReadAll`).
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// `pool` | `queue` | `cache` | `read`.
+    pub class: String,
+    /// The control an unbounded construction of this type violates.
+    pub control: String,
+    /// Observation names that bound the object. A positional constructor
+    /// argument is named `arg<N>` (`arg0`), a keyword by its keyword, a
+    /// setter by its method name, a wrapping call by its qualified name.
+    #[serde(default)]
+    pub bounded_by: Vec<String>,
+    /// Renderings of a bound's value that mean "no limit" (`0`, `-1`,
+    /// `None`). Compared only against a value the retriever resolved: a
+    /// non-constant is a name, and a name is credited as a bound.
+    #[serde(default)]
+    pub unbounded_values: Vec<String>,
+    /// Whether the library's DEFAULT is a finite bound, so a construction
+    /// that sets none of `bounded_by` is still bounded (`lru_cache` keeps 128
+    /// entries, SQLAlchemy's pool holds 5 connections). Absent is `false`: the
+    /// default is no limit.
+    #[serde(default)]
+    pub default_bounded: bool,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 /// What a client's configuration TYPE proves about the calls made through it.
 ///
 /// The key is a type, but the bound almost always lives in a FIELD of it that
@@ -846,6 +887,10 @@ pub struct SpecFile {
     /// a pre-G4 consumer with the field ignored — compatible both ways.
     #[serde(default)]
     pub emissions: Vec<EmissionSpec>,
+    /// Construction-bound specs. Additive both ways, like the sections
+    /// above: a cache without it judges no construction.
+    #[serde(default)]
+    pub construction_bounds: Vec<ConstructionBoundSpec>,
     /// Decorator-identity specs (po-av01j.58). Additive both ways, like the
     /// sections above: a cache without it declares no decorator sentinels,
     /// so every decorator bound is credited exactly as before.
@@ -920,6 +965,7 @@ pub struct SpecCache {
     config_keys: HashMap<(String, String), ConfigKeySpec>,
     server: Vec<ServerSpec>,
     emissions: Vec<EmissionSpec>,
+    construction_bounds: Vec<ConstructionBoundSpec>,
     decorators: Vec<DecoratorSpec>,
     misuse_shapes: Vec<MisuseSpec>,
 }
@@ -946,6 +992,7 @@ impl SpecCache {
         }
         c.server = f.server;
         c.emissions = f.emissions;
+        c.construction_bounds = f.construction_bounds;
         for d in f.decorators {
             c.merge_decorator(d);
         }
@@ -1057,6 +1104,11 @@ impl SpecCache {
     pub fn emission_specs(&self) -> &[EmissionSpec] {
         &self.emissions
     }
+    /// The construction-bound specs, for the unsized-construction lane. A
+    /// slice for the same reason as [`SpecCache::emission_specs`].
+    pub fn construction_bound_specs(&self) -> &[ConstructionBoundSpec] {
+        &self.construction_bounds
+    }
     /// The apis section alone. `len()` sums every section, so a
     /// vocabulary-only artifact (scopes, config keys, emissions, no apis)
     /// reads as populated by it; the G1 call-site lane abstains on every
@@ -1075,6 +1127,7 @@ impl SpecCache {
             + self.config_keys.len()
             + self.server.len()
             + self.emissions.len()
+            + self.construction_bounds.len()
             + self.decorators.len()
             + self.misuse_shapes.len()
     }
@@ -1138,6 +1191,17 @@ impl SpecCache {
                 Some(existing) if existing.confidence >= v.confidence => {}
                 Some(existing) => *existing = v,
                 None => self.emissions.push(v),
+            }
+        }
+        // Construction-bound specs merge on (type, class, control), same
+        // policy as emissions.
+        for v in other.construction_bounds {
+            match self.construction_bounds.iter_mut().find(|e| {
+                e.type_name == v.type_name && e.class == v.class && e.control == v.control
+            }) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.construction_bounds.push(v),
             }
         }
         for v in other.decorators {
@@ -1358,6 +1422,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![],
             configs: specs
                 .into_iter()
@@ -1491,6 +1556,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![],
             configs,
             decorators: vec![],
@@ -1780,6 +1846,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
             decorators: vec![],
@@ -1792,6 +1859,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![better],
             configs: vec![],
             decorators: vec![],
@@ -2478,6 +2546,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![e(0.7, "base")],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         });
@@ -2498,6 +2567,7 @@ mod tests {
                     rationale: "new".into(),
                 },
             ],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         }));
@@ -2508,6 +2578,38 @@ mod tests {
             .find(|s| s.type_name == "log/slog.Logger")
             .unwrap();
         assert_eq!(slog.rationale, "better", "higher confidence wins");
+    }
+
+    #[test]
+    fn construction_bound_specs_load_merge_and_count() {
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "construction_bounds": [
+                {"type": "database/sql.DB", "class": "pool", "control": "RC-055",
+                 "bounded_by": ["SetMaxOpenConns"], "unbounded_values": ["0"],
+                 "confidence": 0.7, "rationale": "base"}
+            ]
+        }"#;
+        let mut cache = SpecCache::load(text).expect("construction_bounds must parse");
+        assert_eq!(cache.len(), 1, "the section counts toward the cache size");
+        let overlay = r#"{"apis":[],"configs":[],"construction_bounds":[
+            {"type":"database/sql.DB","class":"pool","control":"RC-055",
+             "bounded_by":["SetMaxOpenConns","SetMaxIdleConns"],"confidence":0.9,"rationale":"overlay"},
+            {"type":"queue.Queue","class":"queue","control":"RC-055","bounded_by":["maxsize","arg0"],
+             "confidence":0.9,"rationale":"new"}]}"#;
+        cache.merge(SpecCache::load(overlay).unwrap());
+        let specs = cache.construction_bound_specs();
+        assert_eq!(specs.len(), 2, "same identity merges, a new one is added");
+        assert_eq!(specs[0].rationale, "overlay", "higher confidence wins");
+        assert!(specs[0].unbounded_values.is_empty());
+        assert!(
+            !specs[0].default_bounded,
+            "absent means the default is no limit"
+        );
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(empty.construction_bound_specs().is_empty());
     }
 
     #[test]
@@ -2720,6 +2822,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         }));

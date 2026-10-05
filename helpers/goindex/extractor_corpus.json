@@ -7,7 +7,13 @@
     "known_unretrieved is the completeness measure: I/O the tables do not retrieve,",
     "counted per scan as existing-but-not-retrieved so the gap is a number.",
     "Moving an entry from known_unretrieved into io_methods is a retrieval change",
-    "and needs specs for the new sites, or every one of them abstains as no_spec."
+    "and needs specs for the new sites, or every one of them abstains as no_spec.",
+    "bound_constructors selects the unsized-construction inventory: package-level",
+    "functions that build an object which takes a bound (class pool, queue, cache)",
+    "or that read a whole body (class read). It says where to look, not what a",
+    "bound is: the packet lists the setters and options seen, and a",
+    "construction-bound spec judges them. io.ReadAll is in both lists on purpose:",
+    "it is still not a G1 call site, and it is an unsized read."
   ],
   "io_methods": [
     "Query", "QueryRow", "Exec",
@@ -34,5 +40,12 @@
      "why": "reads a whole body with no size or time bound of its own; po-av01j.149 found three on nats-server that no number reported"},
     {"package": "io/ioutil", "func": "ReadAll",
      "why": "the deprecated spelling of io.ReadAll, still common in older trees"}
+  ],
+  "bound_constructors": [
+    {"class": "pool", "package": "database/sql", "func": "Open"},
+    {"class": "pool", "package": "database/sql", "func": "OpenDB"},
+    {"class": "cache", "package": "github.com/patrickmn/go-cache", "func": "New"},
+    {"class": "read", "package": "io", "func": "ReadAll"},
+    {"class": "read", "package": "io/ioutil", "func": "ReadAll"}
   ]
 }

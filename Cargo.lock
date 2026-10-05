@@ -956,14 +956,18 @@ name = "rvl"
 version = "1.2.2"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "cindex",
  "clap",
  "clap_complete",
+ "ed25519-dalek",
  "flate2",
  "hex",
  "ignore",
  "libc",
+ "rand",
  "rustindex",
+ "rvl-bounds",
  "rvl-cache",
  "rvl-config",
  "rvl-content",
@@ -983,6 +987,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "rvl-bounds"
+version = "1.2.2"
+dependencies = [
+ "rvl-core",
+ "rvl-spec",
 ]
 
 [[package]]

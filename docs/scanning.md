@@ -256,6 +256,28 @@ skip in place and a warm scan could only honor it for the files it
 re-parsed. Hook scans therefore never include test code; there is no
 `--include-tests` on `rvl index reindex` either.
 
+A whole language is skipped on the same principle. A full scan does not
+run a retriever for a language that is found only in test material while
+another language is really present: one Rust fixture under `testdata/` in a
+Go repository does not start `rustindex`. A language is really present
+when one source file or one project file (`go.mod`, `Cargo.toml`,
+`pyproject.toml`, `package.json`, `tsconfig.json`, a `.csproj` or `.sln`,
+`pom.xml`, `build.gradle`, `compile_commands.json`) is outside the test,
+`testdata`, `fixtures`, `examples` and `docs` paths. One file is enough;
+there is no minimum file count. The skip is named in the COVERAGE roll-call:
+
+```
+  languages: Go 412 sites · Rust skipped (1 file, test material only; --include-tests scans it)
+```
+
+`--out` carries it as a `coverage.lang_status` row with `state: "skipped"`,
+and `rvl doctor` reports the language as skipped instead of asking for its
+helper. If your test paths hold real sources, `rvl scan --include-tests`
+turns the skip off. A repository that is only test material is scanned as
+before, because there the test material is the repository. The skip applies
+to the full scan; an `--incremental` scan retrieves per changed file and
+does not apply it.
+
 The TypeScript retriever scans a workspace whose dependencies are not
 installed, but it resolves client types from import syntax instead of from
 the packages. That is a weaker scan: medium tier, no client versions, and

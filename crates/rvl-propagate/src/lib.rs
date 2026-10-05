@@ -742,6 +742,18 @@ fn judge(
             ),
         };
     }
+    // And for an unsized-construction packet: the construction-bounds lane
+    // judges it. Its question is a size bound, never a deadline.
+    if site.is_unsized_construction() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "{} site: not a client-call surface, API specs do not apply",
+                site.site_kind
+            ),
+        };
+    }
     let key = site.api_key();
     let spec = specs.api(&key);
 
@@ -1224,6 +1236,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         })
@@ -1265,6 +1278,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         })
@@ -1309,6 +1323,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         })
@@ -1513,6 +1528,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         });
@@ -1550,6 +1566,22 @@ mod tests {
         // unbounded call.
         let mut s = site();
         s.site_kind = rvl_core::SITE_KIND_MISUSE.into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable, "{}", f.reason);
+    }
+
+    #[test]
+    fn unsized_construction_sites_are_never_judged_by_g1_specs() {
+        // The same guard for the construction-bounds lane: a packet whose
+        // (client_type, method) collides with a G1 API spec asks about a size
+        // bound, not a deadline, and must not become an unbounded call.
+        let mut s = site();
+        s.site_kind = rvl_core::SITE_KIND_UNSIZED.into();
         let f = propagate(
             &s,
             &cache(vec![Mechanism::Context], vec![]),
@@ -1667,6 +1699,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         })
@@ -1898,6 +1931,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         }));
@@ -2276,6 +2310,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         });
@@ -2777,6 +2812,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         });
@@ -3082,6 +3118,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             scopes: vec![ScopeSpec {
                 scope: "dev_only".into(),
                 applies: false,
@@ -3156,6 +3193,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
         })

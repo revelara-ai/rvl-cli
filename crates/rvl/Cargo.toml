@@ -31,6 +31,7 @@ rvl-index = { path = "../rvl-index" }
 flate2 = { workspace = true }
 rvl-misuse = { path = "../rvl-misuse" }
 rvl-structure = { path = "../rvl-structure" }
+rvl-bounds = { path = "../rvl-bounds" }
 rvl-emission = { path = "../rvl-emission" }
 serde = { workspace = true }
 # Repo-evidence scope classification (po-av01j.173): `toml` reads the hatch
@@ -58,6 +59,11 @@ serde_json = { workspace = true }
 # two processes (po-l3jo5).
 rvl-index = { path = "../rvl-index" }
 flate2 = { workspace = true }
+# Sign a test spec-cache envelope, so the CLI tests can scan on a verified
+# commercial tier (po-97wqs). Dev-only: the shipped binary holds no signing code.
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
 
 # RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
 # this each of cindex/rustindex was its own dist "app" — its own archive, its

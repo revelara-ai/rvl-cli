@@ -1063,6 +1063,36 @@ fn a_missing_helper_reads_as_not_installed_not_as_a_failure() {
     );
 }
 
+// po-av01j.123. A language found only in test material is not scanned, and
+// the roll-call must say so with the count and the flag that scans it: the
+// reader has to be able to tell "skipped on purpose" from "scanned and clean",
+// and to undo the skip when the test paths hold real sources.
+#[test]
+fn a_skipped_language_is_named_with_its_file_count_and_the_lever() {
+    let cov = Coverage {
+        lang_status: vec![
+            LangStatus {
+                lang: "Go".into(),
+                state: LangState::Scanned,
+                detail: "12".into(),
+            },
+            LangStatus {
+                lang: "Rust".into(),
+                state: LangState::Skipped,
+                detail: "1 file".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("Rust skipped (1 file, test material only; --include-tests scans it)"),
+        "{out}"
+    );
+    assert!(!out.contains("Rust FAILED"), "{out}");
+    assert!(!out.contains("Rust 1 file sites"), "{out}");
+}
+
 // --- test files skipped ---
 
 #[test]

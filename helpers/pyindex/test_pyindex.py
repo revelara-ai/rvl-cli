@@ -485,7 +485,7 @@ class TestEmissionPackets(unittest.TestCase):
         # The fixture also exercises the G2/G3 lanes: only records outside the
         # known kinds must stay classic G1 (empty site_kind).
         known_kinds = {"emission_point", "background_job", "server_entry",
-                       "misuse_shape"}
+                       "misuse_shape", "unsized_construction"}
         for r in _retrieve_records():
             if r.get("site_kind") in known_kinds:
                 continue
@@ -603,6 +603,97 @@ class TestMisuseShapePackets(unittest.TestCase):
         g1 = [r for r in self.sites
               if not r.get("site_kind") and r["symbol"] == "blocks"]
         self.assertTrue(any(r["func"] == "get" for r in g1), g1)
+
+
+class TestUnsizedConstructionPackets(unittest.TestCase):
+    """Queues, pools and caches ride the same stream, one packet per
+    construction, stamped site_kind: "unsized_construction". The class and
+    every constructor argument ride const_args. A constant is a value; anything
+    else is a NAME (how: "name") and is never resolved."""
+
+    ROOT = os.path.join(HERE, "testdata", "fixture_bounds")
+
+    def _by_symbol(self):
+        code, out, err = _run("--retrieve", "--root", self.ROOT)
+        self.assertEqual(code, 0, err)
+        sites, _ = _parse_stream(out)
+        out = {}
+        for r in sites:
+            if r.get("site_kind") == "unsized_construction":
+                out.setdefault(r["symbol"], []).append(r)
+        return out
+
+    def _one(self, symbol):
+        recs = self._by_symbol().get(symbol, [])
+        self.assertEqual(len(recs), 1, "{}: {}".format(symbol, recs))
+        return recs[0]
+
+    def _seen(self, rec):
+        return sorted("{}={}/{}".format(a["name"], a["value"], a["how"])
+                      for a in rec["const_args"] if a["how"] != "aggregate")
+
+    def _agg(self, rec, name):
+        return next((a["value"] for a in rec["const_args"]
+                     if a["name"] == name and a["how"] == "aggregate"), None)
+
+    def test_queue_with_no_arguments_reports_class_and_nothing_seen(self):
+        rec = self._one("unbounded_queue")
+        self.assertEqual(rec["client_type"], "queue.Queue")
+        self.assertEqual(rec["func"], "Queue")
+        self.assertEqual(self._agg(rec, "bound_class"), "queue")
+        self.assertEqual(self._seen(rec), [])
+        self.assertEqual(rec["packet_schema"], 2)
+        self.assertEqual(rec["site_key"], "{}:{}:queue.Queue:Queue".format(
+            rec["file_path"], rec["line_number"]))
+
+    def test_constant_arguments_are_values(self):
+        self.assertEqual(self._seen(self._one("zero_is_no_limit")),
+                         ["maxsize=0/literal"])
+        self.assertEqual(self._seen(self._one("literal_capacity")),
+                         ["arg0=50/literal"])
+        rec = self._one("constant_capacity")
+        self.assertEqual(rec["client_type"], "asyncio.Queue")
+        self.assertEqual(self._seen(rec), ["maxsize=100/named_constant"])
+
+    def test_a_non_constant_argument_is_a_name_not_a_value(self):
+        self.assertEqual(self._seen(self._one("named_capacity")),
+                         ["maxsize=settings.max_jobs/name"])
+
+    def test_spread_options_are_reported_as_opaque(self):
+        rec = self._one("hidden_options")
+        self.assertEqual(self._agg(rec, "bound_opaque"), "**opts")
+        self.assertEqual(self._seen(rec), [])
+        self.assertIsNone(self._agg(self._one("unbounded_queue"), "bound_opaque"))
+
+    def test_deque_resolves_through_either_import_form(self):
+        self.assertEqual(self._one("history")["client_type"], "collections.deque")
+        rec = self._one("bounded_history")
+        self.assertEqual(rec["client_type"], "collections.deque")
+        self.assertIn("maxlen=10/literal", self._seen(rec))
+
+    def test_pool_constructions_are_one_packet_each(self):
+        recs = self._by_symbol()["pool"]
+        self.assertEqual(
+            sorted((r["client_type"], r["func"]) for r in recs),
+            [("redis.ConnectionPool", "ConnectionPool"),
+             ("redis.ConnectionPool", "ConnectionPool")],
+            "from_url is not in the table: its options are in the URL")
+        self.assertEqual({self._agg(r, "bound_class") for r in recs}, {"pool"})
+        self.assertEqual(sorted(self._seen(r) for r in recs),
+                         [[], ["max_connections=settings.pool_size/name"]])
+
+    def test_cache_decorators_are_constructions(self):
+        bare = self._one("default_cache")
+        self.assertEqual(bare["client_type"], "functools.lru_cache")
+        self.assertEqual(self._agg(bare, "bound_class"), "cache")
+        self.assertEqual(self._seen(bare), [])
+        self.assertEqual(self._seen(self._one("cache_forever")),
+                         ["maxsize=None/literal"])
+        self.assertEqual(self._one("always_unbounded")["client_type"],
+                         "functools.cache")
+
+    def test_an_unresolved_lookalike_is_never_guessed(self):
+        self.assertNotIn("not_a_construction", self._by_symbol())
 
 
 TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")
