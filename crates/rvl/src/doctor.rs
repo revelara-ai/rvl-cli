@@ -38,8 +38,8 @@ use crate::hook;
 use crate::hook::Status;
 use crate::{
     detect_languages, detect_unsupported, embedded_for, find_on_path, helper_drift,
-    language_is_incidental, missing_helper_hint, node_path_for, resolve_helper, Config, HelperKind,
-    Lang,
+    language_is_incidental, missing_helper_hint, node_path_for, resolve_helper,
+    test_material_only_languages, Config, HelperKind, Lang,
 };
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
@@ -356,7 +356,23 @@ fn native_lane_checks(
 
 fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
     let mut out = Vec::new();
+    // The scan does not read a language found only in test material
+    // (po-av01j.123), so no helper is needed for it and none is probed. It is
+    // still named, with the count and the flag that reads it, because the
+    // doctor and the scan must tell the same story about what goes unread.
+    let skipped = test_material_only_languages(root, langs);
     for &lang in langs {
+        let label = format!("{lang} ({})", lang.helper_base());
+        if let Some((_, files)) = skipped.iter().find(|(l, _)| *l == lang) {
+            out.push(
+                Check::new("retrievers", Status::Pass, label).detail(format!(
+                    "skipped by the scan: found only in test material ({files} file{}), so no \
+                     helper is needed; `rvl scan --include-tests` reads it",
+                    if *files == 1 { "" } else { "s" }
+                )),
+            );
+            continue;
+        }
         // A language present only as a fixture or testdata must not be
         // reported as a hard gap: the scan itself degrades that lane rather
         // than failing (po-hjte8), so the doctor must agree or it would send
@@ -367,7 +383,6 @@ fn retriever_checks(root: &Path, langs: &[Lang]) -> Vec<Check> {
         } else {
             Status::Fail
         };
-        let label = format!("{lang} ({})", lang.helper_base());
         match resolve_helper(lang) {
             Err(e) => {
                 // The resolver's error ENDS in the install hint, and the hint
@@ -976,6 +991,32 @@ fn render_json(root: &Path, checks: &[Check], worst: Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- a language the scan skips needs no helper (po-av01j.123) ---
+
+    /// The scan does not read a language found only in test material, so the
+    /// doctor must not send anyone to install a toolchain for it. It still
+    /// names the language: the skip has to be visible here too.
+    #[test]
+    fn a_language_the_scan_skips_is_reported_as_skipped_not_as_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(root.join("main.go"), "package main\n").unwrap();
+        std::fs::create_dir_all(root.join("testdata")).unwrap();
+        std::fs::write(root.join("testdata/sample.cs"), "class C {}\n").unwrap();
+
+        let checks = retriever_checks(root, &detect_languages(root));
+        let cs = checks
+            .iter()
+            .find(|c| c.label == "C# (csindex)")
+            .expect("the skipped language is still named");
+        assert_eq!(cs.status, Status::Pass);
+        assert!(cs.remedy.is_none(), "nothing to install: {:?}", cs.remedy);
+        let detail = &cs.detail;
+        assert!(detail.contains("1 file"), "{detail}");
+        assert!(detail.contains("--include-tests"), "{detail}");
+    }
 
     // --- an empty commercial API corpus is a doctor finding ---
 

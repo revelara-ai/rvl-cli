@@ -395,6 +395,10 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
                 LangState::Failed => format!("{} FAILED", s.lang),
                 LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
                 LangState::NotInstalled => format!("{} helper not installed", s.lang),
+                LangState::Skipped => format!(
+                    "{} skipped ({}, test material only; --include-tests scans it)",
+                    s.lang, s.detail
+                ),
             })
             .collect();
         // Yellow when anything failed or parsed only partly: both change what
@@ -566,6 +570,12 @@ pub enum LangState {
     /// (po-av01j.147). Asks the reader for an install command, not a bug
     /// report, so it must not read like a failure.
     NotInstalled,
+    /// Detected, and deliberately not scanned (po-av01j.123): every file of
+    /// the language is test material (testdata, fixtures, examples, docs) and
+    /// another language is really present. No helper was resolved or run.
+    /// `detail` carries the file count. Named in the roll-call because a
+    /// language silently not scanned reads as scanned and clean.
+    Skipped,
 }
 
 /// One language that produced no packets, as rendered to the user.
