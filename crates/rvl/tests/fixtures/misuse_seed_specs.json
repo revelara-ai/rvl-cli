@@ -1,0 +1,21 @@
+{
+  "_comment": "SEED misuse-shape corpus: test-grade, hand-authored, sufficient for the per-language e2e tests of the misuse lane (overbroad catch, discarded error, blocking and synchronous waits in async functions, fire-and-forget tasks, missing await). NO control is arbitrated for these classes yet. RC-029 and RC-019 are stand-ins for these tests only; the production corpus assigns the control.",
+  "apis": [],
+  "configs": [],
+  "misuse_shapes": [
+    {"class": "discarded_error", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
+     "rationale": "an error assigned to the blank identifier is a failure nobody sees"},
+    {"class": "discarded_error", "type": "os.File.Close", "role": "allowed", "confidence": 0.9,
+     "rationale": "Close on a file that was only read has no error worth handling"},
+    {"class": "overbroad_catch", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
+     "rationale": "a catch of the root exception type also handles the failures this code did not expect"},
+    {"class": "blocking_in_async", "type": "*", "control": "RC-019", "role": "violates", "confidence": 0.9,
+     "rationale": "a blocking call on the event loop stops every other task until it returns"},
+    {"class": "sync_over_async", "type": "*", "control": "RC-019", "role": "violates", "confidence": 0.9,
+     "rationale": "a synchronous wait on async work holds the thread that must complete it"},
+    {"class": "fire_and_forget", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
+     "rationale": "a task with no owner can be collected before it completes, and its exception is lost"},
+    {"class": "missing_await", "type": "*", "control": "RC-029", "role": "violates", "severity": "medium", "confidence": 0.9,
+     "rationale": "a coroutine that is never awaited does not run"}
+  ]
+}

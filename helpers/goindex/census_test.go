@@ -35,13 +35,13 @@ func TestCensusCandidatesAreTheEmittedCallSitesAndNeverExceedCallsResolved(t *te
 	sites, scan := runRetrieveAll("testdata/fixture", "fixture")
 	calls := 0
 	for _, s := range sites {
-		if s.SiteKind != siteKindEmission {
+		if s.SiteKind != siteKindEmission && s.SiteKind != siteKindMisuse {
 			calls++
 		}
 	}
 	c := scan.Census
 	if c.Candidates != calls {
-		t.Fatalf("candidates = %d, want the %d call-site packets emitted (emission aggregates excluded)",
+		t.Fatalf("candidates = %d, want the %d call-site packets emitted (emission and misuse aggregates excluded)",
 			c.Candidates, calls)
 	}
 	if c.Candidates == 0 || c.CallsResolved <= c.Candidates {

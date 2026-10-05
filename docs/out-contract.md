@@ -226,6 +226,7 @@ The orchestrator uses it to:
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
   `emission.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
+  The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
 - Consumers MUST ignore unknown fields.
 
 ## What this contract deliberately excludes

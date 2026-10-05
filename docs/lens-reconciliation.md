@@ -36,7 +36,7 @@ the part that must not be built again.
 | 7a | M1: container without requests, or without a memory limit | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:352`, `crates/rvl-config/src/key_ledger.rs:136` | None needed | `kubernetes container.resources.requests.cpu` and `kubernetes container.resources.requests.memory` on RC-024, `kubernetes container.resources.limits.memory` on RC-067. All expect `present`. |
 | 7b | M1: container without a CPU limit | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:354`, `crates/rvl-config/src/key_ledger.rs:135` | `po-av01j.44` | `kubernetes container.resources.limits.cpu` is emitted and has no spec. A CPU limit is contested practice, so this needs a decision before a spec. |
 | 8a | H1: swallowed error | SHIPPED | `helpers/goindex/emission.go:360`, `crates/rvl-emission/src/lib.rs:109` | None needed | The G4 emission lane. The Go, Python, and TypeScript helpers emit swallow aggregates, and three `violates` specs map them to RC-027. The finding is one advisory row per control with at most five evidence sites. |
-| 8b | H2/H3: overbroad catch, discarded error value | GENUINELY-NEW | `crates/rvl-spec/src/lib.rs:510` | `po-6c0v8.3` | The emission vocabulary has no category for the caught type or for a discarded value. |
+| 8b | H2/H3: overbroad catch, discarded error value | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:831`, `helpers/goindex/misuse.go:127`, `crates/rvl-misuse/src/lib.rs:132` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `overbroad_catch` and the Go helper emits `discarded_error`, as `misuse_shape` aggregates. No `misuse_shapes` spec is in the corpus, so the lane judges nothing yet. A handler that 8a counts as a swallow is not reported again. The other helpers do not emit the packet. |
 | 9 | F2: cache with no eviction, TTL, or size cap | GENUINELY-NEW | `crates/rvl-core/src/lib.rs:316` | `po-6c0v8.2` | Same mechanism as M6: the construction snippet is retrieved, no bound is read from it. |
 | 10a | K2: container without a liveness or readiness probe | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:368`, `crates/rvl-config/src/key_ledger.rs:133` | None needed | `kubernetes container.liveness-probe` and `kubernetes container.readiness-probe` on RC-020. |
 | 10b | K2: container without a startup probe | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:370`, `crates/rvl-config/src/key_ledger.rs:140` | `po-av01j.44` | `kubernetes container.startup-probe` is emitted and has no spec. |
@@ -47,8 +47,8 @@ the part that must not be built again.
 | 12c | Q26: container runs as root, fat base image | GENUINELY-NEW | `crates/rvl-config/src/dep_manifests.rs:674` | `po-6c0v8.6` | The Dockerfile retriever reads `FROM` only. Nothing reads `USER`, the value of `runAsNonRoot`, or the size class of a base image. |
 | 13 | I1: unstructured or print-style logging | GENUINELY-NEW | `helpers/goindex/emission.go:56` | `po-6c0v8.4` | G4 counts log-framework calls, not `fmt.Println`. It also lets stdlib `log.Print*` satisfy RC-027, so I1 must be arbitrated against that before it ships. |
 | 14 | J7: average latency in place of a histogram | GENUINELY-NEW | `crates/rvl-spec/src/lib.rs:510` | `po-6c0v8.4` | Emission categories are `log`, `trace`, and `error_capture`. There is no metric-registration category. |
-| 15 | G5/G6: sync-over-async, blocking in async | GENUINELY-NEW | `crates/rvl-core/src/lib.rs:292` | `po-6c0v8.3` | A site packet does not record that its enclosing function is async. |
-| 16 | E5/E6: fire-and-forget async, missing await | GENUINELY-NEW | `crates/rvl-core/src/lib.rs:292` | `po-6c0v8.3` | No retriever emits an expression-statement fact. |
+| 15 | G5/G6: sync-over-async, blocking in async | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:831`, `crates/rvl-misuse/src/lib.rs:132` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `blocking_in_async` and `sync_over_async` for a table of module-level functions. A blocking method on a client object is not emitted. Go has no async functions. |
+| 16 | E5/E6: fire-and-forget async, missing await | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:831`, `crates/rvl-misuse/src/lib.rs:132` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `fire_and_forget` and `missing_await`. A coroutine function is known only when the same module defines it. The TypeScript helper, which has the types for a floating promise, does not emit the packet yet. |
 | 17 | L5: alert with no runbook link | SHIPPED | `crates/rvl-config/src/prometheus.rs:318`, `crates/rvl-config/src/key_ledger.rs:154` | None needed | `prometheus-rules rule.annotations.runbook` on RC-006. Ships in the OSS tier. |
 | 18a | Q29: action not pinned to a commit SHA | SHIPPED | `crates/rvl-config/src/github_actions.rs:315`, `crates/rvl-config/src/key_ledger.rs:125` | None needed | `github-actions step.uses.ref` and `github-actions job.uses.ref` on RC-042, pattern `sha40`. |
 | 18b | Q21/Q22: no dependency scanning, no SAST in CI | GENUINELY-NEW | `crates/rvl-config/src/key_ledger.rs:122` | `po-6c0v8.7` | Every GitHub Actions key is per job or per step. A whole-tree absence needs a repo-level fact, which is a G7 inventory shape. |
@@ -77,6 +77,13 @@ Count by rank: 3 ranks ship in full (1, 3, 17), 5 ship in their main class
 with a remainder (7, 10, 12, 18, 19), 1 ships in part through a different lane
 (8), and 11 are new in full (2, 4, 5, 6, 9, 11, 13, 14, 15, 16, 20).
 
+**Update, 2026-10-04 (`po-6c0v8.3`).** Wave 2 landed its retrieval and its
+lane. Rows 8b, 15, and 16 moved from GENUINELY-NEW to
+LANE-WIRED-NEEDS-CORPUS: the Go and Python helpers emit the fact, and no spec
+judges it. The corpus entries, and the helpers that do not emit the packet,
+are `po-6c0v8.10`. The count above and the table below this point are the
+2026-10-04 snapshot and were not recomputed.
+
 ## What to build, and what not to build
 
 **Do not build.** A timeout detector, a secret detector, a swallowed-error
@@ -92,7 +99,7 @@ the corrections recorded as notes on each bead:
 | Bead | Classes | Correction |
 | --- | --- | --- |
 | `po-6c0v8.2` | M6, D2, F2, F3 | None to scope. Reuse the construction snippet (M6, F2), the capacity argument (D2), and the retrieval census (F3). |
-| `po-6c0v8.3` | H2, H3, G5/G6, E5/E6 | H1 is removed: it ships. The statement that no lane is wired is wrong for H1. |
+| `po-6c0v8.3` | H2, H3, G5/G6, E5/E6 | H1 is removed: it ships. Landed for Go (H3) and Python on 2026-10-04. What is left is in `po-6c0v8.10`. |
 | `po-6c0v8.4` | B1/B2, N1, Q4, I1, J7 | None to scope. I1 must not contradict the emission lane on stdlib log calls. |
 
 Four classes had no bead. Each is now a child of the epic:

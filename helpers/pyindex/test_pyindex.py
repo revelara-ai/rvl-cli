@@ -484,13 +484,125 @@ class TestEmissionPackets(unittest.TestCase):
     def test_g1_sites_carry_no_site_kind(self):
         # The fixture also exercises the G2/G3 lanes: only records outside the
         # known kinds must stay classic G1 (empty site_kind).
-        known_kinds = {"emission_point", "background_job", "server_entry"}
+        known_kinds = {"emission_point", "background_job", "server_entry",
+                       "misuse_shape"}
         for r in _retrieve_records():
             if r.get("site_kind") in known_kinds:
                 continue
             self.assertFalse(r.get("site_kind"),
                              "G1 packets must not grow a site_kind: {}".format(r))
 
+
+
+class TestMisuseShapePackets(unittest.TestCase):
+    """Error-handling and async shapes ride the same stream as AGGREGATES,
+    one packet per (enclosing function, class, identity), stamped
+    site_kind: "misuse_shape" with the class and the count in const_args.
+    Retrieval only: nothing here says a shape is a finding."""
+
+    ROOT = os.path.join(HERE, "testdata", "fixture_misuse")
+
+    @classmethod
+    def setUpClass(cls):
+        code, out, err = _run("--retrieve", "--root", cls.ROOT)
+        assert code == 0, err
+        sites, _ = _parse_stream(out)
+        cls.sites = sites
+        cls.shapes = {}
+        for r in sites:
+            if r.get("site_kind") != "misuse_shape":
+                continue
+            const = {a["name"]: a["value"] for a in r["const_args"]}
+            key = (r["symbol"], const["misuse_class"], r["client_type"])
+            assert key not in cls.shapes, "one packet per key: {}".format(key)
+            cls.shapes[key] = (r, int(const["misuse_count"]))
+
+    def _count(self, symbol, cls, identity):
+        return self.shapes.get((symbol, cls, identity), (None, 0))[1]
+
+    def _in(self, symbol):
+        return sorted(k[1:] for k in self.shapes if k[0] == symbol)
+
+    def test_root_exception_catches_aggregate_per_function_and_type(self):
+        self.assertEqual(
+            self._count("catches_root", "overbroad_catch", "Exception"), 2,
+            "a tuple that names Exception catches it too")
+        self.assertEqual(
+            self._count("catches_base", "overbroad_catch", "BaseException"), 1)
+        self.assertEqual(self._count("catches_bare", "overbroad_catch", "bare"), 1)
+        rec, _ = self.shapes[("catches_root", "overbroad_catch", "Exception")]
+        self.assertEqual(rec["line_number"], 20)
+        self.assertEqual(rec["func"], "except")
+        self.assertEqual(rec["enclosing_function_body"], "")
+        self.assertEqual(rec["packet_schema"], 2)
+        self.assertTrue(rec["site_key"])
+
+    def test_a_handler_that_reraises_or_is_narrow_is_not_emitted(self):
+        self.assertEqual(self._in("catches_and_reraises"), [])
+        self.assertEqual(self._in("catches_narrow"), [])
+
+    def test_a_swallowed_handler_is_left_to_the_emission_lane(self):
+        # `except Exception: pass` is the H1 swallow. It rides the stream once,
+        # as the emission lane's except_handler aggregate.
+        self.assertEqual(self._in("swallows"), [])
+        swallow = [r for r in self.sites
+                   if r.get("site_kind") == "emission_point"
+                   and r["symbol"] == "swallows"
+                   and r["client_type"] == "except_handler"]
+        self.assertEqual(len(swallow), 1)
+
+    def test_blocking_calls_inside_async_def_are_keyed_by_callee(self):
+        self.assertEqual(self._in("blocks"), [
+            ("blocking_in_async", "requests.get"),
+            ("blocking_in_async", "subprocess.run"),
+            ("blocking_in_async", "time.sleep"),
+        ])
+        self.assertEqual(
+            self._count("blocks", "blocking_in_async", "time.sleep"), 2,
+            "`from time import sleep` resolves to the same callee")
+
+    def test_a_blocking_call_handed_to_a_worker_is_not_emitted(self):
+        # A lambda or a nested def runs where it is called, not on the loop.
+        self.assertEqual(self._in("offloads"), [])
+        self.assertEqual(self._in("helper"), [])
+
+    def test_a_blocking_call_in_a_sync_function_is_not_emitted(self):
+        self.assertEqual(self._in("sync_caller"), [])
+
+    def test_synchronous_waits_inside_async_def(self):
+        self.assertEqual(self._in("waits_synchronously"), [
+            ("sync_over_async", "asyncio.loop.run_until_complete"),
+            ("sync_over_async", "asyncio.run"),
+            ("sync_over_async", "asyncio.run_coroutine_threadsafe.result"),
+        ])
+
+    def test_a_task_started_as_a_statement_is_fire_and_forget(self):
+        self.assertEqual(self._in("forgets"), [
+            ("fire_and_forget", "asyncio.create_task"),
+            ("fire_and_forget", "asyncio.ensure_future"),
+        ])
+        # A held task and a TaskGroup's task have an owner.
+        self.assertEqual(self._in("holds"), [])
+
+    def test_a_coroutine_called_and_never_awaited(self):
+        self.assertEqual(self._in("never_awaits"),
+                         [("missing_await", "coroutine")])
+        self.assertEqual(
+            self._count("never_awaits", "missing_await", "coroutine"), 2,
+            "the bare call and the assignment nobody reads; work() is sync")
+        self.assertEqual(self._in("awaits"), [])
+        self.assertEqual(self._in("shadows"), [],
+                         "a parameter shadows the module-level coroutine")
+
+    def test_an_async_method_called_on_self_and_never_awaited(self):
+        self.assertEqual(self._in("run"), [("missing_await", "coroutine")])
+        self.assertEqual(self._count("run", "missing_await", "coroutine"), 1)
+
+    def test_the_wider_fixture_g1_sites_are_unchanged(self):
+        # requests.get in an async def is still a G1 call site as well.
+        g1 = [r for r in self.sites
+              if not r.get("site_kind") and r["symbol"] == "blocks"]
+        self.assertTrue(any(r["func"] == "get" for r in g1), g1)
 
 
 TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")

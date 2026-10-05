@@ -230,6 +230,11 @@ construction/timeout is retrievable, and that noise calls are not emitted.
 `testdata/fixture_graph/` is a small package with a known multi-hop call
 chain (`main -> run_once -> sync_user -> fetch_profile`) for the call-graph
 tests.
+`testdata/fixture_misuse/` holds one function per rule of the misuse-shape
+inventory (`site_kind: "misuse_shape"`): overbroad catches, blocking calls and
+synchronous waits inside `async def`, tasks that nothing holds, and coroutines
+that are never awaited, each beside the shapes that must not be emitted. See
+"Misuse shapes" in `docs/retrievers.md`.
 `testdata/fixture_tests/` holds one file per test-path convention beside
 three production files, for the tests that pin what is skipped, what is
 counted and named, and what `--include-tests` restores.

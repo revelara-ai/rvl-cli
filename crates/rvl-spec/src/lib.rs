@@ -851,6 +851,53 @@ pub struct SpecFile {
     /// so every decorator bound is credited exactly as before.
     #[serde(default)]
     pub decorators: Vec<DecoratorSpec>,
+    /// Misuse-shape specs. Additive both ways, like the sections above: a
+    /// cache without it judges no misuse shape.
+    #[serde(default)]
+    pub misuse_shapes: Vec<MisuseSpec>,
+}
+
+/// A misuse-shape spec: what an error-handling or async shape MEANS, for the
+/// misuse lane.
+///
+/// A retriever reports the shape and the identity it was seen on: the caught
+/// type for an overbroad catch (`Exception`), the callee for a discarded
+/// error (`os.Remove`) or a blocking call in an async function
+/// (`requests.get`). Only this spec says which control the shape violates.
+/// A shape whose class no spec names is not judged.
+///
+/// `role` is how the legitimate-suppression allowlist is written:
+///   - `"violates"`: the shape on this identity is a finding under `control`.
+///   - `"allowed"`: the shape on this identity is legitimate and is never a
+///     finding (a discarded `Close` on a read-only file).
+///
+/// `type` is an exact identity, or `"*"` for every identity of the class. An
+/// exact entry beats a `"*"` entry, so one class-wide `violates` entry and a
+/// list of `allowed` identities is the usual form. A role this consumer does
+/// not know matches nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MisuseSpec {
+    /// `overbroad_catch` | `discarded_error` | `sync_over_async` |
+    /// `blocking_in_async` | `fire_and_forget` | `missing_await`.
+    pub class: String,
+    /// The identity the retriever stamped, or `"*"`.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// The control a `violates` entry maps the shape to. Empty on `allowed`.
+    #[serde(default)]
+    pub control: String,
+    /// `violates` | `allowed`.
+    #[serde(default)]
+    pub role: String,
+    /// `low` | `medium`. Empty, or any other value, keeps the default of the
+    /// class. This is the volume control: these shapes are common, so the
+    /// corpus tunes how loud a class is and the retriever keeps reporting it.
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -874,6 +921,7 @@ pub struct SpecCache {
     server: Vec<ServerSpec>,
     emissions: Vec<EmissionSpec>,
     decorators: Vec<DecoratorSpec>,
+    misuse_shapes: Vec<MisuseSpec>,
 }
 
 impl SpecCache {
@@ -901,7 +949,32 @@ impl SpecCache {
         for d in f.decorators {
             c.merge_decorator(d);
         }
+        for m in f.misuse_shapes {
+            c.merge_misuse(m);
+        }
         c
+    }
+
+    /// Insert a misuse-shape spec, keeping the higher-confidence entry per
+    /// (class, type). The role is part of the value, not of the key: an
+    /// overlay that is more confident an identity is `allowed` replaces a
+    /// baseline `violates` entry for it.
+    fn merge_misuse(&mut self, v: MisuseSpec) {
+        match self
+            .misuse_shapes
+            .iter_mut()
+            .find(|m| m.class == v.class && m.type_name == v.type_name)
+        {
+            Some(existing) if existing.confidence >= v.confidence => {}
+            Some(existing) => *existing = v,
+            None => self.misuse_shapes.push(v),
+        }
+    }
+
+    /// The misuse-shape specs, for the misuse lane. A slice for the same
+    /// reason as [`SpecCache::emission_specs`].
+    pub fn misuse_specs(&self) -> &[MisuseSpec] {
+        &self.misuse_shapes
     }
 
     /// Insert a decorator spec, keeping the higher-confidence entry per
@@ -1003,6 +1076,7 @@ impl SpecCache {
             + self.server.len()
             + self.emissions.len()
             + self.decorators.len()
+            + self.misuse_shapes.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1068,6 +1142,9 @@ impl SpecCache {
         }
         for v in other.decorators {
             self.merge_decorator(v);
+        }
+        for v in other.misuse_shapes {
+            self.merge_misuse(v);
         }
     }
 
@@ -1298,6 +1375,7 @@ mod tests {
                 })
                 .collect(),
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1416,6 +1494,7 @@ mod tests {
             apis: vec![],
             configs,
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1704,6 +1783,7 @@ mod tests {
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -1715,6 +1795,7 @@ mod tests {
             apis: vec![better],
             configs: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -2287,6 +2368,44 @@ mod tests {
     }
 
     #[test]
+    fn misuse_specs_load_merge_and_count() {
+        let text = r#"{"apis":[],"configs":[],"misuse_shapes":[
+            {"class":"discarded_error","type":"*","control":"RC-029","role":"violates",
+             "confidence":0.9,"rationale":"base"},
+            {"class":"discarded_error","type":"os.File.Close","control":"RC-029",
+             "role":"violates","confidence":0.7,"rationale":"base"}]}"#;
+        let mut cache = SpecCache::load(text).expect("misuse_shapes must parse");
+        assert_eq!(cache.len(), 2, "the section counts toward the cache size");
+        let overlay = r#"{"apis":[],"configs":[],"misuse_shapes":[
+            {"class":"discarded_error","type":"os.File.Close","role":"allowed",
+             "confidence":0.9,"rationale":"overlay"},
+            {"class":"missing_await","type":"*","control":"RC-029","role":"violates",
+             "severity":"low","confidence":0.9}]}"#;
+        cache.merge(SpecCache::load(overlay).unwrap());
+        let specs = cache.misuse_specs();
+        assert_eq!(
+            specs.len(),
+            3,
+            "same (class, type) merges, a new one is added"
+        );
+        let close = specs
+            .iter()
+            .find(|s| s.type_name == "os.File.Close")
+            .unwrap();
+        assert_eq!(
+            close.role, "allowed",
+            "a more confident overlay replaces the entry, role included"
+        );
+        assert!(
+            specs[0].severity.is_empty(),
+            "absent keeps the class default"
+        );
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(empty.misuse_specs().is_empty());
+    }
+
+    #[test]
     fn a_cache_without_a_decorators_section_declares_nothing() {
         let cache = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
         assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "0"));
@@ -2360,6 +2479,7 @@ mod tests {
             server: vec![],
             emissions: vec![e(0.7, "base")],
             decorators: vec![],
+            misuse_shapes: vec![],
         });
         base.merge(SpecCache::from_file(SpecFile {
             apis: vec![],
@@ -2379,6 +2499,7 @@ mod tests {
                 },
             ],
             decorators: vec![],
+            misuse_shapes: vec![],
         }));
         let specs = base.emission_specs();
         assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
@@ -2600,6 +2721,7 @@ mod tests {
             server: vec![],
             emissions: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         }));
         assert_eq!(c.api_count(), 1);
         assert_eq!(c.config_count(), 1);

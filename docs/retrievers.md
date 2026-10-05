@@ -260,6 +260,91 @@ lanes on a full scan (`goindex` is unchanged). It is refused together with
 scan could only honor the flag for the files it re-parsed and would report
 that partial answer as the repository's.
 
+## Misuse shapes
+
+Some shapes of error handling and of async code are wrong where they stand.
+One function is enough to see them, and no call graph is necessary. A
+retriever reports them as packets with `site_kind: "misuse_shape"`. The packet
+is not a call site. It is not counted in COVERAGE, and it is not a row in
+`--out`.
+
+A misuse packet is an aggregate, like an emission point. There is one packet
+for each enclosing function, class, and identity. The class and the count are
+in `const_args`, with `how: "aggregate"`:
+
+| Entry | Meaning |
+| --- | --- |
+| `misuse_class` | The class of the shape. See the table below. |
+| `misuse_count` | The number of times the shape occurs in the function. |
+
+The identity is in `client_type`. The line and the snippet are those of the
+first occurrence.
+
+| Class | Shape | Identity |
+| --- | --- | --- |
+| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught (`Exception`, `BaseException`), or `bare` for `except:`. |
+| `discarded_error` | A call result of type error is assigned to a discard (`_ = f.Close()`). | The callee: `os.Remove`, `os.File.Close`. `func value` when the call goes through a function value. |
+| `blocking_in_async` | A blocking function is called in the text of an async function. | The callee: `time.sleep`, `requests.get`. |
+| `sync_over_async` | An async function waits synchronously for async work. | The call that waits: `asyncio.run`. |
+| `fire_and_forget` | A task is started as a statement. Nothing holds the task. | The call that starts it: `asyncio.create_task`. |
+| `missing_await` | A coroutine function is called as a statement, or its result is assigned to a name that nothing reads. | `coroutine`. |
+
+A swallowed error is not in this table. It is an emission-point fact
+(`except_handler`, `catch_clause`, `recover_block`), and the emission lane
+reports it. A handler that the emission lane counts as a swallow is not
+reported again as an overbroad catch.
+
+A retriever does not decide that a shape is a finding. A `misuse_shapes` spec
+does. Each entry has a class, a type, a role, and a control:
+
+- `type` is one identity, or `*` for all identities of the class. An entry
+  for one identity has priority over a `*` entry.
+- `role: "violates"` makes the shape a finding for the control of the entry.
+- `role: "allowed"` makes the shape legitimate for that identity. This is the
+  list of legitimate suppressions. A discarded `Close` on a file that was only
+  read is an example.
+- `severity` is optional: `low` or `medium`. Without it, the class has its
+  default severity.
+
+A class that no spec names is not judged.
+
+These shapes are frequent, and a report with one line for each occurrence is
+a report that nobody reads. The retriever does not report fewer shapes to
+prevent this. The volume is controlled in three other places:
+
+1. The scan reports one finding for each class and control, with a maximum of
+   five sites.
+2. The finding gives the total count, so that the exposure tier of the report
+   applies to it.
+3. A finding is always advisory. The default severity is `low` for
+   `overbroad_catch`, `discarded_error`, and `fire_and_forget`. It is `medium`
+   for `blocking_in_async`, `sync_over_async`, and `missing_await`. A spec can
+   set `low` or `medium`. It cannot set `high`.
+
+The finding has the class `misuse.<class>` (`misuse.discarded_error`). A
+waiver or `rvl suppress` uses that name.
+
+| Retriever | Emits |
+| --- | --- |
+| `goindex` | `discarded_error`. Go has no typed catch and no async functions, so it has no other class. |
+| `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`. |
+| The other retrievers | Nothing yet. |
+
+Limits:
+
+- `goindex` reports an assignment to `_` only. It does not report a call
+  statement that ignores all its results (`f.Close()`), and it does not
+  report `_ = err` on a variable.
+- `pyindex` has no types. For `blocking_in_async` it reports module-level
+  functions from a fixed table (`time.sleep`, `requests.get`,
+  `subprocess.run`). It does not report a blocking method on a client object.
+- `pyindex` knows that a callee is a coroutine function only when the same
+  module defines it with `async def`, at module level or on the enclosing
+  class. It does not see a coroutine function that is imported.
+- A call in a lambda or in a nested function that is not async is not
+  reported as `blocking_in_async`. It runs where that function is called, for
+  example in a worker thread.
+
 ## Scanning a prebuilt packet stream
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape

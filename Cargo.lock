@@ -971,6 +971,7 @@ dependencies = [
  "rvl-data",
  "rvl-emission",
  "rvl-index",
+ "rvl-misuse",
  "rvl-propagate",
  "rvl-skills",
  "rvl-spec",
@@ -1092,6 +1093,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "rvl-misuse"
+version = "1.2.2"
+dependencies = [
+ "rvl-core",
+ "rvl-spec",
 ]
 
 [[package]]

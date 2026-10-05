@@ -50,5 +50,12 @@ type-resolved). That census is the retrieval denominator: coverage is
 resolution over what these tables retrieve, and the census is how much they
 retrieve. It is computed before any `-files` filter, so it is always whole-repo.
 
+A discarded error (`_ = f.Close()`, `n, _ := strconv.Atoi(s)`) rides the same
+stream as an aggregate with `site_kind: "misuse_shape"`: one packet per
+function and callee, with `misuse_class: discarded_error` and `misuse_count`
+in `const_args` (`misuse.go`). It is not a call site and is not in the census.
+Whether a discard is legitimate is spec knowledge, so every one is emitted.
+See "Misuse shapes" in `docs/retrievers.md`.
+
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.

@@ -3304,6 +3304,13 @@ fn findings_from_sites(
     let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
         .into_iter()
         .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
+    // Misuse-shape aggregates (an overbroad catch, a discarded error, a
+    // blocking call in an async function, an async call never awaited) ride
+    // the same stream and are not client-call surfaces. They leave the G1
+    // site list here, for the same reasons as the emission points below, and
+    // the misuse lane consumes them.
+    let (misuse_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_misuse_shape());
     // G4 (po-av01j.5): emission-point aggregates ride the same stream but are
     // NOT client-call surfaces. Partition them out before propagation so they
     // never enter G1 coverage totals, `--out` eval rows, or triage classes;
@@ -3367,6 +3374,7 @@ fn findings_from_sites(
                     })
                     .collect(),
                 decorators: vec![],
+                misuse_shapes: vec![],
             };
             cache.merge(rvl_spec::SpecCache::from_file(overlay));
         }
@@ -3402,6 +3410,10 @@ fn findings_from_sites(
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
     let mut items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    // Misuse lane: error-handling and async shapes, one advisory item per
+    // class and control, keyed `misuse.<class>`. With no misuse spec in the
+    // cache the lane judges nothing.
+    items.extend(misuse_items(&misuse_sites, cache.misuse_specs()));
     // Emission lane (G4): judge the emission inventory against RC-027/RC-046/
     // RC-061 with the cache's emission specs. Only violations surface, as
     // triage items keyed `emission.RC-XXX` — the same waiver/suppress surface
@@ -3421,6 +3433,34 @@ fn findings_from_sites(
         server_findings,
         empty_api_corpus,
     ))
+}
+
+/// Map misuse-lane violations into triage items. The class key is (`misuse`,
+/// class), so the ladder renders `misuse.discarded_error — <why>` and a
+/// waiver or `rvl suppress` matches on `misuse.discarded_error`. The control
+/// and the severity come from the spec that judged the shape. `site_count` is
+/// every occurrence, not the capped evidence, so the exposure tier is true.
+fn misuse_items(
+    misuse_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::MisuseSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_misuse::evaluate(misuse_sites, specs)
+        .into_iter()
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "misuse".into(),
+                method: f.class,
+                reason: f.reason,
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            control: f.control,
+            site_count: f.occurrences,
+            example_sites: f.evidence.into_iter().take(3).collect(),
+        })
+        .collect()
 }
 
 /// Map emission-lane violations into triage items. The class key is

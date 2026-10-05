@@ -393,6 +393,7 @@ mod tests {
                 },
             ],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 

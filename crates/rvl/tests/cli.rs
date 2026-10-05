@@ -2232,6 +2232,197 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
     assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
 }
 
+// --- misuse lane (error handling and async misuse) ---
+
+/// A `--retrieved` stream carrying misuse-shape packets surfaces one advisory
+/// `misuse.<class>` item per class, under the control its spec names. An
+/// identity the spec allows is not a finding, a class with no spec is not
+/// judged, and the packets stay out of the G1 site count and `--out` rows.
+#[test]
+fn scan_surfaces_misuse_shapes_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let misuse_packet = |line: u32, class: &str, identity: &str, count: u32| {
+        format!(
+            r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":{line},"symbol":"f{line}","func":"x","client_type":{identity:?},"site_kind":"misuse_shape","const_args":[{{"index":0,"name":"misuse_class","value":{class:?},"how":"aggregate"}},{{"index":0,"name":"misuse_count","value":"{count}","how":"aggregate"}}],"lang":"go"}}"#
+        )
+    };
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        [
+            format!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            misuse_packet(20, "discarded_error", "os.Remove", 2),
+            misuse_packet(30, "discarded_error", "encoding/json.Unmarshal", 1),
+            // An identity the spec allows: not a finding, not counted.
+            misuse_packet(40, "discarded_error", "os.File.Close", 7),
+            // A class no spec names: not judged.
+            misuse_packet(50, "missing_await", "coroutine", 1),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""misuse_shapes":["#,
+        r#"{"class":"discarded_error","type":"*","control":"RC-029","role":"violates","confidence":0.9,"rationale":"a discarded error hides a failure"},"#,
+        r#"{"class":"discarded_error","type":"os.File.Close","role":"allowed","confidence":0.9,"rationale":"Close on a file opened for reading"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    assert!(
+        stdout.contains("misuse.discarded_error") && stdout.contains("3 error value(s)"),
+        "the two judged identities collapse into one finding of 3, the allowed one is left out: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-029"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("misuse.missing_await"),
+        "a class with no spec is not judged: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+    assert!(
+        stdout.contains("sites 1 "),
+        "misuse packets leaked into the G1 site list: {stdout}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED misuse-shape corpus (test-grade).
+fn misuse_seed_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("misuse_seed_specs.json")
+}
+
+/// Go, live end to end: goindex inventories the misuse fixture's discarded
+/// errors, the seed specs judge them, and the ladder surfaces one advisory
+/// item. The count pins the rules: only an error-typed discard is counted, a
+/// tuple and a parallel assignment count each error, and the identity the
+/// seed allows (`os.File.Close`) is left out.
+#[test]
+fn live_go_scan_surfaces_discarded_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture().with_file_name("misusefixture"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("misuse.discarded_error")
+            && stdout.contains("7 error value(s) are assigned to a discard, in 5 function(s)"),
+        "eight discards, one of them an allowed Close: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-029"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories the misuse fixture, and the
+/// seed specs judge it. One item per class, each with the total count. The
+/// counts pin the rules that keep the lane honest: a handler that re-raises
+/// and a handler the emission lane counts as a swallow are not overbroad
+/// catches, a call handed to a worker is not on the event loop, a held task
+/// is not forgotten, and an awaited or returned coroutine is not missing its
+/// await.
+#[test]
+fn live_python_scan_surfaces_misuse_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pyindex = helpers_dir().join("pyindex");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_misuse"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    for (class, why) in [
+        (
+            "misuse.overbroad_catch",
+            "4 handler(s) catch the root exception type and do not re-raise, in 3 function(s)",
+        ),
+        (
+            "misuse.blocking_in_async",
+            "4 blocking call(s) inside an async function, in 1 function(s)",
+        ),
+        (
+            "misuse.sync_over_async",
+            "3 synchronous wait(s) on async work inside an async function, in 1 function(s)",
+        ),
+        (
+            "misuse.fire_and_forget",
+            "2 async task(s) are started and the result is not held, in 1 function(s)",
+        ),
+        (
+            "misuse.missing_await",
+            "3 async call(s) are never awaited, in 2 function(s)",
+        ),
+    ] {
+        assert!(
+            stdout.contains(class) && stdout.contains(why),
+            "want {class}: {why}\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {
