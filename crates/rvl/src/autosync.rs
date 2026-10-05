@@ -178,7 +178,7 @@ pub fn init_sync(cfg: &Config) -> String {
     }
     let fix = format!("run '{BIN} sync' before the first scan");
     let synced = CacheStore::open(&cfg.cache_dir).and_then(|store| {
-        let keyset = Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX)?;
+        let keyset = crate::keyset::trusted_keyset()?;
         sync_tiers(cfg, &store, &keyset)
     });
     let (oss, commercial) = match synced {

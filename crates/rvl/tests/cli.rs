@@ -7230,6 +7230,163 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The debug-only variable that adds test verifying keys to the pinned keyset.
+/// Mirrors `TEST_KEYSET_ENV` in `crates/rvl/src/keyset.rs`.
+const TEST_KEYSET_ENV: &str = "RVL_TEST_KEYSET_HEX";
+
+/// Sign a commercial-tier envelope carrying `apis` with a fresh key and
+/// install it as the cache under `<root>/cache`. Returns the public half, hex
+/// encoded, which is the only thing a scan needs to trust the result.
+fn install_signed_commercial_tier(root: &std::path::Path, apis: &str) -> String {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
+    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let key_hex = hex::encode(signing.verifying_key().to_bytes());
+    let keyset = rvl_cache::Keyset::from_hex(&[key_hex.as_str()]).unwrap();
+    let bytes = format!(
+        r#"{{"schema":1,"content_version":"{}.1","specs":{{"apis":{apis},"configs":[]}}}}"#,
+        rvl_cache::today_utc()
+    )
+    .into_bytes();
+    let sig = base64::engine::general_purpose::STANDARD.encode(signing.sign(&bytes).to_bytes());
+    let store = rvl_cache::CacheStore::open(&root.join("cache")).unwrap();
+    let outcome = store.install(&bytes, &sig, &keyset);
+    assert!(
+        matches!(outcome, rvl_cache::SyncOutcome::Installed { .. }),
+        "the test envelope must install: {outcome:?}"
+    );
+    key_hex
+}
+
+/// Scan the runtime Python fixture on the SIGNED cache (no `--specs-file`),
+/// trusting `key_hex` through the debug-only seam.
+fn scan_on_the_signed_cache(
+    root: &std::path::Path,
+    packets: &std::path::Path,
+    key_hex: &str,
+) -> std::process::Output {
+    bin()
+        .args(["scan", "--retrieved"])
+        .arg(packets)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .env("HOME", root.join("home"))
+        .env(TEST_KEYSET_ENV, key_hex)
+        .output()
+        .expect("failed to run rvl")
+}
+
+/// The positive half, end to end (po-97wqs): a commercial tier that verifies
+/// and carries `apis: []` is the 2026-08-19 artifact. `commercial_loaded`
+/// reaches `Coverage.empty_api_corpus` through the `ResolvedScan` tuple, and
+/// until this test only the compiler checked that wiring.
+#[cfg(debug_assertions)]
+#[test]
+fn a_signed_empty_commercial_tier_warns_on_stderr_and_in_coverage() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-empty-corpus");
+    let key_hex = install_signed_commercial_tier(&root, "[]");
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warning is advisory, the exit code is unchanged:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: the commercial spec cache carries 0 API specs"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("0/1 API surfaces resolved"),
+        "the one site must abstain as no_spec: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 API specs in the commercial spec cache"),
+        "COVERAGE must name the empty corpus: {stdout}"
+    );
+    assert!(
+        stderr.contains(TEST_KEYSET_ENV),
+        "a widened keyset is never quiet: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The contrast: the same signed path with a populated tier says nothing, so
+/// the warning above comes from the empty corpus and not from the seam.
+#[cfg(debug_assertions)]
+#[test]
+fn a_signed_populated_commercial_tier_does_not_warn() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-populated-corpus");
+    let key_hex = install_signed_commercial_tier(
+        &root,
+        r#"[{"type":"requests","method":"get","site_count":1,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests defaults to no timeout"}]"#,
+    );
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1/1 API surfaces resolved"), "{stdout}");
+    assert!(!stderr.contains("0 API specs"), "{stderr}");
+    assert!(!stdout.contains("0 API specs"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A key outside the keyset is still refused: the seam adds named keys, it
+/// does not turn verification off.
+#[cfg(debug_assertions)]
+#[test]
+fn the_test_keyset_does_not_trust_a_tier_signed_by_another_key() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-other-key");
+    install_signed_commercial_tier(&root, "[]");
+    let other = hex::encode(
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let out = scan_on_the_signed_cache(&root, &packets, &other);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no spec cache tier loadable"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE RELEASE BINARY HAS NO KEYSET OVERRIDE. Runs under `cargo test
+/// --release` only: the variable is not read, so a tier signed by a key
+/// outside the pinned keyset does not load whatever the environment says.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_release_build_ignores_the_test_keyset_variable() {
+    let (root, packets, _) = write_runtime_python_fixture("release-ignores-keyset");
+    let key_hex = install_signed_commercial_tier(&root, "[]");
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no spec cache tier loadable"), "{stderr}");
+    assert!(!stderr.contains(TEST_KEYSET_ENV), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The seam is gated on `debug_assertions`, so a profile that turns them on
+/// for a shipped build would ship the override. No profile may set the key.
+#[test]
+fn no_cargo_profile_turns_debug_assertions_on() {
+    for rel in ["../../Cargo.toml", "Cargo.toml"] {
+        let path = manifest_dir().join(rel);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let offenders: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("debug-assertions"))
+            .collect();
+        assert!(offenders.is_empty(), "{}: {offenders:?}", path.display());
+    }
+}
+
 // --- node helper heap limit (po-av01j.118) ---
 
 /// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
