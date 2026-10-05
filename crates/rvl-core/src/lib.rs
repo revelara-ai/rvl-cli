@@ -413,6 +413,26 @@ pub struct Site {
 /// or middleware-chain registration inventoried by a typed retriever.
 pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
+/// The `site_kind` stamped on a misuse-shape packet: an error-handling or
+/// async shape that is wrong where it stands, with no call graph needed to
+/// see it (an overbroad catch, a discarded error value, a blocking call in an
+/// async function, an async call that is never awaited). Like an emission
+/// point it is an AGGREGATE: one packet per (enclosing function, class,
+/// identity), with the class and the count in `const_args`. Retrieval only:
+/// a `MisuseSpec` says which control a shape violates and which identities
+/// are legitimate.
+pub const SITE_KIND_MISUSE: &str = "misuse_shape";
+
+/// The `const_args` entry name carrying a misuse shape's class
+/// (`overbroad_catch` | `discarded_error` | `sync_over_async` |
+/// `blocking_in_async` | `fire_and_forget` | `missing_await`), with
+/// `how: "aggregate"`.
+pub const CONST_ARG_MISUSE_CLASS: &str = "misuse_class";
+
+/// The `const_args` entry name carrying how many times the shape occurs in
+/// the enclosing function, with `how: "aggregate"`.
+pub const CONST_ARG_MISUSE_COUNT: &str = "misuse_count";
+
 impl Site {
     pub fn id(&self) -> String {
         format!("{}:{}", self.file_path, self.line_number)
@@ -424,6 +444,29 @@ impl Site {
     /// A G4 emission-point aggregate (log/trace/error-capture inventory).
     pub fn is_emission_point(&self) -> bool {
         self.site_kind == SITE_KIND_EMISSION
+    }
+    /// A misuse-shape aggregate (error handling or async misuse), judged by
+    /// the misuse lane.
+    pub fn is_misuse_shape(&self) -> bool {
+        self.site_kind == SITE_KIND_MISUSE
+    }
+    /// The misuse shape's class, read from the [`CONST_ARG_MISUSE_CLASS`]
+    /// entry. `None` on every other kind and on a malformed packet, where the
+    /// caller abstains.
+    pub fn misuse_class(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_MISUSE_CLASS)
+            .map(|a| a.value.as_str())
+    }
+    /// How many occurrences the aggregate stands for. An absent or malformed
+    /// count reads as 1: the packet itself is one occurrence.
+    pub fn misuse_count(&self) -> u32 {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_MISUSE_COUNT)
+            .and_then(|a| a.value.parse().ok())
+            .unwrap_or(1)
     }
     /// The emission aggregate's category (`log` | `trace` | `error_capture`),
     /// read from the [`CONST_ARG_EMISSION_CATEGORY`] const-args entry. `None`
@@ -1440,6 +1483,33 @@ mod tests {
             "",
             "a classic G1 site defaults to an empty site_kind"
         );
+    }
+
+    #[test]
+    fn misuse_accessors_read_the_class_and_count() {
+        let arg = |name: &str, value: &str| ConstArg {
+            name: name.into(),
+            value: value.into(),
+            how: "aggregate".into(),
+            ..Default::default()
+        };
+        let s = Site {
+            client_type: "os.Remove".into(),
+            site_kind: SITE_KIND_MISUSE.into(),
+            const_args: vec![
+                arg(CONST_ARG_MISUSE_CLASS, "discarded_error"),
+                arg(CONST_ARG_MISUSE_COUNT, "3"),
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_misuse_shape() && !s.is_call_site() && !s.is_emission_point());
+        assert_eq!(s.misuse_class(), Some("discarded_error"));
+        assert_eq!(s.misuse_count(), 3);
+
+        let g1 = Site::default();
+        assert!(!g1.is_misuse_shape());
+        assert_eq!(g1.misuse_class(), None);
+        assert_eq!(g1.misuse_count(), 1);
     }
 
     #[test]

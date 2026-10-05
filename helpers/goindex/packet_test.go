@@ -136,8 +136,8 @@ func TestBackgroundJobRegistrationsAreEmittedWithSiteKind(t *testing.T) {
 	for _, s := range sites {
 		if s.SiteKind == "background_job" {
 			byMethod[s.Method] = append(byMethod[s.Method], s)
-		} else if s.SiteKind != "" && s.SiteKind != siteKindServerEntry && s.SiteKind != "emission_point" && s.SiteKind != siteKindUnsized {
-			// The fixture also exercises the G2/G4 and unsized-construction lanes; only unknown kinds fail.
+		} else if s.SiteKind != "" && s.SiteKind != siteKindServerEntry && s.SiteKind != "emission_point" && s.SiteKind != siteKindMisuse && s.SiteKind != siteKindUnsized {
+			// The fixture also exercises the G2/G4, misuse and unsized-construction lanes; only unknown kinds fail.
 			t.Fatalf("unexpected site_kind %q on %s:%d", s.SiteKind, s.File, s.Line)
 		}
 	}

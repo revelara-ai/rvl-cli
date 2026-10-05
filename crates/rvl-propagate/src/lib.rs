@@ -713,6 +713,19 @@ fn judge(
             ),
         };
     }
+    // And for a misuse-shape aggregate: the misuse lane judges it. Its
+    // question is the shape of error handling or of an await, never a
+    // deadline, even where its identity is a callee a G1 spec is keyed to.
+    if site.is_misuse_shape() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "{} site: not a client-call surface, API specs do not apply",
+                site.site_kind
+            ),
+        };
+    }
     // Same for G4 emission points (po-av01j.5): an API spec judges CALLS. An
     // emission-point aggregate is routed to the emission lane by the scan
     // pipeline; if one reaches here anyway (eval harness, a stream fed
@@ -1225,6 +1238,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1266,6 +1280,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1310,6 +1325,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1514,6 +1530,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -1539,6 +1556,23 @@ mod tests {
             "the reason must name the kind that was routed away: {}",
             f.reason
         );
+    }
+
+    #[test]
+    fn misuse_shape_sites_are_never_judged_by_g1_specs() {
+        // A blocking_in_async packet is keyed to the callee (`requests.get`),
+        // which a G1 API spec can name too. It asks about the async function
+        // around the call, not about a deadline, and must not become an
+        // unbounded call.
+        let mut s = site();
+        s.site_kind = rvl_core::SITE_KIND_MISUSE.into();
+        let f = propagate(
+            &s,
+            &cache(vec![Mechanism::Context], vec![]),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::NotApplicable, "{}", f.reason);
     }
 
     #[test]
@@ -1667,6 +1701,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1898,6 +1933,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         }));
         let f = propagate(&s, &cache, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
@@ -2276,6 +2312,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -2777,6 +2814,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         });
         let client = HashMap::from([(
             Family::Database,
@@ -3088,6 +3126,7 @@ mod tests {
                 rationale: "local tooling fails open".into(),
             }],
             decorators: vec![],
+            misuse_shapes: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
@@ -3156,6 +3195,7 @@ mod tests {
             emissions: vec![],
             construction_bounds: vec![],
             decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 

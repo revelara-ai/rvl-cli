@@ -29,6 +29,7 @@ rvl-propagate = { path = "../rvl-propagate" }
 rvl-triage = { path = "../rvl-triage" }
 rvl-index = { path = "../rvl-index" }
 flate2 = { workspace = true }
+rvl-misuse = { path = "../rvl-misuse" }
 rvl-structure = { path = "../rvl-structure" }
 rvl-bounds = { path = "../rvl-bounds" }
 rvl-emission = { path = "../rvl-emission" }

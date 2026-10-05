@@ -617,8 +617,13 @@ def _emission_identity(ctype):
     return None, None
 
 
-def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
+def collect_emissions(tree, source, idx, enclosing, file_path, snapshot,
+                      swallowed=None):
     """Return the file's emission-point aggregate records.
+
+    `swallowed`, when given, is a set this fills with the id() of every
+    handler counted as a swallow, so the misuse inventory can leave those
+    handlers to this lane.
 
     Also inventories the SWALLOW fact RC-027's capture-vs-swallow question
     needs: an except handler that neither emits anything recognized nor
@@ -669,6 +674,8 @@ def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
     for i, h in enumerate(handler_nodes):
         if handler_emits[i] or reraises[i]:
             continue
+        if swallowed is not None:
+            swallowed.add(id(h))
         symbol, _fn = enclosing.get(id(h), ("", None))
         key = (symbol, "except_handler", "error_capture")
         agg = aggs.get(key)
@@ -710,6 +717,252 @@ def collect_emissions(tree, source, idx, enclosing, file_path, snapshot):
             "macro_expansion": False,
             "provenance": {
                 "client_type_resolved": framework != "except_handler",
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+            },
+            "lang": "python",
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Misuse-shape inventory: error-handling and async shapes that are wrong where
+# they stand.
+#
+# They ride the SAME stream, stamped site_kind: "misuse_shape", as AGGREGATES
+# like the emission points: one packet per (enclosing function, class,
+# identity), with the class and the count in const_args. Five classes:
+#
+#   overbroad_catch    `except Exception`, `except BaseException`, bare
+#                      `except:`. Identity: the caught type, or "bare".
+#   blocking_in_async  a call to a blocking function, lexically inside an
+#                      `async def`. Identity: the dotted callee.
+#   sync_over_async    a synchronous wait on async work inside an `async def`.
+#   fire_and_forget    `asyncio.create_task(...)` as a statement: nothing
+#                      holds the task.
+#   missing_await      a coroutine function of this module called as a
+#                      statement, or assigned to a name nothing reads.
+#
+# The retrieval/judgment split holds. Which control a shape violates, and
+# which identities are legitimate, is a misuse spec downstream.
+#
+# Three shapes are kept back here, because each is a different FACT and not a
+# legitimate case of the same one:
+#
+#   - A handler that re-raises. It propagates the error, like the swallow
+#     rule in collect_emissions says.
+#   - A handler collect_emissions counts as a swallow. That is the emission
+#     lane's finding already, and one handler is reported once.
+#   - A call inside a lambda or a nested sync def. It runs where that callable
+#     is called (run_in_executor, to_thread), not on the event loop.
+#
+# Detection is IMPORT-RESOLVED for the tables and STRUCTURAL for coroutines:
+# a callee is a coroutine only when this module defines it with `async def`,
+# at module level or on the enclosing class, under a name nothing else in the
+# module or the function binds. There are no types here, so a coroutine
+# imported from another module, or a method on another object, is not seen.
+# ---------------------------------------------------------------------------
+
+SITE_KIND_MISUSE = "misuse_shape"
+
+# Blocking functions worth surfacing inside an `async def`. Like
+# STRONG_IO_METHODS this selects WHICH calls to surface, never what they mean.
+# Module-level functions only: a method on a client object needs the
+# receiver's type, and the G1 site for that call already carries it.
+_BLOCKING_CALLS = frozenset({
+    "time.sleep",
+    "requests.get", "requests.post", "requests.put", "requests.patch",
+    "requests.delete", "requests.head", "requests.options", "requests.request",
+    "httpx.get", "httpx.post", "httpx.put", "httpx.patch", "httpx.delete",
+    "httpx.head", "httpx.options", "httpx.request",
+    "urllib.request.urlopen",
+    "subprocess.run", "subprocess.call", "subprocess.check_call",
+    "subprocess.check_output",
+    "os.system",
+    "socket.create_connection", "socket.getaddrinfo", "socket.gethostbyname",
+})
+
+# Synchronous waits on async work, by dotted callee.
+_SYNC_WAIT_CALLS = frozenset({"asyncio.run"})
+
+# Calls that start a task. As a statement, the task has no owner.
+_TASK_STARTERS = frozenset({"asyncio.create_task", "asyncio.ensure_future"})
+
+_ROOT_EXCEPTIONS = ("BaseException", "Exception")
+
+
+def _overbroad_type(handler):
+    """The root exception type a handler catches, "bare" for `except:`, or
+    None for a handler that names only narrower types."""
+    t = handler.type
+    if t is None:
+        return "bare"
+    names = [e.id for e in (t.elts if isinstance(t, ast.Tuple) else [t])
+             if isinstance(e, ast.Name)]
+    for root in _ROOT_EXCEPTIONS:
+        if root in names:
+            return root
+    return None
+
+
+def _coroutine_names(body):
+    """Names a block binds with `async def` and with nothing else."""
+    is_async, other = set(), set()
+    for stmt in body:
+        if isinstance(stmt, ast.AsyncFunctionDef):
+            is_async.add(stmt.name)
+        elif isinstance(stmt, (ast.FunctionDef, ast.ClassDef)):
+            other.add(stmt.name)
+        else:
+            for n in ast.walk(stmt):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    other.add(n.id)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef)):
+                    # A def under `if` or `try`: which one binds is not known.
+                    other.add(n.name)
+                elif isinstance(n, ast.alias):
+                    other.add((n.asname or n.name).split(".")[0])
+    return is_async - other
+
+
+def collect_misuse(tree, source, idx, enclosing, file_path, snapshot,
+                   swallowed):
+    """Return the file's misuse-shape aggregate records. `swallowed` is the
+    set of handler ids collect_emissions counted as swallows."""
+    module_coros = _coroutine_names(tree.body)
+    aggs = {}  # (symbol, class, identity) -> agg dict
+    bound_cache, loads_cache = {}, {}
+
+    def note(node, cls, identity, method, resolved=True):
+        symbol = enclosing.get(id(node), ("", None))[0]
+        key = (symbol, cls, identity)
+        agg = aggs.get(key)
+        if agg is None:
+            aggs[key] = agg = {
+                "line": node.lineno,
+                "method": method,
+                "snippet": "" if cls == "overbroad_catch" else _segment(source, node),
+                "resolved": resolved,
+                "count": 0,
+            }
+        agg["count"] += 1
+
+    def bound_in(fn):
+        """Names a function binds itself: parameters and assignments."""
+        if id(fn) not in bound_cache:
+            names = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+            names.update(n.id for n in ast.walk(fn)
+                         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+            bound_cache[id(fn)] = names
+        return bound_cache[id(fn)]
+
+    def loads_in(fn):
+        if id(fn) not in loads_cache:
+            loads_cache[id(fn)] = {
+                n.id for n in ast.walk(fn)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        return loads_cache[id(fn)]
+
+    def coroutine_callee(call, class_coros):
+        """The name of the coroutine function a call invokes, or None."""
+        func = call.func
+        fn = enclosing.get(id(call), ("", None))[1]
+        if isinstance(func, ast.Name) and func.id in module_coros:
+            if fn is None or func.id not in bound_in(fn):
+                return func.id
+        if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                and func.value.id == "self" and func.attr in class_coros):
+            return func.attr
+        return None
+
+    def handle(node, class_coros, in_async):
+        if isinstance(node, ast.ExceptHandler):
+            caught = _overbroad_type(node)
+            reraises = any(isinstance(n, ast.Raise) for n in ast.walk(node))
+            if caught and not reraises and id(node) not in swallowed:
+                note(node, "overbroad_catch", caught, "except")
+        elif isinstance(node, ast.Call) and in_async:
+            func = node.func
+            dotted = idx.resolve_ctor(func)
+            if dotted in _BLOCKING_CALLS:
+                note(node, "blocking_in_async", dotted, dotted.rsplit(".", 1)[-1])
+            elif dotted in _SYNC_WAIT_CALLS:
+                note(node, "sync_over_async", dotted, dotted.rsplit(".", 1)[-1])
+            elif isinstance(func, ast.Attribute):
+                if func.attr == "run_until_complete":
+                    # Named for what it is: the receiver has no type here.
+                    note(node, "sync_over_async",
+                         "asyncio.loop.run_until_complete", func.attr,
+                         resolved=False)
+                elif (func.attr == "result" and isinstance(func.value, ast.Call)
+                        and idx.resolve_ctor(func.value.func)
+                        == "asyncio.run_coroutine_threadsafe"):
+                    note(node, "sync_over_async",
+                         "asyncio.run_coroutine_threadsafe.result", func.attr)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            dotted = idx.resolve_ctor(node.value.func)
+            if dotted in _TASK_STARTERS:
+                note(node, "fire_and_forget", dotted, dotted.rsplit(".", 1)[-1])
+            else:
+                name = coroutine_callee(node.value, class_coros)
+                if name:
+                    note(node, "missing_await", "coroutine", name)
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)):
+            # Inside a function only: a module-level name can be read from
+            # another module.
+            fn = enclosing.get(id(node), ("", None))[1]
+            name = coroutine_callee(node.value, class_coros)
+            if name and fn is not None and node.targets[0].id not in loads_in(fn):
+                note(node, "missing_await", "coroutine", name)
+
+    def visit(node, class_coros, in_async):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, _coroutine_names(child.body), False)
+            elif isinstance(child, ast.AsyncFunctionDef):
+                visit(child, class_coros, True)
+            elif isinstance(child, (ast.FunctionDef, ast.Lambda)):
+                visit(child, class_coros, False)
+            else:
+                handle(child, class_coros, in_async)
+                visit(child, class_coros, in_async)
+
+    visit(tree, frozenset(), False)
+
+    records = []
+    for (symbol, cls, identity), agg in sorted(
+            aggs.items(), key=lambda kv: (kv[1]["line"], kv[0])):
+        records.append({
+            "packet_schema": PACKET_SCHEMA,
+            "site_key": "",  # stamped in emit(), like every packet
+            "site_kind": SITE_KIND_MISUSE,
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": agg["line"],
+            "symbol": symbol,
+            "func": agg["method"],
+            "receiver": "",
+            "client_type": identity,
+            "snippet": agg["snippet"],
+            # Volume control: no function body on aggregates.
+            "enclosing_function_body": "",
+            "callers": [],
+            "callees": [],
+            "client_construction": [],
+            "const_args": [
+                {"index": 0, "name": "misuse_class",
+                 "value": cls, "how": "aggregate"},
+                {"index": 0, "name": "misuse_count",
+                 "value": str(agg["count"]), "how": "aggregate"},
+            ],
+            "macro_expansion": False,
+            "provenance": {
+                "client_type_resolved": agg["resolved"],
                 "callers_total": 0,
                 "callers_included": 0,
                 "callees_total": 0,
@@ -1569,7 +1822,12 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
                 graph.wants(record, fn)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
     # G4 emission inventory rides the same stream (po-av01j.5).
-    out.extend(collect_emissions(tree, source, idx, enclosing, file_path, snapshot))
+    swallowed = set()
+    out.extend(collect_emissions(tree, source, idx, enclosing, file_path,
+                                 snapshot, swallowed))
+    # Misuse-shape inventory: overbroad catches and async misuse.
+    out.extend(collect_misuse(tree, source, idx, enclosing, file_path,
+                              snapshot, swallowed))
     # Unsized-construction inventory: queues, pools and caches.
     out.extend(collect_unsized(tree, source, idx, enclosing, file_path, snapshot))
     return out
