@@ -1445,6 +1445,91 @@ fn language_is_incidental(root: &Path, lang: Lang) -> bool {
     true
 }
 
+/// The language a file is EVIDENCE for: a source file its helper reads, a
+/// C/C++ header, or a project file (the markers `detect_languages` knows).
+fn lang_evidenced_by(path: &Path) -> Option<Lang> {
+    if let Some(lang) = lang_of_path(path) {
+        return Some(lang);
+    }
+    if is_c_header(path) {
+        return Some(Lang::CCpp);
+    }
+    match path.file_name().and_then(|n| n.to_str())? {
+        "go.mod" => Some(Lang::Go),
+        "pyproject.toml" => Some(Lang::Python),
+        "Cargo.toml" => Some(Lang::Rust),
+        "tsconfig.json" | "package.json" => Some(Lang::TypeScript),
+        "pom.xml" | "build.gradle" | "build.gradle.kts" => Some(Lang::Java),
+        "compile_commands.json" => Some(Lang::CCpp),
+        name if name.ends_with(".csproj") || name.ends_with(".sln") => Some(Lang::CSharp),
+        _ => None,
+    }
+}
+
+/// The detected languages that are present ONLY as test material, each with
+/// the number of files seen, so the scan can skip them and say so
+/// (po-av01j.123).
+///
+/// A language is REALLY present when one file that is evidence for it, a
+/// source file or a project file, sits outside test-support paths
+/// (`rvl_core::scope_of`: tests, testdata, fixtures, examples, docs). One file
+/// is enough, and there is no file-count threshold: a count only moves the
+/// cliff. A manifest inside a fixture directory is part of the fixture.
+///
+/// Stricter than [`language_is_incidental`], which also calls dev-only code
+/// (`scripts/`, `cmd/`) incidental. That check decides whether a MISSING
+/// helper may fail the scan. This one decides whether to read the language at
+/// all, so code a developer runs keeps the language present.
+///
+/// Returns nothing when NO detected language is really present: the test
+/// material is then the whole repo, and to skip it would scan nothing.
+fn test_material_only_languages(root: &Path, langs: &[Lang]) -> Vec<(Lang, usize)> {
+    // Per detected language: (really present, files seen in test material).
+    let mut seen: Vec<(bool, usize)> = vec![(false, 0); langs.len()];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if seen.iter().all(|(present, _)| *present) {
+            return Vec::new();
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Some(i) = lang_evidenced_by(&path).and_then(|l| langs.iter().position(|x| *x == l))
+            else {
+                continue;
+            };
+            if rvl_core::scope_of(&repo_relative(root, &path)) == rvl_core::ScopeClass::TestSupport
+            {
+                seen[i].1 += 1;
+            } else {
+                seen[i].0 = true;
+            }
+        }
+    }
+    if !seen.iter().any(|(present, _)| *present) {
+        return Vec::new();
+    }
+    langs
+        .iter()
+        .zip(seen)
+        .filter(|(_, (present, files))| !present && *files > 0)
+        .map(|(l, (_, files))| (*l, files))
+        .collect()
+}
+
 /// Classify a resolved helper path into how it must be invoked. Go, Rust, and
 /// C/C++ helpers are always executables (rustindex and cindex are bins of the
 /// rvl package, built next to rvl); a Python helper is a `python3` script when
@@ -2818,7 +2903,20 @@ fn resolve_packet_stream(
             retrieval: cfg.retrieval,
         });
     }
-    let langs = detect_languages(path);
+    let mut langs = detect_languages(path);
+    // A LANGUAGE FOUND ONLY IN TEST MATERIAL IS NOT READ (po-av01j.123). One
+    // fixture under testdata/ used to spawn a whole retriever, or a lookup
+    // for a helper nobody installed, and print a degradation line on every
+    // scan. Such a language is taken out here, before any helper resolves,
+    // and named in the roll-call as skipped: a language silently not scanned
+    // is the failure po-av01j.102 exists to prevent. `--include-tests` asks
+    // for test material, so it turns the skip off.
+    let skipped = if include_tests {
+        Vec::new()
+    } else {
+        test_material_only_languages(path, &langs)
+    };
+    langs.retain(|l| !skipped.iter().any(|(s, _)| s == l));
     // NO DETECTED LANGUAGE IS NOT AN ERROR (po-av01j.148). A repository of pure
     // infrastructure -- terraform, workflows, manifests and nothing else -- has
     // no source for any retriever to read, so NO helper is needed and there is
@@ -2998,6 +3096,13 @@ fn resolve_packet_stream(
                 degraded.push(LangDegradation { lang, kind, reason })
             }
         }
+    }
+    for (lang, files) in skipped {
+        status.push(render::LangStatus {
+            lang: lang.to_string(),
+            state: render::LangState::Skipped,
+            detail: format!("{files} file{}", if files == 1 { "" } else { "s" }),
+        });
     }
     for (name, count) in detect_unsupported(path) {
         status.push(render::LangStatus {
@@ -7719,6 +7824,160 @@ mod tests {
     // RVL_HELPER_DIR, and a second mutex over the same process-wide state
     // is not a lock at all (see `embedded_helpers::env_lock`).
     use crate::embedded_helpers::env_lock;
+
+    // --- A language present only as test material (po-av01j.123) ---
+
+    /// A Go repo that carries one Rust fixture and one C# fixture, the shape
+    /// that made every scan spawn rustindex and look for csindex.
+    fn polyglot_with_fixtures() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(root.join("main.go"), "package main\n").unwrap();
+        for (dir, file) in [("rust-pro", "rust_pro.rs"), ("csharp-pro", "csharp_pro.cs")] {
+            let d = root.join("scripts/skilleval/testdata/matrix").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), "// fixture\n").unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn a_language_found_only_in_test_material_is_skipped_and_counted() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        let langs = detect_languages(root);
+        assert_eq!(langs, vec![Lang::Go, Lang::Rust, Lang::CSharp]);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::Rust, 1), (Lang::CSharp, 1)],
+            "the fixtures are detected, and named with their file count"
+        );
+    }
+
+    #[test]
+    fn one_source_file_outside_test_paths_makes_a_language_present() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        // scripts/ is dev-only, not test material: real code someone runs.
+        std::fs::write(root.join("scripts/gen.rs"), "fn main() {}\n").unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::CSharp, 1)]
+        );
+    }
+
+    #[test]
+    fn a_project_file_makes_a_language_present_unless_it_is_a_fixture_too() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        // A manifest that ships with the fixture is part of the fixture.
+        std::fs::write(
+            root.join("scripts/skilleval/testdata/matrix/rust-pro/Cargo.toml"),
+            "[package]\n",
+        )
+        .unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::Rust, 2), (Lang::CSharp, 1)]
+        );
+        // A crate whose only sources are its tests is still a real crate.
+        std::fs::create_dir_all(root.join("tools/bench/tests")).unwrap();
+        std::fs::write(root.join("tools/bench/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("tools/bench/tests/it.rs"), "\n").unwrap();
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::CSharp, 1)]
+        );
+    }
+
+    #[test]
+    fn a_repo_that_is_only_test_material_skips_nothing() {
+        // The risk in the other direction: with no language really present,
+        // the test material IS the repo, and skipping it would scan nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("testdata")).unwrap();
+        std::fs::write(root.join("testdata/a.go"), "package a\n").unwrap();
+        std::fs::write(root.join("testdata/b.cs"), "class B {}\n").unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(langs, vec![Lang::Go, Lang::CSharp]);
+        assert!(test_material_only_languages(root, &langs).is_empty());
+    }
+
+    /// An executable that records that it ran and prints one honest
+    /// repo-scoped record, so the lane reads as scanned with zero sites.
+    #[cfg(unix)]
+    fn recording_helper(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let ran = dir.join(format!("{name}.ran"));
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho '{}'\n",
+                ran.display(),
+                r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[]}"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, ran)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_does_not_spawn_the_helper_of_a_test_material_only_language() {
+        let _guard = env_lock();
+        let tmp = polyglot_with_fixtures();
+        let helpers = tempfile::tempdir().unwrap();
+        let (go, go_ran) = recording_helper(helpers.path(), "goindex");
+        let (rs, rs_ran) = recording_helper(helpers.path(), "rustindex");
+        let (cs, cs_ran) = recording_helper(helpers.path(), "csindex");
+        std::env::set_var("RVL_GOINDEX", &go);
+        std::env::set_var("RVL_RUSTINDEX", &rs);
+        std::env::set_var("RVL_CSINDEX", &cs);
+        let default = resolve_packet_stream(None, tmp.path(), false, false);
+        let default_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
+        let with_tests = resolve_packet_stream(None, tmp.path(), false, true);
+        let with_tests_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
+        for v in ["RVL_GOINDEX", "RVL_RUSTINDEX", "RVL_CSINDEX"] {
+            std::env::remove_var(v);
+        }
+
+        let stream = default.expect("the scan completes");
+        assert_eq!(
+            default_ran,
+            (true, false, false),
+            "only the language that is really present runs its helper"
+        );
+        // NOT SILENT. The skipped languages are in the roll-call, by name and
+        // with a count, and they are not degradations: nothing went wrong.
+        let skipped: Vec<(&str, &str)> = stream
+            .status
+            .iter()
+            .filter(|s| s.state == render::LangState::Skipped)
+            .map(|s| (s.lang.as_str(), s.detail.as_str()))
+            .collect();
+        assert_eq!(skipped, vec![("Rust", "1 file"), ("C#", "1 file")]);
+        assert!(stream.degraded.is_empty(), "{:?}", stream.degraded);
+        assert!(stream.total_failure.is_none());
+        assert_eq!(
+            stream.retrievers.len(),
+            1,
+            "no retriever was resolved for a skipped lane"
+        );
+
+        // --include-tests asks for test material, so the skip is off.
+        let stream = with_tests.expect("the scan completes");
+        assert_eq!(with_tests_ran, (true, true, true));
+        assert!(stream
+            .status
+            .iter()
+            .all(|s| s.state != render::LangState::Skipped));
+    }
 
     // --- Changed-only scoping (po-av01j.127) ---
 

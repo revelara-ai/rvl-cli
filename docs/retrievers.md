@@ -254,7 +254,12 @@ production call. A repo whose only `new Pool({ connectionTimeoutMillis })`
 lives under `tests/` used to have its production `pool.query` calls
 credited as bounded; it now abstains on them, which is the honest answer.
 
-`rvl scan --include-tests` lifts the skip for the Python and TypeScript
+A retriever is not started at all for a language that is found only in
+test material while another language is really present; the roll-call
+names it as `skipped`. See [scanning.md](scanning.md) for the rule.
+
+`rvl scan --include-tests` turns that language skip off and lifts the
+file skip for the Python and TypeScript
 lanes on a full scan (`goindex` is unchanged). It is refused together with
 `--incremental`: the packet index is built with the skip in place, so a warm
 scan could only honor the flag for the files it re-parsed and would report

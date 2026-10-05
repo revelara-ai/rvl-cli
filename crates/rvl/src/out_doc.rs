@@ -232,6 +232,7 @@ fn lang_state_str(s: render::LangState) -> String {
         render::LangState::Failed => "failed",
         render::LangState::Unsupported => "unsupported",
         render::LangState::NotInstalled => "not_installed",
+        render::LangState::Skipped => "skipped",
     }
     .to_string()
 }

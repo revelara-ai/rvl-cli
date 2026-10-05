@@ -120,9 +120,11 @@ The orchestrator uses it to:
   so a consumer can report which lanes ran, failed, or read nothing without
   parsing stdout:
   - `lang_status[]`: one row per detected language. `state` is `scanned` |
-    `partial` | `abstained` | `failed` | `unsupported` | `not_installed`;
-    `detail` carries the site count on a scanned lane or the reason
-    otherwise. `partial` means the helper ran but some units parsed only
+    `partial` | `abstained` | `failed` | `unsupported` | `not_installed` |
+    `skipped`; `detail` carries the site count on a scanned lane or the
+    reason otherwise. `skipped` means the language was found only in test
+    material and no retriever ran for it; `detail` is the file count
+    (`1 file`), and the row has no `degraded[]` entry because nothing failed. `partial` means the helper ran but some units parsed only
     partly (for C/C++, usually a header that is not installed), so the site
     count is a floor: `detail` reads `<n> sites, INCOMPLETE: <why>`.
   - `by_language[]`: `resolved`, `total` and `no_spec` split by the language
