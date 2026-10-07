@@ -233,8 +233,11 @@ tests.
 `testdata/fixture_misuse/` holds one function per rule of the misuse-shape
 inventory (`site_kind: "misuse_shape"`): overbroad catches, blocking calls and
 synchronous waits inside `async def`, tasks that nothing holds, and coroutines
-that are never awaited, each beside the shapes that must not be emitted. See
-"Misuse shapes" in `docs/retrievers.md`.
+that are never awaited, each beside the shapes that must not be emitted. Its
+`shapes.py` does the same for the local shapes: the delay of a retry, a query
+on a relation of a loop variable, SQL text built in a query call, `print`
+output, and a latency metric that is not a histogram. See "Misuse shapes" in
+`docs/retrievers.md`.
 `testdata/fixture_tests/` holds one file per test-path convention beside
 three production files, for the tests that pin what is skipped, what is
 counted and named, and what `--include-tests` restores.

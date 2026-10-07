@@ -1,5 +1,5 @@
 {
-  "_comment": "SEED misuse-shape corpus: test-grade, hand-authored, sufficient for the per-language e2e tests of the misuse lane (overbroad catch, discarded error, blocking and synchronous waits in async functions, fire-and-forget tasks, missing await). NO control is arbitrated for these classes yet. RC-029 and RC-019 are stand-ins for these tests only; the production corpus assigns the control.",
+  "_comment": "SEED misuse-shape corpus: test-grade, hand-authored, sufficient for the per-language e2e tests of the misuse lane (overbroad catch, discarded error, blocking and synchronous waits in async functions, fire-and-forget tasks, missing await) and of its local shapes (retry delay, loop-variable query, SQL text built in a call, print-style output, latency metric that is not a histogram). RC-022 (retry), RC-073 (loop-variable query, arbitrated in po-av01j.105) and RC-026 (latency) are the controls the catalog has for those classes. NO control is arbitrated for the other classes yet. RC-029 and RC-019 are stand-ins for these tests only; the production corpus assigns the control.",
   "apis": [],
   "configs": [],
   "misuse_shapes": [
@@ -16,6 +16,16 @@
     {"class": "fire_and_forget", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
      "rationale": "a task with no owner can be collected before it completes, and its exception is lost"},
     {"class": "missing_await", "type": "*", "control": "RC-029", "role": "violates", "severity": "medium", "confidence": 0.9,
-     "rationale": "a coroutine that is never awaited does not run"}
+     "rationale": "a coroutine that is never awaited does not run"},
+    {"class": "retry_shape", "type": "*", "control": "RC-022", "role": "violates", "confidence": 0.9,
+     "rationale": "retries with a constant delay, with no random term or with no limit arrive together and keep a failed dependency down"},
+    {"class": "loop_variable_query", "type": "*", "control": "RC-073", "role": "violates", "confidence": 0.9,
+     "rationale": "a query on a relation of the loop variable runs one time for each row"},
+    {"class": "sql_concat_in_call", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
+     "rationale": "SQL text built from a value lets the value change the statement"},
+    {"class": "print_logging", "type": "*", "control": "RC-029", "role": "violates", "confidence": 0.9,
+     "rationale": "a printed line has no level and no fields, and the log pipeline cannot filter it"},
+    {"class": "latency_scalar_metric", "type": "*", "control": "RC-026", "role": "violates", "confidence": 0.9,
+     "rationale": "a mean hides the slow requests; a percentile needs a histogram"}
   ]
 }

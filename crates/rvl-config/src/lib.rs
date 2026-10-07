@@ -138,10 +138,47 @@ impl ConfigPacket {
     }
 }
 
+/// The `unit` of a [`ConfigPredicate`] that holds for every unit in its file
+/// (the events that trigger a workflow are true of each of its jobs).
+pub const FILE_SCOPE: &str = "";
+
+/// A fact a conditional spec's guard is judged against
+/// ([`rvl_spec::ConfigExpect::When`]): what a unit IS, as opposed to a setting
+/// it carries.
+///
+/// Deliberately NOT a [`ConfigPacket`]. A packet is a setting some spec may
+/// judge, and one without a spec joins the unjudged-keys queue as work for the
+/// spec factory. "This workflow runs on push" is not a setting to judge, so
+/// emitting it as a packet would queue a spec nobody should write and inflate
+/// the lane's totals with rows that can never resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPredicate {
+    /// Repo-relative file the fact was read from.
+    pub file_path: String,
+    /// The unit it describes, in the packet `unit` vocabulary, or
+    /// [`FILE_SCOPE`].
+    pub unit: String,
+    /// The predicate identity within the format, e.g. "workflow.triggers".
+    /// Matches [`rvl_spec::ConfigGuard::key`].
+    pub key: String,
+    /// The set of values that hold. A boolean fact is `["true"]` or
+    /// `["false"]`.
+    pub values: Vec<String>,
+}
+
+impl ConfigPredicate {
+    /// Whether this fact describes the unit `p` belongs to.
+    pub fn applies_to(&self, p: &ConfigPacket) -> bool {
+        self.file_path == p.file_path && (self.unit == FILE_SCOPE || self.unit == p.unit)
+    }
+}
+
 /// What one retriever produced from one file.
 #[derive(Debug, Default)]
 pub struct Retrieved {
     pub packets: Vec<ConfigPacket>,
+    /// Guard facts for conditional specs; see [`ConfigPredicate`].
+    pub predicates: Vec<ConfigPredicate>,
     /// Documents that matched this format's path shape but could not be
     /// parsed or recognized. A retriever bug or a malformed file degrades
     /// coverage, never aborts a scan (same contract as `parse_stream`).
@@ -190,6 +227,7 @@ pub trait ConfigRetriever {
         for (rel, contents) in files {
             let got = self.retrieve_with_root(root, rel, contents, snapshot_id);
             out.packets.extend(got.packets);
+            out.predicates.extend(got.predicates);
             out.unparseable += got.unparseable;
             out.sightings.extend(got.sightings);
         }
@@ -301,6 +339,8 @@ const SKIP_DIRS: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct LaneRetrieval {
     pub packets: Vec<ConfigPacket>,
+    /// Guard facts for conditional specs; see [`ConfigPredicate`].
+    pub predicates: Vec<ConfigPredicate>,
     /// Files a retriever claimed but could not parse (coverage, not failure).
     pub unparseable_files: usize,
     /// Identity-only sightings of unsupported config formats, sorted by
@@ -488,6 +528,7 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         got: Retrieved,
     ) {
         out.packets.extend(got.packets);
+        out.predicates.extend(got.predicates);
         out.unparseable_files += got.unparseable;
         for s in got.sightings {
             // Emitted by a retriever, so the format is handled by construction.

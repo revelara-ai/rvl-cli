@@ -324,8 +324,9 @@ that partial answer as the repository's.
 
 ## Misuse shapes
 
-Some shapes of error handling and of async code are wrong where they stand.
-One function is enough to see them, and no call graph is necessary. A
+Some shapes of code are wrong where they stand: shapes of error handling, of
+async code, of a retry, of a query call, of output, and of a metric. One
+function is enough to see them, and no call graph is necessary. A
 retriever reports them as packets with `site_kind: "misuse_shape"`. The packet
 is not a call site. It is not counted in COVERAGE, and it is not a row in
 `--out`.
@@ -350,6 +351,38 @@ first occurrence.
 | `sync_over_async` | An async function waits synchronously for async work. | The call that waits: `asyncio.run`. |
 | `fire_and_forget` | A task is started as a statement. Nothing holds the task. | The call that starts it: `asyncio.create_task`. |
 | `missing_await` | A coroutine function is called as a statement, or its result is assigned to a name that nothing reads. | `coroutine`. |
+| `retry_shape` | A wait on the failure path of an attempt loop, or the configuration of a retry library. | The shape: `constant_delay`, `no_jitter`, or `unbounded_attempts`. |
+| `loop_variable_query` | A query method is called on a relation of a loop variable (`for c in customers: c.orders.all()`). | The method: `all`, `filter`, `first`. |
+| `sql_concat_in_call` | A query call has SQL text that is built in the argument: a concatenation, a format call, or an f-string. | The query method: `database/sql.DB.Query`, `execute`. |
+| `print_logging` | Output goes through a print function to a standard stream. | The callee: `fmt.Println`, `fmt.Fprintf(os.Stderr)`, `print`. |
+| `latency_scalar_metric` | A Prometheus gauge or counter is registered with a name that contains `latency`, `duration`, `response_time`, or `elapsed`. | The constructor: `prometheus_client.Gauge`. |
+
+Each of the last five classes has the name of the shape that the retriever
+reads. The name is not the name of a defect, because the retriever cannot see
+the defect:
+
+- `retry_shape` is read from the delay expression. The retriever does not
+  decide from the intent of a loop that it is a retry. An attempt loop is a
+  `for` or `while` loop with no collection (`for {}`, `for i := 0; i < n; i++`,
+  `while`, `for attempt in range(n)`). A loop over a collection gives each
+  item one attempt, and is not reported. The wait must be on the failure
+  path: in Go, below an `err != nil` test or after an `err == nil` test that
+  leaves the iteration; in Python, in an `except` handler or after a `try`
+  that leaves the loop. A sleep at another position is a poll interval.
+  `constant_delay` is a delay in which nothing changes between attempts.
+  `no_jitter` is a delay that changes and has no random term.
+  `unbounded_attempts` is a loop with no condition and no counter test that
+  leaves it. A delay that a function computes (`time.Sleep(backoff(n))`) has
+  no shape in the expression, and is not reported.
+- `loop_variable_query` is not the N+1 defect. It is the one form of an N+1
+  that one function shows. A query in a function that the loop calls is not
+  seen, and this lane does not report it with any name.
+- `sql_concat_in_call` is not SQL injection. It is the one form that one
+  expression shows. SQL text that one statement builds and another statement
+  runs is not seen: that needs data flow.
+- `print_logging` does not include the standard log package of a language
+  (`log.Printf`, `logging.info`). The emission lane counts those calls as log
+  emissions, and one line cannot be a log emission and a missing one.
 
 A swallowed error is not in this table. It is an emission-point fact
 (`except_handler`, `catch_clause`, `recover_block`), and the emission lane
@@ -379,8 +412,10 @@ prevent this. The volume is controlled in three other places:
 2. The finding gives the total count, so that the exposure tier of the report
    applies to it.
 3. A finding is always advisory. The default severity is `low` for
-   `overbroad_catch`, `discarded_error`, and `fire_and_forget`. It is `medium`
-   for `blocking_in_async`, `sync_over_async`, and `missing_await`. A spec can
+   `overbroad_catch`, `discarded_error`, `fire_and_forget`,
+   `loop_variable_query`, `print_logging`, and `latency_scalar_metric`. It is
+   `medium` for `blocking_in_async`, `sync_over_async`, `missing_await`,
+   `retry_shape`, and `sql_concat_in_call`. A spec can
    set `low` or `medium`. It cannot set `high`.
 
 The finding has the class `misuse.<class>` (`misuse.discarded_error`). A
@@ -388,8 +423,8 @@ waiver or `rvl suppress` uses that name.
 
 | Retriever | Emits |
 | --- | --- |
-| `goindex` | `discarded_error`. Go has no typed catch and no async functions, so it has no other class. |
-| `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`. |
+| `goindex` | `discarded_error`, `retry_shape`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. Go has no typed catch and no async functions, and a Go ORM does not load a relation through the receiver, so it has no other class. |
+| `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`, `retry_shape`, `loop_variable_query`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. |
 | The other retrievers | Nothing yet. |
 
 Limits:
@@ -406,6 +441,18 @@ Limits:
 - A call in a lambda or in a nested function that is not async is not
   reported as `blocking_in_async`. It runs where that function is called, for
   example in a worker thread.
+- For `retry_shape`, `goindex` reads loops only. It does not read the
+  configuration of a retry library. `pyindex` reads loops and `tenacity`
+  configurations. In Python, the failure path is an exception: a loop that
+  tests a result and sleeps is not reported.
+- For `sql_concat_in_call`, `goindex` knows the handle types of
+  `database/sql`, `sqlx`, and `pgx`. `pyindex` has no types, so it reports
+  the methods `execute`, `executemany`, and `executescript` on any receiver.
+- For `loop_variable_query`, `pyindex` has no types. The method name is the
+  only evidence that the call is a query. `count` and `get` are not in the
+  list, because `str.count` and `dict.get` are more frequent.
+- For `latency_scalar_metric`, the retrievers know the Prometheus client
+  only, and the name of the metric must be a string constant.
 
 ## Scanning a prebuilt packet stream
 

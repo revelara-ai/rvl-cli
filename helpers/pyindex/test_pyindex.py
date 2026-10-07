@@ -598,6 +598,89 @@ class TestMisuseShapePackets(unittest.TestCase):
         self.assertEqual(self._in("run"), [("missing_await", "coroutine")])
         self.assertEqual(self._count("run", "missing_await", "coroutine"), 1)
 
+    # --- local shapes: retry, loop-variable query, SQL, print, metric ------
+
+    def test_retry_shape_is_read_from_the_delay_on_the_failure_path(self):
+        self.assertEqual(self._in("retry_constant"),
+                         [("retry_shape", "constant_delay")])
+        self.assertEqual(self._in("retry_forever"), [
+            ("retry_shape", "constant_delay"),
+            ("retry_shape", "unbounded_attempts"),
+        ])
+        self.assertEqual(self._in("retry_exponential"),
+                         [("retry_shape", "no_jitter")])
+        self.assertEqual(self._in("retry_power"),
+                         [("retry_shape", "no_jitter")],
+                         "a counter in the body limits the attempts")
+        rec, _ = self.shapes[("retry_constant", "retry_shape", "constant_delay")]
+        self.assertEqual(rec["func"], "sleep")
+        self.assertEqual(rec["snippet"], "time.sleep(2)")
+
+    def test_retry_shape_abstains_where_there_is_no_retry_or_no_shape(self):
+        self.assertEqual(self._in("retry_jittered"), [])
+        self.assertEqual(self._in("retry_opaque"), [],
+                         "a delay from a function has no shape here")
+        self.assertEqual(self._in("ping_all"), [],
+                         "a loop over items is not a retry")
+        self.assertEqual(self._in("poll"), [],
+                         "a poll interval is not on the failure path")
+
+    def test_a_retry_library_config_has_the_same_shapes(self):
+        self.assertEqual(self._in("tenacity_bare"), [
+            ("retry_shape", "constant_delay"),
+            ("retry_shape", "unbounded_attempts"),
+        ])
+        self.assertEqual(self._in("tenacity_fixed"),
+                         [("retry_shape", "constant_delay")])
+        self.assertEqual(self._in("tenacity_exponential"),
+                         [("retry_shape", "no_jitter")])
+        self.assertEqual(self._in("tenacity_jittered"), [])
+
+    def test_a_query_on_a_relation_of_the_loop_variable(self):
+        self.assertEqual(self._in("list_orders"), [
+            ("loop_variable_query", "all"),
+            ("loop_variable_query", "filter"),
+        ])
+        self.assertEqual(self._in("comprehension"),
+                         [("loop_variable_query", "all")])
+        self.assertEqual(self._in("mapped"),
+                         [("loop_variable_query", "first")])
+        self.assertEqual(self._in("not_a_loop_variable_query"), [])
+        rec, _ = self.shapes[("list_orders", "loop_variable_query", "all")]
+        self.assertFalse(rec["provenance"]["client_type_resolved"],
+                         "there are no types: the identity is a method name")
+
+    def test_sql_text_built_in_the_query_call(self):
+        self.assertEqual(self._in("find_user"),
+                         [("sql_concat_in_call", "execute")])
+        self.assertEqual(
+            self._count("find_user", "sql_concat_in_call", "execute"), 4,
+            "a concatenation, an f-string, a % format and str.format")
+        self.assertEqual(self._in("find_user_text"),
+                         [("sql_concat_in_call", "execute")])
+        self.assertEqual(self._in("safe_queries"), [],
+                         "a parameter, constants, and text from another "
+                         "statement are not the same-expression form")
+
+    def test_print_style_output(self):
+        self.assertEqual(self._in("report"), [("print_logging", "print")])
+        self.assertEqual(self._count("report", "print_logging", "print"), 2)
+        self.assertEqual(self._in("write_out"), [],
+                         "a print to a file object is a write")
+        # The emission lane counts a logging call as a log emission. This
+        # lane does not report it.
+        self.assertFalse([k for k in self.shapes if k[1] == "print_logging"
+                          and k[2] != "print"])
+
+    def test_a_latency_metric_registered_as_a_gauge_or_counter(self):
+        self.assertEqual(self._in(""), [
+            ("latency_scalar_metric", "prometheus_client.Counter"),
+            ("latency_scalar_metric", "prometheus_client.Gauge"),
+        ])
+        self.assertEqual(
+            self._count("", "latency_scalar_metric", "prometheus_client.Gauge"),
+            1, "queue_depth is not a latency")
+
     def test_the_wider_fixture_g1_sites_are_unchanged(self):
         # requests.get in an async def is still a G1 call site as well.
         g1 = [r for r in self.sites

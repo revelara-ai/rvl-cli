@@ -750,6 +750,24 @@ pub enum ConfigExpect {
     DurationAtLeast { value: String },
     /// The resolved value, parsed as a duration, must be <= `value`.
     DurationAtMost { value: String },
+    /// `then` is expected ONLY WHERE `guard` holds (po-av01j.133.10).
+    ///
+    /// WHY THIS EXISTS. Some controls are true of a subset of the units a key
+    /// appears on, and the unconditional form is wrong on the rest. A
+    /// `workflow.concurrency` spec was rejected for exactly this: a concurrency
+    /// group matters on a workflow that publishes or deploys, and demanding it
+    /// of every lint workflow is noise that teaches people to waive the class.
+    ///
+    /// The guard is judged against a PREDICATE the retriever emitted for the
+    /// packet's unit, never against the packet's own value. Where the guard
+    /// does not hold the control does not apply (not-applicable, not
+    /// satisfied). Where the retriever emitted no such predicate the lane
+    /// ABSTAINS: a spec whose guard this scanner cannot read must not fire
+    /// unconditionally, and must not be silently dropped either.
+    When {
+        guard: ConfigGuard,
+        then: Box<ConfigExpect>,
+    },
     /// A `kind` this binary does not know. The one key abstains instead of
     /// the whole artifact failing to parse, so an expectation added by a
     /// newer scanner degrades the way an unknown pattern name does. Binaries
@@ -757,6 +775,17 @@ pub enum ConfigExpect {
     /// artifact must not carry a kind older than its scanner floor.
     #[serde(other)]
     Unknown,
+}
+
+/// The condition of a [`ConfigExpect::When`]: it holds when the predicate
+/// `key` carries at least one of `any_of`. A predicate is a SET of values
+/// (the events that trigger a workflow), so membership is the one comparison;
+/// a boolean predicate is the set `["true"]` or `["false"]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigGuard {
+    /// The predicate key within the spec's format, e.g. "workflow.triggers".
+    pub key: String,
+    pub any_of: Vec<String>,
 }
 
 /// A spec about one config key in one config format — the G6 analog of
@@ -923,7 +952,9 @@ pub struct SpecFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MisuseSpec {
     /// `overbroad_catch` | `discarded_error` | `sync_over_async` |
-    /// `blocking_in_async` | `fire_and_forget` | `missing_await`.
+    /// `blocking_in_async` | `fire_and_forget` | `missing_await` |
+    /// `retry_shape` | `loop_variable_query` | `sql_concat_in_call` |
+    /// `print_logging` | `latency_scalar_metric`.
     pub class: String,
     /// The identity the retriever stamped, or `"*"`.
     #[serde(rename = "type")]
@@ -1928,6 +1959,37 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
+    // po-av01j.133.10. The WIRE form is the contract the spec factory authors
+    // against, so it is pinned as literal JSON rather than only round-tripped:
+    // a round trip passes whatever the field names happen to be.
+    #[test]
+    fn a_conditional_config_key_spec_parses_from_its_wire_form() {
+        let text = r#"{
+            "config_keys": [
+                {"format": "github-actions", "key": "workflow.concurrency",
+                 "expect": {"kind": "when",
+                            "guard": {"key": "workflow.publishes_image",
+                                      "any_of": ["true"]},
+                            "then": {"kind": "present"}},
+                 "confidence": 0.9, "control": "RC-014"}
+            ]
+        }"#;
+        let cache = SpecCache::load(text).unwrap();
+        let spec = cache
+            .config_key("github-actions", "workflow.concurrency")
+            .unwrap();
+        assert_eq!(
+            spec.expect,
+            ConfigExpect::When {
+                guard: ConfigGuard {
+                    key: "workflow.publishes_image".into(),
+                    any_of: vec!["true".into()],
+                },
+                then: Box::new(ConfigExpect::Present),
+            }
+        );
+    }
+
     #[test]
     fn spec_file_without_config_keys_section_still_parses() {
         // Backward compatibility: the shipped 2026 caches have no config_keys.
@@ -2660,6 +2722,13 @@ mod tests {
             },
             ConfigExpect::AtLeast { value: 2.0 },
             ConfigExpect::AtMost { value: 60.0 },
+            ConfigExpect::When {
+                guard: ConfigGuard {
+                    key: "workflow.publishes_image".into(),
+                    any_of: vec!["true".into()],
+                },
+                then: Box::new(ConfigExpect::Present),
+            },
             ConfigExpect::NotEquals {
                 value: "default".into(),
             },

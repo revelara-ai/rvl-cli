@@ -132,7 +132,7 @@ not Rust.
 | `rvl-config` | The config/IaC lane: per-*format* retrievers (CI, deploy, supply chain, capacity) plus config-spec verification. |
 | `rvl-content` | The content-pattern lane: in-process, language-agnostic secret detection. |
 | `rvl-emission` | The emission-point lane: aggregate facts about logging, tracing and error-handling sites. |
-| `rvl-misuse` | The misuse lane: error-handling and async shapes that are wrong where they stand (an overbroad catch, a discarded error, a blocking call in an async function, a missing await). |
+| `rvl-misuse` | The misuse lane: error-handling and async shapes that are wrong where they stand (an overbroad catch, a discarded error, a blocking call in an async function, a missing await, a retry with a constant delay, SQL text built in a query call). |
 | `rvl-structure` | The repo-structure lane: test conventions, coverage config, dep-manifest hygiene, runbook presence. |
 | `rvl-data` | The platform commands (`risk`, `control`, `evidence`, `knowledge`, …), held to byte-identical JSON parity with the Go CLI via golden tests. |
 | `rvl-skills` | Skill and lens distribution into coding-agent harnesses. Download-only by construction. |

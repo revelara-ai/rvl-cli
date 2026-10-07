@@ -413,10 +413,11 @@ pub struct Site {
 /// or middleware-chain registration inventoried by a typed retriever.
 pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
-/// The `site_kind` stamped on a misuse-shape packet: an error-handling or
-/// async shape that is wrong where it stands, with no call graph needed to
-/// see it (an overbroad catch, a discarded error value, a blocking call in an
-/// async function, an async call that is never awaited). Like an emission
+/// The `site_kind` stamped on a misuse-shape packet: a shape that is wrong
+/// where it stands, with no call graph needed to see it (an overbroad catch,
+/// a discarded error value, a blocking call in an async function, an async
+/// call that is never awaited, a retry wait with a constant delay, SQL text
+/// built in a query call). Like an emission
 /// point it is an AGGREGATE: one packet per (enclosing function, class,
 /// identity), with the class and the count in `const_args`. Retrieval only:
 /// a `MisuseSpec` says which control a shape violates and which identities
@@ -425,8 +426,9 @@ pub const SITE_KIND_MISUSE: &str = "misuse_shape";
 
 /// The `const_args` entry name carrying a misuse shape's class
 /// (`overbroad_catch` | `discarded_error` | `sync_over_async` |
-/// `blocking_in_async` | `fire_and_forget` | `missing_await`), with
-/// `how: "aggregate"`.
+/// `blocking_in_async` | `fire_and_forget` | `missing_await` | `retry_shape` |
+/// `loop_variable_query` | `sql_concat_in_call` | `print_logging` |
+/// `latency_scalar_metric`), with `how: "aggregate"`.
 pub const CONST_ARG_MISUSE_CLASS: &str = "misuse_class";
 
 /// The `const_args` entry name carrying how many times the shape occurs in
