@@ -396,8 +396,8 @@ mod tests {
         let line = |needle: &str| text.lines().position(|l| l.contains(needle));
         assert!(
             text.contains(&format!(
-                "config keys: {} emitted \u{00b7} 2 specced \u{00b7} {} awaiting a spec \u{00b7} 3 vocabulary only",
-                q.emitted, q.mint_queue
+                "config keys: {} emitted \u{00b7} 2 specced \u{00b7} {} awaiting a spec \u{00b7} {} vocabulary only",
+                q.emitted, q.mint_queue, q.vocabulary_only
             )),
             "{text}"
         );
@@ -409,6 +409,9 @@ mod tests {
         let at = |needle: &str| line(needle).unwrap_or_else(|| panic!("no {needle} in {text}"));
         assert!((queue..vocab).contains(&at("github-actions workflow.concurrency")));
         assert!((vocab..specced).contains(&at("terraform module.source ")));
+        // A guard predicate is a fact a conditional spec asks about, never a
+        // key awaiting a spec of its own (po-av01j.133.10).
+        assert!((vocab..specced).contains(&at("github-actions workflow.triggers ")));
         assert!(at("github-actions job.timeout-minutes") > specced);
         assert!(!text.contains("no spec cache"), "{text}");
     }
