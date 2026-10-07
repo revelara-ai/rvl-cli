@@ -923,7 +923,9 @@ pub struct SpecFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MisuseSpec {
     /// `overbroad_catch` | `discarded_error` | `sync_over_async` |
-    /// `blocking_in_async` | `fire_and_forget` | `missing_await`.
+    /// `blocking_in_async` | `fire_and_forget` | `missing_await` |
+    /// `retry_shape` | `loop_variable_query` | `sql_concat_in_call` |
+    /// `print_logging` | `latency_scalar_metric`.
     pub class: String,
     /// The identity the retriever stamped, or `"*"`.
     #[serde(rename = "type")]

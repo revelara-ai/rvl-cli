@@ -61,7 +61,13 @@ stream as an aggregate with `site_kind: "misuse_shape"`: one packet per
 function and callee, with `misuse_class: discarded_error` and `misuse_count`
 in `const_args` (`misuse.go`). It is not a call site and is not in the census.
 Whether a discard is legitimate is spec knowledge, so every one is emitted.
-See "Misuse shapes" in `docs/retrievers.md`.
+Four more classes ride the same kind (`misuse_shapes.go`): `retry_shape` (a
+wait on the failure path of an attempt loop, keyed by the shape of its delay),
+`sql_concat_in_call` (SQL text built in the argument of a query call),
+`print_logging` (`fmt.Print*`, the print builtins, `fmt.Fprint*` to a standard
+stream; never the `log` package) and `latency_scalar_metric` (a Prometheus
+gauge or counter with a latency name). Each is named for the shape, not for a
+defect. See "Misuse shapes" in `docs/retrievers.md`.
 
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.

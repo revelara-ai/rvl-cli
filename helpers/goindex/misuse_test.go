@@ -97,9 +97,16 @@ func TestDiscardThroughAFunctionValueHasNoResolvedIdentity(t *testing.T) {
 
 func TestMisusePacketsCarryASiteKeyAndStayOutOfTheCensus(t *testing.T) {
 	sites, scan := runRetrieveAll("testdata/misusefixture", "misuse")
-	if scan.Census.Candidates != 0 {
-		t.Fatalf("the fixture has no G1 call site; misuse packets are not candidates: %d",
-			scan.Census.Candidates)
+	calls := 0
+	for _, s := range sites {
+		if s.SiteKind == "" {
+			calls++
+		}
+	}
+	// The database/sql calls of shapes.go are the fixture's G1 call sites.
+	if scan.Census.Candidates != calls {
+		t.Fatalf("candidates = %d, want the %d call sites: misuse packets are not candidates",
+			scan.Census.Candidates, calls)
 	}
 	var sb strings.Builder
 	encodeRetrieved(&sb, sites)
@@ -115,4 +122,92 @@ func keysOf(m map[string]RetrievedSite) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Wave 3 shapes: retry delay, SQL text built in a query call, print-style
+// output and a latency metric that is not a histogram. Each class is named
+// for the shape, and each test pins the neighbour that must not be emitted.
+
+func shapesOf(t *testing.T, symbol string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, s := range misuseByKey(t) {
+		if s.Symbol == symbol {
+			out[constArgByName(s.ConstArgs, "misuse_class")+" "+s.ClientType] = constArgByName(s.ConstArgs, "misuse_count")
+		}
+	}
+	return out
+}
+
+func wantShapes(t *testing.T, symbol string, want map[string]string) {
+	t.Helper()
+	got := shapesOf(t, symbol)
+	if len(got) != len(want) {
+		t.Fatalf("%s: shapes = %v, want %v", symbol, got, want)
+	}
+	for k, n := range want {
+		if got[k] != n {
+			t.Fatalf("%s: shapes = %v, want %v", symbol, got, want)
+		}
+	}
+}
+
+func TestRetryShapeIsReadFromTheDelayExpressionOnTheFailurePath(t *testing.T) {
+	wantShapes(t, "RetryConstant", map[string]string{"retry_shape constant_delay": "1"})
+	wantShapes(t, "RetryForever", map[string]string{
+		"retry_shape constant_delay":     "1",
+		"retry_shape unbounded_attempts": "1",
+	})
+	wantShapes(t, "RetryExponential", map[string]string{"retry_shape no_jitter": "1"})
+	// The delay reaches the wait through a local and a select.
+	wantShapes(t, "RetryShifted", map[string]string{"retry_shape no_jitter": "1"})
+	// A counter in the body limits the attempts.
+	wantShapes(t, "RetryCounted", map[string]string{"retry_shape constant_delay": "1"})
+
+	s := misuseByKey(t)["RetryConstant constant_delay"]
+	if s.Method != "Sleep" || !strings.Contains(s.CallSite, "time.Sleep(2 * time.Second)") || !s.Prov.ClientTypeKnown {
+		t.Fatalf("the packet sits on the wait: %+v", s)
+	}
+}
+
+func TestRetryShapeAbstainsWhereTheShapeIsNotARetryOrIsNotVisible(t *testing.T) {
+	wantShapes(t, "RetryJittered", map[string]string{})
+	// A delay from a function has no shape in this expression.
+	wantShapes(t, "RetryOpaque", map[string]string{})
+	// A constant delay in a loop over items is not a retry.
+	wantShapes(t, "PingAll", map[string]string{})
+	// A sleep between rounds of work is not on the failure path.
+	wantShapes(t, "Poll", map[string]string{})
+}
+
+func TestSQLTextBuiltInTheQueryCallIsEmittedAndOtherFormsAreNot(t *testing.T) {
+	wantShapes(t, "FindUser", map[string]string{"sql_concat_in_call database/sql.DB.Query": "1"})
+	wantShapes(t, "DeleteUser", map[string]string{"sql_concat_in_call database/sql.Tx.ExecContext": "1"})
+	// A parameter, a join of constants and text from another statement.
+	wantShapes(t, "SafeQueries", map[string]string{})
+}
+
+func TestPrintStyleOutputIsEmittedAndStdlibLogIsNot(t *testing.T) {
+	wantShapes(t, "Report", map[string]string{
+		"print_logging fmt.Println":            "1",
+		"print_logging fmt.Printf":             "1",
+		"print_logging fmt.Fprintf(os.Stderr)": "1",
+		"print_logging println":                "1",
+	})
+	wantShapes(t, "Render", map[string]string{})
+	// The emission lane counts log.Print* as a log emission that can satisfy
+	// RC-027. This lane must not report the same line as a violation.
+	sites, _ := runRetrieveAll("testdata/fixture", "fixture")
+	for _, s := range sites {
+		if s.SiteKind == siteKindMisuse && strings.HasPrefix(s.ClientType, "log.") {
+			t.Fatalf("a stdlib log call is not print-style output: %+v", s)
+		}
+	}
+}
+
+func TestALatencyMetricRegisteredAsAGaugeOrCounterIsEmitted(t *testing.T) {
+	const prom = "latency_scalar_metric github.com/prometheus/client_golang/prometheus."
+	// Package-level registrations have no enclosing function.
+	wantShapes(t, "", map[string]string{prom + "NewGauge": "1", prom + "NewCounterVec": "1"})
+	wantShapes(t, "registerLate", map[string]string{prom + "NewGauge": "1"})
 }

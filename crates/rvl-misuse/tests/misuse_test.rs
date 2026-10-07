@@ -172,3 +172,71 @@ fn one_class_under_two_controls_is_two_findings() {
     let findings = evaluate(&sites, &specs);
     assert_eq!(findings.len(), 2, "{findings:?}");
 }
+
+#[test]
+fn the_local_shape_classes_say_what_was_seen_and_are_never_high() {
+    // Each class is named for the shape, and its words do not claim the
+    // defect: a query on a loop variable is not called an N+1, and SQL text
+    // built in a call is not called an injection.
+    for (class, identity, severity, words) in [
+        (
+            "retry_shape",
+            "constant_delay",
+            "medium",
+            "retry delay shape(s)",
+        ),
+        (
+            "loop_variable_query",
+            "all",
+            "low",
+            "query call(s) on a relation of a loop variable",
+        ),
+        (
+            "sql_concat_in_call",
+            "execute",
+            "medium",
+            "query call(s) take SQL text that is built in the call",
+        ),
+        (
+            "print_logging",
+            "fmt.Println",
+            "low",
+            "print-style output call(s)",
+        ),
+        (
+            "latency_scalar_metric",
+            "prometheus_client.Gauge",
+            "low",
+            "latency metric(s) are registered as a gauge or a counter",
+        ),
+    ] {
+        let sites = [shape("svc/a.py", 10, class, identity, 2)];
+        let mut s = spec(class, "*", "violates", "RC-022");
+        let findings = evaluate(&sites, std::slice::from_ref(&s));
+        let f = one(&findings, class);
+        assert_eq!(f.severity, severity, "{class}");
+        assert!(f.reason.starts_with(&format!("2 {words}")), "{}", f.reason);
+        assert!(
+            !f.reason.contains("N+1") && !f.reason.contains("injection"),
+            "{}",
+            f.reason
+        );
+        s.severity = "high".into();
+        let findings = evaluate(&sites, &[s]);
+        assert_eq!(one(&findings, class).severity, severity, "{class}");
+    }
+}
+
+#[test]
+fn one_retry_identity_can_be_allowed_and_the_others_stay() {
+    let sites = [
+        shape("svc/a.go", 10, "retry_shape", "constant_delay", 1),
+        shape("svc/a.go", 10, "retry_shape", "unbounded_attempts", 1),
+    ];
+    let specs = [
+        spec("retry_shape", "*", "violates", "RC-022"),
+        spec("retry_shape", "constant_delay", "allowed", ""),
+    ];
+    let findings = evaluate(&sites, &specs);
+    assert_eq!(one(&findings, "retry_shape").occurrences, 1);
+}

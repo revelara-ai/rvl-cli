@@ -1,9 +1,19 @@
-//! Misuse lane: error-handling and async shapes that are wrong where they
-//! stand. Six lens classes share it: H2 (a catch of the root exception type),
+//! Misuse lane: shapes that are wrong where they stand. Six lens classes of
+//! error handling and async code share it: H2 (a catch of the root exception type),
 //! H3 (an error value assigned to a discard), G5 (a synchronous wait on async
 //! work), G6 (a blocking call lexically inside an async function), E5 (an
 //! async task started and never held) and E6 (an async call that is never
 //! awaited). All six are local: one function is enough to see them.
+//!
+//! Five more classes are local shapes of retry, query, SQL, print and metric
+//! code: B1/B2 (`retry_shape`), N1 (`loop_variable_query`), Q4
+//! (`sql_concat_in_call`), I1 (`print_logging`) and J7
+//! (`latency_scalar_metric`). Each is NAMED FOR THE SHAPE the retriever reads,
+//! and the words of its finding do not claim more. `loop_variable_query` is
+//! the one form of an N+1 that one function shows, and `sql_concat_in_call`
+//! is the one form of an injection that one expression shows. The
+//! cross-function forms need a call graph or data flow, and this lane does
+//! not report them under any name.
 //!
 //! H1, the swallowed error, is not here. It ships through the emission lane
 //! (`rvl-emission`, RC-027), and a retriever leaves a handler that lane
@@ -92,6 +102,33 @@ fn describe(class: &str) -> (&'static str, &'static str, &'static str) {
             "async call(s) are never awaited",
             "medium",
             "await the call; without an await the work does not run and its failure is not seen",
+        ),
+        "retry_shape" => (
+            "retry delay shape(s) with a constant delay, no random term or no limit on attempts",
+            "medium",
+            "increase the delay on each attempt, add a random term to it, and limit the number \
+             of attempts",
+        ),
+        "loop_variable_query" => (
+            "query call(s) on a relation of a loop variable",
+            "low",
+            "load the related rows in one query before the loop (a join, an IN query or an \
+             eager load)",
+        ),
+        "sql_concat_in_call" => (
+            "query call(s) take SQL text that is built in the call",
+            "medium",
+            "pass the values as query parameters; do not build SQL text from values",
+        ),
+        "print_logging" => (
+            "print-style output call(s)",
+            "low",
+            "use the logger of the service, so that each line has a level, a time and fields",
+        ),
+        "latency_scalar_metric" => (
+            "latency metric(s) are registered as a gauge or a counter",
+            "low",
+            "register the latency as a histogram, so that percentiles can be calculated",
         ),
         _ => (
             "occurrence(s) of the shape",

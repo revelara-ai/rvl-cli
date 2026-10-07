@@ -39,6 +39,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import sys
 
 # PACKET_SCHEMA is the version of the emitted packet contract. rvl absorbs
@@ -733,7 +734,9 @@ def collect_emissions(tree, source, idx, enclosing, file_path, snapshot,
 #
 # They ride the SAME stream, stamped site_kind: "misuse_shape", as AGGREGATES
 # like the emission points: one packet per (enclosing function, class,
-# identity), with the class and the count in const_args. Five classes:
+# identity), with the class and the count in const_args. Five classes are
+# about error handling and async code (the local shapes of retry, query, SQL,
+# print and metric code are below, at _local_shapes):
 #
 #   overbroad_catch    `except Exception`, `except BaseException`, bare
 #                      `except:`. Identity: the caught type, or "bare".
@@ -826,6 +829,339 @@ def _coroutine_names(body):
                 elif isinstance(n, ast.alias):
                     other.add((n.asname or n.name).split(".")[0])
     return is_async - other
+
+
+# ---------------------------------------------------------------------------
+# Local shapes of the misuse lane that are not about a handler or an await.
+# Each class is named for the SHAPE that is read, never for the defect a
+# reader may infer from it:
+#
+#   retry_shape            a wait on the failure path of an attempt loop, or a
+#                          retry-library config. Identity: constant_delay,
+#                          no_jitter or unbounded_attempts.
+#   loop_variable_query    a query method called on a relation of a loop
+#                          variable (`for c in cs: c.orders.all()`). Identity:
+#                          the method.
+#   sql_concat_in_call     an `execute` call whose SQL argument is built in
+#                          that same expression. Identity: the method.
+#   print_logging          a call of the builtin `print` to a standard stream.
+#   latency_scalar_metric  a Prometheus Gauge or Counter registered with a
+#                          latency name. Identity: the constructor.
+#
+# What each rule does NOT see is part of the rule:
+#
+#   - retry_shape reads the delay expression and does not guess intent. An
+#     attempt loop is a `while`, or a `for` over `range(...)`. A `for` over a
+#     collection gives each item one attempt. The wait must be in an `except`
+#     handler, or after a `try` that leaves the loop on success: a sleep
+#     anywhere else is a poll interval. A delay that a function computes has
+#     no shape in this expression, and is not reported.
+#   - loop_variable_query is NOT the N+1 defect. It is the one form of it that
+#     one function shows: the loop and the query are in the same function and
+#     the receiver is the loop variable. There are no types, so the method
+#     name is the only evidence that the call is a query. A query in a helper
+#     that the loop calls is not seen.
+#   - sql_concat_in_call is the same-expression form only. SQL text built in
+#     one statement and run in another needs data flow, and is not claimed.
+#   - print_logging is `print` only. A call on the `logging` module is a log
+#     emission in collect_emissions, and one line cannot be both.
+# ---------------------------------------------------------------------------
+
+# Method names that load rows from an ORM relation. `count` and `get` are left
+# out: `str.count` and `dict.get` are far more common than the query forms.
+_QUERY_METHODS = frozenset({
+    "all", "filter", "filter_by", "exclude", "first", "last", "exists",
+    "order_by", "values", "values_list", "select_related", "prefetch_related",
+    "aggregate", "annotate",
+})
+
+_SQL_EXEC_METHODS = frozenset({"execute", "executemany", "executescript"})
+
+# Wrappers that mark a string as SQL text and pass it through.
+_SQL_TEXT_WRAPPERS = frozenset({
+    "sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text",
+})
+
+_SCALAR_METRICS = frozenset({"prometheus_client.Gauge", "prometheus_client.Counter"})
+
+# A metric name that says it measures latency. A bare `_seconds` is not
+# enough: `process_cpu_seconds_total` is a correct counter.
+_LATENCY_NAME = re.compile(r"latency|duration|response_time|elapsed", re.I)
+
+_SLEEP_CALLS = frozenset({"time.sleep", "asyncio.sleep"})
+
+_TENACITY_RETRY = frozenset({
+    "tenacity.retry", "tenacity.Retrying", "tenacity.AsyncRetrying",
+})
+_TENACITY_GROWING = frozenset({"wait_exponential", "wait_incrementing", "wait_chain"})
+_TENACITY_CONSTANT = frozenset({"wait_fixed", "wait_none"})
+
+# Arithmetic builtins a delay expression can use and keep its shape visible.
+_DELAY_BUILTINS = frozenset({"min", "max", "float", "int", "pow", "abs"})
+
+
+def _is_text(e):
+    return isinstance(e, ast.JoinedStr) or (
+        isinstance(e, ast.Constant) and isinstance(e.value, str))
+
+
+def _built_sql(idx, e):
+    """Whether a SQL argument is put together where it stands from a part
+    that is not a constant: a concatenation, an f-string with a value, a `%`
+    format or `str.format`."""
+    if isinstance(e, ast.JoinedStr):
+        return any(isinstance(v, ast.FormattedValue) for v in e.values)
+    if isinstance(e, ast.BinOp):
+        left, right = e.left, e.right
+        if isinstance(e.op, ast.Mod):
+            return _is_text(left)
+        if isinstance(e.op, ast.Add):
+            return (_built_sql(idx, left) or _built_sql(idx, right)
+                    or (_is_text(left) and not isinstance(right, ast.Constant))
+                    or (_is_text(right) and not isinstance(left, ast.Constant)))
+        return False
+    if isinstance(e, ast.Call):
+        func = e.func
+        if (isinstance(func, ast.Attribute) and func.attr == "format"
+                and _is_text(func.value)):
+            return bool(e.args or e.keywords)
+        if idx.resolve_ctor(func) in _SQL_TEXT_WRAPPERS and e.args:
+            return _built_sql(idx, e.args[0])
+    return False
+
+
+def _relation_root(func):
+    """`c.orders.all` -> "c". None unless the receiver is an attribute chain
+    of at least one relation on a plain name."""
+    v = func.value
+    if not isinstance(v, ast.Attribute):
+        return None
+    while isinstance(v, ast.Attribute):
+        v = v.value
+    return v.id if isinstance(v, ast.Name) else None
+
+
+def _loop_nodes(loop):
+    """The nodes of a loop that run on its terms: not the functions and the
+    inner loops in it."""
+    stack = list(ast.iter_child_nodes(loop))
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                          ast.For, ast.AsyncFor, ast.While)):
+            continue
+        yield n
+        stack.extend(ast.iter_child_nodes(n))
+
+
+def _retry_loop(loop, idx, note):
+    """Report the delay shape of an attempt loop."""
+    waits = []
+
+    def sleep_call(stmt):
+        v = stmt.value if isinstance(stmt, ast.Expr) else None
+        if isinstance(v, ast.Await):
+            v = v.value
+        if (isinstance(v, ast.Call) and len(v.args) == 1
+                and idx.resolve_ctor(v.func) in _SLEEP_CALLS):
+            return v
+        return None
+
+    def leaves(stmts):
+        return any(isinstance(s, (ast.Return, ast.Break)) for s in stmts)
+
+    def walk(stmts, on_fail):
+        for s in stmts:
+            call = sleep_call(s)
+            if call is not None:
+                if on_fail:
+                    waits.append(call)
+            elif isinstance(s, ast.Try):
+                walk(s.body, on_fail)
+                for h in s.handlers:
+                    walk(h.body, True)
+                walk(s.orelse, on_fail)
+                walk(s.finalbody, on_fail)
+                if s.handlers and (leaves(s.body) or leaves(s.orelse)):
+                    # What follows runs only after a failed attempt.
+                    on_fail = True
+            elif isinstance(s, ast.If):
+                walk(s.body, on_fail)
+                walk(s.orelse, on_fail)
+            elif isinstance(s, (ast.With, ast.AsyncWith)):
+                walk(s.body, on_fail)
+
+    walk(loop.body, False)
+    if not waits:
+        return
+
+    # What the loop says about its own variables: the ones it changes in
+    # place, and every value it assigns.
+    mutated, defs = set(), {}
+    if isinstance(loop, ast.For):
+        mutated.update(n.id for n in ast.walk(loop.target)
+                       if isinstance(n, ast.Name))
+    for n in _loop_nodes(loop):
+        if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+            mutated.add(n.target.id)
+            defs.setdefault(n.target.id, []).append(n.value)
+        elif (isinstance(n, ast.Assign) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)):
+            defs.setdefault(n.targets[0].id, []).append(n.value)
+
+    def shape(e, resolving, out):
+        for n in ast.walk(e):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                # A variable whose value depends on itself varies.
+                if n.id in mutated or n.id in resolving:
+                    out.add("varying")
+                if n.id not in resolving and n.id in defs:
+                    resolving.add(n.id)
+                    for d in defs[n.id]:
+                        shape(d, resolving, out)
+                    resolving.discard(n.id)
+            elif isinstance(n, ast.Call):
+                dotted = idx.resolve_ctor(n.func) or ""
+                top = dotted.split(".")[0]
+                if top in ("random", "secrets"):
+                    out.add("random")
+                elif top == "math" or (
+                        isinstance(n.func, ast.Name)
+                        and n.func.id in _DELAY_BUILTINS
+                        and n.func.id not in idx.imports):
+                    pass  # arithmetic: the shape is in the arguments
+                else:
+                    out.add("opaque")
+
+    counters = set(mutated)
+    for call in waits:
+        out = set()
+        shape(call.args[0], set(), out)
+        if "opaque" in out or "random" in out:
+            continue
+        identity = "no_jitter" if "varying" in out else "constant_delay"
+        note(call, "retry_shape", identity, "sleep")
+    for name in defs:
+        out = set()
+        shape(ast.Name(id=name, ctx=ast.Load()), set(), out)
+        if "varying" in out:
+            counters.add(name)
+
+    # `while True` with no test of a counter that leaves the loop.
+    if not (isinstance(loop, ast.While) and isinstance(loop.test, ast.Constant)
+            and loop.test.value):
+        return
+    for n in _loop_nodes(loop):
+        if not isinstance(n, ast.If):
+            continue
+        tests_counter = any(
+            isinstance(c, ast.Compare) and any(
+                isinstance(x, ast.Name) and x.id in counters
+                for x in ast.walk(c))
+            for c in ast.walk(n.test))
+        if tests_counter and any(
+                isinstance(x, (ast.Break, ast.Return, ast.Raise))
+                for b in n.body for x in ast.walk(b)):
+            return
+    note(waits[0], "retry_shape", "unbounded_attempts", "sleep")
+
+
+def _retry_config(call, idx, note):
+    """Report the delay shape of a tenacity config. A wait strategy this does
+    not know is not reported."""
+    kws = {k.arg: k.value for k in call.keywords}
+    if None in kws:
+        return  # **kwargs: the config is not in this expression
+    if "stop" not in kws:
+        note(call, "retry_shape", "unbounded_attempts", "retry")
+    wait = kws.get("wait")
+    if wait is None:
+        note(call, "retry_shape", "constant_delay", "retry")
+        return
+    names = [idx.resolve_ctor(c.func) or "" for c in ast.walk(wait)
+             if isinstance(c, ast.Call)]
+    if not names or not all(n.startswith("tenacity.") for n in names):
+        return
+    tails = {n.rsplit(".", 1)[-1] for n in names}
+    if any("random" in t or "jitter" in t for t in tails):
+        return
+    if tails & _TENACITY_GROWING:
+        note(call, "retry_shape", "no_jitter", "retry")
+    elif tails <= _TENACITY_CONSTANT:
+        note(call, "retry_shape", "constant_delay", "retry")
+
+
+def _local_shapes(tree, idx, note):
+    """Report the local shapes of one module through `note`."""
+    seen_queries = set()
+
+    def queries(names, bodies):
+        for body in bodies:
+            for n in ast.walk(body):
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr in _QUERY_METHODS
+                        and _relation_root(n.func) in names
+                        and id(n) not in seen_queries):
+                    seen_queries.add(id(n))
+                    note(n, "loop_variable_query", n.func.attr, n.func.attr,
+                         resolved=False)
+
+    def names_of(target):
+        return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                # A bare `@retry` has no stop and no wait.
+                if (not isinstance(dec, ast.Call)
+                        and idx.resolve_ctor(dec) == "tenacity.retry"):
+                    note(dec, "retry_shape", "unbounded_attempts", "retry")
+                    note(dec, "retry_shape", "constant_delay", "retry")
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            queries(names_of(node.target), node.body)
+            is_range = (isinstance(node.iter, ast.Call)
+                        and isinstance(node.iter.func, ast.Name)
+                        and node.iter.func.id == "range")
+            if isinstance(node, ast.For) and is_range:
+                _retry_loop(node, idx, note)
+        elif isinstance(node, ast.While):
+            _retry_loop(node, idx, note)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                               ast.DictComp)):
+            names = set()
+            for gen in node.generators:
+                names |= names_of(gen.target)
+            bodies = [node.key, node.value] if isinstance(node, ast.DictComp) \
+                else [node.elt]
+            queries(names, bodies + [i for g in node.generators for i in g.ifs])
+        elif isinstance(node, ast.Call):
+            func = node.func
+            dotted = idx.resolve_ctor(func)
+            if isinstance(func, ast.Name) and func.id not in idx.imports:
+                if (func.id == "map" and node.args
+                        and isinstance(node.args[0], ast.Lambda)):
+                    lam = node.args[0]
+                    queries({a.arg for a in lam.args.args}, [lam.body])
+                elif func.id == "print":
+                    # `file=` anything but a standard stream is a write.
+                    files = [k.value for k in node.keywords if k.arg == "file"]
+                    if all(idx.resolve_ctor(f) in ("sys.stdout", "sys.stderr")
+                           for f in files):
+                        note(node, "print_logging", "print", "print")
+            elif (isinstance(func, ast.Attribute)
+                    and func.attr in _SQL_EXEC_METHODS and node.args
+                    and _built_sql(idx, node.args[0])):
+                note(node, "sql_concat_in_call", func.attr, func.attr,
+                     resolved=False)
+            if dotted in _TENACITY_RETRY:
+                _retry_config(node, idx, note)
+            elif dotted in _SCALAR_METRICS:
+                name = node.args[0] if node.args else next(
+                    (k.value for k in node.keywords if k.arg == "name"), None)
+                if (isinstance(name, ast.Constant) and isinstance(name.value, str)
+                        and _LATENCY_NAME.search(name.value)):
+                    note(node, "latency_scalar_metric", dotted,
+                         dotted.rsplit(".", 1)[-1])
 
 
 def collect_misuse(tree, source, idx, enclosing, file_path, snapshot,
@@ -933,6 +1269,7 @@ def collect_misuse(tree, source, idx, enclosing, file_path, snapshot,
                 visit(child, class_coros, in_async)
 
     visit(tree, frozenset(), False)
+    _local_shapes(tree, idx, note)
 
     records = []
     for (symbol, cls, identity), agg in sorted(

@@ -2423,6 +2423,127 @@ fn live_python_scan_surfaces_misuse_shapes() {
     );
 }
 
+/// Go, live end to end, for the local shapes: a retry delay, SQL text built
+/// in a query call, print-style output and a latency metric that is not a
+/// histogram. The counts pin what must NOT be reported: a jittered delay, a
+/// delay that a function computes, a loop over items, a poll interval, a
+/// query with a parameter, SQL text from another statement, a write to a
+/// writer, and a gauge that is not a latency.
+#[test]
+fn live_go_scan_surfaces_local_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture().with_file_name("misusefixture"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    for (class, why, control) in [
+        (
+            "misuse.retry_shape",
+            "6 retry delay shape(s) with a constant delay, no random term or no limit on \
+             attempts, in 5 function(s)",
+            "RC-022",
+        ),
+        (
+            "misuse.sql_concat_in_call",
+            "2 query call(s) take SQL text that is built in the call, in 2 function(s)",
+            "RC-029",
+        ),
+        (
+            "misuse.print_logging",
+            "4 print-style output call(s), in 1 function(s)",
+            "RC-029",
+        ),
+        (
+            "misuse.latency_scalar_metric",
+            "3 latency metric(s) are registered as a gauge or a counter, in 2 function(s)",
+            "RC-026",
+        ),
+    ] {
+        assert!(
+            stdout.contains(class) && stdout.contains(why) && stdout.contains(control),
+            "want {class}: {why} ({control})\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("misuse.loop_variable_query"),
+        "goindex has no loop-variable query form: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
+/// Python, live end to end, for the local shapes. The counts pin the same
+/// limits as the Go test, and two more: a query method on a name that is not
+/// the loop variable is not reported, and a `print` to a file object is a
+/// write.
+#[test]
+fn live_python_scan_surfaces_local_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pyindex = helpers_dir().join("pyindex");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_misuse"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    for (class, why, control) in [
+        (
+            "misuse.retry_shape",
+            "9 retry delay shape(s) with a constant delay, no random term or no limit on \
+             attempts, in 7 function(s)",
+            "RC-022",
+        ),
+        (
+            "misuse.loop_variable_query",
+            "4 query call(s) on a relation of a loop variable, in 3 function(s)",
+            "RC-073",
+        ),
+        (
+            "misuse.sql_concat_in_call",
+            "5 query call(s) take SQL text that is built in the call, in 2 function(s)",
+            "RC-029",
+        ),
+        (
+            "misuse.print_logging",
+            "2 print-style output call(s), in 1 function(s)",
+            "RC-029",
+        ),
+        (
+            "misuse.latency_scalar_metric",
+            "2 latency metric(s) are registered as a gauge or a counter, in 1 function(s)",
+            "RC-026",
+        ),
+    ] {
+        assert!(
+            stdout.contains(class) && stdout.contains(why) && stdout.contains(control),
+            "want {class}: {why} ({control})\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
 // --- construction-bounds lane (pool, queue, cache, whole-body read) ---
 
 /// A `--retrieved` stream carrying unsized-construction packets surfaces one
