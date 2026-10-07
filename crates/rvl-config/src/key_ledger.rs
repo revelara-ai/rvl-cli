@@ -501,7 +501,8 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        assert_eq!(q.vocabulary_only, 3);
+        // Three terraform raw-identity keys and three guard predicates.
+        assert_eq!(q.vocabulary_only, 6);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(
