@@ -83,7 +83,7 @@ jobs:
       # committed golden stream (po-av01j.57). Under CI a missing SDK fails
       # them instead of skipping, so this step is what keeps the lane covered:
       # a skip here once hid a csindex that did not compile (po-av01j.47).
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
