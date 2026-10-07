@@ -121,10 +121,25 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("gatekeeper", "constraint.enforcementAction"),
     judged("github-actions", "job.continue-on-error"),
     judged("github-actions", "job.permissions"),
+    vocabulary_only(
+        "github-actions",
+        "job.publishes_image",
+        "a guard predicate: what the job is, for a conditional spec to ask about",
+    ),
     judged("github-actions", "job.timeout-minutes"),
     judged("github-actions", "job.uses.ref"),
     judged("github-actions", "step.uses.ref"),
     judged("github-actions", "workflow.concurrency"),
+    vocabulary_only(
+        "github-actions",
+        "workflow.publishes_image",
+        "a guard predicate: true when any job in the workflow publishes an image",
+    ),
+    vocabulary_only(
+        "github-actions",
+        "workflow.triggers",
+        "a guard predicate: the events that start the workflow",
+    ),
     judged("gitlab-ci", "job.allow_failure"),
     judged("gitlab-ci", "job.retry"),
     judged("gitlab-ci", "job.timeout"),
@@ -486,7 +501,8 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        assert_eq!(q.vocabulary_only, 3);
+        // Three terraform raw-identity keys and three guard predicates.
+        assert_eq!(q.vocabulary_only, 6);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(
