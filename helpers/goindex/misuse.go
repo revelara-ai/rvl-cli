@@ -2,9 +2,10 @@
 // stand, emitted on the SAME packet stream as call sites, distinguished by
 // site_kind: "misuse_shape".
 //
-// Go contributes one class, discarded_error: an error-typed call result
-// assigned to the blank identifier (`_ = f.Close()`, `n, _ := strconv.Atoi(s)`).
-// The other classes of the lane do not exist in Go. It has no typed catch, so
+// Go contributes discarded_error here: an error-typed call result assigned to
+// the blank identifier (`_ = f.Close()`, `n, _ := strconv.Atoi(s)`). The
+// retry, SQL, print and metric shapes are in misuse_shapes.go. The other
+// error-handling and async classes of the lane do not exist in Go. It has no typed catch, so
 // there is no overbroad one, and it has no async/await, so there is no
 // blocking-in-async and no missing await. A swallowed panic is the
 // recover_block fact in emission.go, not this.
@@ -14,7 +15,7 @@
 // (MisuseSpec, role "allowed"). Nothing here keeps a discard back.
 //
 // VOLUME CONTROL is the same as for emission points: packets are AGGREGATES,
-// one per (enclosing function, callee), with the count in const_args
+// one per (enclosing function, class, identity), with the count in const_args
 // (misuse_class / misuse_count, how: "aggregate").
 //
 // Out of scope on purpose: a call statement that ignores every result
@@ -45,6 +46,7 @@ var errorType = types.Universe.Lookup("error").Type()
 
 type misuseAgg struct {
 	site  RetrievedSite
+	class string
 	count int
 }
 
@@ -121,6 +123,11 @@ func discardedErrorCalls(info *types.Info, as *ast.AssignStmt) []*ast.CallExpr {
 	return out
 }
 
+// shapeNote records one occurrence of a shape: its class, the identity it
+// was seen on, the method name for the packet, whether the identity is
+// type-resolved, and the node the packet sits on.
+type shapeNote func(class, identity, method string, known bool, at ast.Node)
+
 // collectMisuse walks every scanned function and returns the misuse
 // aggregates. Paths are repo-relative, and test and vendored files are left
 // out, as in collectEmissions.
@@ -132,51 +139,64 @@ func collectMisuse(pkgs []*packages.Package, src *srcIndex, root, snapshot strin
 		}
 		info := p.TypesInfo
 		for _, f := range p.Syntax {
+			rel := relPath(root, p.Fset.Position(f.Pos()).Filename)
+			if strings.HasSuffix(rel, "_test.go") || strings.HasPrefix(rel, "vendor/") {
+				continue
+			}
+			// One aggregate per (function, class, identity). Package-level
+			// declarations share the empty function name.
+			aggs := map[[3]string]*misuseAgg{}
+			noteIn := func(symbol string) shapeNote {
+				return func(class, identity, method string, known bool, at ast.Node) {
+					key := [3]string{symbol, class, identity}
+					agg, seen := aggs[key]
+					if !seen {
+						agg = &misuseAgg{class: class, site: RetrievedSite{
+							SiteKind:   siteKindMisuse,
+							Snapshot:   snapshot,
+							File:       rel,
+							Line:       p.Fset.Position(at.Pos()).Line,
+							Symbol:     symbol,
+							Method:     method,
+							ClientType: identity,
+							CallSite:   src.text(p, at, at),
+							Callers:    []Snippet{},
+							Callees:    []Snippet{},
+							Prov:       Provenance{ClientTypeKnown: known},
+						}}
+						aggs[key] = agg
+					}
+					agg.count++
+				}
+			}
 			for _, d := range f.Decls {
-				fd, ok := d.(*ast.FuncDecl)
-				if !ok || fd.Body == nil {
-					continue
-				}
-				rel := relPath(root, p.Fset.Position(fd.Pos()).Filename)
-				if strings.HasSuffix(rel, "_test.go") || strings.HasPrefix(rel, "vendor/") {
-					continue
-				}
-				aggs := map[string]*misuseAgg{}
-				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					as, ok := n.(*ast.AssignStmt)
-					if !ok {
-						return true
+				switch d := d.(type) {
+				case *ast.FuncDecl:
+					if d.Body == nil {
+						continue
 					}
-					for _, call := range discardedErrorCalls(info, as) {
-						identity, name, known := calleeIdentity(info, call)
-						agg, seen := aggs[identity]
-						if !seen {
-							agg = &misuseAgg{site: RetrievedSite{
-								SiteKind:   siteKindMisuse,
-								Snapshot:   snapshot,
-								File:       rel,
-								Line:       p.Fset.Position(as.Pos()).Line,
-								Symbol:     fd.Name.Name,
-								Method:     name,
-								ClientType: identity,
-								CallSite:   src.text(p, as, as),
-								Callers:    []Snippet{},
-								Callees:    []Snippet{},
-								Prov:       Provenance{ClientTypeKnown: known},
-							}}
-							aggs[identity] = agg
+					note := noteIn(d.Name.Name)
+					ast.Inspect(d.Body, func(n ast.Node) bool {
+						if as, ok := n.(*ast.AssignStmt); ok {
+							for _, call := range discardedErrorCalls(info, as) {
+								identity, name, known := calleeIdentity(info, call)
+								note("discarded_error", identity, name, known, as)
+							}
 						}
-						agg.count++
-					}
-					return true
-				})
-				for _, a := range aggs {
-					a.site.ConstArgs = []ConstArg{
-						{Index: 0, Name: "misuse_class", Value: "discarded_error", How: "aggregate"},
-						{Index: 0, Name: "misuse_count", Value: fmt.Sprint(a.count), How: "aggregate"},
-					}
-					out = append(out, a.site)
+						return true
+					})
+					collectLocalShapes(info, d.Body, note)
+				case *ast.GenDecl:
+					// A metric is often registered in a package-level var.
+					collectLocalShapes(info, d, noteIn(""))
 				}
+			}
+			for _, a := range aggs {
+				a.site.ConstArgs = []ConstArg{
+					{Index: 0, Name: "misuse_class", Value: a.class, How: "aggregate"},
+					{Index: 0, Name: "misuse_count", Value: fmt.Sprint(a.count), How: "aggregate"},
+				}
+				out = append(out, a.site)
 			}
 		}
 	}
@@ -188,7 +208,10 @@ func collectMisuse(pkgs []*packages.Package, src *srcIndex, root, snapshot strin
 		if out[i].Line != out[j].Line {
 			return out[i].Line < out[j].Line
 		}
-		return out[i].ClientType < out[j].ClientType
+		if out[i].ClientType != out[j].ClientType {
+			return out[i].ClientType < out[j].ClientType
+		}
+		return out[i].ConstArgs[0].Value < out[j].ConstArgs[0].Value
 	})
 	return out
 }
