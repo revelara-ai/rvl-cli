@@ -70,7 +70,10 @@ note: no API key; the commercial judgment lanes were not synced.
 Everything local works without credentials: `rvl scan`, `rvl doctor`,
 `rvl explain`, `rvl suppress`, `rvl report`, `rvl index`, `rvl hook`. Once
 synced, a scan works offline; `RVL_OFFLINE=1` disables all network fetches
-if you want to guarantee it.
+if you want to guarantee it. After that first sync the cache keeps itself
+current: `rvl init` syncs, and a scan starts a background check at most every
+six hours that applies from the next scan (see
+[Keeping the cache current](configuration.md#keeping-the-cache-current)).
 
 To set a repo up properly, run `rvl init` once. It writes `.revelara.yaml`
 (project name, and the committed home for waivers and declared bounds) and
@@ -113,6 +116,32 @@ binary, nothing to uninstall, no migration. The OSS store lives in an
 `oss/` subdirectory beside the commercial one under the cache root, so the
 two never conflict. Remove the key and the scanner falls back to the free
 tier.
+
+### Scanning with the free tier only
+
+To see what the free tier reports on an install that also has the commercial
+tier, add `--oss-only`:
+
+```sh
+rvl scan --oss-only
+rvl report --oss-only
+```
+
+The flag skips the commercial tier at load time, so the scan behaves exactly
+like a no-key install: vocabulary lanes only, no judgments, and every finding
+advisory except lanes that carry their own severity (secret detection). Use
+it to demo the free tier, to compare the two tiers on the same repo, or to
+check the free experience before you publish.
+
+`--oss-only` is a load filter. `rvl sync` still syncs both tiers and nothing
+is uninstalled, so the next scan without the flag uses both tiers again. Each
+run prints a note on stderr that the commercial tier was not loaded. If the
+OSS tier is not installed the scan fails and tells you to run `rvl sync`; it
+does not fall back to the commercial tier. The flag cannot be combined with
+`--specs-file` or `--judgments`, which bypass the tiers.
+
+`rvl explain` and `rvl suppress` resolve an id from the last scan, so they
+work on the findings of an `--oss-only` scan without a flag of their own.
 
 ## Reading the output
 
@@ -161,6 +190,7 @@ Three things about severity:
   47/91 API surfaces resolved (51%)
   12 abstain — 8 no spec · 2 unresolved bounds · 1 need per-site judge · 1 other
   3 sites block by design — uvicorn.run (server main loop) — waiting is the contract, so no deadline is expected
+  by language: Go 47/51 resolved (0 no spec) · Python 0/40 resolved (8 no spec)
 ```
 
 The scanner reports what it did not decide, and why. Exit 0 means "nothing
@@ -170,6 +200,14 @@ difference shows up. Each abstain names what would close it:
 - `no spec`: no ruleset entry for that API yet. These are what the Revelara
   spec factory mints next (see [Privacy](#privacy) for what a shape-only
   report is).
+  The `by language` line splits the resolved and `no spec` counts by the
+  language of the file each site is in, and it prints when sites came from
+  two or more languages. When a language resolves almost nothing (under 5%
+  of at least 20 sites) and `no spec` is the cause of most of it, a further
+  line says so: `Python: 0/7184 resolved — the spec corpus carries no specs
+  matching this language's ecosystem`. That is a statement about the
+  ruleset, not about your code or the scanner. It is a hint and never
+  changes the verdict.
 - `unresolved bounds`: the call may be bounded in a way no retrieval can
   see, or its client's config spec names no field the scan can check
   (see [Client constructions and config specs](retrievers.md#client-constructions-and-config-specs)).
@@ -180,6 +218,20 @@ difference shows up. Each abstain names what would close it:
 
 Sites that resolved correctly to no finding, like a server main loop that
 blocks by design, are named so you can challenge the call if you disagree.
+
+The resolved percentage is measured over the call sites the retriever chose
+to look at, not over every call in the repo. For Go, COVERAGE prints the
+second denominator next to it:
+
+```
+  go retrieval: 118 candidate call sites of 25263 resolved calls (0.5%) · known I/O not retrieved: io.ReadAll 10
+```
+
+`resolved calls` is every call in non-test code whose target the type checker
+resolved, and most of those calls are not I/O. `known I/O not retrieved`
+counts calls that are I/O but that the retriever's tables do not collect yet,
+so they are in no other number in the report. The line is yellow when that
+count is not zero. `--out` carries the same numbers as `coverage.retrieval`.
 
 Test code is not scanned for API surfaces. The Python and TypeScript
 retrievers skip test paths (`tests/`, `e2e/`, `*.test.ts`, `conftest.py`,
@@ -203,6 +255,43 @@ them. To scan test code anyway, run a full scan with `rvl scan
 skip in place and a warm scan could only honor it for the files it
 re-parsed. Hook scans therefore never include test code; there is no
 `--include-tests` on `rvl index reindex` either.
+
+A whole language is skipped on the same principle. A full scan does not
+run a retriever for a language that is found only in test material while
+another language is really present: one Rust fixture under `testdata/` in a
+Go repository does not start `rustindex`. A language is really present
+when one source file or one project file (`go.mod`, `Cargo.toml`,
+`pyproject.toml`, `package.json`, `tsconfig.json`, a `.csproj` or `.sln`,
+`pom.xml`, `build.gradle`, `compile_commands.json`) is outside the test,
+`testdata`, `fixtures`, `examples` and `docs` paths. One file is enough;
+there is no minimum file count. The skip is named in the COVERAGE roll-call:
+
+```
+  languages: Go 412 sites · Rust skipped (1 file, test material only; --include-tests scans it)
+```
+
+`--out` carries it as a `coverage.lang_status` row with `state: "skipped"`,
+and `rvl doctor` reports the language as skipped instead of asking for its
+helper. If your test paths hold real sources, `rvl scan --include-tests`
+turns the skip off. A repository that is only test material is scanned as
+before, because there the test material is the repository. The skip applies
+to the full scan; an `--incremental` scan retrieves per changed file and
+does not apply it.
+
+The TypeScript retriever scans a workspace whose dependencies are not
+installed, but it resolves client types from import syntax instead of from
+the packages. That is a weaker scan: medium tier, no client versions, and
+coarser keys for module objects. The roll-call prints the same site count
+for both, so COVERAGE names the difference,
+
+```
+  TypeScript: 2 workspaces without installed dependencies (client types resolved from import syntax: medium tier, no client versions)
+```
+
+and `--out` carries the total as `coverage.dependency_trees_uninstalled`.
+Install the dependencies and scan again to get the full resolution. A warm
+scan prints the line when it re-parses TypeScript in this pass; packets it
+reuses from the index keep the resolution they were retrieved with.
 
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly
@@ -244,6 +333,13 @@ The installed shim runs
   `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `scanner.base_ref` in
   `.revelara.yaml`), so a GitHub PR job usually needs no flag at all.
 
+The hooks are the fast path, not the guard. `git commit --no-verify` and a
+squash-merge both produce commits no hook saw, so the authoritative gate is
+a required CI check on the merge ref:
+[Gating commits and CI](gating.md) ships the job. For the same reason the
+pre-commit scan refuses, with exit `1`, a staged file that also has unstaged
+edits: it reads the working tree, and that is not what the commit contains.
+
 `rvl index init/reindex/status` manages the incremental index directly.
 `rvl index reindex --detach` rebuilds it in the background, which is useful
 from your own post-commit hook to keep the next pre-commit scan warm.
@@ -257,6 +353,13 @@ A blocked commit prints what to do:
 ```
 ✗ blocked — fix or suppress 1 blocking finding to commit
 commit blocked; use RVL_FORCE=1 or 'rvl scan force-next' to override
+```
+
+Under the pre-push hook the same two lines name the push:
+
+```
+✗ blocked — fix or suppress 1 blocking finding to push
+push blocked; use RVL_FORCE=1 or 'rvl scan force-next' to override
 ```
 
 ## Suppressing, bounding, waiving
@@ -306,7 +409,7 @@ consumes it, so it cannot silently apply to a later one.
 
 The scan engine never calls a model; your coding agent does. Used together,
 reliability issues get found and fixed while you are still working, and the
-commit gate becomes a backstop that rarely fires.
+commit hook rarely fires.
 
 ```sh
 rvl init            # writes .revelara.yaml AND installs the agent skills
@@ -373,10 +476,57 @@ new endpoints, keys, or data flows. Consent is off by default at every
 layer and every layer must say yes; `RVL_NO_AGENT=1` is a hard kill switch.
 The hook makes one batched invocation per run, capped at 10 sites; a
 timeout or malformed output fails open and the sites stay undecided.
+When more than 10 sites are undecided, the batch takes runtime sites first,
+then migration, backfill, dev-only, and test-support sites; inside a scope,
+the API with the most call sites goes first.
 Verdicts are asymmetric: `satisfies` clears a site, while `violates` is an
 agent-tagged warning. Blocking stays deterministic-only unless the repo
 commits `scanner.agent_verdicts: gate`. Agent verdicts never enter the eval
 rows or the shape-only report.
+
+### Blending the scan with your agent from the command line
+
+`rvl scan --blend` does the same adjudication for a manual scan, in one
+command, with no hook and no repo opt-in:
+
+```sh
+rvl scan --blend
+rvl scan --blend --incremental --changed-only   # only the files you changed
+```
+
+The deterministic scan runs first and settles everything it can. Then the
+undecided call sites in runtime code, and only those, go to your agent
+(found the same way as above). Undecided sites in test, migration, dev-only
+and backfill code are not sent; the report counts them. One run sends at
+most 50 sites, in batches of 10, under a 5-minute total budget. The first
+batch that fails, times out or replies off-contract stops the run.
+
+The agent's verdicts print in a `BLEND` section after the ladder, with the
+same asymmetric rules: `satisfies` clears a site, `violates` is an
+agent-tagged advisory warning, and only `scanner.agent_verdicts: gate` lets
+it block. The deterministic findings and the `--out` eval rows never change.
+
+Typing `--blend` is the consent for that run. These still refuse it:
+`RVL_NO_AGENT=1`, the org kill switch, and an explicit
+`scanner.use_agent: deny` in `.revelara.yaml`.
+
+When the agent half does not answer (refused, not installed, failed,
+timed out, or undecided sites over the cap), the scan fails open: the exit
+code is the deterministic one. But the footer does not say "commit clean".
+It says what happened:
+
+```
+⚠ 0 advisory · NOT A BLENDED RESULT — agent half unavailable: RVL_NO_AGENT=1 (env hard-off) (see BLEND); deterministic half only, rvl fails open
+```
+
+`--blend` is for manual scans. It is refused with `--hook` and with the
+old CLI's `--staged` and `--pre-push`, so a hook never starts calling an
+agent it was not configured for. `--agent` is unchanged: it is a
+compatibility alias for the deterministic scan and never calls a model.
+
+`--blend` covers adjudication only. The expert lenses that `/rvl:scan`
+runs as a scanner in their own right are not part of it yet, and the
+`BLEND` section says so on every run.
 
 ## Privacy
 
@@ -416,6 +566,7 @@ channels precisely.
 | `rvl doctor [--fix]` | Machine/repo readiness |
 | `rvl sync` | Refresh rulesets (both tiers if keyed) |
 | `rvl cache status` | Installed ruleset versions and staleness |
+| `rvl cache keys [--json]` | Every config key the retrievers emit: specced, awaiting a spec, or vocabulary only |
 | `rvl index init\|reindex\|status` | The incremental packet index |
 | `rvl hook install\|doctor` | The git-hook gates |
 | `rvl completion bash\|zsh\|fish` | Shell completion |

@@ -7,10 +7,12 @@ depends on, and neither is recoverable after the fact.
 Run from the pyindex dir:  python3 -m unittest   (or python3 test_pyindex.py)
 """
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +53,18 @@ class TestPacketSchema(unittest.TestCase):
     def test_packet_schema_prints_the_v2_version(self):
         code, out, _ = _run("--packet-schema")
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "2")
+        # Line 1 stays the bare schema integer, so a consumer that reads only
+        # the first line of the reply keeps working.
+        self.assertEqual(out.splitlines()[0], "2")
+
+    def test_packet_schema_reports_this_files_content_version(self):
+        # The handshake (po-8ozxg): rvl compares this value against the copy
+        # it ships, and computes it for a script by hashing the file. The two
+        # must be the same number or every pyindex reads as drifted.
+        _, out, _ = _run("--packet-schema")
+        with open(PYINDEX, "rb") as f:
+            want = hashlib.sha256(f.read()).hexdigest()[:12]
+        self.assertEqual(out.splitlines()[1], "content-version " + want)
 
 
 class TestRetrievedPackets(unittest.TestCase):
@@ -151,6 +164,37 @@ class TestRetrievedPackets(unittest.TestCase):
         self.assertTrue(
             any("OpenAI(" in s for s in ctor_sources),
             "construction of the chained client must be retrievable")
+
+    def test_a_local_receiver_carries_only_its_own_functions_construction(self):
+        # An assignment inside a function binds a LOCAL, so a same-named
+        # variable constructed in another function never reaches this call.
+        # Attaching both made `q = queue.Queue()` and `q = queue.Queue(maxsize=10)`
+        # indistinguishable at their `q.put` sites (po-av01j.231). A name the
+        # function does not assign is the module's, and keeps every
+        # construction of it.
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "svc.py"), "w") as f:
+                f.write(
+                    "import queue\n\n"
+                    "shared = queue.Queue(maxsize=3)\n\n\n"
+                    "def unbounded(x):\n"
+                    "    q = queue.Queue()\n"
+                    "    q.put(x)\n\n\n"
+                    "def bounded(x):\n"
+                    "    q = queue.Queue(maxsize=10)\n"
+                    "    q.put(x)\n\n\n"
+                    "def module_level(x):\n"
+                    "    shared.put(x)\n")
+            code, out, err = _run("--retrieve", "--root", root)
+            self.assertEqual(code, 0, err)
+            sites, _ = _parse_stream(out)
+        ctors = {
+            r["symbol"]: [c["source"] for c in r["client_construction"]]
+            for r in sites if r["func"] == "put"
+        }
+        self.assertEqual(ctors["unbounded"], ["q = queue.Queue()"])
+        self.assertEqual(ctors["bounded"], ["q = queue.Queue(maxsize=10)"])
+        self.assertEqual(ctors["module_level"], ["shared = queue.Queue(maxsize=3)"])
 
     def test_noise_calls_are_not_emitted(self):
         # items.append(...) and os.path.join(...) must never be sites
@@ -440,13 +484,216 @@ class TestEmissionPackets(unittest.TestCase):
     def test_g1_sites_carry_no_site_kind(self):
         # The fixture also exercises the G2/G3 lanes: only records outside the
         # known kinds must stay classic G1 (empty site_kind).
-        known_kinds = {"emission_point", "background_job", "server_entry"}
+        known_kinds = {"emission_point", "background_job", "server_entry",
+                       "misuse_shape", "unsized_construction"}
         for r in _retrieve_records():
             if r.get("site_kind") in known_kinds:
                 continue
             self.assertFalse(r.get("site_kind"),
                              "G1 packets must not grow a site_kind: {}".format(r))
 
+
+
+class TestMisuseShapePackets(unittest.TestCase):
+    """Error-handling and async shapes ride the same stream as AGGREGATES,
+    one packet per (enclosing function, class, identity), stamped
+    site_kind: "misuse_shape" with the class and the count in const_args.
+    Retrieval only: nothing here says a shape is a finding."""
+
+    ROOT = os.path.join(HERE, "testdata", "fixture_misuse")
+
+    @classmethod
+    def setUpClass(cls):
+        code, out, err = _run("--retrieve", "--root", cls.ROOT)
+        assert code == 0, err
+        sites, _ = _parse_stream(out)
+        cls.sites = sites
+        cls.shapes = {}
+        for r in sites:
+            if r.get("site_kind") != "misuse_shape":
+                continue
+            const = {a["name"]: a["value"] for a in r["const_args"]}
+            key = (r["symbol"], const["misuse_class"], r["client_type"])
+            assert key not in cls.shapes, "one packet per key: {}".format(key)
+            cls.shapes[key] = (r, int(const["misuse_count"]))
+
+    def _count(self, symbol, cls, identity):
+        return self.shapes.get((symbol, cls, identity), (None, 0))[1]
+
+    def _in(self, symbol):
+        return sorted(k[1:] for k in self.shapes if k[0] == symbol)
+
+    def test_root_exception_catches_aggregate_per_function_and_type(self):
+        self.assertEqual(
+            self._count("catches_root", "overbroad_catch", "Exception"), 2,
+            "a tuple that names Exception catches it too")
+        self.assertEqual(
+            self._count("catches_base", "overbroad_catch", "BaseException"), 1)
+        self.assertEqual(self._count("catches_bare", "overbroad_catch", "bare"), 1)
+        rec, _ = self.shapes[("catches_root", "overbroad_catch", "Exception")]
+        self.assertEqual(rec["line_number"], 20)
+        self.assertEqual(rec["func"], "except")
+        self.assertEqual(rec["enclosing_function_body"], "")
+        self.assertEqual(rec["packet_schema"], 2)
+        self.assertTrue(rec["site_key"])
+
+    def test_a_handler_that_reraises_or_is_narrow_is_not_emitted(self):
+        self.assertEqual(self._in("catches_and_reraises"), [])
+        self.assertEqual(self._in("catches_narrow"), [])
+
+    def test_a_swallowed_handler_is_left_to_the_emission_lane(self):
+        # `except Exception: pass` is the H1 swallow. It rides the stream once,
+        # as the emission lane's except_handler aggregate.
+        self.assertEqual(self._in("swallows"), [])
+        swallow = [r for r in self.sites
+                   if r.get("site_kind") == "emission_point"
+                   and r["symbol"] == "swallows"
+                   and r["client_type"] == "except_handler"]
+        self.assertEqual(len(swallow), 1)
+
+    def test_blocking_calls_inside_async_def_are_keyed_by_callee(self):
+        self.assertEqual(self._in("blocks"), [
+            ("blocking_in_async", "requests.get"),
+            ("blocking_in_async", "subprocess.run"),
+            ("blocking_in_async", "time.sleep"),
+        ])
+        self.assertEqual(
+            self._count("blocks", "blocking_in_async", "time.sleep"), 2,
+            "`from time import sleep` resolves to the same callee")
+
+    def test_a_blocking_call_handed_to_a_worker_is_not_emitted(self):
+        # A lambda or a nested def runs where it is called, not on the loop.
+        self.assertEqual(self._in("offloads"), [])
+        self.assertEqual(self._in("helper"), [])
+
+    def test_a_blocking_call_in_a_sync_function_is_not_emitted(self):
+        self.assertEqual(self._in("sync_caller"), [])
+
+    def test_synchronous_waits_inside_async_def(self):
+        self.assertEqual(self._in("waits_synchronously"), [
+            ("sync_over_async", "asyncio.loop.run_until_complete"),
+            ("sync_over_async", "asyncio.run"),
+            ("sync_over_async", "asyncio.run_coroutine_threadsafe.result"),
+        ])
+
+    def test_a_task_started_as_a_statement_is_fire_and_forget(self):
+        self.assertEqual(self._in("forgets"), [
+            ("fire_and_forget", "asyncio.create_task"),
+            ("fire_and_forget", "asyncio.ensure_future"),
+        ])
+        # A held task and a TaskGroup's task have an owner.
+        self.assertEqual(self._in("holds"), [])
+
+    def test_a_coroutine_called_and_never_awaited(self):
+        self.assertEqual(self._in("never_awaits"),
+                         [("missing_await", "coroutine")])
+        self.assertEqual(
+            self._count("never_awaits", "missing_await", "coroutine"), 2,
+            "the bare call and the assignment nobody reads; work() is sync")
+        self.assertEqual(self._in("awaits"), [])
+        self.assertEqual(self._in("shadows"), [],
+                         "a parameter shadows the module-level coroutine")
+
+    def test_an_async_method_called_on_self_and_never_awaited(self):
+        self.assertEqual(self._in("run"), [("missing_await", "coroutine")])
+        self.assertEqual(self._count("run", "missing_await", "coroutine"), 1)
+
+    def test_the_wider_fixture_g1_sites_are_unchanged(self):
+        # requests.get in an async def is still a G1 call site as well.
+        g1 = [r for r in self.sites
+              if not r.get("site_kind") and r["symbol"] == "blocks"]
+        self.assertTrue(any(r["func"] == "get" for r in g1), g1)
+
+
+class TestUnsizedConstructionPackets(unittest.TestCase):
+    """Queues, pools and caches ride the same stream, one packet per
+    construction, stamped site_kind: "unsized_construction". The class and
+    every constructor argument ride const_args. A constant is a value; anything
+    else is a NAME (how: "name") and is never resolved."""
+
+    ROOT = os.path.join(HERE, "testdata", "fixture_bounds")
+
+    def _by_symbol(self):
+        code, out, err = _run("--retrieve", "--root", self.ROOT)
+        self.assertEqual(code, 0, err)
+        sites, _ = _parse_stream(out)
+        out = {}
+        for r in sites:
+            if r.get("site_kind") == "unsized_construction":
+                out.setdefault(r["symbol"], []).append(r)
+        return out
+
+    def _one(self, symbol):
+        recs = self._by_symbol().get(symbol, [])
+        self.assertEqual(len(recs), 1, "{}: {}".format(symbol, recs))
+        return recs[0]
+
+    def _seen(self, rec):
+        return sorted("{}={}/{}".format(a["name"], a["value"], a["how"])
+                      for a in rec["const_args"] if a["how"] != "aggregate")
+
+    def _agg(self, rec, name):
+        return next((a["value"] for a in rec["const_args"]
+                     if a["name"] == name and a["how"] == "aggregate"), None)
+
+    def test_queue_with_no_arguments_reports_class_and_nothing_seen(self):
+        rec = self._one("unbounded_queue")
+        self.assertEqual(rec["client_type"], "queue.Queue")
+        self.assertEqual(rec["func"], "Queue")
+        self.assertEqual(self._agg(rec, "bound_class"), "queue")
+        self.assertEqual(self._seen(rec), [])
+        self.assertEqual(rec["packet_schema"], 2)
+        self.assertEqual(rec["site_key"], "{}:{}:queue.Queue:Queue".format(
+            rec["file_path"], rec["line_number"]))
+
+    def test_constant_arguments_are_values(self):
+        self.assertEqual(self._seen(self._one("zero_is_no_limit")),
+                         ["maxsize=0/literal"])
+        self.assertEqual(self._seen(self._one("literal_capacity")),
+                         ["arg0=50/literal"])
+        rec = self._one("constant_capacity")
+        self.assertEqual(rec["client_type"], "asyncio.Queue")
+        self.assertEqual(self._seen(rec), ["maxsize=100/named_constant"])
+
+    def test_a_non_constant_argument_is_a_name_not_a_value(self):
+        self.assertEqual(self._seen(self._one("named_capacity")),
+                         ["maxsize=settings.max_jobs/name"])
+
+    def test_spread_options_are_reported_as_opaque(self):
+        rec = self._one("hidden_options")
+        self.assertEqual(self._agg(rec, "bound_opaque"), "**opts")
+        self.assertEqual(self._seen(rec), [])
+        self.assertIsNone(self._agg(self._one("unbounded_queue"), "bound_opaque"))
+
+    def test_deque_resolves_through_either_import_form(self):
+        self.assertEqual(self._one("history")["client_type"], "collections.deque")
+        rec = self._one("bounded_history")
+        self.assertEqual(rec["client_type"], "collections.deque")
+        self.assertIn("maxlen=10/literal", self._seen(rec))
+
+    def test_pool_constructions_are_one_packet_each(self):
+        recs = self._by_symbol()["pool"]
+        self.assertEqual(
+            sorted((r["client_type"], r["func"]) for r in recs),
+            [("redis.ConnectionPool", "ConnectionPool"),
+             ("redis.ConnectionPool", "ConnectionPool")],
+            "from_url is not in the table: its options are in the URL")
+        self.assertEqual({self._agg(r, "bound_class") for r in recs}, {"pool"})
+        self.assertEqual(sorted(self._seen(r) for r in recs),
+                         [[], ["max_connections=settings.pool_size/name"]])
+
+    def test_cache_decorators_are_constructions(self):
+        bare = self._one("default_cache")
+        self.assertEqual(bare["client_type"], "functools.lru_cache")
+        self.assertEqual(self._agg(bare, "bound_class"), "cache")
+        self.assertEqual(self._seen(bare), [])
+        self.assertEqual(self._seen(self._one("cache_forever")),
+                         ["maxsize=None/literal"])
+        self.assertEqual(self._one("always_unbounded")["client_type"],
+                         "functools.cache")
+
+    def test_an_unresolved_lookalike_is_never_guessed(self):
+        self.assertNotIn("not_a_construction", self._by_symbol())
 
 
 TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")
@@ -539,6 +786,258 @@ class TestTestPathSkip(unittest.TestCase):
                                       "--include-tests")
         self.assertEqual({r["file_path"] for r in sites}, {"tests/test_app.py"})
         self.assertEqual(stats["test_files_skipped"], 0)
+
+
+GRAPH_ROOT = os.path.join(HERE, "testdata", "fixture_graph")
+
+
+def _graph_records(*extra):
+    code, out, err = _run("--retrieve", "--root", GRAPH_ROOT, *extra)
+    if code != 0:
+        raise AssertionError("retrieve failed ({}): {}".format(code, err))
+    sites, _ = _parse_stream(out)
+    return sites
+
+
+def _site_in(records, symbol, file_path):
+    hits = [r for r in records
+            if r["symbol"] == symbol and r["file_path"] == file_path]
+    if len(hits) != 1:
+        raise AssertionError("expected one site in {} ({}), got {}".format(
+            symbol, file_path, len(hits)))
+    return hits[0]
+
+
+class TestCallGraph(unittest.TestCase):
+    """The caller/callee graph (po-cafdn.3): what v1 emitted as empty arrays.
+
+    testdata/fixture_graph holds a known multi-hop chain,
+    main -> run_once -> sync_user -> fetch_profile, across three modules,
+    beside one case per rule the walk has to keep."""
+
+    def test_multi_hop_chain_reaches_its_root_across_modules(self):
+        site = _site_in(_graph_records(), "fetch_profile", "app/gateway.py")
+        # Proximity order: both direct callers first, then each hop outward.
+        self.assertEqual([c["symbol"] for c in site["callers"]],
+                         ["_warm", "sync_user", "run_once", "main"])
+        by_symbol = {c["symbol"]: c for c in site["callers"]}
+        self.assertEqual(by_symbol["sync_user"]["file"], "app/service.py")
+        self.assertEqual(by_symbol["sync_user"]["line"], 7)
+        self.assertIn("return fetch_profile(uid)",
+                      by_symbol["sync_user"]["source"])
+        prov = site["provenance"]
+        self.assertEqual(prov["callers_total"], 4)
+        self.assertEqual(prov["callers_included"], 4)
+        self.assertEqual(prov["ancestry_depth_searched"], 4)
+        self.assertFalse(prov["hit_depth_cap"])
+        self.assertFalse(prov["hit_caller_budget"])
+        self.assertEqual(sorted(r["symbol"] for r in prov["chain_roots"]),
+                         ["_warm", "main"])
+
+    def test_chain_root_carries_structural_facts_not_a_classification(self):
+        site = _site_in(_graph_records(), "fetch_profile", "app/gateway.py")
+        roots = {r["symbol"]: r for r in site["provenance"]["chain_roots"]}
+        self.assertEqual(roots["main"], {
+            "symbol": "main",
+            "package": "app.main",
+            "signature": "def main()",
+            "doc": "Run one sync pass and exit.",
+            "exported": True,
+            "in_package_main": True,
+            "referenced_as_value": 0,
+            "decorators": [],
+        })
+        # A leading underscore is the Python spelling of "not exported", and
+        # jobs.py has no __main__ guard.
+        self.assertFalse(roots["_warm"]["exported"])
+        self.assertFalse(roots["_warm"]["in_package_main"])
+        self.assertEqual(roots["_warm"]["package"], "app.jobs")
+
+    def test_method_hops_resolve_through_self_and_a_constructed_attribute(self):
+        # Gateway.pull <- Syncer._one (self.gw.pull, gw = gateway.Gateway())
+        #              <- Syncer.sync_all (self._one) <- run_once
+        #              (Syncer().sync_all()) <- main.
+        site = _site_in(_graph_records(), "pull", "app/gateway.py")
+        self.assertEqual([c["symbol"] for c in site["callers"]],
+                         ["Syncer._one", "Syncer.sync_all", "run_once", "main"])
+        self.assertEqual(
+            [r["symbol"] for r in site["provenance"]["chain_roots"]], ["main"])
+
+    def test_callees_are_the_in_repo_functions_the_enclosing_function_calls(self):
+        site = _site_in(_graph_records(), "fetch_with_auth", "app/gateway.py")
+        self.assertEqual([c["symbol"] for c in site["callees"]],
+                         ["_token", "_headers"])
+        self.assertIn('return "t"', site["callees"][0]["source"])
+        self.assertEqual(site["callees"][0]["file"], "app/gateway.py")
+        prov = site["provenance"]
+        self.assertEqual(prov["callees_total"], 2)
+        self.assertEqual(prov["callees_included"], 2)
+        # Nothing calls fetch_with_auth: it is its own chain root.
+        self.assertEqual(site["callers"], [])
+        self.assertEqual([r["symbol"] for r in prov["chain_roots"]],
+                         ["fetch_with_auth"])
+
+    def test_root_reports_decorators_and_value_references(self):
+        site = _site_in(_graph_records(), "refresh_all", "app/jobs.py")
+        self.assertEqual([c["symbol"] for c in site["callers"]], ["nightly"])
+        (root,) = site["provenance"]["chain_roots"]
+        self.assertEqual(root["symbol"], "nightly")
+        self.assertEqual(root["decorators"], ["@retrying"])
+        # register() hands `nightly` to a scheduler without calling it.
+        self.assertEqual(root["referenced_as_value"], 1)
+        self.assertEqual(root["doc"], "Refresh everything once a night.")
+
+    def test_a_cycle_terminates_and_reports_no_root(self):
+        site = _site_in(_graph_records(), "pong", "app/jobs.py")
+        self.assertEqual([c["symbol"] for c in site["callers"]], ["ping"])
+        self.assertEqual([c["symbol"] for c in site["callees"]], ["ping"])
+        self.assertEqual(site["provenance"]["chain_roots"], [])
+        self.assertFalse(site["provenance"]["hit_depth_cap"])
+
+    def test_a_function_that_only_calls_itself_is_its_own_root(self):
+        site = _site_in(_graph_records(), "walk", "app/jobs.py")
+        self.assertEqual(site["callers"], [])
+        self.assertEqual(site["callees"], [])
+        self.assertEqual(
+            [r["symbol"] for r in site["provenance"]["chain_roots"]], ["walk"])
+
+    def test_caller_budget_truncation_is_reported(self):
+        site = _site_in(_graph_records(), "leaf", "app/fanout.py")
+        prov = site["provenance"]
+        self.assertEqual([c["symbol"] for c in site["callers"]],
+                         ["c1", "c2", "c3", "c4"])
+        self.assertEqual(prov["callers_total"], 6)
+        self.assertEqual(prov["callers_included"], 4)
+        self.assertTrue(prov["hit_caller_budget"])
+        # The roots are counted over the WHOLE walk, not the emitted slice.
+        # `outer` is one of them: its nested def has a parameter named
+        # `leaf`, which shadows nothing in `outer` itself.
+        self.assertEqual([r["symbol"] for r in prov["chain_roots"]],
+                         ["c1", "c2", "c3", "c4", "c5", "outer"])
+
+    def test_unresolved_and_shadowed_calls_make_no_edge(self):
+        # `obj.leaf()` on an unknown receiver and `leaf()` on a parameter of
+        # that name are not calls of fanout.leaf: abstain, never name-match.
+        site = _site_in(_graph_records(), "leaf", "app/fanout.py")
+        roots = [r["symbol"] for r in site["provenance"]["chain_roots"]]
+        self.assertNotIn("dynamic", roots)
+        self.assertNotIn("shadowed", roots)
+
+    def test_depth_cap_truncation_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            lines = ["import requests", "", "def f0():",
+                     "    return requests.post('https://x')", ""]
+            for i in range(1, 15):
+                lines += ["def f{}():".format(i),
+                          "    return f{}()".format(i - 1), ""]
+            with open(os.path.join(root, "deep.py"), "w") as fh:
+                fh.write("\n".join(lines))
+            code, out, err = _run("--retrieve", "--root", root)
+            self.assertEqual(code, 0, err)
+            (site,) = _parse_stream(out)[0]
+        prov = site["provenance"]
+        self.assertTrue(prov["hit_depth_cap"])
+        self.assertEqual(prov["ancestry_depth_searched"], 12)
+        self.assertEqual(prov["callers_total"], 12)
+        # The walk stopped before any function with no callers: a truncated
+        # search names no root rather than inventing one.
+        self.assertEqual(prov["chain_roots"], [])
+
+    def test_ambiguous_import_makes_no_edge(self):
+        # Two modules answer to `util`: the import cannot be pinned to one
+        # file, so neither `helper` gets the caller.
+        with tempfile.TemporaryDirectory() as root:
+            for pkg in ("a", "b"):
+                os.makedirs(os.path.join(root, pkg))
+                with open(os.path.join(root, pkg, "util.py"), "w") as fh:
+                    fh.write("import requests\n\n"
+                             "def helper():\n"
+                             "    return requests.post('https://x')\n")
+            with open(os.path.join(root, "run.py"), "w") as fh:
+                fh.write("from util import helper\n\n"
+                         "def go():\n    return helper()\n")
+            code, out, err = _run("--retrieve", "--root", root)
+            self.assertEqual(code, 0, err)
+            sites = _parse_stream(out)[0]
+        self.assertEqual(len(sites), 2)
+        for site in sites:
+            self.assertEqual(site["callers"], [])
+            self.assertEqual(
+                [r["symbol"] for r in site["provenance"]["chain_roots"]],
+                ["helper"])
+
+    def test_files_filter_emits_the_same_packets_as_a_full_run(self):
+        # The incremental path must not hand rvl a different packet for the
+        # same site: the graph still spans the whole tree.
+        full = [r for r in _graph_records()
+                if r["file_path"] == "app/gateway.py"]
+        only = _graph_records("--files", "app/gateway.py")
+        self.assertTrue(only)
+        self.assertEqual(only, full)
+
+    def test_files_filter_stats_count_only_the_requested_files(self):
+        code, out, err = _run("--retrieve", "--root", GRAPH_ROOT,
+                              "--files", "app/gateway.py")
+        self.assertEqual(code, 0, err)
+        _, kinds = _parse_stream(out)
+        (stats,) = [k for k in kinds if k["kind"] == "retrieval_stats"]
+        self.assertEqual(stats["files_total"], 1)
+        self.assertEqual(stats["files_parsed"], 1)
+        self.assertEqual(stats["files_failed"], 0)
+
+    def test_a_broken_neighbour_does_not_fail_an_incremental_reload(self):
+        # A file outside --files that does not parse costs its own edges and
+        # nothing else: it is not counted, and the reload stays exit 0.
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "ok.py"), "w") as fh:
+                fh.write("import requests\n\n"
+                         "def go():\n    return requests.post('https://x')\n")
+            with open(os.path.join(root, "broken.py"), "w") as fh:
+                fh.write("def (:\n")
+            code, out, err = _run("--retrieve", "--root", root,
+                                  "--files", "ok.py")
+            self.assertEqual(code, 0, err)
+            sites, kinds = _parse_stream(out)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(kinds[0]["files_failed"], 0)
+
+    def test_test_paths_stay_out_of_the_graph_unless_included(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "svc.py"), "w") as fh:
+                fh.write("import requests\n\n"
+                         "def go():\n    return requests.post('https://x')\n")
+            with open(os.path.join(root, "test_svc.py"), "w") as fh:
+                fh.write("from svc import go\n\n"
+                         "def test_go():\n    return go()\n")
+            code, out, err = _run("--retrieve", "--root", root)
+            self.assertEqual(code, 0, err)
+            (site,) = _parse_stream(out)[0]
+            self.assertEqual(site["callers"], [])
+            code, out, err = _run("--retrieve", "--root", root,
+                                  "--include-tests")
+            self.assertEqual(code, 0, err)
+            (site,) = _parse_stream(out)[0]
+            self.assertEqual([c["symbol"] for c in site["callers"]],
+                             ["test_go"])
+
+    def test_site_at_module_scope_has_no_ancestry(self):
+        # No enclosing function, so there is nothing to walk up from.
+        (site,) = [r for r in _retrieve_records()
+                   if r["file_path"] == "svc.py" and r["symbol"] == ""
+                   and r.get("site_kind", "") == ""]
+        self.assertEqual(site["callers"], [])
+        self.assertEqual(site["callees"], [])
+        self.assertEqual(site["provenance"]["chain_roots"], [])
+
+    def test_packet_contracts_are_unchanged(self):
+        for rec in _graph_records():
+            self.assertEqual(rec["packet_schema"], 2)
+            self.assertEqual(rec["site_key"], "{}:{}:{}:{}".format(
+                rec["file_path"], rec["line_number"], rec["client_type"],
+                rec["func"]))
+            for snip in rec["callers"] + rec["callees"]:
+                self.assertEqual(sorted(snip),
+                                 ["file", "line", "source", "symbol"])
 
 
 # Last statement in the module: `python3 test_pyindex.py` is a documented

@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -Iinclude -c src/net.c",
+    "file": "src/net.c"
+  },
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -Iinclude -c src/files.c",
+    "file": "src/files.c"
+  }
+]

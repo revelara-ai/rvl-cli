@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -c src/daemon.c",
+    "file": "src/daemon.c"
+  },
+  {
+    "directory": ".",
+    "arguments": ["c++", "-std=c++17", "-Ivendor", "-c", "src/service.cpp"],
+    "file": "src/service.cpp"
+  }
+]

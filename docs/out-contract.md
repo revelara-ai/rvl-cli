@@ -53,8 +53,13 @@ The orchestrator uses it to:
     "abstain": { "no_spec": 90, "bounds": 40, "judge": 30, "other": 6 },
     "generated_skipped": 3,
     "test_files_skipped": 12,
+    "dependency_trees_uninstalled": 0,
     "degraded_note": null,
     "lang_status": [ { "lang": "go", "state": "scanned", "detail": "1240" } ],
+    "by_language": [
+      { "lang": "Go", "resolved": 1614, "total": 1780, "no_spec": 90,
+        "corpus_gap": false }
+    ],
     "retrievers": [ { "lang": "go", "path": "...", "source": "bundled" } ],
     "degraded": [
       { "lang": "python", "abstained": false, "not_installed": true,
@@ -62,10 +67,17 @@ The orchestrator uses it to:
     ],
     "config": {
       "resolved": 120, "total": 140,
-      "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2 },
+      "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2,
+                   "vocabulary_only": 4 },
       "no_spec_keys": ["github_actions permissions"],
       "unparseable_files": 0
-    }
+    },
+    "retrieval": [
+      { "lang": "go", "calls_resolved": 18233, "candidates": 412,
+        "unretrieved": { "io.ReadAll": 3 } }
+    ],
+    "structure": { "total": 6, "violates": 1, "satisfies": 3, "abstain": 1,
+                   "not_applicable": 1 }
   },
   "sites": [
     { "site_id": "...", "snapshot_id": "...", "verdict": "violates",
@@ -76,7 +88,12 @@ The orchestrator uses it to:
       "lever": "judge", "scope": "runtime" }
   ],
   "covered_classes": ["net/http.Client.Do", "redis.pipeline"],
-  "hook_agent": null
+  "structure": [
+    { "site_id": "repo", "snapshot_id": "...", "verdict": "violates",
+      "reason": "no test files for go", "class": "repo_structure.RC-033" }
+  ],
+  "hook_agent": null,
+  "blend": null
 }
 ```
 
@@ -103,8 +120,18 @@ The orchestrator uses it to:
   so a consumer can report which lanes ran, failed, or read nothing without
   parsing stdout:
   - `lang_status[]`: one row per detected language. `state` is `scanned` |
-    `abstained` | `failed` | `unsupported` | `not_installed`; `detail`
-    carries the site count on a scanned lane or the reason otherwise.
+    `partial` | `abstained` | `failed` | `unsupported` | `not_installed` |
+    `skipped`; `detail` carries the site count on a scanned lane or the
+    reason otherwise. `skipped` means the language was found only in test
+    material and no retriever ran for it; `detail` is the file count
+    (`1 file`), and the row has no `degraded[]` entry because nothing failed. `partial` means the helper ran but some units parsed only
+    partly (for C/C++, usually a header that is not installed), so the site
+    count is a floor: `detail` reads `<n> sites, INCOMPLETE: <why>`.
+  - `by_language[]`: `resolved`, `total` and `no_spec` split by the language
+    of the file each site is in (`other` when no retriever claims the
+    extension). `corpus_gap` is true when the language resolves almost
+    nothing and missing specs are the cause: the ruleset has no specs for
+    that ecosystem. It is a hint, and it never changes `exit`.
   - `retrievers[]`: which helper served each lane and from which resolution
     slot.
   - `degraded[]`: one row per degraded lane (`lang`, `abstained`,
@@ -119,6 +146,50 @@ The orchestrator uses it to:
     test files its packet index flagged when they were first retrieved as
     well as the ones it re-parsed this pass. `rvl scan --include-tests`
     makes the second zero by scanning them.
+  - `retrieval[]`: the retrieval denominator, one row per language whose
+    helper measures it (Go today). `resolved`/`total` is resolution over the
+    sites the extractor RETRIEVED, and the extractor's tables decide what is
+    retrieved, so never quote that percentage without this row.
+    `candidates` is the call sites the extractor retrieved; `calls_resolved`
+    is every call in non-test code whose callee the type checker resolved
+    (crude by design: most are not I/O); `unretrieved` counts calls the
+    helper's corpus knows are I/O and its tables do not retrieve, keyed by
+    surface (`io.ReadAll`). The counts are whole-repo even under
+    `--incremental`, but a warm pass that re-parsed no file of a language has
+    no row for it: absent means not measured this run, never zero.
+  - `dependency_trees_uninstalled`: workspaces that declare dependencies
+    with no installed tree, summed across languages. Non-zero means the
+    TypeScript retriever resolved those workspaces' client types from import
+    syntax: the packets are tier `medium`, carry no `client_version`, and
+    are not filtered by awaitability. `lang_status` still says `scanned`,
+    so this is the field that tells such a scan from a fully resolved one.
+    On a warm (`--incremental`) scan it counts what the retrievers that ran
+    this pass reported; the packet index does not record the dependency
+    state behind a reused packet.
+  - `config.abstain.vocabulary_only`: config settings whose key is emitted
+    as evidence and deliberately never judged. They have no spec by design,
+    so they are counted apart from `no_spec` and never appear in
+    `no_spec_keys`. `rvl cache keys` lists which keys carry the marker and
+    why.
+  - `structure`: the repo-structure lane's verdict counts (`total`,
+    `violates`, `satisfies`, `abstain`, `not_applicable`), one control each.
+    It mirrors the `structure:` line of the COVERAGE block. Null when the
+    lane did not run.
+- `structure` is the repo-structure lane: one eval row per control (RC-033,
+  RC-057, RC-058, RC-034, RC-070, RC-006) in that order, with the same five
+  fields as a `sites` row. `site_id` is always `repo`, because the lane
+  judges the repository and not a location, so `class`
+  (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
+  `satisfies`, `abstain` and `not_applicable` included, and the rows are
+  pre-waiver engine truth. The violations among them are also ladder rows in
+  `findings`, post-waiver. The rows are kept out of `sites` on purpose:
+  `coverage.resolved`, `coverage.total`, `undecided` and `covered_classes`
+  count call sites only. The array is empty when the lane did not run
+  (`--changed-only`, or a `--retrieved` stream with no `repo_structure`
+  record). An empty array never means that the repository satisfies the
+  controls. To score the lane, run
+  `rvl-eval score --lane structure --findings <scan.json> --gold <gold.json>`;
+  a gold case id is a control code (`RC-033`) or the full class.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime
@@ -134,6 +205,13 @@ The orchestrator uses it to:
 - `hook_agent` is the hook-adjudication block as rendered text, present when
   `--hook` ran with the agent lane enabled and verdicts to show (verdicts are
   provenance-tagged and separate, exactly as rendered). Null otherwise.
+- `blend` is present when `rvl scan --blend` ran, null otherwise. It is a
+  status report, not findings: `complete` (bool), `reason` (why the blend
+  is incomplete, else null), `agent` (the agent consulted, else null), the
+  counts `in_scope`, `sent`, `cleared`, `warned`, `undecided` and
+  `out_of_scope`, and `block`, the BLEND section as rendered text.
+  `complete: false` means the report is the deterministic half alone.
+  Nothing in `findings`, `sites` or `undecided` changes because of it.
 - `exit` duplicates the process exit code so a consumer holding only the file
   knows whether the gate fired (`0` clean, `3` blocking).
 
@@ -148,8 +226,9 @@ The orchestrator uses it to:
   spec-lane findings it is the producing spec's identity
   (`client_type.method`, the waiver key, e.g. `net/http.Client.Do`); for
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
-  `emission.`, `repo_structure.`, `config.`). The server's precision arm
+  `emission.`, `unsized.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
+  The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
 - Consumers MUST ignore unknown fields.
 
 ## What this contract deliberately excludes

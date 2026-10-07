@@ -29,12 +29,57 @@ used.
   rvl surfaces that error rather than silently under-reporting a detected
   C/C++ repo.
 - **Pinning discipline:** a dev build uses the system libclang (floor:
-  libclang 6.0, the `clang_6_0` API feature). RELEASE artifacts must vendor a
-  pinned, checksummed LLVM build so scan results are reproducible across
-  machines — that packaging rides its own bead; nothing in this crate may
-  grow a dependency on system-specific clang behavior beyond the C API.
+  libclang 6.0, the `clang_6_0` API feature). RELEASE archives vendor a
+  pinned, checksummed libclang so scan results are reproducible across
+  machines (see "Release engine" below). Nothing in this crate may grow a
+  dependency on system-specific clang behavior beyond the C API.
 - `--engine-check` exists so callers (tests, doctors) can probe the engine
-  cheaply; engine-dependent tests SKIP with a log line when it fails.
+  cheaply; engine-dependent tests SKIP with a log line when it fails. It
+  prints one line: the clang version, then which engine loaded it —
+  `[vendored <path>]`, `[system]` or `[LIBCLANG_PATH <path>]`.
+
+## Release engine: the vendored libclang (po-av01j.49)
+
+**Pinned version: LLVM 18.1.1**, for every release target.
+[`libclang.pin`](libclang.pin) is the single source of truth: per Rust
+target triple, the library download and its sha256, plus the clang source
+tarball whose `lib/Headers` supplies the builtin headers. The comments in
+that file say where each artifact comes from and why.
+
+Release CI (`.github/build-setup.yml`) runs
+[`ci/fetch-libclang.sh <triple> crates/rvl/dist-extras`](../../ci/fetch-libclang.sh)
+before `dist build`. It checks every download against the pin, fails the
+release on any mismatch, and only then writes the bundle, which dist's
+`include` packs beside `cindex`:
+
+    rvl-<triple>/
+      rvl  cindex  rustindex  goindex
+      libclang/
+        libclang.so | libclang.dylib   the pinned library
+        include/                       clang 18.1.1 builtin headers (stddef.h ...)
+        LICENSE.TXT                    LLVM's license
+
+Engine resolution at run time (`src/engine.rs`), first match wins:
+
+1. `LIBCLANG_PATH`: an explicit override, used as-is.
+2. `libclang/` beside the **symlink-resolved** `cindex`. Homebrew runs the
+   helper through a link in its `bin`; the bundle sits beside the Caskroom
+   original. A half-present bundle fails closed.
+3. The system libclang. A release build (compiled with
+   `CINDEX_REQUIRE_VENDORED_LIBCLANG`, which release CI sets) never takes this
+   step: with its bundle missing it fails closed, because a release that
+   quietly scans with a different clang is not reproducible.
+
+On the vendored engine every TU also gets `-resource-dir <bundle>`. The
+vendored library reports a relative resource dir and cannot find its own
+builtin headers; without them any TU that includes a libc header takes a
+fatal `'stddef.h' file not found` and still comes back as "parsed".
+
+To bump the pin, change every line of `libclang.pin` together (one LLVM
+version for all targets, the headers from that same version), and run
+`cargo test -p cindex`: `tests/libclang_pin.rs` holds the pinned triples to
+`dist-workspace.toml`'s `targets` and exercises the fetch script's
+fail-closed paths.
 
 ## Compile-database rules (native paths only)
 
@@ -54,6 +99,17 @@ generating the db is user-run tooling (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 - **A TU that fails to parse is COUNTED, never guessed at**: the
   `retrieval_stats` record carries `tus_total` / `tus_parsed` / `tus_failed`,
   and coverage claims stop at what actually parsed.
+- **A TU that parses with errors is COUNTED as incomplete** (po-av01j.138).
+  Clang recovers from an error by dropping the construct: with
+  `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as a
+  multiplication of undeclared identifiers and the statement vanishes, calls
+  and all, leaving no call expression to count. So `tus_parsed` includes
+  `tus_incomplete` (TUs with any error diagnostic, paths in
+  `tus_incomplete_paths`), and `includes_missing` / `decls_unresolved` say
+  why. An incomplete TU still emits the sites that DID resolve, but its zero
+  is never reported as a clean one: `rvl scan` shows the lane as `partial`.
+  `calls_callee_unresolved` counts only calls clang formed whose callee did
+  not resolve; it is not a completeness claim (it was `calls_unresolved`).
 - Files not listed in the db are not scanned: the gate population for C/C++
   is compile-db repos (expansion gate protocol, po-ae75b.2).
 
@@ -69,18 +125,47 @@ emitted, stamped `client_type_resolved: false`:
 - `redis*` (connect/command families) → `hiredis.redisContext`
 - POSIX socket verbs `connect`/`send`/`recv`/`sendto`/`recvfrom`/
   `sendmsg`/`recvmsg` → `posix.socket`
+- `pthread_create` → `posix.pthread` (a G3 `background_job` registration)
 
 Everything else abstains. **C++ without a db is a documented abstention
 class** — a flagless C++ parse is guesswork — counted in
-`cpp_files_skipped_no_db`. POSIX `read`/`write` are deliberately OFF the
-allowlist even in db mode: telling a socket fd from a file fd needs dataflow
-(follow-up bead), and a wrong guess multiplies.
+`cpp_files_skipped_no_db`.
+
+### POSIX `read`/`write`: local fd dataflow (po-av01j.53)
+
+`read` and `write` are not on the identity allowlist, because a socket fd and
+a file fd share them. They are emitted as `posix.socket` only when the fd has
+socket evidence **inside the enclosing function**:
+
+- the first argument is a local variable or a parameter of that function, and
+- the function assigns it the result of `socket`/`accept`/`accept4`, or passes
+  it as the first argument to a socket-only call (`connect`, `bind`, `listen`,
+  `send`, `recv`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`,
+  `getsockopt`, `getpeername`, `getsockname`, `shutdown`), and
+- nothing in the function assigns it a file fd (`open`, `openat`, `creat`,
+  `fileno`, `dup`, `dup2`).
+
+The analysis is flow-insensitive and does not cross function boundaries. A
+struct member (`conn->fd`), a global, a call result, a bare parameter with no
+socket use in the function, and a variable that holds a socket and a file at
+different points all abstain. Each abstention is counted in
+`retrieval_stats.fd_calls_abstained`; none is guessed at, because a wrong
+guess would stamp every file read in the repo as network I/O.
 
 ## What it emits
 
-One JSON object per line (JSONL) to stdout: Site packets plus one
+One JSON object per line (JSONL) to stdout: Site packets, one
+`{"kind":"tu_includes", ...}` record per parsed TU, and one
 `{"kind":"retrieval_stats", ...}` record (consumers route unknown kinds away
-from Site parsing, so the stats record is additive). Every site carries the
+from Site parsing, so these records are additive).
+
+A `tu_includes` record is one TU's edges in the include graph:
+`{"kind":"tu_includes","file":"src/net.c","includes":["include/proto.h", ...]}`.
+`includes` lists the in-repo files the TU includes, transitively, as
+repo-relative sorted paths. Headers outside the repo are not listed. rvl
+stores the list in its packet index (see "Performance posture").
+
+Every site carries the
 schema-v2 contract fields (`packet_schema: 2`, agreeing with
 `rvl_core::PACKET_SCHEMA` and the other helpers):
 
@@ -99,10 +184,72 @@ schema-v2 contract fields (`packet_schema: 2`, agreeing with
   expansion range is flagged. No heuristics, no macro understanding.
 - `snippet`, `enclosing_function_body`, `symbol`, `receiver` — source-level
   provenance, extents read straight from the file.
-- `callers` / `callees` / `client_construction` — **empty in v1** (pyindex
-  precedent): cross-TU graph walking is future work and the keys keep the
+- `callers` / `callees` / `client_construction` — **empty in v1** (as they
+  were in pyindex's v1): cross-TU graph walking is future work and the keys keep the
   shape stable.
+- `site_kind` — absent for a classic G1 client-call site, `"background_job"`
+  for a G3 thread-start registration, `"server_entry"` for a G2 handler
+  registration, `"emission_point"` for a G4 aggregate (all below).
 - `lang` — `"c_cpp"`.
+
+### G4 emission-point aggregates
+
+Log statements ride the same stream, stamped `site_kind: "emission_point"`
+(G1 client-call packets carry no `site_kind` key at all). They are
+AGGREGATES: one packet per enclosing function × framework × category, never
+one per log line. The packet's `line_number`, `func` and `snippet` are those
+of the function's FIRST emission call into that framework, and two
+`const_args` entries with `how: "aggregate"` carry the rest:
+`emission_category` and `emission_count` (the `rvl_core` G4 convention the
+other helpers follow).
+
+| Framework | What counts | `client_type` |
+| --- | --- | --- |
+| syslog | global `syslog` / `vsyslog` | `posix.syslog` |
+| spdlog | `spdlog::logger` members and `spdlog::` free functions `trace`/`debug`/`info`/`warn`/`error`/`critical`/`log`; the `SPDLOG_*` macros, which expand to `logger::log` | `spdlog::logger` |
+| glog | `google::LogMessage::stream()`: what each `LOG`/`PLOG`/`VLOG`/`LOG_IF` statement expands to, once per statement | `google::LogMessage` |
+
+- Identities are resolved, never matched on a bare name in C++: a user's
+  `app::syslog` or `Report::info` abstains. A framework's configuration
+  surface (`openlog`, `set_level`, `flush`) is not an emission.
+- `macro_expansion` is true when ANY counted call sits in a recorded macro
+  expansion, so the macro surfaces (`SPDLOG_*`, `LOG()`) are flagged by the
+  same mechanical ranges as G1 sites.
+- The no-db allowlist tier inventories `syslog` in `.c` files at LOW tier
+  (`client_type_resolved: false`), like every other no-db packet.
+- **The only category is `log`.** `error_capture` (emission on an error path)
+  needs C++ catch-clause analysis, which this helper does not have yet.
+- Not inventoried: a call outside any function (a namespace-scope
+  initializer), and a call with a dependent callee in an uninstantiated
+  template (counted in `calls_unresolved`, as for G1). Calls inside a lambda
+  count toward the enclosing named function.
+
+## G3 background-job sites (po-av01j.51)
+
+A call that STARTS a thread is emitted as a `site_kind: "background_job"`
+packet, on the same stream and with the same fields as a G1 site. A spec
+governs it only when it declares `site_kinds: ["background_job"]`, so a G1
+spec never decides a thread start.
+
+| Registration | `client_type` | `func` | Mode |
+| --- | --- | --- | --- |
+| `pthread_create(...)` | `posix.pthread` | `pthread_create` | compile db (high tier) and no-db allowlist (low tier) |
+| `std::thread t(f, ...)` / `std::thread(f).detach()` / `new std::thread(f)` | `std::thread` | `thread` | compile db only |
+| `std::jthread t(f, ...)` | `std::jthread` | `jthread` | compile db only |
+
+**Registrations only.** The retriever reports where the thread starts. It
+does not analyze the loop the thread runs, so whether the thread is a
+long-lived worker is a judgment for the spec layer (the seed specs answer
+`depends`). Deliberately not emitted:
+
+- The default constructor (`std::thread t;`) starts nothing, and a copy or
+  move constructor only transfers a thread that already runs.
+- `pthread_join` / `pthread_detach` / `join()` / `detach()` are lifecycle
+  calls, not registrations.
+- A thread constructed inside a library header
+  (`std::vector<std::thread>::emplace_back(f)`) sits in a system header:
+  documented abstention. `std::async` and thread-pool libraries are not
+  covered.
 
 ## C/C++ typing tiers
 
@@ -115,7 +262,7 @@ The hardest typing story in the inventory, split into explicit tiers:
 | C++ member call, strong I/O verb (`execute`, `perform`, `request`, …) | emitted at the receiver's declared type | `client_type_resolved: true` |
 | C++ member call, weak verb (`get`, `send`, `query`, …) on an out-of-repo (third-party) type | emitted | `client_type_resolved: true` |
 | **Virtual dispatch** (weak or strong verb) | emitted at the STATIC interface identity | **mid tier:** `provenance.callee_candidates` = 1 + overriding definitions in the TU (>1 = ambiguous dispatch) |
-| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_unresolved`, never guessed | — |
+| **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_callee_unresolved`, never guessed | — |
 | Weak verb on an in-repo, non-virtual type | not emitted (noise floor) | — |
 | No-db `.c` allowlist match | emitted | LOW: `client_type_resolved: false` |
 
@@ -125,18 +272,58 @@ which is exactly the mid-confidence semantics the gate protocol quarantines.
 Uninstantiated templates have no types to ask about — abstention, documented,
 counted.
 
+## G2 server entries: civetweb and mongoose (po-av01j.50)
+
+HTTP handler registrations of the embedded C servers ride the same stream,
+stamped `site_kind: "server_entry"`. rvl routes them to the G2 server-entry
+lane (`rvl_propagate::server_entry`) and never to the G1 client-call lane.
+G1 packets carry no `site_kind` key at all. The set is identity-driven like
+the G1 allowlist, and it is emitted in no-db mode too (LOW tier):
+
+| Call | `client_type` | Route path |
+| --- | --- | --- |
+| `mg_set_request_handler(ctx, uri, handler, cbdata)` (civetweb) | `civetweb.mg_context` | a literal `uri` rides `const_args` (index 1) |
+| `mg_http_listen(mgr, url, fn, fn_data)` (mongoose) | `mongoose.mg_mgr` | none: this is the listener, its routes live in `fn` |
+| `mg_http_match_uri(hm, glob)` (mongoose) | `mongoose.mg_http_message` | a literal `glob` rides `const_args` (index 1) |
+| `mg_match(hm->uri, mg_str(glob), caps)` (mongoose) | `mongoose.mg_http_message` | the literal rides `snippet` |
+
+`mg_match` is mongoose's general glob matcher, so it is gated two ways, both
+mechanical: its first argument must read a field named `uri`, and its
+enclosing function must be one that the same TU passes to `mg_http_listen`
+as the event handler. A method match, or a match outside a registered
+handler, is not emitted. The gate needs resolved declarations, so it does
+not apply in no-db mode.
+
+A mongoose server has no closed route table: the event handler can dispatch
+by `strcmp`, or in another TU. The listener registration therefore stays a
+route registration with no resolvable path, and the lane can find a mongoose
+health endpoint (RC-020 satisfied) but never asserts that one is absent.
+The civetweb C++ wrapper (`CivetServer::addHandler`) is not inventoried.
+
 ## Performance posture
 
-What is implemented now vs deliberately documented for later:
-
-- **Now:** per-TU parse with exact flags; deterministic TU order; site dedup;
+- **Per-TU parse** with exact flags; deterministic TU order; site dedup;
   `--files` filtering re-parses only the named TUs (compile-db entries or
-  no-db `.c` files). Incremental scans ride rvl's existing hash-gate.
-- **Documented, follow-up beads:** per-TU index shards built at `index init`
-  + preamble-cached re-parse (clang's preamble makes header-heavy TUs cheap
-  on re-parse), background re-index via the existing detached-reindex
-  pattern, and header→TU invalidation (a changed `.h` maps to no helper
-  today, so header edits take the full-rescan path rather than guessing).
+  no-db `.c` files).
+- **Per-TU index shards (po-av01j.53).** rvl's packet index holds one entry
+  per TU: the sites in the TU's source file plus the sites in the headers it
+  includes (an inline function's call sits at the header's path). The entry
+  records the content hash of the TU and of every header in its `tu_includes`
+  record. `rvl index init` builds the shards; a warm scan reuses each one
+  whose TU and headers are unchanged, without running this helper.
+- **Header→TU invalidation (po-av01j.53).** A changed header makes stale
+  exactly the TUs whose `tu_includes` record names it, and the next warm scan
+  re-parses those. A header that cannot be read counts as changed. An index
+  entry for a C/C++ file written before the include graph existed is
+  re-parsed once.
+- **Background re-index.** `rvl index reindex --detach --files <changed>` (the
+  existing detached-reindex pattern) accepts a header in the list and adds the
+  TUs the index knows to include it.
+- **Not implemented: preamble-cached re-parse.** A clang preamble lives inside
+  one libclang process, and the C API cannot save it to disk. This helper is a
+  one-shot process that parses each TU once, so a preamble would never be
+  reused. It becomes useful only if the helper becomes a long-lived process,
+  which is a separate decision.
 
 ## Tests
 
@@ -147,6 +334,8 @@ Golden packet tests run the built helper over the
 checked-in fixtures (`testdata/fixture-c`, `fixture-cpp`, `fixture-nodb`)
 and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
-accounting. Engine-dependent tests skip (loudly) without libclang; the pure
+accounting; `testdata/fixture-emission` pins the G4 aggregates (syslog,
+spdlog, glog). `testdata/fixture-server` pins the civetweb/mongoose G2
+server entries and the `mg_match` event-handler gate. Engine-dependent tests skip (loudly) without libclang; the pure
 compile-db plumbing (shell splitting, arg filtering, the allowlist) is unit
 tested and always runs.

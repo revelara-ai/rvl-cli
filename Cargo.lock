@@ -398,7 +398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -831,9 +831,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "2.6.3"
+version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+checksum = "fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22"
 dependencies = [
  "libc",
 ]
@@ -913,7 +913,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -956,13 +956,18 @@ name = "rvl"
 version = "1.2.2"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "cindex",
  "clap",
  "clap_complete",
+ "ed25519-dalek",
+ "flate2",
  "hex",
  "ignore",
  "libc",
+ "rand",
  "rustindex",
+ "rvl-bounds",
  "rvl-cache",
  "rvl-config",
  "rvl-content",
@@ -970,6 +975,7 @@ dependencies = [
  "rvl-data",
  "rvl-emission",
  "rvl-index",
+ "rvl-misuse",
  "rvl-propagate",
  "rvl-skills",
  "rvl-spec",
@@ -981,6 +987,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "rvl-bounds"
+version = "1.2.2"
+dependencies = [
+ "rvl-core",
+ "rvl-spec",
 ]
 
 [[package]]
@@ -1076,6 +1090,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1084,11 +1099,20 @@ version = "1.2.2"
 dependencies = [
  "anyhow",
  "blake3",
+ "flate2",
  "redb",
  "rvl-core",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "rvl-misuse"
+version = "1.2.2"
+dependencies = [
+ "rvl-core",
+ "rvl-spec",
 ]
 
 [[package]]
@@ -1367,7 +1391,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1551,7 +1575,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

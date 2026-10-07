@@ -30,6 +30,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 const BARE_SPEC: &str = r#"{"apis":[{"type":"net/http.Client","method":"Do","site_count":1,"blocking":"yes","bounded_by":["client_config"],"confidence":0.95,"rationale":"Do blocks until the response headers arrive"}],"configs":[{"type":"net/http.Client","bounds":"whole_call","scope":"this_client","confidence":1,"rationale":"net/http.Client has a Timeout field that bounds the entire HTTP request end-to-end."}]}"#;
 
 const FIELDS_SPEC: &str = r#"{"apis":[{"type":"net/http.Client","method":"Do","site_count":1,"blocking":"yes","bounded_by":["client_config"],"confidence":0.95,"rationale":"Do blocks until the response headers arrive"}],"configs":[{"type":"net/http.Client","bounds":"whole_call","scope":"this_client","confidence":1,"fields":["Timeout"],"rationale":"net/http.Client is bounded end-to-end only when Timeout is set."}]}"#;
@@ -178,10 +187,13 @@ fn a_declared_bound_closes_the_bare_type_abstain_over_the_shipped_spec() {
 /// install is broken (a stale GOROOT, say): the other tests in this file do
 /// not need Go, and one dead toolchain must not read as a propagator bug.
 fn goindex_binary(dir: &Path) -> Option<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../helpers/goindex");
+    let src = manifest_dir().join("../../helpers/goindex");
     let bin = dir.join("goindex");
     match Command::new("go")
         .args(["build", "-o"])
+        // A `go` binary locates its own root; an inherited GOROOT naming
+        // another release fails every std package (see cli.rs go_build_command).
+        .env_remove("GOROOT")
         .arg(&bin)
         .arg(".")
         .current_dir(&src)

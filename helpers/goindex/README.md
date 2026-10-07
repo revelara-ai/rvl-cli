@@ -7,6 +7,12 @@ helper decides nothing about reliability, it only says what the code is.
     goindex -root <repo> -retrieve -files a.go,b.go     # incremental reload
     goindex -packet-schema                              # negotiate before loading
 
+`-packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of the helper's Go sources, which the binary embeds. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 Every emitted record carries:
 
 - `packet_schema` — the contract version (currently `2`). rvl absorbs
@@ -33,6 +39,29 @@ Every emitted record carries:
   constant propagation.
 - `macro_expansion` (v2) — whether the site sits inside a macro expansion.
   Always `false` for Go (no macros); mechanical for C/C++ retrievers.
+
+The candidate-extractor tables -- the G1 I/O method names and the G4 emission
+framework list -- are corpus data in `extractor_corpus.json`, embedded at build
+time, not code constants (po-av01j.219). Its `known_unretrieved` list names I/O
+the tables deliberately do not retrieve (`io.ReadAll`), and every `-retrieve`
+run counts those calls on the `repo_config` record's `retrieval` census beside
+`candidates` (call sites emitted) and `calls_resolved` (every call whose callee
+type-resolved). That census is the retrieval denominator: coverage is
+resolution over what these tables retrieve, and the census is how much they
+retrieve. It is computed before any `-files` filter, so it is always whole-repo.
+
+The same file holds `bound_constructors`: the functions whose calls are
+emitted as `site_kind: "unsized_construction"` packets (a connection pool, a
+cache, a read of a whole body). The packet lists the setters and options seen
+in the constructing function. It does not say which one is a bound. See
+"Unsized constructions" in `docs/retrievers.md`.
+
+A discarded error (`_ = f.Close()`, `n, _ := strconv.Atoi(s)`) rides the same
+stream as an aggregate with `site_kind: "misuse_shape"`: one packet per
+function and callee, with `misuse_class: discarded_error` and `misuse_count`
+in `const_args` (`misuse.go`). It is not a call site and is not in the census.
+Whether a discard is legitimate is spec knowledge, so every one is emitted.
+See "Misuse shapes" in `docs/retrievers.md`.
 
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.

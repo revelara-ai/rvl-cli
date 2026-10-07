@@ -1,0 +1,74 @@
+name: SLSA provenance
+
+# Publishes rvl.intoto.jsonl, the SLSA Build Level 3 provenance for every
+# asset of a release, onto that release.
+#
+# This is a cargo-dist CUSTOM POST-ANNOUNCE JOB: it is declared in
+# dist-workspace.toml as `post-announce-jobs = ["./slsa-provenance"]` and
+# called by the generated release.yml after `announce`. `workflow_call` is its
+# ONLY trigger, and release.yml only reaches `announce` on a pushed version
+# tag. The tag guard below is a second lock on the same door.
+#
+# Post-announce and not a publish job, because cargo-dist skips publish jobs on
+# a prerelease and a prerelease binary needs provenance as much as a final one.
+# The cost: if `announce` does not succeed (a failed cask publish, say), the
+# release exists with no provenance until the failed jobs are re-run.
+#
+# The permissions each job holds are granted by the caller, in
+# `github-custom-job-permissions` in dist-workspace.toml. A called workflow
+# cannot hold more than its caller grants, so a change here needs one there.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "cargo-dist plan manifest (unused directly; the subjects are read from the run's artifacts)"
+        required: true
+        type: string
+
+jobs:
+  subjects:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Check out this repo (for ci/slsa-subjects.sh)
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: src
+
+      - name: Fetch this release's dist artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Hash the release assets
+        id: hash
+        run: |
+          set -euo pipefail
+          src/ci/slsa-subjects.sh dist-artifacts > subjects.txt
+          echo "--- provenance subjects ---"
+          cat subjects.txt
+          echo "hashes=$(base64 -w0 subjects.txt)" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    needs: subjects
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: read # the generator reads the workflow run to describe the build
+      id-token: write # Sigstore signs with the run's OIDC identity
+      contents: write # upload rvl.intoto.jsonl to the release
+    # MUST be a release tag, never a commit SHA: the generator verifies its own
+    # ref and refuses to run from anything else. Dependabot bumps it.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.subjects.outputs.hashes }}
+      provenance-name: rvl.intoto.jsonl
+      upload-assets: true
+      upload-tag-name: ${{ github.ref_name }}

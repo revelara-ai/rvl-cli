@@ -1,11 +1,13 @@
 //! Destination-gate scoring: gate-set loading, provenance enforcement
-//! (fail-closed), and per-language precision as a Wilson 95% lower bound.
+//! (fail-closed), and per-language precision as a Wilson 95% lower bound at
+//! the cluster-adjusted effective sample size (po-io8sk.1).
 //!
 //! Contract sources: rvlscan-eval gate-sets/README.md and
 //! docs/POPULATION_TEMPLATE.md (po-3t3oj.10), wayfinder po-ipkfg.1 / po-ipkfg.11.
 
-use crate::stats::wilson_lower_bound;
+use crate::stats::{kish_design_effect, wilson_lower_bound, wilson_lower_bound_at, GATE_ICC};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A pinned source repo inside a gate-set manifest.
@@ -131,9 +133,13 @@ pub struct GoldRow {
     pub adjudicated: AdjudicatedVerdict,
 }
 
+/// The n >= 50 bar (po-ipkfg.1). It applies to the declared sample and to the
+/// effective sample size after the cluster adjustment (po-io8sk.1).
+pub const MIN_SAMPLE: usize = 50;
+
 /// Why a gate run was refused. All refusals are fail-closed: absence of
 /// evidence is refusal, never a skipped check.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Refusal {
     /// The set carries a `withdrawn:` block: retracted after minting by a
     /// human decision (po-av01j.119). Checked before everything else, because
@@ -151,6 +157,17 @@ pub enum Refusal {
     AlreadyConsumed { set_id: String, reason: String },
     /// sample_size below the n>=50 bar (po-ipkfg.1).
     SampleTooSmall(usize),
+    /// The scored rows clear the bar on raw n but not after the cluster
+    /// adjustment (po-io8sk.1): too few (repo, spec class) clusters decide
+    /// them. Distinct from `SampleTooSmall` on purpose. That one reads the
+    /// manifest's own `sample_size`, so a manifest can satisfy it by
+    /// declaration; this one is computed from the engine run.
+    EffectiveSampleTooSmall {
+        n: usize,
+        n_clusters: usize,
+        deff: f64,
+        n_eff: f64,
+    },
     /// Quarantine registry missing or unreadable.
     RegistryUnavailable(String),
     /// Any other required gate input missing, unreadable, or malformed
@@ -158,6 +175,23 @@ pub enum Refusal {
     EvidenceUnreadable(String),
     /// A manifest repo is not in the quarantine registry.
     RepoNotQuarantined(String),
+    /// A manifest pins a repo at a commit other than the registry's
+    /// frozen_sha for it (po-av01j.93): the repo was re-designated after
+    /// minting, or the manifest was edited, and either way the sample may not
+    /// have been drawn from the commit the gate would measure.
+    FrozenShaMismatch {
+        repo: String,
+        pinned: String,
+        registry: String,
+    },
+    /// The set was minted against a newer registry than the run supplied
+    /// (po-av01j.93). The supplied registry is stale or the wrong file, so
+    /// nothing it says about this set's repos is evidence.
+    RegistryVersionAhead {
+        set_id: String,
+        minted_against: u64,
+        supplied: u64,
+    },
     /// A gate-set repo appears in the engine's grounding corpus.
     GroundingOverlap(String),
     /// The artifact under test declares a grounding manifest and the run was
@@ -169,6 +203,10 @@ pub enum Refusal {
     },
     /// Fewer decided adjudications than the manifest's sample_size claims.
     GoldTooSmall { decided: usize, required: usize },
+    /// More decided adjudications than the manifest's sample_size declares
+    /// (po-av01j.92). The sampling frame describes `declared` rows; scoring
+    /// the extra ones reports a number the published frame does not describe.
+    GoldExceedsSample { decided: usize, declared: usize },
     /// A gate set in a language whose retrieval depends on installed packages
     /// pinned a commit but no dependency tree (po-av01j.117). The SHA alone
     /// does not determine the packet stream, so the set is not reproducible.
@@ -192,7 +230,19 @@ impl std::fmt::Display for Refusal {
                 f,
                 "refused: {set_id} is already consumed ({reason}). Gate sets are single-use per version; mint a fresh set rather than re-running this one."
             ),
-            Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < 50"),
+            Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < {MIN_SAMPLE}"),
+            Refusal::EffectiveSampleTooSmall {
+                n,
+                n_clusters,
+                deff,
+                n_eff,
+            } => write!(
+                f,
+                "refused: effective sample size is below {MIN_SAMPLE} (n {n} | n_clusters {n_clusters} | \
+                 deff {deff:.2} | n_eff {n_eff:.1}). One spec decides every site of its class, so the \
+                 {n} scored rows are {n_clusters} (repo, spec class) clusters and carry the evidence of \
+                 {n_eff:.1} independent observations. Mint a set that draws from more repos and spec classes."
+            ),
             Refusal::MissingDepsProvenance { repo, language } => write!(
                 f,
                 "refused: {repo} pins a commit but no dependency tree, and {language} retrieval reads installed packages. \
@@ -208,6 +258,25 @@ impl std::fmt::Display for Refusal {
                 write!(f, "refused (fail-closed): gate evidence unreadable: {e}")
             }
             Refusal::RepoNotQuarantined(r) => write!(f, "refused: {r} not in quarantine registry"),
+            Refusal::FrozenShaMismatch {
+                repo,
+                pinned,
+                registry,
+            } => write!(
+                f,
+                "refused: {repo} is pinned at {pinned} but the quarantine registry freezes it at {registry}. \
+                 The sample may not have been drawn from the commit this run would measure; mint a fresh set \
+                 against the current designation."
+            ),
+            Refusal::RegistryVersionAhead {
+                set_id,
+                minted_against,
+                supplied,
+            } => write!(
+                f,
+                "refused: {set_id} was minted against quarantine registry v{minted_against} but the run \
+                 supplied v{supplied}. The registry is stale or the wrong file; pass the current one."
+            ),
             Refusal::GroundingOverlap(r) => {
                 write!(f, "refused: gate-set repo {r} present in grounding corpus")
             }
@@ -225,6 +294,13 @@ impl std::fmt::Display for Refusal {
                     "refused: only {decided} decided adjudications < sample_size {required}"
                 )
             }
+            Refusal::GoldExceedsSample { decided, declared } => write!(
+                f,
+                "refused: {decided} decided adjudications but the manifest declares sample_size {declared}. \
+                 The sampling frame describes {declared} rows; scoring the other {extra} reports a number \
+                 the frame does not describe. Mint a fresh set whose manifest declares the rows it scores.",
+                extra = decided - declared
+            ),
         }
     }
 }
@@ -394,16 +470,22 @@ pub fn check_manifest_matches_artifact(
     Ok(())
 }
 
-/// Quarantine registry: version + quarantined repo names.
+/// Quarantine registry: version + each quarantined repo's frozen_sha.
 #[derive(Debug)]
 pub struct Registry {
     pub registry_version: u64,
-    pub repos: Vec<String>,
+    /// Repo name -> the frozen_sha it was designated at. A manifest pin is
+    /// checked against it (po-av01j.93).
+    pub repos: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct QuarantinedRepo {
     repo: String,
+    /// Required: rvlscan-eval's own registry tests make it mandatory, and a
+    /// designation without one gives a manifest pin nothing to be checked
+    /// against.
+    frozen_sha: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,9 +501,24 @@ pub fn load_registry(path: &Path) -> Result<Registry, Refusal> {
         .map_err(|e| Refusal::RegistryUnavailable(format!("{}: {e}", path.display())))?;
     let f: QuarantineFile = serde_yaml::from_str(&raw)
         .map_err(|e| Refusal::RegistryUnavailable(format!("{}: {e}", path.display())))?;
+    if let Some(r) = f
+        .quarantined_repos
+        .iter()
+        .find(|r| r.frozen_sha.trim().is_empty())
+    {
+        return Err(Refusal::RegistryUnavailable(format!(
+            "{}: {} has a blank frozen_sha",
+            path.display(),
+            r.repo
+        )));
+    }
     Ok(Registry {
         registry_version: f.registry_version,
-        repos: f.quarantined_repos.into_iter().map(|r| r.repo).collect(),
+        repos: f
+            .quarantined_repos
+            .into_iter()
+            .map(|r| (r.repo, r.frozen_sha))
+            .collect(),
     })
 }
 
@@ -537,12 +634,34 @@ pub fn validate_gate_set(
     if manifest.consumed {
         return Err(Refusal::Consumed(manifest.set_id.clone()));
     }
-    if manifest.sample_size < 50 {
+    if manifest.sample_size < MIN_SAMPLE {
         return Err(Refusal::SampleTooSmall(manifest.sample_size));
     }
+    // Older-than-minted is refused; newer is not, because the registry grows
+    // with every designation. See `registry_version_note` for that case.
+    if manifest.registry_version > registry.registry_version {
+        return Err(Refusal::RegistryVersionAhead {
+            set_id: manifest.set_id.clone(),
+            minted_against: manifest.registry_version,
+            supplied: registry.registry_version,
+        });
+    }
     for pin in &manifest.repos {
-        if !registry.repos.contains(&pin.repo) {
+        let Some(registry_sha) = registry.repos.get(&pin.repo) else {
             return Err(Refusal::RepoNotQuarantined(pin.repo.clone()));
+        };
+        // This is what catches a re-designation since minting, whatever the
+        // registry version says.
+        if !pin
+            .frozen_sha
+            .trim()
+            .eq_ignore_ascii_case(registry_sha.trim())
+        {
+            return Err(Refusal::FrozenShaMismatch {
+                repo: pin.repo.clone(),
+                pinned: pin.frozen_sha.clone(),
+                registry: registry_sha.clone(),
+            });
         }
         // A SHA alone does not determine the packet stream in these languages;
         // see DepsPin. A deps block whose hash is blank pins nothing while
@@ -574,6 +693,46 @@ pub fn validate_gate_set(
         }
     }
     Ok(registry.registry_version)
+}
+
+/// The decided gold rows must be exactly the sample the manifest pre-registers
+/// (po-av01j.92). `>=` read as a safety margin, but it let rows adjudicated
+/// after the draw, under no stated rule, move the number while the published
+/// claim still cited the seeded sample. `Unsure` rows are not part of the
+/// decided sample, so they neither count toward it nor break the match.
+pub fn check_gold_matches_sample(rows: &[GoldRow], sample_size: usize) -> Result<(), Refusal> {
+    let decided = rows
+        .iter()
+        .filter(|r| r.adjudicated != AdjudicatedVerdict::Unsure)
+        .count();
+    match decided.cmp(&sample_size) {
+        std::cmp::Ordering::Less => Err(Refusal::GoldTooSmall {
+            decided,
+            required: sample_size,
+        }),
+        std::cmp::Ordering::Greater => Err(Refusal::GoldExceedsSample {
+            decided,
+            declared: sample_size,
+        }),
+        std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
+/// Annotation for a set minted against an older registry than the one supplied
+/// (po-av01j.93), or `None` when the versions match.
+///
+/// Not a refusal: every designation bumps the version, and `validate_gate_set`
+/// has already checked each pinned repo's SHA against the live registry. But
+/// the header used to print only the live version, which a reader took for the
+/// mint-time one, so the drift is printed next to the number.
+pub fn registry_version_note(manifest: &GateManifest, registry: &Registry) -> Option<String> {
+    (manifest.registry_version != registry.registry_version).then(|| {
+        format!(
+            "WARNING: {} was minted against quarantine registry v{}, this run supplied v{}. \
+             Every pinned SHA still matches its current designation.",
+            manifest.set_id, manifest.registry_version, registry.registry_version
+        )
+    })
 }
 
 /// Gate score for one language.
@@ -608,12 +767,7 @@ pub fn score_gate(rows: &[GoldRow], sample_size: usize, target: f64) -> Result<G
         .filter(|r| r.adjudicated == AdjudicatedVerdict::Unsure)
         .count();
     let n_decided = rows.len() - n_unsure;
-    if n_decided < sample_size {
-        return Err(Refusal::GoldTooSmall {
-            decided: n_decided,
-            required: sample_size,
-        });
-    }
+    check_gold_matches_sample(rows, sample_size)?;
     let confirmed = rows
         .iter()
         .filter(|r| r.adjudicated == AdjudicatedVerdict::Violates)
@@ -652,6 +806,26 @@ pub struct JoinedRow {
     pub line_number: u64,
     pub adjudicated: AdjudicatedVerdict,
     pub engine: EngineSaid,
+    /// (repo, spec class) of the engine site that decided this location.
+    /// `None` only when the engine has no site here.
+    pub cluster: Option<(String, String)>,
+}
+
+/// One engine site, as the join needs it: where it is, whether the engine
+/// flagged it, and which cluster decided it.
+///
+/// THE CLUSTER KEY IS (repo, spec class) (po-io8sk.1). One spec decides every
+/// site of its class, and a repo applies one coding habit to all of them, so
+/// rows that share both are one decision observed many times. A stream that
+/// carries no repo identity leaves `repo` empty and clusters on the class
+/// alone: fewer clusters, a smaller n_eff, the fail-closed direction.
+#[derive(Debug, Clone)]
+pub struct EngineSite {
+    pub file_path: String,
+    pub line_number: u64,
+    pub flagged: bool,
+    pub repo: String,
+    pub class: String,
 }
 
 /// Engine-measured gate score (po-av01j.95).
@@ -674,7 +848,14 @@ pub struct EngineGateScore {
     /// means the gold and the checkout have drifted apart.
     pub unmatched: usize,
     pub n_unsure: usize,
+    /// (repo, spec class) clusters among the scored rows.
+    pub n_clusters: usize,
+    /// Kish design effect of that clustering at `stats::GATE_ICC`.
+    pub deff: f64,
+    /// n_scored / deff. The n the bound is taken at.
+    pub n_eff: f64,
     pub precision: f64,
+    /// Wilson 95% lower bound at `n_eff`, NOT at `n_scored`.
     pub wilson_lb: f64,
     pub pass: bool,
 }
@@ -696,6 +877,17 @@ pub struct EngineGateScore {
 ///
 /// `Unsure` rows are excluded from both terms, as before: the panel declining
 /// to decide is not evidence either way.
+///
+/// THE BOUND IS TAKEN AT n_eff, NOT AT n (po-io8sk.1). The scored rows are
+/// clustered by (repo, spec class), and 50 violates from 4 specs in 2 repos
+/// are far fewer than 50 independent observations. The Wilson bound on raw n
+/// is too tight for them, so the gate could pass on evidence it did not have.
+/// See `stats::kish_design_effect`. A run whose n_eff is under the n >= 50 bar
+/// is refused, the same as a sample that is too small on its face.
+///
+/// This scores whatever gold it is handed. The caller checks first that the
+/// gold is the pre-registered sample (`check_gold_matches_sample`); the gate
+/// command does so before it consumes the set.
 pub fn score_gate_against_engine(
     joined: &[JoinedRow],
     sample_size: usize,
@@ -735,7 +927,25 @@ pub fn score_gate_against_engine(
         .count();
     let false_positives = scored.len() - confirmed;
     let precision = confirmed as f64 / scored.len() as f64;
-    let wilson_lb = crate::stats::wilson_lower_bound(confirmed as u64, scored.len() as u64);
+
+    let mut cluster_sizes: BTreeMap<&(String, String), usize> = BTreeMap::new();
+    for r in &scored {
+        // A scored row is Flagged, and the join gives every Flagged row the
+        // cluster of the site that flagged it.
+        let key = r.cluster.as_ref().expect("a flagged row has a cluster");
+        *cluster_sizes.entry(key).or_insert(0) += 1;
+    }
+    let sizes: Vec<usize> = cluster_sizes.into_values().collect();
+    let design = kish_design_effect(&sizes, GATE_ICC);
+    if design.n_eff < MIN_SAMPLE as f64 {
+        return Err(Refusal::EffectiveSampleTooSmall {
+            n: design.n,
+            n_clusters: design.n_clusters,
+            deff: design.deff,
+            n_eff: design.n_eff,
+        });
+    }
+    let wilson_lb = wilson_lower_bound_at(precision, design.n_eff);
 
     Ok(EngineGateScore {
         n_scored: scored.len(),
@@ -744,6 +954,9 @@ pub fn score_gate_against_engine(
         no_longer_flagged,
         unmatched,
         n_unsure,
+        n_clusters: design.n_clusters,
+        deff: design.deff,
+        n_eff: design.n_eff,
         precision,
         wilson_lb,
         pass: wilson_lb >= target,
@@ -762,27 +975,34 @@ pub fn score_gate_against_engine(
 ///
 /// One location can carry several sites (different client types, different
 /// verdicts). Flagged wins: if ANY site at that location is a violation, the
-/// engine flagged that location, which is what the panel was shown.
-pub fn join_gold_to_engine(
-    rows: &[GoldRow],
-    engine_sites: &[(String, u64, bool)],
-) -> Vec<JoinedRow> {
+/// engine flagged that location, which is what the panel was shown. The
+/// location's cluster follows the same rule: it is the cluster of the first
+/// site in stream order that flagged it, or of the first site when none did.
+pub fn join_gold_to_engine(rows: &[GoldRow], engine_sites: &[EngineSite]) -> Vec<JoinedRow> {
     use std::collections::HashMap;
-    let mut by_loc: HashMap<(&str, u64), bool> = HashMap::new();
-    for (file, line, flagged) in engine_sites {
-        let e = by_loc.entry((file.as_str(), *line)).or_insert(false);
-        *e = *e || *flagged;
+    let mut by_loc: HashMap<(&str, u64), &EngineSite> = HashMap::new();
+    for site in engine_sites {
+        let e = by_loc
+            .entry((site.file_path.as_str(), site.line_number))
+            .or_insert(site);
+        if site.flagged && !e.flagged {
+            *e = site;
+        }
     }
     rows.iter()
-        .map(|r| JoinedRow {
-            file_path: r.file_path.clone(),
-            line_number: r.line_number,
-            adjudicated: r.adjudicated,
-            engine: match by_loc.get(&(r.file_path.as_str(), r.line_number)) {
-                Some(true) => EngineSaid::Flagged,
-                Some(false) => EngineSaid::NotFlagged,
-                None => EngineSaid::Absent,
-            },
+        .map(|r| {
+            let site = by_loc.get(&(r.file_path.as_str(), r.line_number));
+            JoinedRow {
+                file_path: r.file_path.clone(),
+                line_number: r.line_number,
+                adjudicated: r.adjudicated,
+                engine: match site {
+                    Some(s) if s.flagged => EngineSaid::Flagged,
+                    Some(_) => EngineSaid::NotFlagged,
+                    None => EngineSaid::Absent,
+                },
+                cluster: site.map(|s| (s.repo.clone(), s.class.clone())),
+            }
         })
         .collect()
 }

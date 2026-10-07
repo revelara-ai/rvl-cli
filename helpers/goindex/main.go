@@ -101,13 +101,6 @@ var wholeCallFields = map[string]bool{
 	"DialTimeout_": false,
 }
 
-// I/O methods worth indexing. Kept aligned with scripts/12_go_corpus.py.
-var ioMethods = map[string]bool{
-	"Query": true, "QueryRow": true, "Exec": true,
-	"QueryContext": true, "QueryRowContext": true, "ExecContext": true,
-	"Get": true, "Post": true, "Do": true, "Head": true, "Send": true,
-}
-
 type funcInfo struct {
 	decl       *ast.FuncDecl
 	file       string
@@ -513,7 +506,7 @@ func main() {
 
 	// Lets a consumer negotiate before paying for a load.
 	if *schemaOnly {
-		fmt.Println(PacketSchema)
+		fmt.Print(handshake())
 		return
 	}
 
@@ -579,7 +572,7 @@ func main() {
 			sites = filterToFiles(sites, strings.Split(*files, ","))
 		}
 		emitRetrieved(sites)
-		emitRepoConfig(lastRepoConfig)
+		emitRepoConfig(repoConfigFor(scan, snap))
 		// REPORT THE SKIP ON EVERY PATH, not just the failing ones. Passing
 		// over an empty module is now routine, and a routine skip that says
 		// nothing is how "goindex read one module of seven" would look exactly
@@ -599,6 +592,8 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d retrieved sites from %d of %d module(s)\n",
 			snap, len(sites), len(scan.Loaded), len(scan.Discovered))
+		fmt.Fprintf(os.Stderr, "%s: retrieval %d candidate call sites of %d resolved calls; known I/O not retrieved: %v\n",
+			snap, scan.Census.Candidates, scan.Census.CallsResolved, scan.Census.Unretrieved)
 		return
 	}
 

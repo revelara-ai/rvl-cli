@@ -18,23 +18,50 @@ use std::path::{Path, PathBuf};
 
 use clang_sys::*;
 
+use crate::engine::{self, Source};
 use crate::PACKET_SCHEMA;
+
+/// A loaded engine: its version string and where it came from.
+pub struct Engine {
+    pub version: String,
+    pub source: Source,
+}
 
 /// Load libclang at runtime and report its version string. Fails with
 /// actionable guidance when no library can be found — rvl surfaces this
 /// stderr, so a detected C/C++ repo fails CLOSED rather than silently
-/// under-reporting.
-pub fn load_engine() -> Result<String, String> {
+/// under-reporting. Which library loads is decided by [`crate::engine`]:
+/// LIBCLANG_PATH, then the vendored bundle, then (dev builds only) the system.
+pub fn load_engine() -> Result<Engine, String> {
+    let exe = std::env::current_exe().ok();
+    let source = engine::resolve(
+        std::env::var_os("LIBCLANG_PATH").as_deref(),
+        exe.as_deref(),
+        engine::REQUIRE_VENDORED,
+    )
+    .map_err(|e| format!("cindex requires libclang (engine pin po-ae75b.9): {e}"))?;
     if !clang_sys::is_loaded() {
-        clang_sys::load().map_err(|e| {
-            format!(
+        if let Source::Vendored { lib, .. } = &source {
+            // clang-sys searches only LIBCLANG_PATH when it is set, and a file
+            // path there names that exact library, so this pins the load to
+            // the bundle. Safe to set: nothing else runs yet (the helper is
+            // single-threaded and has not spawned anything).
+            std::env::set_var("LIBCLANG_PATH", lib);
+        }
+        clang_sys::load().map_err(|e| match &source {
+            Source::Vendored { lib, .. } => format!(
+                "cindex could not load its vendored libclang at {}: {e}. \
+                 Reinstall rvl, or point LIBCLANG_PATH at a libclang to override the pin.",
+                lib.display()
+            ),
+            _ => format!(
                 "cindex requires libclang (engine pin po-ae75b.9) and none could be loaded: {e}. \
                  Install one (e.g. `apt install libclang-dev`) or point LIBCLANG_PATH at it."
-            )
+            ),
         })?;
     }
     let version = unsafe { cx_string(clang_getClangVersion()) };
-    Ok(version)
+    Ok(Engine { version, source })
 }
 
 // --- packet shapes (field-for-field with the goindex/pyindex/tsindex contract) ---
@@ -82,6 +109,12 @@ struct SiteOut {
     lang: &'static str,
     const_args: Vec<ConstArgOut>,
     macro_expansion: bool,
+    /// "" = a classic G1 client call (the key is omitted, so G1 packets are
+    /// unchanged); [`SITE_KIND_SERVER_ENTRY`] = a G2 handler registration;
+    /// [`SITE_KIND_BACKGROUND_JOB`] = a G3 thread-start registration;
+    /// [`SITE_KIND_EMISSION`] = a G4 aggregate.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    site_kind: &'static str,
 }
 
 /// Repo-scoped retrieval accounting. Rides the same stream tagged by `kind`;
@@ -95,16 +128,59 @@ struct StatsOut {
     /// "compile_db" | "allowlist"
     mode: &'static str,
     tus_total: u32,
+    /// TUs libclang returned an AST for. INCLUDES the incomplete ones below:
+    /// `tus_parsed - tus_incomplete` is the count of genuinely clean parses.
     tus_parsed: u32,
     /// TUs that failed to parse: counted and documented, never guessed at.
     tus_failed: u32,
-    /// Call expressions whose callee could not be resolved (template-dependent
-    /// callees in uninstantiated templates are the dominant class): documented
-    /// abstentions, never guesses.
-    calls_unresolved: u32,
+    /// Parsed TUs whose parse raised at least one error (po-av01j.138). Clang
+    /// recovers from an error by DROPPING the construct it could not build:
+    /// with `<curl/curl.h>` missing, `CURL *h = curl_easy_init();` parses as
+    /// a multiplication of two undeclared identifiers and the whole statement
+    /// vanishes, call and all. No call expression is left to count, so the
+    /// only record of the loss is the diagnostic. A zero from one of these
+    /// TUs is not a complete zero.
+    tus_incomplete: u32,
+    /// Repo-relative paths behind `tus_incomplete`, sorted.
+    tus_incomplete_paths: Vec<String>,
+    /// `#include` directives that resolved to no file, summed over TUs. The
+    /// usual cause: the repo is scanned without its -dev packages installed.
+    includes_missing: u32,
+    /// Error diagnostics naming an identifier with no visible declaration
+    /// (undeclared identifier or function, unknown type name). Each marks a
+    /// construct clang may have dropped, and every call inside it with it.
+    decls_unresolved: u32,
+    /// Call expressions clang DID form whose callee did not resolve
+    /// (template-dependent callees in uninstantiated templates are the
+    /// dominant class): documented abstentions, never guesses. NOT a
+    /// completeness claim: a call lost to recovery never becomes a call
+    /// expression and so can never be counted here. That is why this was
+    /// renamed from `calls_unresolved`, which read as "no call went
+    /// unresolved" when the parse had silently dropped calls
+    /// (po-av01j.138); `decls_unresolved` and `tus_incomplete` count those.
+    calls_callee_unresolved: u32,
     /// C++ sources seen in no-db mode: a flagless C++ parse is guesswork, so
     /// they are skipped and counted (documented abstention class).
     cpp_files_skipped_no_db: u32,
+    /// POSIX `read`/`write` calls whose fd had no local socket evidence (or
+    /// conflicting evidence): documented abstentions, never guesses.
+    fd_calls_abstained: u32,
+}
+
+/// One parsed TU's edge list in the include graph: the in-repo files it
+/// includes, transitively. rvl keys header -> TU invalidation on this, so a
+/// changed header re-parses exactly the TUs that saw it.
+#[derive(Serialize)]
+struct TuIncludesOut {
+    kind: &'static str,
+    packet_schema: u32,
+    snapshot_id: String,
+    lang: &'static str,
+    /// Repo-relative path of the TU's source file.
+    file: String,
+    /// Repo-relative, sorted, without the TU itself. Headers outside the
+    /// repo (system, toolchain) are not listed.
+    includes: Vec<String>,
 }
 
 // --- compile db ---
@@ -285,8 +361,8 @@ fn load_compile_db(db_path: &Path, root: &Path) -> anyhow::Result<Vec<TuJob>> {
 
 /// The C free-function G1 candidate set: unique unmangled identities mapped
 /// to their client type. Identity-driven by design — C has no receiver to
-/// resolve. POSIX `read`/`write` are deliberately ABSENT: telling a socket fd
-/// from a file fd needs dataflow (documented abstention, follow-up bead).
+/// resolve. POSIX `read`/`write` are deliberately ABSENT: a socket fd and a
+/// file fd share them, so they go through [`fd_is_socket`] instead.
 fn c_family(name: &str) -> Option<&'static str> {
     match name {
         "curl_easy_perform" | "curl_easy_setopt" | "curl_easy_send" | "curl_easy_recv"
@@ -305,6 +381,87 @@ fn c_family(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The fd verbs a socket shares with a file. Emitted as `posix.socket` only
+/// when [`fd_is_socket`] finds local evidence for the fd.
+fn is_fd_verb(name: &str) -> bool {
+    matches!(name, "read" | "write")
+}
+
+/// Calls whose RESULT is a socket fd.
+const SOCKET_SOURCES: &[&str] = &["socket", "accept", "accept4"];
+
+/// Calls whose result is a fd that is NOT a socket. A variable that holds
+/// one of these and a socket in the same function is conflicting evidence.
+const FILE_SOURCES: &[&str] = &["open", "openat", "creat", "fileno", "dup", "dup2"];
+
+/// Calls that only make sense on a socket: an fd passed as their FIRST
+/// argument is one.
+const SOCKET_USERS: &[&str] = &[
+    "connect",
+    "bind",
+    "listen",
+    "accept",
+    "accept4",
+    "send",
+    "recv",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "setsockopt",
+    "getsockopt",
+    "getpeername",
+    "getsockname",
+    "shutdown",
+];
+
+/// The `site_kind` a G3 registration carries (the cross-helper contract value).
+const SITE_KIND_BACKGROUND_JOB: &str = "background_job";
+
+/// The C free-function G3 set: calls that START a background thread, mapped
+/// to their client type. Registrations only — the retriever reports where a
+/// thread starts and never analyzes the loop it runs.
+fn c_job_family(name: &str) -> Option<&'static str> {
+    match name {
+        "pthread_create" => Some("posix.pthread"),
+        _ => None,
+    }
+}
+
+/// Mirrors `rvl_core::SITE_KIND_SERVER_ENTRY`.
+const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
+
+/// The C free-function G2 candidate set: HTTP handler registrations of the
+/// embedded servers, mapped to their framework identity. Identity-driven like
+/// [`c_family`]: each name is a unique unmangled identifier of ONE library
+/// (civetweb and mongoose share the `mg_` prefix, not these names).
+/// RETRIEVAL, not judgement: which path is a health endpoint is the lane's
+/// question. `mg_match` is deliberately ABSENT: it is mongoose's general glob
+/// matcher and is a route only under the event-handler gate in `handle_call`.
+fn server_family(name: &str) -> Option<&'static str> {
+    match name {
+        "mg_set_request_handler" => Some("civetweb.mg_context"),
+        "mg_http_listen" => Some("mongoose.mg_mgr"),
+        "mg_http_match_uri" => Some(MONGOOSE_MESSAGE),
+        _ => None,
+    }
+}
+
+/// The identity of a mongoose route match (`mg_http_match_uri`, gated
+/// `mg_match`): the request message whose URI is matched.
+const MONGOOSE_MESSAGE: &str = "mongoose.mg_http_message";
+
+/// (client type, site kind) of a C free function on any identity table.
+fn c_identity(name: &str) -> Option<(&'static str, &'static str)> {
+    c_family(name)
+        .map(|f| (f, ""))
+        .or_else(|| server_family(name).map(|f| (f, SITE_KIND_SERVER_ENTRY)))
+        .or_else(|| c_job_family(name).map(|f| (f, SITE_KIND_BACKGROUND_JOB)))
+}
+
+/// C++ types whose construction WITH a callable starts a background thread.
+const THREAD_TYPES: &[&str] = &["std::thread", "std::jthread"];
 
 /// Method names that are almost never non-I/O in C++ client code: emitted on
 /// any resolved member call. Mirrors pyindex's strong-verb tier.
@@ -334,6 +491,41 @@ const WEAK_VERBS: &[&str] = &[
     "get", "send", "connect", "call", "run", "query", "invoke", "read", "write", "fetch", "delete",
     "exec", "wait", "recv",
 ];
+
+// --- G4 emission identities ---
+
+/// Mirrors `rvl_core::SITE_KIND_EMISSION`.
+const SITE_KIND_EMISSION: &str = "emission_point";
+
+/// The only category this helper reports. `error_capture` needs to know that
+/// an emission sits on an error path, which waits on C++ catch-clause
+/// analysis (po-av01j.52).
+const EMISSION_CATEGORY_LOG: &str = "log";
+
+/// spdlog's emitting names, shared by `spdlog::logger` members and the free
+/// functions that forward to the default logger. The rest of that surface
+/// (`set_level`, `flush`, `set_pattern`) configures and emits nothing.
+const SPDLOG_EMIT_VERBS: &[&str] = &["trace", "debug", "info", "warn", "error", "critical", "log"];
+
+/// The G4 candidate set: a resolved callee's identity mapped to the framework
+/// its aggregate is filed under. `scope` is the class for a member function
+/// and the namespace path for a free one (`""` = global).
+///
+/// Identity-driven, like [`c_family`]: a C++ name counts only inside its own
+/// namespace or class, so a user's `app::syslog` or `Report::info` abstains.
+/// The macro surfaces need no rule of their own: `SPDLOG_*` expands to a
+/// `logger::log` member call, and every glog `LOG`/`PLOG`/`VLOG`/`LOG_IF`
+/// statement to exactly one `google::LogMessage::stream()` call.
+fn emission_framework(is_method: bool, scope: &str, name: &str) -> Option<&'static str> {
+    match (is_method, scope) {
+        (false, "") if matches!(name, "syslog" | "vsyslog") => Some("posix.syslog"),
+        (false, "spdlog") | (true, "spdlog::logger") if SPDLOG_EMIT_VERBS.contains(&name) => {
+            Some("spdlog::logger")
+        }
+        (true, "google::LogMessage") if name == "stream" => Some("google::LogMessage"),
+        _ => None,
+    }
+}
 
 // --- libclang plumbing ---
 
@@ -365,6 +557,21 @@ unsafe fn loc_parts(
     (path, line, col, off)
 }
 
+/// The `::`-joined namespaces enclosing a declaration; empty at global scope.
+/// Non-namespace parents (an `extern "C"` block) are transparent.
+unsafe fn namespace_path(decl: CXCursor) -> String {
+    let mut parts = Vec::new();
+    let mut cur = clang_getCursorSemanticParent(decl);
+    while clang_Cursor_isNull(cur) == 0 && clang_isTranslationUnit(clang_getCursorKind(cur)) == 0 {
+        if clang_getCursorKind(cur) == CXCursor_Namespace {
+            parts.push(cx_string(clang_getCursorSpelling(cur)));
+        }
+        cur = clang_getCursorSemanticParent(cur);
+    }
+    parts.reverse();
+    parts.join("::")
+}
+
 /// First child of a cursor, if any.
 unsafe fn first_child(cursor: CXCursor) -> Option<CXCursor> {
     extern "C" fn grab(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
@@ -376,27 +583,40 @@ unsafe fn first_child(cursor: CXCursor) -> Option<CXCursor> {
     out
 }
 
-/// Depth-first search for a DeclRefExpr referencing an enum constant.
-unsafe fn find_enum_ref(cursor: CXCursor) -> Option<CXCursor> {
-    if clang_getCursorKind(cursor) == CXCursor_DeclRefExpr {
+/// The direct children of a cursor, in source order.
+unsafe fn children(cursor: CXCursor) -> Vec<CXCursor> {
+    extern "C" fn push(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
+        unsafe { (*(data as *mut Vec<CXCursor>)).push(c) };
+        CXChildVisit_Continue
+    }
+    let mut out: Vec<CXCursor> = Vec::new();
+    clang_visitChildren(cursor, push, &mut out as *mut _ as CXClientData);
+    out
+}
+
+/// Depth-first search for the declaration of kind `target` that a
+/// DeclRefExpr or MemberRefExpr under `cursor` references.
+unsafe fn find_ref_of_kind(cursor: CXCursor, target: CXCursorKind) -> Option<CXCursor> {
+    let kind = clang_getCursorKind(cursor);
+    if kind == CXCursor_DeclRefExpr || kind == CXCursor_MemberRefExpr {
         let r = clang_getCursorReferenced(cursor);
-        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == CXCursor_EnumConstantDecl {
+        if clang_Cursor_isNull(r) == 0 && clang_getCursorKind(r) == target {
             return Some(r);
         }
     }
     extern "C" fn walk(c: CXCursor, _p: CXCursor, data: CXClientData) -> CXChildVisitResult {
-        let found = data as *mut Option<CXCursor>;
+        let state = data as *mut (CXCursorKind, Option<CXCursor>);
         unsafe {
-            if let Some(r) = find_enum_ref(c) {
-                *found = Some(r);
+            if let Some(r) = find_ref_of_kind(c, (*state).0) {
+                (*state).1 = Some(r);
                 return CXChildVisit_Break;
             }
         }
         CXChildVisit_Continue
     }
-    let mut found: Option<CXCursor> = None;
-    clang_visitChildren(cursor, walk, &mut found as *mut _ as CXClientData);
-    found
+    let mut state: (CXCursorKind, Option<CXCursor>) = (target, None);
+    clang_visitChildren(cursor, walk, &mut state as *mut _ as CXClientData);
+    state.1
 }
 
 /// Peel implicit casts / parens down to the interesting expression.
@@ -437,7 +657,7 @@ unsafe fn const_args_of(call: CXCursor) -> Vec<ConstArgOut> {
     let mut out = Vec::new();
     for i in 0..n.min(8) {
         let arg = clang_Cursor_getArgument(call, i as c_uint);
-        if let Some(e) = find_enum_ref(arg) {
+        if let Some(e) = find_ref_of_kind(arg, CXCursor_EnumConstantDecl) {
             out.push(ConstArgOut {
                 index: i as u32,
                 name: String::new(),
@@ -485,6 +705,121 @@ unsafe fn const_args_of(call: CXCursor) -> Vec<ConstArgOut> {
     out
 }
 
+// --- fd dataflow (POSIX read/write) ---
+
+/// A declaration's identity inside one TU: the file and byte offset it is
+/// spelled at. Locals have no stable USR across libclang versions.
+type DeclKey = (String, u32);
+
+unsafe fn decl_key(decl: CXCursor) -> DeclKey {
+    let (path, _, _, off) = loc_parts(clang_getCursorLocation(decl), clang_getExpansionLocation);
+    (path, off)
+}
+
+/// What one function's body says about the fds it names.
+#[derive(Default)]
+struct FdEvidence {
+    /// Variables assigned a socket, or handed to a socket-only call.
+    socket: HashSet<DeclKey>,
+    /// Variables assigned a non-socket fd.
+    file: HashSet<DeclKey>,
+}
+
+/// The local variable or parameter an expression names, if it is exactly that.
+unsafe fn local_ref(expr: CXCursor) -> Option<DeclKey> {
+    let e = peel(expr);
+    if clang_getCursorKind(e) != CXCursor_DeclRefExpr {
+        return None;
+    }
+    let decl = clang_getCursorReferenced(e);
+    let kind = clang_getCursorKind(decl);
+    (kind == CXCursor_VarDecl || kind == CXCursor_ParmDecl).then(|| decl_key(decl))
+}
+
+/// The callee name of an expression that is exactly a call. A call spells its
+/// callee's name whether or not the callee resolved (no-db mode).
+unsafe fn call_name(expr: CXCursor) -> Option<String> {
+    let e = peel(expr);
+    (clang_getCursorKind(e) == CXCursor_CallExpr).then(|| cx_string(clang_getCursorSpelling(e)))
+}
+
+/// Walk one function body and collect its fd evidence. FLOW-INSENSITIVE on
+/// purpose: order inside the function is not modelled, so a variable that
+/// holds both a socket and a file at different points is conflicting and
+/// [`fd_is_socket`] abstains on it.
+unsafe fn collect_fd_evidence(cursor: CXCursor, st: &mut WalkState, ev: &mut FdEvidence) {
+    let kids = children(cursor);
+    let kind = clang_getCursorKind(cursor);
+    let record = |key: DeclKey, source: &str, ev: &mut FdEvidence| {
+        if SOCKET_SOURCES.contains(&source) {
+            ev.socket.insert(key);
+        } else if FILE_SOURCES.contains(&source) {
+            ev.file.insert(key);
+        }
+    };
+    if kind == CXCursor_VarDecl {
+        // `int s = socket(...)`: the initializer is the last child.
+        if let Some(source) = kids.last().and_then(|init| call_name(*init)) {
+            record(decl_key(cursor), &source, ev);
+        }
+    } else if kind == CXCursor_BinaryOperator && kids.len() == 2 {
+        // `s = accept(...)`. The C API floor (libclang 6) cannot name the
+        // operator, so the text between the operands must be exactly `=`.
+        if let (Some(key), Some(source)) = (local_ref(kids[0]), call_name(kids[1])) {
+            let (lp, _, _, l_end) = loc_parts(
+                clang_getRangeEnd(clang_getCursorExtent(kids[0])),
+                clang_getFileLocation,
+            );
+            let (rp, _, _, r_start) = loc_parts(
+                clang_getRangeStart(clang_getCursorExtent(kids[1])),
+                clang_getFileLocation,
+            );
+            if lp == rp && st.source_slice(&lp, l_end, r_start, 16).trim() == "=" {
+                record(key, &source, ev);
+            }
+        }
+    } else if kind == CXCursor_CallExpr
+        && SOCKET_USERS.contains(&cx_string(clang_getCursorSpelling(cursor)).as_str())
+        && clang_Cursor_getNumArguments(cursor) > 0
+    {
+        if let Some(key) = local_ref(clang_Cursor_getArgument(cursor, 0)) {
+            ev.socket.insert(key);
+        }
+    }
+    for kid in kids {
+        collect_fd_evidence(kid, st, ev);
+    }
+}
+
+/// Is the fd a `read`/`write` call takes a socket, on LOCAL evidence alone?
+///
+/// True only when the first argument is a local variable or parameter of the
+/// enclosing function, that function assigns it a socket (`socket`, `accept`)
+/// or hands it to a socket-only call (`connect`, `send`, ...), and nothing in
+/// the function assigns it a file fd. Everything else abstains: a struct
+/// member, a global, an fd that arrives as a bare parameter, a call result.
+/// Inter-procedural provenance is not modelled, and a wrong guess here would
+/// stamp every file read in the repo as network I/O.
+unsafe fn fd_is_socket(call: CXCursor, st: &mut WalkState) -> bool {
+    if clang_Cursor_getNumArguments(call) <= 0 {
+        return false;
+    }
+    let Some(fd) = local_ref(clang_Cursor_getArgument(call, 0)) else {
+        return false;
+    };
+    let Some(func) = st.fn_stack.last().copied() else {
+        return false;
+    };
+    let func_key = decl_key(func);
+    if !st.fd_evidence.contains_key(&func_key) {
+        let mut ev = FdEvidence::default();
+        collect_fd_evidence(func, st, &mut ev);
+        st.fd_evidence.insert(func_key.clone(), ev);
+    }
+    let ev = &st.fd_evidence[&func_key];
+    ev.socket.contains(&fd) && !ev.file.contains(&fd)
+}
+
 // --- the walk ---
 
 struct PendingSite {
@@ -492,6 +827,18 @@ struct PendingSite {
     /// USR of a virtual callee: callee_candidates is finalized after the TU
     /// walk from the override counts (1 + in-TU overriding definitions).
     virtual_usr: Option<String>,
+    /// USR of the enclosing function of a mongoose `mg_match` route match:
+    /// the site is kept only when that function is a registered event
+    /// handler (decided after the TU walk; a handler is usually defined
+    /// before the `mg_http_listen` call that registers it).
+    handler_gate: Option<String>,
+}
+
+/// One G4 aggregate under construction: the packet of the function's FIRST
+/// emission call into a framework, and how many calls it stands for.
+struct EmissionAgg {
+    site: SiteOut,
+    count: u32,
 }
 
 struct WalkState {
@@ -504,13 +851,33 @@ struct WalkState {
     /// base-method USR -> number of overriding definitions seen in this TU.
     override_counts: HashMap<String, u32>,
     pending: Vec<PendingSite>,
-    calls_unresolved: u32,
+    /// G4 aggregates of this TU in first-seen order (the stream must be
+    /// deterministic), indexed by (enclosing function USR, framework).
+    emissions: Vec<EmissionAgg>,
+    emission_index: HashMap<(String, &'static str), usize>,
+    /// USRs of the functions this TU passes to `mg_http_listen` as the event
+    /// handler.
+    http_handlers: HashSet<String>,
+    fd_calls_abstained: u32,
+    /// Per-function fd evidence for the TU being walked, built on the first
+    /// `read`/`write` each function holds.
+    fd_evidence: HashMap<DeclKey, FdEvidence>,
+    /// Included path -> its repo-relative spelling (None outside the repo),
+    /// kept across TUs.
+    include_rel: HashMap<String, Option<String>>,
+    calls_callee_unresolved: u32,
+    /// Per-TU count of `#include` directives that resolved to no file,
+    /// collected in the preprocessing pass.
+    tu_includes_missing: u32,
     file_cache: HashMap<String, Vec<u8>>,
     /// Macro-expansion ranges per file (byte offsets), collected from the
     /// detailed preprocessing record in a first pass. The v2 `macro_expansion`
     /// flag is set mechanically: a site whose offset falls inside one of
     /// these ranges sits in an expansion.
     macro_ranges: HashMap<String, Vec<(u32, u32)>>,
+    /// Appended to every TU's args: the engine's own needs (the vendored
+    /// bundle's `-resource-dir`), after the compile db's flags so they win.
+    engine_args: Vec<String>,
 }
 
 impl WalkState {
@@ -576,7 +943,8 @@ extern "C" fn visitor(
 }
 
 /// Pass 1: collect macro-expansion ranges from the detailed preprocessing
-/// record. Purely mechanical evidence for the v2 `macro_expansion` flag.
+/// record (purely mechanical evidence for the v2 `macro_expansion` flag), and
+/// count the `#include` directives that resolved to no file.
 extern "C" fn macro_visitor(
     cursor: CXCursor,
     _parent: CXCursor,
@@ -594,6 +962,10 @@ extern "C" fn macro_visitor(
                     .or_default()
                     .push((s_off, e_off + 1));
             }
+        } else if clang_getCursorKind(cursor) == CXCursor_InclusionDirective
+            && clang_getIncludedFile(cursor).is_null()
+        {
+            st.tu_includes_missing += 1;
         }
     }
     CXChildVisit_Continue
@@ -632,6 +1004,55 @@ unsafe fn visit(cursor: CXCursor, st: &mut WalkState) {
     }
 }
 
+/// The (client type, site kind) of a C free-function call: the identity
+/// tables, plus `read`/`write` on an fd with local socket evidence. An fd
+/// verb without that evidence is counted as an abstention.
+unsafe fn c_client_type(
+    call: CXCursor,
+    method: &str,
+    st: &mut WalkState,
+) -> Option<(&'static str, &'static str)> {
+    if is_fd_verb(method) {
+        if fd_is_socket(call, st) {
+            return Some(("posix.socket", ""));
+        }
+        st.fd_calls_abstained += 1;
+        return None;
+    }
+    c_identity(method)
+}
+
+/// The in-repo files a parsed TU includes, transitively: repo-relative,
+/// sorted, without the TU's own source file.
+unsafe fn tu_includes(tu: CXTranslationUnit, tu_rel: &str, st: &mut WalkState) -> Vec<String> {
+    extern "C" fn collect(
+        file: CXFile,
+        _stack: *mut CXSourceLocation,
+        _len: c_uint,
+        data: CXClientData,
+    ) {
+        unsafe { (*(data as *mut Vec<String>)).push(cx_string(clang_getFileName(file))) };
+    }
+    let mut paths: Vec<String> = Vec::new();
+    clang_getInclusions(tu, collect, &mut paths as *mut _ as CXClientData);
+    let mut set = std::collections::BTreeSet::new();
+    for p in paths {
+        // TUs share most of their headers; resolve each path once per run.
+        let rel = match st.include_rel.get(&p) {
+            Some(rel) => rel.clone(),
+            None => {
+                let rel = st.rel_path(&p);
+                st.include_rel.insert(p, rel.clone());
+                rel
+            }
+        };
+        if let Some(rel) = rel.filter(|rel| rel != tu_rel) {
+            set.insert(rel);
+        }
+    }
+    set.into_iter().collect()
+}
+
 unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let loc = clang_getCursorLocation(call);
     if clang_Location_isInSystemHeader(loc) != 0 {
@@ -651,19 +1072,64 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
     let client_type: String;
     let mut receiver = String::new();
     let mut virtual_usr: Option<String> = None;
+    let mut handler_gate: Option<String> = None;
+    let site_kind: &'static str;
 
     if callee_resolved {
         let ckind = clang_getCursorKind(callee);
         method = cx_string(clang_getCursorSpelling(callee));
+        let framework = match ckind {
+            k if k == CXCursor_FunctionDecl => {
+                emission_framework(false, &namespace_path(callee), &method)
+            }
+            k if k == CXCursor_CXXMethod => {
+                let class_cur = clang_getCursorSemanticParent(callee);
+                let class = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
+                emission_framework(true, &class, &method)
+            }
+            _ => None,
+        };
+        if let Some(framework) = framework {
+            record_emission(
+                call,
+                framework,
+                method,
+                file_path,
+                exp_line,
+                macro_expansion,
+                st,
+            );
+            return;
+        }
         if method.starts_with("operator") {
             return;
         }
         match ckind {
             k if k == CXCursor_FunctionDecl => {
-                let Some(family) = c_family(&method) else {
+                if let Some((family, kind)) = c_client_type(call, &method, st) {
+                    client_type = family.to_string();
+                    site_kind = kind;
+                } else if method == "mg_match" {
+                    // mongoose's glob matcher is a route match only when it
+                    // matches the request URI inside an event handler. The
+                    // handler half is decided after the TU walk.
+                    let Some(f) = st.fn_stack.last().copied() else {
+                        return;
+                    };
+                    let matches_uri = clang_Cursor_getNumArguments(call) > 0
+                        && find_ref_of_kind(clang_Cursor_getArgument(call, 0), CXCursor_FieldDecl)
+                            .is_some_and(|field| {
+                                cx_string(clang_getCursorSpelling(field)) == "uri"
+                            });
+                    if !matches_uri {
+                        return;
+                    }
+                    handler_gate = Some(cx_string(clang_getCursorUSR(f)));
+                    client_type = MONGOOSE_MESSAGE.to_string();
+                    site_kind = SITE_KIND_SERVER_ENTRY;
+                } else {
                     return;
-                };
-                client_type = family.to_string();
+                }
             }
             k if k == CXCursor_CXXMethod => {
                 if !st.compile_db_mode {
@@ -688,6 +1154,7 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     return;
                 }
                 client_type = type_name;
+                site_kind = "";
                 if is_virtual {
                     virtual_usr = Some(cx_string(clang_getCursorUSR(callee)));
                 }
@@ -700,28 +1167,69 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     }
                 }
             }
-            _ => return, // constructors, destructors, conversions: not G1 calls
+            k if k == CXCursor_Constructor => {
+                // G3: constructing a thread type WITH a callable is the
+                // registration. The default constructor starts nothing and a
+                // copy/move only transfers a thread that already runs. A
+                // thread built inside a library header (`emplace_back`) sits
+                // in a system header and is a documented abstention.
+                if !st.compile_db_mode {
+                    return; // C++ without a db is a documented abstention
+                }
+                let class_cur = clang_getCursorSemanticParent(callee);
+                let type_name = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
+                if !THREAD_TYPES.contains(&type_name.as_str())
+                    || clang_Cursor_getNumArguments(call) < 1
+                    || clang_CXXConstructor_isCopyConstructor(callee) != 0
+                    || clang_CXXConstructor_isMoveConstructor(callee) != 0
+                {
+                    return;
+                }
+                client_type = type_name;
+                site_kind = SITE_KIND_BACKGROUND_JOB;
+            }
+            _ => return, // other constructors, destructors, conversions: not sites
         }
     } else if !st.compile_db_mode {
         // No-db mode: an unresolved callee still SPELLS its name on the call
         // cursor; only the curated extern-C allowlist is trusted at low tier.
         method = cx_string(clang_getCursorSpelling(call));
-        let Some(family) = c_family(&method) else {
+        if let Some(framework) = emission_framework(false, "", &method) {
+            record_emission(
+                call,
+                framework,
+                method,
+                file_path,
+                exp_line,
+                macro_expansion,
+                st,
+            );
+            return;
+        }
+        let Some((family, kind)) = c_client_type(call, &method, st) else {
             if method.is_empty() {
-                st.calls_unresolved += 1;
+                st.calls_callee_unresolved += 1;
             }
             return;
         };
         client_type = family.to_string();
+        site_kind = kind;
     } else {
         // Compile-db mode with an unresolved callee: the uninstantiated
         // template's dependent call lands here. Counted, never guessed.
-        st.calls_unresolved += 1;
+        st.calls_callee_unresolved += 1;
         return;
     }
 
     if method.is_empty() {
         return;
+    }
+    if method == "mg_http_listen" && clang_Cursor_getNumArguments(call) > 2 {
+        // The event handler this listener dispatches to (argument 2).
+        if let Some(f) = find_ref_of_kind(clang_Cursor_getArgument(call, 2), CXCursor_FunctionDecl)
+        {
+            st.http_handlers.insert(cx_string(clang_getCursorUSR(f)));
+        }
     }
 
     let (symbol, enclosing_body) = match st.fn_stack.last().copied() {
@@ -758,21 +1266,128 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
             lang: "c_cpp",
             const_args,
             macro_expansion,
+            site_kind,
         },
         virtual_usr,
+        handler_gate,
     });
 }
 
-/// Parse one TU and drain its sites. Returns None when the TU fails to parse.
+/// Count one emission call toward its (enclosing function, framework)
+/// aggregate. Log statements are the highest-volume site class there is, so
+/// the stream carries one packet per aggregate, never one per log line. A
+/// call outside any function (a namespace-scope initializer) has no function
+/// to aggregate under and is not inventoried.
+unsafe fn record_emission(
+    call: CXCursor,
+    framework: &'static str,
+    method: String,
+    file_path: String,
+    line: u32,
+    macro_expansion: bool,
+    st: &mut WalkState,
+) {
+    let Some(f) = st.fn_stack.last().copied() else {
+        return;
+    };
+    let key = (cx_string(clang_getCursorUSR(f)), framework);
+    let idx = match st.emission_index.get(&key) {
+        Some(&idx) => idx,
+        None => {
+            let site = SiteOut {
+                packet_schema: PACKET_SCHEMA,
+                site_key: format!("{file_path}:{line}:{framework}:{method}"),
+                snapshot_id: st.snapshot.clone(),
+                file_path,
+                line_number: line,
+                symbol: cx_string(clang_getCursorSpelling(f)),
+                method,
+                receiver: String::new(),
+                client_type: framework.to_string(),
+                snippet: extent_text(call, st, 2000),
+                enclosing_function_body: extent_text(f, st, 8000),
+                callers: Vec::new(),
+                callees: Vec::new(),
+                client_construction: Vec::new(),
+                provenance: ProvenanceOut {
+                    client_type_resolved: st.compile_db_mode,
+                    ..Default::default()
+                },
+                lang: "c_cpp",
+                const_args: Vec::new(),
+                macro_expansion: false,
+                site_kind: SITE_KIND_EMISSION,
+            };
+            st.emissions.push(EmissionAgg { site, count: 0 });
+            st.emission_index.insert(key, st.emissions.len() - 1);
+            st.emissions.len() - 1
+        }
+    };
+    let agg = &mut st.emissions[idx];
+    agg.count += 1;
+    // Set when ANY counted call sits in an expansion (rustindex precedent).
+    agg.site.macro_expansion |= macro_expansion;
+}
+
+/// Is this diagnostic about an identifier with no visible declaration? The
+/// libclang C API exposes no diagnostic IDs, so the stable message stems are
+/// matched. A miss here only lowers `decls_unresolved`: the TU is still
+/// marked incomplete by its error count.
+fn is_undeclared_diagnostic(message: &str) -> bool {
+    const STEMS: &[&str] = &[
+        "undeclared identifier",
+        "call to undeclared function",
+        "implicit declaration of function",
+        "unknown type name",
+        "no type named",
+        "no member named",
+        "no template named",
+    ];
+    STEMS.iter().any(|stem| message.contains(stem))
+}
+
+/// What one parsed TU produced: its sites, plus the evidence of how complete
+/// the parse was (po-av01j.138).
+struct TuOutcome {
+    sites: Vec<SiteOut>,
+    /// The in-repo files the TU includes, repo-relative.
+    includes: Vec<String>,
+    /// Error or fatal diagnostics raised by the parse.
+    errors: u32,
+    includes_missing: u32,
+    decls_unresolved: u32,
+}
+
+/// Count the parse's error-severity diagnostics, and the subset that name an
+/// undeclared identifier.
+unsafe fn error_diagnostics(tu: CXTranslationUnit) -> (u32, u32) {
+    let (mut errors, mut undeclared) = (0u32, 0u32);
+    for i in 0..clang_getNumDiagnostics(tu) {
+        let d = clang_getDiagnostic(tu, i);
+        if clang_getDiagnosticSeverity(d) >= CXDiagnostic_Error {
+            errors += 1;
+            if is_undeclared_diagnostic(&cx_string(clang_getDiagnosticSpelling(d))) {
+                undeclared += 1;
+            }
+        }
+        clang_disposeDiagnostic(d);
+    }
+    (errors, undeclared)
+}
+
+/// Parse one TU and drain its sites, with the in-repo files it includes.
+/// Returns None when the TU fails to parse.
 unsafe fn walk_tu(
     index: CXIndex,
     file: &Path,
+    tu_rel: &str,
     args: &[String],
     st: &mut WalkState,
-) -> Option<Vec<SiteOut>> {
+) -> Option<TuOutcome> {
     let path = CString::new(file.to_string_lossy().as_bytes()).ok()?;
     let c_args: Vec<CString> = args
         .iter()
+        .chain(st.engine_args.iter())
         .filter_map(|a| CString::new(a.as_bytes()).ok())
         .collect();
     let arg_ptrs: Vec<*const std::os::raw::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
@@ -800,7 +1415,12 @@ unsafe fn walk_tu(
     st.fn_stack.clear();
     st.override_counts.clear();
     st.pending.clear();
+    st.emissions.clear();
+    st.emission_index.clear();
+    st.http_handlers.clear();
     st.macro_ranges.clear();
+    st.fd_evidence.clear();
+    st.tu_includes_missing = 0;
     let root_cursor = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(
         root_cursor,
@@ -809,10 +1429,16 @@ unsafe fn walk_tu(
     );
     clang_visitChildren(root_cursor, visitor, st as *mut WalkState as CXClientData);
     // Finalize the mid tier: a virtual callee's ambiguity is 1 (its own
-    // definition) + the overriding definitions this TU declares.
-    let sites = st
+    // definition) + the overriding definitions this TU declares. A gated
+    // mongoose route match survives only inside a registered event handler.
+    let mut sites: Vec<SiteOut> = st
         .pending
         .drain(..)
+        .filter(|p| {
+            p.handler_gate
+                .as_ref()
+                .is_none_or(|usr| st.http_handlers.contains(usr))
+        })
         .map(|mut p| {
             if let Some(usr) = p.virtual_usr {
                 p.site.provenance.callee_candidates =
@@ -821,8 +1447,34 @@ unsafe fn walk_tu(
             p.site
         })
         .collect();
+    // Category and count ride const_args (the rvl-core G4 convention).
+    sites.extend(st.emissions.drain(..).map(|mut agg| {
+        agg.site.const_args = vec![
+            ConstArgOut {
+                index: 0,
+                name: "emission_category".to_string(),
+                value: EMISSION_CATEGORY_LOG.to_string(),
+                how: "aggregate",
+            },
+            ConstArgOut {
+                index: 0,
+                name: "emission_count".to_string(),
+                value: agg.count.to_string(),
+                how: "aggregate",
+            },
+        ];
+        agg.site
+    }));
+    let includes = tu_includes(tu, tu_rel, st);
+    let (errors, decls_unresolved) = error_diagnostics(tu);
     clang_disposeTranslationUnit(tu);
-    Some(sites)
+    Some(TuOutcome {
+        sites,
+        includes,
+        errors,
+        includes_missing: st.tu_includes_missing,
+        decls_unresolved,
+    })
 }
 
 /// Bounded walk for no-db mode: `.c` sources parsed with the allowlist tier,
@@ -866,7 +1518,7 @@ fn walk_no_db(root: &Path) -> (Vec<PathBuf>, u32) {
 
 /// Emit the packet stream for `root` to stdout.
 pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
-    load_engine().map_err(|e| anyhow::anyhow!(e))?;
+    let engine = load_engine().map_err(|e| anyhow::anyhow!(e))?;
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("cannot resolve --root {}: {e}", root.display()))?;
@@ -898,15 +1550,25 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         fn_stack: Vec::new(),
         override_counts: HashMap::new(),
         pending: Vec::new(),
-        calls_unresolved: 0,
+        emissions: Vec::new(),
+        emission_index: HashMap::new(),
+        http_handlers: HashSet::new(),
+        fd_calls_abstained: 0,
+        fd_evidence: HashMap::new(),
+        include_rel: HashMap::new(),
+        calls_callee_unresolved: 0,
+        tu_includes_missing: 0,
         file_cache: HashMap::new(),
         macro_ranges: HashMap::new(),
+        engine_args: engine.source.parse_args(),
     };
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut seen_keys: HashSet<String> = HashSet::new();
     let (mut tus_total, mut tus_parsed, mut tus_failed) = (0u32, 0u32, 0u32);
+    let (mut includes_missing, mut decls_unresolved) = (0u32, 0u32);
+    let mut tus_incomplete_paths: Vec<String> = Vec::new();
 
     let index = unsafe { clang_createIndex(0, 0) };
     let mut jobs = jobs;
@@ -924,10 +1586,28 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
             tus_failed += 1;
             continue;
         }
-        match unsafe { walk_tu(index, &job.file, &job.args, &mut st) } {
-            Some(sites) => {
+        match unsafe { walk_tu(index, &job.file, &rel, &job.args, &mut st) } {
+            Some(tu) => {
                 tus_parsed += 1;
-                for s in sites {
+                includes_missing += tu.includes_missing;
+                decls_unresolved += tu.decls_unresolved;
+                // An incomplete TU still emits the sites that DID resolve:
+                // they are real evidence, and dropping them would turn a
+                // partial answer into a bigger false negative. What it must
+                // never do is count as a clean parse.
+                if tu.errors > 0 || tu.includes_missing > 0 {
+                    tus_incomplete_paths.push(rel.clone());
+                }
+                let edges = TuIncludesOut {
+                    kind: "tu_includes",
+                    packet_schema: PACKET_SCHEMA,
+                    snapshot_id: name.to_string(),
+                    lang: "c_cpp",
+                    file: rel,
+                    includes: tu.includes,
+                };
+                writeln!(out, "{}", serde_json::to_string(&edges)?)?;
+                for s in tu.sites {
                     // A header included by many TUs re-emits its sites; the
                     // stream carries each site_key once.
                     if seen_keys.insert(s.site_key.clone()) {
@@ -939,6 +1619,7 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         }
     }
     unsafe { clang_disposeIndex(index) };
+    tus_incomplete_paths.sort();
 
     let stats = StatsOut {
         kind: "retrieval_stats",
@@ -953,8 +1634,13 @@ pub fn run(root: &Path, name: &str, files: &[String]) -> anyhow::Result<()> {
         tus_total,
         tus_parsed,
         tus_failed,
-        calls_unresolved: st.calls_unresolved,
+        tus_incomplete: tus_incomplete_paths.len() as u32,
+        tus_incomplete_paths,
+        includes_missing,
+        decls_unresolved,
+        calls_callee_unresolved: st.calls_callee_unresolved,
         cpp_files_skipped_no_db: cpp_skipped,
+        fd_calls_abstained: st.fd_calls_abstained,
     };
     writeln!(out, "{}", serde_json::to_string(&stats)?)?;
     out.flush()?;
@@ -999,14 +1685,113 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_diagnostics_are_recognized_and_other_errors_are_not() {
+        for m in [
+            "use of undeclared identifier 'CURL'",
+            "call to undeclared function 'curl_easy_init'; ISO C99 and later do not support implicit function declarations",
+            "implicit declaration of function 'foo' is invalid in C99",
+            "unknown type name 'CURL'",
+            "no type named 'Stub' in namespace 'rpc'",
+            "no member named 'perform' in 'Client'",
+        ] {
+            assert!(is_undeclared_diagnostic(m), "{m}");
+        }
+        assert!(!is_undeclared_diagnostic("'curl/curl.h' file not found"));
+        assert!(!is_undeclared_diagnostic("expected ';' after expression"));
+    }
+
+    #[test]
     fn c_family_covers_the_curated_allowlist_and_nothing_else() {
         assert_eq!(c_family("curl_easy_perform"), Some("libcurl.CURL"));
         assert_eq!(c_family("PQexec"), Some("libpq.PGconn"));
         assert_eq!(c_family("redisCommand"), Some("hiredis.redisContext"));
         assert_eq!(c_family("connect"), Some("posix.socket"));
-        // read/write are the documented fd-ambiguity abstention.
+        // read/write are never on the identity allowlist: a file fd shares
+        // them, so they go through the fd dataflow instead.
         assert_eq!(c_family("read"), None);
         assert_eq!(c_family("write"), None);
+        assert!(is_fd_verb("read") && is_fd_verb("write"));
+        assert!(!is_fd_verb("recv"));
         assert_eq!(c_family("printf"), None);
+    }
+
+    #[test]
+    fn emission_framework_is_scoped_to_the_framework_identity() {
+        assert_eq!(
+            emission_framework(false, "", "syslog"),
+            Some("posix.syslog")
+        );
+        assert_eq!(
+            emission_framework(false, "", "vsyslog"),
+            Some("posix.syslog")
+        );
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "warn"),
+            Some("spdlog::logger")
+        );
+        // SPDLOG_* macros expand to logger::log.
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "log"),
+            Some("spdlog::logger")
+        );
+        assert_eq!(
+            emission_framework(false, "spdlog", "info"),
+            Some("spdlog::logger")
+        );
+        assert_eq!(
+            emission_framework(true, "google::LogMessage", "stream"),
+            Some("google::LogMessage")
+        );
+        // Configuration surface of a framework is not emission.
+        assert_eq!(emission_framework(false, "", "openlog"), None);
+        assert_eq!(
+            emission_framework(true, "spdlog::logger", "set_level"),
+            None
+        );
+        assert_eq!(emission_framework(false, "spdlog", "set_level"), None);
+        // The same names outside the framework's scope abstain.
+        assert_eq!(emission_framework(false, "app", "syslog"), None);
+        assert_eq!(emission_framework(true, "app::Report", "info"), None);
+        assert_eq!(emission_framework(false, "", "info"), None);
+        assert_eq!(
+            emission_framework(true, "std::stringstream", "stream"),
+            None
+        );
+    }
+
+    #[test]
+    fn c_identity_keeps_thread_starts_off_the_g1_table() {
+        assert_eq!(c_identity("PQexec"), Some(("libpq.PGconn", "")));
+        assert_eq!(
+            c_identity("pthread_create"),
+            Some(("posix.pthread", SITE_KIND_BACKGROUND_JOB))
+        );
+        // A thread start is a G3 registration, never a classic G1 call site.
+        assert_eq!(c_family("pthread_create"), None);
+        // Lifecycle calls around the thread are not registrations.
+        assert_eq!(c_identity("pthread_join"), None);
+        assert_eq!(c_identity("pthread_detach"), None);
+    }
+
+    #[test]
+    fn server_family_names_the_registrations_and_nothing_else() {
+        assert_eq!(
+            server_family("mg_set_request_handler"),
+            Some("civetweb.mg_context")
+        );
+        assert_eq!(server_family("mg_http_listen"), Some("mongoose.mg_mgr"));
+        assert_eq!(
+            server_family("mg_http_match_uri"),
+            Some("mongoose.mg_http_message")
+        );
+        // mg_match is a general glob matcher: it is a route only under the
+        // event-handler gate, never by name alone.
+        assert_eq!(server_family("mg_match"), None);
+        // Plain listeners and starts carry no HTTP route surface.
+        assert_eq!(server_family("mg_listen"), None);
+        assert_eq!(server_family("mg_start"), None);
+        // The two tables are disjoint: a client call is never a server entry.
+        assert_eq!(server_family("curl_easy_perform"), None);
+        assert_eq!(c_family("mg_http_listen"), None);
     }
 }

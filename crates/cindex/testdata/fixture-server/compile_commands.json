@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -c src/civet.c",
+    "file": "src/civet.c"
+  },
+  {
+    "directory": ".",
+    "command": "cc -Ivendor -c src/mongoose_app.c",
+    "file": "src/mongoose_app.c"
+  }
+]

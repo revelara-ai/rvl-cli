@@ -18,6 +18,10 @@ use std::collections::BTreeSet;
 
 use crate::render;
 
+/// The `site_id` of every `structure` row: the lane judges the repository as
+/// a whole, so a row is identified by its `class`, not by a location.
+pub const STRUCTURE_SITE_ID: &str = "repo";
+
 /// Which abstain lever closes an unresolved site. The same classification the
 /// COVERAGE block buckets by; kept as one function so the rendered counts and
 /// the per-site `undecided` rows can never disagree.
@@ -50,15 +54,30 @@ pub struct OutDoc {
     pub sites: Vec<OutSite>,
     pub undecided: Vec<OutUndecided>,
     pub covered_classes: Vec<String>,
+    /// The repo-structure lane (po-av01j.28): one eval row per control
+    /// (RC-033/057/058/034/070/006) with EVERY verdict, satisfies and
+    /// abstain included, pre-waiver. Kept out of `sites` on purpose: these
+    /// rows describe the repo, not a call site, so they must not move
+    /// `coverage.resolved/total`, `undecided` or `covered_classes`. Empty
+    /// when the lane did not run (`--changed-only`, or a `--retrieved`
+    /// stream with no `repo_structure` record). The violations among them
+    /// are also ladder rows in `findings`, post-waiver.
+    pub structure: Vec<OutSite>,
     /// The hook-adjudication agent block verbatim when `--hook` ran; null
     /// otherwise. Provenance-tagged and separate, exactly as rendered.
     pub hook_agent: Option<String>,
+    /// `scan --blend` status (po-av01j.205): complete or not, why, counts,
+    /// and the BLEND block verbatim. Null when `--blend` was not given. A
+    /// status report, not findings: engine rows above are never rewritten.
+    pub blend: Option<crate::blend::BlendSummary>,
 }
 
 /// One per-site eval row. Field names match the old top-level array (and the
 /// rvl-eval `run` emitter) exactly, so harness consumers migrate by reading
-/// `.sites` instead of the document root, nothing else.
-#[derive(Serialize)]
+/// `.sites` instead of the document root, nothing else. The `structure` rows
+/// reuse the shape with `site_id` fixed to [`STRUCTURE_SITE_ID`] and `class`
+/// set to `repo_structure.RC-XXX`, so the one findings loader reads both.
+#[derive(Clone, Debug, Serialize)]
 pub struct OutSite {
     pub site_id: String,
     pub snapshot_id: String,
@@ -102,10 +121,24 @@ pub struct OutLang {
 }
 
 #[derive(Serialize)]
+pub struct OutLangCoverage {
+    pub lang: String,
+    pub resolved: usize,
+    pub total: usize,
+    pub no_spec: usize,
+    /// The resolved rate is ~0 and missing specs are why: the corpus, not the
+    /// scanner, is the lever for this language. A hint, never a gate.
+    pub corpus_gap: bool,
+}
+
+#[derive(Serialize)]
 pub struct OutRetriever {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// How this helper differs from the build this binary ships, when it does
+    /// and a shipped sibling exists to compare against (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -121,6 +154,9 @@ pub struct OutConfigAbstain {
     pub no_spec: usize,
     pub outside_repo: usize,
     pub other: usize,
+    /// Unjudged by design (the key ledger's vocabulary-only marker): not a
+    /// lever, and never part of `no_spec` or `no_spec_keys`.
+    pub vocabulary_only: usize,
 }
 
 #[derive(Serialize)]
@@ -132,6 +168,17 @@ pub struct OutConfig {
     pub unparseable_files: usize,
 }
 
+/// The repo-structure lane's verdict counts, one control each. Mirrors the
+/// COVERAGE block's `structure:` line.
+#[derive(Serialize)]
+pub struct OutStructureCoverage {
+    pub total: usize,
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    pub not_applicable: usize,
+}
+
 #[derive(Serialize)]
 pub struct OutCoverage {
     pub resolved: usize,
@@ -141,11 +188,25 @@ pub struct OutCoverage {
     /// Test files the retrievers skipped, summed across languages
     ///; the per-language split is in the COVERAGE block.
     pub test_files_skipped: usize,
+    /// Workspaces scanned without their installed dependencies, summed
+    /// across languages (po-pk3fp.15). Non-zero means those lanes resolved
+    /// client types from import syntax; the per-language split is in the
+    /// COVERAGE block.
+    pub dependency_trees_uninstalled: usize,
     pub degraded_note: Option<String>,
     pub lang_status: Vec<OutLang>,
+    /// Resolved and no-spec counts per language (po-5csvg). Additive.
+    pub by_language: Vec<OutLangCoverage>,
     pub retrievers: Vec<OutRetriever>,
     pub degraded: Vec<OutDegraded>,
     pub config: Option<OutConfig>,
+    /// The retrieval denominator per language (po-av01j.219): candidate call
+    /// sites the extractor retrieved, out of every call the type checker
+    /// resolved, plus the known I/O it did not retrieve. `resolved`/`total`
+    /// is measured over the retrieved sites only, so quote them together.
+    pub retrieval: Vec<rvl_core::RetrievalCensus>,
+    /// Null when the structure lane did not run.
+    pub structure: Option<OutStructureCoverage>,
 }
 
 /// A site the engine reached and abstained on, with the lever that closes it.
@@ -166,10 +227,12 @@ pub struct OutUndecided {
 fn lang_state_str(s: render::LangState) -> String {
     match s {
         render::LangState::Scanned => "scanned",
+        render::LangState::Partial => "partial",
         render::LangState::Abstained => "abstained",
         render::LangState::Failed => "failed",
         render::LangState::Unsupported => "unsupported",
         render::LangState::NotInstalled => "not_installed",
+        render::LangState::Skipped => "skipped",
     }
     .to_string()
 }
@@ -182,7 +245,9 @@ pub fn build(
     config: Option<&render::ConfigCoverage>,
     propagated: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
+    structure: &[OutSite],
     hook_agent_block: Option<&str>,
+    blend: Option<&crate::blend::BlendSummary>,
     blocked: bool,
 ) -> OutDoc {
     let findings = ladder
@@ -245,6 +310,11 @@ pub fn build(
             },
             generated_skipped: coverage.generated_skipped,
             test_files_skipped: coverage.test_files_skipped.iter().map(|t| t.count).sum(),
+            dependency_trees_uninstalled: coverage
+                .dependencies_uninstalled
+                .iter()
+                .map(|d| d.count)
+                .sum(),
             degraded_note: coverage.degraded_note.clone(),
             lang_status: coverage
                 .lang_status
@@ -255,6 +325,19 @@ pub fn build(
                     detail: s.detail.clone(),
                 })
                 .collect(),
+            by_language: coverage
+                .by_lang
+                .iter()
+                .map(|l| OutLangCoverage {
+                    lang: l.lang.clone(),
+                    resolved: l.resolved,
+                    total: l.total,
+                    no_spec: l.no_spec,
+                    // The ladder prints no lever line under an empty corpus;
+                    // the document must not say otherwise.
+                    corpus_gap: !coverage.empty_api_corpus && l.corpus_is_the_lever(),
+                })
+                .collect(),
             retrievers: coverage
                 .retrievers
                 .iter()
@@ -262,6 +345,7 @@ pub fn build(
                     lang: r.lang.clone(),
                     path: r.path.clone(),
                     source: r.source.clone(),
+                    drift: r.drift.clone(),
                 })
                 .collect(),
             degraded: coverage
@@ -281,15 +365,26 @@ pub fn build(
                     no_spec: c.abstain_no_spec,
                     outside_repo: c.abstain_outside_repo,
                     other: c.abstain_other,
+                    vocabulary_only: c.vocabulary_only,
                 },
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
                 unparseable_files: c.unparseable_files,
+            }),
+            retrieval: coverage.retrieval.clone(),
+            structure: coverage.structure.map(|c| OutStructureCoverage {
+                total: c.total(),
+                violates: c.violates,
+                satisfies: c.satisfies,
+                abstain: c.abstain,
+                not_applicable: c.not_applicable,
             }),
         },
         sites: site_rows,
         undecided,
         covered_classes: covered.into_iter().collect(),
+        structure: structure.to_vec(),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
+        blend: blend.cloned(),
     }
 }
 
@@ -324,6 +419,8 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
+            None,
             None,
             blocked,
         );
@@ -371,10 +468,121 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
+            None,
             None,
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
+    /// po-av01j.219: the retrieval denominator reaches the document beside
+    /// resolved/total, so a consumer never quotes a coverage percentage
+    /// without the extractor scope it was measured over.
+    #[test]
+    fn coverage_carries_the_retrieval_denominator() {
+        let mut cov = render::Coverage::default();
+        let mut unretrieved = std::collections::BTreeMap::new();
+        unretrieved.insert("io.ReadAll".to_string(), 3);
+        cov.retrieval = vec![rvl_core::RetrievalCensus {
+            lang: "go".into(),
+            calls_resolved: 4200,
+            candidates: 97,
+            unretrieved,
+        }];
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        let v = serde_json::to_value(&doc.coverage).unwrap();
+        assert_eq!(v["retrieval"][0]["lang"], "go");
+        assert_eq!(v["retrieval"][0]["candidates"], 97);
+        assert_eq!(v["retrieval"][0]["calls_resolved"], 4200);
+        assert_eq!(v["retrieval"][0]["unretrieved"]["io.ReadAll"], 3);
+    }
+
+    /// The per-language split reaches the document, with the same corpus-gap
+    /// call the ladder's lever line makes (po-5csvg).
+    #[test]
+    fn by_language_carries_the_split_and_the_corpus_gap() {
+        let lc = |lang: &str, resolved, total, no_spec| render::LangCoverage {
+            lang: lang.into(),
+            resolved,
+            total,
+            no_spec,
+        };
+        let mut cov = render::Coverage {
+            by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+            ..Default::default()
+        };
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        let v = serde_json::to_value(&doc.coverage.by_language).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"lang": "Go", "resolved": 900, "total": 1000, "no_spec": 100, "corpus_gap": false},
+                {"lang": "Python", "resolved": 0, "total": 7184, "no_spec": 5173, "corpus_gap": true},
+            ])
+        );
+        cov.empty_api_corpus = true;
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        assert!(!doc.coverage.by_language[1].corpus_gap);
+    }
+
+    /// The structure lane rides its own array (po-av01j.28): repo-level rows
+    /// must not change what the site-shaped fields mean.
+    #[test]
+    fn structure_rows_ride_their_own_array_and_leave_sites_alone() {
+        let row = |control: &str, verdict: &str| OutSite {
+            site_id: STRUCTURE_SITE_ID.into(),
+            snapshot_id: "snap".into(),
+            verdict: verdict.into(),
+            reason: "r".into(),
+            class: format!("repo_structure.{control}"),
+        };
+        let rows = [
+            row("RC-033", "violates"),
+            row("RC-057", "satisfies"),
+            row("RC-034", "abstain"),
+        ];
+        let coverage = render::Coverage {
+            structure: render::StructureCoverage::from_verdicts(
+                rows.iter().map(|r| r.verdict.as_str()),
+            ),
+            ..Default::default()
+        };
+        let doc = build(&[], &coverage, None, &[], &[], &rows, None, None, false);
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["structure"].as_array().unwrap().len(), 3);
+        assert_eq!(v["structure"][0]["site_id"], "repo");
+        assert_eq!(v["structure"][0]["class"], "repo_structure.RC-033");
+        assert_eq!(v["structure"][2]["verdict"], "abstain");
+        assert_eq!(v["sites"].as_array().unwrap().len(), 0);
+        assert_eq!(v["undecided"].as_array().unwrap().len(), 0);
+        assert_eq!(v["covered_classes"].as_array().unwrap().len(), 0);
+        assert_eq!(v["coverage"]["total"], 0);
+        assert_eq!(
+            v["coverage"]["structure"],
+            serde_json::json!({"total": 3, "violates": 1, "satisfies": 1,
+                               "abstain": 1, "not_applicable": 0})
+        );
+    }
+
+    /// A scan whose structure lane did not run says so: an empty array and a
+    /// null summary, never six fabricated abstains.
+    #[test]
+    fn no_structure_lane_is_an_empty_array_and_a_null_summary() {
+        let doc = build(
+            &[],
+            &render::Coverage::default(),
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+        );
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["structure"], serde_json::json!([]));
+        assert!(v["coverage"]["structure"].is_null());
     }
 
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE

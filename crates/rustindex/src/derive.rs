@@ -847,6 +847,7 @@ pub fn derive(
             facts.push(ConfigFact {
                 type_name: c.type_name.clone(),
                 fields: vec![field.clone()],
+                zero_fields: Vec::new(),
                 file: c.file.clone(),
                 line: c.line,
                 source: c.source.clone(),
@@ -863,6 +864,12 @@ pub fn derive(
             // it has no test-path skip to count.
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            // rustindex does not measure a retrieval denominator yet.
+            retrieval: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
+            // The include graph is C/C++ only.
+            tu_includes: Vec::new(),
         },
     }
 }

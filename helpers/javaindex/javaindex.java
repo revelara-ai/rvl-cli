@@ -74,6 +74,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -110,6 +111,51 @@ class JavaIndex {
     // macro_expansion (always false for Java, which has no macros; mechanical
     // for C/C++). v2 is a strict superset of v1.
     static final int PACKET_SCHEMA = 2;
+
+    // contentVersion is the second line of the --packet-schema reply: which
+    // javaindex this is. The schema integer says what SHAPE the stream has. It
+    // does not move when the helper learns a new client surface, so a week-old
+    // javaindex and today's answer the same "2" and scan differently. This is
+    // the first 12 hex digits of the sha256 of this source file. rvl computes
+    // the same value for the copy it ships and warns when the helper it found
+    // is a different one.
+    //
+    // Source-file mode (JEP 330) compiles this file in memory and keeps no
+    // reference to it, so the path is recovered from the launcher's own record
+    // of its command line: "[launcher class] <file> <args...>". Null when that record is absent
+    // or does not name a readable file (a JVM that does not set the property,
+    // or a precompiled class). Then the line is omitted. A wrong version would
+    // be worse than none.
+    static String contentVersion(String[] args) {
+        try {
+            String command = System.getProperty("sun.java.command");
+            if (command == null) {
+                return null;
+            }
+            String tail = args.length == 0 ? "" : " " + String.join(" ", args);
+            if (!command.endsWith(tail)) {
+                return null;
+            }
+            // Some launchers record their own main class first
+            // ("jdk.compiler/com.sun.tools.javac.launcher.Main <file>").
+            String named = command.substring(0, command.length() - tail.length());
+            Path source = Paths.get(named);
+            if (!Files.isRegularFile(source) && named.indexOf(' ') >= 0) {
+                source = Paths.get(named.substring(named.indexOf(' ') + 1));
+            }
+            if (!source.toString().endsWith(".java") || !Files.isRegularFile(source)) {
+                return null;
+            }
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(source));
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < 6; i++) {
+                hex.append(String.format("%02x", digest[i]));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     // Byte cap per emitted snippet, mirroring goindex's maxSnippetBytes.
     static final int MAX_SNIPPET_BYTES = 2400;
@@ -281,6 +327,10 @@ class JavaIndex {
         if (packetSchema) {
             // Let a consumer negotiate the contract before paying for a load.
             System.out.println(PACKET_SCHEMA);
+            String version = contentVersion(args);
+            if (version != null) {
+                System.out.println("content-version " + version);
+            }
             return;
         }
 

@@ -173,7 +173,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                     file_path: rel_path.to_string(),
                     line: 0,
                     unit: format!("step:runs/{idx}"),
-                    key: "step.uses.ref".to_string(),
+                    key: crate::key_ledger::declared("github-actions", "step.uses.ref"),
                     resolved_value: Some(reference),
                     resolution: Resolution::AsAuthored,
                     provenance: vec![ProvenanceStep::new(
@@ -203,7 +203,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         file_path: rel_path.to_string(),
         line: 0,
         unit: unit.to_string(),
-        key: key.to_string(),
+        key: crate::key_ledger::declared("github-actions", key),
         resolved_value: value,
         resolution,
         provenance,

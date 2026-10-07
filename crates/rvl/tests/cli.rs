@@ -1,5 +1,14 @@
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 #[test]
 fn version_flag_reports_name_and_semver() {
     let out = Command::new(env!("CARGO_BIN_EXE_rvl"))
@@ -34,6 +43,10 @@ fn bin() -> Command {
     ] {
         c.env_remove(k);
     }
+    // THE SUITE MUST NOT REACH THE NETWORK (po-av01j.171). A scan on the
+    // signed cache now starts a background cache check; offline turns it
+    // off. auto_sync_cli.rs covers that check against a local server.
+    c.env("RVL_OFFLINE", "1");
     c
 }
 
@@ -81,6 +94,47 @@ fn sync_respects_offline_kill_switch() {
     assert!(stdout.to_lowercase().contains("offline"), "got: {stdout}");
 }
 
+// The standing mint queue is a property of the binary, so it reports with no
+// cache at all; it just has to say that nothing was there to compare against.
+#[test]
+fn cache_keys_lists_the_mint_queue_without_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success(), "cache keys must not need a cache");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("no spec cache installed"), "got: {stdout}");
+    assert!(
+        stdout.contains("kubernetes hpa.min-replicas")
+            && stdout.contains("vocabulary only, not judged"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn cache_keys_json_accounts_for_every_emitted_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["cache", "keys", "--json"])
+        .env("RVL_CACHE_DIR", dir.path())
+        .output()
+        .expect("failed to run rvl");
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let n = |k: &str| doc[k].as_u64().unwrap_or_else(|| panic!("no {k} in {doc}"));
+    assert_eq!(doc["artifact_loaded"], false);
+    assert_eq!(n("specced"), 0);
+    assert_eq!(n("mint_queue") + n("vocabulary_only"), n("emitted"));
+    let keys = doc["keys"].as_array().unwrap();
+    assert_eq!(keys.len() as u64, n("emitted"));
+    assert!(keys.iter().any(|k| k["format"] == "terraform"
+        && k["key"] == "module.source"
+        && k["state"] == "vocabulary_only"));
+}
+
 #[test]
 fn cache_import_refuses_missing_signature() {
     let dir = tempfile::tempdir().unwrap();
@@ -118,6 +172,57 @@ fn write_scan_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path:
     let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"configs":[]}"#).unwrap();
     (packets, specs)
+}
+
+/// po-av01j.28: the structure lane's verdicts reach `--out` as their own
+/// array, every control included, and the call-site fields do not move.
+#[test]
+fn scan_out_carries_the_structure_lane_in_its_own_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets).unwrap();
+    stream.push_str(
+        r#"{"kind":"repo_structure","snapshot_id":"fixture","ecosystems":[],"walk_complete":true}"#,
+    );
+    stream.push('\n');
+    std::fs::write(&packets, stream).unwrap();
+    let out_path = dir.path().join("scan.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("structure: 6 repo controls"),
+        "COVERAGE must summarize the structure lane: {stdout}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = doc["structure"].as_array().expect("structure array");
+    assert_eq!(rows.len(), 6, "one row per control: {rows:?}");
+    for r in rows {
+        assert_eq!(r["site_id"], "repo");
+        assert_eq!(r["snapshot_id"], "fixture");
+        assert!(r["class"]
+            .as_str()
+            .unwrap()
+            .starts_with("repo_structure.RC-"));
+    }
+    assert_eq!(doc["coverage"]["structure"]["total"], 6);
+    // The call-site lane is exactly what it was without the record.
+    assert_eq!(doc["sites"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["coverage"]["total"], 2);
+    assert!(doc["undecided"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|u| !u["class"].as_str().unwrap().starts_with("repo_structure.")));
 }
 
 #[test]
@@ -407,6 +512,17 @@ fn force_next_outside_a_repo_is_refused() {
 
 // --- single-command scan: helper orchestration (po-3t3oj.25) ---
 
+/// `go build`, with any inherited GOROOT dropped. A `go` binary locates its
+/// own root; an exported GOROOT that names another release (a gvm shell whose
+/// PATH resolves to an auto-switched toolchain) makes every std package fail
+/// with "compile: version ... does not match go tool version ...", which is
+/// the host's toolchain and not our helper failing to build.
+fn go_build_command() -> Command {
+    let mut cmd = Command::new("go");
+    cmd.arg("build").env_remove("GOROOT");
+    cmd
+}
+
 /// End-to-end: `rvl scan <dir>` with NO `--retrieved` must detect the Go
 /// source, run goindex itself, and feed the packets into the pipeline. Requires
 /// a `go` toolchain to build the helper; if `go` is absent the test is skipped
@@ -414,7 +530,7 @@ fn force_next_outside_a_repo_is_refused() {
 /// just missing the compiler).
 #[test]
 fn scan_without_retrieved_runs_the_go_helper() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let fixture = goindex_src.join("testdata").join("fixture");
@@ -423,8 +539,8 @@ fn scan_without_retrieved_runs_the_go_helper() {
     // Build goindex from source so the test exercises a real helper run.
     let dir = tempfile::tempdir().unwrap();
     let goindex_bin = dir.path().join("goindex");
-    let build = Command::new("go")
-        .args(["build", "-o"])
+    let build = go_build_command()
+        .args(["-o"])
         .arg(&goindex_bin)
         .arg(".")
         .current_dir(&goindex_src)
@@ -614,6 +730,62 @@ fn scan_detects_planted_secret_and_waiver_suppresses_it() {
     );
 }
 
+/// po-av01j.98: a waiver scoped with `paths:` must match the finding's FILE.
+/// Every other waiver e2e omits `paths:`, which is the always-matches branch,
+/// so the glob being fed `path:line` went unnoticed. An exact path and the
+/// `**/*.env` idiom both suppress; a glob for another directory does not.
+#[test]
+fn path_scoped_waiver_matches_the_finding_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("internal/pay")).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(
+        repo.join("internal/pay/prod.env"),
+        format!("GH_TOKEN=\"{token}\"\n"),
+    )
+    .unwrap();
+
+    let scan = |paths: &str| {
+        std::fs::write(
+            repo.join(".revelara.yaml"),
+            format!(
+                "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n    paths: {paths}\n"
+            ),
+        )
+        .unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (out.status.code(), stdout)
+    };
+
+    for paths in ["[\"internal/pay/prod.env\"]", "[\"**/*.env\"]"] {
+        let (code, stdout) = scan(paths);
+        assert_eq!(
+            code,
+            Some(0),
+            "paths: {paths} must suppress the finding: {stdout}"
+        );
+        assert!(
+            stdout.contains("suppressed"),
+            "paths: {paths} must fold into Suppressed: {stdout}"
+        );
+    }
+
+    let (code, stdout) = scan("[\"other/*.env\"]");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "a waiver scoped to another directory must not suppress: {stdout}"
+    );
+}
+
 // --- exit-code contract (po-av01j.94) ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code
@@ -674,7 +846,6 @@ fn advisory_only_scan_exits_zero() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
@@ -714,17 +885,36 @@ fn advisory_only_scan_exits_zero() {
 /// production corpus rides the LLM factory.
 const SERVER_SPECS_SEED: &str = include_str!("testdata/server_specs_seed.json");
 
+/// A Go packet identity a hand-authored stream in this file claims goindex
+/// emits: (func, client_type, site_kind).
+type GoIdentity = (&'static str, &'static str, &'static str);
+
+/// `mux.HandleFunc(...)`, the G2 route registration.
+const GO_SERVE_MUX_ROUTE: GoIdentity = ("HandleFunc", "net/http.ServeMux", "server_entry");
+/// A `recover()` block, the G4 swallow aggregate.
+const GO_RECOVER_BLOCK: GoIdentity = ("recover", "recover_block", "emission_point");
+/// A method call on a `*slog.Logger`, the G4 log aggregate.
+const GO_SLOG_LOGGER: GoIdentity = ("Warn", "log/slog.Logger", "emission_point");
+
+/// Every Go identity the hand-authored streams use. Each is pinned against
+/// goindex's live output by `go_hand_authored_identities_are_what_goindex_emits`,
+/// so a stream can never encode an identity goindex does not produce
+/// (po-av01j.57).
+const GO_HAND_AUTHORED_IDENTITIES: &[GoIdentity] =
+    &[GO_SERVE_MUX_ROUTE, GO_RECOVER_BLOCK, GO_SLOG_LOGGER];
+
 /// One JSONL server-entry registration record for a fixture stream.
-fn server_entry_line(file: &str, line: u32, method: &str, snippet: &str) -> String {
+fn server_entry_line(file: &str, line: u32, snippet: &str) -> String {
+    let (func, client_type, site_kind) = GO_SERVE_MUX_ROUTE;
     serde_json::json!({
         "snapshot_id": "fixture",
         "file_path": file,
         "line_number": line,
-        "func": method,
-        "client_type": "net/http.ServeMux",
+        "func": func,
+        "client_type": client_type,
         "snippet": snippet,
         "lang": "go",
-        "site_kind": "server_entry",
+        "site_kind": site_kind,
     })
     .to_string()
 }
@@ -742,14 +932,12 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/users", usersHandler)"#,
     ));
     stream.push('\n');
     stream.push_str(&server_entry_line(
         "routes.go",
         11,
-        "HandleFunc",
         r#"mux.HandleFunc("/orders", ordersHandler)"#,
     ));
     stream.push('\n');
@@ -813,15 +1001,15 @@ fn scan_with_health_route_and_limiter_surfaces_no_server_findings() {
     stream.push_str(&server_entry_line(
         "routes.go",
         10,
-        "HandleFunc",
         r#"mux.HandleFunc("/healthz", healthHandler)"#,
     ));
     stream.push('\n');
+    // A ServeMux has no middleware verb (goindex inventories no `Use` on it),
+    // so the stdlib limiter shape is a wrapped handler on a registration.
     stream.push_str(&server_entry_line(
         "routes.go",
         12,
-        "Use",
-        "r.Use(middleware.Throttle(100))",
+        r#"mux.HandleFunc("/users", throttle(usersHandler))"#,
     ));
     stream.push('\n');
     std::fs::write(&packets_path, stream).unwrap();
@@ -936,12 +1124,12 @@ fn output_piped_to_a_truncating_reader_does_not_panic() {
 /// Build goindex from source, or None when no Go toolchain is available (the
 /// test is then skipped with a log line, matching the scan e2e convention).
 fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let goindex_src = workspace.join("helpers").join("goindex");
     let goindex_bin = dir.join("goindex");
-    match Command::new("go")
-        .args(["build", "-o"])
+    match go_build_command()
+        .args(["-o"])
         .arg(&goindex_bin)
         .arg(".")
         .current_dir(&goindex_src)
@@ -963,13 +1151,54 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn goindex_fixture() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
         .join("goindex")
         .join("testdata")
         .join("fixture")
+}
+
+/// Every Go identity a hand-authored stream in this file uses is one goindex
+/// really emits over its fixture. Those streams test the Rust side without a
+/// Go toolchain; this is what keeps them describing goindex's behaviour and
+/// not their author's intent (po-av01j.57).
+#[test]
+fn go_hand_authored_identities_are_what_goindex_emits() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = Command::new(&goindex)
+        .args(["-retrieve", "-name", "fx", "-root"])
+        .arg(goindex_fixture())
+        .output()
+        .expect("failed to run goindex");
+    assert!(
+        out.status.success(),
+        "goindex -retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let emitted: Vec<(String, String, String)> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| p.get("kind").is_none())
+        .map(|p| {
+            let field = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+            (field("func"), field("client_type"), field("site_kind"))
+        })
+        .collect();
+    for &(func, client_type, site_kind) in GO_HAND_AUTHORED_IDENTITIES {
+        assert!(
+            emitted
+                .iter()
+                .any(|(f, t, k)| f == func && t == client_type && k == site_kind),
+            "goindex never emits ({func}, {client_type}, {site_kind}) over its fixture, \
+             so the hand-authored stream using it tests an intent, not goindex: {emitted:?}"
+        );
+    }
 }
 
 /// `index reindex <repo>` with NO --retrieved runs the helpers itself: this is
@@ -1104,6 +1333,51 @@ fn wait_for_indexed(index_dir: &std::path::Path, cache_dir: &std::path::Path, se
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// An index written before the redb 2 -> 4 bump is in a file format the new
+/// engine refuses to open. Every user has one, so the first command after an
+/// upgrade must work AND say why the index is cold, not fail with the storage
+/// engine's "manual upgrade required" (po-av01j.210).
+#[test]
+fn index_status_rebuilds_an_old_format_index_and_says_so() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let index_dir = dir.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    // A real index written by redb 2.6.3; shared with the rvl-index tests.
+    let gz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rvl-index/tests/testdata/packets-redb2.redb.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(gz).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    std::fs::write(index_dir.join("packets.redb"), bytes).unwrap();
+
+    let status = || {
+        bin()
+            .args(["index", "status"])
+            .env("RVL_INDEX_DIR", &index_dir)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl")
+    };
+    let out = status();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "status must succeed: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("0 file(s) indexed"),
+        "a rebuilt index is empty"
+    );
+    assert!(
+        stderr.contains("older on-disk format") && stderr.contains("rebuilt"),
+        "the rebuild must be reported, got: {stderr}"
+    );
+
+    // Once rebuilt, the note does not repeat.
+    let again = status();
+    assert!(again.status.success());
+    assert!(!String::from_utf8_lossy(&again.stderr).contains("rebuilt"));
 }
 
 /// The detached child's log, or a marker when it never wrote one. A detached
@@ -1421,11 +1695,12 @@ fn scan_runs_the_prometheus_family_and_surfaces_missing_for_and_severity() {
         stdout.contains("RC-001"),
         "the seed spec's control rides into the ladder: {stdout}"
     );
-    // The sloth file contributes packets (unspecced: abstentions), and the
-    // alertmanager config is identified without being inventoried.
+    // The sloth file and the alertmanager config contribute packets
+    // (unspecced: abstentions). Alertmanager is an inventoried family
+    // (po-av01j.39), so it is no longer sighted as an unsupported format.
     assert!(
-        stdout.contains("unsupported config formats sighted: alertmanager (1)"),
-        "alertmanager identity sighting: {stdout}"
+        !stdout.contains("unsupported config formats sighted"),
+        "alertmanager is a supported format: {stdout}"
     );
 }
 
@@ -1517,6 +1792,108 @@ fn scan_runs_the_terraform_family_with_seed_specs() {
     assert!(
         !stdout.contains("unsupported config formats sighted: terraform"),
         "supported formats must not be sighted: {stdout}"
+    );
+}
+
+/// A repo with NO supported language: a planted (fake) token so the content
+/// lane has a finding, and Terraform with an unpinned provider and no state
+/// backend. This is the content-only early return in `run_scan`.
+fn write_content_only_terraform_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake token, assembled so no token-shaped literal sits in this source.
+    let token = ["ghp", "_", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"].concat();
+    std::fs::write(repo.join("prod.env"), format!("GH_TOKEN=\"{token}\"\n")).unwrap();
+    std::fs::write(
+        repo.join("main.tf"),
+        "terraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\" }\n  }\n}\n",
+    )
+    .unwrap();
+    repo
+}
+
+/// po-av01j.31: the content-only path used to return before any spec cache
+/// was resolved, so the config lane never ran on the repos it was built for
+/// (pure terraform/.env trees). Both lanes must report in one scan.
+#[test]
+fn content_only_repo_runs_the_config_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"terraform","key":"provider.version-constraint","expect":{"kind":"present"},"confidence":0.9,"control":"RC-045","severity":"medium","fix":"pin provider versions in required_providers","rationale":"an unconstrained provider floats to the newest release"},
+            {"format":"terraform","key":"terraform.backend","expect":{"kind":"present"},"confidence":0.9,"control":"RC-030","severity":"medium","fix":"configure a remote state backend in the terraform block","rationale":"local state cannot be shared, locked, or recovered"}
+        ]
+    }"#).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // The content lane still reports and still blocks...
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "the planted token must still block: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    // ...and the config lane now runs beside it.
+    assert!(
+        stdout.contains("terraform provider.version-constraint"),
+        "unpinned provider must surface on the content-only path: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("terraform terraform.backend"),
+        "missing remote state must surface on the content-only path: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-030"),
+        "the config spec's control rides into the ladder: {stdout}"
+    );
+    assert!(
+        stdout.contains("settings resolved"),
+        "config coverage line: {stdout}"
+    );
+}
+
+/// With no spec cache at all the config lane cannot run, but that must not
+/// cost the content lane its verdict (a fresh install must still catch a
+/// committed token), and the skipped lane must be named, not left silent.
+#[test]
+fn content_only_repo_without_a_spec_cache_still_blocks_and_names_the_skipped_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = write_content_only_terraform_repo(dir.path());
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a missing spec cache must not cost the content lane its verdict: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("secret.github_token"),
+        "content lane must still report: {stdout}"
+    );
+    assert!(
+        stderr.contains("config lane did not run"),
+        "the skipped lane must be named on stderr: {stderr}"
     );
 }
 
@@ -1661,14 +2038,14 @@ fn declared_bound_is_exact_type_and_expiry_scoped() {
 /// timeout re-application). Production specs ride the LLM factory; this file
 /// exists so the e2e tests exercise real verdicts.
 fn background_jobs_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("background_jobs_specs.json")
 }
 
 fn helper_fixture(helper: &str) -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     workspace
         .join("helpers")
@@ -1787,12 +2164,18 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
                 r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":"recover","client_type":"recover_block","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("error_capture", 2)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":20,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("error_capture", 2),
+                f = GO_RECOVER_BLOCK.0,
+                t = GO_RECOVER_BLOCK.1,
+                k = GO_RECOVER_BLOCK.2,
             ),
             format_args!(
-                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":"Error","client_type":"log/slog.Logger","site_kind":"emission_point","const_args":{},"lang":"go"}}"#,
-                cat("log", 7)
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":12,"symbol":"q","func":{f:?},"client_type":{t:?},"site_kind":{k:?},"const_args":{},"lang":"go"}}"#,
+                cat("log", 7),
+                f = GO_SLOG_LOGGER.0,
+                t = GO_SLOG_LOGGER.1,
+                k = GO_SLOG_LOGGER.2,
             ),
         ),
     )
@@ -1849,17 +2232,416 @@ fn scan_surfaces_emission_findings_and_keeps_them_out_of_g1_coverage() {
     assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
 }
 
+// --- misuse lane (error handling and async misuse) ---
+
+/// A `--retrieved` stream carrying misuse-shape packets surfaces one advisory
+/// `misuse.<class>` item per class, under the control its spec names. An
+/// identity the spec allows is not a finding, a class with no spec is not
+/// judged, and the packets stay out of the G1 site count and `--out` rows.
+#[test]
+fn scan_surfaces_misuse_shapes_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let misuse_packet = |line: u32, class: &str, identity: &str, count: u32| {
+        format!(
+            r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":{line},"symbol":"f{line}","func":"x","client_type":{identity:?},"site_kind":"misuse_shape","const_args":[{{"index":0,"name":"misuse_class","value":{class:?},"how":"aggregate"}},{{"index":0,"name":"misuse_count","value":"{count}","how":"aggregate"}}],"lang":"go"}}"#
+        )
+    };
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        [
+            format!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            misuse_packet(20, "discarded_error", "os.Remove", 2),
+            misuse_packet(30, "discarded_error", "encoding/json.Unmarshal", 1),
+            // An identity the spec allows: not a finding, not counted.
+            misuse_packet(40, "discarded_error", "os.File.Close", 7),
+            // A class no spec names: not judged.
+            misuse_packet(50, "missing_await", "coroutine", 1),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""misuse_shapes":["#,
+        r#"{"class":"discarded_error","type":"*","control":"RC-029","role":"violates","confidence":0.9,"rationale":"a discarded error hides a failure"},"#,
+        r#"{"class":"discarded_error","type":"os.File.Close","role":"allowed","confidence":0.9,"rationale":"Close on a file opened for reading"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    assert!(
+        stdout.contains("misuse.discarded_error") && stdout.contains("3 error value(s)"),
+        "the two judged identities collapse into one finding of 3, the allowed one is left out: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-029"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("misuse.missing_await"),
+        "a class with no spec is not judged: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+    assert!(
+        stdout.contains("sites 1 "),
+        "misuse packets leaked into the G1 site list: {stdout}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED misuse-shape corpus (test-grade).
+fn misuse_seed_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("misuse_seed_specs.json")
+}
+
+/// Go, live end to end: goindex inventories the misuse fixture's discarded
+/// errors, the seed specs judge them, and the ladder surfaces one advisory
+/// item. The count pins the rules: only an error-typed discard is counted, a
+/// tuple and a parallel assignment count each error, and the identity the
+/// seed allows (`os.File.Close`) is left out.
+#[test]
+fn live_go_scan_surfaces_discarded_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture().with_file_name("misusefixture"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("misuse.discarded_error")
+            && stdout.contains("7 error value(s) are assigned to a discard, in 5 function(s)"),
+        "eight discards, one of them an allowed Close: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-029"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories the misuse fixture, and the
+/// seed specs judge it. One item per class, each with the total count. The
+/// counts pin the rules that keep the lane honest: a handler that re-raises
+/// and a handler the emission lane counts as a swallow are not overbroad
+/// catches, a call handed to a worker is not on the event loop, a held task
+/// is not forgotten, and an awaited or returned coroutine is not missing its
+/// await.
+#[test]
+fn live_python_scan_surfaces_misuse_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pyindex = helpers_dir().join("pyindex");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_misuse"))
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    for (class, why) in [
+        (
+            "misuse.overbroad_catch",
+            "4 handler(s) catch the root exception type and do not re-raise, in 3 function(s)",
+        ),
+        (
+            "misuse.blocking_in_async",
+            "4 blocking call(s) inside an async function, in 1 function(s)",
+        ),
+        (
+            "misuse.sync_over_async",
+            "3 synchronous wait(s) on async work inside an async function, in 1 function(s)",
+        ),
+        (
+            "misuse.fire_and_forget",
+            "2 async task(s) are started and the result is not held, in 1 function(s)",
+        ),
+        (
+            "misuse.missing_await",
+            "3 async call(s) are never awaited, in 2 function(s)",
+        ),
+    ] {
+        assert!(
+            stdout.contains(class) && stdout.contains(why),
+            "want {class}: {why}\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
+// --- construction-bounds lane (pool, queue, cache, whole-body read) ---
+
+/// A `--retrieved` stream carrying unsized-construction packets surfaces one
+/// advisory `unsized.<class>` item per class with an unbounded construction,
+/// under the control its spec names. A bound set through a non-constant is
+/// credited, and the packets stay out of the G1 site count and `--out` rows.
+#[test]
+fn scan_surfaces_unsized_constructions_and_keeps_them_out_of_g1_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("svc");
+    std::fs::create_dir_all(&src).unwrap();
+    let db_go = src.join("db.go");
+    std::fs::write(&db_go, "package svc\n\nfunc q() { tx.Query(ctx, q) }\n").unwrap();
+    let db = db_go.to_str().unwrap();
+
+    let unsized_packet = |line: u32, t: &str, class: &str, seen: &str| {
+        format!(
+            r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":{line},"symbol":"open","func":"New","client_type":{t:?},"site_kind":"unsized_construction","const_args":[{{"index":0,"name":"bound_class","value":{class:?},"how":"aggregate"}}{seen}],"lang":"go"}}"#
+        )
+    };
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(
+        &packets,
+        [
+            format!(
+                r#"{{"snapshot_id":"fx","file_path":{db:?},"line_number":10,"func":"Query","client_type":"github.com/jackc/pgx/v5.Tx","snippet":"tx.Query(ctx, q)","lang":"go"}}"#
+            ),
+            // A pool with no setter: unbounded.
+            unsized_packet(20, "database/sql.DB", "pool", ""),
+            // A pool bounded through a non-constant: a name, credited.
+            unsized_packet(
+                30,
+                "database/sql.DB",
+                "pool",
+                r#",{"index":0,"name":"SetMaxOpenConns","value":"cfg.Max","how":"name"}"#,
+            ),
+            // A read wrapped in a limiter: bounded, so no `unsized.read`.
+            unsized_packet(
+                40,
+                "io.ReadAll",
+                "read",
+                r#",{"index":0,"name":"io.LimitReader","value":"","how":"call"}"#,
+            ),
+            // A cache no spec names: not judged.
+            unsized_packet(50, "example.com/x.Cache", "cache", ""),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, concat!(
+        r#"{"apis":[{"type":"github.com/jackc/pgx/v5.Tx","method":"Query","site_count":1,"blocking":"yes","bounded_by":["context"],"confidence":0.95,"rationale":"pgx query blocks"}],"#,
+        r#""configs":[],"#,
+        r#""construction_bounds":["#,
+        r#"{"type":"database/sql.DB","class":"pool","control":"RC-055","bounded_by":["SetMaxOpenConns"],"unbounded_values":["0"],"confidence":0.9,"rationale":"sql.DB opens connections without limit by default"},"#,
+        r#"{"type":"io.ReadAll","class":"read","control":"RC-067","bounded_by":["io.LimitReader","net/http.MaxBytesReader"],"confidence":0.9,"rationale":"ReadAll reads until EOF"}"#,
+        r#"]}"#,
+    )).unwrap();
+
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 2 connection pool(s)"),
+        "the unbounded pool must surface, and the named bound must be credited: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-055"),
+        "the finding carries the control its spec names: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unsized.read") && !stdout.contains("unsized.cache"),
+        "a bounded read and an unspecced cache are not findings: {stdout}"
+    );
+    assert!(
+        !stdout.contains("cfg.Max"),
+        "a non-constant bound is a name, its value is never reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "construction-bound findings are advisory: {stdout}"
+    );
+    assert!(
+        stdout.contains("sites 1 "),
+        "unsized-construction packets leaked into the G1 site list: {stdout}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
+}
+
+/// The hand-authored SEED construction-bound corpus (test-grade).
+fn construction_bound_seed_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("construction_bound_seed_specs.json")
+}
+
+/// Go, live end to end: goindex inventories the bounds fixture's pools, caches
+/// and whole-body reads, the seed specs judge them, and the ladder surfaces
+/// one advisory item per class. The counts pin the three rules that keep the
+/// lane honest: a non-constant bound is credited, a value that leaves the
+/// function with a setter on its type elsewhere is not a finding, and an
+/// unbuffered channel is not a queue.
+#[test]
+fn live_go_scan_surfaces_unsized_constructions() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let fixture = goindex_fixture().with_file_name("boundsfixture");
+    let out = bin()
+        .arg("scan")
+        .arg(fixture)
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    // Seven sql.Open calls: one unbounded in scope, two bounded (a literal
+    // and a name), four that leave the function and abstain.
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 7 connection pool(s)"),
+        "only the in-scope unbounded pool is a finding: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("1 of 3 cache(s)"),
+        "only the NoExpiration cache is a finding: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.read") && stdout.contains("2 of 5 whole-body read(s)"),
+        "the bare body and the bufio-wrapped body are findings, the three limited reads are not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unsized.queue"),
+        "make(chan T) is a rendezvous, not an unbounded queue: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "construction-bound findings are advisory: {stdout}"
+    );
+}
+
+/// Python, live end to end: pyindex inventories the bounds fixture's queues,
+/// pools and caches, and the seed specs judge them. The counts pin the rules:
+/// a literal 0 or None is "no limit", a non-constant is credited, `**opts` and
+/// a finite library default are not findings.
+#[test]
+fn live_python_scan_surfaces_unsized_constructions() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP live_python_scan_surfaces_unsized_constructions: no python3");
+        return;
+    }
+    let pyindex = helpers_dir().join("pyindex");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_bounds"))
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("unsized.queue") && stdout.contains("3 of 8 queue(s)"),
+        "Queue(), Queue(maxsize=0) and deque() are the unbounded queues: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("1 of 2 connection pool(s)"),
+        "the bare ConnectionPool() is the unbounded pool: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("2 of 3 cache(s)"),
+        "lru_cache(maxsize=None) and functools.cache are unbounded, bare lru_cache is not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("settings."),
+        "a non-constant bound is a name, its text is never reported as a value: {stdout}"
+    );
+}
+
 /// The hand-authored SEED emission-spec corpus (test-grade; the production
 /// corpus rides the LLM factory, HITL — follow-up bead under po-av01j).
 fn g4_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("g4_seed_specs.json")
 }
 
 fn helpers_dir() -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     manifest
         .parent()
         .and_then(|p| p.parent())
@@ -1870,7 +2652,7 @@ fn helpers_dir() -> std::path::PathBuf {
 /// The SEED corpus declaring UNBOUNDED SENTINELS (po-av01j.25): the values of
 /// an API's own timeout argument that mean no bound.
 fn sentinel_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("sentinel_seed_specs.json")
@@ -1946,6 +2728,95 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
     );
 }
 
+/// The SEED corpus declaring a CAPACITY PRECONDITION (po-av01j.231): the
+/// constructor argument without which a queue's `put` cannot block.
+fn queue_capacity_specs() -> std::path::PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("queue_capacity_specs.json")
+}
+
+/// Python, live end to end: `put` on a `queue.Queue()` built with no maxsize
+/// cannot block, so it is not_applicable, while the same call on a
+/// `queue.Queue(maxsize=10)` with no timeout still violates. A queue that
+/// arrives as a parameter has no construction to read and abstains. The
+/// pilot's site (a queue built in `__init__`, put from another method) is the
+/// fourth row.
+#[test]
+fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("svc.py"),
+        "import queue\nfrom queue import LifoQueue\n\n\n\
+         def unbounded(x):\n    q = queue.Queue()\n    q.put(x)\n\n\n\
+         def bounded(x):\n    q = queue.Queue(maxsize=10)\n    q.put(x)\n\n\n\
+         def sized_by_caller(n, x):\n    stack = LifoQueue(n)\n    stack.put(x)\n\n\n\
+         class Client:\n    \
+             def __init__(self):\n        self._notifications = queue.Queue()\n\n    \
+             def on_notification(self, notification):\n        \
+                 self._notifications.put(notification)\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&src)
+        .arg("--specs-file")
+        .arg(queue_capacity_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env(
+            "RVL_PYINDEX",
+            helpers_dir().join("pyindex").join("pyindex.py"),
+        )
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let by_line = |line: u32| {
+        let rows = verdicts_for(doc["sites"].as_array().unwrap(), &format!("svc.py:{line}"));
+        assert_eq!(rows.len(), 1, "one finding at svc.py:{line}: {rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+
+    let (verdict, reason) = by_line(7);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert_eq!(
+        reason,
+        "cannot block: unbounded queue (queue.Queue constructed with no maxsize at svc.py:6)"
+    );
+
+    let (verdict, reason) = by_line(12);
+    assert_eq!(verdict, "violates", "{reason}");
+    assert_eq!(reason, "no bound anywhere and the search was complete");
+
+    let (verdict, reason) = by_line(17);
+    assert_eq!(verdict, "abstain", "{reason}");
+    assert!(reason.contains("could not be read"), "{reason}");
+
+    let (verdict, reason) = by_line(25);
+    assert_eq!(verdict, "not_applicable", "{reason}");
+    assert!(reason.contains("svc.py:22"), "{reason}");
+}
+
 /// Python e2e: celery's decorator idiom IS the job bound — @shared_task with
 /// time_limit satisfies, the bare @app.task violates, and a classic-call-site
 /// spec (rq.Queue.enqueue, no site_kinds) must never decide a background_job
@@ -1961,7 +2832,7 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let pyindex = workspace.join("helpers").join("pyindex").join("pyindex.py");
     let rows = scan_fixture_findings(
@@ -2000,7 +2871,7 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
         return;
     }
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
@@ -2062,6 +2933,94 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Copy a fixture tree into a scratch directory the test can edit.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// Header -> TU invalidation, end to end with the real cindex (po-av01j.53).
+/// A header edit changes no `.c` file, so the hash gate alone reused every
+/// TU. The index now holds each TU's include list: the edit re-parses the
+/// TUs that include the header, and a header named to `--files` (what the
+/// background warm passes) maps to those TUs.
+#[test]
+fn a_c_header_edit_re_parses_the_tus_that_include_it() {
+    let Some(cindex) = cindex_helper("a_c_header_edit_re_parses_the_tus_that_include_it") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let repo = dir.path().join("repo");
+    copy_tree(
+        &workspace
+            .join("crates")
+            .join("cindex")
+            .join("testdata")
+            .join("fixture-fd"),
+        &repo,
+    );
+    let reindex = |files: Option<&str>| -> String {
+        let mut cmd = bin();
+        cmd.args(["index", "reindex"]).arg(&repo);
+        if let Some(files) = files {
+            cmd.args(["--files", files]);
+        }
+        let out = cmd
+            .env("RVL_CINDEX", &cindex)
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "reindex failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+    let header = repo.join("include").join("proto.h");
+    let edit = |note: &str| {
+        let mut text = std::fs::read_to_string(&header).unwrap();
+        text.push_str(&format!("/* {note} */\n"));
+        std::fs::write(&header, text).unwrap();
+    };
+
+    let cold = reindex(None);
+    assert!(cold.contains("retrieved 2 changed"), "{cold}");
+    let warm = reindex(None);
+    assert!(warm.contains("reused 2 unchanged, retrieved 0"), "{warm}");
+
+    // Both TUs include proto.h: its edit makes both stale.
+    edit("first edit");
+    let after_edit = reindex(None);
+    assert!(
+        after_edit.contains("reused 0 unchanged, retrieved 2 changed"),
+        "a header edit must re-parse the TUs that include it: {after_edit}"
+    );
+
+    // The background warm names the changed file. The two TUs come in
+    // through the index's include graph (the third file is the header).
+    edit("second edit");
+    let named = reindex(Some("include/proto.h"));
+    assert!(named.contains("retrieved 3 changed"), "{named}");
+    let settled = reindex(None);
+    assert!(
+        settled.contains("reused 2 unchanged, retrieved 0"),
+        "{settled}"
+    );
+}
+
 /// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
 /// compile_commands.json, helper via RVL_CINDEX), the seed specs judge
 /// the C identities, and the judgments map the surfaced classes to RC-019 /
@@ -2074,7 +3033,7 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let fixture = workspace
         .join("crates")
@@ -2142,6 +3101,102 @@ fn scan_decides_c_sites_end_to_end_with_seed_specs() {
     assert!(
         stdout.contains("RC-022"),
         "the hiredis retry class must surface control-mapped: {stdout}"
+    );
+}
+
+/// C G3 e2e (po-av01j.51): the `pthread_create` registration cindex emits as
+/// a background_job site is decided by the job-altitude seed spec and by
+/// nothing else. The seed is `depends` (the retriever does no loop-body
+/// analysis), so the site routes to per-site judgment.
+#[test]
+fn scan_decides_c_background_job_sites_end_to_end() {
+    let Some(cindex) = cindex_helper("scan_decides_c_background_job_sites_end_to_end") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-c");
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(manifest.join("tests/fixtures/c_seed_specs.json"))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        scan_reached_a_verdict(&out) || out.status.code() == Some(1),
+        "scan errored: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = rows["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .clone();
+    let workers = verdicts_for(&rows, "src/workers.c");
+    assert_eq!(workers.len(), 1, "one registration site: {workers:?}");
+    assert!(
+        workers[0].0 == "abstain" && workers[0].1.contains("depends"),
+        "the thread start must abstain on the depends spec: {workers:?}"
+    );
+}
+
+/// C G2, live end to end (po-av01j.50): cindex inventories the civetweb and
+/// mongoose registrations as server entries, rvl routes them to the G2 lane
+/// and keeps them out of the G1 site count. The fixture registers `/healthz`,
+/// so RC-020 is satisfied and stays off the ladder; it attaches no rate
+/// limiter, so RC-069 surfaces.
+#[test]
+fn live_c_scan_judges_civetweb_and_mongoose_server_entries() {
+    let Some(cindex) = cindex_helper("live_c_scan_judges_civetweb_and_mongoose_server_entries")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manifest_dir();
+    let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
+    let fixture = workspace
+        .join("crates")
+        .join("cindex")
+        .join("testdata")
+        .join("fixture-server");
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(&specs)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("sites 0") && stdout.contains("server-entry 5"),
+        "the five registrations are server entries, not G1 sites: {stdout}"
+    );
+    assert!(
+        !stdout.contains("RC-020"),
+        "the registered /healthz endpoint satisfies the health control: {stdout}"
+    );
+    assert!(
+        stdout.contains("RC-069"),
+        "no rate limiter is attached, so RC-069 must surface: {stdout}"
     );
 }
 
@@ -2268,7 +3323,7 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
 /// RC-022 retry-posture rationale, RC-060 job altitude, and a self-contained
 /// emission section). The production corpus rides the LLM factory, HITL.
 fn java_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("java_seed_specs.json")
@@ -2385,7 +3440,7 @@ fn live_java_scan_surfaces_g4_emission_findings() {
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
 /// sqlx identities — the production corpus rides the LLM factory, HITL).
 fn rust_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("testdata")
         .join("rust_seed_specs.json")
@@ -2405,7 +3460,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
             return;
         }
     }
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .unwrap()
@@ -2578,19 +3633,42 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     let home = dir.path().join("home"); // isolates org policy + user config
     std::fs::create_dir_all(&home).unwrap();
-    let out = bin()
-        .args(["scan", "--incremental", "--hook", "pre-commit"])
-        .arg(&repo)
-        .arg("--specs-file")
-        .arg(&specs)
-        .env("RVL_GOINDEX", &goindex_bin)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("RVL_AGENT_CMD", &stub)
-        .env("HOME", &home)
-        .output()
-        .expect("failed to run rvl");
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The hook's 10s retrieval cap fails OPEN: on a loaded host the scan
+    // degrades to zero sites and, correctly, renders no agent block. That is
+    // not the path under test, so a capped run is retried from a clean cache
+    // and index; a run that is still capped fails naming the cap, not the
+    // agent block.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        for state in ["cache", "index", "agent-telemetry.jsonl"] {
+            let path = dir.path().join(state);
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = bin()
+            .args(["scan", "--incremental", "--hook", "pre-commit"])
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("RVL_AGENT_CMD", &stub)
+            .env("HOME", &home)
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if !stdout.contains("retrieval capped at") {
+            break (out, stdout);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "the hook retrieval cap fired on all {ATTEMPTS} attempts (host too loaded \
+             to exercise the agent lane): {stdout}"
+        );
+    };
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(out.status.success(), "hook scan failed: {stdout}\n{stderr}");
     assert!(
@@ -2663,7 +3741,7 @@ fn hook_scan_without_consent_stays_deterministic_only() {
 
 /// A repo with GitOps CRs only (no code lane): an Argo CD Application that
 /// auto-syncs a floating branch with no retry and no selfHeal, a Flux
-/// GitRepository tracking a branch, and an Argo Rollout the family does not
+/// GitRepository tracking a branch, and an Argo Experiment the family does not
 /// parse. Seed config-key specs cover the pin-shape and remediation keys.
 fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // The config lane is the subject; the code lane gets one unspecced Go
@@ -2690,7 +3768,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     .unwrap();
     std::fs::write(
         dir.join("deploy/rollout.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
     )
     .unwrap();
     let specs = dir.join("specs.json");
@@ -2748,7 +3826,7 @@ fn scan_runs_the_argo_flux_family_and_reports_its_findings() {
         stdout.contains("RC-050"),
         "the deciding spec's control rides into the ladder: {stdout}"
     );
-    // The unparsed Argo Rollout is a product-identity sighting, never a
+    // The unparsed Argo Experiment is a product-identity sighting, never a
     // generic kubernetes one.
     assert!(
         stdout.contains("argo-rollouts (1)"),
@@ -2873,78 +3951,51 @@ fn scan_runs_the_kubernetes_config_family_end_to_end() {
 /// for the G4 lane. The production corpus rides the LLM factory, HITL — see
 /// the gate-set mint bead under po-av01j.
 fn csharp_seed_specs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("csharp_seed_specs.json")
 }
 
-/// C#, golden packet stream: a `--retrieved` stream shaped exactly like
-/// csindex output is decided by the seed C# specs WITHOUT a dotnet SDK
-/// present. This is the contract test for the Rust side of the lane: the
-/// satisfies / violates / abstain shapes, G2 registrations routed out of the
-/// G1 lane, and a G4 catch_clause swallow surfacing under RC-027.
+/// The C# golden packet stream: csindex's own output over its fixture,
+/// GENERATED by a live run and committed (po-av01j.57), never hand-authored.
+/// A hand-authored stream encodes what its author meant csindex to emit, and
+/// stayed green through po-av01j.47 while csindex could not compile at all.
+/// `csindex_live_output_matches_the_committed_golden` fails the moment the
+/// two diverge; `RVL_UPDATE_GOLDEN=1` regenerates this file from csindex.
+fn csharp_retrieved_golden() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("csharp_retrieved_golden.jsonl")
+}
+
+/// C#, golden packet stream: the committed csindex output is decided by the
+/// seed C# specs WITHOUT a dotnet SDK present. This is the contract test for
+/// the Rust side of the lane: the satisfies / violates / abstain shapes, G2
+/// registrations routed out of the G1 lane, and a G4 catch_clause swallow
+/// surfacing under RC-027.
 #[test]
 fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
     let dir = tempfile::tempdir().unwrap();
-    let packets = dir.path().join("retrieved.jsonl");
-    let mk = |line: u32, symbol: &str, func: &str, ctype: &str, snippet: &str, extra: &str| {
-        format!(
-            r#"{{"packet_schema":2,"snapshot_id":"fx","file_path":"Svc.cs","line_number":{line},"symbol":{symbol:?},"func":{func:?},"receiver":"_c","client_type":{ctype:?},"snippet":{snippet:?},"lang":"csharp"{extra}}}"#
-        )
-    };
-    let stream = [
-        // Satisfies: HttpClient carries a whole-call default Timeout (100s),
-        // spec knowledge riding the this_client config spec.
-        mk(
-            10,
-            "FetchUser",
-            "GetAsync",
-            "System.Net.Http.HttpClient",
-            "await _c.GetAsync(url)",
-            "",
-        ),
-        // Violates: a gRPC call has NO default deadline; the seed spec says
-        // the bound rides CallOptions at the call, and none is present.
-        mk(
-            20,
-            "SayHello",
-            "AsyncUnaryCall",
-            "Grpc.Core.CallInvoker",
-            "_c.AsyncUnaryCall(method, host, options, req)",
-            "",
-        ),
-        // Abstain: librdkafka retries internally; whether app-level retry
-        // wrapping is needed is per-site judgment (RC-022 seed, depends).
-        mk(
-            30,
-            "Publish",
-            "ProduceAsync",
-            "Confluent.Kafka.IProducer",
-            "await _c.ProduceAsync(topic, msg)",
-            "",
-        ),
-        // A G2 route registration must be routed OUT of the G1 lane.
-        mk(
-            40,
-            "MapRoutes",
-            "MapGet",
-            "Microsoft.AspNetCore.Builder.WebApplication",
-            "app.MapGet(\"/health\", handler)",
-            r#","site_kind":"server_entry""#,
-        ),
-        // A G4 catch_clause swallow aggregate surfaces under RC-027.
-        mk(
-            50,
-            "Handle",
-            "catch",
-            "catch_clause",
-            "",
-            r#","site_kind":"emission_point","const_args":[{"index":0,"name":"emission_category","value":"error_capture","how":"aggregate"},{"index":0,"name":"emission_count","value":"1","how":"aggregate"}]"#,
-        ),
-    ]
-    .join("\n");
-    std::fs::write(&packets, stream + "\n").unwrap();
+    let packets = csharp_retrieved_golden();
+    let golden = std::fs::read_to_string(&packets).expect(
+        "the C# golden is missing: regenerate it with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+    );
+    // Every site record gets an --out row except server_entry registrations
+    // and emission_point aggregates, which their own lanes judge.
+    let g1_sites = golden
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| {
+            p.get("kind").is_none()
+                && !matches!(
+                    p["site_kind"].as_str(),
+                    Some("server_entry" | "emission_point")
+                )
+        })
+        .count();
 
     let out_path = dir.path().join("findings.json");
     let out = bin()
@@ -2984,16 +4035,20 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
             .any(|(v, r)| v == "abstain" && r.contains("depends")),
         "the Kafka produce must abstain on the depends spec: {g1:?}"
     );
-    // The route registration and the emission aggregate stay OUT of the G1
+    // The route registration and the emission aggregates stay OUT of the G1
     // verdict rows (their lanes judge them).
     assert!(
-        !g1.iter().any(|(_, r)| r.contains("MapGet")),
-        "a server_entry registration must not be judged as a client call: {g1:?}"
+        verdicts_for(&rows, "Server.cs:14").is_empty(),
+        "a server_entry registration must not be judged as a client call: {rows:?}"
+    );
+    assert!(
+        verdicts_for(&rows, "Emitters.cs").is_empty(),
+        "an emission_point aggregate must not be judged as a client call: {rows:?}"
     );
     assert_eq!(
         rows.len(),
-        3,
-        "only the three G1 call sites belong in --out: {rows:?}"
+        g1_sites,
+        "only the golden's G1 and job sites belong in --out: {rows:?}"
     );
     // The G4 swallow surfaces in the ladder, control-mapped and advisory.
     assert!(
@@ -3005,39 +4060,294 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
 /// Build csindex with the dotnet SDK, or skip (returns None) when the SDK or
 /// its NuGet restore (Roslyn) is unavailable — matching the tsindex
 /// "run npm install first" skip convention.
+///
+/// The build is bounded (po-l1a0p): an unbounded one sat for 10h48m on 12 s
+/// of CPU and stopped the dev loop. RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS
+/// overrides the default of 600 s; a cold NuGet restore plus Release build
+/// takes about a minute.
 fn build_csindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if std::process::Command::new("dotnet")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP csindex e2e: no dotnet SDK");
-        return None;
+    let secs = std::env::var("RVL_TEST_DOTNET_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    build_csindex_with(
+        std::ffi::OsStr::new("dotnet"),
+        dir,
+        std::time::Duration::from_secs(secs),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `build_csindex` with the dotnet program and the bound as parameters, so a
+/// fake dotnet can prove the bound. Ok(None) is a skip, Err is a failure.
+///
+/// What each measure is for:
+/// * The project is copied into `dir` and built there. Test binaries from
+///   several worktrees run at once and otherwise all restore and compile
+///   into the same helpers/csindex/obj.
+/// * --disable-build-servers, -nodeReuse:false and UseSharedCompilation=false
+///   stop the build from handing work to, or waiting on, a Roslyn compiler
+///   server or MSBuild node that outlives it and is shared with other runs.
+/// * Output goes to files, not pipes, and the build runs in its own process
+///   group that is killed whole on timeout, so no descendant can keep the
+///   test waiting.
+fn build_csindex_with(
+    dotnet: &std::ffi::OsStr,
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match run_bounded(
+        std::process::Command::new(dotnet).arg("--version"),
+        dir,
+        "dotnet-version",
+        std::time::Duration::from_secs(60),
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // CI provisions the SDK, so there a missing one is a broken
+            // runner, not a skip: the C# lane is the one whose green skip hid
+            // a helper that could not compile (po-av01j.47).
+            if std::env::var_os("CI").is_some() {
+                return Err("no dotnet SDK under CI: the C# live tests cannot run".to_string());
+            }
+            eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
+        Ok(None) => return Err("`dotnet --version` timed out after 60s".to_string()),
+        Ok(Some(_)) => {}
     }
-    let csdir = helpers_dir().join("csindex");
+
+    let src = dir.join("csindex-src");
+    std::fs::create_dir_all(&src).map_err(|e| format!("create {src:?}: {e}"))?;
+    for entry in std::fs::read_dir(helpers_dir().join("csindex")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::copy(&path, src.join(path.file_name().unwrap()))
+                .map_err(|e| format!("copy {path:?}: {e}"))?;
+        }
+    }
     let out_dir = dir.join("csindex-build");
-    let out = std::process::Command::new("dotnet")
-        .args(["build", "-c", "Release", "-o"])
-        .arg(&out_dir)
-        .current_dir(&csdir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let args: [&std::ffi::OsStr; 8] = [
+        "build".as_ref(),
+        "-c".as_ref(),
+        "Release".as_ref(),
+        "--disable-build-servers".as_ref(),
+        "-nodeReuse:false".as_ref(),
+        "-p:UseSharedCompilation=false".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_os_str(),
+    ];
+    let shown = format!(
+        "{} {} (in {})",
+        dotnet.to_string_lossy(),
+        args.map(|a| a.to_string_lossy().into_owned()).join(" "),
+        src.display()
+    );
+    let mut cmd = std::process::Command::new(dotnet);
+    cmd.args(args)
+        .current_dir(&src)
+        .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_NOLOGO", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
+    let (status, output) = match run_bounded(&mut cmd, dir, "dotnet-build", timeout) {
+        Ok(Some(done)) => done,
+        Ok(None) => {
+            return Err(format!(
+                "csindex build timed out after {timeout:?} and was killed: {shown}"
+            ))
+        }
+        Err(e) => return Err(format!("csindex build did not start: {shown}: {e}")),
+    };
+    if !status.success() {
+        // NU1301: NuGet could not reach its feed, so Roslyn was never
+        // restored. That is the environment (no network, cold cache), not our
+        // helper, so it is a skip like a missing SDK.
+        if output.contains("NU1301") {
+            // Under CI the feed is part of the runner, so this is fatal there
+            // for the same reason a missing SDK is.
+            if std::env::var_os("CI").is_some() {
+                return Err(format!(
+                    "NuGet restore could not reach its feed (NU1301) under CI: {shown}\n{output}"
+                ));
+            }
+            eprintln!(
+                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache"
+            );
+            return Ok(None);
+        }
         // The SDK being absent is a skip (handled above); the SDK being
         // present while OUR helper fails to compile is a defect. This exact
         // branch hid four CS0103 errors through an entire epic (po-av01j.47),
         // because a green skip reads identically to a green pass.
-        panic!(
-            "csindex failed to build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return Err(format!("csindex failed to build: {shown}\n{output}"));
     }
     let dll = out_dir.join("csindex.dll");
     if dll.is_file() {
-        Some(dll)
+        Ok(Some(dll))
     } else {
-        panic!("csindex built but produced no csindex.dll at {out_dir:?}")
+        Err(format!(
+            "csindex built but produced no csindex.dll at {out_dir:?}"
+        ))
     }
+}
+
+/// Run `cmd` to completion or until `timeout`, with stdout and stderr in
+/// files under `dir` named after `tag`. Ok(Some) carries the exit status and
+/// the combined output; Ok(None) is a timeout, after which the command's
+/// whole process group has been killed.
+fn run_bounded(
+    cmd: &mut std::process::Command,
+    dir: &std::path::Path,
+    tag: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    let out_path = dir.join(format!("{tag}.stdout"));
+    let err_path = dir.join(format!("{tag}.stderr"));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&out_path)?)
+        .stderr(std::fs::File::create(&err_path)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        // Kill the whole group before reaping the leader, so its pid (the
+        // group id) cannot have been reused by an unrelated process.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    Ok(Some((
+        status,
+        format!("{}{}", read(&out_path), read(&err_path)),
+    )))
+}
+
+/// A dotnet build that never ends must fail the test within the bound, name
+/// the build command, and leave nothing running (po-l1a0p). The fake dotnet
+/// answers `--version` and then sleeps in a CHILD on `build`, the way a
+/// compiler server or MSBuild node outlives the process the test started:
+/// killing only the direct child would leave that sleeper holding the pipes.
+#[cfg(unix)]
+#[test]
+fn csindex_build_that_never_ends_fails_within_the_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleeper.pid");
+    let fake = dir.path().join("dotnet");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 8.0.0; exit 0; fi\n\
+             sleep 600 &\n\
+             echo $! > '{}'\n\
+             wait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bound = std::time::Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let err = build_csindex_with(fake.as_os_str(), dir.path(), bound)
+        .expect_err("a build that never ends must fail, not pass or skip");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < bound + std::time::Duration::from_secs(10),
+        "the build must fail at the bound ({bound:?}), took {elapsed:?}"
+    );
+    assert!(
+        err.contains("timed out") && err.contains(&format!("{} build -c Release", fake.display())),
+        "the failure must say it timed out and name the build command: {err}"
+    );
+    let sleeper = std::fs::read_to_string(&pid_file).unwrap();
+    let proc_dir = std::path::Path::new("/proc").join(sleeper.trim());
+    if std::path::Path::new("/proc/self").exists() {
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_dir.exists() && std::time::Instant::now() < gone_by {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !proc_dir.exists(),
+            "the build's own children must be killed on timeout, {} still runs",
+            sleeper.trim()
+        );
+    }
+}
+
+/// Run csindex over its fixture and return the JSONL stream it emits. The
+/// snapshot name is fixed, so the stream is byte-stable across machines.
+fn csindex_retrieve_fixture(csindex_dll: &std::path::Path) -> String {
+    let out = std::process::Command::new("dotnet")
+        .arg(csindex_dll)
+        .args(["--retrieve", "--root"])
+        .arg(helper_fixture("csindex"))
+        .args(["--name", "fx"])
+        .output()
+        .expect("failed to run csindex");
+    assert!(
+        out.status.success(),
+        "csindex --retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("csindex emitted non-UTF-8")
+}
+
+/// The committed C# golden IS csindex's behaviour: a live run over the
+/// fixture must reproduce it byte for byte. This is what binds the
+/// no-SDK contract test above to the helper it stands in for. After an
+/// intended csindex change, regenerate with
+/// `RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output`
+/// and review the diff like code.
+#[test]
+fn csindex_live_output_matches_the_committed_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let live = csindex_retrieve_fixture(&csindex_dll);
+    let golden_path = csharp_retrieved_golden();
+    if std::env::var_os("RVL_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden_path, &live).unwrap();
+        return;
+    }
+    let golden = std::fs::read_to_string(&golden_path).unwrap_or_default();
+    if live == golden {
+        return;
+    }
+    let first_diff = live
+        .lines()
+        .zip(golden.lines())
+        .position(|(l, g)| l != g)
+        .unwrap_or_else(|| live.lines().count().min(golden.lines().count()));
+    panic!(
+        "csindex's live output has drifted from {golden_path:?} at line {}:\n  live:   {}\n  golden: {}\n\
+         If the csindex change is intended, regenerate with \
+         RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
+        first_diff + 1,
+        live.lines().nth(first_diff).unwrap_or("<end of stream>"),
+        golden.lines().nth(first_diff).unwrap_or("<end of stream>"),
+    );
 }
 
 /// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
@@ -3572,6 +4882,70 @@ fn a_prebuilt_stream_keeps_its_test_file_skip_count() {
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
         doc["coverage"]["test_files_skipped"], 2,
+        "{}",
+        doc["coverage"]
+    );
+}
+
+/// A stream from a tsindex run over an uninstalled tree says so on its
+/// repo-scoped record, and the scan must repeat it (po-pk3fp.15): on the
+/// COVERAGE block and on `--out`. Without the line, a scan resolved from
+/// import syntax reads exactly like one resolved from the installed tree.
+#[test]
+fn a_scan_names_the_dependency_trees_that_were_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    let run = |stream: &str, out_name: &str| {
+        let p = dir.path().join(format!("{out_name}.jsonl"));
+        std::fs::write(&p, stream).unwrap();
+        let out_path = dir.path().join(format!("{out_name}.json"));
+        let out = bin()
+            .args(["scan", "--retrieved"])
+            .arg(&p)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan errored: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        (stdout, doc)
+    };
+    let base = std::fs::read_to_string(&packets).unwrap();
+
+    let (stdout, doc) = run(&base, "installed");
+    assert!(
+        !stdout.contains("installed dependencies"),
+        "a stream that reports nothing uninstalled prints nothing: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 0,
+        "{}",
+        doc["coverage"]
+    );
+
+    let degraded = format!(
+        "{base}{}\n",
+        r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"fixture","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#
+    );
+    let (stdout, doc) = run(&degraded, "uninstalled");
+    assert!(
+        stdout.contains(
+            "retrieved stream: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "the stream's dependency state must reach COVERAGE: {stdout}"
+    );
+    assert_eq!(
+        doc["coverage"]["dependency_trees_uninstalled"], 2,
         "{}",
         doc["coverage"]
     );
@@ -5527,24 +6901,13 @@ fn an_unstaged_edit_cannot_block_a_pre_commit_scan() {
     );
 }
 
-/// PARTIAL STAGING, and the limit of this fix stated out loud. The staged hunk
-/// puts the file in scope; the retrievers still read WORKING-TREE bytes, so the
-/// unstaged hunk is judged too. That is a known gap — what the scan must never
-/// do is carry it silently, so it names the partially staged files.
-#[test]
-fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
-    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
-    stage(&root, &["add", "half.py"]);
-    // Further edit, deliberately NOT staged.
-    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
-    let specs = dir.path().join("specs.json");
+/// Run the pre-commit gate over `root`, exactly as the installed shim does.
+fn pre_commit_gate(dir: &std::path::Path, root: &std::path::Path) -> std::process::Output {
+    let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
-
-    let out = bin()
+    bin()
         .arg("scan")
-        .arg(&root)
+        .arg(root)
         .args([
             "--incremental",
             "--changed-only",
@@ -5553,17 +6916,117 @@ fn a_partially_staged_file_is_reported_as_judged_on_working_tree_bytes() {
             "--specs-file",
         ])
         .arg(&specs)
-        .env("RVL_CACHE_DIR", dir.path().join("cache"))
-        .env("RVL_INDEX_DIR", dir.path().join("index"))
-        .env("HOME", dir.path().join("home"))
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .env("RVL_INDEX_DIR", dir.join("index"))
+        .env("HOME", dir.join("home"))
+        .env_remove("RVL_FORCE")
         .output()
-        .expect("failed to run rvl");
+        .expect("failed to run rvl")
+}
+
+/// PARTIAL STAGING IS REFUSED (po-io8sk.3). The staged hunk puts the file in
+/// scope, but every lane reads WORKING-TREE bytes, so the scan would judge
+/// content that is not the content being committed. That used to be a note on
+/// stderr over a verdict the commit did not earn; it is now an error. Exit 1,
+/// not `EXIT_BLOCKED`: the code was never judged.
+#[test]
+fn a_partially_staged_file_is_refused_not_judged_on_working_tree_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    // Further edit, deliberately NOT staged.
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a partially staged file must fail the gate as 'not judged':\n{stdout}\n{stderr}"
+    );
     assert!(
         stderr.contains("half.py") && stderr.contains("unstaged edits"),
-        "a partially staged file must be named, not silently judged on \
-         working-tree bytes: {stderr}"
+        "the refusal must name the partially staged file: {stderr}"
     );
+    assert!(
+        stderr.contains("git stash --keep-index"),
+        "the refusal must say how to get the staged content judged: {stderr}"
+    );
+    assert!(
+        !stdout.contains("commit clean"),
+        "a refused scan must not print a verdict: {stdout}"
+    );
+}
+
+/// THE RACE THE REFUSAL CLOSES. The author stages a secret, then deletes it
+/// from the working tree without staging the deletion. The working tree is
+/// clean, the commit is not. A gate that read working-tree bytes passed this
+/// commit; the verdict must never be `0` here.
+#[test]
+fn a_staged_secret_hidden_by_an_unstaged_edit_cannot_pass_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(
+        root.join("leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "leak.py"]);
+    std::fs::write(root.join("leak.py"), "VALUE = 1\n").unwrap();
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the staged secret is what gets committed; a clean working tree must \
+         not buy a clean verdict:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The refusal is scoped to the gap, not to staging in general: once the
+/// working tree and the index agree on the file, the same commit is judged.
+#[test]
+fn a_fully_staged_file_is_still_judged_by_the_pre_commit_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(root.join("half.py"), "VALUE = 1\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+    std::fs::write(root.join("half.py"), "VALUE = 1\nOTHER = 2\n").unwrap();
+    stage(&root, &["add", "half.py"]);
+
+    let out = pre_commit_gate(dir.path(), &root);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "index and working tree agree, so the scan must run:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE REFERENCE CI JOB SHIPS, and the copy in the docs is the file
+/// (po-io8sk.3). docs/gating.md names the required CI check as the guard and
+/// the hook as the fast path; a guard nobody can copy is not a guard.
+#[test]
+fn gating_docs_ship_the_reference_ci_job_verbatim() {
+    let docs = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into()),
+    )
+    .join("../../docs");
+    let job = std::fs::read_to_string(docs.join("examples/rvl-gate.yml"))
+        .expect("docs/examples/rvl-gate.yml must exist");
+    let gating = std::fs::read_to_string(docs.join("gating.md")).unwrap();
+    assert!(
+        gating.contains(job.trim_end()),
+        "docs/gating.md must carry docs/examples/rvl-gate.yml verbatim"
+    );
+    for needle in ["pull_request", "merge_group", "--strict", "lang_status"] {
+        assert!(job.contains(needle), "reference job must mention {needle}");
+    }
 }
 
 /// PRE-PUSH picks up the commits in the pushed range, so a finding introduced
@@ -5621,6 +7084,64 @@ fn pre_push_gates_on_the_pushed_range_not_the_working_tree() {
     assert!(
         !stdout.contains("legacy.py"),
         "and the already-pushed file must stay out of scope: {stdout}"
+    );
+    // The verdict and the bypass hint name the operation that was stopped
+    // (po-av01j.207): both said "commit" here, to someone running `git push`.
+    assert!(
+        stdout.contains("blocking finding to push") && stdout.contains("push blocked; use"),
+        "a blocked pre-push must say push: {stdout}"
+    );
+    assert!(
+        !stdout.contains("to commit") && !stdout.contains("commit blocked"),
+        "a blocked pre-push must not talk about a commit: {stdout}"
+    );
+}
+
+/// The pre-commit half of po-av01j.207: the same block under `--hook
+/// pre-commit` keeps saying commit.
+#[test]
+fn a_blocked_pre_commit_says_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = git_repo_with_pre_existing_blocking_finding(dir.path());
+    std::fs::write(
+        root.join("new_leak.py"),
+        "GITHUB_TOKEN = \"ghp_SG7jb0Qq2ZrvlScAn9xKdTm4Wp6Yh1Bc3Nf5\"\n",
+    )
+    .unwrap();
+    stage(&root, &["add", "new_leak.py"]);
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+
+    let out = bin()
+        .arg("scan")
+        .arg(&root)
+        .args([
+            "--incremental",
+            "--changed-only",
+            "--hook",
+            "pre-commit",
+            "--specs-file",
+        ])
+        .arg(&specs)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_BLOCKED),
+        "a staged secret must block the commit:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("blocking finding to commit") && stdout.contains("commit blocked; use"),
+        "a blocked pre-commit must say commit: {stdout}"
+    );
+    assert!(
+        !stdout.contains("to push") && !stdout.contains("push blocked"),
+        "a blocked pre-commit must not talk about a push: {stdout}"
     );
 }
 
@@ -6106,4 +7627,304 @@ fn an_empty_dev_spec_file_does_not_raise_the_commercial_corpus_warning() {
     );
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The debug-only variable that adds test verifying keys to the pinned keyset.
+/// Mirrors `TEST_KEYSET_ENV` in `crates/rvl/src/keyset.rs`.
+const TEST_KEYSET_ENV: &str = "RVL_TEST_KEYSET_HEX";
+
+/// Sign a commercial-tier envelope carrying `apis` with a fresh key and
+/// install it as the cache under `<root>/cache`. Returns the public half, hex
+/// encoded, which is the only thing a scan needs to trust the result.
+fn install_signed_commercial_tier(root: &std::path::Path, apis: &str) -> String {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
+    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let key_hex = hex::encode(signing.verifying_key().to_bytes());
+    let keyset = rvl_cache::Keyset::from_hex(&[key_hex.as_str()]).unwrap();
+    let bytes = format!(
+        r#"{{"schema":1,"content_version":"{}.1","specs":{{"apis":{apis},"configs":[]}}}}"#,
+        rvl_cache::today_utc()
+    )
+    .into_bytes();
+    let sig = base64::engine::general_purpose::STANDARD.encode(signing.sign(&bytes).to_bytes());
+    let store = rvl_cache::CacheStore::open(&root.join("cache")).unwrap();
+    let outcome = store.install(&bytes, &sig, &keyset);
+    assert!(
+        matches!(outcome, rvl_cache::SyncOutcome::Installed { .. }),
+        "the test envelope must install: {outcome:?}"
+    );
+    key_hex
+}
+
+/// Scan the runtime Python fixture on the SIGNED cache (no `--specs-file`),
+/// trusting `key_hex` through the debug-only seam.
+fn scan_on_the_signed_cache(
+    root: &std::path::Path,
+    packets: &std::path::Path,
+    key_hex: &str,
+) -> std::process::Output {
+    bin()
+        .args(["scan", "--retrieved"])
+        .arg(packets)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .env("HOME", root.join("home"))
+        .env(TEST_KEYSET_ENV, key_hex)
+        .output()
+        .expect("failed to run rvl")
+}
+
+/// The positive half, end to end (po-97wqs): a commercial tier that verifies
+/// and carries `apis: []` is the 2026-08-19 artifact. `commercial_loaded`
+/// reaches `Coverage.empty_api_corpus` through the `ResolvedScan` tuple, and
+/// until this test only the compiler checked that wiring.
+#[cfg(debug_assertions)]
+#[test]
+fn a_signed_empty_commercial_tier_warns_on_stderr_and_in_coverage() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-empty-corpus");
+    let key_hex = install_signed_commercial_tier(&root, "[]");
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warning is advisory, the exit code is unchanged:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: the commercial spec cache carries 0 API specs"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("0/1 API surfaces resolved"),
+        "the one site must abstain as no_spec: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 API specs in the commercial spec cache"),
+        "COVERAGE must name the empty corpus: {stdout}"
+    );
+    assert!(
+        stderr.contains(TEST_KEYSET_ENV),
+        "a widened keyset is never quiet: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The contrast: the same signed path with a populated tier says nothing, so
+/// the warning above comes from the empty corpus and not from the seam.
+#[cfg(debug_assertions)]
+#[test]
+fn a_signed_populated_commercial_tier_does_not_warn() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-populated-corpus");
+    let key_hex = install_signed_commercial_tier(
+        &root,
+        r#"[{"type":"requests","method":"get","site_count":1,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests defaults to no timeout"}]"#,
+    );
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1/1 API surfaces resolved"), "{stdout}");
+    assert!(!stderr.contains("0 API specs"), "{stderr}");
+    assert!(!stdout.contains("0 API specs"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A key outside the keyset is still refused: the seam adds named keys, it
+/// does not turn verification off.
+#[cfg(debug_assertions)]
+#[test]
+fn the_test_keyset_does_not_trust_a_tier_signed_by_another_key() {
+    let (root, packets, _) = write_runtime_python_fixture("signed-other-key");
+    install_signed_commercial_tier(&root, "[]");
+    let other = hex::encode(
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let out = scan_on_the_signed_cache(&root, &packets, &other);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no spec cache tier loadable"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE RELEASE BINARY HAS NO KEYSET OVERRIDE. Runs under `cargo test
+/// --release` only: the variable is not read, so a tier signed by a key
+/// outside the pinned keyset does not load whatever the environment says.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_release_build_ignores_the_test_keyset_variable() {
+    let (root, packets, _) = write_runtime_python_fixture("release-ignores-keyset");
+    let key_hex = install_signed_commercial_tier(&root, "[]");
+    let out = scan_on_the_signed_cache(&root, &packets, &key_hex);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no spec cache tier loadable"), "{stderr}");
+    assert!(!stderr.contains(TEST_KEYSET_ENV), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The seam is gated on `debug_assertions`, so a profile that turns them on
+/// for a shipped build would ship the override. No profile may set the key.
+#[test]
+fn no_cargo_profile_turns_debug_assertions_on() {
+    for rel in ["../../Cargo.toml", "Cargo.toml"] {
+        let path = manifest_dir().join(rel);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let offenders: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("debug-assertions"))
+            .collect();
+        assert!(offenders.is_empty(), "{}: {offenders:?}", path.display());
+    }
+}
+
+// --- node helper heap limit (po-av01j.118) ---
+
+/// Scan a one-file TypeScript tree with `script` standing in for tsindex, and
+/// return everything rvl printed. `None` when `node` is absent.
+fn scan_with_fake_tsindex(script: &str, heap_mb: &str) -> Option<String> {
+    if Command::new("node").arg("--version").output().is_err() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("index.ts"), "export const x = 1;\n").unwrap();
+    let helper = dir.path().join("tsindex.js");
+    std::fs::write(&helper, script).unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(g4_seed_specs())
+        .env("RVL_TSINDEX", &helper)
+        .env("RVL_NODE_MAX_OLD_SPACE_MB", heap_mb)
+        .env_remove("NODE_OPTIONS")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The limit must reach `node` itself, ahead of the script: V8 reads it at
+/// startup, so a flag placed after `tsindex.js` would be a helper argument and
+/// change nothing. The fake helper reports the flags node actually parsed.
+#[test]
+fn node_helper_runs_with_a_raised_heap_limit() {
+    let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
+                  process.exit(1);\n";
+    let Some(text) = scan_with_fake_tsindex(script, "777") else {
+        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        return;
+    };
+    assert!(
+        text.contains("execArgv=--max-old-space-size=777"),
+        "node must be started with the heap limit: {text}"
+    );
+}
+
+/// A REAL V8 heap exhaustion, not a simulated exit code: the helper allocates
+/// until node aborts under a 32 MB limit. The scan must say what happened and
+/// which variable moves the ceiling, because "signal: 6" names neither.
+#[test]
+fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
+    let script = "const hold = [];\n\
+                  for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
+    let Some(text) = scan_with_fake_tsindex(script, "32") else {
+        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        return;
+    };
+    assert!(
+        text.contains("RVL_NODE_MAX_OLD_SPACE_MB") && text.contains("32 MB"),
+        "a heap OOM must name the limit and the override: {text}"
+    );
+}
+
+// --- `--oss-only`: load the OSS tier alone (po-7wgx3) ---
+//
+// The layering itself is proven on signed stores in rvl-cache's tests; a CLI
+// test cannot install a tier (the pinned keyset has no private half here), so
+// these cover the flag's surface: it parses on `scan` and `report`, it names
+// the tier it needs, and it refuses the dev overrides that bypass the tiers.
+
+#[test]
+fn oss_only_scan_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["scan", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unloadable tier fails closed"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier") && stderr.contains("rvl sync"),
+        "error must name the flag, the tier and the fix: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_report_names_the_oss_tier_when_it_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, _) = write_scan_fixtures(dir.path());
+    let out = bin()
+        .args(["report", "--oss-only", "--retrieved"])
+        .arg(&packets)
+        .env("RVL_CACHE_DIR", dir.path().join("empty-cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--oss-only") && stderr.contains("OSS tier"),
+        "error must name the flag and the tier: {stderr}"
+    );
+}
+
+#[test]
+fn oss_only_refuses_the_dev_overrides_that_bypass_the_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets, specs) = write_scan_fixtures(dir.path());
+    for (cmd, flag) in [
+        ("scan", "--specs-file"),
+        ("scan", "--judgments"),
+        ("report", "--specs-file"),
+    ] {
+        let out = bin()
+            .args([cmd, "--oss-only", "--retrieved"])
+            .arg(&packets)
+            .arg(flag)
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{cmd} --oss-only {flag} must be a usage error"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("--oss-only") && stderr.contains(flag),
+            "usage error must name both flags: {stderr}"
+        );
+    }
 }

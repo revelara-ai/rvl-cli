@@ -24,18 +24,23 @@
 //!     machine, so a sighting is structurally incapable of carrying it.
 //!
 //! New formats (Kubernetes, Prometheus/sloth, dependency manifests,
-//! Terraform, Argo/Flux — po-av01j.20-.24) plug in by implementing
+//! Terraform, Argo/Flux — po-av01j.20-.24; operator CRs — po-pk3fp.13;
+//! Alertmanager — po-av01j.39) plug
+//! in by implementing
 //! [`ConfigRetriever`] and joining [`registry`].
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod alertmanager;
 pub mod argo_flux;
 pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;
+pub mod key_ledger;
 pub mod kubernetes;
+pub mod operators;
 pub mod prometheus;
 pub mod terraform;
 
@@ -251,11 +256,13 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(gitlab_ci::GitlabCi),
         Box::new(dep_manifests::DepManifests),
         Box::new(prometheus::PrometheusRules),
+        Box::new(alertmanager::Alertmanager),
         Box::new(argo_flux::ArgoFlux),
         Box::new(terraform::Terraform),
+        Box::new(operators::OperatorCrs),
         // Kubernetes stays LAST: its content claim (bare apiVersion+kind
         // YAML) is the broadest, so narrower families (sloth CRDs, Argo/Flux
-        // CRs, rule files) must get first refusal.
+        // and operator CRs, rule files) must get first refusal.
         Box::new(kubernetes::Kubernetes),
     ]
 }
@@ -417,9 +424,6 @@ fn non_kubernetes_api_group(v: &str) -> Option<&'static str> {
 fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let is_yaml = rel.ends_with(".yml") || rel.ends_with(".yaml");
-    if name == "alertmanager.yml" || name == "alertmanager.yaml" {
-        return Some("alertmanager");
-    }
     if rel == ".circleci/config.yml" || rel == ".circleci/config.yaml" {
         return Some("circleci");
     }
@@ -494,9 +498,9 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
             }
             return Some("prometheus-rules");
         }
-        if col0("route:") && col0("receivers:") {
-            return Some("alertmanager");
-        }
+        // Alertmanager routing config never reaches here: the Alertmanager
+        // retriever claims it by content, and sights its own templated
+        // variant.
     }
     None
 }
@@ -801,17 +805,12 @@ mod tests {
             Some("prometheus-rules")
         );
         assert_eq!(
-            sight_format("monitoring/alertmanager.yml", ""),
-            Some("alertmanager"),
-            "the canonical file name identifies alertmanager"
-        );
-        assert_eq!(
             sight_format(
-                "config/am.yaml",
-                "route:\n  receiver: default\nreceivers:\n- name: default\n"
+                "k8s/alertmanager.yaml",
+                "apiVersion: apps/v1\nkind: StatefulSet\n"
             ),
-            Some("alertmanager"),
-            "route+receivers shape identifies alertmanager"
+            Some("kubernetes"),
+            "a manifest named after alertmanager is classified by its shape, not its name"
         );
         assert_eq!(
             sight_format(
@@ -990,8 +989,8 @@ mod tests {
         // An argoproj.io CR the family does not parse: a product sighting,
         // never absorbed into the kubernetes bucket.
         std::fs::write(
-            root.join("deploy/rollout.yaml"),
-            "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n",
+            root.join("deploy/experiment.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\nmetadata:\n  name: web\n",
         )
         .unwrap();
         // A generic Kubernetes manifest: claimed by the kubernetes family
@@ -1016,9 +1015,9 @@ mod tests {
             "a generic manifest is claimed by the kubernetes family: {:?}",
             got.packets
         );
-        // The argo-rollouts CR is declined by BOTH families (argo_flux does
-        // not parse Rollout; kubernetes refuses foreign apiVersion groups)
-        // and sights by product.
+        // The argo-rollouts Experiment is declined by BOTH families (argo_flux
+        // does not parse that kind; kubernetes refuses foreign apiVersion
+        // groups) and sights by product.
         assert_eq!(
             got.sightings,
             vec![FormatSighting {
@@ -1027,6 +1026,52 @@ mod tests {
                 retriever_exists: false,
             }]
         );
+    }
+
+    #[test]
+    fn retrieve_repo_routes_rollouts_and_operator_crs_by_content() {
+        // po-pk3fp.13: these were identity-only sightings, so no spec could
+        // be authored against them.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deploy")).unwrap();
+        for (file, body) in [
+            (
+                "rollout.yaml",
+                "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\nspec:\n  strategy:\n    canary: {}\n",
+            ),
+            (
+                "pg.yaml",
+                "apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n  name: pg\nspec:\n  instances: 3\n",
+            ),
+            (
+                "kyverno.yaml",
+                "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: registries\nspec:\n  rules:\n  - name: allowed\n    validate:\n      message: no\n",
+            ),
+            (
+                "gatekeeper.yaml",
+                "apiVersion: constraints.gatekeeper.sh/v1beta1 # Copyright\nkind: K8sAllowedRepos\nmetadata:\n  name: repos\nspec:\n  enforcementAction: dryrun\n",
+            ),
+        ] {
+            std::fs::write(root.join("deploy").join(file), body).unwrap();
+        }
+        let got = retrieve_repo(root, "snap");
+        for (format, key) in [
+            ("argo-rollouts", "rollout.strategy"),
+            ("cnpg", "cluster.backup.method"),
+            ("kyverno", "rule.validate.failureAction"),
+            ("gatekeeper", "constraint.enforcementAction"),
+        ] {
+            assert!(
+                got.packets
+                    .iter()
+                    .any(|p| p.format == format && p.key == key),
+                "{format} {key} missing: {:?}",
+                got.packets
+            );
+        }
+        assert!(got.sightings.is_empty(), "{:?}", got.sightings);
+        assert_eq!(got.unparseable_files, 0);
     }
 
     #[test]
@@ -1117,10 +1162,10 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_repo_sights_templated_rules_and_alertmanager() {
+    fn retrieve_repo_sights_templated_rules() {
         // A Helm-templated rule file is declined by the retriever (no
         // rendering on the scan path) and degrades to an identity-only
-        // sighting; alertmanager config is identified but not inventoried.
+        // sighting.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("chart/templates")).unwrap();
@@ -1129,27 +1174,87 @@ mod tests {
             "groups:\n- name: api\n  rules:\n  - alert: A\n    expr: up == 0\n    for: {{ .Values.forDuration }}\n",
         )
         .unwrap();
-        std::fs::write(
-            root.join("alertmanager.yml"),
-            "route:\n  receiver: default\nreceivers:\n- name: default\n",
-        )
-        .unwrap();
         let got = retrieve_repo(root, "snap");
         assert!(got.packets.is_empty(), "nothing literal to parse");
         assert_eq!(
             got.sightings,
-            vec![
-                FormatSighting {
-                    format: "alertmanager".into(),
-                    file_count: 1,
-                    retriever_exists: false,
-                },
-                FormatSighting {
-                    format: "prometheus-rules-templated".into(),
-                    file_count: 1,
-                    retriever_exists: true,
-                },
-            ]
+            vec![FormatSighting {
+                format: "prometheus-rules-templated".into(),
+                file_count: 1,
+                retriever_exists: true,
+            }]
         );
+    }
+
+    #[test]
+    fn retrieve_repo_routes_alertmanager_config_to_its_retriever() {
+        // Identified by content under any name (po-av01j.39): the canonical
+        // basename and the route+receivers shape both inventory keys, and
+        // neither is sighted as an unsupported format any more.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let literal = "route:\n  receiver: default\nreceivers:\n- name: default\n";
+        std::fs::write(root.join("alertmanager.yml"), literal).unwrap();
+        std::fs::write(root.join("config/am.yaml"), literal).unwrap();
+        let got = retrieve_repo(root, "snap");
+        for file in ["alertmanager.yml", "config/am.yaml"] {
+            assert!(
+                got.packets.iter().any(|p| p.format == "alertmanager"
+                    && p.file_path == file
+                    && p.key == "route.receiver"),
+                "{file} routes to the Alertmanager retriever: {:?}",
+                got.packets
+            );
+        }
+        assert!(
+            got.sightings.is_empty(),
+            "a supported format is not sighted"
+        );
+        assert_eq!(got.unparseable_files, 0);
+    }
+
+    #[test]
+    fn retrieve_repo_sights_templated_alertmanager_and_leaves_manifests_to_kubernetes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("chart/templates")).unwrap();
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        // Helm-templated routing config: declined by the retriever itself, so
+        // the sighting says a retriever exists.
+        std::fs::write(
+            root.join("chart/templates/alertmanager.yaml"),
+            "route:\n  receiver: default\n{{- if .Values.routes }}\n  routes:\n{{ toYaml .Values.routes | indent 2 }}\n{{- end }}\nreceivers:\n- name: default\n",
+        )
+        .unwrap();
+        // A workload that DEPLOYS Alertmanager shares the basename and is the
+        // Kubernetes family's.
+        std::fs::write(
+            root.join("k8s/alertmanager.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: alertmanager\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n      - name: am\n        image: prom/alertmanager:v0.27.0\n",
+        )
+        .unwrap();
+        let got = retrieve_repo(root, "snap");
+        assert!(
+            got.packets.iter().all(|p| p.format != "alertmanager"),
+            "{:?}",
+            got.packets
+        );
+        assert!(
+            got.packets
+                .iter()
+                .any(|p| p.format == "kubernetes" && p.file_path == "k8s/alertmanager.yaml"),
+            "the manifest is the Kubernetes retriever's: {:?}",
+            got.packets
+        );
+        assert_eq!(
+            got.sightings,
+            vec![FormatSighting {
+                format: "alertmanager-templated".into(),
+                file_count: 1,
+                retriever_exists: true,
+            }]
+        );
+        assert_eq!(got.unparseable_files, 0);
     }
 }

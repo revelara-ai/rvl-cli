@@ -11,7 +11,8 @@
 //!     verification run — a wrong config spec is multiplied across every repo
 //!     using the format, exactly like a wrong API spec);
 //!   * value set outside the repo → out-of-repo declaration (policy file);
-//!   * unknown pattern name → the spec is newer than this scanner: upgrade;
+//!   * unknown pattern name or expectation kind → the spec is newer than this
+//!     scanner: upgrade;
 //!   * guard predicate not retrieved → same lever: the retriever does not
 //!     state the fact a conditional spec asks about.
 
@@ -52,6 +53,47 @@ pub fn pattern_matches(name: &str, value: &str) -> Option<bool> {
         "configured" => Some(!value.is_empty() && value != crate::ABSENT_RENDERING),
         _ => None,
     }
+}
+
+/// Seconds in a duration string of the Go / Prometheus grammar: one or more
+/// `<number><unit>` terms (`30s`, `1h30m`, `1.5h`, `2d`). `None` for anything
+/// else, including a bare number: only `0` needs no unit, and guessing one
+/// for `15` is how a bound starts flagging correct configurations.
+fn parse_duration_secs(text: &str) -> Option<f64> {
+    const UNITS: &[(&str, f64)] = &[
+        ("ns", 1e-9),
+        ("us", 1e-6),
+        ("\u{b5}s", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+        ("m", 60.0),
+        ("h", 3600.0),
+        ("d", 86_400.0),
+        ("w", 604_800.0),
+        ("y", 31_536_000.0),
+    ];
+    let mut rest = text.trim();
+    if rest == "0" {
+        return Some(0.0);
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let (_, scale) = UNITS.iter().find(|(u, _)| *u == &rest[..unit_len])?;
+        total += number * scale;
+        rest = &rest[unit_len..];
+    }
+    Some(total)
 }
 
 /// A compact citation of how the value was produced, for reasons. Uses the
@@ -239,6 +281,57 @@ pub fn evaluate(
                     format!("not equal to {want}: {} = {value}", p.key),
                 )
             }
+        }
+        ConfigExpect::NotEquals { value: unwanted } => {
+            if value != unwanted {
+                decided(
+                    Verdict::Satisfies,
+                    format!("{} = {value}; {}", p.key, provenance_note(p)),
+                )
+            } else {
+                decided(
+                    Verdict::Violates,
+                    format!("equal to {unwanted}: {}", provenance_note(p)),
+                )
+            }
+        }
+        ConfigExpect::DurationAtLeast { value: want }
+        | ConfigExpect::DurationAtMost { value: want } => {
+            let at_least = matches!(expect, ConfigExpect::DurationAtLeast { .. });
+            let (Some(bound), Some(got)) = (parse_duration_secs(want), parse_duration_secs(value))
+            else {
+                // The same rule as the numeric bounds: an unresolved template
+                // or an authored absence is not evidence of a violation, and
+                // neither is a spec whose own bound does not parse.
+                return abstain(format!(
+                    "{} = {value:?} against {want:?} is not a duration comparison, so the bound cannot be judged",
+                    p.key
+                ));
+            };
+            let (met, missed) = if at_least {
+                (got >= bound, "below the minimum of")
+            } else {
+                (got <= bound, "above the maximum of")
+            };
+            if met {
+                let side = if at_least {
+                    "meets the minimum of"
+                } else {
+                    "is within the maximum of"
+                };
+                decided(
+                    Verdict::Satisfies,
+                    format!("{} = {value} {side} {want}", p.key),
+                )
+            } else {
+                decided(
+                    Verdict::Violates,
+                    format!("{missed} {want}: {} = {value}", p.key),
+                )
+            }
+        }
+        ConfigExpect::Unknown => {
+            abstain("unknown expectation kind: the spec is newer than this scanner".to_string())
         }
         ConfigExpect::OneOf { values } => {
             if values.iter().any(|v| v == value) {
@@ -655,6 +748,177 @@ mod tests {
         assert_eq!(pattern_matches("configured", ""), Some(false));
     }
 
+    /// A cache built from the artifact's JSON, the way a served spec arrives.
+    fn cache_from_json(key: &str, expect: &str) -> SpecCache {
+        SpecCache::load(&format!(
+            r#"{{"config_keys":[{{"format":"github-actions","key":"{key}","expect":{expect},
+                "confidence":0.9,"control":"RC-050","severity":"medium","fix":"set it"}}]}}"#
+        ))
+        .expect("the spec file parses")
+    }
+
+    // po-pk3fp.13. "Not the default project" was unstatable: equals flags what
+    // does NOT match, so it can only name the one value that is wanted, and
+    // one_of cannot enumerate every project name an org might use.
+    #[test]
+    fn not_equals_decides_both_ways() {
+        let c = cache_from_json(
+            "application.project",
+            r#"{"kind":"not_equals","value":"default"}"#,
+        );
+        let ok = evaluate(
+            &packet(
+                "application.project",
+                Some("payments"),
+                Resolution::AsAuthored,
+            ),
+            &c,
+        );
+        assert_eq!(ok.verdict, Verdict::Satisfies, "{}", ok.reason);
+        let bad = evaluate(
+            &packet(
+                "application.project",
+                Some("default"),
+                Resolution::PlatformDefault,
+            ),
+            &c,
+        );
+        assert_eq!(bad.verdict, Verdict::Violates, "{}", bad.reason);
+        assert!(bad.reason.starts_with("equal to default"), "{}", bad.reason);
+    }
+
+    // Flux remediation retries: -1 means "remediate forever", the strongest
+    // setting, and at_least 1 flagged it. not_equals 0 states the control.
+    #[test]
+    fn not_equals_zero_passes_the_retry_forever_sentinel() {
+        let c = cache_from_json("job.retry", r#"{"kind":"not_equals","value":"0"}"#);
+        for (v, want) in [
+            ("-1", Verdict::Satisfies),
+            ("3", Verdict::Satisfies),
+            ("0", Verdict::Violates),
+        ] {
+            let f = evaluate(&packet("job.retry", Some(v), Resolution::AsAuthored), &c);
+            assert_eq!(f.verdict, want, "{v} -> {}", f.reason);
+        }
+    }
+
+    #[test]
+    fn not_equals_still_abstains_when_unresolvable() {
+        let c = cache_from_json(
+            "job.permissions",
+            r#"{"kind":"not_equals","value":"write-all"}"#,
+        );
+        let f = evaluate(&unauthored_unresolvable("job.permissions"), &c);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+    }
+
+    #[test]
+    fn duration_strings_parse_to_seconds() {
+        for (text, want) in [
+            ("30s", 30.0),
+            ("10m", 600.0),
+            ("1h30m", 5400.0),
+            ("1h0m0s", 3600.0),
+            ("500ms", 0.5),
+            ("1.5h", 5400.0),
+            ("2d", 172_800.0),
+            ("1w", 604_800.0),
+            ("0", 0.0),
+            (" 5m ", 300.0),
+        ] {
+            assert_eq!(parse_duration_secs(text), Some(want), "{text}");
+        }
+        // A bare number has no unit, and guessing one is how a bound starts
+        // flagging correct configurations.
+        for text in [
+            "15",
+            "",
+            "m",
+            "10x",
+            "5m3",
+            "absent",
+            "{{ .Values.i }}",
+            "-5m",
+        ] {
+            assert_eq!(parse_duration_secs(text), None, "{text:?}");
+        }
+    }
+
+    // The frames' M4 cell: a reconcile interval is a DURATION, and at_most
+    // abstained on "10m" because it is not a number.
+    #[test]
+    fn duration_bounds_decide_both_ways_and_include_the_boundary() {
+        let at_most = cache_from_json(
+            "kustomization.interval",
+            r#"{"kind":"duration_at_most","value":"10m"}"#,
+        );
+        for (v, want) in [
+            ("5m", Verdict::Satisfies),
+            ("600s", Verdict::Satisfies),
+            ("1h", Verdict::Violates),
+        ] {
+            let f = evaluate(
+                &packet("kustomization.interval", Some(v), Resolution::AsAuthored),
+                &at_most,
+            );
+            assert_eq!(f.verdict, want, "{v} -> {}", f.reason);
+        }
+        let at_least = cache_from_json("rule.for", r#"{"kind":"duration_at_least","value":"1m"}"#);
+        for (v, want) in [
+            ("5m", Verdict::Satisfies),
+            ("60s", Verdict::Satisfies),
+            ("10s", Verdict::Violates),
+        ] {
+            let f = evaluate(
+                &packet("rule.for", Some(v), Resolution::AsAuthored),
+                &at_least,
+            );
+            assert_eq!(f.verdict, want, "{v} -> {}", f.reason);
+        }
+    }
+
+    // A value that is not a duration abstains, and so does a spec whose own
+    // bound is not one: neither is evidence about the repo.
+    #[test]
+    fn a_non_duration_value_or_bound_abstains() {
+        let c = cache_from_json(
+            "kustomization.interval",
+            r#"{"kind":"duration_at_most","value":"10m"}"#,
+        );
+        for v in [crate::ABSENT_RENDERING, "15", "{{ .Values.interval }}"] {
+            let f = evaluate(
+                &packet("kustomization.interval", Some(v), Resolution::AsAuthored),
+                &c,
+            );
+            assert_eq!(f.verdict, Verdict::Abstain, "{v:?} -> {}", f.reason);
+        }
+        let broken = cache_from_json(
+            "kustomization.interval",
+            r#"{"kind":"duration_at_most","value":"soon"}"#,
+        );
+        let f = evaluate(
+            &packet("kustomization.interval", Some("5m"), Resolution::AsAuthored),
+            &broken,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+    }
+
+    // An expectation kind this binary does not know must not take the whole
+    // artifact down with it: it loads, and that one key abstains.
+    #[test]
+    fn an_expectation_kind_from_a_newer_scanner_abstains() {
+        let c = cache_from_json(
+            "job.timeout-minutes",
+            r#"{"kind":"some_future_kind","value":"x"}"#,
+        );
+        let f = evaluate(
+            &packet("job.timeout-minutes", Some("15"), Resolution::AsAuthored),
+            &c,
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert!(f.reason.contains("newer than this scanner"), "{}", f.reason);
+    }
+
     #[test]
     fn one_of_accepts_members_only() {
         let c = cache(
@@ -744,6 +1008,58 @@ mod tests {
         set.resolution = Resolution::AsAuthored;
         let ok = super::evaluate(&set, &facts, &c);
         assert_eq!(ok.verdict, Verdict::Satisfies, "{}", ok.reason);
+    }
+
+    // The inner expectation is judged as ITSELF, not as the `when` that wraps
+    // it. A duration floor read off the outer spec is taken for a ceiling, so
+    // the too-short interval passes and the long one is flagged.
+    #[test]
+    fn a_guarded_duration_floor_stays_a_floor() {
+        let c = cache(
+            "workflow.concurrency",
+            when_publishing(ConfigExpect::DurationAtLeast { value: "5m".into() }),
+            0.9,
+        );
+        let facts = [predicate(
+            crate::FILE_SCOPE,
+            "workflow.publishes_image",
+            &["true"],
+        )];
+        let mut p = unset_concurrency();
+        p.resolution = Resolution::AsAuthored;
+        p.resolved_value = Some("10m".into());
+        let ok = super::evaluate(&p, &facts, &c);
+        assert_eq!(ok.verdict, Verdict::Satisfies, "{}", ok.reason);
+
+        p.resolved_value = Some("1m".into());
+        let bad = super::evaluate(&p, &facts, &c);
+        assert_eq!(bad.verdict, Verdict::Violates, "{}", bad.reason);
+        assert!(bad.reason.contains("below the minimum"), "{}", bad.reason);
+    }
+
+    // A guard that holds over a kind this scanner does not know abstains on
+    // the kind, the same as the unguarded spec.
+    #[test]
+    fn a_held_guard_over_an_unknown_kind_abstains() {
+        let c = cache(
+            "workflow.concurrency",
+            when_publishing(ConfigExpect::Unknown),
+            0.9,
+        );
+        let facts = [predicate(
+            crate::FILE_SCOPE,
+            "workflow.publishes_image",
+            &["true"],
+        )];
+        let mut p = unset_concurrency();
+        p.resolution = Resolution::AsAuthored;
+        let f = super::evaluate(&p, &facts, &c);
+        assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
+        assert!(
+            f.reason.contains("unknown expectation kind"),
+            "{}",
+            f.reason
+        );
     }
 
     #[test]

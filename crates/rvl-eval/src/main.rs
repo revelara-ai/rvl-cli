@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use rvl_core::parse_stream;
 use rvl_eval::compare::{self, Finding};
 use rvl_eval::stats::{paired_bootstrap, wilson_interval};
-use rvl_eval::{consumption, gate, latency, load_findings, load_jsonl};
+use rvl_eval::{consumption, gate, latency, load_findings, load_findings_lane, load_jsonl, Lane};
 use rvl_propagate::propagate_all;
 use rvl_spec::SpecCache;
 use serde::Deserialize;
@@ -50,6 +50,11 @@ enum Cmd {
         findings: PathBuf,
         #[arg(long)]
         gold: PathBuf,
+        /// Which lane of an `rvl scan --out` document to score. `structure`
+        /// scores the repo-structure controls: gold ids are control codes
+        /// (`RC-033`, or the full class `repo_structure.RC-033`).
+        #[arg(long, value_enum, default_value = "sites")]
+        lane: Lane,
     },
     /// Sweep a retrieval-policy axis and report what each setting buys.
     ///
@@ -194,6 +199,36 @@ fn join<'a>(findings: &'a [Finding], gold: &'a [GoldCase]) -> Vec<(&'a GoldCase,
     out
 }
 
+/// The structure lane's join. Every row shares one `site_id`, so the control
+/// is the key: a gold id is a control code or the full class.
+fn join_structure<'a>(
+    findings: &'a [Finding],
+    gold: &'a [GoldCase],
+) -> Vec<(&'a GoldCase, &'a Finding)> {
+    let mut out = Vec::new();
+    for g in gold {
+        let class = format!("repo_structure.{}", g.id);
+        if let Some(f) = findings
+            .iter()
+            .find(|f| f.class.as_deref().is_some_and(|c| c == g.id || c == class))
+        {
+            out.push((g, f));
+        }
+    }
+    out
+}
+
+/// A structure findings file must describe ONE scan: with two snapshots in it
+/// a control code names two rows, and scoring whichever came first would be a
+/// silent coin flip. Returns the first class seen twice.
+fn duplicated_class(findings: &[Finding]) -> Option<&str> {
+    let mut seen = std::collections::BTreeSet::new();
+    findings
+        .iter()
+        .filter_map(|f| f.class.as_deref())
+        .find(|c| !seen.insert(*c))
+}
+
 fn counts(findings: &[Finding]) -> BTreeMap<String, usize> {
     let mut m = BTreeMap::new();
     for f in findings {
@@ -202,8 +237,11 @@ fn counts(findings: &[Finding]) -> BTreeMap<String, usize> {
     m
 }
 
-fn score(findings: &[Finding], gold: &[GoldCase]) -> (usize, usize, Vec<String>) {
-    let pairs = join(findings, gold);
+fn score(findings: &[Finding], gold: &[GoldCase], lane: Lane) -> (usize, usize, Vec<String>) {
+    let pairs = match lane {
+        Lane::Sites => join(findings, gold),
+        Lane::Structure => join_structure(findings, gold),
+    };
     let mut correct = 0;
     let mut misses = Vec::new();
     for (g, f) in &pairs {
@@ -364,10 +402,22 @@ fn main() -> Result<()> {
                 println!("wrote {p:?}");
             }
         }
-        Cmd::Score { findings, gold } => {
-            let f = load_findings(&findings)?;
+        Cmd::Score {
+            findings,
+            gold,
+            lane,
+        } => {
+            let f = load_findings_lane(&findings, lane)?;
+            if lane == Lane::Structure {
+                if let Some(class) = duplicated_class(&f) {
+                    anyhow::bail!(
+                        "{class} appears more than once in {findings:?}: the structure lane \
+                         scores one scan at a time, so score each scan document separately"
+                    );
+                }
+            }
             let g: GoldFile = serde_json::from_str(&std::fs::read_to_string(&gold)?)?;
-            let (correct, total, misses) = score(&f, &g.cases);
+            let (correct, total, misses) = score(&f, &g.cases, lane);
             println!(
                 "gold cases {} | joined {total} | UNJOINED {}",
                 g.cases.len(),
@@ -682,16 +732,34 @@ specs borrowed by method for {borrowed} rows",
                     Ok(v) => v,
                     Err(r) => refuse(&r),
                 };
+            // The gold must be the pre-registered sample (po-av01j.92). Checked
+            // before consumption: a set whose rows are not the declared sample
+            // is invalid evidence, refused like the other provenance checks.
+            if let Err(r) = gate::check_gold_matches_sample(&rows, manifest.sample_size) {
+                refuse(&r);
+            }
 
             // The population, printed WITH the number, always.
             println!(
-                "GATE RUN  set {} | language {} | minted {} | registry v{registry_version}",
-                manifest.set_id, manifest.language, manifest.minted
+                "GATE RUN  set {} | language {} | minted {} | registry v{registry_version} (minted against v{})",
+                manifest.set_id, manifest.language, manifest.minted, manifest.registry_version
             );
+            if let Some(note) = gate::registry_version_note(&manifest, &reg) {
+                println!("  {note}");
+            }
             for pin in &manifest.repos {
                 println!("  repo {} @ {}", pin.repo, pin.frozen_sha);
             }
             println!("  sampling frame: {}", manifest.sampling_frame.trim());
+            let n_unsure = rows
+                .iter()
+                .filter(|r| r.adjudicated == gate::AdjudicatedVerdict::Unsure)
+                .count();
+            println!(
+                "  sample: {} decided + {n_unsure} unsure adjudications = sample_size {}",
+                rows.len() - n_unsure,
+                manifest.sample_size
+            );
             println!(
                 "  adjudication: {} by {} ({})",
                 manifest.adjudication.protocol,
@@ -779,16 +847,18 @@ specs borrowed by method for {borrowed} rows",
                 cache.len()
             );
 
-            let engine_sites: Vec<(String, u64, bool)> = sites
+            let engine_sites: Vec<gate::EngineSite> = sites
                 .iter()
                 .zip(engine_findings.iter())
-                .map(|(s, f)| {
-                    (
-                        s.file_path.clone(),
-                        // Site carries u32, GoldRow u64. Widening is lossless.
-                        u64::from(s.line_number),
-                        f.verdict == rvl_core::Verdict::Violates,
-                    )
+                .map(|(s, f)| gate::EngineSite {
+                    file_path: s.file_path.clone(),
+                    // Site carries u32, GoldRow u64. Widening is lossless.
+                    line_number: u64::from(s.line_number),
+                    flagged: f.verdict == rvl_core::Verdict::Violates,
+                    // The cluster key (po-io8sk.1): the retriever stamps
+                    // each site with the repo it came from.
+                    repo: s.snapshot_id.clone(),
+                    class: rvl_triage::class_key_string(s),
                 })
                 .collect();
             let joined = gate::join_gold_to_engine(&rows, &engine_sites);
@@ -813,8 +883,14 @@ specs borrowed by method for {borrowed} rows",
                 "  confirmed violates {} | FALSE POSITIVES {}",
                 s.confirmed_violates, s.false_positives
             );
+            // Never a lone scalar: the bound is taken at n_eff, so the four
+            // numbers that produce n_eff are printed next to it (po-io8sk.1).
             println!(
-                "  precision {:.3} | Wilson 95% LB {:.3} | target {target:.2}",
+                "  n {} | n_clusters {} | deff {:.2} | n_eff {:.1}  (clusters are (repo, spec class))",
+                s.n_scored, s.n_clusters, s.deff, s.n_eff
+            );
+            println!(
+                "  precision {:.3} | Wilson 95% LB {:.3} at n_eff | target {target:.2}",
                 s.precision, s.wilson_lb
             );
             println!(
@@ -957,7 +1033,7 @@ mod tests {
     fn gold_paths_join_to_file_line_site_ids() {
         let findings = vec![f("app/orders.py:7", "violates")];
         let gold = vec![g("app/orders.py", "violates")];
-        let (correct, total, _) = score(&findings, &gold);
+        let (correct, total, _) = score(&findings, &gold, Lane::Sites);
         assert_eq!((correct, total), (1, 1));
     }
 
@@ -966,10 +1042,60 @@ mod tests {
         let (_, total, _) = score(
             &[f("a.py:1", "violates")],
             &[g("a.py", "violates"), g("missing.py", "satisfies")],
+            Lane::Sites,
         );
         assert_eq!(
             total, 1,
             "the caller must be able to see the join was partial"
+        );
+    }
+
+    fn s(control: &str, v: &str) -> Finding {
+        Finding {
+            site_id: "repo".into(),
+            snapshot_id: "r".into(),
+            verdict: v.into(),
+            reason: String::new(),
+            class: Some(format!("repo_structure.{control}")),
+        }
+    }
+
+    /// po-av01j.28: all six structure rows share `site_id: "repo"`, so the
+    /// site join would pair every gold case with the first row.
+    #[test]
+    fn structure_gold_joins_on_the_control_not_the_site() {
+        let findings = vec![s("RC-033", "violates"), s("RC-057", "satisfies")];
+        let gold = vec![
+            g("RC-057", "satisfies"),
+            g("repo_structure.RC-033", "satisfies"),
+            g("RC-070", "violates"),
+        ];
+        let (correct, total, misses) = score(&findings, &gold, Lane::Structure);
+        assert_eq!((correct, total), (1, 2), "RC-070 has no row: {misses:?}");
+        assert_eq!(misses.len(), 1);
+        assert!(misses[0].contains("RC-033"), "{misses:?}");
+    }
+
+    #[test]
+    fn a_site_id_never_joins_in_the_structure_lane() {
+        let (_, total, _) = score(
+            &[s("RC-033", "violates")],
+            &[g("repo", "violates")],
+            Lane::Structure,
+        );
+        assert_eq!(total, 0, "'repo' names every row, so it names none");
+    }
+
+    #[test]
+    fn two_scans_in_one_structure_file_are_detected() {
+        assert_eq!(duplicated_class(&[s("RC-033", "violates")]), None);
+        assert_eq!(
+            duplicated_class(&[
+                s("RC-033", "violates"),
+                s("RC-057", "abstain"),
+                s("RC-033", "satisfies")
+            ]),
+            Some("repo_structure.RC-033")
         );
     }
 

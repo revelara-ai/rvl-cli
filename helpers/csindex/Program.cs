@@ -49,6 +49,23 @@ internal static class Program
     // PACKET_SCHEMA, and rvl_core::PACKET_SCHEMA.
     private const int PacketSchema = 2;
 
+    // ContentVersion is the second line of the --packet-schema reply: which
+    // csindex this is. PacketSchema says what SHAPE the stream has. It does
+    // not move when the helper learns a new client surface, so a week-old
+    // csindex and today's answer the same "2" and scan differently. This is
+    // the first 12 hex digits of the sha256 of Program.cs, which the project
+    // file embeds in the assembly as a resource. rvl compares this value
+    // between the csindex it found and the one bundled with it, and warns when
+    // they are different builds. Null when the resource is absent (a build
+    // from a project file that does not embed it); the line is then omitted.
+    private static string ContentVersion()
+    {
+        using var source = typeof(Program).Assembly.GetManifestResourceStream("csindex.Program.cs");
+        if (source == null) return null;
+        byte[] digest = System.Security.Cryptography.SHA256.HashData(source);
+        return Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 12);
+    }
+
     private static int Main(string[] args)
     {
         bool packetSchema = false, retrieve = false;
@@ -72,6 +89,8 @@ internal static class Program
         if (packetSchema)
         {
             Console.WriteLine(PacketSchema);
+            string version = ContentVersion();
+            if (version != null) Console.WriteLine("content-version " + version);
             return 0;
         }
 

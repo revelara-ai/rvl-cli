@@ -13,14 +13,20 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl suppress <ID> [PATH] [--reason …] [--expires YYYY-MM-DD]` | Waive a finding: append a rule waiver to `./.revelara.yaml` under `scanner.waivers`. |
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
 | `rvl index <init\|reindex\|status>` | Incremental-scan packet index (content-hash keyed). `reindex --detach` rebuilds in the background. |
-| `rvl sync` | Refresh the spec cache from the Revelara API (async-safe, never blocks a scan). With no key, syncs the OSS vocabulary tier; with a key, both tiers. |
-| `rvl cache <import\|status>` | Spec-cache maintenance, including air-gapped import of a signed artifact. |
+| `rvl sync` | Refresh the spec cache from the Revelara API (async-safe, never blocks a scan). With no key, syncs the OSS vocabulary tier; with a key, both tiers. Rarely needed by hand: `init` syncs, and scans start a background check every six hours. An HTTP 404 is reported as "the server has not published a spec cache", separate from `fetch failed` (network or server error). |
+| `rvl cache <import\|status\|keys>` | Spec-cache maintenance, including air-gapped import of a signed artifact. `keys` lists every config key the retrievers emit and where it stands against the installed specs: specced, awaiting a spec, or vocabulary only (emitted as evidence, never judged). |
 
 `scan`, `explain`, `suppress`, and `report` all take the same input escape
 hatches: `--retrieved <packets.jsonl>` scans a prebuilt retriever packet
 stream instead of running helpers, and `--specs-file` is a loudly-announced
 dev-only bypass of the signed cache (`--judgments` likewise overrides the
 cache's judgment corpus).
+
+`scan` and `report` also take `--oss-only`, which loads the OSS tier alone
+even when a commercial tier is installed, so the result matches a no-key
+install. It is a load filter (`rvl sync` is unchanged), it is announced on
+stderr, and it cannot be combined with `--specs-file` or `--judgments`. See
+[Scanning](scanning.md#scanning-with-the-free-tier-only).
 
 ### Submission mode
 
@@ -49,7 +55,7 @@ set is rvl-cli parity:
 
 | Command | What it does |
 | --- | --- |
-| `rvl init` | Initialize Revelara for this repository: write `.revelara.yaml`, install the plugin skills, check credentials. |
+| `rvl init` | Initialize Revelara for this repository: write `.revelara.yaml`, install the plugin skills, check credentials, sync the spec cache. |
 | `rvl doctor [PATH]` | Diagnose (and with `--fix`, repair) this machine's ability to scan this repository. |
 | `rvl hook <install\|doctor>` | Install or check the git-hook scan gate. |
 | `rvl skills <install\|update\|status>` | Install the Revelara workflow skills and lenses into your coding-agent harness. |

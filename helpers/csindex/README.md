@@ -54,6 +54,12 @@ csindex --packet-schema
 csindex --retrieve --root <repo> --name <snapshot> [--files a.cs,b.cs]
 ```
 
+`--packet-schema` prints two lines: the contract version, then
+`content-version <12 hex digits>`, the start of a sha256 of `Program.cs`, which the assembly embeds. The first
+line is what a consumer negotiates on. The second identifies this build of the
+helper: rvl compares it with the copy it ships and warns in `COVERAGE` when
+the two differ (see "Helper drift" in `docs/retrievers.md`).
+
 Build requires a .NET 8 SDK and NuGet access for the Roslyn package:
 
 ```

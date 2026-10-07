@@ -293,3 +293,225 @@ fn a_skipped_test_file_is_flagged_and_reused_like_any_entry() {
     idx.put(&t, &h_t, &[]).unwrap();
     assert!(!idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
 }
+
+// --- dependency (header -> TU) invalidation, po-av01j.53 ---
+
+#[test]
+fn an_entry_goes_stale_when_a_recorded_dependency_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+    let tu = write(dir.path(), "main.c", "#include \"api.h\"\n");
+    let header = write(dir.path(), "api.h", "int f(void);\n");
+    let h = hash_file(&tu).unwrap();
+    idx.put_with_deps(
+        &tu,
+        &h,
+        &[site("main.c", 3, "libcurl.CURL", "f")],
+        std::slice::from_ref(&header),
+    )
+    .unwrap();
+
+    // Fresh: the TU and its header are as indexed.
+    assert!(idx.lookup(&tu, &h).unwrap().is_some());
+    assert_eq!(
+        idx.plan_reload(std::slice::from_ref(&tu)).unchanged,
+        vec![tu.clone()]
+    );
+
+    // The header changes; the TU's own bytes do not. The shard is stale.
+    std::fs::write(&header, "long f(void);\n").unwrap();
+    assert!(idx.lookup(&tu, &h).unwrap().is_none());
+    assert_eq!(
+        idx.plan_reload(std::slice::from_ref(&tu)).changed,
+        vec![tu.clone()]
+    );
+
+    // A deleted header is stale too: fail toward doing the work.
+    idx.put_with_deps(&tu, &h, &[], std::slice::from_ref(&header))
+        .unwrap();
+    std::fs::remove_file(&header).unwrap();
+    assert!(idx.lookup(&tu, &h).unwrap().is_none());
+}
+
+#[test]
+fn dependents_maps_a_header_to_the_files_that_recorded_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+    let a = write(dir.path(), "a.c", "a\n");
+    let b = write(dir.path(), "b.c", "b\n");
+    let c = write(dir.path(), "c.c", "c\n");
+    let shared = write(dir.path(), "shared.h", "s\n");
+    let only_b = write(dir.path(), "only_b.h", "o\n");
+    idx.put_with_deps(
+        &a,
+        &hash_file(&a).unwrap(),
+        &[],
+        std::slice::from_ref(&shared),
+    )
+    .unwrap();
+    idx.put_with_deps(
+        &b,
+        &hash_file(&b).unwrap(),
+        &[],
+        &[shared.clone(), only_b.clone()],
+    )
+    .unwrap();
+    idx.put(&c, &hash_file(&c).unwrap(), &[]).unwrap();
+
+    let canon = |p: &PathBuf| p.canonicalize().unwrap();
+    assert_eq!(idx.dependents(&shared).unwrap(), vec![canon(&a), canon(&b)]);
+    assert_eq!(idx.dependents(&only_b).unwrap(), vec![canon(&b)]);
+    assert!(idx.dependents(&c).unwrap().is_empty());
+}
+
+// --- on-disk format across the redb 2 -> 4 bump (po-av01j.210) ---
+//
+// Every user has a live index written by redb 2, and redb 4 refuses to open
+// that file format. The index is a content-hash cache, so the story is
+// detect-and-rebuild: opening must succeed with an empty index and SAY that
+// it rebuilt, never surface the storage engine's upgrade error.
+
+/// A real index written through `PacketIndex` by redb 2.6.3 (one entry),
+/// unpacked into `dir`.
+fn redb2_index(dir: &std::path::Path) -> PathBuf {
+    use std::io::Read;
+    let gz = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/packets-redb2.redb.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(gz).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let path = dir.join("packets.redb");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn an_index_written_by_redb_2_is_detected_and_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = redb2_index(dir.path());
+
+    let idx = PacketIndex::open(&path).expect("an old-format index must open, not error");
+    assert!(
+        idx.rebuilt_from_old_format(),
+        "the rebuild must be reported, not silent"
+    );
+    assert!(idx.is_empty().unwrap(), "a rebuilt index starts empty");
+
+    // The rebuilt index is a working one, and the rebuild happens once.
+    let f = write(dir.path(), "a.go", "package a");
+    let h = hash_file(&f).unwrap();
+    idx.put(&f, &h, &[site("a.go", 1, "http.Client", "Do")])
+        .unwrap();
+    drop(idx);
+    let idx = PacketIndex::open(&path).unwrap();
+    assert!(!idx.rebuilt_from_old_format());
+    assert_eq!(idx.get(&f, &h).unwrap().unwrap().len(), 1);
+}
+
+#[test]
+fn a_fresh_index_is_not_reported_as_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+    assert!(!idx.rebuilt_from_old_format());
+}
+
+// --- packet contract stamp (po-av01j.67) ---
+//
+// The content hash says the FILE has not changed; it says nothing about the
+// packet contract the entry was retrieved under. An entry written before a
+// packet field existed would otherwise serve sites without that field for as
+// long as the file stays untouched.
+
+/// Write `value` as the raw stored entry for `file`, the way an older binary
+/// would have left it. The index must be closed: redb is single-opener.
+fn put_raw_entry(index: &std::path::Path, file: &std::path::Path, value: &serde_json::Value) {
+    const ENTRIES: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("entries");
+    let db = redb::Database::create(index).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(ENTRIES).unwrap();
+        let key = std::fs::canonicalize(file).unwrap();
+        table
+            .insert(key.to_str().unwrap(), value.to_string().as_str())
+            .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+/// One stored entry for `a.go` whose content hash still matches, carrying
+/// `stamp` as its packet contract version (`None` = written before the stamp).
+fn index_with_entry_stamped(dir: &std::path::Path, stamp: Option<u32>) -> (PathBuf, PathBuf) {
+    let index = dir.join("packets.redb");
+    let f = write(dir, "a.go", "package a\n");
+    let mut entry = serde_json::json!({
+        "hash": hash_file(&f).unwrap(),
+        "sites": [site("a.go", 1, "pkg.C", "Do")],
+    });
+    if let Some(stamp) = stamp {
+        entry["packet_schema"] = stamp.into();
+    }
+    put_raw_entry(&index, &f, &entry);
+    (index, f)
+}
+
+#[test]
+fn an_entry_written_under_an_older_packet_schema_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, f) = index_with_entry_stamped(dir.path(), Some(rvl_core::PACKET_SCHEMA - 1));
+    let idx = PacketIndex::open(&index).unwrap();
+    let h = hash_file(&f).unwrap();
+
+    assert!(
+        idx.get(&f, &h).unwrap().is_none(),
+        "the hash matches but the entry predates the packet contract: a miss"
+    );
+    assert!(idx.lookup(&f, &h).unwrap().is_none());
+    assert!(
+        idx.planned(&f, &h).unwrap().is_none(),
+        "the plan's fast read applies the same contract check"
+    );
+    let plan = idx.plan_reload(std::slice::from_ref(&f));
+    assert_eq!(plan.changed, vec![f.clone()], "the file is re-retrieved");
+    assert!(plan.unchanged.is_empty());
+}
+
+#[test]
+fn an_entry_with_no_packet_schema_stamp_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, f) = index_with_entry_stamped(dir.path(), None);
+    let idx = PacketIndex::open(&index).unwrap();
+
+    assert!(idx.get(&f, &hash_file(&f).unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn an_entry_written_under_a_newer_packet_schema_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, f) = index_with_entry_stamped(dir.path(), Some(rvl_core::PACKET_SCHEMA + 1));
+    let idx = PacketIndex::open(&index).unwrap();
+
+    assert!(
+        idx.get(&f, &hash_file(&f).unwrap()).unwrap().is_none(),
+        "a downgraded binary must not read a shape it does not know"
+    );
+}
+
+#[test]
+fn a_warm_scan_re_retrieves_a_stale_stamped_entry_and_heals_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, f) = index_with_entry_stamped(dir.path(), None);
+    let idx = PacketIndex::open(&index).unwrap();
+    let r = FakeRetriever::new(1);
+
+    let first = idx
+        .warm_scan(std::slice::from_ref(&f), &r, &Budget::hook())
+        .unwrap();
+    assert_eq!((first.reused_files, first.retrieved_files), (0, 1));
+
+    // The re-retrieved entry carries the current stamp: the next pass is warm.
+    let second = idx
+        .warm_scan(std::slice::from_ref(&f), &r, &Budget::hook())
+        .unwrap();
+    assert_eq!((second.reused_files, second.retrieved_files), (1, 0));
+    assert_eq!(idx.len().unwrap(), 1, "healed in place, not duplicated");
+}

@@ -26,9 +26,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"go/constant"
 	"io"
 	"io/fs"
 	"go/ast"
+	"go/parser"
+	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
@@ -197,8 +200,11 @@ type RetrievedSite struct {
 	// "type": the receiver could not be traced, so these are constructions of
 	// the same type found elsewhere in the repository, candidates only. One
 	// bounded client must never vouch for another, so downstream reads a
-	// "type" construction as evidence to abstain on, never to pass. Additive
-	// within the v2 packet train, like SiteKind.
+	// "type" construction as evidence to abstain on, never to pass.
+	// "unresolved": the receiver was traced to a value built outside this
+	// repository (a dependency's call result), so there is no construction to
+	// attach and none of the type elsewhere speaks for it. Additive within the
+	// v2 packet train, like SiteKind.
 	ConstructionScope string `json:"client_construction_scope,omitempty"`
 	Prov         Provenance `json:"provenance"`
 
@@ -213,8 +219,10 @@ type RetrievedSite struct {
 	// client-call site; "server_entry" = an HTTP handler/route/middleware
 	// registration (G2, po-av01j.3); "background_job" = a G3 scheduler/queue
 	// registration or worker-loop entry (po-av01j.4); "emission_point" = a G4
-	// emission aggregate (po-av01j.5). Additive default-carrying field within
-	// the v2 packet train — not a schema bump.
+	// emission aggregate (po-av01j.5); "misuse_shape" = an error-handling
+	// shape aggregate (misuse.go); "unsized_construction" = a pool, cache
+	// or whole-body read built here (bounds.go). Additive default-carrying
+	// field within the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
 }
 
@@ -386,6 +394,11 @@ func (s *srcIndex) text(pkg *packages.Package, from, to ast.Node) string {
 	return out
 }
 
+// span is the byte length of n's source, before any truncation.
+func (s *srcIndex) span(pkg *packages.Package, n ast.Node) int {
+	return pkg.Fset.Position(n.End()).Offset - pkg.Fset.Position(n.Pos()).Offset
+}
+
 type retFunc struct {
 	id        string
 	name      string
@@ -514,6 +527,70 @@ func constArgs(info *types.Info, call *ast.CallExpr) []ConstArg {
 	return out
 }
 
+// loadMode is what every goindex load asks go/packages for. NeedDeps stays:
+// without it dependencies come from compiler export data, which means
+// `go list -export` compiling the whole graph on a cold build cache -- a fresh
+// CI runner, a new HOME -- and that blows the pre-commit hook's 10s cap.
+const loadMode = packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+	packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps
+
+// loadConfig is the one packages.Config every goindex load uses.
+//
+// DEPENDENCY BODIES ARE DROPPED AT PARSE TIME (po-av01j.133.11). NeedDeps with
+// NeedSyntax|NeedTypesInfo type-checks every transitive dependency -- the
+// standard library and every imported module -- from source, and kept every
+// function body's AST and type facts, so peak RSS tracked the dependency graph
+// rather than the repo: 2.26 GB on a 28 MB prometheus checkout, 3.8 GB on a
+// 57 MB temporal one. goindex reads bodies only in the module it is loading;
+// for everything else the declarations carry all the type information it
+// uses. This is how gopls type-checks dependencies. Measured on prometheus:
+// byte-identical output, 2.26 GB -> 0.93 GB, 76s -> 15s.
+//
+// The failure to avoid is the inverse: a module file mistaken for a dependency
+// loses its bodies and its call sites vanish without a word. So the module is
+// recognised by its path as given AND as symlinks resolve it, and anything
+// under that directory keeps its bodies -- including an in-tree module pulled
+// in by a `replace`, which costs memory, never sites.
+func loadConfig(dir string) *packages.Config {
+	sep := string(filepath.Separator)
+	// go/packages reports absolute filenames; a relative dir would match none
+	// of them and strip every module body.
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	prefixes := []string{filepath.Clean(dir) + sep}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		prefixes = append(prefixes, filepath.Clean(real)+sep)
+	}
+	inModule := func(filename string) bool {
+		for _, p := range prefixes {
+			if rest, ok := strings.CutPrefix(filename, p); ok {
+				// A vendored copy is a dependency that happens to live here.
+				return !strings.HasPrefix(rest, "vendor"+sep)
+			}
+		}
+		return false
+	}
+	return &packages.Config{
+		Mode: loadMode, Dir: dir, Tests: false,
+		ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+			if inModule(filename) {
+				// go/packages' own default for a file it will hand back.
+				return parser.ParseFile(fset, filename, src, parser.AllErrors|parser.ParseComments)
+			}
+			f, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
+			if f != nil {
+				for _, d := range f.Decls {
+					if fd, ok := d.(*ast.FuncDecl); ok {
+						fd.Body = nil
+					}
+				}
+			}
+			return f, err
+		},
+	}
+}
+
 // runRetrieve builds the index and emits retrieved source per I/O call site.
 var lastRepoConfig RepoConfig
 
@@ -525,13 +602,12 @@ var lastRepoConfig RepoConfig
 // The `loaded` result separates a module that HELD no Go from one that could
 // not be READ. False with a nil error means the module matched no packages --
 // it is EMPTY, and the caller must carry on to the next module (po-pk3fp.12).
-func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loaded bool, err error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-		Dir: moduleDir, Tests: false,
-	}
-	pkgs, err := packages.Load(cfg, "./...")
+//
+// The census is this module's retrieval denominator (see RetrievalCensus),
+// counted in the same walk that emits the sites so the two cannot disagree
+// about which functions were visited.
+func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, census RetrievalCensus, loaded bool, err error) {
+	pkgs, err := packages.Load(loadConfig(moduleDir), "./...")
 	// A LOAD THAT FAILED IS NOT A SCAN THAT FOUND NOTHING (po-av01j.209).
 	// This arm used to print "load failed:" and return nil, and main then
 	// exited 0 -- so on a machine with no Go toolchain rvl recorded a
@@ -542,7 +618,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// returned packages that carry no type information: in both of those Go
 	// source EXISTS and was not read, so both stay errors.
 	if err != nil {
-		return nil, false, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
+		return nil, census, false, fmt.Errorf("go/packages could not load %s: %w", moduleDir, err)
 	}
 	// ...BUT NEITHER IS AN EMPTY MODULE A LOAD THAT FAILED (po-pk3fp.12).
 	// This arm used to error too, on the reasoning that it was the same fact
@@ -552,7 +628,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// Treating it as a failure cost dolt its entire Go lane, because proto/
 	// sorts before the go/ module that holds all 201 of the product packages.
 	if len(pkgs) == 0 {
-		return nil, false, nil
+		return nil, census, false, nil
 	}
 	usable := 0
 	for _, p := range pkgs {
@@ -561,7 +637,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 		}
 	}
 	if usable == 0 {
-		return nil, false, fmt.Errorf(
+		return nil, census, false, fmt.Errorf(
 			"go/packages returned %d package(s) under %s but none carried type information, "+
 				"so no Go source was analysed", len(pkgs), moduleDir)
 	}
@@ -672,16 +748,20 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 				file, line := rel(p, cl)
 				litsByType[key] = append(litsByType[key],
 					Snippet{File: file, Line: line, Symbol: key, Source: src.text(p, cl, cl)})
-				var fields []string
+				var fields, zeroFields []string
 				for _, el := range cl.Elts {
 					if kv, ok := el.(*ast.KeyValueExpr); ok {
 						if id, ok := kv.Key.(*ast.Ident); ok {
 							fields = append(fields, id.Name)
+							if isConstantZero(p.TypesInfo, kv.Value) {
+								zeroFields = append(zeroFields, id.Name)
+							}
 						}
 					}
 				}
 				if len(fields) > 0 {
 					configFacts = append(configFacts, ConfigFact{Type: key, Fields: fields,
+						ZeroFields: zeroFields,
 						File: file, Line: line, Source: src.text(p, cl, cl)})
 				}
 				return true
@@ -689,6 +769,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 			reach.collect(p, f, src, rel)
 		}
 	}
+	reach.finish()
 
 	callees := map[string][]*retFunc{}
 
@@ -793,6 +874,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	lastRepoConfig = RepoConfig{Kind: "repo_config", Snapshot: name, Constructions: append(lastRepoConfig.Constructions, configFacts...)}
 
 	var out []RetrievedSite
+	census = newRetrievalCensus()
 	for _, p := range pkgs {
 		if p.TypesInfo == nil {
 			continue
@@ -812,7 +894,22 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 				if me == nil {
 					continue
 				}
+				// The function literals open around the node being visited,
+				// innermost last.
+				var lits []*ast.FuncLit
+				var stack []ast.Node
 				ast.Inspect(fd.Body, func(x ast.Node) bool {
+					if x == nil {
+						if _, ok := stack[len(stack)-1].(*ast.FuncLit); ok {
+							lits = lits[:len(lits)-1]
+						}
+						stack = stack[:len(stack)-1]
+						return true
+					}
+					stack = append(stack, x)
+					if fl, ok := x.(*ast.FuncLit); ok {
+						lits = append(lits, fl)
+					}
 					c, ok := x.(*ast.CallExpr)
 					if !ok {
 						return true
@@ -822,6 +919,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						return true
 					}
 					callee, _ := info.Uses[sel.Sel].(*types.Func)
+					if callee != nil {
+						census.CallsResolved++
+					}
 					// G2 server-entry registrations are checked FIRST: chi's
 					// r.Get would otherwise collide with the G1 ioMethods
 					// gate and emit a route registration as a client call. A
@@ -840,6 +940,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 							SiteKind:   siteKindServerEntry,
 							Prov:       Provenance{ClientTypeKnown: true},
 						})
+						census.Candidates++
 						return true
 					}
 					if callee == nil {
@@ -849,6 +950,9 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					// I/O call (G1); anything else is not a site.
 					jobType := jobFrameworkType(callee)
 					if jobType == "" && !ioMethods[callee.Name()] {
+						if surface, known := knownUnretrieved(callee); known {
+							census.Unretrieved[surface]++
+						}
 						return true
 					}
 					if jobType == "" && len(c.Args) == 0 && (callee.Name() == "Query" ||
@@ -856,12 +960,23 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						return true
 					}
 					file, line := rel(p, c)
+					// The enclosing function is the declaration, so a
+					// deadline derived before a closure is in scope of a call
+					// inside it. A declaration over the snippet budget is cut
+					// from the top, though, and a call in a handler literal
+					// at the bottom of a long main() then loses the literal
+					// it sits in, deadline included. The innermost literal is
+					// the function that call is in, so it is sent instead.
+					var enclosing ast.Node = fd
+					if len(lits) > 0 && src.span(p, fd) > maxSnippetBytes {
+						enclosing = lits[len(lits)-1]
+					}
 					rs := RetrievedSite{
 						Snapshot: name, File: file, Line: line,
 						Symbol: fd.Name.Name, Method: callee.Name(),
 						Receiver:  exprString(sel.X),
 						CallSite:  src.text(p, c, c),
-						Enclosing: src.text(p, fd, fd),
+						Enclosing: src.text(p, enclosing, enclosing),
 						ConstArgs: constArgs(info, c),
 					}
 					pkgPath, pkgRecv := packageReceiver(info, sel)
@@ -942,12 +1057,15 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 					// The values that reach this receiver, when the type checker
 					// can say which: see trace.go.
 					if !pkgRecv {
-						if got, ok := reach.trace(varOf(info, sel.X), funcs, src, 0); ok {
+						switch got, st := reach.trace(varOf(info, sel.X), funcs, src, 0); st {
+						case traceOK:
 							rs.ConstructionScope = "receiver"
 							if len(got) > maxCtorsEmitted {
 								got = got[:maxCtorsEmitted]
 							}
 							rs.Construction = got
+						case traceOpaque:
+							rs.ConstructionScope = "unresolved"
 						}
 					}
 					if rs.ConstructionScope == "" && rs.ClientType != "" {
@@ -995,6 +1113,7 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 						rs.ConstructionScope = "type"
 					}
 					out = append(out, rs)
+					census.Candidates++
 					return true
 				})
 			}
@@ -1003,7 +1122,13 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, loa
 	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)
-	return out, true, nil
+	// Misuse-shape inventory: discarded error values, stamped
+	// site_kind: "misuse_shape".
+	out = append(out, collectMisuse(pkgs, src, root, name)...)
+	// Unsized-construction inventory: pools, caches and whole-body reads,
+	// stamped site_kind: "unsized_construction".
+	out = append(out, collectUnsized(pkgs, src, root, name)...)
+	return out, census, true, nil
 }
 
 // RepoConfig is repo-scoped, not site-scoped, and that is the point. An
@@ -1015,14 +1140,36 @@ type RepoConfig struct {
 	Kind          string        `json:"kind"`
 	Snapshot      string        `json:"snapshot_id"`
 	Constructions []ConfigFact  `json:"constructions"`
+	// The retrieval denominator (po-av01j.219), whole-repo: computed before
+	// any --files filter, because goindex loads every module either way.
+	Retrieval []RetrievalCensus `json:"retrieval"`
 }
 
 type ConfigFact struct {
 	Type   string   `json:"type"`
 	Fields []string `json:"fields"`
+	// ZeroFields is the subset of Fields set to a constant zero.
+	// `http.Client{Timeout: 0}` names Timeout and sets no timeout, so the
+	// name alone is not evidence of a bound.
+	ZeroFields []string `json:"zero_fields,omitempty"`
 	File   string   `json:"file"`
 	Line   int      `json:"line"`
 	Source string   `json:"source"`
+}
+
+// isConstantZero reports whether the type checker folded e to a numeric
+// zero: `0`, `0 * time.Second`, a named zero constant. A value it could not
+// fold is unknown, and unknown is never reported as zero.
+func isConstantZero(info *types.Info, e ast.Expr) bool {
+	tv, ok := info.Types[e]
+	if !ok || tv.Value == nil {
+		return false
+	}
+	switch tv.Value.Kind() {
+	case constant.Int, constant.Float:
+		return constant.Sign(tv.Value) == 0
+	}
+	return false
 }
 
 // filterToFiles keeps only sites from the named files (exact path match,
@@ -1148,6 +1295,16 @@ type moduleScan struct {
 	Empty      []string // modules that matched no packages at all
 	FailedDir  string   // the module behind Err, named so the operator can go there
 	Err        error    // the FIRST genuine load failure, if any
+	Census     RetrievalCensus // summed over the Loaded modules
+}
+
+// repoConfigFor is the repo-scoped record for one run: the construction facts
+// every module contributed, and the run's retrieval census.
+func repoConfigFor(scan moduleScan, name string) RepoConfig {
+	rc := lastRepoConfig
+	rc.Kind, rc.Snapshot = "repo_config", name
+	rc.Retrieval = []RetrievalCensus{scan.Census}
+	return rc
 }
 
 // runRetrieveAll loads every discovered module and returns their sites with
@@ -1164,10 +1321,10 @@ type moduleScan struct {
 // going after a genuine error too, but only to finish counting: the error is
 // retained and main still treats it as fatal.
 func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
-	scan := moduleScan{Discovered: discoverModules(root)}
+	scan := moduleScan{Discovered: discoverModules(root), Census: newRetrievalCensus()}
 	var all []RetrievedSite
 	for _, m := range scan.Discovered {
-		sites, loaded, err := runRetrieveModule(m, root, name)
+		sites, census, loaded, err := runRetrieveModule(m, root, name)
 		switch {
 		case err != nil:
 			if scan.Err == nil {
@@ -1178,6 +1335,7 @@ func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
 		default:
 			scan.Loaded = append(scan.Loaded, m)
 			all = append(all, sites...)
+			scan.Census.add(census)
 		}
 	}
 	return all, scan

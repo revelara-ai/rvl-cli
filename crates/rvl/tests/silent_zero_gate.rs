@@ -32,6 +32,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+/// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+/// carries the compile-time path of whichever checkout built it, which may be gone.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .into()
+}
+
 /// git forwards a hook's stdout to ITS stderr, so a hook's ladder can land on
 /// either stream depending on git version; assertions read both.
 fn combined(out: &std::process::Output) -> String {
@@ -76,7 +85,7 @@ fn goindex_binary() -> Option<PathBuf> {
     static BUILT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     BUILT
         .get_or_init(|| {
-            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let src = manifest_dir()
                 .join("../../helpers/goindex")
                 .canonicalize()
                 .ok()?;
@@ -85,6 +94,10 @@ fn goindex_binary() -> Option<PathBuf> {
                 .join("goindex-under-test");
             let st = Command::new("go")
                 .arg("build")
+                // A `go` binary locates its own root; an inherited GOROOT naming
+                // another release fails every std package (see cli.rs
+                // go_build_command).
+                .env_remove("GOROOT")
                 .arg("-o")
                 .arg(&out)
                 .arg(".")

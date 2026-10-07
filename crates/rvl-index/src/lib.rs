@@ -14,9 +14,10 @@
 //!   failed job.
 
 use anyhow::Context;
-use redb::ReadableTableMetadata;
+use redb::{ReadableDatabase, ReadableTableMetadata};
 use rvl_core::Site;
 use rvl_core::BIN;
+use rvl_core::PACKET_SCHEMA;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -43,9 +44,11 @@ pub fn site_key(site: &Site) -> String {
 /// What a warm pre-commit pass decided to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReloadPlan {
-    /// Files whose content hash matches the index: packets are reused.
+    /// Files whose content hash matches an index entry written under the
+    /// current packet contract: packets are reused.
     pub unchanged: Vec<PathBuf>,
-    /// Files that must be re-retrieved (changed, new, or never indexed).
+    /// Files that must be re-retrieved (changed, new, never indexed, or
+    /// indexed under another packet contract version).
     pub changed: Vec<PathBuf>,
 }
 
@@ -59,15 +62,30 @@ pub trait Retriever {
 /// The persistent index: path -> (content hash, packets retrieved from it).
 pub struct PacketIndex {
     db: redb::Database,
+    rebuilt_from_old_format: bool,
 }
 
-/// path -> JSON {hash, sites}. One table keeps the store trivially
-/// forward-compatible: a schema change is a new value shape, not a migration.
+/// path -> JSON {hash, packet_schema, sites}. One table keeps the store
+/// trivially forward-compatible: a schema change is a new value shape, not a
+/// migration. The value shape decoding is not the same as the packets being
+/// current, which is what `Entry::packet_schema` is for.
 const ENTRIES: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("entries");
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Entry {
     hash: String,
+    /// The packet contract version ([`PACKET_SCHEMA`]) the sites were
+    /// retrieved under. The content hash only says the file has not changed;
+    /// an entry written before a packet field existed would otherwise serve
+    /// sites without it until the file is next edited. Any other version,
+    /// older or newer, is a miss (po-av01j.67). Defaults to 0, older than
+    /// every real version, so an entry written before the stamp is a miss
+    /// too.
+    ///
+    /// The stamp is only as good as the constant: a field added to the
+    /// contract WITHOUT a version bump is not noticed here.
+    #[serde(default)]
+    packet_schema: u32,
     /// The helper declined to read this file as test material.
     /// Indistinguishable from scanned-with-zero-packets without the flag,
     /// and a warm scan needs the distinction to report the repository-wide
@@ -76,6 +94,37 @@ struct Entry {
     #[serde(default)]
     test_skipped: bool,
     sites: Vec<Site>,
+    /// The files this entry's packets also depend on, as (index key, content
+    /// hash at indexing time): for a C/C++ translation unit, the headers it
+    /// includes. The entry is reusable only while every one still hashes the
+    /// same. `None` on an entry written before dependencies were recorded,
+    /// which is "unknown", not "none".
+    #[serde(default)]
+    deps: Option<Vec<(String, String)>>,
+}
+
+/// Content hashes of dependency files, memoized for one pass. Many
+/// translation units share the same headers; each is hashed once. `None` is
+/// an unreadable file, which never matches a recorded hash.
+type DepHashes = std::collections::HashMap<String, Option<String>>;
+
+impl Entry {
+    /// Is this the entry for the file's content at `hash`, written under the
+    /// packet contract version this build reads?
+    fn current_at(&self, hash: &str) -> bool {
+        self.hash == hash && self.packet_schema == PACKET_SCHEMA
+    }
+
+    /// Does every recorded dependency still hash as it did at indexing time?
+    /// A missing or unreadable dependency is stale: fail toward doing the work.
+    fn deps_fresh(&self, memo: &mut DepHashes) -> bool {
+        self.deps.iter().flatten().all(|(path, recorded)| {
+            memo.entry(path.clone())
+                .or_insert_with(|| hash_file(Path::new(path)).ok())
+                .as_deref()
+                == Some(recorded.as_str())
+        })
+    }
 }
 
 /// How long [`PacketIndex::open`] waits for a busy index before giving up.
@@ -124,15 +173,21 @@ impl PacketIndex {
     /// the lock for a few milliseconds throws away the whole reindex
     /// (po-l3jo5).
     ///
-    /// Only `DatabaseAlreadyOpen` is retried. A storage error or a required
-    /// format upgrade will not resolve itself, and retrying one for a minute
-    /// only delays the report.
+    /// Only `DatabaseAlreadyOpen` is retried. A storage error will not
+    /// resolve itself, and retrying one for a minute only delays the report.
+    ///
+    /// An index in an older on-disk format (one written by redb 2, which
+    /// redb 4 refuses to open) is deleted and created afresh. The index is a
+    /// content-hash cache, so nothing is lost but warmth, and the next scan
+    /// refills it. The rebuild is recorded, never silent: see
+    /// [`PacketIndex::rebuilt_from_old_format`] (po-av01j.210).
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let started = Instant::now();
         let mut backoff = Duration::from_millis(25);
+        let mut rebuilt_from_old_format = false;
         let db = loop {
             match redb::Database::create(path) {
                 Ok(db) => break db,
@@ -146,6 +201,14 @@ impl PacketIndex {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(250));
                 }
+                // Once only: a second refusal after the delete is a real
+                // fault, and looping on it would never end.
+                Err(redb::DatabaseError::UpgradeRequired(_)) if !rebuilt_from_old_format => {
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("removing old-format packet index at {}", path.display())
+                    })?;
+                    rebuilt_from_old_format = true;
+                }
                 Err(e) => {
                     return Err(anyhow::Error::new(e))
                         .with_context(|| format!("opening packet index at {}", path.display()))
@@ -158,17 +221,41 @@ impl PacketIndex {
             let _ = tx.open_table(ENTRIES)?;
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            rebuilt_from_old_format,
+        })
     }
 
     /// Record the packets retrieved from `file` at content hash `hash`.
     pub fn put(&self, file: &Path, hash: &str, sites: &[Site]) -> anyhow::Result<()> {
+        self.put_with_deps(file, hash, sites, &[])
+    }
+
+    /// Record the packets retrieved from `file` at content hash `hash`,
+    /// together with the files those packets also depend on (`deps`, hashed
+    /// here as they are now). A later change to any of them makes the entry
+    /// stale. A dependency that cannot be read is recorded with a hash
+    /// nothing matches, so the entry is re-retrieved on the next pass.
+    pub fn put_with_deps(
+        &self,
+        file: &Path,
+        hash: &str,
+        sites: &[Site],
+        deps: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let deps = deps
+            .iter()
+            .map(|d| (key_of(d), hash_file(d).unwrap_or_default()))
+            .collect();
         self.put_entry(
             file,
             Entry {
                 hash: hash.to_string(),
+                packet_schema: PACKET_SCHEMA,
                 test_skipped: false,
                 sites: sites.to_vec(),
+                deps: Some(deps),
             },
         )
     }
@@ -181,8 +268,10 @@ impl PacketIndex {
             file,
             Entry {
                 hash: hash.to_string(),
+                packet_schema: PACKET_SCHEMA,
                 test_skipped: true,
                 sites: Vec::new(),
+                deps: Some(Vec::new()),
             },
         )
     }
@@ -207,21 +296,62 @@ impl PacketIndex {
         Ok(Some(serde_json::from_str(raw.value())?))
     }
 
-    /// Packets stored for `file`, if the stored hash matches `hash`.
+    /// Packets stored for `file`, if the stored hash matches `hash` and the
+    /// entry was written under the current packet contract.
     pub fn get(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Vec<Site>>> {
         Ok(self.lookup(file, hash)?.map(|e| e.sites))
     }
 
     /// What the index holds for `file` at `hash`: its packets and whether it
-    /// was skipped as test material rather than scanned.
+    /// was skipped as test material rather than scanned. `None` when the
+    /// stored hash differs, a recorded dependency has changed since, or the
+    /// entry was written under another packet contract version, so the
+    /// caller re-retrieves the file and overwrites the entry.
     pub fn lookup(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
         Ok(self
             .entry(file)?
-            .filter(|e| e.hash == hash)
-            .map(|e| Indexed {
-                sites: e.sites,
-                test_skipped: e.test_skipped,
-            }))
+            .filter(|e| e.current_at(hash) && e.deps_fresh(&mut DepHashes::new()))
+            .map(Indexed::from))
+    }
+
+    /// What the index holds for a file [`PacketIndex::plan_reload`] has just
+    /// declared unchanged at `hash`. Unlike [`PacketIndex::lookup`] it does
+    /// not hash the dependencies again: the plan did, a moment ago, and on a
+    /// header-heavy repo that second pass is the cost of the whole scan.
+    pub fn planned(&self, file: &Path, hash: &str) -> anyhow::Result<Option<Indexed>> {
+        Ok(self
+            .entry(file)?
+            .filter(|e| e.current_at(hash))
+            .map(Indexed::from))
+    }
+
+    /// The indexed files that recorded `dep` as a dependency, sorted: for a
+    /// header, the translation units that include it.
+    pub fn dependents(&self, dep: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        use redb::ReadableTable;
+        let want = key_of(dep);
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(ENTRIES)?;
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (key, raw) = row?;
+            // An entry this build cannot decode has no dependencies to name.
+            let Ok(entry) = serde_json::from_str::<Entry>(raw.value()) else {
+                continue;
+            };
+            if entry.deps.iter().flatten().any(|(path, _)| *path == want) {
+                out.push(PathBuf::from(key.value()));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// True when opening found an index in an older on-disk format and
+    /// replaced it with an empty one. Callers report it, so that a cold
+    /// scan after an upgrade has a stated cause.
+    pub fn rebuilt_from_old_format(&self) -> bool {
+        self.rebuilt_from_old_format
     }
 
     /// Number of indexed files.
@@ -238,10 +368,29 @@ impl PacketIndex {
     /// Hash-gate the candidate files: split into reusable and must-retrieve.
     /// Unreadable files count as changed (fail toward doing the work).
     pub fn plan_reload(&self, files: &[PathBuf]) -> ReloadPlan {
+        self.plan_reload_with(files, |_| false)
+    }
+
+    /// [`PacketIndex::plan_reload`], for callers with files whose packets
+    /// depend on other files. Where `needs_deps` says so (a C/C++ source,
+    /// whose packets change with its headers), an entry written before
+    /// dependencies were recorded counts as changed: nothing says which
+    /// headers it saw, so it is retrieved again, once.
+    pub fn plan_reload_with(
+        &self,
+        files: &[PathBuf],
+        needs_deps: impl Fn(&Path) -> bool,
+    ) -> ReloadPlan {
         let mut plan = ReloadPlan::default();
+        let mut memo = DepHashes::new();
         for f in files {
             let reusable = match hash_file(f) {
-                Ok(h) => self.get(f, &h).ok().flatten().is_some(),
+                Ok(h) => self
+                    .entry(f)
+                    .ok()
+                    .flatten()
+                    .filter(|e| e.current_at(&h) && e.deps_fresh(&mut memo))
+                    .is_some_and(|e| e.deps.is_some() || !needs_deps(f)),
                 Err(_) => false,
             };
             if reusable {
@@ -341,6 +490,15 @@ pub struct Indexed {
     pub test_skipped: bool,
 }
 
+impl From<Entry> for Indexed {
+    fn from(e: Entry) -> Self {
+        Indexed {
+            sites: e.sites,
+            test_skipped: e.test_skipped,
+        }
+    }
+}
+
 /// Index key for a path. Absolute where possible so the same file is not
 /// indexed twice under different relative spellings.
 fn key_of(file: &Path) -> String {
@@ -393,5 +551,44 @@ impl Budget {
 
     pub fn is_strict(&self) -> bool {
         self.strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry from before dependencies were recorded decodes and is
+    /// reusable at its hash, except for a file whose packets depend on
+    /// other files: nothing says which, so it is planned as changed. `put`
+    /// records "none", which is a known answer.
+    #[test]
+    fn a_pre_dependency_entry_is_replanned_only_where_dependencies_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = PacketIndex::open(&dir.path().join("i.redb")).unwrap();
+        let tu = dir.path().join("main.c");
+        std::fs::write(&tu, "x\n").unwrap();
+        let h = hash_file(&tu).unwrap();
+        let files = std::slice::from_ref(&tu);
+
+        // Stamped with the current packet contract: an unstamped entry is a
+        // miss on that ground alone, which is not what this test is about.
+        let legacy: Entry = serde_json::from_str(&format!(
+            r#"{{"hash":"{h}","packet_schema":{PACKET_SCHEMA},"sites":[]}}"#
+        ))
+        .unwrap();
+        idx.put_entry(&tu, legacy).unwrap();
+        assert!(idx.lookup(&tu, &h).unwrap().is_some());
+        assert_eq!(idx.plan_reload(files).unchanged, vec![tu.clone()]);
+        assert_eq!(
+            idx.plan_reload_with(files, |_| true).changed,
+            vec![tu.clone()]
+        );
+
+        idx.put(&tu, &h, &[]).unwrap();
+        assert_eq!(
+            idx.plan_reload_with(files, |_| true).unchanged,
+            vec![tu.clone()]
+        );
     }
 }

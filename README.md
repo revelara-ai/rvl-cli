@@ -132,6 +132,7 @@ not Rust.
 | `rvl-config` | The config/IaC lane: per-*format* retrievers (CI, deploy, supply chain, capacity) plus config-spec verification. |
 | `rvl-content` | The content-pattern lane: in-process, language-agnostic secret detection. |
 | `rvl-emission` | The emission-point lane: aggregate facts about logging, tracing and error-handling sites. |
+| `rvl-misuse` | The misuse lane: error-handling and async shapes that are wrong where they stand (an overbroad catch, a discarded error, a blocking call in an async function, a missing await). |
 | `rvl-structure` | The repo-structure lane: test conventions, coverage config, dep-manifest hygiene, runbook presence. |
 | `rvl-data` | The platform commands (`risk`, `control`, `evidence`, `knowledge`, …), held to byte-identical JSON parity with the Go CLI via golden tests. |
 | `rvl-skills` | Skill and lens distribution into coding-agent harnesses. Download-only by construction. |
@@ -158,14 +159,16 @@ cargo build -p rvl --bin cindex --bin rustindex   # so the C/C++ e2e runs instea
 cargo test --workspace
 
 cd helpers/goindex && go mod verify && go vet ./... && go test ./...
-go run . -packet-schema                           # must print a schema version
+go run . -packet-schema                           # must print a schema version, then a content version
 ```
 
 Two of those are worth understanding rather than just satisfying. Building
 `cindex` matters because the C/C++ end-to-end tests skip themselves when the
 helper is absent, and a helper the suite never builds is a lane the suite
 never covers. `-packet-schema` must be printable without loading anything,
-because a consumer negotiates on that number before paying for a load.
+because a consumer negotiates on that number before paying for a load. Its
+second line, `content-version`, identifies the build of the helper, and the
+scan uses it to warn when the helper it found is not the one it ships.
 
 CI also greps the whole tree for an internal codename and fails the build if
 it appears anywhere, including in comments and docs. The product is Revelara

@@ -291,6 +291,43 @@ pub struct ApiSpec {
     /// remove, never a hidden defect.
     #[serde(default)]
     pub blocking_intent: BlockingIntent,
+    /// The authorer-assigned I/O family of this API's client (po-3t3oj.40),
+    /// read by [`SpecCache::call_family`]. Same wire contract as
+    /// [`ConfigSpec::family`]: absent, unreadable or unknown is `None`, which
+    /// falls back to the keyword classifier.
+    #[serde(
+        default,
+        deserialize_with = "lenient_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub family: Option<Family>,
+    /// The constructor argument that gives this API's RECEIVER a finite
+    /// capacity, when the call blocks only because that capacity is full
+    /// (po-av01j.231). `queue.Queue.put` "blocks until a free slot is
+    /// available if the queue is full", and a `queue.Queue()` built with no
+    /// `maxsize` is never full: the spec's premise cannot occur at that site,
+    /// and reporting a missing deadline there is a false violation.
+    ///
+    /// Library knowledge, like [`ApiSpec::unbounded_sentinels`], so it is
+    /// declared here and never guessed by propagation. `None` -- every spec
+    /// authored before the field existed -- changes nothing. Skipped on
+    /// serialization when absent so such a spec round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_arg: Option<CapacityArg>,
+}
+
+/// Where a receiver's constructor takes its capacity: see
+/// [`ApiSpec::capacity_arg`]. The contract is the one Python's queue family
+/// documents: a positive integer is a finite capacity, so the call can block;
+/// the argument absent, zero or negative means no limit, so it cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityArg {
+    /// The keyword the argument is passed by (`maxsize`).
+    pub name: String,
+    /// Its zero-based position when passed positionally (`queue.Queue(10)`).
+    /// Absent for a keyword-only argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
 }
 
 impl ApiSpec {
@@ -350,15 +387,48 @@ pub enum Scope {
 /// deliberately CONSERVATIVE: only strong, well-known markers classify; an
 /// unrecognised type returns `None` and never borrows another family's bound —
 /// a finding is left for a human rather than risk a cross-family false pass.
-/// (The more general design is an authorer-assigned family tag on the spec;
-/// this keyword classifier is the sound interim — see po-3t3oj.34.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// An authorer-assigned tag on the spec (`family`, po-3t3oj.40) takes
+/// precedence where one exists; this keyword classifier is the fallback for
+/// every spec without one — see po-3t3oj.34.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Family {
     Database,
     Http,
     Cache,
     Rpc,
+    #[serde(rename = "queue")]
     MessageQueue,
+}
+
+impl Family {
+    /// The authored spelling of a family (`database`, `http`, `cache`, `rpc`,
+    /// `queue`), or `None` for anything else. A closed vocabulary, matched
+    /// exactly: a near-miss must not be guessed into a family, because the
+    /// family is what licenses borrowing another client's bound.
+    pub fn from_tag(tag: &str) -> Option<Family> {
+        match tag {
+            "database" => Some(Family::Database),
+            "http" => Some(Family::Http),
+            "cache" => Some(Family::Cache),
+            "rpc" => Some(Family::Rpc),
+            "queue" => Some(Family::MessageQueue),
+            _ => None,
+        }
+    }
+}
+
+/// Read an authored `family` without ever failing the artifact. A value this
+/// binary does not recognise — a family added by a newer corpus, a null, a
+/// non-string — becomes `None`, which is the keyword fallback: the spec
+/// behaves as if the tag were absent instead of failing `SpecCache::load` for
+/// every spec in the file.
+fn lenient_family<'de, D>(d: D) -> Result<Option<Family>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(Family::from_tag))
 }
 
 /// Classify a client type into an I/O family, or `None` if unrecognised.
@@ -459,6 +529,47 @@ pub struct EmissionSpec {
     pub rationale: String,
 }
 
+/// A construction-bound spec: which setters and options BOUND an object of
+/// this type, for the unsized-construction lane (connection pools, queues,
+/// caches, whole-body reads).
+///
+/// The retriever reports what it saw in the constructing function
+/// (`SetMaxOpenConns`, `maxsize`, `io.LimitReader`). Only this spec says
+/// which of those names is a bound, which values of it mean "no limit", and
+/// which control a construction with no bound violates. A site whose type and
+/// class no spec names is not judged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstructionBoundSpec {
+    /// The identity the retriever stamped on the construction
+    /// (`database/sql.DB`, `queue.Queue`, `io.ReadAll`).
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// `pool` | `queue` | `cache` | `read`.
+    pub class: String,
+    /// The control an unbounded construction of this type violates.
+    pub control: String,
+    /// Observation names that bound the object. A positional constructor
+    /// argument is named `arg<N>` (`arg0`), a keyword by its keyword, a
+    /// setter by its method name, a wrapping call by its qualified name.
+    #[serde(default)]
+    pub bounded_by: Vec<String>,
+    /// Renderings of a bound's value that mean "no limit" (`0`, `-1`,
+    /// `None`). Compared only against a value the retriever resolved: a
+    /// non-constant is a name, and a name is credited as a bound.
+    #[serde(default)]
+    pub unbounded_values: Vec<String>,
+    /// Whether the library's DEFAULT is a finite bound, so a construction
+    /// that sets none of `bounded_by` is still bounded (`lru_cache` keeps 128
+    /// entries, SQLAlchemy's pool holds 5 connections). Absent is `false`: the
+    /// default is no limit.
+    #[serde(default)]
+    pub default_bounded: bool,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 /// What a client's configuration TYPE proves about the calls made through it.
 ///
 /// The key is a type, but the bound almost always lives in a FIELD of it that
@@ -512,9 +623,29 @@ pub struct ConfigSpec {
     /// policy provenance into the finding's reason.
     #[serde(default, skip_serializing)]
     pub declared: bool,
+    /// The authorer-assigned I/O family of this client type (po-3t3oj.40).
+    /// The factory knows what a type IS; the keyword classifier only knows
+    /// what its name looks like, so it misses a bare `Repository` or a
+    /// re-exported `QueryRunner`. When present the tag wins; absent — every
+    /// spec authored before the field existed, and every `.revelara.yaml`
+    /// declaration — falls back to [`client_family`], so those behave exactly
+    /// as they did. Additive in both directions: the envelope schema version
+    /// does not move, and a legacy spec round-trips byte for byte.
+    #[serde(
+        default,
+        deserialize_with = "lenient_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub family: Option<Family>,
 }
 
 impl ConfigSpec {
+    /// The family this type's bound may broaden to: the authored tag, else
+    /// the keyword classifier, else none (never a basis for broadening).
+    pub fn family_or_classified(&self) -> Option<Family> {
+        self.family.or_else(|| client_family(&self.type_name))
+    }
+
     /// A whole-call `this_client` spec keyed on a bare type: it asserts that
     /// constructing the type bounds every call through it, without saying
     /// which field carries the bound or that the library bounds it by
@@ -602,6 +733,23 @@ pub enum ConfigExpect {
     AtLeast { value: f64 },
     /// The resolved value, parsed as a number, must be <= `value`.
     AtMost { value: f64 },
+    /// The resolved value must NOT equal `value` (po-pk3fp.13).
+    ///
+    /// The complement `equals` and `one_of` cannot state: "not the default
+    /// Argo CD project" has no enumerable satisfying set, and a Flux
+    /// `remediation.retries` of `-1` (remediate forever) is the strongest
+    /// setting, which `at_least 1` flagged. `not_equals "0"` says both.
+    NotEquals { value: String },
+    /// The resolved value, parsed as a duration, must be >= `value`.
+    ///
+    /// Both sides are duration strings in the Go / Prometheus grammar
+    /// (`30s`, `10m`, `1h30m`, `2d`), which is what Flux intervals and alert
+    /// `for:` clauses are authored in. `at_least` cannot judge them: `10m` is
+    /// not a number, and a bare number carries no unit. A value or a bound
+    /// that is not a duration ABSTAINS, the same rule as `at_least`.
+    DurationAtLeast { value: String },
+    /// The resolved value, parsed as a duration, must be <= `value`.
+    DurationAtMost { value: String },
     /// `then` is expected ONLY WHERE `guard` holds (po-av01j.133.10).
     ///
     /// WHY THIS EXISTS. Some controls are true of a subset of the units a key
@@ -620,6 +768,13 @@ pub enum ConfigExpect {
         guard: ConfigGuard,
         then: Box<ConfigExpect>,
     },
+    /// A `kind` this binary does not know. The one key abstains instead of
+    /// the whole artifact failing to parse, so an expectation added by a
+    /// newer scanner degrades the way an unknown pattern name does. Binaries
+    /// that predate this variant still reject unknown kinds outright: an
+    /// artifact must not carry a kind older than its scanner floor.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The condition of a [`ConfigExpect::When`]: it holds when the predicate
@@ -702,6 +857,43 @@ pub struct ServerSpec {
     pub rationale: String,
 }
 
+/// What a DECORATOR's own arguments mean, keyed on the decorator's identity
+/// (po-av01j.58).
+///
+/// The decorator mechanism is AMBIENT: `@shared_task(time_limit=120)` bounds
+/// every call in the task, so propagation credits it for any blocking site
+/// whatever the site's own [`ApiSpec`] lists. That is also why the values that
+/// switch such a bound off cannot ride the site's spec the way
+/// [`ApiSpec::unbounded_sentinels`] do for call arguments -- a DB call inside a
+/// celery task has no reason to mention celery. They belong to the decorator,
+/// and this is the spec that carries them: `celery.shared_task` declares
+/// `time_limit=0` and `time_limit=None` as "no limit".
+///
+/// The retrievers emit decorators as raw text, so the only identity a
+/// decorator carries is the callable as written (`@shared_task(`,
+/// `@app.task(`). A spec governs the decorators whose written callable ends in
+/// one of `names`. That is loose -- another library's `@x.task` matches a
+/// celery spec naming `task` -- and deliberately so: the only effect of a
+/// match is that a sentinel value stops crediting a bound, which errs toward
+/// NOT crediting one, the only safe direction on this property.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecoratorSpec {
+    /// The decorator's library identity (`celery.shared_task`), the merge key.
+    pub identity: String,
+    /// The written callable's last dotted segment this spec governs
+    /// (`shared_task`, `task`).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Values of a bounding keyword argument (`time_limit`, `timeout`, ...)
+    /// that mean NO bound. Compared like [`ApiSpec::is_unbounded_sentinel`].
+    #[serde(default)]
+    pub unbounded_sentinels: Vec<String>,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpecFile {
     #[serde(default)]
@@ -724,6 +916,62 @@ pub struct SpecFile {
     /// a pre-G4 consumer with the field ignored — compatible both ways.
     #[serde(default)]
     pub emissions: Vec<EmissionSpec>,
+    /// Construction-bound specs. Additive both ways, like the sections
+    /// above: a cache without it judges no construction.
+    #[serde(default)]
+    pub construction_bounds: Vec<ConstructionBoundSpec>,
+    /// Decorator-identity specs (po-av01j.58). Additive both ways, like the
+    /// sections above: a cache without it declares no decorator sentinels,
+    /// so every decorator bound is credited exactly as before.
+    #[serde(default)]
+    pub decorators: Vec<DecoratorSpec>,
+    /// Misuse-shape specs. Additive both ways, like the sections above: a
+    /// cache without it judges no misuse shape.
+    #[serde(default)]
+    pub misuse_shapes: Vec<MisuseSpec>,
+}
+
+/// A misuse-shape spec: what an error-handling or async shape MEANS, for the
+/// misuse lane.
+///
+/// A retriever reports the shape and the identity it was seen on: the caught
+/// type for an overbroad catch (`Exception`), the callee for a discarded
+/// error (`os.Remove`) or a blocking call in an async function
+/// (`requests.get`). Only this spec says which control the shape violates.
+/// A shape whose class no spec names is not judged.
+///
+/// `role` is how the legitimate-suppression allowlist is written:
+///   - `"violates"`: the shape on this identity is a finding under `control`.
+///   - `"allowed"`: the shape on this identity is legitimate and is never a
+///     finding (a discarded `Close` on a read-only file).
+///
+/// `type` is an exact identity, or `"*"` for every identity of the class. An
+/// exact entry beats a `"*"` entry, so one class-wide `violates` entry and a
+/// list of `allowed` identities is the usual form. A role this consumer does
+/// not know matches nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MisuseSpec {
+    /// `overbroad_catch` | `discarded_error` | `sync_over_async` |
+    /// `blocking_in_async` | `fire_and_forget` | `missing_await`.
+    pub class: String,
+    /// The identity the retriever stamped, or `"*"`.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// The control a `violates` entry maps the shape to. Empty on `allowed`.
+    #[serde(default)]
+    pub control: String,
+    /// `violates` | `allowed`.
+    #[serde(default)]
+    pub role: String,
+    /// `low` | `medium`. Empty, or any other value, keeps the default of the
+    /// class. This is the volume control: these shapes are common, so the
+    /// corpus tunes how loud a class is and the retriever keeps reporting it.
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// What repo-level config imposes on served requests, if anything.
@@ -746,6 +994,9 @@ pub struct SpecCache {
     config_keys: HashMap<(String, String), ConfigKeySpec>,
     server: Vec<ServerSpec>,
     emissions: Vec<EmissionSpec>,
+    construction_bounds: Vec<ConstructionBoundSpec>,
+    decorators: Vec<DecoratorSpec>,
+    misuse_shapes: Vec<MisuseSpec>,
 }
 
 impl SpecCache {
@@ -770,7 +1021,66 @@ impl SpecCache {
         }
         c.server = f.server;
         c.emissions = f.emissions;
+        c.construction_bounds = f.construction_bounds;
+        for d in f.decorators {
+            c.merge_decorator(d);
+        }
+        for m in f.misuse_shapes {
+            c.merge_misuse(m);
+        }
         c
+    }
+
+    /// Insert a misuse-shape spec, keeping the higher-confidence entry per
+    /// (class, type). The role is part of the value, not of the key: an
+    /// overlay that is more confident an identity is `allowed` replaces a
+    /// baseline `violates` entry for it.
+    fn merge_misuse(&mut self, v: MisuseSpec) {
+        match self
+            .misuse_shapes
+            .iter_mut()
+            .find(|m| m.class == v.class && m.type_name == v.type_name)
+        {
+            Some(existing) if existing.confidence >= v.confidence => {}
+            Some(existing) => *existing = v,
+            None => self.misuse_shapes.push(v),
+        }
+    }
+
+    /// The misuse-shape specs, for the misuse lane. A slice for the same
+    /// reason as [`SpecCache::emission_specs`].
+    pub fn misuse_specs(&self) -> &[MisuseSpec] {
+        &self.misuse_shapes
+    }
+
+    /// Insert a decorator spec, keeping the higher-confidence entry per
+    /// identity -- the same policy as apis.
+    fn merge_decorator(&mut self, v: DecoratorSpec) {
+        match self
+            .decorators
+            .iter_mut()
+            .find(|d| d.identity == v.identity)
+        {
+            Some(existing) if existing.confidence >= v.confidence => {}
+            Some(existing) => *existing = v,
+            None => self.decorators.push(v),
+        }
+    }
+
+    /// Whether `value`, given to a bounding argument of the decorator whose
+    /// written callable is `callable` (`shared_task`, `app.task`), is a value
+    /// some usable decorator spec declares as NO bound. Every spec governing
+    /// the name is consulted, so the answer is the union of their sentinels:
+    /// see [`DecoratorSpec`] for why a loose match is the safe one. A
+    /// decorator no spec governs declares nothing.
+    pub fn decorator_is_unbounded_sentinel(&self, callable: &str, value: &str) -> bool {
+        let name = callable.trim().rsplit('.').next().unwrap_or_default();
+        let v = value.trim();
+        self.decorators
+            .iter()
+            .filter(|d| d.confidence >= MIN_CONFIDENCE && d.names.iter().any(|n| n == name))
+            .flat_map(|d| d.unbounded_sentinels.iter())
+            .any(|s| s.trim().eq_ignore_ascii_case(v))
     }
 
     /// The usable G2 server-entry specs: everything at or above the
@@ -799,6 +1109,20 @@ impl SpecCache {
     pub fn config(&self, type_name: &str) -> Option<&ConfigSpec> {
         self.configs.get(type_name)
     }
+    /// The I/O family of a call, which names the one repo-level client bound
+    /// that may broaden to it. The authored tag on the call's own API spec
+    /// wins; then the tag on its client type's config spec, at or above the
+    /// confidence floor; then the keyword classifier on the type name. `None`
+    /// — no tag and no recognised keyword — is never broadened.
+    pub fn call_family(&self, api: &ApiSpec, client_type: &str) -> Option<Family> {
+        api.family
+            .or_else(|| {
+                self.config(client_type)
+                    .filter(|c| c.confidence >= MIN_CONFIDENCE)
+                    .and_then(|c| c.family)
+            })
+            .or_else(|| client_family(client_type))
+    }
     /// The G6 config-lane lookup: the spec for one (format, key) identity.
     pub fn config_key(&self, format: &str, key: &str) -> Option<&ConfigKeySpec> {
         self.config_keys.get(&(format.to_string(), key.to_string()))
@@ -808,6 +1132,11 @@ impl SpecCache {
     /// combinations and the corpus is small (tens of entries).
     pub fn emission_specs(&self) -> &[EmissionSpec] {
         &self.emissions
+    }
+    /// The construction-bound specs, for the unsized-construction lane. A
+    /// slice for the same reason as [`SpecCache::emission_specs`].
+    pub fn construction_bound_specs(&self) -> &[ConstructionBoundSpec] {
+        &self.construction_bounds
     }
     /// The apis section alone. `len()` sums every section, so a
     /// vocabulary-only artifact (scopes, config keys, emissions, no apis)
@@ -827,6 +1156,9 @@ impl SpecCache {
             + self.config_keys.len()
             + self.server.len()
             + self.emissions.len()
+            + self.construction_bounds.len()
+            + self.decorators.len()
+            + self.misuse_shapes.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -889,6 +1221,23 @@ impl SpecCache {
                 Some(existing) => *existing = v,
                 None => self.emissions.push(v),
             }
+        }
+        // Construction-bound specs merge on (type, class, control), same
+        // policy as emissions.
+        for v in other.construction_bounds {
+            match self.construction_bounds.iter_mut().find(|e| {
+                e.type_name == v.type_name && e.class == v.class && e.control == v.control
+            }) {
+                Some(existing) if existing.confidence >= v.confidence => {}
+                Some(existing) => *existing = v,
+                None => self.construction_bounds.push(v),
+            }
+        }
+        for v in other.decorators {
+            self.merge_decorator(v);
+        }
+        for v in other.misuse_shapes {
+            self.merge_misuse(v);
         }
     }
 
@@ -959,13 +1308,19 @@ impl SpecCache {
             // corroborated by any construction, so it is no basis for
             // broadening either; one that names fields is corroborated only
             // by a construction that sets one of them. A literal
-            // that set only `Transport` is not a whole-call timeout.
+            // that set only `Transport` is not a whole-call timeout, and
+            // neither is one that set `Timeout: 0`: a zero duration is the
+            // field's "no timeout", so it counts as unset (po-xtoe4).
             if spec.names_no_bounding_field()
-                || (!spec.fields.is_empty() && !c.fields.iter().any(|f| spec.fields.contains(f)))
+                || (!spec.fields.is_empty()
+                    && !c
+                        .fields
+                        .iter()
+                        .any(|f| spec.fields.contains(f) && !c.zero_fields.contains(f)))
             {
                 continue;
             }
-            let Some(fam) = client_family(&c.type_name) else {
+            let Some(fam) = spec.family_or_classified() else {
                 continue;
             };
             let seen = by_family.entry(fam).or_default();
@@ -1056,6 +1411,8 @@ mod tests {
             unbounded_sentinels: vec![],
             default_bound: DefaultBound::Unknown,
             blocking_intent: BlockingIntent::Incidental,
+            family: None,
+            capacity_arg: None,
         }
     }
 
@@ -1094,6 +1451,7 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![],
             configs: specs
                 .into_iter()
@@ -1107,8 +1465,11 @@ mod tests {
                     default_bound: DefaultBound::Unknown,
                     unbounded_sentinels: vec![],
                     declared: false,
+                    family: None,
                 })
                 .collect(),
+            decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1125,6 +1486,10 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            retrieval: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 
@@ -1210,6 +1575,7 @@ mod tests {
             default_bound: DefaultBound::Unknown,
             unbounded_sentinels: vec![],
             declared,
+            family: None,
         }
     }
 
@@ -1219,8 +1585,11 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![],
             configs,
+            decorators: vec![],
+            misuse_shapes: vec![],
         })
     }
 
@@ -1237,6 +1606,10 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            retrieval: Vec::new(),
+            dependency_trees_uninstalled: 0,
+            dependency_trees_uninstalled_paths: Vec::new(),
+            tu_includes: Vec::new(),
         }
     }
 
@@ -1270,6 +1643,138 @@ mod tests {
     }
 
     #[test]
+    fn an_authored_family_parses_and_a_legacy_spec_round_trips_without_it() {
+        let legacy: ConfigSpec = serde_json::from_str(
+            r#"{"type":"typeorm.Repository","bounds":"whole_call","scope":"this_client","confidence":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.family, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("family"));
+        for (tag, fam) in [
+            ("database", Family::Database),
+            ("http", Family::Http),
+            ("cache", Family::Cache),
+            ("rpc", Family::Rpc),
+            ("queue", Family::MessageQueue),
+        ] {
+            let c: ConfigSpec = serde_json::from_str(&format!(
+                r#"{{"type":"x.Repository","bounds":"whole_call","scope":"this_client","confidence":1,"family":"{tag}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.family, Some(fam), "{tag}");
+            // What is written back is what the authorer wrote.
+            assert!(serde_json::to_string(&c)
+                .unwrap()
+                .contains(&format!(r#""family":"{tag}""#)));
+            let a: ApiSpec = serde_json::from_str(&format!(
+                r#"{{"type":"x.Repository","method":"find","blocking":"yes","family":"{tag}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(a.family, Some(fam), "{tag}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_family_degrades_to_the_keyword_fallback_and_never_fails_the_load() {
+        // A newer corpus, a null, a wrong type, a near-miss spelling: each is
+        // "no tag", and the rest of the artifact still loads.
+        for bad in [
+            r#""storage""#,
+            "null",
+            "7",
+            r#"["database"]"#,
+            r#""Database""#,
+        ] {
+            let text = format!(
+                r#"{{"apis":[{{"type":"x.Repository","method":"find","blocking":"yes","family":{bad}}}],
+                    "configs":[{{"type":"x.Repository","bounds":"whole_call","scope":"this_client","confidence":1,"family":{bad}}}]}}"#
+            );
+            let c = SpecCache::load(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(c.config("x.Repository").unwrap().family, None, "{bad}");
+            let key = ("x.Repository".to_string(), "find".to_string());
+            assert_eq!(c.api(&key).unwrap().family, None, "{bad}");
+        }
+    }
+
+    /// A whole-call `this_client` config spec naming `Timeout`, for a type
+    /// the keyword classifier does not recognise unless told.
+    fn tagged(type_name: &str, family: Option<Family>, confidence: f64) -> ConfigSpec {
+        ConfigSpec {
+            type_name: type_name.into(),
+            confidence,
+            family,
+            ..cfg(Bounds::WholeCall, Scope::ThisClient, &["Timeout"], false)
+        }
+    }
+
+    #[test]
+    fn an_authored_family_recovers_broadening_for_a_type_the_keywords_miss() {
+        // A bare `Repository` carries no keyword, so untagged it is no basis
+        // for broadening; tagged `database` it bounds the Database family.
+        let repo = repo_with(&[("orm.Repository", &["Timeout"])]);
+        assert_eq!(client_family("orm.Repository"), None);
+        assert!(cache_of(vec![tagged("orm.Repository", None, 1.0)])
+            .client_bound_by_family(&repo)
+            .is_empty());
+        assert_eq!(
+            cache_of(vec![tagged("orm.Repository", Some(Family::Database), 1.0)])
+                .client_bound_by_family(&repo)
+                .get(&Family::Database),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+    }
+
+    #[test]
+    fn an_authored_family_overrides_the_keyword_classifier() {
+        // `httpcache.Store` reads as Http by keyword; the authorer says cache.
+        // The bound lands in Cache and NOT in Http, so the tag cannot widen a
+        // bound into two families at once.
+        let got = cache_of(vec![tagged("httpcache.Store", Some(Family::Cache), 1.0)])
+            .client_bound_by_family(&repo_with(&[("httpcache.Store", &["Timeout"])]));
+        assert_eq!(
+            got.get(&Family::Cache),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+        assert_eq!(got.get(&Family::Http), None);
+    }
+
+    #[test]
+    fn call_family_prefers_the_api_tag_then_the_config_tag_then_keywords() {
+        let api_of = |family| ApiSpec {
+            type_name: "orm.Repository".into(),
+            family,
+            ..api(Blocking::Yes, 0.9)
+        };
+        let none = cache_of(vec![]);
+        // Nothing authored, no keyword: no family, so never broadened.
+        assert_eq!(none.call_family(&api_of(None), "orm.Repository"), None);
+        // Nothing authored: the keyword classifier, exactly as before.
+        assert_eq!(
+            none.call_family(&api_of(None), "typeorm.QueryRunner"),
+            Some(Family::Database)
+        );
+        // The API's own tag wins over the keywords.
+        assert_eq!(
+            none.call_family(&api_of(Some(Family::Cache)), "typeorm.QueryRunner"),
+            Some(Family::Cache)
+        );
+        // No API tag: the client type's config spec says what the type is.
+        let with_cfg = cache_of(vec![tagged("orm.Repository", Some(Family::Database), 0.9)]);
+        assert_eq!(
+            with_cfg.call_family(&api_of(None), "orm.Repository"),
+            Some(Family::Database)
+        );
+        assert_eq!(
+            with_cfg.call_family(&api_of(Some(Family::Rpc)), "orm.Repository"),
+            Some(Family::Rpc)
+        );
+        // A config spec below the confidence floor is ignored entirely, tag
+        // included: a shaky spec must not license borrowing a bound.
+        let shaky = cache_of(vec![tagged("orm.Repository", Some(Family::Database), 0.3)]);
+        assert_eq!(shaky.call_family(&api_of(None), "orm.Repository"), None);
+    }
+
+    #[test]
     fn family_broadening_needs_a_construction_setting_the_named_field() {
         let c = cache_of(vec![cfg(
             Bounds::WholeCall,
@@ -1286,6 +1791,43 @@ mod tests {
         assert_eq!(
             c.client_bound_by_family(&repo_with(&[("net/http.Client", &["Timeout"])]))
                 .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+    }
+
+    #[test]
+    fn a_named_field_set_to_zero_is_not_a_basis_for_family_broadening() {
+        let c = cache_of(vec![cfg(
+            Bounds::WholeCall,
+            Scope::ThisClient,
+            &["Timeout"],
+            false,
+        )]);
+        let repo_zeroing = |fields: &[&str], zero: &[&str]| {
+            let mut r = repo_with(&[("net/http.Client", fields)]);
+            r.constructions[0].zero_fields = zero.iter().map(|f| f.to_string()).collect();
+            r
+        };
+        // `http.Client{Timeout: 0}` is Go's "no timeout": the field is named
+        // and nothing is bounded, so no sibling may borrow a bound from it.
+        assert_eq!(
+            c.client_bound_by_family(&repo_zeroing(&["Timeout"], &["Timeout"]))
+                .get(&Family::Http),
+            None
+        );
+        // A zero on some other field takes nothing from a real Timeout.
+        assert_eq!(
+            c.client_bound_by_family(&repo_zeroing(&["Timeout", "MaxRetries"], &["MaxRetries"]))
+                .get(&Family::Http),
+            Some(&ServedBound::Agreed(Bounds::WholeCall))
+        );
+        // The zeroed literal neither vouches nor vetoes: a second literal of
+        // the same type with a real Timeout still carries the family.
+        let mut both = repo_zeroing(&["Timeout"], &["Timeout"]);
+        both.constructions
+            .extend(repo_with(&[("net/http.Client", &["Timeout"])]).constructions);
+        assert_eq!(
+            c.client_bound_by_family(&both).get(&Family::Http),
             Some(&ServedBound::Agreed(Bounds::WholeCall))
         );
     }
@@ -1333,8 +1875,11 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![api(Blocking::Yes, 0.7)],
             configs: vec![],
+            decorators: vec![],
+            misuse_shapes: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -1343,8 +1888,11 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
             apis: vec![better],
             configs: vec![],
+            decorators: vec![],
+            misuse_shapes: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -1788,11 +2336,55 @@ mod tests {
         assert_eq!(by_design_label(&why), None);
     }
 
+    // --- capacity precondition (po-av01j.231) ---
+
+    #[test]
+    fn a_cache_without_capacity_arg_declares_none() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[{"type":"queue.Queue","method":"put","blocking":"yes",
+                 "bounded_by":["call_arg"],"confidence":1.0}],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.apis[0].capacity_arg, None);
+        // Absent stays absent on the wire: a legacy spec round-trips.
+        assert!(!serde_json::to_string(&f.apis[0])
+            .unwrap()
+            .contains("capacity_arg"));
+    }
+
+    #[test]
+    fn capacity_arg_parses_with_and_without_a_position() {
+        let f: SpecFile = serde_json::from_str(
+            r#"{"apis":[
+                 {"type":"queue.Queue","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"maxsize","position":0}},
+                 {"type":"k.Only","method":"put","blocking":"yes","confidence":1.0,
+                  "capacity_arg":{"name":"capacity"}}
+               ],"configs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.apis[0].capacity_arg,
+            Some(CapacityArg {
+                name: "maxsize".into(),
+                position: Some(0)
+            })
+        );
+        assert_eq!(
+            f.apis[1].capacity_arg,
+            Some(CapacityArg {
+                name: "capacity".into(),
+                position: None
+            })
+        );
+    }
+
     #[test]
     fn merge_carries_the_winning_specs_blocking_intent() {
         let mk = |confidence: f64, bi: BlockingIntent| SpecFile {
             apis: vec![ApiSpec {
                 blocking_intent: bi,
+                family: None,
                 ..api(Blocking::Yes, confidence)
             }],
             ..Default::default()
@@ -1879,6 +2471,110 @@ mod tests {
     }
 
     #[test]
+    fn a_decorator_spec_declares_sentinels_for_the_names_it_governs() {
+        // po-av01j.58: the decorator mechanism is ambient, so its sentinels
+        // cannot ride the SITE's api spec -- a DB call inside a celery task
+        // has no reason to mention celery. They ride a spec keyed on the
+        // decorator's own identity, matched on the written callable's last
+        // dotted segment, the only identity the retrievers' raw decorator
+        // text carries.
+        let cache = SpecCache::load(
+            r#"{"apis":[],"decorators":[{"identity":"celery.shared_task",
+                 "names":["shared_task","task"],"confidence":0.9,
+                 "unbounded_sentinels":["0","None"]}]}"#,
+        )
+        .unwrap();
+        assert!(cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+        assert!(cache.decorator_is_unbounded_sentinel("celery.shared_task", " none "));
+        assert!(cache.decorator_is_unbounded_sentinel("app.task", "None"));
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "120"));
+        assert!(
+            !cache.decorator_is_unbounded_sentinel("retry", "0"),
+            "a decorator no spec governs declares nothing"
+        );
+        assert_eq!(cache.len(), 1, "the section counts toward the cache");
+    }
+
+    #[test]
+    fn misuse_specs_load_merge_and_count() {
+        let text = r#"{"apis":[],"configs":[],"misuse_shapes":[
+            {"class":"discarded_error","type":"*","control":"RC-029","role":"violates",
+             "confidence":0.9,"rationale":"base"},
+            {"class":"discarded_error","type":"os.File.Close","control":"RC-029",
+             "role":"violates","confidence":0.7,"rationale":"base"}]}"#;
+        let mut cache = SpecCache::load(text).expect("misuse_shapes must parse");
+        assert_eq!(cache.len(), 2, "the section counts toward the cache size");
+        let overlay = r#"{"apis":[],"configs":[],"misuse_shapes":[
+            {"class":"discarded_error","type":"os.File.Close","role":"allowed",
+             "confidence":0.9,"rationale":"overlay"},
+            {"class":"missing_await","type":"*","control":"RC-029","role":"violates",
+             "severity":"low","confidence":0.9}]}"#;
+        cache.merge(SpecCache::load(overlay).unwrap());
+        let specs = cache.misuse_specs();
+        assert_eq!(
+            specs.len(),
+            3,
+            "same (class, type) merges, a new one is added"
+        );
+        let close = specs
+            .iter()
+            .find(|s| s.type_name == "os.File.Close")
+            .unwrap();
+        assert_eq!(
+            close.role, "allowed",
+            "a more confident overlay replaces the entry, role included"
+        );
+        assert!(
+            specs[0].severity.is_empty(),
+            "absent keeps the class default"
+        );
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(empty.misuse_specs().is_empty());
+    }
+
+    #[test]
+    fn a_cache_without_a_decorators_section_declares_nothing() {
+        let cache = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+    }
+
+    #[test]
+    fn a_low_confidence_decorator_spec_decides_nothing() {
+        let cache = SpecCache::load(
+            r#"{"decorators":[{"identity":"celery.shared_task",
+                 "names":["shared_task"],"confidence":0.3,
+                 "unbounded_sentinels":["0"]}]}"#,
+        )
+        .unwrap();
+        assert!(!cache.decorator_is_unbounded_sentinel("shared_task", "0"));
+    }
+
+    #[test]
+    fn decorator_specs_merge_by_identity_preferring_confidence() {
+        let mk = |confidence: f64, sentinels: Vec<&str>| SpecFile {
+            decorators: vec![DecoratorSpec {
+                identity: "celery.shared_task".into(),
+                names: vec!["shared_task".into()],
+                unbounded_sentinels: sentinels.into_iter().map(String::from).collect(),
+                confidence,
+                rationale: String::new(),
+            }],
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(0.7, vec!["None"]));
+        base.merge(SpecCache::from_file(mk(0.95, vec!["0"])));
+        assert!(base.decorator_is_unbounded_sentinel("shared_task", "0"));
+        assert!(!base.decorator_is_unbounded_sentinel("shared_task", "None"));
+        base.merge(SpecCache::from_file(mk(0.6, vec!["-1"])));
+        assert!(
+            !base.decorator_is_unbounded_sentinel("shared_task", "-1"),
+            "a lower-confidence spec never displaces the winner"
+        );
+        assert_eq!(base.len(), 1);
+    }
+
+    #[test]
     fn spec_applicability_defaults_to_classic_call_sites_only() {
         // G3 (po-av01j.4): every existing spec was authored against G1 client
         // call sites. An undeclared site_kinds list must therefore keep the
@@ -1910,6 +2606,9 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![e(0.7, "base")],
+            construction_bounds: vec![],
+            decorators: vec![],
+            misuse_shapes: vec![],
         });
         base.merge(SpecCache::from_file(SpecFile {
             apis: vec![],
@@ -1928,6 +2627,9 @@ mod tests {
                     rationale: "new".into(),
                 },
             ],
+            construction_bounds: vec![],
+            decorators: vec![],
+            misuse_shapes: vec![],
         }));
         let specs = base.emission_specs();
         assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
@@ -1936,6 +2638,38 @@ mod tests {
             .find(|s| s.type_name == "log/slog.Logger")
             .unwrap();
         assert_eq!(slog.rationale, "better", "higher confidence wins");
+    }
+
+    #[test]
+    fn construction_bound_specs_load_merge_and_count() {
+        let text = r#"{
+            "apis": [],
+            "configs": [],
+            "construction_bounds": [
+                {"type": "database/sql.DB", "class": "pool", "control": "RC-055",
+                 "bounded_by": ["SetMaxOpenConns"], "unbounded_values": ["0"],
+                 "confidence": 0.7, "rationale": "base"}
+            ]
+        }"#;
+        let mut cache = SpecCache::load(text).expect("construction_bounds must parse");
+        assert_eq!(cache.len(), 1, "the section counts toward the cache size");
+        let overlay = r#"{"apis":[],"configs":[],"construction_bounds":[
+            {"type":"database/sql.DB","class":"pool","control":"RC-055",
+             "bounded_by":["SetMaxOpenConns","SetMaxIdleConns"],"confidence":0.9,"rationale":"overlay"},
+            {"type":"queue.Queue","class":"queue","control":"RC-055","bounded_by":["maxsize","arg0"],
+             "confidence":0.9,"rationale":"new"}]}"#;
+        cache.merge(SpecCache::load(overlay).unwrap());
+        let specs = cache.construction_bound_specs();
+        assert_eq!(specs.len(), 2, "same identity merges, a new one is added");
+        assert_eq!(specs[0].rationale, "overlay", "higher confidence wins");
+        assert!(specs[0].unbounded_values.is_empty());
+        assert!(
+            !specs[0].default_bounded,
+            "absent means the default is no limit"
+        );
+
+        let empty = SpecCache::load(r#"{"apis":[],"configs":[]}"#).unwrap();
+        assert!(empty.construction_bound_specs().is_empty());
     }
 
     #[test]
@@ -1993,12 +2727,63 @@ mod tests {
                 },
                 then: Box::new(ConfigExpect::Present),
             },
+            ConfigExpect::NotEquals {
+                value: "default".into(),
+            },
+            ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ConfigExpect::DurationAtMost {
+                value: "10m".into(),
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
             let back: ConfigExpect = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back, "{json}");
         }
+    }
+
+    #[test]
+    fn config_expect_names_the_new_kinds_in_snake_case() {
+        // The wire names the factory authors against.
+        for (json, want) in [
+            (
+                r#"{"kind":"not_equals","value":"0"}"#,
+                ConfigExpect::NotEquals { value: "0".into() },
+            ),
+            (
+                r#"{"kind":"duration_at_most","value":"10m"}"#,
+                ConfigExpect::DurationAtMost {
+                    value: "10m".into(),
+                },
+            ),
+            (
+                r#"{"kind":"duration_at_least","value":"1m"}"#,
+                ConfigExpect::DurationAtLeast { value: "1m".into() },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<ConfigExpect>(json).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn an_unknown_expect_kind_does_not_fail_the_whole_cache() {
+        // One spec from a newer factory must cost one key, not every spec in
+        // the artifact.
+        let cache = SpecCache::load(
+            r#"{"config_keys": [
+                {"format": "flux", "key": "a", "expect": {"kind": "from_the_future", "n": 1}},
+                {"format": "flux", "key": "b", "expect": {"kind": "present"}}
+            ]}"#,
+        )
+        .expect("an unknown kind degrades, it does not abort the load");
+        assert_eq!(
+            cache.config_key("flux", "a").unwrap().expect,
+            ConfigExpect::Unknown
+        );
+        assert_eq!(
+            cache.config_key("flux", "b").unwrap().expect,
+            ConfigExpect::Present
+        );
     }
 
     #[test]
@@ -2104,6 +2889,9 @@ mod tests {
             config_keys: vec![],
             server: vec![],
             emissions: vec![],
+            construction_bounds: vec![],
+            decorators: vec![],
+            misuse_shapes: vec![],
         }));
         assert_eq!(c.api_count(), 1);
         assert_eq!(c.config_count(), 1);

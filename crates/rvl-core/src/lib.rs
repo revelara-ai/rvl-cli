@@ -62,6 +62,38 @@ pub const CONST_ARG_EMISSION_CATEGORY: &str = "emission_category";
 /// must not produce tens of thousands of emission Sites).
 pub const CONST_ARG_EMISSION_COUNT: &str = "emission_count";
 
+/// The `site_kind` stamped on an unsized-construction packet: an object that
+/// takes a bound (a connection pool, a queue, a cache, a whole-body read) was
+/// built at this site. One packet per construction. Retrieval only: the
+/// packet lists the setters and options OBSERVED in the constructing
+/// function, and a `ConstructionBoundSpec` says which of them is a bound.
+pub const SITE_KIND_UNSIZED: &str = "unsized_construction";
+
+/// The `const_args` entry name carrying an unsized construction's class
+/// (`pool` | `queue` | `cache` | `read`), with `how: "aggregate"` like the
+/// emission entries.
+pub const CONST_ARG_BOUND_CLASS: &str = "bound_class";
+
+/// The `const_args` entry name present when the constructed value leaves the
+/// constructing function (it is returned, or was never given a local name),
+/// so a setter may run where the retriever did not look.
+pub const CONST_ARG_BOUND_ESCAPES: &str = "bound_escapes";
+
+/// The `const_args` entry name present when the retriever could not see
+/// every option the constructor was given (`Queue(**opts)`). A bound may be
+/// among the ones it could not see.
+pub const CONST_ARG_BOUND_OPAQUE: &str = "bound_opaque";
+
+/// [`ConstArg::how`] on a bound observation whose value is a NAME, not a
+/// value (`db.SetMaxOpenConns(cfg.Max)`). The bound is set; what it is set to
+/// is not known and is never resolved.
+pub const BOUND_HOW_NAME: &str = "name";
+
+/// [`ConstArg::how`] on a bound observation made on the same TYPE elsewhere
+/// in the repository, emitted only for a value that escapes. Like
+/// [`CONSTRUCTION_SCOPE_TYPE`], it may evidence an abstention, never a pass.
+pub const BOUND_HOW_TYPE: &str = "type";
+
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
 /// this, 821 of 1525 real production records failed to parse and the scanner
@@ -282,6 +314,10 @@ pub const CONSTRUCTION_SCOPE_RECEIVER: &str = "receiver";
 /// `client_construction_scope`: the receiver was not traced; the
 /// constructions are candidates of the same type.
 pub const CONSTRUCTION_SCOPE_TYPE: &str = "type";
+/// `client_construction_scope`: the receiver was traced to a value built
+/// outside the repository (a dependency's call result), so no construction
+/// is attached and none can be read.
+pub const CONSTRUCTION_SCOPE_UNRESOLVED: &str = "unresolved";
 
 /// One call site plus every piece of source bearing on it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,7 +351,10 @@ pub struct Site {
     /// traced to this call's receiver, possibly none. [`CONSTRUCTION_SCOPE_TYPE`]:
     /// the receiver was not traced, so these are constructions of the same
     /// type found elsewhere, which may evidence an abstention but never a
-    /// pass. Additive within the v2 packet train.
+    /// pass. [`CONSTRUCTION_SCOPE_UNRESOLVED`]: the receiver is a value built
+    /// outside the repository; nothing is attached, and the site abstains
+    /// unless something else bounds the call. Additive within the v2 packet
+    /// train.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_construction_scope: String,
     #[serde(default)]
@@ -374,6 +413,26 @@ pub struct Site {
 /// or middleware-chain registration inventoried by a typed retriever.
 pub const SITE_KIND_SERVER_ENTRY: &str = "server_entry";
 
+/// The `site_kind` stamped on a misuse-shape packet: an error-handling or
+/// async shape that is wrong where it stands, with no call graph needed to
+/// see it (an overbroad catch, a discarded error value, a blocking call in an
+/// async function, an async call that is never awaited). Like an emission
+/// point it is an AGGREGATE: one packet per (enclosing function, class,
+/// identity), with the class and the count in `const_args`. Retrieval only:
+/// a `MisuseSpec` says which control a shape violates and which identities
+/// are legitimate.
+pub const SITE_KIND_MISUSE: &str = "misuse_shape";
+
+/// The `const_args` entry name carrying a misuse shape's class
+/// (`overbroad_catch` | `discarded_error` | `sync_over_async` |
+/// `blocking_in_async` | `fire_and_forget` | `missing_await`), with
+/// `how: "aggregate"`.
+pub const CONST_ARG_MISUSE_CLASS: &str = "misuse_class";
+
+/// The `const_args` entry name carrying how many times the shape occurs in
+/// the enclosing function, with `how: "aggregate"`.
+pub const CONST_ARG_MISUSE_COUNT: &str = "misuse_count";
+
 impl Site {
     pub fn id(&self) -> String {
         format!("{}:{}", self.file_path, self.line_number)
@@ -385,6 +444,29 @@ impl Site {
     /// A G4 emission-point aggregate (log/trace/error-capture inventory).
     pub fn is_emission_point(&self) -> bool {
         self.site_kind == SITE_KIND_EMISSION
+    }
+    /// A misuse-shape aggregate (error handling or async misuse), judged by
+    /// the misuse lane.
+    pub fn is_misuse_shape(&self) -> bool {
+        self.site_kind == SITE_KIND_MISUSE
+    }
+    /// The misuse shape's class, read from the [`CONST_ARG_MISUSE_CLASS`]
+    /// entry. `None` on every other kind and on a malformed packet, where the
+    /// caller abstains.
+    pub fn misuse_class(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_MISUSE_CLASS)
+            .map(|a| a.value.as_str())
+    }
+    /// How many occurrences the aggregate stands for. An absent or malformed
+    /// count reads as 1: the packet itself is one occurrence.
+    pub fn misuse_count(&self) -> u32 {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_MISUSE_COUNT)
+            .and_then(|a| a.value.parse().ok())
+            .unwrap_or(1)
     }
     /// The emission aggregate's category (`log` | `trace` | `error_capture`),
     /// read from the [`CONST_ARG_EMISSION_CATEGORY`] const-args entry. `None`
@@ -405,6 +487,40 @@ impl Site {
             .find(|a| a.name == CONST_ARG_EMISSION_COUNT)
             .and_then(|a| a.value.parse().ok())
             .unwrap_or(1)
+    }
+    /// An unsized-construction packet (a pool, queue, cache or whole-body
+    /// read whose bound the construction-bounds lane judges).
+    pub fn is_unsized_construction(&self) -> bool {
+        self.site_kind == SITE_KIND_UNSIZED
+    }
+    /// The construction's class (`pool` | `queue` | `cache` | `read`), read
+    /// from the [`CONST_ARG_BOUND_CLASS`] entry. `None` on every other kind
+    /// and on a malformed packet, where the caller abstains.
+    pub fn bound_class(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_BOUND_CLASS)
+            .map(|a| a.value.as_str())
+    }
+    /// Whether the constructed value leaves the constructing function: see
+    /// [`CONST_ARG_BOUND_ESCAPES`].
+    pub fn bound_escapes(&self) -> bool {
+        self.const_args
+            .iter()
+            .any(|a| a.name == CONST_ARG_BOUND_ESCAPES)
+    }
+    /// Whether some of the constructor's options were not visible to the
+    /// retriever: see [`CONST_ARG_BOUND_OPAQUE`].
+    pub fn bound_opaque(&self) -> bool {
+        self.const_args
+            .iter()
+            .any(|a| a.name == CONST_ARG_BOUND_OPAQUE)
+    }
+    /// The setters and options the retriever observed on this construction:
+    /// every `const_args` entry that is not one of the lane's own aggregate
+    /// entries.
+    pub fn bound_observations(&self) -> impl Iterator<Item = &ConstArg> {
+        self.const_args.iter().filter(|a| a.how != "aggregate")
     }
     /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
     /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
@@ -561,6 +677,17 @@ pub struct ConfigFact {
     pub type_name: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub fields: Vec<String>,
+    /// The subset of `fields` the construction sets to a constant zero.
+    /// `http.Client{Timeout: 0}` names Timeout and bounds nothing, so a field
+    /// listed here is evidence of no bound. Additive: a helper that does not
+    /// evaluate values leaves it empty, and a non-constant value is never
+    /// listed (unknown is not zero).
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub zero_fields: Vec<String>,
     #[serde(default)]
     pub file: String,
     #[serde(default)]
@@ -593,6 +720,73 @@ pub struct RepoConfig {
     /// by [`RepoConfig::absorb`] alongside the count.
     #[serde(default)]
     pub test_files_skipped_paths: Vec<String>,
+    /// Workspaces that declare dependencies but have no installed tree, as
+    /// the helper saw them (po-pk3fp.2). Like `test_files_skipped`, a
+    /// retrieval statistic on the repo-scoped record, additive within v2 and
+    /// zero from a helper that does not report it. Only tsindex does: an
+    /// uninstalled tree is resolved from import syntax, at tier `medium`,
+    /// with no `client_version`. SUMMED by [`RepoConfig::absorb`], which is
+    /// right across languages and WRONG across the batches of one helper,
+    /// since each batch restates the whole-repo number; read it through
+    /// [`RepoConfig::uninstalled_dependency_trees`].
+    #[serde(default)]
+    pub dependency_trees_uninstalled: usize,
+    /// The repo-relative workspace directories behind that count.
+    /// Concatenated by [`RepoConfig::absorb`], repeats included.
+    #[serde(default)]
+    pub dependency_trees_uninstalled_paths: Vec<String>,
+    /// The include graph, one edge list per parsed translation unit
+    /// (po-av01j.53). Only cindex reports it, as `tu_includes` records
+    /// that [`parse_stream`] collects here. The packet index stores each
+    /// list beside the TU's packets, so a changed header invalidates the
+    /// TUs that include it. Concatenated by [`RepoConfig::absorb`]. Left off
+    /// the wire when empty, so the `repo_config` the other helpers write is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tu_includes: Vec<TuIncludes>,
+    /// The retrieval denominator per language (po-av01j.219). Additive within
+    /// v2: a helper that predates it, or does not measure it, leaves it empty
+    /// and COVERAGE says nothing rather than inventing a number.
+    /// Not serialized when empty, so a helper that does not measure it
+    /// (rustindex) emits the same record it always did.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub retrieval: Vec<RetrievalCensus>,
+}
+
+/// The in-repo files one translation unit includes, transitively. Paths are
+/// repo-relative and forward-slashed, like a site's `file_path`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuIncludes {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub includes: Vec<String>,
+}
+
+/// How many call sites one language's extractor RETRIEVED out of the ones
+/// that exist (po-av01j.219).
+///
+/// Resolution coverage is measured over retrieved sites only, and the
+/// extractor tables decide what is retrieved -- so "94% resolved" can be a
+/// statement about the tables rather than the repo. This is the other
+/// denominator. `calls_resolved` is crude by design (every call whose callee
+/// the type checker resolved, most of them not I/O); `unretrieved` is the
+/// sharp half: calls the helper's corpus knows are I/O and its tables do not
+/// retrieve, keyed by surface (`io.ReadAll`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalCensus {
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub calls_resolved: usize,
+    #[serde(default)]
+    pub candidates: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub unretrieved: std::collections::BTreeMap<String, usize>,
 }
 
 impl RepoConfig {
@@ -631,6 +825,35 @@ impl RepoConfig {
         self.test_files_skipped += other.test_files_skipped;
         self.test_files_skipped_paths
             .extend(other.test_files_skipped_paths);
+        // REPLACED per language, never summed: each helper run reports the
+        // whole repo, and a batched stream repeats it once per batch.
+        for census in other.retrieval {
+            match self.retrieval.iter_mut().find(|r| r.lang == census.lang) {
+                Some(slot) => *slot = census,
+                None => self.retrieval.push(census),
+            }
+        }
+        self.dependency_trees_uninstalled += other.dependency_trees_uninstalled;
+        self.dependency_trees_uninstalled_paths
+            .extend(other.dependency_trees_uninstalled_paths);
+        self.tu_includes.extend(other.tu_includes);
+    }
+
+    /// How many dependency trees ONE helper's stream reported uninstalled.
+    ///
+    /// The distinct named workspaces when the helper named them, because a
+    /// batched `--files` run writes one repo-scoped record per batch and
+    /// every one restates the same whole-repo state: three batches over a
+    /// repo with two uninstalled workspaces sum to six. The summed count is
+    /// the fallback for a record that carries the number without the names.
+    pub fn uninstalled_dependency_trees(&self) -> usize {
+        if self.dependency_trees_uninstalled_paths.is_empty() {
+            return self.dependency_trees_uninstalled;
+        }
+        self.dependency_trees_uninstalled_paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 }
 
@@ -688,6 +911,10 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 if let Some(paths) = v.get("test_files_skipped_paths").and_then(|p| p.as_array()) {
                     cfg.test_files_skipped_paths
                         .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
+                }
+            } else if kind == "tu_includes" {
+                if let Ok(edges) = serde_json::from_value::<TuIncludes>(v) {
+                    cfg.tu_includes.push(edges);
                 }
             }
             continue;
@@ -925,6 +1152,35 @@ mod tests {
         assert_eq!(cfg.snapshot_id, "x");
     }
 
+    /// po-av01j.219: goindex's retrieval census rides its `repo_config`.
+    /// Every run reports the WHOLE repo (goindex loads every module whatever
+    /// `--files` says), so a batched stream carrying the same language twice
+    /// must REPLACE, not sum -- summing would double the denominator -- while
+    /// a second language accumulates beside it.
+    #[test]
+    fn retrieval_census_rides_repo_config_and_replaces_per_language() {
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"go","calls_resolved":900,"candidates":40,"unretrieved":{"io.ReadAll":3}}]}"#;
+        let other = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"typescript","calls_resolved":10,"candidates":2,"unretrieved":{}}]}"#;
+        let old = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!(
+            "{go}
+{other}
+{go}
+{old}
+"
+        ));
+        assert!(sites.is_empty());
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.retrieval.len(), 2, "{:?}", cfg.retrieval);
+        let g = cfg.retrieval.iter().find(|r| r.lang == "go").unwrap();
+        assert_eq!(
+            (g.calls_resolved, g.candidates),
+            (900, 40),
+            "batches must not sum"
+        );
+        assert_eq!(g.unretrieved.get("io.ReadAll"), Some(&3));
+    }
+
     /// The test-file skip count rides whichever repo-scoped
     /// record a helper writes: tsindex's `repo_config`, pyindex's
     /// `retrieval_stats`. Both are consumed, and a polyglot stream SUMS
@@ -953,6 +1209,76 @@ mod tests {
             cfg.test_files_skipped_paths,
             vec!["e2e/login.ts", "tests/test_a.py", "conftest.py"]
         );
+    }
+
+    /// cindex writes one `tu_includes` record per parsed TU (po-av01j.53).
+    /// They are carried on the repo-scoped record, concatenated across
+    /// helper runs, and never fall through into Site parsing.
+    #[test]
+    fn tu_includes_records_are_carried_and_merged_across_records() {
+        let a = r#"{"packet_schema":2,"kind":"tu_includes","snapshot_id":"x","lang":"c_cpp","file":"src/a.c","includes":["include/api.h"]}"#;
+        let b = r#"{"packet_schema":2,"kind":"tu_includes","snapshot_id":"x","lang":"c_cpp","file":"src/b.c","includes":[]}"#;
+        let (sites, cfg, skipped) = parse_stream(&format!("{a}\n{b}\n"));
+        assert!(sites.is_empty());
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            cfg.tu_includes,
+            vec![
+                TuIncludes {
+                    file: "src/a.c".to_string(),
+                    includes: vec!["include/api.h".to_string()],
+                },
+                TuIncludes {
+                    file: "src/b.c".to_string(),
+                    includes: Vec::new(),
+                },
+            ]
+        );
+        let mut merged = RepoConfig::default();
+        merged.absorb(cfg.clone());
+        merged.absorb(cfg);
+        assert_eq!(merged.tu_includes.len(), 4);
+    }
+
+    /// tsindex reports the workspaces it resolved from import syntax on its
+    /// `repo_config` record (po-pk3fp.2), count and paths. Both are read,
+    /// and both merge across records the way the test-file skip does.
+    #[test]
+    fn uninstalled_dependency_trees_are_carried_and_merged_across_records() {
+        let a = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let b = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":1,"dependency_trees_uninstalled_paths":["tools"]}"#;
+        let (_, cfg, skipped) = parse_stream(&format!("{a}\n{b}\n"));
+        assert_eq!(skipped, 0);
+        assert_eq!(cfg.dependency_trees_uninstalled, 3);
+        assert_eq!(
+            cfg.dependency_trees_uninstalled_paths,
+            vec!["backend", "frontend", "tools"]
+        );
+        assert_eq!(cfg.uninstalled_dependency_trees(), 3);
+    }
+
+    /// A batched `--files` run writes one `repo_config` per batch, and each
+    /// restates the WHOLE-REPO dependency state. The reported number is the
+    /// distinct workspaces, not the sum: two uninstalled workspaces seen by
+    /// three batches are two, not six.
+    #[test]
+    fn batches_restating_the_same_uninstalled_trees_count_them_once() {
+        let rec = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{rec}\n{rec}\n{rec}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 2);
+    }
+
+    /// A record that carries the count without the names still reports it,
+    /// and a helper that reports neither (goindex, pyindex) reads as zero.
+    #[test]
+    fn an_unnamed_uninstalled_count_is_kept_and_an_absent_one_is_zero() {
+        let unnamed = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":1}"#;
+        let (_, cfg, _) = parse_stream(&format!("{unnamed}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 1);
+        let go = r#"{"kind":"repo_config","snapshot_id":"x","constructions":[]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{go}\n"));
+        assert_eq!(cfg.uninstalled_dependency_trees(), 0);
+        assert!(cfg.dependency_trees_uninstalled_paths.is_empty());
     }
 
     /// Only the two documented carriers are read. A future repo-scoped
@@ -1160,6 +1486,33 @@ mod tests {
     }
 
     #[test]
+    fn misuse_accessors_read_the_class_and_count() {
+        let arg = |name: &str, value: &str| ConstArg {
+            name: name.into(),
+            value: value.into(),
+            how: "aggregate".into(),
+            ..Default::default()
+        };
+        let s = Site {
+            client_type: "os.Remove".into(),
+            site_kind: SITE_KIND_MISUSE.into(),
+            const_args: vec![
+                arg(CONST_ARG_MISUSE_CLASS, "discarded_error"),
+                arg(CONST_ARG_MISUSE_COUNT, "3"),
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_misuse_shape() && !s.is_call_site() && !s.is_emission_point());
+        assert_eq!(s.misuse_class(), Some("discarded_error"));
+        assert_eq!(s.misuse_count(), 3);
+
+        let g1 = Site::default();
+        assert!(!g1.is_misuse_shape());
+        assert_eq!(g1.misuse_class(), None);
+        assert_eq!(g1.misuse_count(), 1);
+    }
+
+    #[test]
     fn site_kind_defaults_to_the_g1_call_site() {
         // Every v1/v2 record predating the field parses as a classic G1 call
         // site: the empty default IS the G1 marker, so no schema bump is
@@ -1173,6 +1526,39 @@ mod tests {
             Some(""),
             "a record predating the field must parse as a G1 call site"
         );
+    }
+
+    #[test]
+    fn unsized_construction_accessors_read_class_escape_and_observations() {
+        let arg = |name: &str, value: &str, how: &str| ConstArg {
+            name: name.into(),
+            value: value.into(),
+            how: how.into(),
+            ..Default::default()
+        };
+        let s = Site {
+            client_type: "database/sql.DB".into(),
+            site_kind: SITE_KIND_UNSIZED.into(),
+            const_args: vec![
+                arg(CONST_ARG_BOUND_CLASS, "pool", "aggregate"),
+                arg(CONST_ARG_BOUND_ESCAPES, "returned", "aggregate"),
+                arg("SetMaxOpenConns", "cfg.Max", BOUND_HOW_NAME),
+            ],
+            ..Default::default()
+        };
+        assert!(s.is_unsized_construction() && !s.is_call_site() && !s.is_emission_point());
+        assert_eq!(s.bound_class(), Some("pool"));
+        assert!(s.bound_escapes());
+        let seen: Vec<&str> = s.bound_observations().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            seen,
+            ["SetMaxOpenConns"],
+            "aggregate entries are not observations"
+        );
+
+        let g1 = Site::default();
+        assert!(!g1.is_unsized_construction() && !g1.bound_escapes() && !g1.bound_opaque());
+        assert_eq!(g1.bound_class(), None);
     }
 
     #[test]

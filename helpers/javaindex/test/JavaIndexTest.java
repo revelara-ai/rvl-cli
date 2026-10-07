@@ -34,8 +34,20 @@ class JavaIndexTest {
         }
 
         // --packet-schema negotiation before any load.
-        String schema = run("--packet-schema").trim();
-        check("2".equals(schema), "--packet-schema prints 2, got " + schema);
+        // Line 1 stays the bare schema integer; line 2 is the content version
+        // (po-8ozxg), which rvl computes for a script by hashing the file. The
+        // two must be the same number or every javaindex reads as drifted.
+        String[] schema = run("--packet-schema").split("\\R");
+        check("2".equals(schema[0]), "--packet-schema prints 2 first, got " + schema[0]);
+        byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(Files.readAllBytes(Paths.get("javaindex.java")));
+        StringBuilder want = new StringBuilder("content-version ");
+        for (int i = 0; i < 6; i++) {
+            want.append(String.format("%02x", digest[i]));
+        }
+        check(schema.length > 1 && want.toString().equals(schema[1]),
+                "--packet-schema line 2 is `" + want + "`, got "
+                        + (schema.length > 1 ? schema[1] : "nothing"));
 
         List<Map<String, Object>> all = retrieve("--retrieve", "--root", "testdata/fixture",
                 "--name", "fx");

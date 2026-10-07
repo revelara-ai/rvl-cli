@@ -88,6 +88,36 @@ pub struct Finding {
     pub gate_exempt: bool,
 }
 
+/// The git operation a blocking verdict stops (po-av01j.207). The verdict line
+/// and the bypass hint are shared by both hooks and said "commit" on a push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatedOperation {
+    #[default]
+    Commit,
+    Push,
+}
+
+impl GatedOperation {
+    /// The operation a `--hook <name>` gates. Only pre-push selects `Push`:
+    /// no hook, pre-commit, and an unrecognized name keep the commit wording,
+    /// which is what a scan at a keyboard is asking about.
+    pub fn from_hook(hook: Option<&str>) -> Self {
+        match hook {
+            Some(h) if h.eq_ignore_ascii_case("pre-push") || h.eq_ignore_ascii_case("pre_push") => {
+                GatedOperation::Push
+            }
+            _ => GatedOperation::Commit,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatedOperation::Commit => "commit",
+            GatedOperation::Push => "push",
+        }
+    }
+}
+
 /// Coverage summary for the coverage section.
 ///
 /// `resolved` counts every site the scanner reached a conclusion on: a bounded
@@ -101,6 +131,16 @@ pub struct Finding {
 // bucket, which is how a new bucket gets silently forgotten at a call site.
 #[derive(Debug, Clone, Default)]
 pub struct Coverage {
+    /// What a blocking verdict stops. Rides here because every ladder call
+    /// already carries a `Coverage`, and the default keeps the commit wording.
+    pub operation: GatedOperation,
+    /// `rvl scan --blend` ran and its agent half did not answer for every
+    /// undecided runtime site (po-av01j.205): vetoed, no agent, timed out,
+    /// failed, malformed, or over the cap. Carries the reason. The footer
+    /// then refuses "commit clean": the report is the deterministic half
+    /// alone, and presenting it as the blend is the po-av01j.199 bug at a new
+    /// seam. `None` when no blend ran or it completed.
+    pub blend_incomplete: Option<String>,
     /// Distinct machine-generated files whose packets were dropped before
     /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
     /// without saying so reads as having scanned them, and it moves every
@@ -110,6 +150,12 @@ pub struct Coverage {
     /// Same rule as `generated_skipped`: reported, never silent. Only
     /// languages with a non-zero count are listed.
     pub test_files_skipped: Vec<TestFilesSkipped>,
+    /// Workspaces whose declared dependencies were not installed, per
+    /// language (po-pk3fp.15). The lane still scanned, from import syntax,
+    /// which is a weaker scan than one that resolved types from the
+    /// installed tree, and the roll-call above prints the same "N sites"
+    /// for both. Only languages with a non-zero count are listed.
+    pub dependencies_uninstalled: Vec<DependenciesUninstalled>,
     pub resolved: usize,
     pub total: usize,
     /// No spec for the API — the mint/coverage lever.
@@ -161,6 +207,162 @@ pub struct Coverage {
     /// nothing, and it has to say so: "0/N resolved" read as an ordinary
     /// low-coverage scan for four weeks.
     pub empty_api_corpus: bool,
+    /// The retrieval denominator per language that measures it
+    /// (po-av01j.219). `resolved`/`total` above is resolution over RETRIEVED
+    /// sites, and the extractor tables decide what is retrieved; this is how
+    /// many call sites were retrieved out of the ones that exist, and which
+    /// known I/O the tables left out. Empty when no helper reported one.
+    pub retrieval: Vec<rvl_core::RetrievalCensus>,
+    /// Resolved and no-spec counts per language (po-5csvg), in first-seen
+    /// order. The aggregate lines above cannot say WHICH language the no-spec
+    /// sites belong to, and that is the fact that names the lever.
+    pub by_lang: Vec<LangCoverage>,
+    /// The repo-structure lane's verdict counts (po-av01j.28). `None` when
+    /// the lane did not run, which renders no line at all.
+    pub structure: Option<StructureCoverage>,
+}
+
+/// One language's share of the resolved line (po-5csvg). The language is the
+/// one whose retriever read the site's file, so the split agrees with the
+/// roll-call's site counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LangCoverage {
+    pub lang: String,
+    pub resolved: usize,
+    pub total: usize,
+    /// Sites that abstained for want of a spec. The other abstain levers are
+    /// not split per language: only this one is a statement about the corpus.
+    pub no_spec: usize,
+}
+
+impl LangCoverage {
+    /// Below this many sites a zero is not evidence about an ecosystem.
+    const LEVER_MIN_SITES: usize = 20;
+
+    /// The resolved rate is ~0 AND missing specs are why: under 5% resolved,
+    /// over enough sites to mean something, with no-spec the majority outcome.
+    /// The last clause keeps the corpus from being blamed for a zero that
+    /// unresolved bounds caused. A coverage HINT, never a gate.
+    pub fn corpus_is_the_lever(&self) -> bool {
+        self.total >= Self::LEVER_MIN_SITES
+            && self.resolved * 20 < self.total
+            && self.no_spec * 2 > self.total
+    }
+}
+
+/// The per-language split and its lever lines (po-5csvg). The onyx dogfood
+/// printed "Python 7184 sites" and "5173 no spec" and never connected them: a
+/// language whose no-spec rate is ~100% says the CORPUS has nothing for that
+/// ecosystem, and the reader had to join the two lines by hand to learn it.
+pub fn render_lang_coverage(cov: &Coverage, color: bool) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    // One language: the split would only restate the aggregate line above it.
+    if cov.by_lang.len() > 1 {
+        let parts: Vec<String> = cov
+            .by_lang
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} {}/{} resolved ({} no spec)",
+                    l.lang, l.resolved, l.total, l.no_spec
+                )
+            })
+            .collect();
+        let line = format!("  by language: {}", parts.join(" \u{00b7} "));
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
+    // An empty commercial cache has its own line and it is the truer one: the
+    // corpus is empty for every language, which is a sync problem and not a
+    // per-ecosystem gap.
+    if cov.empty_api_corpus {
+        return o;
+    }
+    // Yellow, like the other lines that change what the percentage means.
+    for l in cov.by_lang.iter().filter(|l| l.corpus_is_the_lever()) {
+        let line = format!(
+            "  {}: {}/{} resolved \u{2014} the spec corpus carries {} specs matching this \
+             language's ecosystem ({} no spec); minting them is the coverage lever here",
+            l.lang,
+            l.resolved,
+            l.total,
+            if l.resolved == 0 { "no" } else { "almost no" },
+            l.no_spec
+        );
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
+    }
+    o
+}
+
+/// How the repo-structure controls came out, one verdict per control. Only
+/// violations reach the ladder, so without this line a reader cannot tell a
+/// lane that found nothing from one that abstained on everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StructureCoverage {
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    pub not_applicable: usize,
+}
+
+impl StructureCoverage {
+    /// Count wire-string verdicts. `None` for no rows: the lane did not run.
+    pub fn from_verdicts<'a>(verdicts: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut c = Self::default();
+        for v in verdicts {
+            match v {
+                "violates" => c.violates += 1,
+                "satisfies" => c.satisfies += 1,
+                "not_applicable" => c.not_applicable += 1,
+                _ => c.abstain += 1,
+            }
+        }
+        (c.total() > 0).then_some(c)
+    }
+
+    pub fn total(&self) -> usize {
+        self.violates + self.satisfies + self.abstain + self.not_applicable
+    }
+}
+
+/// The retrieval-denominator lines (po-av01j.219), one per language that
+/// measured one. Printed whether or not any site is in scope: the census
+/// describes the repo, not the sites this scan resolved.
+///
+/// Yellow when the corpus names I/O the tables skipped, because then the
+/// resolved percentage above is known to exclude real I/O; dim otherwise.
+pub fn render_retrieval(cov: &Coverage, color: bool) -> String {
+    let mut o = String::new();
+    for r in &cov.retrieval {
+        // One decimal, not the integer percent the resolved line uses: the
+        // crude denominator is large, and nats-server's 118 of 25263 printed
+        // as "0%", which reads as "nothing retrieved".
+        let pct = 100.0 * r.candidates as f64 / r.calls_resolved.max(1) as f64;
+        let missed: Vec<String> = r
+            .unretrieved
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(surface, n)| format!("{surface} {n}"))
+            .collect();
+        let line = format!(
+            "  {} retrieval: {} candidate call sites of {} resolved calls ({:.1}%) \u{00b7} known I/O not retrieved: {}",
+            r.lang,
+            r.candidates,
+            r.calls_resolved,
+            pct,
+            if missed.is_empty() {
+                "none".to_string()
+            } else {
+                missed.join(", ")
+            }
+        );
+        let _ = writeln!(
+            o,
+            "{}",
+            paint(&line, if missed.is_empty() { "2" } else { "33" }, color)
+        );
+    }
+    o
 }
 
 /// The one-line per-language roll-call. Rendered whenever anything was seen, so
@@ -174,6 +376,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         && cov.retrievers.is_empty()
         && cov.generated_skipped == 0
         && cov.test_files_skipped.is_empty()
+        && cov.dependencies_uninstalled.is_empty()
     {
         return String::new();
     }
@@ -187,15 +390,24 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             .iter()
             .map(|s| match s.state {
                 LangState::Scanned => format!("{} {} sites", s.lang, s.detail),
+                LangState::Partial => format!("{} {}", s.lang, s.detail),
                 LangState::Abstained => format!("{} abstained", s.lang),
                 LangState::Failed => format!("{} FAILED", s.lang),
                 LangState::Unsupported => format!("{} not supported ({})", s.lang, s.detail),
                 LangState::NotInstalled => format!("{} helper not installed", s.lang),
+                LangState::Skipped => format!(
+                    "{} skipped ({}, test material only; --include-tests scans it)",
+                    s.lang, s.detail
+                ),
             })
             .collect();
-        // Yellow when anything failed: a failure changes what the numbers above
-        // it mean, an abstention or an unsupported language does not.
-        let any_failed = cov.lang_status.iter().any(|s| s.state == LangState::Failed);
+        // Yellow when anything failed or parsed only partly: both change what
+        // the numbers above it mean, an abstention or an unsupported language
+        // does not.
+        let any_failed = cov
+            .lang_status
+            .iter()
+            .any(|s| matches!(s.state, LangState::Failed | LangState::Partial));
         let line = format!("  languages: {}", parts.join(" \u{00b7} "));
         let _ = writeln!(
             o,
@@ -215,6 +427,19 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             .collect();
         let line = format!("  retrievers: {}", parts.join(" \u{00b7} "));
         let _ = writeln!(o, "{}", paint(&line, "2", color));
+        // po-vd7ii left the reader to notice that a path above was the wrong
+        // one. A helper that is measurably not the shipped build gets its own
+        // line, in the warning color, so the roll-call cannot be skimmed past
+        // (po-8ozxg).
+        for r in &cov.retrievers {
+            if let Some(drift) = &r.drift {
+                let line = format!(
+                    "  helper drift: {} {} ({}) {drift}",
+                    r.lang, r.path, r.source
+                );
+                let _ = writeln!(o, "{}", paint(&line, "33", color));
+            }
+        }
     }
     if cov.generated_skipped > 0 {
         let g = format!(
@@ -236,7 +461,30 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         );
         let _ = writeln!(o, "{}", paint(&line, "2", color));
     }
+    // A lane that scanned without its installed dependencies (po-pk3fp.15):
+    // the roll-call's "N sites" is the same for a tree resolved from the
+    // packages and one resolved from import syntax, so the weaker scan is
+    // named here. Dim like the lines above it, because the lane did run; a
+    // zero prints nothing.
+    for d in cov.dependencies_uninstalled.iter().filter(|d| d.count > 0) {
+        let line = format!(
+            "  {}: {} workspace{} without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)",
+            d.lang,
+            d.count,
+            if d.count == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&line, "2", color));
+    }
     o
+}
+
+/// How many of one language's workspaces declare dependencies that are not
+/// installed, so the helper resolved their client types from import syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependenciesUninstalled {
+    pub lang: String,
+    pub count: usize,
 }
 
 /// How many test files one language's helper declined to read.
@@ -281,7 +529,8 @@ pub fn render_coverage_degradations(cov: &Coverage, color: bool) -> String {
 pub struct LangStatus {
     pub lang: String,
     pub state: LangState,
-    /// Site count for Scanned; the reason for the others.
+    /// Site count for Scanned; the site count and what went unparsed for
+    /// Partial; the reason for the others.
     pub detail: String,
 }
 
@@ -295,6 +544,9 @@ pub struct RetrieverInfo {
     pub lang: String,
     pub path: String,
     pub source: String,
+    /// Set when this helper is not the build this binary ships and a shipped
+    /// sibling exists to compare against: what differs, in words (po-8ozxg).
+    pub drift: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +554,11 @@ pub enum LangState {
     /// The helper ran to completion. `detail` carries the packet count, which
     /// may legitimately be zero.
     Scanned,
+    /// The helper ran to completion, but some units parsed only partly
+    /// (po-av01j.138): clang recovered from errors, usually a header that is
+    /// not installed, by dropping constructs, and any call inside one went
+    /// with it. `detail` carries the site count, which is a floor, and why.
+    Partial,
     /// The helper ran and declined, with a reason. Working as intended.
     Abstained,
     /// The helper could not run or errored. NOT working as intended.
@@ -313,6 +570,12 @@ pub enum LangState {
     /// (po-av01j.147). Asks the reader for an install command, not a bug
     /// report, so it must not read like a failure.
     NotInstalled,
+    /// Detected, and deliberately not scanned (po-av01j.123): every file of
+    /// the language is test material (testdata, fixtures, examples, docs) and
+    /// another language is really present. No helper was resolved or run.
+    /// `detail` carries the file count. Named in the roll-call because a
+    /// language silently not scanned reads as scanned and clean.
+    Skipped,
 }
 
 /// One language that produced no packets, as rendered to the user.
@@ -358,6 +621,10 @@ pub struct ConfigCoverage {
     pub abstain_outside_repo: usize,
     /// Any other undecided outcome (low-confidence spec, unknown pattern).
     pub abstain_other: usize,
+    /// Settings whose key the ledger marks vocabulary only: no spec judges
+    /// them and none is wanted (`rvl_config::key_ledger`). Kept out of
+    /// `abstain_no_spec` so that lever counts only real authoring gaps.
+    pub vocabulary_only: usize,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format
@@ -368,7 +635,7 @@ pub struct ConfigCoverage {
 
 impl ConfigCoverage {
     pub fn abstain_total(&self) -> usize {
-        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other
+        self.abstain_no_spec + self.abstain_outside_repo + self.abstain_other + self.vocabulary_only
     }
     /// Nothing to render: the lane saw no config at all.
     pub fn is_empty(&self) -> bool {
@@ -560,6 +827,7 @@ pub fn render_ladder(
             );
             let _ = writeln!(o, "{}", paint(&bline, "2", color));
         }
+        o.push_str(&render_lang_coverage(&cov, color));
     }
     // Outside the branch on purpose. A degraded language is the reason the G1
     // lane can be empty, so it must be reported precisely when total == 0; and
@@ -582,8 +850,27 @@ pub fn render_ladder(
         );
         let _ = writeln!(o, "{}", paint(&line, "33", color));
     }
+    o.push_str(&render_retrieval(&cov, color));
     o.push_str(&render_lang_status(&cov, color));
     o.push_str(&render_coverage_degradations(&cov, color));
+    if let Some(sc) = &cov.structure {
+        let parts: Vec<String> = [
+            (sc.violates, "violates"),
+            (sc.satisfies, "satisfied"),
+            (sc.abstain, "abstain"),
+            (sc.not_applicable, "not applicable"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+        let sline = format!(
+            "  structure: {} repo controls \u{2014} {}",
+            sc.total(),
+            parts.join(" \u{00b7} ")
+        );
+        let _ = writeln!(o, "{}", paint(&sline, "2", color));
+    }
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
             let pct = 100 * cc.resolved / cc.total.max(1);
@@ -603,6 +890,9 @@ pub fn render_ladder(
                 }
                 if cc.abstain_other > 0 {
                     parts.push(format!("{} other", cc.abstain_other));
+                }
+                if cc.vocabulary_only > 0 {
+                    parts.push(format!("{} vocabulary only", cc.vocabulary_only));
                 }
                 let aline = format!("  config abstain \u{2014} {}", parts.join(" \u{00b7} "));
                 let _ = writeln!(o, "{}", paint(&aline, "2", color));
@@ -707,7 +997,7 @@ pub fn render_ladder(
     if blocking.is_empty() {
         let mut foot = format!(
             "{} {} advisory",
-            if nothing_scanned {
+            if nothing_scanned || cov.blend_incomplete.is_some() {
                 paint("\u{26a0}", "33", color)
             } else {
                 paint("\u{2713}", "32", color)
@@ -732,16 +1022,32 @@ pub fn render_ladder(
                     color
                 )
             );
+        } else if let Some(why) = &cov.blend_incomplete {
+            // Same fail-open posture as above: the agent being unavailable
+            // must not block a commit, so the verdict line carries it.
+            let _ = writeln!(
+                o,
+                "{foot} \u{00b7} {}",
+                paint(
+                    &format!(
+                        "NOT A BLENDED RESULT \u{2014} {why} (see BLEND); \
+                         deterministic half only, rvl fails open"
+                    ),
+                    "33",
+                    color
+                )
+            );
         } else {
             let _ = writeln!(o, "{foot} \u{00b7} commit clean");
         }
     } else {
         let _ = writeln!(
             o,
-            "{} blocked \u{2014} fix or suppress {} blocking finding{} to commit",
+            "{} blocked \u{2014} fix or suppress {} blocking finding{} to {}",
             paint("\u{2717}", "31", color),
             blocking.len(),
-            if blocking.len() == 1 { "" } else { "s" }
+            if blocking.len() == 1 { "" } else { "s" },
+            cov.operation.as_str()
         );
     }
     o
@@ -751,7 +1057,7 @@ pub fn render_ladder(
 /// the class hits) is the one severity signal available without a class judge.
 /// It is EXPOSURE, not criticality -- reported as such so the reader is never
 /// told a severity we didn't actually judge.
-fn exposure_tier(site_count: usize) -> &'static str {
+pub(crate) fn exposure_tier(site_count: usize) -> &'static str {
     if site_count >= 100 {
         "high"
     } else if site_count >= 10 {
@@ -1073,6 +1379,56 @@ mod empty_api_corpus_tests {
         };
         let out = render_ladder(&[], cov, None, "0.1s", false);
         assert!(!out.contains("0 API specs"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod structure_coverage_tests {
+    use super::*;
+
+    /// The ladder shows structure VIOLATIONS only, so COVERAGE is where the
+    /// satisfied and abstained controls stay visible (po-av01j.28).
+    #[test]
+    fn the_coverage_block_summarizes_the_structure_lane() {
+        let structure = StructureCoverage::from_verdicts(
+            [
+                "violates",
+                "satisfies",
+                "satisfies",
+                "abstain",
+                "not_applicable",
+                "abstain",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            structure,
+            Some(StructureCoverage {
+                violates: 1,
+                satisfies: 2,
+                abstain: 2,
+                not_applicable: 1,
+            })
+        );
+        let cov = Coverage {
+            structure,
+            ..Default::default()
+        };
+        let out = render_ladder(&[], cov, None, "0.1s", false);
+        assert!(
+            out.contains(
+                "  structure: 6 repo controls \u{2014} 1 violates \u{00b7} 2 satisfied \u{00b7} \
+                 2 abstain \u{00b7} 1 not applicable"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_scan_without_the_structure_lane_renders_no_structure_line() {
+        assert_eq!(StructureCoverage::from_verdicts(std::iter::empty()), None);
+        let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
+        assert!(!out.contains("structure:"), "{out}");
     }
 }
 

@@ -15,7 +15,7 @@ Do not open a public GitHub issue for security reports.
 **In scope:**
 - The `rvl` binary and the crates under `crates/` (credential storage, plugin installation, scan commands)
 - The language indexer helpers under `helpers/` (`csindex`, `goindex`, `javaindex`, `pyindex`, `tsindex`)
-- Plugin integrity verification (checksum, Ed25519 signature)
+- Plugin integrity verification (checksum, Ed25519 signature, signing-key pinning)
 - Authentication and token handling
 - Release artifact integrity (checksums, SBOMs, Homebrew tap publication)
 

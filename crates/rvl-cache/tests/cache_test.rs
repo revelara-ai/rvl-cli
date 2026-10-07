@@ -269,6 +269,105 @@ fn fetch_failure_is_an_outcome_not_an_error() {
     assert!(matches!(out, SyncOutcome::FetchFailed { .. }));
 }
 
+// --- "never published" is not "network down" (po-gcn3q) ---
+
+struct NotPublishedFetcher;
+impl Fetcher for NotPublishedFetcher {
+    fn fetch(&self, _: Option<&str>) -> anyhow::Result<Fetched> {
+        Ok(Fetched::NotPublished {
+            url: "https://api.example.test/api/v1/scanner/spec-cache".into(),
+        })
+    }
+}
+
+#[test]
+fn not_published_is_its_own_outcome_and_keeps_the_installed_cache() {
+    let k = keys();
+    let (_d, s) = store();
+    let v1 = envelope_bytes(1, "2026-07-29.1");
+    s.install(&v1, &sign_b64(&k, &v1), &k.keyset);
+
+    let out = sync(&s, &NotPublishedFetcher, &k.keyset, false);
+    let SyncOutcome::NotPublished { url } = out else {
+        panic!("expected NotPublished, got {out:?}");
+    };
+    assert!(url.ends_with("/api/v1/scanner/spec-cache"));
+    let loaded = s.load(&k.keyset, "2026-07-30").unwrap();
+    assert_eq!(loaded.envelope.content_version, "2026-07-29.1");
+}
+
+#[test]
+fn not_published_message_names_the_endpoint_and_is_not_a_network_message() {
+    let msg = not_published_message("https://api.example.test/api/v1/scanner/spec-cache");
+    assert!(msg.contains("https://api.example.test/api/v1/scanner/spec-cache"));
+    assert!(msg.contains("404"), "{msg}");
+    assert!(msg.contains("published"), "{msg}");
+    assert!(!msg.contains("fetch failed"), "{msg}");
+}
+
+/// A loopback server that answers every request with `status` and an empty
+/// body, then closes. Returns its base URL.
+fn serve_status(status: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    base
+}
+
+#[test]
+fn http_404_on_the_artifact_is_not_published_for_both_tiers() {
+    let base = serve_status("404 Not Found");
+    let commercial = HttpFetcher {
+        base_url: base.clone(),
+        org_key: "k".into(),
+    };
+    let Ok(Fetched::NotPublished { url }) = commercial.fetch(None) else {
+        panic!("commercial 404 must be NotPublished");
+    };
+    assert_eq!(url, format!("{base}/api/v1/scanner/spec-cache"));
+
+    let oss = OssHttpFetcher {
+        base_url: base.clone(),
+    };
+    let Ok(Fetched::NotPublished { url }) = oss.fetch(None) else {
+        panic!("oss 404 must be NotPublished");
+    };
+    assert_eq!(url, format!("{base}/api/v1/scanner/spec-cache/oss"));
+}
+
+#[test]
+fn server_errors_and_dead_networks_stay_fetch_failed() {
+    let k = keys();
+    let (_d, s) = store();
+
+    let f = HttpFetcher {
+        base_url: serve_status("500 Internal Server Error"),
+        org_key: "k".into(),
+    };
+    let out = sync(&s, &f, &k.keyset, false);
+    assert!(matches!(out, SyncOutcome::FetchFailed { .. }), "{out:?}");
+
+    // A port nothing listens on: bind, read the address, drop the listener.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let f = OssHttpFetcher { base_url: dead };
+    let out = sync(&s, &f, &k.keyset, false);
+    assert!(matches!(out, SyncOutcome::FetchFailed { .. }), "{out:?}");
+}
+
 // --- air-gapped import ---
 
 #[test]
@@ -531,6 +630,80 @@ fn a_304_is_up_to_date_not_a_signature_failure() {
              body then fails signature verification",
             bytes.len()
         ),
+        Ok(Fetched::NotPublished { url }) => panic!("a 304 from {url} is not a 404"),
         Err(e) => panic!("a 304 must not be an error: {e}"),
     }
+}
+
+// --- tier filter (po-7wgx3) ---
+
+/// A keyed install: the OSS vocabulary tier under `oss/` and a commercial
+/// tier carrying judgments beside it, both signed by the same keyset.
+fn keyed_install(k: &TestKeys) -> (tempfile::TempDir, CacheStore, CacheStore) {
+    let (dir, commercial) = store();
+    let oss = commercial.subdir_store(OSS_DIR).unwrap();
+    let oss_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "content_version": "2026-07-30.1",
+        "specs": {"apis": [], "configs": [], "server": ["oss-vocabulary"]}
+    }))
+    .unwrap();
+    assert!(matches!(
+        oss.install(&oss_bytes, &sign_b64(k, &oss_bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+    let com_bytes = envelope_with_judgments("2026-07-30.1", "blocking");
+    assert!(matches!(
+        commercial.install(&com_bytes, &sign_b64(k, &com_bytes), &k.keyset),
+        SyncOutcome::Installed { .. }
+    ));
+    (dir, commercial, oss)
+}
+
+#[test]
+fn tier_filter_both_layers_the_commercial_tier_over_oss() {
+    let k = keys();
+    let (_d, commercial, oss) = keyed_install(&k);
+    let t = load_tiered(&commercial, &oss, &k.keyset, "2026-07-30", TierFilter::Both);
+    assert!(t.oss.is_some() && t.commercial.is_some());
+    assert!(t.judgments().is_some());
+    let (_base, overlay) = t.spec_texts().unwrap().unwrap();
+    assert!(overlay.is_some());
+}
+
+#[test]
+fn tier_filter_oss_only_behaves_like_a_no_key_install() {
+    let k = keys();
+    let (_d, commercial, oss) = keyed_install(&k);
+    let t = load_tiered(
+        &commercial,
+        &oss,
+        &k.keyset,
+        "2026-07-30",
+        TierFilter::OssOnly,
+    );
+    assert!(t.oss.is_some());
+    assert!(t.commercial.is_none(), "the commercial tier must not load");
+    assert!(t.judgments().is_none(), "no judgments: everything advisory");
+    let (base, overlay) = t.spec_texts().unwrap().unwrap();
+    assert!(base.contains("oss-vocabulary"));
+    assert!(overlay.is_none(), "no commercial overlay to merge");
+}
+
+#[test]
+fn tier_filter_oss_only_never_falls_back_to_the_commercial_tier() {
+    let k = keys();
+    let (_d, commercial) = store();
+    let oss = commercial.subdir_store(OSS_DIR).unwrap();
+    let com_bytes = envelope_with_judgments("2026-07-30.1", "blocking");
+    commercial.install(&com_bytes, &sign_b64(&k, &com_bytes), &k.keyset);
+    let t = load_tiered(
+        &commercial,
+        &oss,
+        &k.keyset,
+        "2026-07-30",
+        TierFilter::OssOnly,
+    );
+    assert!(!t.any());
+    assert!(t.spec_texts().unwrap().is_none());
 }

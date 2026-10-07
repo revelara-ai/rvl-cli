@@ -39,8 +39,8 @@ pub enum G {
     /// Pre-rendered JSON spliced verbatim, the way Go marshals a
     /// `json.RawMessage`: key order and number literals preserved. Callers
     /// pass output of [`compact_raw`] so the splice matches Go's compact +
-    /// HTML-escape pass. Compact emission only (the ported paths that carry
-    /// raw JSON never pretty-print it).
+    /// HTML-escape pass. Pretty emission re-indents it the way
+    /// `MarshalIndent` does (`json.Indent`), leaving every token untouched.
     Raw(String),
 }
 
@@ -75,7 +75,60 @@ fn write_g(out: &mut String, g: &G, depth: usize, indent: bool) {
         G::Arr(items) => write_arr(out, items, depth, indent),
         G::Obj(fields) => write_obj(out, fields, depth, indent),
         G::Dyn(v) => write_dyn(out, v, depth, indent),
+        G::Raw(s) if indent => write_raw_indented(out, s, depth),
         G::Raw(s) => out.push_str(s),
+    }
+}
+
+/// Go's `json.Indent` over already-compact JSON, starting at `depth`: a
+/// newline and indent after every `{` `[` `,`, a space after every `:`, and
+/// empty containers kept as `{}` / `[]`. String contents are copied as is.
+fn write_raw_indented(out: &mut String, s: &str, depth: usize) {
+    let mut depth = depth;
+    let mut chars = s.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                out.push(c);
+                in_string = true;
+            }
+            '{' | '[' => {
+                out.push(c);
+                let close = if c == '{' { '}' } else { ']' };
+                if chars.peek() == Some(&close) {
+                    out.push(close);
+                    chars.next();
+                } else {
+                    depth += 1;
+                    write_indent(out, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                write_indent(out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                write_indent(out, depth);
+            }
+            ':' => out.push_str(": "),
+            c => out.push(c),
+        }
     }
 }
 
@@ -344,10 +397,17 @@ pub fn path_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The crate directory, read at run time. `cargo test` sets CARGO_MANIFEST_DIR
+    /// for every test process; a binary reused from a shared CARGO_TARGET_DIR still
+    /// carries the compile-time path of whichever checkout built it, which may be gone.
+    fn manifest_dir() -> std::path::PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+            .into()
+    }
+
     fn testdata(name: &str) -> String {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata")
-            .join(name);
+        let p = manifest_dir().join("testdata").join(name);
         std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
     }
 
@@ -496,6 +556,36 @@ mod tests {
         assert_eq!(compact_raw("{\"k\": \"x \\\" y\"}"), r#"{"k":"x \" y"}"#);
         let g = G::Raw(compact_raw("{\"z\":1,\"a\":2}"));
         assert_eq!(compact(&g), r#"{"z":1,"a":2}"#);
+    }
+
+    #[test]
+    fn raw_pretty_indents_like_go_json_indent() {
+        // MarshalIndent of a RawMessage: key order, number literals, string
+        // contents (including `,` `:` `{` and an escaped quote) untouched;
+        // empty containers stay `{}` / `[]`; nested depth follows the parent.
+        let g = G::Obj(vec![(
+            "risks".into(),
+            G::Arr(vec![G::Raw(compact_raw(
+                r#"{"z":2.50,"s":"a,b:{c} \"q\"","e":{},"l":[],"n":{"k":[1,null]}}"#,
+            ))]),
+        )]);
+        let want = r#"{
+  "risks": [
+    {
+      "z": 2.50,
+      "s": "a,b:{c} \"q\"",
+      "e": {},
+      "l": [],
+      "n": {
+        "k": [
+          1,
+          null
+        ]
+      }
+    }
+  ]
+}"#;
+        assert_eq!(pretty(&g), want);
     }
 
     #[test]

@@ -98,13 +98,18 @@ fn low_value_is_suppressed_and_unjudged_is_advisory_never_blocking() {
 /// it, so one fully-resolved value serves.
 fn cov() -> Coverage {
     Coverage {
+        by_lang: vec![],
+        blend_incomplete: None,
+        operation: GatedOperation::Commit,
         retrievers: vec![],
         empty_api_corpus: false,
+        structure: None,
         resolved: 1,
         total: 1,
         abstain_no_spec: 0,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -113,6 +118,7 @@ fn cov() -> Coverage {
         degraded: Vec::new(),
         degraded_note: None,
         lang_status: Vec::new(),
+        retrieval: Vec::new(),
     }
 }
 
@@ -152,13 +158,18 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         f("hidden", "low", "low_value", 0),
     ];
     let cov = Coverage {
+        by_lang: vec![],
+        blend_incomplete: None,
+        operation: GatedOperation::Commit,
         retrievers: vec![],
         empty_api_corpus: false,
+        structure: None,
         resolved: 58,
         total: 59,
         abstain_no_spec: 1,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
         abstain_other: 0,
@@ -167,6 +178,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         degraded: Vec::new(),
         degraded_note: None,
         lang_status: Vec::new(),
+        retrieval: Vec::new(),
     };
     let out = render_ladder(&findings, cov, None, "0.4s (warm)", false);
 
@@ -211,13 +223,18 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
     let out = render_ladder(
         &findings,
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 5,
             total: 5,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -226,6 +243,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -253,13 +271,18 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
     let out = render_ladder(
         &[f("adv1", "medium", "surface", 0)],
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -268,6 +291,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -286,13 +310,18 @@ fn ladder_with_no_blocking_says_commit_clean() {
     let out = render_ladder(
         &findings,
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 10,
             total: 10,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -301,6 +330,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -315,13 +345,18 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let out = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -330,6 +365,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -343,13 +379,18 @@ fn no_color_mode_emits_no_ansi_escapes() {
     let colored = render_ladder(
         &[f("b", "high", "surface", 1)],
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -358,6 +399,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -376,13 +418,18 @@ fn hook_ladder_shows_counts_not_named_incidents() {
     let out = render_ladder(
         &[f("b", "high", "surface", 2)],
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -391,6 +438,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         None,
         "0.1s",
@@ -425,6 +473,23 @@ fn unjudged_keys_are_named_not_just_counted() {
 }
 
 #[test]
+fn vocabulary_only_keys_are_counted_apart_from_missing_specs() {
+    // Both are unjudged; only one of them is a gap.
+    let cc = ConfigCoverage {
+        resolved: 1,
+        total: 4,
+        abstain_no_spec: 1,
+        vocabulary_only: 2,
+        ..Default::default()
+    };
+    let out = render_ladder(&[], Coverage::default(), Some(&cc), "0.1s", false);
+    assert!(
+        out.contains("1 no spec") && out.contains("2 vocabulary only"),
+        "{out}"
+    );
+}
+
+#[test]
 fn unjudged_key_list_states_what_it_dropped() {
     // Capping is fine; capping silently would read as "that is the whole queue".
     let cc = ConfigCoverage {
@@ -446,6 +511,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         abstain_no_spec: 1,
         abstain_outside_repo: 2,
         abstain_other: 0,
+        vocabulary_only: 0,
         unparseable_files: 1,
         no_spec_keys: Default::default(),
         sightings: vec![
@@ -456,13 +522,18 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
     let out = render_ladder(
         &[],
         Coverage {
+            by_lang: vec![],
+            blend_incomplete: None,
+            operation: GatedOperation::Commit,
             retrievers: vec![],
             empty_api_corpus: false,
+            structure: None,
             resolved: 1,
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
             abstain_other: 0,
@@ -471,6 +542,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             degraded: Vec::new(),
             degraded_note: None,
             lang_status: Vec::new(),
+            retrieval: Vec::new(),
         },
         Some(&cc),
         "0.1s",
@@ -495,13 +567,18 @@ fn empty_config_coverage_renders_nothing_extra() {
         render_ladder(
             &[],
             Coverage {
+                by_lang: vec![],
+                blend_incomplete: None,
+                operation: GatedOperation::Commit,
                 retrievers: vec![],
                 empty_api_corpus: false,
+                structure: None,
                 resolved: 1,
                 total: 1,
                 abstain_no_spec: 0,
                 generated_skipped: 0,
                 test_files_skipped: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
                 abstain_bounds: 0,
                 abstain_judge: 0,
                 abstain_other: 0,
@@ -510,6 +587,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 degraded: Vec::new(),
                 degraded_note: None,
                 lang_status: Vec::new(),
+                retrieval: Vec::new(),
             },
             cfg,
             "0.1s",
@@ -853,6 +931,32 @@ fn every_language_seen_is_named_including_the_ones_that_found_nothing() {
     );
 }
 
+// po-av01j.138. A helper that parsed a unit only partly (for C/C++, a header
+// that is not installed made clang drop whole statements, calls and all) must
+// not print a zero that reads like the clean one above. The line names the
+// loss and goes yellow, like a failure: both change what the numbers mean.
+#[test]
+fn a_partial_parse_is_not_rendered_like_a_clean_zero() {
+    let cov = Coverage {
+        lang_status: vec![LangStatus {
+            lang: "C/C++".into(),
+            state: LangState::Partial,
+            detail: "0 sites, INCOMPLETE: 1 of 1 translation unit had parse errors".into(),
+        }],
+        ..Default::default()
+    };
+    let out = render_lang_status(&cov, false);
+    assert!(
+        out.contains("C/C++ 0 sites, INCOMPLETE: 1 of 1 translation unit"),
+        "{out}"
+    );
+    let colored = render_lang_status(&cov, true);
+    assert!(
+        colored.contains("\u{1b}[33m"),
+        "a partial lane is yellow: {colored:?}"
+    );
+}
+
 #[test]
 fn a_failed_language_is_distinguishable_from_one_that_abstained() {
     let cov = Coverage {
@@ -959,6 +1063,36 @@ fn a_missing_helper_reads_as_not_installed_not_as_a_failure() {
     );
 }
 
+// po-av01j.123. A language found only in test material is not scanned, and
+// the roll-call must say so with the count and the flag that scans it: the
+// reader has to be able to tell "skipped on purpose" from "scanned and clean",
+// and to undo the skip when the test paths hold real sources.
+#[test]
+fn a_skipped_language_is_named_with_its_file_count_and_the_lever() {
+    let cov = Coverage {
+        lang_status: vec![
+            LangStatus {
+                lang: "Go".into(),
+                state: LangState::Scanned,
+                detail: "12".into(),
+            },
+            LangStatus {
+                lang: "Rust".into(),
+                state: LangState::Skipped,
+                detail: "1 file".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("Rust skipped (1 file, test material only; --include-tests scans it)"),
+        "{out}"
+    );
+    assert!(!out.contains("Rust FAILED"), "{out}");
+    assert!(!out.contains("Rust 1 file sites"), "{out}");
+}
+
 // --- test files skipped ---
 
 #[test]
@@ -994,4 +1128,326 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
     );
+}
+
+// --- the retrieval denominator (po-av01j.219) ---
+
+fn go_census(candidates: usize, calls: usize, readall: usize) -> rvl_core::RetrievalCensus {
+    let mut unretrieved = std::collections::BTreeMap::new();
+    if readall > 0 {
+        unretrieved.insert("io.ReadAll".to_string(), readall);
+    }
+    rvl_core::RetrievalCensus {
+        lang: "go".into(),
+        calls_resolved: calls,
+        candidates,
+        unretrieved,
+    }
+}
+
+/// Coverage is resolution over RETRIEVED sites. The retrieval denominator
+/// prints beside it, with the known I/O the extractor tables do not
+/// retrieve, so "97% resolved" can no longer read as a statement about the
+/// whole repo.
+#[test]
+fn coverage_prints_the_retrieval_denominator_and_known_unretrieved_io() {
+    let mut c = cov();
+    c.retrieval = vec![go_census(97, 4200, 3)];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(out.contains("1/1 API surfaces resolved"), "{out}");
+    assert!(
+        out.contains("go retrieval: 97 candidate call sites of 4200 resolved calls (2.3%)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("known I/O not retrieved: io.ReadAll 3"),
+        "{out}"
+    );
+}
+
+/// The denominator is a fact about the repo, not about the sites in scope:
+/// it prints even when the resolution line has nothing to count.
+#[test]
+fn retrieval_denominator_prints_when_no_site_is_in_scope() {
+    let mut c = cov();
+    c.resolved = 0;
+    c.total = 0;
+    c.retrieval = vec![go_census(0, 12, 0)];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(
+        out.contains("go retrieval: 0 candidate call sites of 12 resolved calls (0.0%)"),
+        "{out}"
+    );
+    assert!(out.contains("known I/O not retrieved: none"), "{out}");
+}
+
+/// No census (an older helper, a language that does not measure it) prints
+/// no retrieval line: absent is not zero.
+#[test]
+fn no_census_prints_no_retrieval_line() {
+    let out = render_ladder(&[], cov(), None, "0.1s", false);
+    assert!(!out.contains("retrieval:"), "{out}");
+}
+
+// --- per-language coverage split and lever (po-5csvg) ---
+//
+// The onyx dogfood printed "Python 7184 sites" and "5173 no spec" on separate
+// lines and left the reader to join them. A language whose no-spec rate is
+// ~100% is a statement about the CORPUS, not about the scanner, and the
+// coverage block has to say so itself.
+
+fn lc(lang: &str, resolved: usize, total: usize, no_spec: usize) -> LangCoverage {
+    LangCoverage {
+        lang: lang.into(),
+        resolved,
+        total,
+        no_spec,
+    }
+}
+
+#[test]
+fn coverage_splits_resolved_and_no_spec_per_language() {
+    let cov = Coverage {
+        resolved: 900,
+        total: 8184,
+        abstain_no_spec: 5273,
+        abstain_bounds: 2011,
+        by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("by language: Go 900/1000 resolved (100 no spec) \u{00b7} Python 0/7184 resolved (5173 no spec)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_language_with_nothing_resolved_names_the_corpus_as_the_lever() {
+    let cov = Coverage {
+        resolved: 900,
+        total: 8184,
+        abstain_no_spec: 5273,
+        abstain_bounds: 2011,
+        by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains(
+            "Python: 0/7184 resolved \u{2014} the spec corpus carries no specs matching this language's ecosystem"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Go: 900/1000"),
+        "a healthy language gets no lever line: {out}"
+    );
+}
+
+// "~0", not only an exact zero: a handful of stdlib hits in thousands of sites
+// is the same corpus statement. The wording must not claim "no specs" though.
+#[test]
+fn a_near_zero_resolved_rate_is_named_without_claiming_an_exact_zero() {
+    let cov = Coverage {
+        resolved: 12,
+        total: 7184,
+        abstain_no_spec: 7172,
+        by_lang: vec![lc("Python", 12, 7184, 7172)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("Python: 12/7184 resolved \u{2014} the spec corpus carries almost no specs matching this language's ecosystem"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("by language:"),
+        "one language: the split would only restate the aggregate line: {out}"
+    );
+}
+
+// The sentence blames the corpus, so it may only print when no-spec IS the
+// cause. Zero resolved because every bound was unresolvable is another lever.
+#[test]
+fn no_corpus_lever_when_the_zero_is_not_a_no_spec_zero() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 400,
+        abstain_no_spec: 10,
+        abstain_bounds: 390,
+        by_lang: vec![lc("Python", 0, 400, 10)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("spec corpus carries"), "{out}");
+}
+
+// Three sites with nothing resolved is not evidence about an ecosystem.
+#[test]
+fn no_corpus_lever_for_a_handful_of_sites() {
+    let cov = Coverage {
+        resolved: 50,
+        total: 53,
+        abstain_no_spec: 3,
+        by_lang: vec![lc("Go", 50, 50, 0), lc("Python", 0, 3, 3)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("spec corpus carries"), "{out}");
+    assert!(out.contains("Python 0/3 resolved (3 no spec)"), "{out}");
+}
+
+// An empty commercial cache already has its own line, and it is the truer one:
+// the corpus is empty for EVERY language, which is a sync problem and not a
+// per-ecosystem minting gap.
+#[test]
+fn no_corpus_lever_when_the_whole_api_corpus_is_empty() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 500,
+        abstain_no_spec: 500,
+        empty_api_corpus: true,
+        by_lang: vec![lc("Python", 0, 500, 500)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(
+        out.contains("0 API specs in the commercial spec cache"),
+        "{out}"
+    );
+    assert!(!out.contains("spec corpus carries"), "{out}");
+}
+
+// A hint, never a gate: the footer verdict is unchanged by the lever line.
+#[test]
+fn the_corpus_lever_does_not_change_the_verdict() {
+    let cov = Coverage {
+        resolved: 0,
+        total: 7184,
+        abstain_no_spec: 7184,
+        by_lang: vec![lc("Python", 0, 7184, 7184)],
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("spec corpus carries"), "{out}");
+    assert!(out.contains("commit clean"), "{out}");
+}
+
+// --- dependency trees not installed (po-pk3fp.15) ---
+
+#[test]
+fn uninstalled_dependencies_are_named_per_language_and_zero_is_silent() {
+    // "TypeScript 900 sites" reads the same for a tree resolved from the
+    // installed packages and one resolved from import syntax alone. The
+    // second is a weaker scan, so the lane says which one it was.
+    let mut c = cov();
+    c.dependencies_uninstalled = vec![
+        DependenciesUninstalled {
+            lang: "TypeScript".into(),
+            count: 2,
+        },
+        DependenciesUninstalled {
+            lang: "retrieved stream".into(),
+            count: 1,
+        },
+    ];
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains(
+            "  TypeScript: 2 workspaces without installed dependencies \
+             (client types resolved from import syntax: medium tier, no client versions)"
+        ),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("  retrieved stream: 1 workspace without installed dependencies"),
+        "singular for one: {out}"
+    );
+    let quiet = render_lang_status(&cov(), false);
+    assert!(
+        !quiet.contains("installed dependencies"),
+        "zero must print nothing: {quiet}"
+    );
+}
+
+#[test]
+fn an_uninstalled_tree_is_reported_even_with_no_roll_call() {
+    // The warm path has no roll-call. The dependency line must not vanish
+    // with it, the same rule the skipped-test count follows.
+    let c = Coverage {
+        dependencies_uninstalled: vec![DependenciesUninstalled {
+            lang: "TypeScript".into(),
+            count: 1,
+        }],
+        ..Default::default()
+    };
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains("TypeScript: 1 workspace without installed dependencies"),
+        "got: {out:?}"
+    );
+}
+
+// po-av01j.205. `rvl scan --blend` whose agent half did not answer is the
+// deterministic half alone. Fail open (no block), but the footer may not call
+// that a clean commit, same rule as po-av01j.199 at the new seam.
+#[test]
+fn an_incomplete_blend_does_not_render_the_clean_verdict() {
+    let cov = Coverage {
+        total: 4,
+        resolved: 2,
+        blend_incomplete: Some("agent half unavailable: RVL_NO_AGENT=1".into()),
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(!out.contains("commit clean"), "{out}");
+    assert!(out.contains("NOT A BLENDED RESULT"), "{out}");
+    assert!(
+        out.contains("RVL_NO_AGENT"),
+        "the footer must carry the reason: {out}"
+    );
+    assert!(out.contains("fails open"), "{out}");
+}
+
+#[test]
+fn a_complete_blend_keeps_the_clean_verdict() {
+    let cov = Coverage {
+        total: 4,
+        resolved: 2,
+        ..Default::default()
+    };
+    let out = render_ladder(&[], cov, None, "0.1s", false);
+    assert!(out.contains("commit clean"), "{out}");
+    assert!(!out.contains("NOT A BLENDED RESULT"), "{out}");
+}
+
+// --- the verdict names the gated operation (po-av01j.207) ---
+// The blocked line said "to commit" under the pre-push hook too, at the moment
+// someone is working out why their push stopped.
+#[test]
+fn blocked_verdict_names_the_operation_the_hook_gates() {
+    let findings = vec![f("b1", "high", "surface", 0)];
+    let out = render_ladder(&findings, cov(), None, "0.1s", false);
+    assert!(out.contains("1 blocking finding to commit"), "{out}");
+
+    let push = Coverage {
+        operation: GatedOperation::Push,
+        ..cov()
+    };
+    let out = render_ladder(&findings, push, None, "0.1s", false);
+    assert!(out.contains("1 blocking finding to push"), "{out}");
+    assert!(!out.contains("to commit"), "{out}");
+}
+
+#[test]
+fn gated_operation_follows_the_hook_name() {
+    for hook in ["pre-push", "pre_push", "PRE-PUSH"] {
+        assert_eq!(GatedOperation::from_hook(Some(hook)), GatedOperation::Push);
+    }
+    // No hook, pre-commit, and a typo all keep the commit wording: a scan at
+    // a keyboard is asking "can I commit this".
+    for hook in [None, Some("pre-commit"), Some("pre-psuh")] {
+        assert_eq!(GatedOperation::from_hook(hook), GatedOperation::Commit);
+    }
 }

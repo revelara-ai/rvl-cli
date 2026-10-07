@@ -32,15 +32,19 @@ headless and CI use work with no config file at all.
 | `RVL_API_KEY` | API key (config `api_key`) |
 | `RVL_API_URL` | API endpoint (config `api_url`) |
 | `RVL_ORG_NAME` | Organization name (config `org_name`) |
-| `RVL_OFFLINE=1` | Kill switch for every network fetch |
+| `RVL_OFFLINE=1` | Kill switch for every network fetch, including the background spec-cache check |
+| `RVL_SPEC_VERSION` | Pin the spec cache content_version for `scan` (same as `--spec-version`); see below |
+| `CI` | When set (and not `0`/`false`), a scan does not start the background spec-cache check |
 | `RVL_BASE_REF` | Base ref for `--changed-only` (below `--base`, above CI's own vars) |
 | `RVL_FORCE=1` | Commit despite blocking findings |
 | `RVL_SCAN_TIMEOUT` | HTTP timeout for submission mode (default 60s) |
 | `RVL_HELPER_DIR` | Relocate the extracted-helper directory |
 | `RVL_GOINDEX`, `RVL_PYINDEX`, `RVL_TSINDEX`, `RVL_JAVAINDEX`, `RVL_CINDEX`, `RVL_RUSTINDEX`, `RVL_CSINDEX` | Point a lane at a specific helper (slot 1) |
+| `RVL_NODE_MAX_OLD_SPACE_MB` | V8 heap limit, in MB, for the `node` that runs the TypeScript helper. Default: half of physical memory, at most 16384. `0` leaves node's own default (about 4 GB). A `NODE_OPTIONS` that sets `--max-old-space-size` is respected when this is unset |
 | `RVL_RUST_ANALYZER` | Path to the `rust-analyzer` binary the Rust lane drives (`RVL_RUST_ANALYZER_SHA256` optionally pins its checksum) |
 | `RVL_CACHE_DIR`, `RVL_INDEX_DIR`, `RVL_SKILLS_CACHE_DIR` | Relocate the spec cache, packet index, skills cache |
 | `RVL_ALLOW_UNSIGNED_PLUGIN=1` | Accept plugin content from a server with no signing key |
+| `RVL_TRUST_PLUGIN_SIGNING_KEY=<fingerprint>` | Trust a changed plugin signing key. The value must be the `sha256:…` fingerprint of the key the server serves; see [agent-skills](agent-skills.md#the-signing-key-is-trusted-on-first-use) |
 | `RVL_ALLOW_MISSING_CHECKSUM=1` | Accept a skills/plugin download whose server sent no transport-checksum header (self-hosted servers) |
 | `RVL_ALLOW_MISSING_HELPERS=1` | Scan the remaining lanes when a helper is absent |
 | `RVL_NO_AGENT=1` | Hard kill switch for hook-mode agent adjudication; overrides every opt-in |
@@ -70,6 +74,29 @@ the baseline. The judgments corpus (what grades a finding) rides only in the
 commercial tier. See [Scanning your repo with rvl](scanning.md) for the
 user-facing guide.
 
+### Keeping the cache current
+
+You do not need to run `rvl sync` by hand:
+
+- `rvl init` syncs both tiers (the commercial one only with a key) before it
+  finishes. A failed fetch does not fail init; it says to run `rvl sync`.
+- A scan on the signed cache starts at most one background check every six
+  hours, after the scan has finished. The scan never waits for it, and a
+  failed check is silent. The last check time is `auto-sync.stamp` in the
+  cache root; `rvl sync` and `rvl init` reset it.
+- A cache the check installs applies from the NEXT scan, never the running
+  one, so a single scan always runs on one corpus. When a repo's scan runs on
+  a different corpus than its previous scan, stderr says so:
+  `spec cache updated since this repo's last scan: <old> -> <new>`. A result
+  that changed with no code change is then visibly the corpus, not the code.
+
+The background check is off with `RVL_OFFLINE=1`, in CI (`CI` set), and when
+the scan is pinned. To make a CI gate reproducible across time, pin the
+corpus with `--spec-version <content_version>` or `RVL_SPEC_VERSION` (a
+comma-separated list gives one version per tier; `rvl cache status` prints
+them). A pinned scan refuses to run on any other installed version; install
+the pinned artifact with `rvl cache import`.
+
 ## Compatibility flags
 
 `rvl scan` accepts several flags from the previous Go CLI so that hook files
@@ -79,7 +106,7 @@ notice naming the repair:
 
 | Flag | Behavior now |
 | --- | --- |
-| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. |
+| `--agent` | Runs the ordinary deterministic scan. It never invokes a model. To blend in your agent, use `--blend` (manual scans only). |
 | `--staged` | Alias for `--incremental --changed-only --hook pre-commit`. |
 | `--pre-push` | Alias for `--incremental --changed-only --hook pre-push`. |
 | `--mode enforce\|eval` | `enforce` is the only mode; `eval` reports without blocking. |

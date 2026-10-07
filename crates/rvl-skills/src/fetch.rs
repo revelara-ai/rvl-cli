@@ -113,6 +113,11 @@ impl HttpFetcher {
     fn auth(&self) -> String {
         format!("Bearer {}", self.org_key)
     }
+    /// The cache scope of this server + org key; see
+    /// [`crate::store::cache_scope`].
+    pub fn cache_scope(&self) -> Option<String> {
+        crate::store::cache_scope(&self.base_url, &self.org_key)
+    }
 }
 
 impl Fetcher for HttpFetcher {

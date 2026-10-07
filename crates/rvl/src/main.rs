@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 mod agent;
+mod autosync;
 mod base_ref;
+mod blend;
 mod changed;
 mod compat;
 mod config_lane;
@@ -10,8 +12,11 @@ mod doctor;
 mod embedded_helpers;
 mod empty_flag;
 mod force;
+mod help_text;
+mod helper_drift;
 mod hook;
 mod init;
+mod keyset;
 mod out_doc;
 mod render;
 mod report;
@@ -21,7 +26,9 @@ mod waiver;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use rvl_cache::{offline_from_env, CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome};
+use rvl_cache::{
+    offline_from_env, CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TierFilter,
+};
 use rvl_data::BIN;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,12 +77,14 @@ enum Cmd {
     /// Exit codes: 0 = clean, 3 = BLOCKING findings remain (the gate fires),
     /// 1 = the scan could not complete, 2 = usage error.
     ///
-    /// SUBMISSION MODE (rvl-cli parity, po-av01j.153): when `--scan-dir`,
-    /// `--file`, `--stdin`, or `--service` is present, this command instead
-    /// submits risk findings to the Revelara risk register — same flags and
-    /// wire contract as `rvl scan --service <name> --scan-dir <dir>`, so
-    /// plugin skill content works against this binary verbatim. The
-    /// deterministic scan above is untouched when none of those flags appear.
+    /// SUBMISSION MODE: when `--scan-dir`, `--file`, `--stdin`, or
+    /// `--service` is present, this command instead submits risk findings to
+    /// the Revelara risk register, as in `rvl scan --service <name>
+    /// --scan-dir <dir>`. The deterministic scan above is untouched when none
+    /// of those flags appear.
+    //
+    // Submission mode is rvl-cli parity (po-av01j.153): same flags and wire
+    // contract, so plugin skill content works against this binary verbatim.
     Scan {
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
@@ -88,12 +97,25 @@ enum Cmd {
         /// Loudly announced; never silent.
         #[arg(long)]
         specs_file: Option<PathBuf>,
+        /// Pin the spec cache content_version (one, or a comma-separated
+        /// list with one per tier) so a CI gate is reproducible across time.
+        /// The scan refuses to run on anything else, and a pinned scan never
+        /// starts a background cache check. Also RVL_SPEC_VERSION.
+        #[arg(long)]
+        spec_version: Option<String>,
         /// DEV ONLY: override the signed cache's judgments with a JSON array.
         /// The ratified corpus ships inside the cache, so no flag is needed;
         /// this is loudly announced when used. Unjudged classes still surface,
         /// they are never dropped.
         #[arg(long)]
         judgments: Option<PathBuf>,
+        /// Load the OSS tier alone, even when a commercial tier is installed,
+        /// so the scan behaves exactly like a no-key install: vocabulary lanes
+        /// only, no judgments, everything advisory except lanes that carry
+        /// their own severity (secrets). A load filter: `sync` is untouched
+        /// and nothing is uninstalled. Announced on stderr on every run.
+        #[arg(long, conflicts_with_all = ["specs_file", "judgments"])]
+        oss_only: bool,
         /// Write findings JSON here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -119,9 +141,11 @@ enum Cmd {
         /// re-parsed files alone.
         #[arg(long)]
         include_tests: bool,
-        /// Report and gate ONLY on findings in the files this change touched
-        /// (po-av01j.127). The changed set comes from GIT, never from the
-        /// packet index (po-sg7jb): staged paths under `--hook pre-commit`,
+        // Delta gating is po-av01j.127; the changed set being git's rather
+        // than the packet index's is po-sg7jb.
+        /// Report and gate ONLY on findings in the files this change touched.
+        /// The changed set comes from GIT, never from the packet index:
+        /// staged paths under `--hook pre-commit`,
         /// the pushed range under `--hook pre-push`, otherwise the working
         /// tree against HEAD. Outside a git work tree the scan REFUSES rather
         /// than widening to the whole repository. Requires `--incremental`,
@@ -135,8 +159,8 @@ enum Cmd {
         #[arg(long)]
         changed_only: bool,
         /// Base ref for `--changed-only`: the gate scopes to `<ref>...HEAD`,
-        /// the committed work on this branch since it diverged (po-av01j.194,
-        /// rvl-cli parity). THE FLAG IS THE TOP OF A CHAIN — `--base`,
+        /// the committed work on this branch since it diverged. THE FLAG IS
+        /// THE TOP OF A CHAIN — `--base`,
         /// `RVL_BASE_REF`, `GITHUB_BASE_REF`,
         /// `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `.revelara.yaml`
         /// `scanner.base_ref` — so CI needs no flag at all: a GitHub PR event
@@ -148,21 +172,36 @@ enum Cmd {
         /// that is set but not present in the clone (a shallow checkout) is a
         /// REFUSAL, never a fallback.
         ///
-        /// `--base=` means "not given" and falls through to the next link,
-        /// exactly as rvl-cli's `!= ""` guard does (scan.go:473/500).
+        /// `--base=` means "not given" and falls through to the next link.
+        //
+        // po-av01j.194, rvl-cli parity: the empty-value fall-through is
+        // rvl-cli's `!= ""` guard (scan.go:473/500).
         #[arg(long)]
         base: Option<String>,
         /// COMPATIBILITY ALIAS for rvl-cli's `rvl scan --agent`: prints a
         /// one-line deprecation notice and runs the deterministic scan.
-        /// Consented hook adjudication is configured separately
-        /// (po-av01j.15, `--hook`); this flag never invokes a model.
+        /// Consented hook adjudication is configured separately (`--hook`);
+        /// this flag never invokes a model.
         #[arg(long)]
         agent: bool,
+        // po-av01j.205.
+        /// Blend the deterministic scan with your own coding agent: the
+        /// undecided runtime call sites, and only those, go to the agent (claude/copilot on PATH, `agent:` in
+        /// ~/.revelara/config.yaml, or RVL_AGENT_CMD) and its verdicts merge
+        /// into a BLEND section. Advisory unless `.revelara.yaml` sets
+        /// `scanner.agent_verdicts: gate`. An agent that is vetoed
+        /// (RVL_NO_AGENT=1, org force_deny, `scanner.use_agent: deny`),
+        /// missing, failing or out of budget fails OPEN, and the footer says
+        /// NOT A BLENDED RESULT. Manual scans only: refused with `--hook` and
+        /// the v1 hook aliases, which keep the consented hook lane.
+        #[arg(long)]
+        blend: bool,
         /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
         /// --hook pre-commit`. v1's `--staged` gated on `git diff --cached`,
         /// the same question `--hook pre-commit` asks. Accepted because v1's
         /// `hook install` wrote it into `.git/hooks/pre-commit`, where no
-        /// human can update it before the next `git commit` (po-av01j.191).
+        /// human can update it before the next `git commit`.
+        // po-av01j.191.
         #[arg(long)]
         staged: bool,
         /// rvl-cli v1 COMPATIBILITY ALIAS for `--incremental --changed-only
@@ -179,11 +218,12 @@ enum Cmd {
         /// With `--incremental`, enables the CONSENTED hook-mode agent
         /// adjudication lane for delta-scoped undecided sites — OFF by
         /// default at every layer; see `scanner.use_agent` and
-        /// `scanner.agent_hooks` in `.revelara.yaml` (po-av01j.15). The
+        /// `scanner.agent_hooks` in `.revelara.yaml`. The
         /// deterministic scan is unchanged either way; advisory agent verdicts
         /// cannot affect the exit code, and gate-mode verdicts
         /// (`scanner.agent_verdicts: gate`) block exactly like any other
-        /// BLOCKING row — see EXIT_BLOCKED.
+        /// BLOCKING row (exit 3).
+        // The hook lane is po-av01j.15; exit 3 is EXIT_BLOCKED.
         #[arg(long)]
         hook: Option<String>,
         /// Submission mode: service name the findings belong to (selects
@@ -279,6 +319,10 @@ enum Cmd {
         /// DEV ONLY: bypass the signed cache and load specs from a file.
         #[arg(long)]
         specs_file: Option<PathBuf>,
+        /// Load the OSS tier alone, as `scan --oss-only` does, so the report
+        /// shows what a no-key install would send.
+        #[arg(long, conflicts_with = "specs_file")]
+        oss_only: bool,
         /// Warm re-scan: reuse the persistent packet index. Ignored when
         /// `--retrieved` is given.
         #[arg(long)]
@@ -337,7 +381,12 @@ enum Cmd {
     },
     /// Refresh the spec cache from the Revelara API (async-safe, never
     /// blocks a scan; RVL_OFFLINE=1 disables all fetches).
-    Sync,
+    Sync {
+        // po-av01j.171. Hidden: a scan starts it, a person runs plain `sync`.
+        /// The check a scan hands off: silent, always exit 0.
+        #[arg(long, hide = true)]
+        background: bool,
+    },
     /// Spec-cache maintenance.
     Cache {
         #[command(subcommand)]
@@ -366,7 +415,8 @@ enum Cmd {
     },
     /// Initialize Revelara for this repository: write .revelara.yaml with
     /// the project name and detected components, install the plugin skills,
-    /// and check credentials (rvl-cli `rvl init` parity, po-av01j.163).
+    /// and check credentials.
+    // rvl-cli `rvl init` parity (po-av01j.163).
     Init {
         /// Set project name (default: from git remote or directory name)
         #[arg(long)]
@@ -451,10 +501,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Compliance framework views. `compliance report` is rvl-cli's `rvl
-    /// report` readiness scorecard, renamed because this binary already
-    /// spells `report` for the scan privacy-payload preview
-    /// (po-av01j.185 item 2). Readiness/supporting framing only, never
+    // `compliance report` is rvl-cli's `rvl report` readiness scorecard,
+    // renamed because this binary already spells `report` for the scan
+    // privacy-payload preview (po-av01j.185 item 2).
+    /// Compliance framework views. `compliance report` prints the readiness
+    /// scorecard for a framework. Readiness/supporting framing only, never
     /// certification.
     Compliance {
         #[command(subcommand)]
@@ -490,13 +541,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::config::ConfigCmd,
     },
+    // `stpa submit` is the `stpa-review` skill's only ingestion path, since
+    // `scan --cs-file` carries the control structure alone (po-av01j.183).
+    // `stpa list-ucas` is po-av01j.202.
     /// STPA-inspired safety analysis. `stpa submit --file` ingests the
     /// losses, UCAs, loss scenarios and control-structure model produced by
-    /// the `stpa-review` skill — that skill's only ingestion path, since
-    /// `scan --cs-file` carries the control structure alone (po-av01j.183).
-    /// `stpa list-ucas` reads the UCA store back, including the design-review
-    /// UCAs that never become risks and so never show up in `risk list`
-    /// (po-av01j.202).
+    /// the `stpa-review` skill. `stpa list-ucas` reads the UCA store back,
+    /// including the design-review UCAs that never become risks and so never
+    /// show up in `risk list`.
     ///
     /// Revelara's analysis is STPA-inspired (adapted from Systems-Theoretic
     /// Process Analysis, Leveson & Thomas, MIT). Findings are candidates for
@@ -506,9 +558,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::stpa::StpaCmd,
     },
-    /// Print the version. rvl-cli spells this as a SUBCOMMAND (`rvl version`)
-    /// and has no `--version` flag; this binary accepts both, so a script
-    /// written against either spelling keeps working (po-av01j.185 item 3).
+    // rvl-cli spells this as a SUBCOMMAND (`rvl version`) and has no
+    // `--version` flag; this binary accepts both, so a script written against
+    // either spelling keeps working (po-av01j.185 item 3).
+    /// Print the version. Same output as `rvl --version`.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish).
     /// Bash/zsh: eval "$(rvl completion bash)" in your rc file.
@@ -542,11 +595,12 @@ impl From<CompletionShell> for clap_complete::Shell {
 
 /// The `scan --agent` compatibility notice. One line, stderr, then the
 /// deterministic scan proceeds. Extended per po-av01j.15 with the consented
-/// hook-adjudication pointer.
+/// hook-adjudication pointer, and per po-av01j.205 with the `--blend` one.
 fn agent_alias_notice() {
     eprintln!(
         "note: --agent is a deprecated rvl-cli compatibility alias; {BIN} runs its \
-         deterministic scan (no model calls) — drop --agent. For consented agent \
+         deterministic scan (no model calls) — drop --agent. To blend in your own \
+         agent on a manual scan, run '{BIN} scan --blend'. For consented agent \
          adjudication of undecided sites on git hooks, opt in via scanner.use_agent + \
          scanner.agent_hooks in .revelara.yaml and run '{BIN} scan --incremental \
          --hook <pre-commit|pre-push>'; see '{BIN} skills' for the agent-side \
@@ -602,7 +656,8 @@ enum PluginCmd {
         project: bool,
         /// rvl-cli COMPATIBILITY ALIAS: this binary spells "every harness"
         /// as OMITTING the harness name, so `--all` is exactly the default
-        /// and is accepted rather than rejected (po-av01j.188).
+        /// and is accepted rather than rejected.
+        // po-av01j.188.
         #[arg(long)]
         all: bool,
         /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
@@ -619,7 +674,8 @@ enum PluginCmd {
         #[arg(long)]
         no_register: bool,
         /// rvl-cli COMPATIBILITY ALIAS for the default "every installed
-        /// harness" sweep (po-av01j.188).
+        /// harness" sweep.
+        // po-av01j.188.
         #[arg(long)]
         all: bool,
         /// Skip writing the managed AGENTS.md/CLAUDE.md blocks into the
@@ -704,6 +760,13 @@ enum CacheCmd {
     },
     /// Show installed cache versions and staleness.
     Status,
+    /// List every config key the retrievers emit and where it stands against
+    /// the installed specs: specced, awaiting a spec, or vocabulary only.
+    Keys {
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// All runtime configuration, resolved once. `base_url` and `org_key` layer
@@ -803,6 +866,10 @@ fn report(outcome: &SyncOutcome) -> ExitCode {
         }
         SyncOutcome::FetchFailed { reason } => {
             eprintln!("fetch failed: {reason} (continuing on the installed cache)");
+            ExitCode::FAILURE
+        }
+        SyncOutcome::NotPublished { url } => {
+            eprintln!("{}", rvl_cache::not_published_message(url));
             ExitCode::FAILURE
         }
         SyncOutcome::InstallFailed { reason } => {
@@ -911,23 +978,51 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
         .collect()
 }
 
-/// The ladder findings for this scan's repo-structure lane. Live scans
-/// inventory the tree directly; a `--retrieved` scan has no tree, so the
-/// facts come from the `repo_structure` record riding the prebuilt stream
-/// (absent record = no facts = no findings, honestly).
-fn resolve_structure_findings(
-    retrieved: Option<&Path>,
-    stream: &str,
-    path: &Path,
-) -> Vec<render::Finding> {
+/// What the repo-structure lane produced for one scan: the ladder rows
+/// (violations only) and the `--out` eval rows (every control's verdict).
+#[derive(Default)]
+struct StructureLane {
+    ladder: Vec<render::Finding>,
+    rows: Vec<out_doc::OutSite>,
+}
+
+/// Run this scan's repo-structure lane. Live scans inventory the tree
+/// directly; a `--retrieved` scan has no tree, so the facts come from the
+/// `repo_structure` record riding the prebuilt stream (absent record = no
+/// facts = no findings and no rows, honestly).
+fn resolve_structure_lane(retrieved: Option<&Path>, stream: &str, path: &Path) -> StructureLane {
     let facts = if retrieved.is_some() {
         rvl_structure::parse_record(stream)
     } else {
         Some(rvl_structure::retrieve(path, &snapshot_name(path)))
     };
-    facts
-        .map(|f| structure_to_findings(&rvl_structure::evaluate(&f)))
-        .unwrap_or_default()
+    let Some(facts) = facts else {
+        return StructureLane::default();
+    };
+    let verdicts = rvl_structure::evaluate(&facts);
+    StructureLane {
+        ladder: structure_to_findings(&verdicts),
+        rows: verdicts
+            .iter()
+            .map(|f| out_doc::OutSite {
+                site_id: out_doc::STRUCTURE_SITE_ID.to_string(),
+                snapshot_id: facts.snapshot_id.clone(),
+                verdict: f.verdict.as_str().to_string(),
+                reason: f.reason.clone(),
+                class: format!("repo_structure.{}", f.control),
+            })
+            .collect(),
+    }
+}
+
+/// The ladder findings alone, for `explain`/`suppress`, which resolve an id
+/// against a fresh scan and never write an `--out` document.
+fn resolve_structure_findings(
+    retrieved: Option<&Path>,
+    stream: &str,
+    path: &Path,
+) -> Vec<render::Finding> {
+    resolve_structure_lane(retrieved, stream, path).ladder
 }
 
 // --- G2 server-entry lane (po-av01j.3) ---
@@ -1351,6 +1446,91 @@ fn language_is_incidental(root: &Path, lang: Lang) -> bool {
     true
 }
 
+/// The language a file is EVIDENCE for: a source file its helper reads, a
+/// C/C++ header, or a project file (the markers `detect_languages` knows).
+fn lang_evidenced_by(path: &Path) -> Option<Lang> {
+    if let Some(lang) = lang_of_path(path) {
+        return Some(lang);
+    }
+    if is_c_header(path) {
+        return Some(Lang::CCpp);
+    }
+    match path.file_name().and_then(|n| n.to_str())? {
+        "go.mod" => Some(Lang::Go),
+        "pyproject.toml" => Some(Lang::Python),
+        "Cargo.toml" => Some(Lang::Rust),
+        "tsconfig.json" | "package.json" => Some(Lang::TypeScript),
+        "pom.xml" | "build.gradle" | "build.gradle.kts" => Some(Lang::Java),
+        "compile_commands.json" => Some(Lang::CCpp),
+        name if name.ends_with(".csproj") || name.ends_with(".sln") => Some(Lang::CSharp),
+        _ => None,
+    }
+}
+
+/// The detected languages that are present ONLY as test material, each with
+/// the number of files seen, so the scan can skip them and say so
+/// (po-av01j.123).
+///
+/// A language is REALLY present when one file that is evidence for it, a
+/// source file or a project file, sits outside test-support paths
+/// (`rvl_core::scope_of`: tests, testdata, fixtures, examples, docs). One file
+/// is enough, and there is no file-count threshold: a count only moves the
+/// cliff. A manifest inside a fixture directory is part of the fixture.
+///
+/// Stricter than [`language_is_incidental`], which also calls dev-only code
+/// (`scripts/`, `cmd/`) incidental. That check decides whether a MISSING
+/// helper may fail the scan. This one decides whether to read the language at
+/// all, so code a developer runs keeps the language present.
+///
+/// Returns nothing when NO detected language is really present: the test
+/// material is then the whole repo, and to skip it would scan nothing.
+fn test_material_only_languages(root: &Path, langs: &[Lang]) -> Vec<(Lang, usize)> {
+    // Per detected language: (really present, files seen in test material).
+    let mut seen: Vec<(bool, usize)> = vec![(false, 0); langs.len()];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if seen.iter().all(|(present, _)| *present) {
+            return Vec::new();
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Some(i) = lang_evidenced_by(&path).and_then(|l| langs.iter().position(|x| *x == l))
+            else {
+                continue;
+            };
+            if rvl_core::scope_of(&repo_relative(root, &path)) == rvl_core::ScopeClass::TestSupport
+            {
+                seen[i].1 += 1;
+            } else {
+                seen[i].0 = true;
+            }
+        }
+    }
+    if !seen.iter().any(|(present, _)| *present) {
+        return Vec::new();
+    }
+    langs
+        .iter()
+        .zip(seen)
+        .filter(|(_, (present, files))| !present && *files > 0)
+        .map(|(l, (_, files))| (*l, files))
+        .collect()
+}
+
 /// Classify a resolved helper path into how it must be invoked. Go, Rust, and
 /// C/C++ helpers are always executables (rustindex and cindex are bins of the
 /// rvl package, built next to rvl); a Python helper is a `python3` script when
@@ -1469,6 +1649,136 @@ fn missing_helper_hint(lang: Lang) -> String {
     }
 }
 
+/// The scripted-helper filename to also look for, for a language whose helper
+/// ships as a script rather than a native binary (pyindex.py, tsindex.js).
+fn helper_script_name(lang: Lang) -> Option<String> {
+    let base = lang.helper_base();
+    match lang {
+        Lang::Python => Some(format!("{base}.py")),
+        Lang::TypeScript => Some(format!("{base}.js")),
+        Lang::CSharp => Some(format!("{base}.dll")),
+        Lang::Java => Some(format!("{base}.java")),
+        Lang::Go | Lang::Rust | Lang::CCpp => None,
+    }
+}
+
+/// The helper packaged with the running binary, if there is one: adjacent, or
+/// in the pkgshare dir a package manager files the archive's non-binary
+/// members into. Step 2 of [`resolve_helper`], and the sibling a helper found
+/// by any other step is compared against ([`helper_drift`]).
+fn bundled_helper(lang: Lang) -> Option<ResolvedHelper> {
+    let base = lang.helper_base();
+    let script_name = helper_script_name(lang);
+    let exe = std::env::current_exe().ok()?;
+    for dir in packaged_helper_dirs(exe.parent()?) {
+        let cand = dir.join(base);
+        if cand.is_file() {
+            return Some(classify_helper(lang, &cand, "bundled"));
+        }
+        if let Some(script) = &script_name {
+            let cand_script = dir.join(script);
+            if cand_script.is_file() {
+                return Some(classify_helper(lang, &cand_script, "bundled"));
+            }
+        }
+    }
+    None
+}
+
+/// How long a helper gets to answer `--packet-schema`. The contract is that it
+/// answers before loading anything, so a real helper takes milliseconds; the
+/// bound is for a program that is not one (a wrapper that ignores its
+/// arguments and starts a full retrieval).
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The content version of a helper on disk (po-8ozxg), or `None` when it
+/// cannot be established.
+///
+/// A scripted helper IS one source file, so its version is read off the file:
+/// no interpreter start, and a copy from before the handshake still gets a
+/// version to compare. A native helper is asked with `--packet-schema`.
+///
+/// Every failure is `None`, never an error. This feeds a warning, and a
+/// warning that cannot be computed must not cost anyone their scan.
+fn helper_content_version(helper: &ResolvedHelper) -> Option<String> {
+    let mut cmd = match helper.kind {
+        HelperKind::PyScript | HelperKind::NodeScript | HelperKind::JavaSource => {
+            let bytes = std::fs::read(&helper.path).ok()?;
+            return Some(helper_drift::content_version(&bytes));
+        }
+        HelperKind::Executable => std::process::Command::new(&helper.path),
+        HelperKind::DotnetAssembly => {
+            let mut c = std::process::Command::new("dotnet");
+            c.arg(&helper.path);
+            c
+        }
+    };
+    let mut child = cmd
+        .arg("--packet-schema")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut stdout).ok()?;
+    helper_drift::parse_handshake(&stdout)
+}
+
+/// Is the helper that is about to run a different build from the one this rvl
+/// ships? `Some(text)` is the statement for the reader; `None` means "the
+/// same" or "nothing to compare against" (po-8ozxg).
+///
+/// The shipped sibling is the bundled helper when one exists, otherwise the
+/// copy embedded in this binary. A helper resolved from one of those slots is
+/// its own reference, with one exception: a BUNDLED script still has an
+/// embedded sibling, and that pair is the one that actually went stale in the
+/// field. `make install` puts pyindex.py beside rvl, a later build of rvl
+/// replaces only the binary, and the adjacent script outranks the newer one
+/// carried inside it.
+///
+/// An env override is compared too. It is deliberate when it is typed and a
+/// stale shadow when it is a forgotten export in a shell profile, and the
+/// output cannot tell which, so it says what it measured.
+fn helper_drift(lang: Lang, ran: &ResolvedHelper) -> Option<String> {
+    if ran.source == "embedded" {
+        return None;
+    }
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    let bundled = bundled_helper(lang).filter(|b| !same_file(&b.path, &ran.path));
+    let (shipped, label) = match (ran.source.as_str(), bundled) {
+        (source, Some(b)) if source != "bundled" => (
+            helper_content_version(&b)?,
+            format!("the bundled {}", b.path.display()),
+        ),
+        _ => (
+            helper_drift::content_version(embedded_for(lang)?.contents.as_bytes()),
+            format!("the copy embedded in this {BIN}"),
+        ),
+    };
+    helper_drift::describe(helper_content_version(ran).as_deref(), &shipped, &label)
+}
+
 /// Locate the retriever helper for `lang`, failing closed with actionable
 /// guidance when none is found (never silently skip a detected language, that
 /// would under-report). Precedence:
@@ -1504,32 +1814,10 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
         ));
     }
     let base = lang.helper_base();
-    // The scripted-helper filename to also look for, for a language whose helper
-    // ships as a script rather than a native binary (pyindex.py, tsindex.js).
-    let script_name = match lang {
-        Lang::Python => Some(format!("{base}.py")),
-        Lang::TypeScript => Some(format!("{base}.js")),
-        Lang::CSharp => Some(format!("{base}.dll")),
-        Lang::Java => Some(format!("{base}.java")),
-        Lang::Go | Lang::Rust | Lang::CCpp => None,
-    };
-    // (2) packaged with the binary: adjacent, or in the pkgshare dir a
-    // package manager files the archive's non-binary members into.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for dir in packaged_helper_dirs(exe_dir) {
-                let cand = dir.join(base);
-                if cand.is_file() {
-                    return Ok(classify_helper(lang, &cand, "bundled"));
-                }
-                if let Some(script) = &script_name {
-                    let cand_script = dir.join(script);
-                    if cand_script.is_file() {
-                        return Ok(classify_helper(lang, &cand_script, "bundled"));
-                    }
-                }
-            }
-        }
+    let script_name = helper_script_name(lang);
+    // (2) packaged with the binary.
+    if let Some(bundled) = bundled_helper(lang) {
+        return Ok(bundled);
     }
     // (3) the copy carried inside this binary, written out on first use.
     // Best-effort: an unwritable HOME degrades to the PATH lookup below rather
@@ -1943,11 +2231,25 @@ fn run_helper(
     } else {
         chunk_files(files, MAX_FILES_ARG_BYTES)
     };
+    let node_heap_mb = (helper.kind == HelperKind::NodeScript)
+        .then(|| {
+            node_heap_limit_mb(
+                std::env::var(NODE_HEAP_ENV).ok().as_deref(),
+                std::env::var("NODE_OPTIONS").ok().as_deref(),
+                physical_memory_mb(),
+            )
+        })
+        .flatten();
     let mut merged = String::new();
     for batch in &batches {
         let argv = helper_argv(helper, root, name, batch, include_tests);
         let (program, args) = argv.split_first().expect("argv always has a program");
         let mut cmd = std::process::Command::new(program);
+        if let Some(mb) = node_heap_mb {
+            // Ahead of the script: V8 reads its flags at startup, and anything
+            // after `tsindex.js` is the helper's argument, not node's.
+            cmd.arg(format!("--max-old-space-size={mb}"));
+        }
         cmd.args(args);
         if helper.kind == HelperKind::NodeScript {
             cmd.env("NODE_PATH", node_path_for(root));
@@ -1978,10 +2280,11 @@ fn run_helper(
         if !output.status.success() {
             let kind = classify_helper_exit(output.status.code());
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(Err((
-                kind,
-                helper_degrade_reason(kind, &output.status, &stderr),
-            )));
+            let mut reason = helper_degrade_reason(kind, &output.status, &stderr);
+            if helper.kind == HelperKind::NodeScript && node_aborted(&output.status) {
+                reason = format!("{}; {reason}", node_abort_hint(node_heap_mb));
+            }
+            return Ok(Err((kind, reason)));
         }
         merged.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -1992,6 +2295,100 @@ fn run_helper(
         return Ok(Err(d));
     }
     Ok(Ok(merged))
+}
+
+/// Operator override for the heap limit a `node` helper runs under, in MB.
+/// `0` passes no limit at all and leaves node to its own default.
+const NODE_HEAP_ENV: &str = "RVL_NODE_MAX_OLD_SPACE_MB";
+
+/// The most heap rvl grants a `node` helper on its own initiative, in MB.
+const NODE_HEAP_CAP_MB: u64 = 16 * 1024;
+
+/// The V8 old-space limit, in MB, to start a `node` helper with; `None` passes
+/// no flag (po-av01j.118).
+///
+/// V8's default limit is about 4 GB on a 64-bit host however much RAM the
+/// machine has, and exceeding it is an abort, not a slow run. tsindex holds one
+/// TypeScript program for the whole repository, and retrieving infisical (7746
+/// files) peaks at 4.4 GB RSS: it completes with nothing to spare, the uncached
+/// thenable check died at that ceiling, and Rocket.Chat is larger still. A
+/// fixed limit under an input that grows is the defect, so the limit is derived
+/// from the host instead: half of physical memory, which leaves the other half
+/// for rvl, the OS and the file cache, capped at [`NODE_HEAP_CAP_MB`]. This is
+/// a ceiling on growth, not a reservation; a small repo uses what it used
+/// before.
+///
+/// Precedence, most specific first:
+///   1. [`NODE_HEAP_ENV`], a positive integer of MB, or `0` for no flag. An
+///      unparseable value is ignored rather than fatal.
+///   2. A `NODE_OPTIONS` that already sets `--max-old-space-size`: the child
+///      inherits it, and a command-line flag would override what the operator
+///      set on purpose.
+///   3. Half of physical memory, capped. Unknown memory size passes no flag.
+fn node_heap_limit_mb(
+    env_override: Option<&str>,
+    node_options: Option<&str>,
+    physical_mb: Option<u64>,
+) -> Option<u64> {
+    if let Some(mb) = env_override.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return (mb > 0).then_some(mb);
+    }
+    // V8 accepts the flag spelled with dashes or underscores.
+    if node_options.is_some_and(|o| o.replace('_', "-").contains("--max-old-space-size")) {
+        return None;
+    }
+    physical_mb
+        .map(|mb| (mb / 2).min(NODE_HEAP_CAP_MB))
+        .filter(|mb| *mb > 0)
+}
+
+/// Physical memory of this host in MB, when the platform will say.
+#[cfg(unix)]
+fn physical_memory_mb() -> Option<u64> {
+    // SAFETY: sysconf takes no pointers and has no preconditions; it returns
+    // -1 for a name it does not support, which the conversion rejects.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let bytes = u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)?;
+    Some(bytes / (1024 * 1024))
+}
+
+#[cfg(not(unix))]
+fn physical_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Did `node` abort? V8 calls abort() when the heap is exhausted, so the
+/// process dies of SIGABRT; a wrapper shell reports the same death as exit 134.
+fn node_aborted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGABRT) {
+            return true;
+        }
+    }
+    status.code() == Some(134)
+}
+
+/// What to tell the reader when a `node` helper aborted. The raw status is
+/// "signal: 6" followed by a frame of a native stack trace, which names neither
+/// the cause nor the one setting that moves the ceiling.
+fn node_abort_hint(limit_mb: Option<u64>) -> String {
+    let limit = match limit_mb {
+        Some(mb) => format!("the {mb} MB heap limit rvl set"),
+        None => "node's own heap limit".to_string(),
+    };
+    format!(
+        "node aborted, which is how V8 reports an exhausted heap; it ran under {limit}. \
+         Set {NODE_HEAP_ENV}=<MB> to raise it"
+    )
 }
 
 /// `NODE_PATH` for a `node` helper scanning `root` (po-aml3h).
@@ -2043,6 +2440,56 @@ fn helper_degrade_reason(
         DegradeKind::NotInstalled => last.to_string(),
         DegradeKind::Failed => format!("{status}: {last}"),
     }
+}
+
+/// Did the helper parse some of its units only PARTLY? Read off the
+/// `retrieval_stats` record(s) on one language's stream: `tus_incomplete`
+/// counts units whose parse raised errors, which clang recovers from by
+/// dropping the construct, calls and all (po-av01j.138). Such a unit's zero
+/// is not a complete zero, and the roll-call must not print it like one.
+///
+/// Returns the one-line explanation, or None for a clean parse or for a
+/// helper that does not report the field. A batched run carries one record
+/// per batch, so the counts SUM.
+fn incomplete_parse_note(stream: &str) -> Option<String> {
+    let (mut incomplete, mut parsed, mut headers, mut undeclared) = (0u64, 0u64, 0u64, 0u64);
+    for line in stream.lines().filter(|l| l.contains("\"retrieval_stats\"")) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("kind").and_then(|k| k.as_str()) != Some("retrieval_stats") {
+            continue;
+        }
+        let n = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        incomplete += n("tus_incomplete");
+        parsed += n("tus_parsed");
+        headers += n("includes_missing");
+        undeclared += n("decls_unresolved");
+    }
+    if incomplete == 0 {
+        return None;
+    }
+    let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut causes = Vec::new();
+    if headers > 0 {
+        causes.push(plural(headers, "header not found", "headers not found"));
+    }
+    if undeclared > 0 {
+        causes.push(plural(
+            undeclared,
+            "undeclared identifier",
+            "undeclared identifiers",
+        ));
+    }
+    let causes = if causes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", causes.join(", "))
+    };
+    Some(format!(
+        "{incomplete} of {} had parse errors{causes}; calls clang could not build are not counted",
+        plural(parsed, "translation unit", "translation units")
+    ))
 }
 
 /// Derive the snapshot tag for a scan target: the canonical base name of
@@ -2134,9 +2581,9 @@ fn repo_relative(root: &Path, file: &Path) -> String {
 
 /// The language whose helper retrieves a given source file, by extension. A
 /// TypeScript declaration file (`*.d.ts`) is types-only and maps to no helper.
-/// C/C++ HEADERS map to no helper: which TUs a changed header invalidates
-/// needs the include graph, so header edits ride the full-rescan path rather
-/// than guessing an incremental subset (follow-up bead under po-av01j.12).
+/// C/C++ HEADERS map to no helper: a header is never retrieved on its own.
+/// A changed header instead invalidates the TUs that include it, through the
+/// include graph cindex reports and the packet index stores (po-av01j.53).
 fn lang_of_path(path: &Path) -> Option<Lang> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Lang::Go),
@@ -2149,6 +2596,114 @@ fn lang_of_path(path: &Path) -> Option<Lang> {
         Some("c" | "cc" | "cpp" | "cxx") => Some(Lang::CCpp),
         _ => None,
     }
+}
+
+/// Is this a C/C++ header? No helper retrieves one directly (see
+/// [`lang_of_path`]); it reaches the scan through the TUs that include it.
+fn is_c_header(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("h" | "hh" | "hpp" | "hxx")
+    )
+}
+
+/// The candidate list for a reindex, with every TU the index knows to
+/// include a listed C/C++ header appended. A caller that names changed files
+/// (`index reindex --files`, the background warm behind a commit) names the
+/// header, and no scan reads a header's own entry; the packets that a header
+/// edit changes live in its TUs' shards.
+///
+/// A header no indexed TU includes brings in nothing. That is not a gap: a
+/// TU with no entry is not reused by the next warm scan either.
+fn with_header_dependents(
+    index: &rvl_index::PacketIndex,
+    mut candidates: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut listed: std::collections::HashSet<PathBuf> =
+        candidates.iter().map(|c| canon(c)).collect();
+    for i in 0..candidates.len() {
+        if !is_c_header(&candidates[i]) {
+            continue;
+        }
+        for tu in index.dependents(&candidates[i])? {
+            if listed.insert(canon(&tu)) {
+                candidates.push(tu);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// The packets one file's index entry holds: the sites located in the file
+/// and, for a C/C++ TU, the sites located in the headers it includes (an
+/// inline function's call sits at the header's path, and a header has no
+/// entry of its own to carry it). Several TUs that share a header each hold
+/// its sites; `merge_on_site_key` reports each once.
+fn shard_of(
+    rel: &str,
+    sites: &[rvl_core::Site],
+    includes: Option<&std::collections::HashSet<&str>>,
+) -> Vec<rvl_core::Site> {
+    sites
+        .iter()
+        .filter(|s| {
+            s.file_path == rel || includes.is_some_and(|i| i.contains(s.file_path.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The include graph a stream carried, as TU -> the headers it includes.
+fn includes_by_tu(
+    cfg: &rvl_core::RepoConfig,
+) -> std::collections::HashMap<&str, std::collections::HashSet<&str>> {
+    cfg.tu_includes
+        .iter()
+        .map(|t| {
+            (
+                t.file.as_str(),
+                t.includes.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Split the resolved and no-spec counts by language (po-5csvg). The language
+/// is the one whose retriever reads the site's file, the same mapping the
+/// roll-call's site counts come from; spec identity carries no language, and
+/// the file does not need one guessed from a `client_type` namespace.
+/// `findings` and `sites` are index-aligned, as `out_doc::build` relies on.
+fn lang_coverage(
+    findings: &[rvl_propagate::Finding],
+    sites: &[rvl_core::Site],
+) -> Vec<render::LangCoverage> {
+    let mut out: Vec<render::LangCoverage> = Vec::new();
+    for (f, s) in findings.iter().zip(sites.iter()) {
+        let lang = match lang_of_path(Path::new(&s.file_path)) {
+            Some(l) => l.to_string(),
+            None => "other".to_string(),
+        };
+        let i = match out.iter().position(|l| l.lang == lang) {
+            Some(i) => i,
+            None => {
+                out.push(render::LangCoverage {
+                    lang,
+                    resolved: 0,
+                    total: 0,
+                    no_spec: 0,
+                });
+                out.len() - 1
+            }
+        };
+        out[i].total += 1;
+        if f.verdict.is_resolved() {
+            out[i].resolved += 1;
+        } else if f.reason.starts_with("no spec") {
+            out[i].no_spec += 1;
+        }
+    }
+    out
 }
 
 /// Normalize a repo-relative path for delta comparison: strip a leading `./`
@@ -2253,6 +2808,22 @@ fn strip_generated_packets(text: &str, root: &Path) -> (String, usize) {
     (kept, dropped.len())
 }
 
+/// One language's uninstalled-dependency line, from that language's own
+/// repo-scoped record; empty when every declared tree was installed. Called
+/// where the stream is still one language's, so COVERAGE can name the lane.
+fn dependencies_uninstalled_of(
+    lang: &str,
+    cfg: &rvl_core::RepoConfig,
+) -> Vec<render::DependenciesUninstalled> {
+    match cfg.uninstalled_dependency_trees() {
+        0 => Vec::new(),
+        count => vec![render::DependenciesUninstalled {
+            lang: lang.to_string(),
+            count,
+        }],
+    }
+}
+
 struct RetrievedStream {
     text: String,
     /// Distinct machine-generated files whose packets were dropped. Reported in
@@ -2261,6 +2832,10 @@ struct RetrievedStream {
     /// Test files each helper declined to read, per language. The
     /// same rule as `generated_skipped`: reported, never silent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Workspaces whose dependencies were not installed, per language
+    /// (po-pk3fp.15). The lane scanned, from import syntax alone, and the
+    /// report has to say so.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
     /// Set when EVERY detected language failed, so the call-site lane is empty
     /// for a reason the reader must be told (po-av01j.145). Rendered by the
     /// COVERAGE block, never swallowed.
@@ -2273,6 +2848,10 @@ struct RetrievedStream {
     status: Vec<render::LangStatus>,
     /// Which helper file ran per language and how it was found (po-vd7ii).
     retrievers: Vec<render::RetrieverInfo>,
+    /// The retrieval denominator each helper reported (po-av01j.219), read
+    /// off its repo-scoped record. Empty for a helper that does not measure
+    /// one.
+    retrieval: Vec<rvl_core::RetrievalCensus>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -2299,7 +2878,9 @@ fn resolve_packet_stream(
         // a captured stream that skipped files must not scan as a false
         // zero. One language per stream is not guaranteed here, so the lane
         // is named for what it is.
-        let test_files_skipped = match rvl_core::parse_stream(&text).1.test_files_skipped {
+        let cfg = rvl_core::parse_stream(&text).1;
+        let dependencies_uninstalled = dependencies_uninstalled_of("retrieved stream", &cfg);
+        let test_files_skipped = match cfg.test_files_skipped {
             0 => Vec::new(),
             count => vec![render::TestFilesSkipped {
                 lang: "retrieved stream".to_string(),
@@ -2312,15 +2893,31 @@ fn resolve_packet_stream(
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
             test_files_skipped,
+            dependencies_uninstalled,
             total_failure: None,
             degraded: Vec::new(),
             // A prebuilt stream says nothing about which helpers ran, so the
             // roll-call stays empty rather than inventing one.
             status: Vec::new(),
             retrievers: Vec::new(),
+            // A captured stream carries its census on the same record.
+            retrieval: cfg.retrieval,
         });
     }
-    let langs = detect_languages(path);
+    let mut langs = detect_languages(path);
+    // A LANGUAGE FOUND ONLY IN TEST MATERIAL IS NOT READ (po-av01j.123). One
+    // fixture under testdata/ used to spawn a whole retriever, or a lookup
+    // for a helper nobody installed, and print a degradation line on every
+    // scan. Such a language is taken out here, before any helper resolves,
+    // and named in the roll-call as skipped: a language silently not scanned
+    // is the failure po-av01j.102 exists to prevent. `--include-tests` asks
+    // for test material, so it turns the skip off.
+    let skipped = if include_tests {
+        Vec::new()
+    } else {
+        test_material_only_languages(path, &langs)
+    };
+    langs.retain(|l| !skipped.iter().any(|(s, _)| s == l));
     // NO DETECTED LANGUAGE IS NOT AN ERROR (po-av01j.148). A repository of pure
     // infrastructure -- terraform, workflows, manifests and nothing else -- has
     // no source for any retriever to read, so NO helper is needed and there is
@@ -2337,8 +2934,10 @@ fn resolve_packet_stream(
             text: String::new(),
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             total_failure: None,
             retrievers: Vec::new(),
+            retrieval: Vec::new(),
             status: detect_unsupported(path)
                 .into_iter()
                 .map(|(name, count)| render::LangStatus {
@@ -2401,9 +3000,11 @@ fn resolve_packet_stream(
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
     let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
+    let mut dependencies_uninstalled: Vec<render::DependenciesUninstalled> = Vec::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
     let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
+    let mut retrieval: Vec<rvl_core::RetrievalCensus> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -2432,6 +3033,7 @@ fn resolve_packet_stream(
             lang: lang.to_string(),
             path: helper.path.display().to_string(),
             source: helper.source.clone(),
+            drift: helper_drift(lang, &helper),
         });
         match run_helper(lang, &helper, path, &name, &[], include_tests)? {
             Ok(out) => {
@@ -2445,7 +3047,14 @@ fn resolve_packet_stream(
                 // its repo-scoped record. Read per language HERE,
                 // where the stream is still one language's, so COVERAGE can
                 // name the lane; the merged stream only knows the total.
-                let skipped = rvl_core::parse_stream(&out).1.test_files_skipped;
+                let cfg = rvl_core::parse_stream(&out).1;
+                // The dependency state the helper resolved against rides the
+                // same record and is read at the same point for the same
+                // reason (po-pk3fp.15).
+                dependencies_uninstalled
+                    .extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
+                retrieval.extend(cfg.retrieval.clone());
+                let skipped = cfg.test_files_skipped;
                 if skipped > 0 {
                     test_files_skipped.push(render::TestFilesSkipped {
                         lang: lang.to_string(),
@@ -2456,10 +3065,19 @@ fn resolve_packet_stream(
                 // and found nothing. Counting site packets rather than lines
                 // keeps repo_config/retrieval_stats records out of the number.
                 let sites = out.matches("\"site_key\"").count();
-                status.push(render::LangStatus {
-                    lang: lang.to_string(),
-                    state: render::LangState::Scanned,
-                    detail: sites.to_string(),
+                // ...unless the helper says part of what it parsed was lost
+                // to parse errors: then the count is a floor, not an answer.
+                status.push(match incomplete_parse_note(&out) {
+                    None => render::LangStatus {
+                        lang: lang.to_string(),
+                        state: render::LangState::Scanned,
+                        detail: sites.to_string(),
+                    },
+                    Some(note) => render::LangStatus {
+                        lang: lang.to_string(),
+                        state: render::LangState::Partial,
+                        detail: format!("{sites} sites, INCOMPLETE: {note}"),
+                    },
                 });
                 if !combined.is_empty() && !combined.ends_with('\n') {
                     combined.push('\n');
@@ -2480,6 +3098,13 @@ fn resolve_packet_stream(
             }
         }
     }
+    for (lang, files) in skipped {
+        status.push(render::LangStatus {
+            lang: lang.to_string(),
+            state: render::LangState::Skipped,
+            detail: format!("{files} file{}", if files == 1 { "" } else { "s" }),
+        });
+    }
     for (name, count) in detect_unsupported(path) {
         status.push(render::LangStatus {
             lang: name,
@@ -2492,10 +3117,12 @@ fn resolve_packet_stream(
         text: combined,
         generated_skipped,
         test_files_skipped,
+        dependencies_uninstalled,
         total_failure,
         status,
         degraded,
         retrievers,
+        retrieval,
     })
 }
 
@@ -2552,12 +3179,13 @@ fn resolve_findings(
     stream: &str,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
-        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, repo_root, verbose,
+        store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, tiers, repo_root, verbose,
     )
 }
 
@@ -2629,6 +3257,15 @@ fn resolve_judgments(
     }
 }
 
+/// `--oss-only` as the load filter it selects.
+fn tier_filter(oss_only: bool) -> TierFilter {
+    if oss_only {
+        TierFilter::OssOnly
+    } else {
+        TierFilter::Both
+    }
+}
+
 /// The pipeline shared by the packet-stream path and the incremental path:
 /// verified specs + already-assembled sites -> propagation -> triage. The
 /// incremental caller hands its merged (reused + freshly retrieved) sites here
@@ -2646,6 +3283,7 @@ fn findings_from_sites(
     skipped: usize,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tier_filter: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> anyhow::Result<ResolvedScan> {
@@ -2673,7 +3311,25 @@ fn findings_from_sites(
             // commercial judgment lanes when a keyed sync installed them.
             // Either tier alone scans; only BOTH missing is fatal.
             let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
-            let tiers = rvl_cache::load_tiered(store, &oss_store, keyset, &rvl_cache::today_utc());
+            let tiers = rvl_cache::load_tiered(
+                store,
+                &oss_store,
+                keyset,
+                &rvl_cache::today_utc(),
+                tier_filter,
+            );
+            // A NARROWED LOAD IS NEVER QUIET (po-7wgx3). Without the
+            // commercial tier nothing grades an API surface, so the ladder
+            // reads lighter than the install's real answer. Said on stderr on
+            // every run, for the same reason `--specs-file` is: a scan whose
+            // inputs were reduced must not look like the ordinary one.
+            if tier_filter == TierFilter::OssOnly {
+                eprintln!(
+                    "note: --oss-only: the commercial tier was not loaded; this scan uses \
+                     the OSS vocabulary tier alone, so API surfaces are unjudged and \
+                     findings are advisory"
+                );
+            }
             for loaded in [&tiers.commercial, &tiers.oss].into_iter().flatten() {
                 if let Some(hint) = &loaded.upgrade_hint {
                     eprintln!("{hint}");
@@ -2691,10 +3347,17 @@ fn findings_from_sites(
                     );
                 }
             }
+            // Before the no-tier bail, so a CI pin over an empty cache says
+            // what it wanted rather than only that nothing loaded.
+            autosync::cache_header(&tiers, store.root(), repo_root)?;
             let judgments = tiers.judgments();
             let commercial_loaded = tiers.commercial.is_some();
             match tiers.spec_texts()? {
                 Some((base, overlay)) => (base, overlay, judgments, commercial_loaded),
+                None if tier_filter == TierFilter::OssOnly => anyhow::bail!(
+                    "--oss-only needs the OSS tier, and it is not installed or did not \
+                     verify: run '{BIN} sync' (the OSS vocabulary tier needs no API key)"
+                ),
                 None => anyhow::bail!(
                     "no spec cache tier loadable: run '{BIN} sync' \
                      (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
@@ -2747,6 +3410,13 @@ fn findings_from_sites(
     let (server_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) = sites
         .into_iter()
         .partition(|s| s.site_kind == rvl_core::SITE_KIND_SERVER_ENTRY);
+    // Misuse-shape aggregates (an overbroad catch, a discarded error, a
+    // blocking call in an async function, an async call never awaited) ride
+    // the same stream and are not client-call surfaces. They leave the G1
+    // site list here, for the same reasons as the emission points below, and
+    // the misuse lane consumes them.
+    let (misuse_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_misuse_shape());
     // G4 (po-av01j.5): emission-point aggregates ride the same stream but are
     // NOT client-call surfaces. Partition them out before propagation so they
     // never enter G1 coverage totals, `--out` eval rows, or triage classes;
@@ -2754,6 +3424,12 @@ fn findings_from_sites(
     // guards on site_kind — defense in depth for other stream consumers.)
     let (emission_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
         sites.into_iter().partition(|s| s.is_emission_point());
+    // Unsized-construction packets (a pool, queue, cache or whole-body read)
+    // ride the same stream and are not client-call surfaces either. Same
+    // partition, same reason; the construction-bounds lane consumes them
+    // below.
+    let (unsized_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_unsized_construction());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Commercial tier layered over the OSS baseline (po-scnmv.13): the
     // existing merge policy applies — higher confidence wins, judgment lanes
@@ -2794,6 +3470,7 @@ fn findings_from_sites(
                 config_keys: vec![],
                 server: vec![],
                 emissions: vec![],
+                construction_bounds: vec![],
                 configs: declared
                     .into_iter()
                     .map(|d| rvl_spec::ConfigSpec {
@@ -2806,8 +3483,11 @@ fn findings_from_sites(
                         default_bound: rvl_spec::DefaultBound::Unknown,
                         unbounded_sentinels: vec![],
                         declared: true,
+                        family: None,
                     })
                     .collect(),
+                decorators: vec![],
+                misuse_shapes: vec![],
             };
             cache.merge(rvl_spec::SpecCache::from_file(overlay));
         }
@@ -2843,6 +3523,10 @@ fn findings_from_sites(
         .map(|(f, s)| (s.site_key(), f.verdict, f.reason.clone()))
         .collect();
     let mut items = rvl_triage::triage(&sites, &verdict_rows, &judgments);
+    // Misuse lane: error-handling and async shapes, one advisory item per
+    // class and control, keyed `misuse.<class>`. With no misuse spec in the
+    // cache the lane judges nothing.
+    items.extend(misuse_items(&misuse_sites, cache.misuse_specs()));
     // Emission lane (G4): judge the emission inventory against RC-027/RC-046/
     // RC-061 with the cache's emission specs. Only violations surface, as
     // triage items keyed `emission.RC-XXX` — the same waiver/suppress surface
@@ -2854,6 +3538,14 @@ fn findings_from_sites(
         &emission_sites,
         cache.emission_specs(),
     ));
+    // Construction-bounds lane: a pool, queue, cache or whole-body read
+    // built with no bound in scope. Violations only, advisory, keyed
+    // `unsized.<class>`. With no construction-bound spec in the cache the
+    // lane judges nothing.
+    items.extend(unsized_items(
+        &unsized_sites,
+        cache.construction_bound_specs(),
+    ));
     Ok((
         findings,
         items,
@@ -2862,6 +3554,62 @@ fn findings_from_sites(
         server_findings,
         empty_api_corpus,
     ))
+}
+
+/// Map misuse-lane violations into triage items. The class key is (`misuse`,
+/// class), so the ladder renders `misuse.discarded_error — <why>` and a
+/// waiver or `rvl suppress` matches on `misuse.discarded_error`. The control
+/// and the severity come from the spec that judged the shape. `site_count` is
+/// every occurrence, not the capped evidence, so the exposure tier is true.
+fn misuse_items(
+    misuse_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::MisuseSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_misuse::evaluate(misuse_sites, specs)
+        .into_iter()
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "misuse".into(),
+                method: f.class,
+                reason: f.reason,
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            control: f.control,
+            site_count: f.occurrences,
+            example_sites: f.evidence.into_iter().take(3).collect(),
+        })
+        .collect()
+}
+
+/// Map construction-bounds violations into triage items. The class key is
+/// (`unsized`, class), so the ladder renders `unsized.pool — <why>` and a
+/// waiver or `rvl suppress` matches on `unsized.pool`. The control comes from
+/// the spec that judged the construction.
+fn unsized_items(
+    unsized_sites: &[rvl_core::Site],
+    specs: &[rvl_spec::ConstructionBoundSpec],
+) -> Vec<rvl_triage::TriagedItem> {
+    rvl_bounds::evaluate(unsized_sites, specs)
+        .into_iter()
+        .filter(|f| f.verdict == rvl_core::Verdict::Violates)
+        .map(|f| rvl_triage::TriagedItem {
+            class: rvl_triage::ClassKey {
+                client_type: "unsized".into(),
+                method: f.class,
+                reason: f.reason,
+                scope: "runtime".into(),
+            },
+            disposition: "surface".into(),
+            severity: f.severity.to_string(),
+            fix: f.fix,
+            site_count: f.evidence.len().max(1),
+            example_sites: f.evidence.into_iter().take(3).collect(),
+            control: f.control,
+        })
+        .collect()
 }
 
 /// Map emission-lane violations into triage items. The class key is
@@ -3002,10 +3750,12 @@ fn run_scan(
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
     include_tests: bool,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // The full path treats "no language detected" as a clean pass too
@@ -3034,20 +3784,53 @@ fn run_scan(
     if retrieved.is_none() && !citems.is_empty() && detect_languages(path).is_empty() {
         // Content-only repo: no packet stream exists, so the structure lane
         // inventories the live tree directly (same as the incremental path).
-        // The config lane is skipped on this early path (no spec cache gets
-        // resolved before the return) -- follow-up tracked on the epic.
-        let structure = resolve_structure_findings(None, "", path);
+        let structure = resolve_structure_lane(None, "", path);
+        // The G6 config lane runs here too (po-av01j.31): a pure
+        // terraform/.env tree is the repo it was built for. It needs the spec
+        // cache, so resolve it through the same loader the full path uses,
+        // over an empty stream. Only the cache is kept: the server-entry and
+        // emission lanes judge code, and this repo has none.
+        //
+        // No loadable cache must not cost the content lane its verdict: a
+        // fresh install still has to catch a committed token. So that case
+        // degrades to the content and structure lanes alone and names the
+        // lane that did not run. An explicit `--specs-file` that fails to
+        // load stays an error; the user asked for those specs.
+        let specs = match resolve_findings(
+            store,
+            keyset,
+            "",
+            specs_file,
+            judgments,
+            tiers,
+            Some(path),
+            true,
+        ) {
+            Ok((_, _, _, specs, _, _)) => Some(specs),
+            Err(e) if specs_file.is_none() => {
+                eprintln!(
+                    "warning: the config lane did not run ({e:#}); \
+                     only the content and structure lanes are reported"
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let lane = specs
+            .as_ref()
+            .map(|s| config_lane::run(path, s, &snapshot_name(path)));
         return render_scan_output(
             state_path,
             path,
             &[],
             &citems,
             &[],
-            // No spec cache is resolved on this path, so every class renders
-            // the unknown-default wording -- which is the honest one.
+            specs.as_ref(),
+            &structure.ladder,
+            &structure.rows,
+            lane.as_ref(),
             None,
-            &structure,
-            None,
+            // No language, so no call site the blend could be asked about.
             None,
             out,
             color,
@@ -3060,6 +3843,10 @@ fn run_scan(
             0,
             false,
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            // The full path takes no `--hook`.
+            render::GatedOperation::Commit,
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
@@ -3069,16 +3856,21 @@ fn run_scan(
         &stream.text,
         specs_file,
         judgments,
+        tiers,
         Some(path),
         true,
     )?;
     items.extend(citems);
     // Structure + server-entry lanes join the ladder at the same seam: both
     // are control-mapped advisory findings outside the per-class triage.
-    let mut structure = resolve_structure_findings(retrieved, &stream.text, path);
+    let StructureLane {
+        ladder: mut structure,
+        rows: structure_rows,
+    } = resolve_structure_lane(retrieved, &stream.text, path);
     structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    let blended = blend.then(|| blend::run(path, None, &findings, &sites, stdout_color(color)));
     render_scan_output(
         state_path,
         path,
@@ -3087,8 +3879,10 @@ fn run_scan(
         &sites,
         Some(&specs),
         &structure,
+        &structure_rows,
         Some(&lane),
         None,
+        blended.as_ref(),
         out,
         color,
         start,
@@ -3102,6 +3896,9 @@ fn run_scan(
         stream.generated_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
+        stream.retrieval.clone(),
+        stream.dependencies_uninstalled.clone(),
+        render::GatedOperation::Commit,
     )
 }
 
@@ -3199,11 +3996,17 @@ fn render_scan_output(
     // The specs the propagation ran against. Carried this far because the
     // ladder's sentence for an unbounded call depends on what the LIBRARY does
     // with no explicit bound, and only the spec knows that (po-av01j.175).
-    // `None` on the content-only path, where no spec cache is resolved at all.
+    // `None` only on the content-only path when no spec cache is loadable.
     specs: Option<&rvl_spec::SpecCache>,
     structure: &[render::Finding],
+    // The structure lane's eval rows for `--out`, every control's verdict
+    // (po-av01j.28). Empty when the lane did not run. `structure` above
+    // also carries the server-entry rows, so the two are not the same list.
+    structure_rows: &[out_doc::OutSite],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
+    // `scan --blend` (po-av01j.205); None when not requested.
+    blended: Option<&blend::BlendOutput>,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     start: std::time::Instant,
@@ -3225,6 +4028,13 @@ fn render_scan_output(
     empty_api_corpus: bool,
     // Test files the retrievers declined to read, per language.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    // The retrieval denominator per language (po-av01j.219).
+    retrieval: Vec<rvl_core::RetrievalCensus>,
+    // Workspaces scanned without their installed dependencies, per language.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
+    // What a blocking verdict stops, so the verdict and the bypass hint say
+    // "push" under the pre-push hook (po-av01j.207).
+    operation: render::GatedOperation,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -3232,14 +4042,17 @@ fn render_scan_output(
     // per-site judge. Reason strings are the propagation layer's output contract.
     let resolved = findings.iter().filter(|f| f.verdict.is_resolved()).count();
     let mut coverage = render::Coverage {
+        operation,
         resolved,
         total: sites.len(),
         generated_skipped,
         empty_api_corpus,
         test_files_skipped,
+        dependencies_uninstalled,
         degraded_note,
         lang_status,
         retrievers,
+        retrieval,
         // A language that never retrieved is NOT an abstaining site: it is
         // absent from `total` entirely, so it has to be reported separately or
         // the percentage silently describes a smaller repo than the user has.
@@ -3255,6 +4068,10 @@ fn render_scan_output(
         ..Default::default()
     };
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
+    coverage.by_lang = lang_coverage(findings, sites);
+    coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
+    coverage.structure =
+        render::StructureCoverage::from_verdicts(structure_rows.iter().map(|r| r.verdict.as_str()));
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
         if f.reason.starts_with("no spec") {
             coverage.abstain_no_spec += 1;
@@ -3287,6 +4104,10 @@ fn render_scan_output(
     if let Some(a) = hook_agent {
         ladder_findings.extend(a.gate_findings.iter().cloned());
     }
+    // `--blend` follows the same rule: rows only in gate mode, agent-tagged.
+    if let Some(b) = blended {
+        ladder_findings.extend(b.gate_findings.iter().cloned());
+    }
 
     // Apply `.revelara.yaml` waivers (PATH-relative, the same base the retriever
     // used). A waived finding is folded into the Suppressed section: reported in
@@ -3295,7 +4116,7 @@ fn render_scan_output(
     if !waivers.is_empty() {
         let today = rvl_cache::today_utc();
         for f in &mut ladder_findings {
-            if waiver::is_waived(&f.class_rule, &f.site, &waivers, &today) {
+            if waiver::is_waived(&f.class_rule, waiver::site_path(&f.site), &waivers, &today) {
                 f.suppressed = true;
             }
         }
@@ -3321,9 +4142,11 @@ fn render_scan_output(
             config.map(|lane| &lane.coverage),
             findings,
             sites,
+            structure_rows,
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
+            blended.map(|b| &b.summary),
             blocked,
         )
     });
@@ -3346,6 +4169,9 @@ fn render_scan_output(
             print!("\n{}", a.block);
         }
     }
+    if let Some(b) = blended {
+        print!("\n{}", b.block);
+    }
 
     if let (Some(p), Some(doc)) = (out, doc.as_ref()) {
         std::fs::write(p, serde_json::to_string_pretty(doc)?)?;
@@ -3366,7 +4192,7 @@ fn render_scan_output(
         // Name the AUDITED way through (po-av01j.182). Without this line the
         // only bypass a blocked committer can find is `--no-verify`, which
         // skips every hook and leaves no record; the force-through leaves one.
-        println!("{}", force::force_through_hint());
+        println!("{}", force::force_through_hint(operation));
         return Ok(ExitCode::from(EXIT_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
@@ -3406,6 +4232,12 @@ struct HelperRetriever {
     /// alternative is letting one language's refusal abort the whole delta,
     /// which is the same bug this bead fixes on the full path.
     degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>>,
+    /// Languages whose helper resolved against an uninstalled dependency
+    /// tree during this pass (po-pk3fp.15). Shared for the same reason
+    /// `degraded` is, and read per language for the same reason the full
+    /// path does: the merged `RepoConfig` no longer knows whose count it is.
+    dependencies_uninstalled:
+        std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>>,
 }
 
 impl HelperRetriever {
@@ -3465,6 +4297,11 @@ impl HelperRetriever {
             };
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
+            // Same tolerance as `push_degradation`: a poisoned lock loses a
+            // COVERAGE line, never the scan.
+            if let Ok(mut g) = self.dependencies_uninstalled.lock() {
+                g.extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
+            }
             // The test files the helper declined to read ride `cfg` too
             // (`test_files_skipped_paths`), and `absorb` concatenates them,
             // so the caller can flag each one in the index.
@@ -3513,6 +4350,11 @@ struct RetrieveResult {
     /// of the same commit from warming the index, and must not alter the
     /// verdict line either.
     degraded_langs: Vec<Lang>,
+    /// Languages whose helper ran this pass against an uninstalled
+    /// dependency tree (po-pk3fp.15). Filled in by the caller, like
+    /// `degraded_langs`. Empty when no helper ran: the packet index does not
+    /// record the dependency state its reused packets were resolved under.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
 }
 
 /// The outcome of running a closure under a wall-clock cap.
@@ -3561,6 +4403,7 @@ fn resolve_budgeted(
             // Filled in by the caller, which holds the per-language degradation
             // collector this function never sees.
             degraded_langs: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
         }),
         Budgeted::TimedOut => {
             if strict {
@@ -3579,6 +4422,7 @@ fn resolve_budgeted(
                 )),
                 // A whole-pass degradation already blocks re-indexing outright.
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         }
         Budgeted::Failed(e) => {
@@ -3592,6 +4436,7 @@ fn resolve_budgeted(
                     "retrieval failed ({e}); results cover the reused portion only"
                 )),
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         }
     }
@@ -3643,6 +4488,11 @@ struct IncrementalScan {
     /// nobody is told about is the silent exclusion the line exists to
     /// prevent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Languages whose helper ran THIS pass against an uninstalled
+    /// dependency tree (po-pk3fp.15). Unlike the test-file skip this is the
+    /// pass's own observation, not a repository-wide one: the index keeps no
+    /// record of the dependency state behind a reused packet.
+    dependencies_uninstalled: Vec<render::DependenciesUninstalled>,
     /// The candidate set was EMPTY: this tree holds no file any retriever
     /// reads (po-av01j.198). Not a degradation and not an error — there was
     /// nothing to retrieve — but the caller must SAY so, because a gate that
@@ -3663,6 +4513,7 @@ impl IncrementalScan {
             reparsed_files: Vec::new(),
             lang_degraded: Vec::new(),
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             no_supported_sources: true,
         }
     }
@@ -3680,7 +4531,9 @@ fn incremental_sites<F>(
 where
     F: FnOnce(&[PathBuf]) -> anyhow::Result<RetrieveResult>,
 {
-    let plan = index.plan_reload(candidates);
+    // A C/C++ entry must say which headers it saw; one that predates that
+    // record is retrieved again rather than trusted (po-av01j.53).
+    let plan = index.plan_reload_with(candidates, |f| lang_of_path(f) == Some(Lang::CCpp));
     let reparsed_files: Vec<String> = plan
         .changed
         .iter()
@@ -3699,7 +4552,7 @@ where
     };
     for f in &plan.unchanged {
         let h = rvl_index::hash_file(f)?;
-        if let Some(cached) = index.lookup(f, &h)? {
+        if let Some(cached) = index.planned(f, &h)? {
             if cached.test_skipped {
                 count_skip(f);
             }
@@ -3735,6 +4588,7 @@ where
     // make the next run skip it.
     let degraded = rr.degraded_note.is_some();
     let mut indexed = 0usize;
+    let includes = includes_by_tu(&rr.repo_cfg);
     if !degraded {
         for f in &plan.changed {
             // po-av01j.209: a file whose LANGUAGE degraded was never read, so
@@ -3754,14 +4608,14 @@ where
                 indexed += 1;
                 continue;
             }
-            let for_file: Vec<rvl_core::Site> = rr
-                .sites
-                .iter()
-                .filter(|s| s.file_path == rel)
-                .cloned()
-                .collect();
+            // The per-TU shard: for a C/C++ TU, its own sites plus those in
+            // the headers it includes, invalidated by a change to any of them.
+            let headers = includes.get(rel.as_str());
+            let deps: Vec<PathBuf> = headers
+                .map(|hs| hs.iter().map(|h| root.join(h)).collect())
+                .unwrap_or_default();
             let h = rvl_index::hash_file(f)?;
-            index.put(f, &h, &for_file)?;
+            index.put_with_deps(f, &h, &shard_of(&rel, &rr.sites, headers), &deps)?;
             indexed += 1;
         }
     }
@@ -3785,6 +4639,7 @@ where
                 count,
             })
             .collect(),
+        dependencies_uninstalled: rr.dependencies_uninstalled,
         // This function is only reached with a candidate set in hand; the
         // no-source case short-circuits in `incremental_scan_pass`.
         no_supported_sources: false,
@@ -3829,7 +4684,7 @@ fn incremental_scan_pass(
         return Ok(IncrementalScan::no_source());
     }
 
-    let index = rvl_index::PacketIndex::open(&index_dir.join("packets.redb"))?;
+    let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
     let name = snapshot_name(path);
     let root = path.to_path_buf();
 
@@ -3843,6 +4698,11 @@ fn incremental_scan_pass(
     // closure is `FnOnce` and moves.
     let attempted: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
     let attempted_w = std::sync::Arc::clone(&attempted);
+    // What the helpers said about the dependency trees they resolved against;
+    // the retriever moves into the budget thread, so this is the handle that
+    // outlives it.
+    let dependencies: std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>> =
+        Default::default();
     let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
         attempted_w.store(
             langs_of_paths(changed).len(),
@@ -3851,6 +4711,7 @@ fn incremental_scan_pass(
         // Budget only the potentially-slow helper retrieval.
         let retriever = HelperRetriever {
             degraded: std::sync::Arc::clone(&collector),
+            dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
             root: root.clone(),
             name: name.clone(),
         };
@@ -3866,6 +4727,9 @@ fn incremental_scan_pass(
         // first that has a `RetrieveResult` to put them on.
         if let Ok(g) = collector.lock() {
             rr.degraded_langs = g.iter().map(|d| d.lang).collect();
+        }
+        if let Ok(mut g) = dependencies.lock() {
+            rr.dependencies_uninstalled = std::mem::take(&mut g);
         }
         Ok(rr)
     })?;
@@ -3943,10 +4807,59 @@ fn detached_log_path(cache_dir: &std::path::Path) -> PathBuf {
     cache_dir.join("reindex.log")
 }
 
+/// The size past which the detached reindex log is rotated at the next spawn.
+/// A warm writes about a kilobyte, so this is roughly a thousand commits of
+/// history before the oldest generation is dropped.
+const DETACHED_LOG_CAP: u64 = 1024 * 1024;
+
+/// Where the previous generation of the detached reindex log is kept.
+fn rotated_log_path(log_path: &std::path::Path) -> PathBuf {
+    let mut name = log_path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Keep the detached reindex log bounded: once it is over `cap`, move it to
+/// `reindex.log.1` (replacing the generation before it) so the next spawn
+/// starts a fresh file. One line per post-commit warm, forever, is otherwise
+/// a file that only grows (po-gvzpc).
+///
+/// A rename, never a truncate. Two warms can be alive at once, and a warm
+/// that is still writing keeps its handle on the renamed file, so its output
+/// lands whole in `reindex.log.1` instead of being cut in half.
+///
+/// Best effort on purpose: a log that cannot be rotated is appended to as
+/// before. Refusing to start the warm over housekeeping would trade a large
+/// file for a stale index.
+fn rotate_detached_log(log_path: &std::path::Path, cap: u64) {
+    let over_cap = std::fs::metadata(log_path).is_ok_and(|m| m.len() > cap);
+    if over_cap {
+        std::fs::rename(log_path, rotated_log_path(log_path)).ok();
+    }
+}
+
 /// How long a background warm waits for a busy index. Generous on purpose:
 /// it runs behind a commit with nobody watching, so waiting out a concurrent
 /// scan costs nothing while giving up loses the entire reindex.
 const INDEX_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Open the packet index under `index_dir`, reporting on stderr when it had
+/// to be rebuilt from an older on-disk format. Every command opens the index
+/// through here, so a cold scan after an upgrade always has a stated cause.
+fn open_packet_index(
+    index_dir: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<rvl_index::PacketIndex> {
+    let path = index_dir.join("packets.redb");
+    let index = rvl_index::PacketIndex::open_with_timeout(&path, timeout)?;
+    if index.rebuilt_from_old_format() {
+        eprintln!(
+            "note: the packet index at {} was in an older on-disk format and was rebuilt empty; the next scan refills it",
+            path.display()
+        );
+    }
+    Ok(index)
+}
 
 /// `index init` / `index reindex`, both packet-stream and live modes.
 ///
@@ -3975,6 +4888,7 @@ fn run_index_build(
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        rotate_detached_log(&log_path, DETACHED_LOG_CAP);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4005,27 +4919,36 @@ fn run_index_build(
     // The warm waits a long time for a busy index. It is a background batch
     // job; losing the whole reindex because a status check held the lock for
     // a few milliseconds is the bug this timeout exists to prevent.
-    let idx = rvl_index::PacketIndex::open_with_timeout(
-        &cfg.index_dir.join("packets.redb"),
-        INDEX_WARM_TIMEOUT,
-    )?;
+    let idx = open_packet_index(&cfg.index_dir, INDEX_WARM_TIMEOUT)?;
 
     if let Some(retrieved) = retrieved {
         let stream = std::fs::read_to_string(&retrieved)?;
         let (sites, cfg, skipped) = rvl_core::parse_stream(&stream);
         // Group by originating file so each entry is keyed by that
-        // file's current content hash.
+        // file's current content hash. A C/C++ TU that reported its includes
+        // is one group with the sites of its headers, and records them as
+        // dependencies (po-av01j.53).
+        let includes = includes_by_tu(&cfg);
         let mut by_file: std::collections::BTreeMap<String, Vec<rvl_core::Site>> =
             std::collections::BTreeMap::new();
+        for (tu, headers) in &includes {
+            by_file.insert(tu.to_string(), shard_of(tu, &sites, Some(headers)));
+        }
         for s in sites {
-            by_file.entry(s.file_path.clone()).or_default().push(s);
+            if !includes.contains_key(s.file_path.as_str()) {
+                by_file.entry(s.file_path.clone()).or_default().push(s);
+            }
         }
         let (mut indexed, mut missing) = (0usize, 0usize);
         for (file, packets) in by_file {
             let path = PathBuf::from(&file);
+            let deps: Vec<PathBuf> = includes
+                .get(file.as_str())
+                .map(|hs| hs.iter().map(PathBuf::from).collect())
+                .unwrap_or_default();
             match rvl_index::hash_file(&path) {
                 Ok(h) => {
-                    idx.put(&path, &h, &packets)?;
+                    idx.put_with_deps(&path, &h, &packets, &deps)?;
                     indexed += 1;
                 }
                 // The stream can name files this checkout does not
@@ -4066,6 +4989,7 @@ fn run_index_build(
             .collect(),
         None => walk_source_files(&root),
     };
+    let candidates = with_header_dependents(&idx, candidates)?;
     anyhow::ensure!(
         !candidates.is_empty(),
         "no supported source files under {}; nothing to index",
@@ -4074,8 +4998,11 @@ fn run_index_build(
 
     let name = snapshot_name(&root);
     let degraded: std::sync::Arc<std::sync::Mutex<Vec<LangDegradation>>> = Default::default();
+    let dependencies: std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>> =
+        Default::default();
     let retriever = HelperRetriever {
         degraded: std::sync::Arc::clone(&degraded),
+        dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
         root: root.clone(),
         name,
     };
@@ -4093,13 +5020,20 @@ fn run_index_build(
             repo_cfg,
             degraded_note: None,
             degraded_langs,
+            dependencies_uninstalled: dependencies
+                .lock()
+                .map(|mut g| std::mem::take(&mut *g))
+                .unwrap_or_default(),
         })
     })?;
     // The skipped test files are flagged in the index for the warm scan to
     // count; this line is the only place a background warm can say so.
     let skipped: usize = scan.test_files_skipped.iter().map(|t| t.count).sum();
+    // Likewise for the dependency state: the packets this run indexed were
+    // resolved from import syntax, and the index itself does not record that.
+    let uninstalled: usize = scan.dependencies_uninstalled.iter().map(|d| d.count).sum();
     println!(
-        "reindexed: reused {} unchanged, retrieved {} changed{}",
+        "reindexed: reused {} unchanged, retrieved {} changed{}{}",
         scan.reused_files,
         scan.retrieved_files,
         if skipped == 0 {
@@ -4108,6 +5042,14 @@ fn run_index_build(
             format!(
                 ", {skipped} test file{} skipped (tests are not scanned for API surfaces)",
                 if skipped == 1 { "" } else { "s" }
+            )
+        },
+        if uninstalled == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {uninstalled} workspace{} without installed dependencies",
+                if uninstalled == 1 { "" } else { "s" }
             )
         }
     );
@@ -4188,12 +5130,14 @@ fn run_scan_incremental(
     path: &std::path::Path,
     specs_file: Option<&std::path::Path>,
     judgments: Option<&std::path::Path>,
+    tiers: TierFilter,
     out: Option<&std::path::Path>,
     color: Option<&str>,
     strict: bool,
     changed_only: bool,
     hook: Option<&str>,
     base_chain: &base_ref::Chain,
+    blend: bool,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
 
@@ -4215,6 +5159,29 @@ fn run_scan_incremental(
                  Refusing rather than gating on the whole repository: --changed-only exists \
                  so a commit is never failed over findings its author did not introduce.\n  \
                  Re-run without --changed-only for a full advisory scan."
+            );
+        }
+    }
+
+    // REFUSE A PARTIALLY STAGED FILE (po-io8sk.3). The changed PATHS come
+    // from the git index, but every lane reads working-tree bytes, so a file
+    // that is staged and then edited again would be judged on content that is
+    // not the content being committed: the scan passes one tree and git
+    // commits another. This was a note on stderr; a gate that knows its
+    // verdict is about the wrong bytes must not print one. An error (exit 1,
+    // "never judged"), not EXIT_BLOCKED, and before the scan so it costs
+    // nothing. `dirty` is only ever populated for the pre-commit mode.
+    if let Ok(cs) = &resolved {
+        if !cs.dirty.is_empty() {
+            anyhow::bail!(
+                "pre-commit: {} staged file(s) also have unstaged edits ({}).\n  \
+                 rvl reads working-tree content, so the scan would judge bytes that are \
+                 not the bytes being committed. Refusing rather than printing a verdict \
+                 for the wrong content.\n  \
+                 Either stage the rest (`git add <file>`), or set the unstaged edits \
+                 aside for the commit (`git stash --keep-index`, then `git stash pop`).",
+                cs.dirty.len(),
+                cs.dirty.join(", ")
             );
         }
     }
@@ -4264,19 +5231,6 @@ fn run_scan_incremental(
     let changed_files = match &resolved {
         Ok(cs) => {
             eprintln!("changed set: {} file(s) from {}", cs.files.len(), cs.source);
-            if !cs.dirty.is_empty() {
-                // KNOWN GAP, STATED OUT LOUD: the changed PATHS come from the
-                // git index, but the retrievers read working-tree bytes, so a
-                // partially staged file is judged in its working-tree form.
-                eprintln!(
-                    "note: {} staged file(s) also have unstaged edits ({}); \
-                     rvl reads working-tree content, so those hunks are \
-                     included in the judgment even though they are not being \
-                     committed",
-                    cs.dirty.len(),
-                    cs.dirty.join(", ")
-                );
-            }
             cs.files.clone()
         }
         Err(e) => {
@@ -4310,6 +5264,7 @@ fn run_scan_incremental(
         0,
         specs_file,
         judgments,
+        tiers,
         Some(path),
         true,
     )?;
@@ -4336,10 +5291,13 @@ fn run_scan_incremental(
     // dropped rather than shown: telling someone their one-line docs edit
     // failed because the repo has no JS tests is the disproportionality this
     // flag exists to remove.
-    let mut structure = if changed_only {
-        Vec::new()
+    let StructureLane {
+        ladder: mut structure,
+        rows: structure_rows,
+    } = if changed_only {
+        StructureLane::default()
     } else {
-        resolve_structure_findings(None, "", path)
+        resolve_structure_lane(None, "", path)
     };
     structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
@@ -4378,6 +5336,18 @@ fn run_scan_incremental(
             stdout_color(color),
         )
     });
+    // `--blend` (po-av01j.205): the same residue, whole repo, or the
+    // changed set under --changed-only so the agent never sees files the
+    // report is not about.
+    let blended = blend.then(|| {
+        blend::run(
+            path,
+            changed_only.then_some(changed_files.as_slice()),
+            &findings,
+            &sites,
+            stdout_color(color),
+        )
+    });
     render_scan_output(
         state_path,
         path,
@@ -4386,8 +5356,10 @@ fn run_scan_incremental(
         &sites,
         Some(&specs),
         &structure,
+        &structure_rows,
         Some(&lane),
         hook_agent.as_ref(),
+        blended.as_ref(),
         out,
         color,
         start,
@@ -4400,6 +5372,12 @@ fn run_scan_incremental(
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
+        // Present only when this pass ran a helper that measures it: the
+        // census is whole-repo, but a pass that re-parsed no file of that
+        // language has none to report, and says nothing rather than zero.
+        scan.repo_cfg.retrieval.clone(),
+        scan.dependencies_uninstalled.clone(),
+        render::GatedOperation::from_hook(hook),
     )
 }
 
@@ -4453,6 +5431,7 @@ fn run_explain(
         &stream.text,
         specs_file,
         judgments,
+        TierFilter::Both,
         Some(path),
         false,
     )?;
@@ -4519,6 +5498,7 @@ fn run_suppress(
                         &stream.text,
                         specs_file,
                         judgments,
+                        TierFilter::Both,
                         Some(scan_path),
                         false,
                     )?;
@@ -4580,6 +5560,7 @@ fn run_report(
     path: &std::path::Path,
     retrieved: Option<&std::path::Path>,
     specs_file: Option<&std::path::Path>,
+    tiers: TierFilter,
     incremental: bool,
     json: bool,
     out: Option<&std::path::Path>,
@@ -4614,6 +5595,7 @@ fn run_report(
             0,
             specs_file,
             None,
+            tiers,
             Some(path),
             false,
         )?;
@@ -4626,6 +5608,7 @@ fn run_report(
             &stream.text,
             specs_file,
             None,
+            tiers,
             Some(path),
             false,
         )?;
@@ -5086,6 +6069,8 @@ struct SkillsCtx {
     home: PathBuf,
     store: rvl_skills::store::SkillsStore,
     fetcher: rvl_skills::fetch::HttpFetcher,
+    trust: rvl_skills::trust::TrustStore,
+    trust_key: Option<String>,
     offline: bool,
     has_key: bool,
     allow_unsigned: bool,
@@ -5106,10 +6091,18 @@ impl SkillsCtx {
             base_url: cfg.base_url.clone(),
             org_key: cfg.org_key.clone(),
         };
+        // Beside config.yaml and never inside it: the shared-config contract
+        // keeps key material out of the config file.
+        let trust =
+            rvl_skills::trust::TrustStore::at(&home.join(".revelara").join("trusted_keys.json"));
         Ok(Self {
             home,
             store,
             fetcher,
+            trust,
+            trust_key: std::env::var(rvl_skills::trust::TRUST_ENV)
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             offline: cfg.offline,
             has_key: !cfg.org_key.is_empty(),
             allow_unsigned: std::env::var("RVL_ALLOW_UNSIGNED_PLUGIN").ok().as_deref() == Some("1"),
@@ -5122,7 +6115,11 @@ impl SkillsCtx {
         rvl_skills::flow::Env {
             store: &self.store,
             fetcher: &self.fetcher,
+            trust: &self.trust,
+            server: &self.fetcher.base_url,
+            trust_key: self.trust_key.clone(),
             home: &self.home,
+            cache_scope: self.fetcher.cache_scope(),
             offline: self.offline,
             allow_unsigned: self.allow_unsigned,
             allow_missing_checksum: self.allow_missing_checksum,
@@ -5852,8 +6849,9 @@ fn run() -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(f.code));
         }
         // Onboarding surface (po-av01j.163): init needs the skills machinery
-        // for its plugin step but never the spec cache; hook is pure file
-        // operations on .git/hooks. Both dispatch before the store opens.
+        // for its plugin step and syncs the spec cache itself (po-av01j.171),
+        // so it opens no store here; hook is pure file operations on
+        // .git/hooks. Both dispatch before the store opens.
         Cmd::Init {
             project,
             skip_plugin,
@@ -5879,6 +6877,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     // already reported by the machinery.
                     Ok(!installed.is_empty())
                 },
+                || autosync::init_sync(&cfg),
             ));
         }
         Cmd::Hook { cmd } => return Ok(hook::run(cmd)),
@@ -5966,7 +6965,7 @@ fn run() -> anyhow::Result<ExitCode> {
     }
     let cfg = Config::from_env();
     let store = CacheStore::open(&cfg.cache_dir)?;
-    let keyset = Keyset::from_hex(rvl_cache::PINNED_KEYSET_HEX)?;
+    let keyset = keyset::trusted_keyset()?;
     let state_path = last_scan_path(&cfg.cache_dir);
     match cmd {
         Cmd::Scan {
@@ -5974,6 +6973,7 @@ fn run() -> anyhow::Result<ExitCode> {
             retrieved,
             specs_file,
             judgments,
+            oss_only,
             out,
             color,
             incremental,
@@ -5982,13 +6982,17 @@ fn run() -> anyhow::Result<ExitCode> {
             changed_only,
             base,
             agent,
+            blend,
             staged,
             pre_push,
             mode,
             hook,
+            spec_version,
             ..
         } => {
+            autosync::set_pin(autosync::resolve_pin(spec_version));
             let path = path.unwrap_or_else(|| PathBuf::from("."));
+            let tiers = tier_filter(oss_only);
             // The base-ref chain (po-av01j.194), resolved once and used twice:
             // to pick the changed-set question below, and HERE to decide what
             // a v1 `--changed-only` meant. v1 resolved that flag against this
@@ -6019,6 +7023,15 @@ fn run() -> anyhow::Result<ExitCode> {
                 base_chain.is_configured(),
             )?;
             compat::set_never_block(never_block);
+            // `--blend` is a manual scan. On the hook path the consented lane
+            // (po-av01j.15) owns agent use, and a v1 shim must never grow an
+            // agent call it did not ask for; refuse rather than pick one.
+            anyhow::ensure!(
+                !(blend && hook.is_some()),
+                "--blend is for manual scans and cannot run on the hook path \
+                 (--hook, --staged, --pre-push); hooks use the consented agent lane \
+                 (scanner.use_agent + scanner.agent_hooks in .revelara.yaml)"
+            );
             match notice {
                 // The v1 notice already names `--agent` and says exactly what
                 // ran instead, so the generic alias paragraph would only add
@@ -6051,7 +7064,7 @@ fn run() -> anyhow::Result<ExitCode> {
             );
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
-            if incremental && retrieved.is_none() {
+            let result = if incremental && retrieved.is_none() {
                 run_scan_incremental(
                     &store,
                     &keyset,
@@ -6060,12 +7073,14 @@ fn run() -> anyhow::Result<ExitCode> {
                     &path,
                     specs_file.as_deref(),
                     judgments.as_deref(),
+                    tiers,
                     out.as_deref(),
                     color.as_deref(),
                     strict,
                     changed_only,
                     hook.as_deref(),
                     &base_chain,
+                    blend,
                 )
             } else {
                 // Hook adjudication is delta-scoped by definition; without
@@ -6085,17 +7100,24 @@ fn run() -> anyhow::Result<ExitCode> {
                     retrieved.as_deref(),
                     specs_file.as_deref(),
                     judgments.as_deref(),
+                    tiers,
                     out.as_deref(),
                     color.as_deref(),
                     strict,
                     include_tests,
+                    blend,
                 )
-            }
+            };
+            // After the scan, never before: the check it starts can install
+            // a new cache, and that must apply to the NEXT run only.
+            autosync::after_scan(&cfg, specs_file.is_none());
+            result
         }
         Cmd::Report {
             path,
             retrieved,
             specs_file,
+            oss_only,
             incremental,
             json,
             out,
@@ -6106,6 +7128,7 @@ fn run() -> anyhow::Result<ExitCode> {
             &path.unwrap_or_else(|| PathBuf::from(".")),
             retrieved.as_deref(),
             specs_file.as_deref(),
+            tier_filter(oss_only),
             incremental,
             json,
             out.as_deref(),
@@ -6148,7 +7171,8 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
         ),
-        Cmd::Sync => {
+        Cmd::Sync { background: true } => Ok(autosync::background(&cfg, &store, &keyset)),
+        Cmd::Sync { background: false } => {
             // Tiered sync (po-scnmv.13). The OSS vocabulary tier syncs with
             // NO credentials — the public binary works out of the box; the
             // commercial tier still requires the org key. No-key is no longer
@@ -6163,12 +7187,9 @@ fn run() -> anyhow::Result<ExitCode> {
                 print!("oss tier: ");
                 let _ = std::io::stdout().flush();
             }
-            let oss_code = report(&rvl_cache::sync(
-                &oss_store,
-                &oss_fetcher,
-                &keyset,
-                cfg.offline,
-            ));
+            let oss_outcome = rvl_cache::sync(&oss_store, &oss_fetcher, &keyset, cfg.offline);
+            autosync::note_if_current(&cfg.cache_dir, [Some(&oss_outcome)]);
+            let oss_code = report(&oss_outcome);
             if cfg.org_key.is_empty() {
                 if !cfg.offline {
                     eprintln!(
@@ -6190,12 +7211,9 @@ fn run() -> anyhow::Result<ExitCode> {
             // A keyed install's exit code stays governed by the commercial
             // sync, exactly as before this slice; an OSS hiccup is reported
             // above but must not fail a healthy commercial sync.
-            Ok(report(&rvl_cache::sync(
-                &store,
-                &fetcher,
-                &keyset,
-                cfg.offline,
-            )))
+            let outcome = rvl_cache::sync(&store, &fetcher, &keyset, cfg.offline);
+            autosync::note_if_current(&cfg.cache_dir, [Some(&outcome)]);
+            Ok(report(&outcome))
         }
         Cmd::Index { cmd } => match cmd {
             IndexCmd::Init { path, retrieved } => {
@@ -6208,7 +7226,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 detach,
             } => run_index_build(&cfg, path, retrieved, files, detach),
             IndexCmd::Status => {
-                match rvl_index::PacketIndex::open(&cfg.index_dir.join("packets.redb")) {
+                match open_packet_index(&cfg.index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT) {
                     Ok(idx) => {
                         println!(
                             "{} file(s) indexed at {}",
@@ -6269,6 +7287,41 @@ fn run() -> anyhow::Result<ExitCode> {
                             "no spec cache installed; run '{BIN} sync' or '{BIN} cache import'"
                         )
                     }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            CacheCmd::Keys { json } => {
+                // The same tiered load a scan performs, so the queue is
+                // measured against the specs a scan would actually judge with.
+                let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
+                let tiers = rvl_cache::load_tiered(
+                    &store,
+                    &oss_store,
+                    &keyset,
+                    &rvl_cache::today_utc(),
+                    TierFilter::Both,
+                );
+                let specs = match tiers.spec_texts()? {
+                    Some((base, overlay)) => {
+                        let mut cache = rvl_spec::SpecCache::load(&base)?;
+                        if let Some(overlay) = &overlay {
+                            cache.merge(rvl_spec::SpecCache::load(overlay)?);
+                        }
+                        Some(cache)
+                    }
+                    None => None,
+                };
+                let artifact_loaded = specs.is_some();
+                let queue = rvl_config::key_ledger::mint_queue(&specs.unwrap_or_default());
+                if json {
+                    let mut doc = serde_json::to_value(&queue)?;
+                    doc["artifact_loaded"] = artifact_loaded.into();
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    print!(
+                        "{}",
+                        config_lane::render_key_report(&queue, artifact_loaded)
+                    );
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -6344,6 +7397,74 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the detached reindex log stays bounded (po-gvzpc) ---
+
+    /// A log under the cap is left alone: rotating on every spawn would throw
+    /// away the history the log exists to keep.
+    #[test]
+    fn a_detached_log_under_the_cap_is_not_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        std::fs::write(&log, "warm 1\n").unwrap();
+
+        rotate_detached_log(&log, 64);
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "warm 1\n");
+        assert!(!rotated_log_path(&log).exists());
+    }
+
+    /// Over the cap, the log becomes the one kept generation and the earlier
+    /// generation is dropped, so the pair never holds more than about twice
+    /// the cap.
+    #[test]
+    fn a_detached_log_over_the_cap_replaces_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        let rotated = rotated_log_path(&log);
+        std::fs::write(&rotated, "ancient\n").unwrap();
+        std::fs::write(&log, "x".repeat(65)).unwrap();
+
+        rotate_detached_log(&log, 64);
+
+        assert!(!log.exists(), "the next spawn must start a fresh log");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "x".repeat(65));
+    }
+
+    /// The first detached warm has no log yet, and that is not an error.
+    #[test]
+    fn a_missing_detached_log_is_left_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+
+        rotate_detached_log(&log, 64);
+
+        assert!(!log.exists());
+        assert!(!rotated_log_path(&log).exists());
+    }
+
+    /// The reason this rotates instead of truncating: a warm that is still
+    /// alive when the next one spawns must not have its output cut. Its
+    /// handle follows the file, so what it writes afterwards is still whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_still_writing_keeps_its_output_across_a_rotation() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let log = detached_log_path(dir.path());
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        writer.write_all("y".repeat(65).as_bytes()).unwrap();
+
+        rotate_detached_log(&log, 64);
+        writer.write_all(b"\nstill here\n").unwrap();
+
+        let kept = std::fs::read_to_string(rotated_log_path(&log)).unwrap();
+        assert_eq!(kept, format!("{}\nstill here\n", "y".repeat(65)));
+    }
 
     // --- an empty commercial API corpus is never quiet ---
 
@@ -6714,6 +7835,24 @@ mod tests {
         }
     }
 
+    /// po-av01j.219: the retrieval census rides the helper's repo_config, and
+    /// must survive into the stream that feeds COVERAGE rather than being
+    /// parsed and dropped like every other repo-scoped field once was.
+    #[test]
+    fn a_retrieved_stream_carries_its_retrieval_census() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &p,
+            r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"go","calls_resolved":900,"candidates":40,"unretrieved":{"io.ReadAll":3}}]}"#,
+        )
+        .unwrap();
+        let stream = resolve_packet_stream(Some(p.as_path()), dir.path(), false, false).unwrap();
+        assert_eq!(stream.retrieval.len(), 1);
+        assert_eq!(stream.retrieval[0].candidates, 40);
+        assert_eq!(stream.retrieval[0].unretrieved.get("io.ReadAll"), Some(&3));
+    }
+
     #[test]
     fn the_judgments_flag_overrides_the_cache() {
         // --judgments survives as a dev override only. When both are present
@@ -6782,6 +7921,160 @@ mod tests {
     // RVL_HELPER_DIR, and a second mutex over the same process-wide state
     // is not a lock at all (see `embedded_helpers::env_lock`).
     use crate::embedded_helpers::env_lock;
+
+    // --- A language present only as test material (po-av01j.123) ---
+
+    /// A Go repo that carries one Rust fixture and one C# fixture, the shape
+    /// that made every scan spawn rustindex and look for csindex.
+    fn polyglot_with_fixtures() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(root.join("main.go"), "package main\n").unwrap();
+        for (dir, file) in [("rust-pro", "rust_pro.rs"), ("csharp-pro", "csharp_pro.cs")] {
+            let d = root.join("scripts/skilleval/testdata/matrix").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), "// fixture\n").unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn a_language_found_only_in_test_material_is_skipped_and_counted() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        let langs = detect_languages(root);
+        assert_eq!(langs, vec![Lang::Go, Lang::Rust, Lang::CSharp]);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::Rust, 1), (Lang::CSharp, 1)],
+            "the fixtures are detected, and named with their file count"
+        );
+    }
+
+    #[test]
+    fn one_source_file_outside_test_paths_makes_a_language_present() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        // scripts/ is dev-only, not test material: real code someone runs.
+        std::fs::write(root.join("scripts/gen.rs"), "fn main() {}\n").unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::CSharp, 1)]
+        );
+    }
+
+    #[test]
+    fn a_project_file_makes_a_language_present_unless_it_is_a_fixture_too() {
+        let tmp = polyglot_with_fixtures();
+        let root = tmp.path();
+        // A manifest that ships with the fixture is part of the fixture.
+        std::fs::write(
+            root.join("scripts/skilleval/testdata/matrix/rust-pro/Cargo.toml"),
+            "[package]\n",
+        )
+        .unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::Rust, 2), (Lang::CSharp, 1)]
+        );
+        // A crate whose only sources are its tests is still a real crate.
+        std::fs::create_dir_all(root.join("tools/bench/tests")).unwrap();
+        std::fs::write(root.join("tools/bench/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("tools/bench/tests/it.rs"), "\n").unwrap();
+        assert_eq!(
+            test_material_only_languages(root, &langs),
+            vec![(Lang::CSharp, 1)]
+        );
+    }
+
+    #[test]
+    fn a_repo_that_is_only_test_material_skips_nothing() {
+        // The risk in the other direction: with no language really present,
+        // the test material IS the repo, and skipping it would scan nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("testdata")).unwrap();
+        std::fs::write(root.join("testdata/a.go"), "package a\n").unwrap();
+        std::fs::write(root.join("testdata/b.cs"), "class B {}\n").unwrap();
+        let langs = detect_languages(root);
+        assert_eq!(langs, vec![Lang::Go, Lang::CSharp]);
+        assert!(test_material_only_languages(root, &langs).is_empty());
+    }
+
+    /// An executable that records that it ran and prints one honest
+    /// repo-scoped record, so the lane reads as scanned with zero sites.
+    #[cfg(unix)]
+    fn recording_helper(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let ran = dir.join(format!("{name}.ran"));
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho '{}'\n",
+                ran.display(),
+                r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[]}"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, ran)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_does_not_spawn_the_helper_of_a_test_material_only_language() {
+        let _guard = env_lock();
+        let tmp = polyglot_with_fixtures();
+        let helpers = tempfile::tempdir().unwrap();
+        let (go, go_ran) = recording_helper(helpers.path(), "goindex");
+        let (rs, rs_ran) = recording_helper(helpers.path(), "rustindex");
+        let (cs, cs_ran) = recording_helper(helpers.path(), "csindex");
+        std::env::set_var("RVL_GOINDEX", &go);
+        std::env::set_var("RVL_RUSTINDEX", &rs);
+        std::env::set_var("RVL_CSINDEX", &cs);
+        let default = resolve_packet_stream(None, tmp.path(), false, false);
+        let default_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
+        let with_tests = resolve_packet_stream(None, tmp.path(), false, true);
+        let with_tests_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
+        for v in ["RVL_GOINDEX", "RVL_RUSTINDEX", "RVL_CSINDEX"] {
+            std::env::remove_var(v);
+        }
+
+        let stream = default.expect("the scan completes");
+        assert_eq!(
+            default_ran,
+            (true, false, false),
+            "only the language that is really present runs its helper"
+        );
+        // NOT SILENT. The skipped languages are in the roll-call, by name and
+        // with a count, and they are not degradations: nothing went wrong.
+        let skipped: Vec<(&str, &str)> = stream
+            .status
+            .iter()
+            .filter(|s| s.state == render::LangState::Skipped)
+            .map(|s| (s.lang.as_str(), s.detail.as_str()))
+            .collect();
+        assert_eq!(skipped, vec![("Rust", "1 file"), ("C#", "1 file")]);
+        assert!(stream.degraded.is_empty(), "{:?}", stream.degraded);
+        assert!(stream.total_failure.is_none());
+        assert_eq!(
+            stream.retrievers.len(),
+            1,
+            "no retriever was resolved for a skipped lane"
+        );
+
+        // --include-tests asks for test material, so the skip is off.
+        let stream = with_tests.expect("the scan completes");
+        assert_eq!(with_tests_ran, (true, true, true));
+        assert!(stream
+            .status
+            .iter()
+            .all(|s| s.state != render::LangState::Skipped));
+    }
 
     // --- Changed-only scoping (po-av01j.127) ---
 
@@ -7009,11 +8302,13 @@ mod tests {
                     lang: "Python".into(),
                     path: "/home/u/.local/bin/pyindex.py".into(),
                     source: "PATH".into(),
+                    drift: None,
                 },
                 render::RetrieverInfo {
                     lang: "Go".into(),
                     path: "/opt/rvl/goindex".into(),
                     source: "bundled".into(),
+                    drift: None,
                 },
             ],
             ..Default::default()
@@ -7025,6 +8320,30 @@ mod tests {
             "got: {out}"
         );
         assert!(out.contains("/opt/rvl/goindex (bundled)"), "got: {out}");
+    }
+
+    /// po-av01j.138: cindex's stats for the SAME call with and without its
+    /// header. The clean record is not a partial parse; the truncated one is,
+    /// and the note says how much was lost and why.
+    #[test]
+    fn an_incomplete_parse_is_read_off_the_retrieval_stats_record() {
+        let clean = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","mode":"allowlist","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":0,"tus_incomplete_paths":[],"includes_missing":0,"decls_unresolved":0,"calls_callee_unresolved":0,"cpp_files_skipped_no_db":0}"#;
+        assert_eq!(incomplete_parse_note(clean), None);
+        // A helper that predates the field is not accused of anything.
+        let old = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"python","files_total":1,"files_parsed":1,"files_failed":0,"sites":0}"#;
+        assert_eq!(incomplete_parse_note(old), None);
+
+        let truncated = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","mode":"allowlist","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/a.c"],"includes_missing":1,"decls_unresolved":7,"calls_callee_unresolved":0,"cpp_files_skipped_no_db":0}"#;
+        let note = incomplete_parse_note(truncated).expect("a truncated parse is reported");
+        assert!(note.contains("1 of 1 translation unit"), "{note}");
+        assert!(note.contains("1 header not found"), "{note}");
+        assert!(note.contains("7 undeclared identifiers"), "{note}");
+
+        // A batched run carries one record per batch: they SUM.
+        let batched = format!("{truncated}\n{truncated}\n");
+        let note = incomplete_parse_note(&batched).unwrap();
+        assert!(note.contains("2 of 2 translation units"), "{note}");
+        assert!(note.contains("2 headers not found"), "{note}");
     }
 
     #[test]
@@ -7134,6 +8453,55 @@ mod tests {
             fs.iter().any(|f| f.control == "RC-033"),
             "an untested live tree must surface RC-033: {fs:?}"
         );
+    }
+
+    /// po-av01j.28: the `--out` rows carry EVERY control's verdict, not just
+    /// the violations the ladder shows, under one repo-level site id.
+    #[test]
+    fn structure_lane_emits_one_eval_row_per_control() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.go")),
+                "package x\nfunc F() {}\n",
+            )
+            .unwrap();
+        }
+        let lane = resolve_structure_lane(None, "", dir.path());
+        let classes: Vec<&str> = lane.rows.iter().map(|r| r.class.as_str()).collect();
+        assert_eq!(
+            classes,
+            [
+                "repo_structure.RC-033",
+                "repo_structure.RC-057",
+                "repo_structure.RC-058",
+                "repo_structure.RC-034",
+                "repo_structure.RC-070",
+                "repo_structure.RC-006",
+            ]
+        );
+        let snapshot = snapshot_name(dir.path());
+        for r in &lane.rows {
+            assert_eq!(r.site_id, out_doc::STRUCTURE_SITE_ID);
+            assert_eq!(r.snapshot_id, snapshot);
+            assert!(!r.reason.is_empty(), "every verdict states why: {r:?}");
+        }
+        assert_eq!(lane.rows[0].verdict, "violates");
+        // The ladder keeps its violations-only view of the same verdicts.
+        let violating = lane.rows.iter().filter(|r| r.verdict == "violates").count();
+        assert_eq!(lane.ladder.len(), violating);
+        assert!(violating < lane.rows.len(), "non-violations are rows too");
+    }
+
+    #[test]
+    fn retrieved_stream_without_a_record_yields_no_structure_rows() {
+        let lane = resolve_structure_lane(
+            Some(Path::new("prebuilt.jsonl")),
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+            Path::new("."),
+        );
+        assert!(lane.rows.is_empty(), "no record, no rows: {:?}", lane.rows);
     }
 
     #[test]
@@ -7470,6 +8838,70 @@ mod tests {
         );
     }
 
+    /// po-av01j.118. The policy is pure so each rung of the precedence is
+    /// pinned without depending on the box the suite runs on.
+    #[test]
+    fn node_heap_limit_scales_with_the_host_and_yields_to_the_operator() {
+        // Derived: half of physical memory, so a 32 GB host gets 16 GB of
+        // heap rather than V8's flat 4 GB...
+        assert_eq!(node_heap_limit_mb(None, None, Some(32_768)), Some(16_384));
+        assert_eq!(node_heap_limit_mb(None, None, Some(8_192)), Some(4_096));
+        // ...and never more than the cap, however large the host.
+        assert_eq!(
+            node_heap_limit_mb(None, None, Some(512 * 1024)),
+            Some(NODE_HEAP_CAP_MB)
+        );
+        // Unknown memory size: say nothing rather than guess.
+        assert_eq!(node_heap_limit_mb(None, None, None), None);
+
+        // The explicit override beats everything, including the cap.
+        assert_eq!(
+            node_heap_limit_mb(Some("24000"), Some("--max-old-space-size=1"), Some(8_192)),
+            Some(24_000)
+        );
+        // 0 opts out: node keeps its own default.
+        assert_eq!(node_heap_limit_mb(Some("0"), None, Some(32_768)), None);
+        // Garbage is ignored, not fatal and not an opt-out.
+        assert_eq!(
+            node_heap_limit_mb(Some("lots"), None, Some(8_192)),
+            Some(4_096)
+        );
+
+        // An operator's NODE_OPTIONS limit is inherited by the child; a
+        // command-line flag would silently override it.
+        for opts in [
+            "--max-old-space-size=2048",
+            "--enable-source-maps --max_old_space_size=2048",
+        ] {
+            assert_eq!(node_heap_limit_mb(None, Some(opts), Some(32_768)), None);
+        }
+        // Unrelated NODE_OPTIONS do not switch the limit off.
+        assert_eq!(
+            node_heap_limit_mb(None, Some("--enable-source-maps"), Some(8_192)),
+            Some(4_096)
+        );
+    }
+
+    #[test]
+    fn node_abort_hint_names_the_limit_in_force_and_the_override() {
+        let set = node_abort_hint(Some(4096));
+        assert!(
+            set.contains("4096 MB") && set.contains(NODE_HEAP_ENV),
+            "{set}"
+        );
+        let unset = node_abort_hint(None);
+        assert!(
+            unset.contains("node's own heap limit") && unset.contains(NODE_HEAP_ENV),
+            "{unset}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_memory_is_readable_on_unix() {
+        assert!(physical_memory_mb().is_some_and(|mb| mb > 0));
+    }
+
     #[test]
     fn ts_node_script_argv_runs_under_node() {
         let helper = ResolvedHelper {
@@ -7570,8 +9002,8 @@ mod tests {
         assert_eq!(lang_of_path(Path::new("src/io.cc")), Some(Lang::CCpp));
         assert_eq!(lang_of_path(Path::new("src/io.cpp")), Some(Lang::CCpp));
         assert_eq!(lang_of_path(Path::new("src/io.cxx")), Some(Lang::CCpp));
-        // Headers map to no helper: invalidating the right TUs needs the
-        // include graph (follow-up), so header edits take the full-rescan path.
+        // Headers map to no helper: a header edit reaches the scan through
+        // the TUs that include it (the include graph in the packet index).
         assert_eq!(lang_of_path(Path::new("src/io.h")), None);
         assert_eq!(lang_of_path(Path::new("src/io.hpp")), None);
     }
@@ -7738,6 +9170,48 @@ mod tests {
         }
     }
 
+    // po-5csvg: the split is by the language whose retriever reads the file,
+    // so it lines up with the roll-call, and only a no-spec abstain counts
+    // toward the corpus lever.
+    #[test]
+    fn lang_coverage_splits_resolved_and_no_spec_by_file_language() {
+        let fnd = |verdict, reason: &str| rvl_propagate::Finding {
+            site_id: String::new(),
+            verdict,
+            reason: reason.into(),
+        };
+        let sites = vec![
+            site_at("svc/a.go", 1, "http.Client", "Do"),
+            site_at("app/b.py", 2, "requests", "get"),
+            site_at("app/c.py", 3, "httpx", "get"),
+            site_at("svc/d.go", 4, "http.Client", "Do"),
+            site_at("app/e.py", 5, "redis.Redis", "get"),
+            site_at("tpl/f.tmpl", 6, "x", "y"),
+        ];
+        let findings = vec![
+            fnd(rvl_core::Verdict::Violates, "unbounded"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for requests.get"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for httpx.get"),
+            fnd(rvl_core::Verdict::NotApplicable, "non-blocking"),
+            fnd(rvl_core::Verdict::Abstain, "search truncated at depth 3"),
+            fnd(rvl_core::Verdict::Abstain, "no spec for x.y"),
+        ];
+        let lc = |lang: &str, resolved, total, no_spec| render::LangCoverage {
+            lang: lang.into(),
+            resolved,
+            total,
+            no_spec,
+        };
+        assert_eq!(
+            lang_coverage(&findings, &sites),
+            vec![
+                lc("Go", 2, 2, 0),
+                lc("Python", 0, 3, 2),
+                lc("other", 0, 1, 1)
+            ]
+        );
+    }
+
     #[test]
     fn merge_keeps_two_sites_sharing_a_location() {
         // po-3t3oj.15: one file:line resolves to two sites with different client
@@ -7807,6 +9281,7 @@ mod tests {
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         };
         let candidates = walk_source_files(dir.path());
@@ -7832,12 +9307,158 @@ mod tests {
                 repo_cfg: rvl_core::RepoConfig::default(),
                 degraded_note: None,
                 degraded_langs: Vec::new(),
+                dependencies_uninstalled: Vec::new(),
             })
         };
         let scan2 = incremental_sites(&idx, dir.path(), &candidates, fake2).unwrap();
         assert_eq!(scan2.reused_files, 2, "both files now reused");
         assert_eq!(scan2.retrieved_files, 0);
         assert_eq!(calls2.get(), 0, "no helper run when nothing changed");
+    }
+
+    /// A fake cindex for the header tests: one site per changed TU, plus
+    /// the site inside `api.h` and the include edge when the TU is `a.c`.
+    fn fake_c_retrieve(root: &Path, changed: &[PathBuf]) -> RetrieveResult {
+        let mut rr = RetrieveResult::default();
+        for c in changed {
+            let rel = repo_relative(root, c);
+            let includes = if rel == "a.c" {
+                rr.sites.push(site_at("api.h", 2, "posix.socket", "send"));
+                vec!["api.h".to_string()]
+            } else {
+                Vec::new()
+            };
+            rr.sites.push(site_at(&rel, 1, "libcurl.CURL", "perform"));
+            rr.repo_cfg.tu_includes.push(rvl_core::TuIncludes {
+                file: rel,
+                includes,
+            });
+        }
+        rr
+    }
+
+    /// po-av01j.53: a header edit leaves the TU's own bytes unchanged, so
+    /// the hash gate alone reused a stale shard. The TU's entry records the
+    /// headers it includes, and holds the sites located in them.
+    #[test]
+    fn a_header_edit_re_retrieves_only_the_tus_that_include_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        std::fs::write(dir.path().join("a.c"), "#include \"api.h\"\n").unwrap();
+        std::fs::write(dir.path().join("b.c"), "int b;\n").unwrap();
+        std::fs::write(dir.path().join("api.h"), "int f(void);\n").unwrap();
+        let candidates = walk_source_files(dir.path());
+        assert_eq!(candidates.len(), 2, "a header is not a candidate itself");
+
+        let cold = incremental_sites(&idx, dir.path(), &candidates, |changed| {
+            Ok(fake_c_retrieve(dir.path(), changed))
+        })
+        .unwrap();
+        assert_eq!(cold.retrieved_files, 2);
+        assert_eq!(cold.sites.len(), 3);
+
+        // Warm, nothing changed: no helper run, and the site inside the
+        // header is still reported, out of a.c's shard.
+        let warm = incremental_sites(&idx, dir.path(), &candidates, |_| {
+            panic!("nothing changed, the helper must not run")
+        })
+        .unwrap();
+        assert_eq!(warm.reused_files, 2);
+        assert!(warm.sites.iter().any(|s| s.file_path == "api.h"));
+        assert_eq!(warm.sites.len(), 3);
+
+        // The header changes. Only a.c includes it, so only a.c is re-parsed.
+        std::fs::write(dir.path().join("api.h"), "long f(void);\n").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let edited = incremental_sites(&idx, dir.path(), &candidates, |changed| {
+            asked.borrow_mut().extend(
+                changed
+                    .iter()
+                    .map(|c| repo_relative(dir.path(), c))
+                    .collect::<Vec<_>>(),
+            );
+            Ok(fake_c_retrieve(dir.path(), changed))
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), vec!["a.c".to_string()]);
+        assert_eq!(edited.reused_files, 1);
+        assert_eq!(edited.sites.len(), 3);
+    }
+
+    /// `index reindex --files` is what the background warm runs. A header in
+    /// that list maps to the TUs the index knows include it.
+    #[test]
+    fn a_header_in_the_reindex_list_brings_in_the_tus_that_include_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        let a = dir.path().join("a.c");
+        let b = dir.path().join("b.c");
+        let header = dir.path().join("api.h");
+        for f in [&a, &b, &header] {
+            std::fs::write(f, "x\n").unwrap();
+        }
+        idx.put_with_deps(
+            &a,
+            &rvl_index::hash_file(&a).unwrap(),
+            &[],
+            std::slice::from_ref(&header),
+        )
+        .unwrap();
+        idx.put(&b, &rvl_index::hash_file(&b).unwrap(), &[])
+            .unwrap();
+
+        let got = with_header_dependents(&idx, vec![header.clone()]).unwrap();
+        assert_eq!(got, vec![header.clone(), a.canonicalize().unwrap()]);
+        // A source file brings in nothing, and nothing is listed twice.
+        let got = with_header_dependents(&idx, vec![a.canonicalize().unwrap(), header]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            with_header_dependents(&idx, vec![b.clone()]).unwrap(),
+            vec![b]
+        );
+    }
+
+    /// One language's record becomes one line, named for the lane, and a
+    /// fully installed tree becomes none (po-pk3fp.15). Batches restating the
+    /// same workspaces are counted once.
+    #[test]
+    fn a_language_names_its_uninstalled_dependency_trees_once() {
+        let rec = r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[],"dependency_trees_uninstalled":2,"dependency_trees_uninstalled_paths":["backend","frontend"]}"#;
+        let cfg = rvl_core::parse_stream(&format!("{rec}\n{rec}\n")).1;
+        assert_eq!(
+            dependencies_uninstalled_of("TypeScript", &cfg),
+            vec![render::DependenciesUninstalled {
+                lang: "TypeScript".to_string(),
+                count: 2,
+            }]
+        );
+        assert!(
+            dependencies_uninstalled_of("Go", &rvl_core::RepoConfig::default()).is_empty(),
+            "an installed tree prints nothing"
+        );
+    }
+
+    /// The warm path carries what its helpers said to COVERAGE too: a hook
+    /// scan that re-parsed TypeScript against an uninstalled tree must not
+    /// report it the way a fully resolved one reads (po-pk3fp.15).
+    #[test]
+    fn a_warm_pass_carries_the_uninstalled_dependency_state_its_helpers_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        std::fs::write(dir.path().join("app.ts"), "export const a = 1;\n").unwrap();
+        let reported = vec![render::DependenciesUninstalled {
+            lang: "TypeScript".to_string(),
+            count: 1,
+        }];
+        let fake = |_: &[PathBuf]| {
+            Ok(RetrieveResult {
+                dependencies_uninstalled: reported.clone(),
+                ..Default::default()
+            })
+        };
+        let candidates = walk_source_files(dir.path());
+        let scan = incremental_sites(&idx, dir.path(), &candidates, fake).unwrap();
+        assert_eq!(scan.dependencies_uninstalled, reported);
     }
 
     #[test]
@@ -7999,6 +9620,7 @@ mod tests {
             reparsed_files: Vec::new(),
             lang_degraded,
             test_files_skipped: Vec::new(),
+            dependencies_uninstalled: Vec::new(),
             no_supported_sources: false,
         }
     }
