@@ -212,7 +212,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
     let predicate = |unit: &str, key: &str, values: Vec<String>| ConfigPredicate {
         file_path: rel_path.to_string(),
         unit: unit.to_string(),
-        key: key.to_string(),
+        key: crate::key_ledger::declared("github-actions", key),
         values,
     };
     if let Some(events) = triggers(root) {
