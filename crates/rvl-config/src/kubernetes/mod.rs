@@ -15,6 +15,9 @@
 //!     detect as governing (there, the token default always governs, so it
 //!     is `unresolvable`; here, the documented default governs unless a
 //!     cluster object someone must author says otherwise).
+//!     One fact spans files: `workload.pdb-coverage` asks whether a
+//!     PodDisruptionBudget selects the workload, and for a bare manifest the
+//!     set it is asked of is the file's own directory.
 //!   * **Kustomize** ([`kustomize`]) — a `kustomization.yaml` resolves its
 //!     resource tree (bases, overlays) with strategic-merge patches and the
 //!     images/replicas transformers applied, bounded and deterministic. The
@@ -158,7 +161,7 @@ fn dispatch(root: Option<&Path>, rel_path: &str, contents: &str, snapshot_id: &s
                     return Retrieved::default();
                 }
             }
-            manifest::retrieve_plain(rel_path, contents, snapshot_id)
+            manifest::retrieve_plain(root, rel_path, contents, snapshot_id)
         }
     }
 }
@@ -225,5 +228,30 @@ mod tests {
             "istio.yaml",
             "apiVersion: networking.istio.io/v1beta1\nkind: VirtualService\n"
         ));
+    }
+
+    #[test]
+    fn a_bare_workload_is_matched_against_the_pdbs_of_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let k8s = dir.path().join("k8s");
+        std::fs::create_dir_all(&k8s).unwrap();
+        let deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      containers: []\n";
+        std::fs::write(k8s.join("deploy.yaml"), deploy).unwrap();
+        std::fs::write(
+            k8s.join("pdb.yaml"),
+            "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: web\n",
+        )
+        .unwrap();
+        let value = |got: Retrieved| {
+            got.packets
+                .into_iter()
+                .find(|p| p.key == "workload.pdb-coverage")
+                .map(|p| p.resolved_value)
+        };
+        let rooted = Kubernetes.retrieve_with_root(dir.path(), "k8s/deploy.yaml", deploy, "snap");
+        assert_eq!(value(rooted), Some(Some("covered".to_string())));
+        // Rootless, the directory is out of reach: no claim either way.
+        let rootless = Kubernetes.retrieve("k8s/deploy.yaml", deploy, "snap");
+        assert_eq!(value(rootless), None);
     }
 }
