@@ -17,7 +17,7 @@
 
 use crate::client::Client;
 use crate::display;
-use crate::gojson::{compact, compact_raw, path_escape, pretty, query_encode, G};
+use crate::gojson::{compact, compact_raw, null_as_default, path_escape, pretty, query_encode, G};
 use crate::risk_context_render as render;
 use crate::{CmdResult, Failure, BIN};
 use rvl_core::flag::EmptyFlag;
@@ -128,7 +128,7 @@ pub struct Risk {
     /// `[]` stays `[]`. Option distinguishes the two.
     #[serde(default)]
     pub linked_services: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub control_codes: Vec<String>,
     #[serde(default)]
     pub stale_since: String,
@@ -138,7 +138,7 @@ pub struct Risk {
     pub resolved_at: String,
     #[serde(default)]
     pub uca_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub causal_factors: Vec<String>,
     #[serde(default)]
     pub loss_scenario: String,
@@ -146,7 +146,7 @@ pub struct Risk {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListRisksResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub risks: Vec<Risk>,
     #[serde(default)]
     pub total: i64,
@@ -156,7 +156,7 @@ pub struct ListRisksResponse {
 pub struct RiskDetail {
     #[serde(flatten)]
     pub risk: Risk,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub mapped_controls: Vec<MappedControl>,
     #[serde(default)]
     pub narrative: String,
@@ -191,13 +191,13 @@ pub struct RiskDetail {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub related_findings: Vec<render::RelatedFindingItem>,
     /// Free-form on the wire (oneOf array/object): kept raw and decoded
     /// only by the renderer, which tolerates a shape it cannot read.
     #[serde(default)]
     pub substantiation: Option<Box<serde_json::value::RawValue>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub corroborating_incidents: Vec<render::CorroboratingIncidentItem>,
     #[serde(default)]
     pub score_breakdown: Option<render::ScoreBreakdown>,
@@ -239,7 +239,11 @@ pub struct CompoundRiskSummary {
     pub status: String,
     #[serde(default)]
     pub narrative: String,
-    #[serde(default, rename = "linked_services")]
+    #[serde(
+        default,
+        rename = "linked_services",
+        deserialize_with = "null_as_default"
+    )]
     pub services: Vec<String>,
     #[serde(default)]
     pub last_seen_at: String,
@@ -251,7 +255,7 @@ pub struct CompoundRuleDetail {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub control_codes: Vec<String>,
     #[serde(default)]
     pub min_control_count: i64,
@@ -267,7 +271,7 @@ pub struct ConstituentRiskSummary {
     pub title: String,
     #[serde(default)]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub control_codes: Vec<String>,
     #[serde(default)]
     pub score: i64,
@@ -279,7 +283,7 @@ pub struct CompoundRiskDetailResponse {
     pub risk: CompoundRiskSummary,
     #[serde(default)]
     pub rule: CompoundRuleDetail,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub constituents: Vec<ConstituentRiskSummary>,
 }
 
@@ -293,7 +297,7 @@ pub struct CoverageStats {
     pub assessed_controls: i64,
     #[serde(default)]
     pub coverage_percentage: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub by_category: Vec<CategoryCoverage>,
 }
 
@@ -577,7 +581,7 @@ pub struct ReadyBody {
 pub fn parse_ready_body(body: &[u8]) -> Result<ReadyBody, serde_json::Error> {
     #[derive(Deserialize)]
     struct Wire {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         risks: Vec<Box<serde_json::value::RawValue>>,
         #[serde(default)]
         total: i64,
@@ -1245,6 +1249,24 @@ mod tests {
             .filter(|r| r.risk.status == "applicable")
             .collect();
         ready_json(&ready, limit)
+    }
+
+    /// The detail and compound bodies carry Go nil slices too (po-m9w56).
+    #[test]
+    fn detail_and_compound_bodies_read_null_lists_as_empty() {
+        let d: RiskDetail = serde_json::from_str(
+            r#"{"risk_code":"R-1","control_codes":null,"causal_factors":null,"mapped_controls":null,"related_findings":null,"corroborating_incidents":null}"#,
+        )
+        .unwrap();
+        assert_eq!(d.risk.risk_code, "R-1");
+        assert!(d.risk.control_codes.is_empty() && d.mapped_controls.is_empty());
+
+        let c: CompoundRiskDetailResponse = serde_json::from_str(
+            r#"{"risk":{"risk_code":"CR-1","linked_services":null},"rule":{"control_codes":null},"constituents":null}"#,
+        )
+        .unwrap();
+        assert_eq!(c.risk.risk_code, "CR-1");
+        assert!(c.risk.services.is_empty() && c.constituents.is_empty());
     }
 
     #[test]
