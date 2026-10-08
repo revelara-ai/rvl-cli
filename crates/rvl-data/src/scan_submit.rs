@@ -1692,6 +1692,21 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The control-structure summary line. `scanned_files` is not measured by
+/// this binary: the server echoes what the `--cs-file` carried, and a file
+/// without the field arrives as 0. A count that is not known is left out
+/// (po-7ocbd), because "0 files scanned" is false for a scan that ran.
+fn control_structure_line(cs: &ControlStructureResult) -> String {
+    let mut line = format!(
+        "  Control Structure: {} nodes, {} edges",
+        cs.node_count, cs.edge_count
+    );
+    if cs.scanned_files > 0 {
+        line.push_str(&format!(" ({} files scanned)", cs.scanned_files));
+    }
+    line
+}
+
 /// The human-readable success block, mirroring rvl-cli's standard output
 /// path (plus the effective-tolerance line the response now carries).
 fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url: &str) {
@@ -1728,10 +1743,7 @@ fn render_text(response: &ScanResponse, norm_report: &FindingNormReport, api_url
         );
     }
     if let Some(cs) = &response.control_structure {
-        println!(
-            "  Control Structure: {} nodes, {} edges ({} files scanned)",
-            cs.node_count, cs.edge_count, cs.scanned_files
-        );
+        println!("{}", control_structure_line(cs));
         if let Some(uca) = &cs.uca_coverage {
             print!(
                 "  STPA Coverage: {}/{} control actions analyzed",
@@ -1805,6 +1817,38 @@ mod tests {
         };
         req.metadata.scanner_id = "rvl/0.1.0".into();
         req
+    }
+
+    // --- control structure line (po-7ocbd) ---
+
+    #[test]
+    fn control_structure_line_omits_an_unknown_file_count() {
+        // `scanned_files` is whatever the --cs-file carried. Absent, it
+        // arrives as 0, and "0 files scanned" is a false statement about a
+        // scan that read thousands of sites.
+        let cs = ControlStructureResult {
+            node_count: 15,
+            edge_count: 12,
+            ..Default::default()
+        };
+        assert_eq!(
+            control_structure_line(&cs),
+            "  Control Structure: 15 nodes, 12 edges"
+        );
+    }
+
+    #[test]
+    fn control_structure_line_keeps_a_reported_file_count() {
+        let cs = ControlStructureResult {
+            node_count: 15,
+            edge_count: 12,
+            scanned_files: 42,
+            ..Default::default()
+        };
+        assert_eq!(
+            control_structure_line(&cs),
+            "  Control Structure: 15 nodes, 12 edges (42 files scanned)"
+        );
     }
 
     // --- idempotency ---

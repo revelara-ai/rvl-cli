@@ -151,6 +151,39 @@ pub struct Loaded {
     pub staleness_note: Option<String>,
 }
 
+/// Which tier a [`Loaded`] came from. The store does not know, so the caller
+/// says, and every line printed about a tier carries its label (po-7ocbd): a
+/// stale OSS tier beside a current commercial tier must not read as a warning
+/// about the commercial one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Commercial,
+    Oss,
+}
+
+impl Loaded {
+    /// The one "this cache is loaded" line: `<tier> <version> (schema, source)`.
+    pub fn summary_line(&self, tier: Tier) -> String {
+        let label = match tier {
+            Tier::Commercial => "spec cache",
+            Tier::Oss => "oss tier",
+        };
+        format!(
+            "{label} {} (schema {}, {:?})",
+            self.envelope.content_version, self.envelope.schema, self.source
+        )
+    }
+
+    /// The staleness note, labeled when it is not about the commercial tier.
+    pub fn staleness_line(&self, tier: Tier) -> Option<String> {
+        let note = self.staleness_note.as_ref()?;
+        Some(match tier {
+            Tier::Commercial => note.clone(),
+            Tier::Oss => format!("oss tier: {note}"),
+        })
+    }
+}
+
 /// On-disk layout under a root dir:
 /// `current/specs.json` + `current/specs.json.sig`, mirrored in `last-good/`,
 /// quarantined artifacts in `rejected/`.
@@ -480,11 +513,10 @@ pub fn staleness_note(content_version: &str, today: &str) -> Option<String> {
     let minted = days_from_civil(content_version.get(..10)?)?;
     let now = days_from_civil(today.get(..10)?)?;
     let age = now - minted;
+    // The full version, not only its date: two tiers load in one scan, and
+    // the note must match the loaded line of the cache it measured (po-7ocbd).
     (age > STALENESS_DAYS).then(|| {
-        format!(
-            "spec cache is {age} days old (from {}); run '{BIN} sync' to refresh",
-            &content_version[..10]
-        )
+        format!("spec cache {content_version} is {age} days old; run '{BIN} sync' to refresh")
     })
 }
 
