@@ -71,6 +71,10 @@ The orchestrator uses it to:
       "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2,
                    "vocabulary_only": 4 },
       "no_spec_keys": ["github_actions permissions"],
+      "by_key": [
+        { "format": "github-actions", "key": "job.timeout-minutes",
+          "violates": 4, "satisfies": 9, "abstain": 0, "not_applicable": 0 }
+      ],
       "unparseable_files": 0
     },
     "retrieval": [
@@ -172,6 +176,19 @@ The orchestrator uses it to:
     so they are counted apart from `no_spec` and never appear in
     `no_spec_keys`. `rvl cache keys` lists which keys carry the marker and
     why.
+  - `config.by_key`: the config lane's verdict counts for each
+    `(format, key)` it found a setting for, ordered by format, then key:
+    `violates`, `satisfies`, `abstain`, `not_applicable`. A finding names
+    only the violating sites of a class; this block also says how many
+    settings of the same key satisfied, so the fire rate of the spec that
+    judges a key is `violates / (violates + satisfies)`. `not_applicable`
+    counts the settings a conditional spec did not apply to (its guard did
+    not hold): they are resolved, and they are not part of that
+    denominator. A key with no spec, or a vocabulary-only key, has a row
+    with only `abstain`. The four counts of all rows sum to `config.total`;
+    `violates + satisfies + not_applicable` sums to `config.resolved`, and
+    `abstain` sums to the four `config.abstain` counts. The counts are
+    pre-waiver engine truth, as `sites` is.
   - `structure`: the repo-structure lane's verdict counts (`total`,
     `violates`, `satisfies`, `abstain`, `not_applicable`), one control each.
     It mirrors the `structure:` line of the COVERAGE block. Null when the

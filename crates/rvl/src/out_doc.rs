@@ -195,12 +195,26 @@ pub struct OutConfigAbstain {
     pub vocabulary_only: usize,
 }
 
+/// The config lane's verdict counts for one (format, key). The four counts
+/// of every row sum to `OutConfig::total`.
+#[derive(Serialize)]
+pub struct OutConfigKey {
+    pub format: String,
+    pub key: String,
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    pub not_applicable: usize,
+}
+
 #[derive(Serialize)]
 pub struct OutConfig {
     pub resolved: usize,
     pub total: usize,
     pub abstain: OutConfigAbstain,
     pub no_spec_keys: Vec<String>,
+    /// Ordered by format, then key (po-av01j.133.12). Additive.
+    pub by_key: Vec<OutConfigKey>,
     pub unparseable_files: usize,
 }
 
@@ -405,6 +419,18 @@ pub fn build(
                     vocabulary_only: c.vocabulary_only,
                 },
                 no_spec_keys: c.no_spec_keys.iter().cloned().collect(),
+                by_key: c
+                    .by_key
+                    .iter()
+                    .map(|((format, key), n)| OutConfigKey {
+                        format: format.clone(),
+                        key: key.clone(),
+                        violates: n.violates,
+                        satisfies: n.satisfies,
+                        abstain: n.abstain,
+                        not_applicable: n.not_applicable,
+                    })
+                    .collect(),
                 unparseable_files: c.unparseable_files,
             }),
             retrieval: coverage.retrieval.clone(),
@@ -633,6 +659,71 @@ mod tests {
 
     /// The per-language split reaches the document, with the same corpus-gap
     /// call the ladder's lever line makes (po-5csvg).
+    /// po-av01j.133.12: the per-key counts are what a per-spec fire rate is
+    /// computed from, so a consumer must be able to read them without the
+    /// ladder, and they must account for every config setting.
+    #[test]
+    fn config_by_key_carries_the_counts_and_sums_to_the_total() {
+        let counts = |violates, satisfies, abstain, not_applicable| render::ConfigKeyCounts {
+            violates,
+            satisfies,
+            abstain,
+            not_applicable,
+        };
+        let cc = render::ConfigCoverage {
+            resolved: 6,
+            total: 9,
+            abstain_no_spec: 3,
+            by_key: [
+                (
+                    ("kubernetes".to_string(), "workload.replicas".to_string()),
+                    counts(0, 0, 3, 0),
+                ),
+                (
+                    (
+                        "github-actions".to_string(),
+                        "job.timeout-minutes".to_string(),
+                    ),
+                    counts(2, 3, 0, 1),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let doc = build(
+            &[],
+            &render::Coverage::default(),
+            Some(&cc),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+        );
+        let v = serde_json::to_value(&doc).unwrap();
+        let config = &v["coverage"]["config"];
+        assert_eq!(
+            config["by_key"],
+            serde_json::json!([
+                { "format": "github-actions", "key": "job.timeout-minutes",
+                  "violates": 2, "satisfies": 3, "abstain": 0, "not_applicable": 1 },
+                { "format": "kubernetes", "key": "workload.replicas",
+                  "violates": 0, "satisfies": 0, "abstain": 3, "not_applicable": 0 },
+            ]),
+            "one row per (format, key), ordered by format then key"
+        );
+        let sum: u64 = config["by_key"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| ["violates", "satisfies", "abstain", "not_applicable"].map(|k| &r[k]))
+            .map(|n| n.as_u64().unwrap())
+            .sum();
+        assert_eq!(Some(sum), config["total"].as_u64());
+    }
+
     #[test]
     fn by_language_carries_the_split_and_the_corpus_gap() {
         let lc = |lang: &str, resolved, total, no_spec| render::LangCoverage {

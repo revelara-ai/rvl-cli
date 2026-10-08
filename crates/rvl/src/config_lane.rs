@@ -63,6 +63,16 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
     let mut classes: BTreeMap<(String, String, String), Class> = BTreeMap::new();
 
     for (f, p) in findings.iter().zip(retrieval.packets.iter()) {
+        let counts = coverage
+            .by_key
+            .entry((p.format.clone(), p.key.clone()))
+            .or_default();
+        match f.verdict {
+            Verdict::Violates => counts.violates += 1,
+            Verdict::Satisfies => counts.satisfies += 1,
+            Verdict::Abstain => counts.abstain += 1,
+            Verdict::NotApplicable => counts.not_applicable += 1,
+        }
         if f.verdict.is_resolved() {
             coverage.resolved += 1;
         } else if f.reason.starts_with("no config spec") {
@@ -389,6 +399,53 @@ mod tests {
         );
     }
 
+    // po-av01j.133.12. A per-spec fire rate is violates / (violates +
+    // satisfies) of ONE key, and the ladder only ever named the violating
+    // half. Every packet lands in exactly one count of exactly one key, so
+    // the block sums to the lane total and to each of its halves.
+    #[test]
+    fn every_packet_is_counted_once_under_its_key() {
+        let dir = repo_with_workflow(
+            "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    runs-on: x\n    timeout-minutes: 5\n  c:\n    runs-on: x\n",
+        );
+        let out = run(dir.path(), &specs("high"), "snap");
+        let cov = &out.coverage;
+        let key = |k: &str| {
+            *cov.by_key
+                .get(&("github-actions".to_string(), k.to_string()))
+                .unwrap_or_else(|| panic!("no row for {k}: {:?}", cov.by_key))
+        };
+        assert_eq!(
+            key("job.timeout-minutes"),
+            render::ConfigKeyCounts {
+                violates: 2,
+                satisfies: 1,
+                abstain: 0,
+                not_applicable: 0,
+            },
+            "two jobs without a timeout, one with"
+        );
+        // A key with no spec is still a row: its packets abstain.
+        let unspecced = key("workflow.concurrency");
+        assert_eq!(unspecced.violates + unspecced.satisfies, 0);
+        assert!(unspecced.abstain >= 1, "{unspecced:?}");
+
+        let sum = |f: fn(&render::ConfigKeyCounts) -> usize| -> usize {
+            cov.by_key.values().map(f).sum()
+        };
+        assert_eq!(
+            sum(|c| c.violates + c.satisfies + c.abstain + c.not_applicable),
+            cov.total,
+            "{cov:?}"
+        );
+        assert_eq!(
+            sum(|c| c.violates + c.satisfies + c.not_applicable),
+            cov.resolved,
+            "{cov:?}"
+        );
+        assert_eq!(sum(|c| c.abstain), cov.abstain_total(), "{cov:?}");
+    }
+
     #[test]
     fn key_report_names_the_queue_and_separates_vocabulary_only() {
         let q = rvl_config::key_ledger::mint_queue(&specs("high"));
@@ -491,6 +548,20 @@ mod tests {
         // satisfies. None fell to an abstention.
         assert_eq!(out.coverage.resolved, 3, "{:?}", out.coverage);
         assert_eq!(out.coverage.abstain_other, 0, "{:?}", out.coverage);
+        // A guard that does not hold is not a site that satisfied: counting
+        // it there would dilute the fire rate of the conditional spec.
+        assert_eq!(
+            out.coverage.by_key[&(
+                "github-actions".to_string(),
+                "workflow.concurrency".to_string()
+            )],
+            render::ConfigKeyCounts {
+                violates: 1,
+                satisfies: 1,
+                abstain: 0,
+                not_applicable: 1,
+            }
+        );
         // And the predicates did not leak into the unjudged-keys queue.
         assert!(
             out.coverage

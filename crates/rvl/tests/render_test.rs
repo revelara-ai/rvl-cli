@@ -453,6 +453,40 @@ fn hook_ladder_shows_counts_not_named_incidents() {
 
 // --- config lane coverage ---
 
+// The per-key verdict counts are for the `--out` document (po-av01j.133.12).
+// The COVERAGE block stays one line per lever, however many keys a repo has.
+#[test]
+fn per_key_counts_do_not_change_the_coverage_block() {
+    let plain = ConfigCoverage {
+        resolved: 2,
+        total: 3,
+        abstain_no_spec: 1,
+        ..Default::default()
+    };
+    let mut keyed = plain.clone();
+    keyed.by_key.insert(
+        (
+            "github-actions".to_string(),
+            "job.timeout-minutes".to_string(),
+        ),
+        ConfigKeyCounts {
+            violates: 1,
+            satisfies: 1,
+            abstain: 1,
+            not_applicable: 0,
+        },
+    );
+    let counted: usize = keyed
+        .by_key
+        .values()
+        .map(|n| n.violates + n.satisfies + n.abstain + n.not_applicable)
+        .sum();
+    assert_eq!(counted, keyed.total);
+    let block =
+        |cc: &ConfigCoverage| render_ladder(&[], Coverage::default(), Some(cc), "0.1s", false);
+    assert_eq!(block(&plain), block(&keyed));
+}
+
 #[test]
 fn unjudged_keys_are_named_not_just_counted() {
     // A count says the authoring lever exists; the names say where to pull it.
@@ -514,6 +548,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         vocabulary_only: 0,
         unparseable_files: 1,
         no_spec_keys: Default::default(),
+        by_key: Default::default(),
         sightings: vec![
             ("circleci".to_string(), 1, false),
             ("terraform".to_string(), 4, false),
