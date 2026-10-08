@@ -40,7 +40,7 @@ the part that must not be built again.
 | 9 | F2: cache with no eviction, TTL, or size cap | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:87`, `helpers/pyindex/pyindex.py:1367`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Same packet as M6. Emitted for go-cache, `functools.lru_cache`, and `functools.cache`. |
 | 10a | K2: container without a liveness or readiness probe | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:368`, `crates/rvl-config/src/key_ledger.rs:133` | None needed | `kubernetes container.liveness-probe` and `kubernetes container.readiness-probe` on RC-020. |
 | 10b | K2: container without a startup probe | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:370`, `crates/rvl-config/src/key_ledger.rs:140` | `po-av01j.44` | `kubernetes container.startup-probe` is emitted and has no spec. |
-| 10c | K3: liveness probe whose handler touches a dependency | GENUINELY-NEW | `crates/rvl-spec/src/lib.rs:754` | `po-6c0v8.5` | G2 knows health paths and G6 knows a probe exists. Nothing carries the probe path or joins the two. |
+| 10c | K3: liveness probe whose handler touches a dependency | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:386`, `crates/rvl-propagate/src/probe_handler.rs:77` | `po-6c0v8.5` | Updated 2026-10-08 by `po-6c0v8.5`. The Kubernetes retriever emits the `httpGet` path of a liveness probe as `kubernetes container.liveness-probe.http-get.path`. The scan joins it to a route in the same repository and reports `server_entry.liveness-probe-handler-io` on RC-020 when the handler holds a G1 call site. No spec is necessary. The join abstains when the path or the handler is not resolved, and it does not follow a call from the handler into another function. See [The liveness probe join](retrievers.md#the-liveness-probe-join). |
 | 11 | F3: unbounded read of a body, file, or result set | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:356`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Go `io.ReadAll` is emitted with the calls its argument passes through. It is still not a G1 call site, so the retrieval census counts it as before. Python reads are not emitted. |
 | 12a | Q25: mutable image tag | SHIPPED | `crates/rvl-config/src/dep_manifests.rs:768`, `crates/rvl-config/src/kubernetes/manifest.rs:390` | None needed | `dep-manifests dockerfile.base_image_pin` and `kubernetes container.image.pin` on RC-041. Both expect `digest` or `tag`. |
 | 12b | Q26: container with no security context | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:377`, `crates/rvl-config/src/key_ledger.rs:139` | None needed | `kubernetes container.security-context` on RC-044, presence only. This is not a root-container check: see 12c. |
@@ -102,6 +102,11 @@ helpers that do not emit the packet are `po-6c0v8.11`. The count above and
 the table below this point are the 2026-10-04 snapshot and were not
 recomputed.
 
+**Update, 2026-10-08 (`po-6c0v8.5`).** Row 10c moved from GENUINELY-NEW to
+SHIPPED. The manifest carries the path of the liveness probe, and the scan
+joins it to the handler in the same repository. Three retriever gaps stay
+(12c, 18b, 19c).
+
 ## What to build, and what not to build
 
 **Do not build.** A timeout detector, a secret detector, a swallowed-error
@@ -124,7 +129,7 @@ Four classes had no bead. Each is now a child of the epic:
 
 | Bead | Class | Row |
 | --- | --- | --- |
-| `po-6c0v8.5` | K3: liveness handler touches a dependency | 10c |
+| `po-6c0v8.5` | K3: liveness handler touches a dependency. Landed on 2026-10-08. | 10c |
 | `po-6c0v8.6` | Q26: Dockerfile `USER`, `runAsNonRoot` value, fat base | 12c |
 | `po-6c0v8.7` | Q21/Q22: no dependency scanning or SAST job | 18b |
 | `po-6c0v8.8` | O8: workload with no PDB or anti-affinity | 19c |

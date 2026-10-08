@@ -17,6 +17,7 @@ use rvl_spec::{
 };
 use std::collections::HashMap;
 
+pub mod probe_handler;
 pub mod server_entry;
 
 /// Evidence of a bound, and how much of the call it covers.

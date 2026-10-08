@@ -146,6 +146,11 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "container.image-pull-policy"),
     judged("kubernetes", "container.image.pin"),
     judged("kubernetes", "container.liveness-probe"),
+    vocabulary_only(
+        "kubernetes",
+        "container.liveness-probe.http-get.path",
+        "a join fact: the path the liveness probe requests, matched to the route handler that serves it",
+    ),
     judged("kubernetes", "container.readiness-probe"),
     judged("kubernetes", "container.resources.limits.cpu"),
     judged("kubernetes", "container.resources.limits.memory"),
@@ -501,8 +506,9 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        // Three terraform raw-identity keys and three guard predicates.
-        assert_eq!(q.vocabulary_only, 6);
+        // Three terraform raw-identity keys, three guard predicates, and the
+        // liveness probe path.
+        assert_eq!(q.vocabulary_only, 7);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(

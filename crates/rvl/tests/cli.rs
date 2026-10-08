@@ -991,6 +991,86 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     );
 }
 
+/// po-6c0v8.5: a liveness probe path in a manifest of the scanned repository
+/// is joined to the route that serves it. A handler that holds an I/O call
+/// site is an advisory finding. A probe path that no route serves abstains.
+#[test]
+fn scan_joins_a_liveness_probe_path_to_a_handler_that_calls_a_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, _) = write_scan_fixtures(dir.path());
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        r#"mux.HandleFunc("/healthz", healthHandler)"#,
+    ));
+    stream.push('\n');
+    stream.push_str(
+        &serde_json::json!({
+            "snapshot_id": "fixture",
+            "file_path": "handlers.go",
+            "line_number": 22,
+            "symbol": "healthHandler",
+            "func": "PingContext",
+            "client_type": "database/sql.DB",
+            "snippet": "db.PingContext(ctx)",
+            "lang": "go",
+        })
+        .to_string(),
+    );
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs = dir.path().join("server_specs.json");
+    std::fs::write(&specs, SERVER_SPECS_SEED).unwrap();
+    let manifest = |probe_path: &str| {
+        format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  \
+             template:\n    spec:\n      containers:\n        - name: app\n          \
+             image: web:v1\n          livenessProbe:\n            httpGet:\n              \
+             path: {probe_path}\n              port: 8080\n"
+        )
+    };
+    std::fs::create_dir_all(dir.path().join("k8s")).unwrap();
+    let scan = |probe_path: &str| {
+        std::fs::write(dir.path().join("k8s/deploy.yaml"), manifest(probe_path)).unwrap();
+        let out = bin()
+            .arg("scan")
+            .arg(dir.path())
+            .arg("--retrieved")
+            .arg(&packets_path)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+        stdout
+    };
+
+    let joined = scan("/healthz");
+    assert!(
+        joined.contains("liveness probe handler calls a dependency")
+            && joined.contains("healthHandler"),
+        "the joined probe must surface: {joined}"
+    );
+    assert!(
+        joined.contains("handlers.go:22"),
+        "the finding sits at the I/O call site: {joined}"
+    );
+    assert!(
+        !joined.contains("BLOCKING"),
+        "the finding is advisory: {joined}"
+    );
+
+    let unresolved = scan("/not-served-here");
+    assert!(
+        !unresolved.contains("liveness probe handler"),
+        "a probe path no route serves must abstain: {unresolved}"
+    );
+}
+
 /// The healthy shape: a health route plus rate-limiting middleware satisfies
 /// RC-020/RC-069 and nothing from the server lane surfaces in the ladder.
 #[test]

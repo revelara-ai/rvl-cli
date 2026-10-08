@@ -254,6 +254,55 @@ Three limits:
 - The retriever reads one function. For a value that leaves the function, the
   only other evidence is a method call on the same type in the same module.
 
+## The liveness probe join
+
+Kubernetes restarts a container when its liveness probe fails. If the handler
+of the probe calls a database or another service, an outage of that
+dependency restarts every replica, and a restart does not bring the
+dependency back.
+
+A scan finds this from two facts in the same repository:
+
+- The Kubernetes retriever reports the `httpGet` path of each liveness probe,
+  as the key `container.liveness-probe.http-get.path`. No spec judges this
+  key. A probe that is `exec`, `tcpSocket`, or `grpc` has no path and is not
+  reported.
+- A language retriever reports each route registration
+  (`site_kind: "server_entry"`) and each I/O call site.
+
+The scan matches the probe path to a route with a literal path, finds the
+function that the route names as its handler, and looks for I/O call sites in
+that function. A handler that has one is the advisory finding
+`server_entry.liveness-probe-handler-io` on RC-020. The finding is at the I/O
+call site, and it names the probe path, the handler, the registration, and
+the manifest. No spec is necessary for this finding.
+
+A route serves a probe path when the two are the same, or when the route path
+is the last segments of the probe path (`/healthz` serves `/api/healthz`,
+because a router can be mounted below a prefix).
+
+The scan reports nothing when a link is not resolved:
+
+- No route with a literal path serves the probe path. The handler is in a
+  different repository, or its path is a variable.
+- More than one registration serves the path.
+- The handler is an inline function, or a call that builds a handler. The
+  scan reads a plain reference (`health`, `h.Health`), a wrapper with one
+  argument (`http.HandlerFunc(health)`), and a decorated function.
+- I/O call sites in a function with the name of the handler are in more than
+  one file. A call site carries the name of its function without the package
+  or the type, so two functions with the same name cannot be told apart.
+
+Two limits:
+
+- The scan reads the handler only. It does not follow a call from the handler
+  into a different function, so a handler with no I/O call site is not
+  reported as safe.
+- The scan reads the liveness probe only. A readiness probe that calls a
+  dependency is correct, and a startup probe is not read.
+
+To waive the finding, use the class `server_entry.liveness-probe-handler-io`.
+
 ## What a retriever skips
 
 A retriever reads production code. Two kinds of file are left out, and

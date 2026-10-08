@@ -15,7 +15,9 @@
 //!     `pod.security-context` (default none)
 //!   * per container: `container.resources.{requests,limits}.{cpu,memory}`
 //!     (default none), `container.{liveness,readiness,startup}-probe`
-//!     (default none), `container.security-context` (default none),
+//!     (default none), `container.liveness-probe.http-get.path` (authored
+//!     only, vocabulary: the manifest half of the probe-to-handler join),
+//!     `container.security-context` (default none),
 //!     `container.image.pin` (derived shape: digest | tag | latest — never
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
@@ -35,6 +37,10 @@
 use crate::{render_value, ConfigPacket, FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
+
+/// The key that carries a liveness probe's `httpGet` path: the manifest half
+/// of the probe-to-handler join (`rvl_propagate::probe_handler`).
+pub const LIVENESS_HTTP_GET_PATH_KEY: &str = "container.liveness-probe.http-get.path";
 
 pub(super) fn get<'a>(m: &'a Mapping, key: &str) -> Option<&'a Value> {
     m.get(Value::String(key.to_string()))
@@ -372,6 +378,14 @@ pub(super) fn packets_from_doc(doc: &Value, em: &mut Emitter) {
             em.setting(&cunit, key, doc, &format!("{cpath}.{field}"), field, "none");
         }
 
+        // The path the kubelet requests, for the join to the handler that
+        // serves it. Carried only when the probe is an httpGet with a path:
+        // an exec, tcpSocket or grpc probe has no route to join to.
+        let live_path = format!("{cpath}.livenessProbe.httpGet.path");
+        if let Some(v @ Value::String(_)) = lookup(doc, &live_path) {
+            em.present(&cunit, LIVENESS_HTTP_GET_PATH_KEY, &live_path, v);
+        }
+
         em.setting(
             &cunit,
             "container.security-context",
@@ -595,6 +609,52 @@ spec:
         );
         assert_eq!(ready.resolved_value.as_deref(), Some("none"));
         assert_eq!(ready.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn a_liveness_http_get_path_is_carried_as_its_own_key() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: web:v1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+        - name: sidecar
+          image: proxy:v1
+          livenessProbe:
+            exec:
+              command: [\"true\"]
+";
+        let got = packets(yaml);
+        let path = find(
+            &got,
+            "container:deployment/web/app",
+            LIVENESS_HTTP_GET_PATH_KEY,
+        );
+        assert_eq!(path.resolved_value.as_deref(), Some("/healthz"));
+        assert_eq!(path.resolution, Resolution::AsAuthored);
+        // Only the liveness probe's path, and only when the probe is an
+        // httpGet: an exec probe has no handler to join to.
+        let carried: Vec<&str> = got
+            .packets
+            .iter()
+            .filter(|p| p.key == LIVENESS_HTTP_GET_PATH_KEY)
+            .map(|p| p.unit.as_str())
+            .collect();
+        assert_eq!(carried, vec!["container:deployment/web/app"]);
     }
 
     #[test]
