@@ -347,6 +347,75 @@ fn risk_list_json_is_raw_body_passthrough() {
     assert_eq!(out, format!("{raw}\n"));
 }
 
+// --- null list fields (po-m9w56) ---
+
+/// A risk list where the first row carries `null` in every list field, the
+/// way Go marshals a nil slice. One such row must not stop the whole list.
+const NULL_LIST_FIELDS_BODY: &str = r#"{"risks":[{"id":"a","risk_code":"R-1","title":"Null lists","category":"c","score":5,"status":"applicable","control_codes":null,"linked_services":null,"causal_factors":null,"linked_incidents":null,"linked_slos":null},{"id":"b","risk_code":"R-2","title":"Plain","category":"c","score":4,"status":"applicable","control_codes":["RC-1"],"linked_services":["svc"]}],"total":2,"page":1,"limit":1000}"#;
+
+#[test]
+fn risk_list_prints_the_list_when_a_risk_has_null_list_fields() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000",
+        200,
+        NULL_LIST_FIELDS_BODY,
+    )]);
+    let out =
+        rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None).unwrap();
+    assert!(out.contains("Total Risks: 2"), "{out}");
+    assert!(out.contains("R-1") && out.contains("Null lists"), "{out}");
+    assert!(out.contains("R-2") && out.contains("Plain"), "{out}");
+}
+
+/// `risk resolve` and `risk accept` find the risk id through this lookup.
+#[test]
+fn risk_id_lookup_reads_past_a_risk_with_null_list_fields() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000",
+        200,
+        NULL_LIST_FIELDS_BODY,
+    )]);
+    let client = server.client();
+    assert_eq!(
+        rvl_data::risk::find_risk_id_by_code(&client, "R-1").unwrap(),
+        "a"
+    );
+    assert_eq!(
+        rvl_data::risk::find_risk_id_by_code(&client, "R-2").unwrap(),
+        "b"
+    );
+}
+
+#[test]
+fn risk_ready_and_stale_read_null_list_fields() {
+    let server = MockServer::start(vec![
+        (
+            "GET /api/v1/risks?limit=1000&sort_by=score&sort_order=desc",
+            200,
+            NULL_LIST_FIELDS_BODY,
+        ),
+        ("GET /api/v1/risks/stale", 200, NULL_LIST_FIELDS_BODY),
+    ]);
+    let client = server.client();
+    let ready = rvl_data::risk::ready_output(&client, None, None, None, 10, None).unwrap();
+    assert!(ready.contains("R-1") && ready.contains("R-2"), "{ready}");
+    let stale = rvl_data::risk::stale_output(&client).unwrap();
+    assert!(stale.contains("R-1") && stale.contains("R-2"), "{stale}");
+}
+
+/// A Go nil `risks` slice is `null` on the wire: an empty list, not an error.
+#[test]
+fn risk_list_with_a_null_risks_array_is_an_empty_list() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?limit=1000",
+        200,
+        r#"{"risks":null,"total":0,"page":1,"limit":1000}"#,
+    )]);
+    let out =
+        rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None).unwrap();
+    assert_eq!(out, "No risks found.\n");
+}
+
 #[test]
 fn risk_list_encodes_filters_like_go_url_values() {
     let raw = r#"{"risks":[],"total":0,"page":1,"limit":1000}"#;

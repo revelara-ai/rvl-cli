@@ -21,6 +21,18 @@
 
 use serde_json::Value;
 
+/// Read a JSON `null` as the type's default. Go marshals a nil slice as
+/// `null`, not `[]`, and serde's `default` attribute covers only a MISSING
+/// field. Without this, one risk row with `control_codes: null` failed the
+/// parse of the whole list (po-m9w56).
+pub(crate) fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
+}
+
 /// A JSON value with Go marshaling semantics attached.
 pub enum G {
     Null,

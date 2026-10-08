@@ -15,6 +15,7 @@
 //! per-section functions keep the Go names so the two files diff by eye.
 
 use crate::display;
+use crate::gojson::null_as_default;
 use crate::risk::{CategoryCoverage, CoverageStats, MappedControl, RiskDetail};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -70,7 +71,7 @@ pub struct ScoreBreakdown {
 pub struct GeneratedMatcherRef {
     #[serde(default)]
     pub slug: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub source_pattern_ids: Vec<String>,
 }
 
@@ -117,7 +118,7 @@ pub struct UcaRef {
     pub uca_type: String,
     #[serde(default)]
     pub content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub control_edges: Vec<ProvenanceEdge>,
 }
 
@@ -127,15 +128,15 @@ pub struct LossScenarioRef {
     pub title: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub control_edges: Vec<ProvenanceEdge>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct StpaProvenanceData {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub ucas: Vec<UcaRef>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub loss_scenarios: Vec<LossScenarioRef>,
 }
 
@@ -162,9 +163,9 @@ pub struct SubstantiationFinding {
 pub struct ControlContextItem {
     #[serde(default)]
     pub control: MappedControl,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub existing_evidence: Vec<ContextEvidenceItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub evidence_gaps: Vec<String>,
 }
 
@@ -184,11 +185,11 @@ pub struct ContextEvidenceItem {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct KnowledgeContextResp {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub patterns: Vec<PatternItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub procedures: Vec<ProcedureItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub facts: Vec<FactItem>,
 }
 
@@ -198,7 +199,7 @@ pub struct PatternItem {
     pub title: String,
     #[serde(default)]
     pub pattern_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub causal_chain: Vec<ChainLink>,
     #[serde(default)]
     pub trigger_event: String,
@@ -208,7 +209,7 @@ pub struct PatternItem {
     pub typical_mttr: String,
     #[serde(default)]
     pub typical_blast_radius: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub prevention_strategies: Vec<String>,
     #[serde(default)]
     pub score: f64,
@@ -234,7 +235,7 @@ pub struct ProcedureItem {
     pub applied_count: i64,
     #[serde(default)]
     pub success_count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub related_controls: Vec<String>,
     #[serde(default)]
     pub score: f64,
@@ -295,16 +296,20 @@ pub struct ScoreFactorResp {
 pub struct RiskContextResponse {
     #[serde(default)]
     pub risk: RiskDetail,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub controls: Vec<ControlContextItem>,
     #[serde(default)]
     pub knowledge: KnowledgeContextResp,
     #[serde(default)]
     pub service_context: Option<ServiceContextResp>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub score_factors: Vec<ScoreFactorResp>,
     /// pre-po-foyko alias for `score_factors`.
-    #[serde(default, rename = "score_breakdown")]
+    #[serde(
+        default,
+        rename = "score_breakdown",
+        deserialize_with = "null_as_default"
+    )]
     pub score_factors_old: Vec<ScoreFactorResp>,
     #[serde(default)]
     pub grounding_provenance: String,
