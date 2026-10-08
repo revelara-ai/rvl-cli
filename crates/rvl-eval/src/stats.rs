@@ -2,7 +2,7 @@
 //! bootstrap. Every statistical primitive lives here so no two modules can
 //! drift apart on constants or algebra.
 
-use rand::distributions::{Distribution, Uniform};
+use rand::distr::{Distribution, Uniform};
 use rand::SeedableRng;
 
 /// The one 95% critical value. Two modules independently hard-coding "1.96"
@@ -142,7 +142,7 @@ pub fn paired_bootstrap(a: &[bool], b: &[bool], reps: usize, seed: u64) -> BootD
     // One pass over the pair, then each replicate sums a single i8 vector
     // instead of indexing two bool vectors; the sampler is built once.
     let d: Vec<i8> = a.iter().zip(b).map(|(x, y)| *y as i8 - *x as i8).collect();
-    let dist = Uniform::from(0..n);
+    let dist = Uniform::new(0, n).expect("non-empty input");
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut deltas = Vec::with_capacity(reps);
     for _ in 0..reps {

@@ -7761,7 +7761,7 @@ fn install_signed_commercial_tier(root: &std::path::Path, apis: &str) -> String 
     use base64::Engine;
     use ed25519_dalek::Signer;
 
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing = ed25519_dalek::SigningKey::from_bytes(&rand::random());
     let key_hex = hex::encode(signing.verifying_key().to_bytes());
     let keyset = rvl_cache::Keyset::from_hex(&[key_hex.as_str()]).unwrap();
     let bytes = format!(
@@ -7862,7 +7862,7 @@ fn the_test_keyset_does_not_trust_a_tier_signed_by_another_key() {
     let (root, packets, _) = write_runtime_python_fixture("signed-other-key");
     install_signed_commercial_tier(&root, "[]");
     let other = hex::encode(
-        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+        ed25519_dalek::SigningKey::from_bytes(&rand::random())
             .verifying_key()
             .to_bytes(),
     );
