@@ -30,12 +30,12 @@ pub fn fetch_latest_cli_version() -> Option<String> {
 }
 
 fn fetch_latest_cli_version_from(url: &str) -> Option<String> {
-    let resp = ureq::get(url)
-        .timeout(TIMEOUT)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-        .ok()?;
-    let body: serde_json::Value = serde_json::from_reader(resp.into_reader()).ok()?;
+    let headers = [("Accept", "application/vnd.github+json")];
+    let resp = crate::client::send("GET", url, &headers, None, TIMEOUT).ok()?;
+    if crate::client::is_error_status(&resp) {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader()).ok()?;
     let tag = body.get("tag_name")?.as_str()?;
     let tag = tag.strip_prefix('v').unwrap_or(tag);
     if tag.is_empty() {

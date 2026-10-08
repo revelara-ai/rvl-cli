@@ -120,35 +120,62 @@ impl HttpFetcher {
     }
 }
 
+/// The agent for one request. Each setting holds a behavior this fetcher was
+/// written against, where the ureq 3 default is different (po-av01j.236):
+/// a 30 s connect timeout (ureq 3 has none), `proxy(None)` because ureq 3
+/// reads the proxy variables from the environment by default, and
+/// `max_redirects(5)`, the ureq 2 limit. A 4xx/5xx stays an error.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .proxy(None)
+        .max_redirects(5)
+        .build()
+        .into()
+}
+
+type Response = ureq::http::Response<ureq::Body>;
+
+/// The full body, with no size limit (a plugin tarball can be large).
+fn read_body(resp: Response) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut body)?;
+    Ok(body)
+}
+
+fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
 impl Fetcher for HttpFetcher {
     fn fetch_version(&self) -> anyhow::Result<String> {
-        let resp = ureq::get(&self.url("/api/v1/plugin"))
-            .set("Authorization", &self.auth())
+        let resp = http_agent()
+            .get(self.url("/api/v1/plugin"))
+            .header("Authorization", self.auth())
             .call()?;
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)?;
-        parse_version_response(&body)
+        parse_version_response(&read_body(resp)?)
     }
 
     fn fetch_signing_key(&self) -> anyhow::Result<[u8; 32]> {
         // Public endpoint; no auth header needed (the key is not secret).
-        let resp = ureq::get(&self.url("/api/v1/plugin/signing-key")).call()?;
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)?;
-        parse_signing_key_response(&body)
+        let resp = http_agent()
+            .get(self.url("/api/v1/plugin/signing-key"))
+            .call()?;
+        parse_signing_key_response(&read_body(resp)?)
     }
 
     fn fetch_tarball(&self, editor: &str) -> anyhow::Result<TarballDownload> {
         let url = format!("{}?editor={editor}", self.url("/api/v1/plugin/download"));
-        let resp = ureq::get(&url).set("Authorization", &self.auth()).call()?;
-        let version = resp
-            .header("X-Plugin-SemVer")
-            .or_else(|| resp.header("X-Plugin-Version"))
+        let resp = http_agent()
+            .get(&url)
+            .header("Authorization", self.auth())
+            .call()?;
+        let version = header(&resp, "X-Plugin-SemVer")
+            .or_else(|| header(&resp, "X-Plugin-Version"))
             .map(|v| semver_base(v).to_string())
             .unwrap_or_default();
-        let checksum = resp.header("X-Checksum").map(str::to_string);
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes)?;
+        let checksum = header(&resp, "X-Checksum").map(str::to_string);
+        let bytes = read_body(resp)?;
         anyhow::ensure!(!bytes.is_empty(), "empty plugin tarball from server");
         anyhow::ensure!(
             !version.is_empty(),
@@ -163,10 +190,10 @@ impl Fetcher for HttpFetcher {
 
     fn fetch_editors(&self) -> anyhow::Result<Vec<EditorInfo>> {
         // Public endpoint; no auth header needed (the list is not secret).
-        let resp = ureq::get(&self.url("/api/v1/plugin/editors")).call()?;
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)?;
-        parse_editors_response(&body)
+        let resp = http_agent()
+            .get(self.url("/api/v1/plugin/editors"))
+            .call()?;
+        parse_editors_response(&read_body(resp)?)
     }
 }
 
