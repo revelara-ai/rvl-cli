@@ -85,7 +85,15 @@ enum Cmd {
     //
     // Submission mode is rvl-cli parity (po-av01j.153): same flags and wire
     // contract, so plugin skill content works against this binary verbatim.
+    //
+    // `digest` and `finalize` are real subcommands, so a directory of either
+    // name is scanned as `./digest`. No scan flag combines with them.
+    // clap's generated `help` subcommand is off: it would take one more name
+    // from PATH, and `scan --help` already lists the two.
+    #[command(args_conflicts_with_subcommands = true, disable_help_subcommand = true)]
     Scan {
+        #[command(subcommand)]
+        tool: Option<ScanTool>,
         /// Repo/dir to scan (default: current directory). Ignored when
         /// `--retrieved` is given.
         path: Option<PathBuf>,
@@ -6732,6 +6740,11 @@ fn run() -> anyhow::Result<ExitCode> {
     // config/exit-code contract inside rvl-data (rvl-cli parity) and never
     // touch the spec cache, so they dispatch before the store opens.
     let cmd = match cmd {
+        // `scan digest` / `scan finalize`: file transforms, so they dispatch
+        // before submission mode and before the spec store opens.
+        Cmd::Scan {
+            tool: Some(tool), ..
+        } => return run_scan_tool(tool),
         // `scan force-next` is a positional SUBCOMMAND, not a path
         // (po-av01j.182). Intercepted first, exactly as rvl-cli intercepts it
         // before flag parsing: otherwise it parses as a directory to scan and
@@ -7370,6 +7383,90 @@ fn restore_default_sigpipe() {
 
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
+
+/// The mechanical steps of an orchestrated scan (the `/rvl:scan` skill),
+/// which the skill once carried as scripts. Neither one scans, reads the spec
+/// cache or uses the network.
+#[derive(clap::Subcommand)]
+enum ScanTool {
+    /// Print the residual-scoping digest of a scan document.
+    ///
+    /// Reads the document that `scan --out` wrote and prints what the engine
+    /// settled (ENGINE_DIGEST, COVERED_CLASSES), the sites it left undecided
+    /// (UNDECIDED), and the ADJUDICATION_LIST of at most 20 runtime sites,
+    /// lever `judge` first, then `bounds`, then `no_spec`. A document whose
+    /// schema is not `rvl-scan/v1` is refused.
+    Digest {
+        /// The scan document (`scan --out <file>`).
+        engine_doc: PathBuf,
+    },
+    /// Rebuild the findings files of a submit directory from the lens outputs.
+    ///
+    /// Reads `<SCAN_DIR>.lens/*.json` and writes one
+    /// `03-findings-<lens>.json` per lens, plus `03-findings-engine.json`
+    /// with `--engine`. Maps lens fields to the
+    /// submission schema, assigns each finding the component of
+    /// `01-stack.json` with the longest matching path, scores it, and prints
+    /// LENS_DIGEST. Every run starts from the lens files, so it is safe to
+    /// run again with another patch. A run that fails changes nothing.
+    Finalize {
+        /// The submit directory, as later given to `scan --scan-dir`.
+        scan_dir: PathBuf,
+        /// The scan document (`scan --out <file>`). Its findings become
+        /// `03-findings-engine.json`, less the suppressed ones.
+        #[arg(long)]
+        engine: Option<PathBuf>,
+        /// Judgments to apply, as JSON: `findings` (per `<lens>#<n>`:
+        /// `control_codes`, `corroboration`, `corroboration_strength`,
+        /// `substantiation_strength`, `graph_evidence`, `extends`), `drop`
+        /// (a list of `<lens>#<n>`), `control_categories` and `catalog_meta`.
+        #[arg(long)]
+        patch: Option<PathBuf>,
+        /// The risk register (`risk list --format=json`). A finding whose
+        /// patch entry has `extends: <risk code>` takes that risk's title and
+        /// control codes; a second finding on the same risk is dropped.
+        #[arg(long)]
+        register: Option<PathBuf>,
+        /// The scan mode written to every findings file.
+        #[arg(long, default_value = "quick", value_parser = ["quick", "deep"])]
+        mode: String,
+        /// Business criticality, 0.0 to 1.0: written to every findings file,
+        /// and a factor of each lens score.
+        #[arg(long, default_value_t = 0.0)]
+        crit: f64,
+    },
+}
+
+/// `scan digest` and `scan finalize`. A failure prints one line and exits 1,
+/// with nothing on stdout.
+fn run_scan_tool(tool: ScanTool) -> anyhow::Result<ExitCode> {
+    let mut out = std::io::stdout().lock();
+    match tool {
+        ScanTool::Digest { engine_doc } => rvl_data::scan_digest::run(&engine_doc, &mut out),
+        ScanTool::Finalize {
+            scan_dir,
+            engine,
+            patch,
+            register,
+            mode,
+            crit,
+        } => rvl_data::scan_finalize::run(
+            &rvl_data::scan_finalize::FinalizeArgs {
+                scan_dir,
+                engine,
+                patch,
+                register,
+                mode,
+                crit,
+            },
+            &mut out,
+        ),
+    }
+    // `main` prints the outermost message alone; these errors carry the file
+    // in their context.
+    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    Ok(ExitCode::SUCCESS)
+}
 
 #[derive(clap::Subcommand)]
 enum ServiceCmd {

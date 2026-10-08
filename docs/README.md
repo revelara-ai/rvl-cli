@@ -22,6 +22,7 @@ end.
 | Document | What is in it |
 | --- | --- |
 | [The `--out` document contract](out-contract.md) | The machine-readable scan document (`rvl-scan/v1`) consumed by orchestrators; the external spec for `crates/rvl/src/out_doc.rs`. |
+| [Release notes](release-notes.md) | What each release adds for a consumer that must know the version it runs against, such as a skill that probes for a minimum `rvl` version. |
 | [Releasing](releasing.md) | Cutting a release, and how each retriever helper is packaged. |
 | [Test packets](test-packets.md) | Why hand-authored `--retrieved` test packets must be bound to a live helper run, and the per-lane audit. |
 | [The top-20 lens candidates, reconciled](lens-reconciliation.md) | Which of the ranked lens classes the scanner already ships, which need only a corpus entry, and which need a retriever. Read it before you port a lens class. |

@@ -71,6 +71,18 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // rvl-native (po-av01j.171). A CI pin is an optional string: empty ==
     // not given, so RVL_SPEC_VERSION still applies and nothing is pinned.
     ("scan", "spec-version", Empty::Absent),
+    // rvl-native, no rvl-cli counterpart: the scan skill's file transforms.
+    // The three inputs are paths (clap's PathBuf parser refuses an empty one,
+    // as for `scan --out`), `--mode` is one of two words and `--crit` is a
+    // number, so an empty value is a usage error for each. None of them is
+    // optional in a way that "empty" could stand for: a skill that passes
+    // `--patch=` has lost the patch, and running without it would submit
+    // findings with no grounding.
+    ("scan finalize", "engine", Empty::Error),
+    ("scan finalize", "patch", Empty::Error),
+    ("scan finalize", "register", Empty::Error),
+    ("scan finalize", "mode", Empty::Error),
+    ("scan finalize", "crit", Empty::Error),
     // Added when po-av01j.185 and .191 merged in alongside .192; this table is
     // what caught them. Each read off rvl-cli origin/main, not inferred:
     //
