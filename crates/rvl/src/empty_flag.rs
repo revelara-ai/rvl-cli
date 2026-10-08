@@ -83,6 +83,9 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("scan finalize", "register", Empty::Error),
     ("scan finalize", "mode", Empty::Error),
     ("scan finalize", "crit", Empty::Error),
+    // A path, as above. `scan report --scan-dir=` has lost the directory, and
+    // a report without it would leave out the practice-control rows silently.
+    ("scan report", "scan-dir", Empty::Error),
     // Added when po-av01j.185 and .191 merged in alongside .192; this table is
     // what caught them. Each read off rvl-cli origin/main, not inferred:
     //

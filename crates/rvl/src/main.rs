@@ -86,10 +86,10 @@ enum Cmd {
     // Submission mode is rvl-cli parity (po-av01j.153): same flags and wire
     // contract, so plugin skill content works against this binary verbatim.
     //
-    // `digest` and `finalize` are real subcommands, so a directory of either
-    // name is scanned as `./digest`. No scan flag combines with them.
-    // clap's generated `help` subcommand is off: it would take one more name
-    // from PATH, and `scan --help` already lists the two.
+    // `digest`, `finalize` and `report` are real subcommands, so a directory
+    // of one of those names is scanned as `./digest`. No scan flag combines
+    // with them. clap's generated `help` subcommand is off: it would take one
+    // more name from PATH, and `scan --help` already lists the three.
     #[command(args_conflicts_with_subcommands = true, disable_help_subcommand = true)]
     Scan {
         #[command(subcommand)]
@@ -7385,8 +7385,8 @@ fn restore_default_sigpipe() {
 fn restore_default_sigpipe() {}
 
 /// The mechanical steps of an orchestrated scan (the `/rvl:scan` skill),
-/// which the skill once carried as scripts. Neither one scans, reads the spec
-/// cache or uses the network.
+/// which the skill once carried as scripts and a report template. None of
+/// them scans, reads the spec cache or uses the network.
 #[derive(clap::Subcommand)]
 enum ScanTool {
     /// Print the residual-scoping digest of a scan document.
@@ -7435,10 +7435,27 @@ enum ScanTool {
         #[arg(long, default_value_t = 0.0)]
         crit: f64,
     },
+    /// Print the sections of the scan report that are pure data, as Markdown.
+    ///
+    /// Reads the document that `scan --out` wrote and prints the Gate section
+    /// (every BLOCKING, ADVISORY and SUPPRESSED row as the engine wrote it; a
+    /// suppressed row is shown with a flag, never left out) and the Coverage
+    /// engine line and language roll-call. With `--scan-dir`, also prints the
+    /// "Not Assessable From Code" rows: the practice controls among the
+    /// control codes of the findings files, with the `/rvl:assess-*` skill
+    /// for each. A document whose schema is not `rvl-scan/v1` is refused.
+    Report {
+        /// The scan document (`scan --out <file>`).
+        engine_doc: PathBuf,
+        /// The submit directory, after `scan finalize` wrote its
+        /// `03-findings-*.json` files.
+        #[arg(long)]
+        scan_dir: Option<PathBuf>,
+    },
 }
 
-/// `scan digest` and `scan finalize`. A failure prints one line and exits 1,
-/// with nothing on stdout.
+/// `scan digest`, `scan finalize` and `scan report`. A failure prints one
+/// line and exits 1, with nothing on stdout.
 fn run_scan_tool(tool: ScanTool) -> anyhow::Result<ExitCode> {
     let mut out = std::io::stdout().lock();
     match tool {
@@ -7461,6 +7478,10 @@ fn run_scan_tool(tool: ScanTool) -> anyhow::Result<ExitCode> {
             },
             &mut out,
         ),
+        ScanTool::Report {
+            engine_doc,
+            scan_dir,
+        } => rvl_data::scan_report::run(&engine_doc, scan_dir.as_deref(), &mut out),
     }
     // `main` prints the outermost message alone; these errors carry the file
     // in their context.

@@ -11,6 +11,7 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl scan force-next [--target <dir>]` | Arm a one-shot gate bypass for the next hook run (for GUI git clients that cannot set `RVL_FORCE=1`). Audited in `.git/rvl-audit.jsonl`. |
 | `rvl scan digest <ENGINE_DOC>` | Print the residual-scoping digest of a scan document (`scan --out`). See [Orchestrated scans](#orchestrated-scans). |
 | `rvl scan finalize <SCAN_DIR>` | Rebuild the findings files of a submit directory from the lens outputs. See [Orchestrated scans](#orchestrated-scans). |
+| `rvl scan report <ENGINE_DOC>` | Print the sections of the scan report that are pure data, as Markdown. See [Orchestrated scans](#orchestrated-scans). |
 | `rvl explain <ID> [PATH]` | Explain one finding as an evidence block: the sites it covers, the control, and the fix. |
 | `rvl suppress <ID> [PATH] [--reason …] [--expires YYYY-MM-DD]` | Waive a finding: append a rule waiver to `./.revelara.yaml` under `scanner.waivers`. |
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
@@ -56,10 +57,10 @@ set is rvl-cli parity:
 ### Orchestrated scans
 
 The `/rvl:scan` skill runs the deterministic scan, then a pass of expert
-lenses, and submits both. `digest` and `finalize` are its mechanical steps.
-They read and write local files only: no scan, no spec cache, no network. A
-failure prints one line on stderr and exits 1. Both need rvl 1.4.0 or later
-(see the [release notes](release-notes.md)).
+lenses, and submits both. `digest`, `finalize` and `report` are its mechanical
+steps. They read and write local files only: no scan, no spec cache, no
+network. A failure prints one line on stderr and exits 1. All three need rvl
+1.4.0 or later (see the [release notes](release-notes.md)).
 
 `rvl scan digest <ENGINE_DOC>` reads the document that `rvl scan --out` wrote
 and prints, as text:
@@ -117,8 +118,36 @@ contains the finding), removes retired control codes, and computes
 lens wrote in that field is not submitted. It prints one `Written:` line for
 each file, then `LENS_DIGEST`, the lens findings by score.
 
-`digest` and `finalize` are subcommand names, so to scan a directory with one
-of those names, write it as a path: `rvl scan ./digest`.
+`rvl scan report <ENGINE_DOC> [--scan-dir <SCAN_DIR>]` prints the sections of
+the scan report that are data, as Markdown. The skill adds the sections that
+need judgment (the lens findings, the adjudicated sites, the recommended
+actions) and does not change these:
+
+- `### Gate (deterministic engine) — exit <n>`: each finding of the scan
+  document under `BLOCKING`, `ADVISORY` or `SUPPRESSED`, as
+  `[id] class — site · control · fix: fix`, with the text of the engine
+  unchanged. The section is the `severity` of the finding. A blocking row has
+  a second line that tells how to waive it. No row is left out: a row under
+  `SUPPRESSED` ends with `(suppressed)` when a waiver suppressed it and with
+  `(low value)` when the engine keeps it out of the gate, and a gate-exempt
+  row ends with `(gate-exempt)`. A finding with another `severity` is an
+  error.
+- `### Coverage`: the `Engine:` line (resolved and total retrieved API
+  surfaces, the percentage, and the abstain count of each lever) and the
+  `Languages:` line, which is the roll-call of `coverage.lang_status` in the
+  words of the COVERAGE block of `rvl scan`.
+- `### Not Assessable From Code`, with `--scan-dir` only: one line for each
+  `/rvl:assess-*` skill whose practice controls are among the `control_codes`
+  of `<SCAN_DIR>/03-findings-*.json`, with those control codes. Run
+  `rvl scan finalize` first: a directory with no findings file is an error.
+  The section is not printed when no practice control is touched. The skill
+  adds the reason to each line.
+
+It refuses a document whose `schema` is not `rvl-scan/v1`, and then prints
+nothing.
+
+`digest`, `finalize` and `report` are subcommand names, so to scan a directory
+with one of those names, write it as a path: `rvl scan ./digest`.
 
 ## Setting up a repo and a machine
 

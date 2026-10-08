@@ -1,6 +1,6 @@
-//! `rvl scan digest` and `rvl scan finalize` through the binary: the wiring,
-//! the exit codes, and that neither one disturbs `rvl scan [PATH]`. What the
-//! two commands compute is tested in `rvl-data`.
+//! `rvl scan digest`, `rvl scan finalize` and `rvl scan report` through the
+//! binary: the wiring, the exit codes, and that none of them disturbs `rvl
+//! scan [PATH]`. What the commands compute is tested in `rvl-data`.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -147,7 +147,90 @@ fn scan_finalize_usage_errors_exit_2_and_a_missing_dir_exits_1() {
     }
 }
 
-/// `digest` and `finalize` are subcommand names now. A path that is not one
+/// `finalize` and then `report` are one pipeline: the report reads the scan
+/// document for the gate and the coverage, and the findings files that
+/// `finalize` wrote for the practice controls.
+#[test]
+fn scan_report_prints_the_data_sections_and_refuses_another_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_dir = dir.path().join("scan-parts");
+    std::fs::create_dir(&scan_dir).unwrap();
+    let doc = dir.path().join("scan-parts.engine.json");
+    let mut engine = engine_doc();
+    engine["coverage"]["lang_status"] = json!([{"lang": "go", "state": "scanned", "detail": "2"}]);
+    let mut waived = engine["findings"][0].clone();
+    waived["id"] = json!("E2");
+    waived["severity"] = json!("suppressed");
+    waived["suppressed"] = json!(true);
+    engine["findings"].as_array_mut().unwrap().push(waived);
+    write(&doc, &engine);
+    write(
+        &dir.path().join("scan-parts.lens/sre-pro.json"),
+        &json!({"findings": [{"title": "No paging policy", "severity": "high", "risk_category": "operations", "location": "deploy/alerts.yaml:1", "control_code": "RC-003"}]}),
+    );
+    let (dir_arg, doc_arg) = (scan_dir.to_str().unwrap(), doc.to_str().unwrap());
+    let out = rvl(
+        dir.path(),
+        &["scan", "finalize", dir_arg, "--engine", doc_arg],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    let gate_and_coverage = "\
+### Gate (deterministic engine) — exit 3
+BLOCKING (1):
+  [E1] http.Client — internal/x.go:3 · RC-019 · fix: set timeout
+    waive: `rvl suppress E1 --reason=\"...\"` or a `# rvl:allow` comment on the line
+ADVISORY (0):
+SUPPRESSED (1):
+  [E2] http.Client — internal/x.go:3 · RC-019 · fix: set timeout (suppressed)
+
+### Coverage
+Engine: 1/2 retrieved API surfaces resolved (50% of retrieved) · abstains: no_spec 1 · bounds 0 · judge 0 · other 0
+Languages: go 2 sites
+";
+    let out = rvl(dir.path(), &["scan", "report", doc_arg]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), gate_and_coverage);
+
+    let out = rvl(
+        dir.path(),
+        &["scan", "report", doc_arg, "--scan-dir", dir_arg],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "{gate_and_coverage}
+### Not Assessable From Code
+These gaps touch practice controls that only the team can attest to; run the interview:
+- `/rvl:assess-alert-hygiene` (RC-003)
+"
+        )
+    );
+
+    for bad in [
+        vec!["scan", "report"],
+        // An empty value is never "not given": the practice-control rows
+        // must not go missing without a word.
+        vec!["scan", "report", doc_arg, "--scan-dir="],
+        vec!["scan", "--strict", "report", doc_arg],
+    ] {
+        let out = rvl(dir.path(), &bad);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", text(&out.stderr));
+    }
+
+    write(&doc, &json!({"schema": "rvl-scan/v2"}));
+    let out = rvl(dir.path(), &["scan", "report", doc_arg]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "a refusal prints no report");
+    assert!(
+        text(&out.stderr).contains("unexpected schema rvl-scan/v2"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// `digest`, `finalize` and `report` are subcommand names now. A path that is not one
 /// of them, `force-next` included, still parses as before.
 #[test]
 fn scan_with_a_path_is_not_taken_for_a_subcommand() {
@@ -155,7 +238,7 @@ fn scan_with_a_path_is_not_taken_for_a_subcommand() {
     let out = rvl(dir.path(), &["scan", "--help"]);
     let help = text(&out.stdout);
     assert!(
-        help.contains("digest") && help.contains("finalize"),
+        help.contains("digest") && help.contains("finalize") && help.contains("report"),
         "{help}"
     );
     assert!(help.contains("[PATH]"), "{help}");
