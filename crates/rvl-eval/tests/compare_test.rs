@@ -164,3 +164,43 @@ fn repeated_site_ids_are_reported_not_silently_joined() {
         "a repeated join key must be surfaced"
     );
 }
+
+/// Pins the seeded streams. The sample and the bootstrap interval come from
+/// `rand`'s StdRng, whose output for a seed is stable within one `rand`
+/// version only. A `rand` upgrade that moves either value fails here, so the
+/// move is seen and re-pinned on purpose, never by accident. Re-pinned once,
+/// for rand 0.8 -> 0.10 (po-av01j.233): the sample was f10, f04, f08, f01 and
+/// the bootstrap mean was -0.6694166666666747.
+#[test]
+fn seeded_outputs_are_pinned() {
+    let a: Vec<Finding> = (0..12)
+        .map(|i| f(&format!("r1/f{i:02}.go:1"), "r1", "db.Query", "violates"))
+        .collect();
+    let b: Vec<Finding> = (0..12)
+        .map(|i| {
+            let verdict = if i % 3 == 0 { "violates" } else { "abstain" };
+            f(&format!("r1/f{i:02}.go:1"), "r1", "db.Query", verdict)
+        })
+        .collect();
+    let r = compare_conditions(&a, &b, None, 1000, 4, 42).unwrap();
+    let ids: Vec<&str> = r
+        .disagreement_sample
+        .iter()
+        .map(|d| d.site_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["r1/f07.go:1", "r1/f10.go:1", "r1/f05.go:1", "r1/f04.go:1"]
+    );
+    let d = r.decided_delta;
+    assert_eq!(
+        (d.mean, d.lo, d.hi, d.p_better),
+        (
+            -0.6672500000000069,
+            -0.9166666666666666,
+            -0.4166666666666667,
+            0.0
+        ),
+        "bootstrap stream moved"
+    );
+}

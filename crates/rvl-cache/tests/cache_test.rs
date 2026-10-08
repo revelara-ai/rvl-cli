@@ -12,7 +12,7 @@ struct TestKeys {
 }
 
 fn keys() -> TestKeys {
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing = ed25519_dalek::SigningKey::from_bytes(&rand::random());
     let hex_pub = hex::encode(signing.verifying_key().to_bytes());
     let keyset = Keyset::from_hex(&[hex_pub.as_str()]).unwrap();
     TestKeys { signing, keyset }
