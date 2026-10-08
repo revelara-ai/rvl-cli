@@ -224,6 +224,10 @@ pub struct OutCoverage {
     /// Test files the retrievers skipped, summed across languages
     ///; the per-language split is in the COVERAGE block.
     pub test_files_skipped: usize,
+    /// Files a retriever parsed only partly, summed across languages
+    /// (po-av01j.224). Non-zero means the site counts are a floor for those
+    /// files; the per-language split is in the COVERAGE block.
+    pub parse_incomplete_files: usize,
     /// Workspaces scanned without their installed dependencies, summed
     /// across languages (po-pk3fp.15). Non-zero means those lanes resolved
     /// client types from import syntax; the per-language split is in the
@@ -347,6 +351,7 @@ pub fn build(
             },
             generated_skipped: coverage.generated_skipped,
             test_files_skipped: coverage.test_files_skipped.iter().map(|t| t.count).sum(),
+            parse_incomplete_files: coverage.parse_incomplete.iter().map(|p| p.count).sum(),
             dependency_trees_uninstalled: coverage
                 .dependencies_uninstalled
                 .iter()

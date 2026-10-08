@@ -2450,6 +2450,20 @@ fn helper_degrade_reason(
     }
 }
 
+/// The files one stream's helper parsed only partly, as a COVERAGE row for
+/// `lang` (po-av01j.224). Empty when the helper named none. The roll-call
+/// note below says WHY from the same record; this is the count the `--out`
+/// document carries, the same on the full and the incremental path.
+fn parse_incomplete_of(lang: &str, cfg: &rvl_core::RepoConfig) -> Vec<render::ParseIncomplete> {
+    match cfg.parse_incomplete_paths.len() {
+        0 => Vec::new(),
+        count => vec![render::ParseIncomplete {
+            lang: lang.to_string(),
+            count,
+        }],
+    }
+}
+
 /// Did the helper parse some of its units only PARTLY? Read off the
 /// `retrieval_stats` record(s) on one language's stream: `tus_incomplete`
 /// counts units whose parse raised errors, which clang recovers from by
@@ -2840,6 +2854,8 @@ struct RetrievedStream {
     /// Test files each helper declined to read, per language. The
     /// same rule as `generated_skipped`: reported, never silent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Files each helper parsed only partly, per language (po-av01j.224).
+    parse_incomplete: Vec<render::ParseIncomplete>,
     /// Workspaces whose dependencies were not installed, per language
     /// (po-pk3fp.15). The lane scanned, from import syntax alone, and the
     /// report has to say so.
@@ -2888,6 +2904,7 @@ fn resolve_packet_stream(
         // is named for what it is.
         let cfg = rvl_core::parse_stream(&text).1;
         let dependencies_uninstalled = dependencies_uninstalled_of("retrieved stream", &cfg);
+        let parse_incomplete = parse_incomplete_of("retrieved stream", &cfg);
         let test_files_skipped = match cfg.test_files_skipped {
             0 => Vec::new(),
             count => vec![render::TestFilesSkipped {
@@ -2901,6 +2918,7 @@ fn resolve_packet_stream(
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
             test_files_skipped,
+            parse_incomplete,
             dependencies_uninstalled,
             total_failure: None,
             degraded: Vec::new(),
@@ -2942,6 +2960,7 @@ fn resolve_packet_stream(
             text: String::new(),
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             total_failure: None,
             retrievers: Vec::new(),
@@ -3008,6 +3027,7 @@ fn resolve_packet_stream(
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
     let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
+    let mut parse_incomplete: Vec<render::ParseIncomplete> = Vec::new();
     let mut dependencies_uninstalled: Vec<render::DependenciesUninstalled> = Vec::new();
     let mut degraded: Vec<LangDegradation> = Vec::new();
     let mut status: Vec<render::LangStatus> = Vec::new();
@@ -3062,6 +3082,7 @@ fn resolve_packet_stream(
                 dependencies_uninstalled
                     .extend(dependencies_uninstalled_of(&lang.to_string(), &cfg));
                 retrieval.extend(cfg.retrieval.clone());
+                parse_incomplete.extend(parse_incomplete_of(&lang.to_string(), &cfg));
                 let skipped = cfg.test_files_skipped;
                 if skipped > 0 {
                     test_files_skipped.push(render::TestFilesSkipped {
@@ -3125,6 +3146,7 @@ fn resolve_packet_stream(
         text: combined,
         generated_skipped,
         test_files_skipped,
+        parse_incomplete,
         dependencies_uninstalled,
         total_failure,
         status,
@@ -3856,6 +3878,7 @@ fn run_scan(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             // The full path takes no `--hook`.
             render::GatedOperation::Commit,
         );
@@ -3907,6 +3930,7 @@ fn run_scan(
         stream.generated_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
+        stream.parse_incomplete.clone(),
         stream.retrieval.clone(),
         stream.dependencies_uninstalled.clone(),
         render::GatedOperation::Commit,
@@ -4039,6 +4063,8 @@ fn render_scan_output(
     empty_api_corpus: bool,
     // Test files the retrievers declined to read, per language.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    // Files the retrievers parsed only partly, per language (po-av01j.224).
+    parse_incomplete: Vec<render::ParseIncomplete>,
     // The retrieval denominator per language (po-av01j.219).
     retrieval: Vec<rvl_core::RetrievalCensus>,
     // Workspaces scanned without their installed dependencies, per language.
@@ -4059,6 +4085,7 @@ fn render_scan_output(
         generated_skipped,
         empty_api_corpus,
         test_files_skipped,
+        parse_incomplete,
         dependencies_uninstalled,
         degraded_note,
         lang_status,
@@ -4499,6 +4526,11 @@ struct IncrementalScan {
     /// nobody is told about is the silent exclusion the line exists to
     /// prevent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
+    /// Files the helpers parsed only partly, per language, REPOSITORY-WIDE
+    /// like the skip count above and for the same reason (po-av01j.224): a
+    /// reused entry whose parse was incomplete is still incomplete, and a
+    /// pass that re-parsed nothing must still say so.
+    parse_incomplete: Vec<render::ParseIncomplete>,
     /// Languages whose helper ran THIS pass against an uninstalled
     /// dependency tree (po-pk3fp.15). Unlike the test-file skip this is the
     /// pass's own observation, not a repository-wide one: the index keeps no
@@ -4524,6 +4556,7 @@ impl IncrementalScan {
             reparsed_files: Vec::new(),
             lang_degraded: Vec::new(),
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             no_supported_sources: true,
         }
@@ -4561,11 +4594,23 @@ where
             *test_skips.entry(lang).or_default() += 1;
         }
     };
+    // Likewise an entry flagged as parsed only partly (po-av01j.224): its
+    // packets are reused, and it is counted, or the unit reads as a clean
+    // parse on every pass after the one that parsed it.
+    let mut incompletes: std::collections::BTreeMap<Lang, usize> = Default::default();
+    let mut count_incomplete = |f: &Path| {
+        if let Some(lang) = lang_of_path(f) {
+            *incompletes.entry(lang).or_default() += 1;
+        }
+    };
     for f in &plan.unchanged {
         let h = rvl_index::hash_file(f)?;
         if let Some(cached) = index.planned(f, &h)? {
             if cached.test_skipped {
                 count_skip(f);
+            }
+            if cached.parse_incomplete {
+                count_incomplete(f);
             }
             reused.extend(cached.sites);
         }
@@ -4588,9 +4633,20 @@ where
         .iter()
         .map(String::as_str)
         .collect();
+    // The changed files the helper parsed only partly, named the same way.
+    let incomplete_now: std::collections::BTreeSet<&str> = rr
+        .repo_cfg
+        .parse_incomplete_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
     for f in &plan.changed {
-        if skipped_now.contains(repo_relative(root, f).as_str()) {
+        let rel = repo_relative(root, f);
+        if skipped_now.contains(rel.as_str()) {
             count_skip(f);
+        }
+        if incomplete_now.contains(rel.as_str()) {
+            count_incomplete(f);
         }
     }
 
@@ -4626,7 +4682,15 @@ where
                 .map(|hs| hs.iter().map(|h| root.join(h)).collect())
                 .unwrap_or_default();
             let h = rvl_index::hash_file(f)?;
-            index.put_with_deps(f, &h, &shard_of(&rel, &rr.sites, headers), &deps)?;
+            let shard = shard_of(&rel, &rr.sites, headers);
+            // A unit parsed only partly is recorded AS incomplete, with the
+            // packets that did resolve: the next pass reuses them and has to
+            // count this one too.
+            if incomplete_now.contains(rel.as_str()) {
+                index.put_incomplete_with_deps(f, &h, &shard, &deps)?;
+            } else {
+                index.put_with_deps(f, &h, &shard, &deps)?;
+            }
             indexed += 1;
         }
     }
@@ -4646,6 +4710,13 @@ where
         test_files_skipped: test_skips
             .into_iter()
             .map(|(lang, count)| render::TestFilesSkipped {
+                lang: lang.to_string(),
+                count,
+            })
+            .collect(),
+        parse_incomplete: incompletes
+            .into_iter()
+            .map(|(lang, count)| render::ParseIncomplete {
                 lang: lang.to_string(),
                 count,
             })
@@ -4950,7 +5021,18 @@ fn run_index_build(
                 by_file.entry(s.file_path.clone()).or_default().push(s);
             }
         }
-        let (mut indexed, mut missing) = (0usize, 0usize);
+        // A file parsed only partly is flagged, with whatever packets it
+        // has, even none: the warm scan reading this index must not reuse it
+        // as a clean parse (po-av01j.224).
+        let incomplete: std::collections::BTreeSet<&str> = cfg
+            .parse_incomplete_paths
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for file in &incomplete {
+            by_file.entry(file.to_string()).or_default();
+        }
+        let (mut indexed, mut missing, mut parse_incomplete) = (0usize, 0usize, 0usize);
         for (file, packets) in by_file {
             let path = PathBuf::from(&file);
             let deps: Vec<PathBuf> = includes
@@ -4958,6 +5040,11 @@ fn run_index_build(
                 .map(|hs| hs.iter().map(PathBuf::from).collect())
                 .unwrap_or_default();
             match rvl_index::hash_file(&path) {
+                Ok(h) if incomplete.contains(file.as_str()) => {
+                    idx.put_incomplete_with_deps(&path, &h, &packets, &deps)?;
+                    indexed += 1;
+                    parse_incomplete += 1;
+                }
                 Ok(h) => {
                     idx.put_with_deps(&path, &h, &packets, &deps)?;
                     indexed += 1;
@@ -4982,7 +5069,8 @@ fn run_index_build(
         }
         println!(
             "indexed {indexed} file(s) | test files skipped {test_skipped} | \
-             unreadable {missing} | unparseable lines {skipped}"
+             parsed incompletely {parse_incomplete} | unreadable {missing} | \
+             unparseable lines {skipped}"
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -5043,8 +5131,10 @@ fn run_index_build(
     // Likewise for the dependency state: the packets this run indexed were
     // resolved from import syntax, and the index itself does not record that.
     let uninstalled: usize = scan.dependencies_uninstalled.iter().map(|d| d.count).sum();
+    // And for a file parsed only partly, which the index does flag.
+    let incomplete: usize = scan.parse_incomplete.iter().map(|p| p.count).sum();
     println!(
-        "reindexed: reused {} unchanged, retrieved {} changed{}{}",
+        "reindexed: reused {} unchanged, retrieved {} changed{}{}{}",
         scan.reused_files,
         scan.retrieved_files,
         if skipped == 0 {
@@ -5061,6 +5151,15 @@ fn run_index_build(
             format!(
                 ", {uninstalled} workspace{} without installed dependencies",
                 if uninstalled == 1 { "" } else { "s" }
+            )
+        },
+        if incomplete == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {incomplete} file{} parsed incompletely (parse errors; \
+                 their call sites are a floor)",
+                if incomplete == 1 { "" } else { "s" }
             )
         }
     );
@@ -5383,6 +5482,7 @@ fn run_scan_incremental(
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
+        scan.parse_incomplete.clone(),
         // Present only when this pass ran a helper that measures it: the
         // census is whole-repo, but a pass that re-parsed no file of that
         // language has none to report, and says nothing rather than zero.
@@ -9505,6 +9605,68 @@ mod tests {
         assert_eq!(edited.sites.len(), 3);
     }
 
+    /// po-av01j.224: cindex says which translation units parsed with errors.
+    /// The warm path reused such a unit's entry as a clean zero on every
+    /// later pass. The count is repository-wide: the cold pass reads it off
+    /// the helper's record, the warm pass off the entries it reuses.
+    #[test]
+    fn an_incomplete_parse_is_counted_on_the_cold_and_the_warm_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = rvl_index::PacketIndex::open(&dir.path().join("packets.redb")).unwrap();
+        std::fs::write(dir.path().join("broken.c"), "#include <gone.h>\n").unwrap();
+        std::fs::write(dir.path().join("clean.c"), "int b;\n").unwrap();
+        let candidates = walk_source_files(dir.path());
+        let incomplete = |scan: &IncrementalScan| -> Vec<(String, usize)> {
+            scan.parse_incomplete
+                .iter()
+                .map(|p| (p.lang.clone(), p.count))
+                .collect()
+        };
+        // The fake cindex: `broken.c` parses with errors, whatever its content.
+        let retrieve = |changed: &[PathBuf]| {
+            let mut rr = fake_c_retrieve(dir.path(), changed);
+            rr.repo_cfg.parse_incomplete_paths = changed
+                .iter()
+                .map(|c| repo_relative(dir.path(), c))
+                .filter(|rel| rel == "broken.c")
+                .collect();
+            Ok(rr)
+        };
+
+        let cold = incremental_sites(&idx, dir.path(), &candidates, retrieve).unwrap();
+        assert_eq!(cold.retrieved_files, 2);
+        assert_eq!(incomplete(&cold), vec![("C/C++".to_string(), 1)]);
+
+        // Warm, nothing changed: no helper run, and the reused entry still
+        // says its parse was incomplete.
+        let warm = incremental_sites(&idx, dir.path(), &candidates, |_| {
+            panic!("nothing changed, the helper must not run")
+        })
+        .unwrap();
+        assert_eq!(warm.reused_files, 2);
+        assert_eq!(incomplete(&warm), vec![("C/C++".to_string(), 1)]);
+
+        // Only the clean file changes: one reused incomplete entry, counted
+        // beside a re-parse that reports none.
+        std::fs::write(dir.path().join("clean.c"), "long b;\n").unwrap();
+        let mixed = incremental_sites(&idx, dir.path(), &candidates, retrieve).unwrap();
+        assert_eq!((mixed.reused_files, mixed.retrieved_files), (1, 1));
+        assert_eq!(incomplete(&mixed), vec![("C/C++".to_string(), 1)]);
+
+        // The broken file is edited and now parses cleanly: the flag clears.
+        std::fs::write(dir.path().join("broken.c"), "int a;\n").unwrap();
+        let fixed = incremental_sites(&idx, dir.path(), &candidates, |changed| {
+            Ok(fake_c_retrieve(dir.path(), changed))
+        })
+        .unwrap();
+        assert!(incomplete(&fixed).is_empty(), "{:?}", incomplete(&fixed));
+        let settled = incremental_sites(&idx, dir.path(), &candidates, |_| {
+            panic!("nothing changed, the helper must not run")
+        })
+        .unwrap();
+        assert!(incomplete(&settled).is_empty());
+    }
+
     /// `index reindex --files` is what the background warm runs. A header in
     /// that list maps to the TUs the index knows include it.
     #[test]
@@ -9740,6 +9902,7 @@ mod tests {
             reparsed_files: Vec::new(),
             lang_degraded,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             no_supported_sources: false,
         }
