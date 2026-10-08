@@ -174,6 +174,58 @@ fn staleness_note_appears_only_when_old() {
     assert!(staleness_note("garbage", "2026-07-30").is_none());
 }
 
+/// The note names the exact cache it measured, so it cannot be read as a
+/// warning about another one (po-7ocbd).
+#[test]
+fn staleness_note_names_the_full_content_version() {
+    let note = staleness_note("2026-09-17.1a2b3c4d", "2026-10-08").unwrap();
+    assert_eq!(
+        note,
+        "spec cache 2026-09-17.1a2b3c4d is 21 days old; run 'rvl sync' to refresh"
+    );
+}
+
+fn loaded_at(content_version: &str, today: &str) -> Loaded {
+    Loaded {
+        envelope: serde_json::from_slice(&envelope_bytes(1, content_version)).unwrap(),
+        source: LoadSource::Current,
+        artifact_sha256: String::new(),
+        upgrade_hint: None,
+        staleness_note: staleness_note(content_version, today),
+    }
+}
+
+/// Two tiers load in one scan. A stale OSS tier beside a current commercial
+/// tier must say which one is stale (po-7ocbd): the warning and the loaded
+/// line of one tier carry the same label and the same version.
+#[test]
+fn tier_lines_say_which_tier_they_describe() {
+    let today = "2026-10-08";
+    let commercial = loaded_at("2026-10-07.88644acd", today);
+    let oss = loaded_at("2026-09-17.1a2b3c4d", today);
+
+    assert_eq!(
+        commercial.summary_line(Tier::Commercial),
+        "spec cache 2026-10-07.88644acd (schema 1, Current)"
+    );
+    assert_eq!(commercial.staleness_line(Tier::Commercial), None);
+
+    assert_eq!(
+        oss.summary_line(Tier::Oss),
+        "oss tier 2026-09-17.1a2b3c4d (schema 1, Current)"
+    );
+    assert_eq!(
+        oss.staleness_line(Tier::Oss).unwrap(),
+        "oss tier: spec cache 2026-09-17.1a2b3c4d is 21 days old; run 'rvl sync' to refresh"
+    );
+    // A stale commercial tier needs no prefix: "spec cache" is its label.
+    let old = loaded_at("2026-09-17.1a2b3c4d", today);
+    assert_eq!(
+        old.staleness_line(Tier::Commercial).unwrap(),
+        "spec cache 2026-09-17.1a2b3c4d is 21 days old; run 'rvl sync' to refresh"
+    );
+}
+
 // --- offline kill switch ---
 
 #[test]

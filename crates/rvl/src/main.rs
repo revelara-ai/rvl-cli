@@ -3338,21 +3338,24 @@ fn findings_from_sites(
                      findings are advisory"
                 );
             }
-            for loaded in [&tiers.commercial, &tiers.oss].into_iter().flatten() {
+            for (tier, loaded) in [
+                (rvl_cache::Tier::Commercial, &tiers.commercial),
+                (rvl_cache::Tier::Oss, &tiers.oss),
+            ] {
+                let Some(loaded) = loaded else { continue };
                 if let Some(hint) = &loaded.upgrade_hint {
                     eprintln!("{hint}");
                 }
-                if let Some(note) = &loaded.staleness_note {
+                // Labeled by tier (po-7ocbd): both tiers load, and a note
+                // about the stale one must not read as the other's.
+                if let Some(note) = loaded.staleness_line(tier) {
                     eprintln!("{note}");
                 }
                 // Gated by `verbose` (like the sites|specs line below) so
                 // quiet callers such as `explain` and `report --json` keep
                 // stdout clean. Staleness/upgrade hints stay on stderr.
                 if verbose {
-                    println!(
-                        "spec cache {} (schema {}, {:?})",
-                        loaded.envelope.content_version, loaded.envelope.schema, loaded.source
-                    );
+                    println!("{}", loaded.summary_line(tier));
                 }
             }
             // Before the no-tier bail, so a CI pin over an empty cache says
@@ -7273,25 +7276,24 @@ fn run() -> anyhow::Result<ExitCode> {
                 // older install is normal and says how to get one.
                 let oss_store = store.subdir_store(rvl_cache::OSS_DIR)?;
                 match oss_store.load(&keyset, &rvl_cache::today_utc()) {
-                    Ok(loaded) => println!(
-                        "oss tier {} (schema {}, {:?})",
-                        loaded.envelope.content_version, loaded.envelope.schema, loaded.source
-                    ),
+                    Ok(loaded) => {
+                        println!("{}", loaded.summary_line(rvl_cache::Tier::Oss));
+                        if let Some(note) = loaded.staleness_line(rvl_cache::Tier::Oss) {
+                            println!("{note}");
+                        }
+                    }
                     Err(_) => {
                         println!("oss tier: not installed (run '{BIN} sync' - no API key needed)")
                     }
                 }
                 match store.load(&keyset, &rvl_cache::today_utc()) {
                     Ok(loaded) => {
-                        println!(
-                            "spec cache {} (schema {}, {:?})",
-                            loaded.envelope.content_version, loaded.envelope.schema, loaded.source
-                        );
+                        println!("{}", loaded.summary_line(rvl_cache::Tier::Commercial));
                         println!("artifact sha256 {}", loaded.artifact_sha256);
-                        if let Some(hint) = loaded.upgrade_hint {
+                        if let Some(hint) = &loaded.upgrade_hint {
                             println!("{hint}");
                         }
-                        if let Some(note) = loaded.staleness_note {
+                        if let Some(note) = loaded.staleness_line(rvl_cache::Tier::Commercial) {
                             println!("{note}");
                         }
                     }

@@ -603,7 +603,7 @@ fn spec_cache_checks() -> Vec<Check> {
                             loaded.envelope.content_version, loaded.envelope.schema, loaded.source
                         )),
                     );
-                    if let Some(note) = loaded.staleness_note {
+                    if let Some(note) = loaded.staleness_line(rvl_cache::Tier::Oss) {
                         out.push(
                             Check::new("spec cache", Status::Warn, "freshness")
                                 .detail(note)
