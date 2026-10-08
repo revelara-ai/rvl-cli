@@ -262,4 +262,21 @@ mod tests {
         assert!(err.to_string().contains("abstains rather than guessing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn lockfile_provenance_records_the_published_sha256() {
+        // The digest goes into scan provenance, which is compared across
+        // runs (po-av01j.235).
+        let dir = std::env::temp_dir().join(format!("rustindex-lock-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "[[package]]\nname = \"x\"\n";
+        std::fs::write(dir.join("Cargo.lock"), body).unwrap();
+        let p = lockfile_provenance(&dir, true);
+        assert_eq!(
+            p.sha256,
+            "c6b2e495e8361ce80582316c7ddbb51ac34d96e88bbe5f39f273409e41a515c6"
+        );
+        assert_eq!(p.bytes, body.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -186,6 +186,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_scope_golden_value_is_pinned() {
+        // The scope is written into meta.json, so a value that moves between
+        // builds makes every cached tarball look like another org's
+        // (po-av01j.235).
+        assert_eq!(
+            cache_scope("https://api.example.test", "org-a-key").as_deref(),
+            Some("ee84126d48f40994")
+        );
+    }
+
+    #[test]
     fn cache_scope_separates_orgs_and_servers_without_holding_the_key() {
         let a = cache_scope("https://api.example.test", "org-a-key").expect("scope");
         assert_eq!(
