@@ -145,7 +145,7 @@ pub(crate) mod testutil {
         version: &str,
         files: &[(&str, &[u8])],
     ) -> (Vec<u8>, ed25519_dalek::VerifyingKey) {
-        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&rand::random());
         let tarball = build_tarball_with_key(version, files, &signing, files);
         (tarball, signing.verifying_key())
     }
@@ -209,7 +209,7 @@ pub(crate) mod testutil {
 
     /// Convenience: a fresh signing key for negative tests.
     pub fn fresh_key() -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+        ed25519_dalek::SigningKey::from_bytes(&rand::random())
     }
 
     /// Gzip arbitrary bytes — fixture for parse-failure tests.
