@@ -945,7 +945,7 @@ mod tests {
     fn first_install_pins_the_signing_key_and_says_so() {
         let fx = Fixture::new();
         let store = SkillsStore::open(fx.cache.path()).unwrap();
-        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&rand::random());
         let key = signing.verifying_key();
         let files: &[(&str, &[u8])] = &[("rvl-scan/SKILL.md", SKILL)];
         let tarball = build_tarball_with_key("0.2.0", files, &signing, files);
