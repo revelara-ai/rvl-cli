@@ -466,7 +466,8 @@ fn lens_files(lens_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(files)
 }
 
-fn stale_findings(scan_dir: &Path) -> Result<Vec<PathBuf>> {
+/// The `03-findings-*.json` files of a submit directory.
+pub(crate) fn findings_files(scan_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut stale = Vec::new();
     for entry in
         std::fs::read_dir(scan_dir).with_context(|| format!("read {}", scan_dir.display()))?
@@ -642,7 +643,7 @@ pub fn run(a: &FinalizeArgs, out: &mut dyn Write) -> Result<()> {
         writeln!(log, "  {line}")?;
     }
 
-    for old in stale_findings(&a.scan_dir)? {
+    for old in findings_files(&a.scan_dir)? {
         std::fs::remove_file(&old).with_context(|| format!("remove {}", old.display()))?;
     }
     let catalog_meta = patch.get("catalog_meta").filter(|v| truthy(v));

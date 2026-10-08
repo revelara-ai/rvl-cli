@@ -55,4 +55,28 @@ What is different from the scripts:
 - The findings files hold the same JSON values. The order of the keys in an
   object is different.
 
-A directory named `digest` or `finalize` is now scanned as `rvl scan ./digest`.
+A directory named `digest`, `finalize` or `report` is now scanned as
+`rvl scan ./digest`.
+
+### `rvl scan report`
+
+**Minimum version to probe for: 1.4.0.** `rvl` 1.3.0 and earlier do not have
+this subcommand.
+
+The `/rvl:scan` skill had a report template, and the model copied the engine
+rows into it by hand. `rvl scan report "{ENGINE_DOC}" --scan-dir "{SCAN_TMPDIR}"`
+prints the sections of that report that are data: the Gate section, the
+`Engine:` and `Languages:` lines of the Coverage section, and the lines of the
+"Not Assessable From Code" section. The skill writes the other sections. See
+[Orchestrated scans](commands.md#orchestrated-scans) for the full description.
+
+To probe, `rvl scan report --help` exits 0 on 1.4.0 and later and has
+`ENGINE_DOC` in its text. On 1.3.0 and earlier, `report` is read as the path
+of a directory to scan.
+
+What is different from the template:
+
+- A row under `SUPPRESSED` is a full row with a flag, `(suppressed)` or
+  `(low value)`. The template had a list of ids.
+- The "Not Assessable From Code" lines have the skill and the control codes.
+  They do not have the one-line reason, which the skill adds.
