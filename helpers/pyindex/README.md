@@ -41,6 +41,13 @@ Every record carries:
   `requests`).
 - `client_type` — the resolved dotted client type/module, best-effort; `""` when
   unresolved.
+- `framework_type` — the framework class the receiver is an instance of, when
+  the receiver's owner is proven to be a class of that framework: a call on
+  `Order.objects` carries `django.db.models.Manager` when `Order` descends
+  from `django.db.models.Model`, through in-repo bases and re-exports. Absent
+  otherwise. It rides beside `client_type` and is not part of `site_key`. rvl
+  looks an API spec up by `framework_type` first, then by `client_type`, so
+  one spec keyed on `django.db.models.Manager.get` covers every model.
 - `snippet` — source of the full call expression, so a call-time `timeout=` is
   visible.
 - `enclosing_function_body` — source of the enclosing `def`, or `""` at module

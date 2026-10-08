@@ -596,7 +596,7 @@ fn main() -> Result<()> {
             let mut borrowed = 0usize;
             for (site, meta) in sites.iter().zip(metas.iter()) {
                 let mut s = site.clone();
-                if cache.api(&s.api_key()).is_none() {
+                if cache.api_for(&s).is_none() {
                     if let Some((t, _)) = by_method.get(&s.method) {
                         s.client_type = t.clone();
                         borrowed += 1;

@@ -336,6 +336,15 @@ pub struct Site {
     pub receiver: String,
     #[serde(default)]
     pub client_type: String,
+    /// The framework class the receiver is an instance of, when the retriever
+    /// proved one: `django.db.models.Manager` beside the client type
+    /// `zerver.models.Message.objects`. Empty when there is none. The server
+    /// keys a spec on it, so the spec lookup tries it before `client_type`
+    /// ([`Site::spec_types`]). It is not part of the site's identity:
+    /// `site_key` and the class key stay on `client_type`. Additive within
+    /// the v2 packet train.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub framework_type: String,
     #[serde(default)]
     pub snippet: String,
     #[serde(default)]
@@ -542,6 +551,20 @@ impl Site {
             self.client_type.clone()
         };
         (t, self.method.clone())
+    }
+    /// The type names a spec for this site may be keyed on, in lookup order:
+    /// the framework type when the retriever proved one, then the client
+    /// type (`?` when unresolved, as in [`Site::api_key`]).
+    pub fn spec_types(&self) -> impl Iterator<Item = &str> {
+        let client = if self.client_type.is_empty() {
+            "?"
+        } else {
+            self.client_type.as_str()
+        };
+        Some(self.framework_type.as_str())
+            .filter(|t| !t.is_empty())
+            .into_iter()
+            .chain(std::iter::once(client))
     }
     /// Where this site lives. Repo evidence first ([`Site::scope_override`]),
     /// the path second ([`scope_of`]). THE ONLY correct way to ask: reading
@@ -1433,6 +1456,33 @@ mod tests {
             "a repo-scoped record must not become an empty Site"
         );
         assert_eq!(skipped, 0, "another record kind is not a parse failure");
+    }
+
+    #[test]
+    fn framework_type_round_trips_and_is_absent_when_unset() {
+        let line = r#"{"file_path":"a.py","line_number":1,"func":"get","client_type":"app.models.X.objects","framework_type":"django.db.models.Manager"}"#;
+        let site: Site = serde_json::from_str(line).unwrap();
+        assert_eq!(site.framework_type, "django.db.models.Manager");
+        assert_eq!(
+            site.spec_types().collect::<Vec<_>>(),
+            vec!["django.db.models.Manager", "app.models.X.objects"]
+        );
+        // The identity of the site stays on the client type.
+        assert_eq!(site.site_key(), "a.py:1:app.models.X.objects:get");
+        let back: Site = serde_json::from_str(&serde_json::to_string(&site).unwrap()).unwrap();
+        assert_eq!(back.framework_type, "django.db.models.Manager");
+
+        // A stream from a retriever that does not emit the field.
+        let plain: Site = serde_json::from_str(
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.spec_types().collect::<Vec<_>>(), vec!["c"]);
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("framework_type"));
+        let unresolved = Site::default();
+        assert_eq!(unresolved.spec_types().collect::<Vec<_>>(), vec!["?"]);
     }
 
     #[test]

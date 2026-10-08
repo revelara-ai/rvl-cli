@@ -1123,6 +1123,52 @@ class TestCallGraph(unittest.TestCase):
                                  ["file", "line", "source", "symbol"])
 
 
+DJANGO_ROOT = os.path.join(HERE, "testdata", "fixture_django")
+
+
+class TestFrameworkType(unittest.TestCase):
+    """framework_type (po-av01j.225): the framework class a receiver is an
+    instance of, beside the concrete client_type. The server keys one spec on
+    it (django.db.models.Manager.get) for every model's manager.
+
+    testdata/fixture_django imports its model through a package re-export
+    (shop.models -> shop.models.orders) and inherits django's Model through
+    an in-repo abstract base, the shape a real Django project has."""
+
+    def _records(self, *extra):
+        code, out, err = _run("--retrieve", "--root", DJANGO_ROOT, *extra)
+        if code != 0:
+            raise AssertionError("retrieve failed ({}): {}".format(code, err))
+        sites, _ = _parse_stream(out)
+        return sites
+
+    def test_a_model_manager_call_emits_the_django_manager_framework_type(self):
+        site = _site_in(self._records(), "load_order", "shop/views.py")
+        self.assertEqual(site["func"], "get")
+        # The concrete type is unchanged: it is still the site's identity.
+        self.assertEqual(site["client_type"], "shop.models.Order.objects")
+        self.assertEqual(site["site_key"],
+                         "shop/views.py:7:shop.models.Order.objects:get")
+        self.assertEqual(site["framework_type"], "django.db.models.Manager")
+
+    def test_an_objects_attribute_of_a_plain_class_has_no_framework_type(self):
+        site = _site_in(self._records(), "load_entry", "shop/views.py")
+        self.assertEqual(site["client_type"], "shop.models.Registry.objects")
+        self.assertNotIn("framework_type", site)
+
+    def test_a_site_with_no_framework_receiver_has_no_framework_type(self):
+        site = _site_in(self._records(), "fetch", "shop/views.py")
+        self.assertEqual(site["client_type"], "requests")
+        self.assertNotIn("framework_type", site)
+
+    def test_the_files_path_resolves_the_model_from_an_unlisted_module(self):
+        # --files emits packets for the listed file only, but the model class
+        # lives in another module: the packet must match the full run's.
+        site = _site_in(self._records("--files", "shop/views.py"),
+                        "load_order", "shop/views.py")
+        self.assertEqual(site["framework_type"], "django.db.models.Manager")
+
+
 # Last statement in the module: `python3 test_pyindex.py` is a documented
 # way to run this suite, and unittest.main() only collects classes defined
 # ABOVE it.

@@ -664,7 +664,7 @@ pub fn propagate(
         return finding;
     }
     let Some((spec, arg)) = specs
-        .api(&site.api_key())
+        .api_for(site)
         .and_then(|s| s.capacity_arg.as_ref().map(|a| (s, a)))
     else {
         return finding;
@@ -754,8 +754,7 @@ fn judge(
             ),
         };
     }
-    let key = site.api_key();
-    let spec = specs.api(&key);
+    let spec = specs.api_for(site);
 
     // Any other kinded site WITHOUT a client-call spec is likewise not this
     // lane's question; with a spec it reaches the applicability gate, so a
@@ -1009,15 +1008,10 @@ fn judge(
                 }
                 // EXACT (b): the call's own client_type carries a this_client
                 // config, even when the construction is not at this site.
-                if let Some(s) = specs.config(&site.client_type) {
+                if let Some((s, type_name)) = specs.config_for(site) {
                     if s.scope == Scope::ThisClient && s.confidence >= rvl_spec::MIN_CONFIDENCE {
                         record(
-                            config_evidence(
-                                s,
-                                &site.client_type,
-                                &site.client_construction,
-                                untraced,
-                            ),
+                            config_evidence(s, type_name, &site.client_construction, untraced),
                             &mut whole,
                             &mut phase,
                             &mut unbounded,
@@ -1048,7 +1042,7 @@ fn judge(
                     && !construction_unresolved
                 {
                     if let Some(bound) = specs
-                        .call_family(spec, &site.client_type)
+                        .call_family_for(spec, site)
                         .and_then(|f| client.get(&f))
                     {
                         match bound {
@@ -1363,6 +1357,55 @@ mod tests {
             rvl_spec::by_design_label(&f.reason),
             Some("uvicorn.run (server main loop)")
         );
+    }
+
+    // --- framework_type spec lookup (po-av01j.225) ---
+
+    /// A Django manager call as pyindex emits it: the concrete, per-model
+    /// client_type, and the framework class beside it.
+    fn manager_site() -> Site {
+        Site {
+            framework_type: "django.db.models.Manager".into(),
+            ..intent_site("app.models.X.objects", "get")
+        }
+    }
+
+    #[test]
+    fn a_spec_keyed_on_the_framework_type_applies_to_a_concrete_client_type() {
+        // The server authors ONE spec for every model's manager. The site's
+        // client_type names one model, so a client_type-only lookup matches
+        // nothing and the collapsed spec never applies.
+        let cache = intent_cache(
+            "django.db.models.Manager",
+            "get",
+            BlockingIntent::Incidental,
+        );
+        let f = propagate(&manager_site(), &cache, &ServedBound::None, &HashMap::new());
+        assert_eq!(f.verdict, Verdict::Violates);
+        assert_eq!(f.reason, "no bound anywhere and the search was complete");
+
+        // The pair: the same site without the framework type has no spec.
+        let f = propagate(
+            &intent_site("app.models.X.objects", "get"),
+            &cache,
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Abstain);
+        assert!(f.reason.starts_with("no spec"), "{}", f.reason);
+    }
+
+    #[test]
+    fn a_spec_keyed_on_the_client_type_still_applies_to_a_framework_site() {
+        // A cache authored before the server collapsed the specs is keyed on
+        // the concrete type. The lookup falls back to it.
+        let f = propagate(
+            &manager_site(),
+            &intent_cache("app.models.X.objects", "get", BlockingIntent::Incidental),
+            &ServedBound::None,
+            &HashMap::new(),
+        );
+        assert_eq!(f.verdict, Verdict::Violates);
     }
 
     /// The same site with the same spec MINUS the intent — the state every

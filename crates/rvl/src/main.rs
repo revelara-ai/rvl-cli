@@ -927,7 +927,13 @@ fn triage_to_findings(
                     &ck.method,
                     &ck.reason,
                     specs
-                        .and_then(|c| c.api(&(ck.client_type.clone(), ck.method.clone())))
+                        .and_then(|c| {
+                            // The engine's order: framework type, then client type.
+                            [&ck.framework_type, &ck.client_type]
+                                .into_iter()
+                                .filter(|t| !t.is_empty())
+                                .find_map(|t| c.api(&(t.clone(), ck.method.clone())))
+                        })
                         .map(|s| s.default_bound)
                         .unwrap_or_default(),
                 ),
@@ -3581,6 +3587,7 @@ fn misuse_items(
         .map(|f| rvl_triage::TriagedItem {
             class: rvl_triage::ClassKey {
                 client_type: "misuse".into(),
+                framework_type: String::new(),
                 method: f.class,
                 reason: f.reason,
                 scope: "runtime".into(),
@@ -3609,6 +3616,7 @@ fn unsized_items(
         .map(|f| rvl_triage::TriagedItem {
             class: rvl_triage::ClassKey {
                 client_type: "unsized".into(),
+                framework_type: String::new(),
                 method: f.class,
                 reason: f.reason,
                 scope: "runtime".into(),
@@ -3638,6 +3646,7 @@ fn emission_items(
         .map(|f| rvl_triage::TriagedItem {
             class: rvl_triage::ClassKey {
                 client_type: "emission".into(),
+                framework_type: String::new(),
                 method: f.control.to_string(),
                 // The control name leads so the ladder line reads
                 // "emission.RC-046 — distributed tracing: <why>".

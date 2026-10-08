@@ -23,6 +23,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ClassKey {
     pub client_type: String,
+    /// The site's framework type, empty when it has none. Carried so a reader
+    /// of the class can find the spec the way the engine did
+    /// (`SpecCache::api_for`). A client type has one framework type, so this
+    /// never splits a class.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub framework_type: String,
     pub method: String,
     pub reason: String,
     pub scope: String,
@@ -43,6 +49,7 @@ pub fn class_of(site: &Site, reason: &str) -> ClassKey {
         } else {
             site.client_type.clone()
         },
+        framework_type: site.framework_type.clone(),
         method: site.method.clone(),
         // The class reason is the RULE NAME that fired: the leading `;` clause,
         // stripped of any `:` tail. Both tails carry site-specific detail
