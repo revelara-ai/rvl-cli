@@ -9,6 +9,8 @@ Every command takes `--help`, and most of the platform commands take
 | --- | --- |
 | `rvl scan [PATH]` | Scan a repo against the signed spec cache: spec matching, propagation, triage. Deterministic, no model calls. |
 | `rvl scan force-next [--target <dir>]` | Arm a one-shot gate bypass for the next hook run (for GUI git clients that cannot set `RVL_FORCE=1`). Audited in `.git/rvl-audit.jsonl`. |
+| `rvl scan digest <ENGINE_DOC>` | Print the residual-scoping digest of a scan document (`scan --out`). See [Orchestrated scans](#orchestrated-scans). |
+| `rvl scan finalize <SCAN_DIR>` | Rebuild the findings files of a submit directory from the lens outputs. See [Orchestrated scans](#orchestrated-scans). |
 | `rvl explain <ID> [PATH]` | Explain one finding as an evidence block: the sites it covers, the control, and the fix. |
 | `rvl suppress <ID> [PATH] [--reason …] [--expires YYYY-MM-DD]` | Waive a finding: append a rule waiver to `./.revelara.yaml` under `scanner.waivers`. |
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
@@ -50,6 +52,73 @@ set is rvl-cli parity:
 | `--format <text\|json>` | `json` is the CI contract: response JSON on stdout, and exit 1 when the server reports critical or high findings. `--ci` is a compatibility alias for `--format json`. |
 | `--review` | Send rvl-cli's interactive-run wire value (`scan_mode: "review"`); `--ci`/`--auto-infer` win over it. |
 | `--cs-file <path>` | Attach a control structure from a separate JSON file to the submission (not `stpa submit`, which ingests a full STPA model). |
+
+### Orchestrated scans
+
+The `/rvl:scan` skill runs the deterministic scan, then a pass of expert
+lenses, and submits both. `digest` and `finalize` are its mechanical steps.
+They read and write local files only: no scan, no spec cache, no network. A
+failure prints one line on stderr and exits 1. Both need rvl 1.4.0 or later
+(see the [release notes](release-notes.md)).
+
+`rvl scan digest <ENGINE_DOC>` reads the document that `rvl scan --out` wrote
+and prints, as text:
+
+- `ENGINE_DIGEST`: the exit code, the counts, and one line for each blocking
+  and each advisory finding.
+- `COVERED_CLASSES`: the API classes the engine judges in this repo. A lens
+  must not report these again.
+- `UNDECIDED` and `UNDECIDED_CLASS_CENSUS`: the sites the engine abstained
+  on, by scope, by lever, and by class (runtime sites, the 10 largest
+  classes).
+- `ADJUDICATION_LIST`: the sites a lens gives a verdict on. Runtime sites
+  only, lever `judge` first, then `bounds`, then `no_spec`, 20 sites at most.
+
+It refuses a document whose `schema` is not `rvl-scan/v1` (see
+[The `--out` document contract](out-contract.md)).
+
+`rvl scan finalize <SCAN_DIR>` builds what `rvl scan --scan-dir <SCAN_DIR>`
+submits. It reads the lens outputs in `<SCAN_DIR>.lens/*.json` (a directory
+beside the submit directory, so the raw outputs are never submitted) and
+writes one `03-findings-<lens>.json` for each, plus `03-findings-engine.json`
+when `--engine` is given. Each run removes the old `03-findings-*.json` files
+and starts from the lens outputs again, so you can run it before grounding and
+again with a patch. It reads and checks every input before it removes
+anything: a run that fails leaves the directory as it was.
+
+| Flag | Meaning |
+| --- | --- |
+| `--engine <doc>` | The scan document. Its findings become `03-findings-engine.json` with title and control unchanged. Suppressed findings are left out, and a finding with no control sends no control code. |
+| `--patch <file>` | Judgments to apply (see below). |
+| `--register <file>` | The risk register, from `rvl risk list --service <name> --format=json`. Needed for `extends`. |
+| `--mode <quick\|deep>` | Written to every findings file as `scan_mode` (default `quick`). |
+| `--crit <n>` | Business criticality, 0.0 to 1.0 (default 0). Written to every findings file, and a factor of each lens score. |
+
+The patch is a JSON object. It names a lens finding by `<lens>#<n>`: the file
+name without `.json`, and the position of the finding in that file, from 1.
+
+| Key | Meaning |
+| --- | --- |
+| `findings` | A map from `<lens>#<n>` to `control_codes`, `corroboration`, `corroboration_strength`, `substantiation_strength`, `graph_evidence` and `extends`. |
+| `drop` | A list of `<lens>#<n>` to leave out. |
+| `control_categories` | A map from a control code to its catalog category, for the engine rows. |
+| `catalog_meta` | Copied to every findings file. |
+
+`extends: "R-038"` says that the finding is register risk R-038, found again.
+The finding takes the title and the control codes of that risk, which is what
+the server matches on, and keeps its own text in the narrative. A second
+finding that extends the same risk is dropped (`DUP`), and a risk code that
+the register file does not hold changes nothing (`UNKNOWN`).
+
+For each lens finding, `finalize` also sets `provenance` (`agent:<lens>`) and
+`component` (the component of `01-stack.json` with the longest path that
+contains the finding), removes retired control codes, and computes
+`risk_score` and `priority`. Corroboration comes from the patch only: what a
+lens wrote in that field is not submitted. It prints one `Written:` line for
+each file, then `LENS_DIGEST`, the lens findings by score.
+
+`digest` and `finalize` are subcommand names, so to scan a directory with one
+of those names, write it as a path: `rvl scan ./digest`.
 
 ## Setting up a repo and a machine
 

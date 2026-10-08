@@ -32,6 +32,8 @@ pub mod project_mapping;
 pub mod risk;
 pub mod risk_context_render;
 pub mod scan_cached_output;
+pub mod scan_digest;
+pub mod scan_finalize;
 pub mod scan_normalize;
 pub mod scan_submit;
 pub mod scan_team;
