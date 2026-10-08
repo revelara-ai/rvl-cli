@@ -36,6 +36,7 @@ The orchestrator uses it to:
     {
       "id": "2ben",
       "class": "net/http.Client.Do",
+      "subject": { "kind": "symbol", "value": "net/http.Client.Do" },
       "severity": "blocking",
       "base_severity": "high",
       "site": "internal/x/y.go:45",
@@ -229,6 +230,18 @@ The orchestrator uses it to:
   `emission.`, `unsized.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
   The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
+- `findings[].subject` is what the row is about, in the shape the server's
+  scan submission reads (`{"kind", "value"}`). An orchestrator that submits
+  an engine row copies it to the finding unchanged, so that the identity of
+  the risk is control, service and subject, not the title. `value` is `class`
+  for a row that rolls up more than one site (`site_count > 1`), and
+  `class@path` for a row on one site, where `path` is the `site` without its
+  `:line` suffix or its config unit. Thus two rows of one class at two files
+  are two risks, and an edit above a site does not make a new one. `kind` is
+  `symbol` for every engine row: the server keeps the case of a `symbol`
+  value, and a class and a path are case-sensitive. Two rows of one class
+  that each roll up more than one site (one class in two scopes, for
+  example) have the same subject.
 - Consumers MUST ignore unknown fields.
 
 ## What this contract deliberately excludes

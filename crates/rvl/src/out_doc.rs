@@ -94,6 +94,10 @@ pub struct OutSite {
 pub struct OutFinding {
     pub id: String,
     pub class: String,
+    /// What the row is about, for the server's identity (po-zcqld). Without
+    /// it the identity is control plus title, and two rows of one class share
+    /// both.
+    pub subject: OutSubject,
     pub severity: &'static str,
     pub base_severity: String,
     pub site: String,
@@ -103,6 +107,38 @@ pub struct OutFinding {
     pub site_count: usize,
     pub suppressed: bool,
     pub gate_exempt: bool,
+}
+
+/// The subject of a finding, in the wire shape the server reads
+/// (`{"kind", "value"}`).
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct OutSubject {
+    pub kind: &'static str,
+    pub value: String,
+}
+
+/// The subject kind of every engine row. The server folds the case of a
+/// `config_key` value and keeps the case of a `symbol` value; a class and a
+/// path are both case-sensitive, so no lane sends `config_key`.
+pub const SUBJECT_KIND: &str = "symbol";
+
+/// The subject of one ladder row: the class for a row that aggregates sites,
+/// and `class@path` for a row on one site, so two rows of one class at two
+/// files stay two risks. The path is the waiver path of the site (no line, no
+/// config unit): an edit above the site does not move the identity. A row
+/// that aggregates sites cannot name one, because its primary site is only an
+/// example.
+pub fn subject_of(class: &str, site: &str, site_count: usize) -> OutSubject {
+    let path = crate::waiver::site_path(site).trim();
+    let value = if site_count == 1 && !path.is_empty() {
+        format!("{class}@{path}")
+    } else {
+        class.to_string()
+    };
+    OutSubject {
+        kind: SUBJECT_KIND,
+        value,
+    }
 }
 
 #[derive(Serialize)]
@@ -255,6 +291,7 @@ pub fn build(
         .map(|f| OutFinding {
             id: f.id.clone(),
             class: f.class_rule.clone(),
+            subject: subject_of(&f.class_rule, &f.site, f.site_count),
             severity: match render::classify(f) {
                 render::Section::Blocking => "blocking",
                 render::Section::Advisory => "advisory",
@@ -474,6 +511,102 @@ mod tests {
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
+    }
+
+    fn row(class: &str, site: &str, site_count: usize) -> render::Finding {
+        render::Finding {
+            id: render::finding_id(&format!("{class}:{site}")),
+            site: site.into(),
+            description: "d".into(),
+            disposition: "surface".into(),
+            severity: "high".into(),
+            incident_count: 0,
+            critical_count: 0,
+            control: "RC-019".into(),
+            fix: "f".into(),
+            site_count,
+            example_sites: vec![],
+            class_rule: class.into(),
+            suppressed: false,
+            gate_exempt: false,
+        }
+    }
+
+    fn subjects(rows: &[render::Finding]) -> Vec<serde_json::Value> {
+        let doc = build(
+            rows,
+            &render::Coverage::default(),
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+        );
+        let v = serde_json::to_value(&doc.findings).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["subject"].clone())
+            .collect()
+    }
+
+    /// po-zcqld: two rows of one class and one control at two sites had one
+    /// title, so the server gave both one identity and refused the second.
+    /// The subject of a one-site row carries the file, so they stay apart.
+    #[test]
+    fn two_one_site_rows_of_one_class_get_two_subjects() {
+        let got = subjects(&[
+            row("secret.generic_api_key", "deploy/prod.env:3", 1),
+            row("secret.generic_api_key", "tests/fixtures/keys.py:12", 1),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                serde_json::json!({"kind": "symbol",
+                    "value": "secret.generic_api_key@deploy/prod.env"}),
+                serde_json::json!({"kind": "symbol",
+                    "value": "secret.generic_api_key@tests/fixtures/keys.py"}),
+            ]
+        );
+    }
+
+    /// A row that aggregates sites is identified by its class alone: the
+    /// primary site is only an example and changes between scans.
+    #[test]
+    fn a_row_that_aggregates_sites_has_the_class_as_subject() {
+        let got = subjects(&[row("net/http.Client.Do", "internal/x/y.go:45", 3)]);
+        assert_eq!(
+            got,
+            vec![serde_json::json!({"kind": "symbol", "value": "net/http.Client.Do"})]
+        );
+    }
+
+    /// The line, the column and the config lane's unit are not identity: an
+    /// edit above the site must not make a new risk.
+    #[test]
+    fn subject_of_a_one_site_row_carries_the_path_and_not_the_line() {
+        assert_eq!(
+            subject_of("t.m", "src/a.ts:12:7", 1).value,
+            subject_of("t.m", "src/a.ts:90", 1).value
+        );
+        assert_eq!(
+            subject_of(
+                "github-actions.job.timeout-minutes",
+                ".github/workflows/ci.yml (build)",
+                1
+            )
+            .value,
+            "github-actions.job.timeout-minutes@.github/workflows/ci.yml"
+        );
+    }
+
+    /// A one-site row with no site to name keeps the class, never `class@`.
+    #[test]
+    fn subject_of_a_one_site_row_with_no_path_is_the_class() {
+        assert_eq!(subject_of("t.m", "", 1).value, "t.m");
+        assert_eq!(subject_of("t.m", "  ", 1).value, "t.m");
     }
 
     /// po-av01j.219: the retrieval denominator reaches the document beside
