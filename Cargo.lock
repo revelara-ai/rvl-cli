@@ -1163,6 +1163,7 @@ dependencies = [
  "rvl-core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
 ]
 
