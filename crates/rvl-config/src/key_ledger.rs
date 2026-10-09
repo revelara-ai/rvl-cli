@@ -98,6 +98,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "cargo_toml.workspace_dependencies.loosest_pin",
     ),
     judged("dep-manifests", "dockerfile.base_image_pin"),
+    judged("dep-manifests", "dockerfile.final_stage_user"),
     judged("dep-manifests", "go_mod.go"),
     judged("dep-manifests", "go_mod.replace.count"),
     judged("dep-manifests", "go_mod.toolchain"),

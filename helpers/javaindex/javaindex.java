@@ -60,6 +60,7 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.UnaryTree;
+import com.sun.source.tree.UnionTypeTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.SourcePositions;
@@ -79,6 +80,7 @@ import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -348,6 +350,34 @@ class JavaIndex {
         return false;
     }
 
+    // -----------------------------------------------------------------------
+    // Misuse-shape inventory: shapes that are wrong where they stand. They
+    // ride the SAME stream, stamped site_kind: "misuse_shape", as AGGREGATES
+    // like the emission points: one packet per (enclosing function, class,
+    // identity), with the class and the count in const_args.
+    //
+    //   overbroad_catch  a catch clause whose type is java.lang.Exception or
+    //                    java.lang.Throwable. Identity: the caught type.
+    //
+    // Two handlers are kept back, because each is a different FACT (the
+    // pyindex rule):
+    //
+    //   - A handler with a throw in it. It propagates the error.
+    //   - A handler the emission lane counts as a swallow (`catch_clause`).
+    //     That is the emission lane's finding already, and one handler is
+    //     reported once.
+    //
+    // The identity is CHECKER-resolved, never read from the name: a class of
+    // the repository with the name `Exception` is not the root type, and a
+    // run in which analyze() failed reports nothing.
+    // -----------------------------------------------------------------------
+    static final String SITE_KIND_MISUSE = "misuse_shape";
+    static final String MISUSE_OVERBROAD_CATCH = "overbroad_catch";
+
+    // Broadest first: a union that names both is a catch of Throwable.
+    static final List<String> ROOT_EXCEPTION_TYPES = Arrays.asList(
+            "java.lang.Throwable", "java.lang.Exception");
+
     // Timeout-ish builder/setter names for the repo_config record
     // (case-insensitive substring match, mirroring tsindex's isTimeoutish).
     static boolean isTimeoutish(String name) {
@@ -560,6 +590,7 @@ class JavaIndex {
             scanner.scan(cu, null);
             out.addAll(scanner.sites);
             out.addAll(scanner.emissionRecords());
+            out.addAll(scanner.misuseRecords());
         }
         return out;
     }
@@ -1034,6 +1065,9 @@ class JavaIndex {
         final Deque<CatchFrame> catchStack = new ArrayDeque<>();
         // (symbol|framework|category) -> aggregate.
         final Map<String, Agg> aggs = new LinkedHashMap<>();
+        // (symbol|class|identity) -> aggregate. `framework` holds the
+        // identity and `category` the class.
+        final Map<String, Agg> misuseAggs = new LinkedHashMap<>();
 
         SiteScanner(CompilationUnitTree cu, String rel, String src, UnitImports imps) {
             this.cu = cu;
@@ -1047,6 +1081,8 @@ class JavaIndex {
             final CatchTree node;
             boolean emits;
             boolean rethrows;
+            // A throw anywhere in the handler, a nested handler included.
+            boolean throwsWithin;
 
             CatchFrame(CatchTree node) {
                 this.node = node;
@@ -1125,14 +1161,83 @@ class JavaIndex {
                 // A handled error path with no recognized emission and no
                 // rethrow: the swallow fact RC-027's question needs.
                 aggregate("catch_clause", "error_capture", "catch", node, "");
+            } else if (!frame.throwsWithin) {
+                String caught = rootCaught(node);
+                if (caught != null) {
+                    misuse(MISUSE_OVERBROAD_CATCH, caught, "catch", node);
+                }
             }
             return null;
+        }
+
+        // rootCaught: the root exception type a catch clause names, or null
+        // for a clause that names only narrower types. A multi-catch is read
+        // alternative by alternative.
+        String rootCaught(CatchTree node) {
+            Tree type = node.getParameter().getType();
+            List<? extends Tree> alternatives = type instanceof UnionTypeTree
+                    ? ((UnionTypeTree) type).getTypeAlternatives()
+                    : Collections.singletonList(type);
+            TreePath paramPath = new TreePath(getCurrentPath(), node.getParameter());
+            Set<String> caught = new HashSet<>();
+            for (Tree alt : alternatives) {
+                TreePath altPath = type == alt
+                        ? new TreePath(paramPath, alt)
+                        : new TreePath(new TreePath(paramPath, type), alt);
+                try {
+                    String fqn = checkerFqn(trees.getTypeMirror(altPath));
+                    if (fqn != null) {
+                        caught.add(fqn);
+                    }
+                } catch (Throwable ignore) {
+                    // no attribution: this alternative names nothing
+                }
+            }
+            for (String root : ROOT_EXCEPTION_TYPES) {
+                if (caught.contains(root)) {
+                    return root;
+                }
+            }
+            return null;
+        }
+
+        void misuse(String cls, String identity, String method, Tree at) {
+            String sym = symbol();
+            String key = sym + "|" + cls + "|" + identity;
+            Agg agg = misuseAggs.get(key);
+            if (agg == null) {
+                agg = new Agg(lineOf(cu, at), sym, method, identity, cls, "");
+                misuseAggs.put(key, agg);
+            }
+            agg.count++;
+        }
+
+        List<Map<String, Object>> misuseRecords() {
+            List<Agg> ordered = new ArrayList<>(misuseAggs.values());
+            ordered.sort((a, b) -> Long.compare(a.line, b.line));
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (Agg a : ordered) {
+                // Volume control: no function body on aggregates.
+                Map<String, Object> rec = baseRecord(a.line, a.symbol, a.method, "",
+                        a.framework, a.snippet, "");
+                rec.put("site_kind", SITE_KIND_MISUSE);
+                List<Object> ca = new ArrayList<>();
+                ca.add(constArg(0, "misuse_class", a.category, "aggregate"));
+                ca.add(constArg(0, "misuse_count", String.valueOf(a.count), "aggregate"));
+                rec.put("const_args", ca);
+                rec.put("provenance", provenance(true, "high"));
+                out.add(rec);
+            }
+            return out;
         }
 
         @Override
         public Void visitThrow(com.sun.source.tree.ThrowTree node, Void p) {
             if (!catchStack.isEmpty()) {
                 catchStack.peek().rethrows = true;
+            }
+            for (CatchFrame frame : catchStack) {
+                frame.throwsWithin = true;
             }
             return super.visitThrow(node, p);
         }

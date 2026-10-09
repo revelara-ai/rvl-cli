@@ -268,6 +268,7 @@ The hardest typing story in the inventory, split into explicit tiers:
 | **Virtual dispatch** (weak or strong verb) | emitted at the STATIC interface identity | **mid tier:** `provenance.callee_candidates` = 1 + overriding definitions in the TU (>1 = ambiguous dispatch) |
 | **Uninstantiated template** (dependent callee) | **abstains** — counted in `calls_callee_unresolved`, never guessed | — |
 | Weak verb on an in-repo, non-virtual type | not emitted (noise floor) | — |
+| Accessor of a standard-library ownership or reference wrapper: `get` on `std::unique_ptr`, `std::shared_ptr`, `std::reference_wrapper`; `lock` on `std::weak_ptr`; `value` on `std::optional` | not emitted (no I/O). `std::future<T>::get` blocks, so it is emitted | — |
 | No-db `.c` allowlist match | emitted | LOW: `client_type_resolved: false` |
 
 A virtual call is emitted against the interface where the method is declared:
@@ -340,6 +341,8 @@ and pin the CURLOPT_TIMEOUT const-arg discrimination, the macro flag, the
 virtual/template tiers, the no-db allowlist tier, and the failed-TU
 accounting; `testdata/fixture-emission` pins the G4 aggregates (syslog,
 spdlog, glog). `testdata/fixture-server` pins the civetweb/mongoose G2
-server entries and the `mg_match` event-handler gate. Engine-dependent tests skip (loudly) without libclang; the pure
+server entries and the `mg_match` event-handler gate. `testdata/fixture-std`
+pins the standard-library wrapper accessors that are not sites, and the
+`std::future<T>::get` that is. Engine-dependent tests skip (loudly) without libclang; the pure
 compile-db plumbing (shell splitting, arg filtering, the allowlist) is unit
 tested and always runs.

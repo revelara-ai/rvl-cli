@@ -8,8 +8,9 @@
 //!    class and confidence tier.
 //!
 //! Skip convention (matches goindex/tsindex): if rust-analyzer is not
-//! available the tests log SKIP and return, so a CI env without the rustup
-//! component degrades to unit coverage rather than failing.
+//! available the tests log SKIP and return. Under RVLSCAN_REQUIRE_ENGINES,
+//! which CI sets, the skip is a failure instead (`rvl_testgate::skip`): CI
+//! installs the rustup component, so its absence there is a broken runner.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -34,19 +35,22 @@ fn indexed() -> Option<&'static (rustindex::ra::RaIdentity, scip::types::Index)>
         let ra = match rustindex::ra::discover() {
             Ok(ra) => ra,
             Err(e) => {
-                eprintln!("SKIP rustindex fixture tests: {e}");
+                rvl_testgate::skip("rustindex fixture tests", format_args!("{e}"));
                 return None;
             }
         };
         let root = fixture_root();
         if let Err(e) = rustindex::ra::require_workspace_loads(&root) {
-            eprintln!("SKIP rustindex fixture tests (workspace load): {e}");
+            rvl_testgate::skip(
+                "rustindex fixture tests (workspace load)",
+                format_args!("{e}"),
+            );
             return None;
         }
         match rustindex::ra::run_scip(&ra, &root) {
             Ok(index) => Some((ra, index)),
             Err(e) => {
-                eprintln!("SKIP rustindex fixture tests (scip run): {e}");
+                rvl_testgate::skip("rustindex fixture tests (scip run)", format_args!("{e}"));
                 None
             }
         }

@@ -1,0 +1,16 @@
+// Vendored STUB of <future>: std::future<T>::get, the blocking accessor.
+#ifndef FIXTURE_STD_FUTURE
+#define FIXTURE_STD_FUTURE
+
+namespace std {
+
+template <typename T>
+class future {
+ public:
+  T get() { return T(); }
+  void wait() const {}
+};
+
+}  // namespace std
+
+#endif  // FIXTURE_STD_FUTURE

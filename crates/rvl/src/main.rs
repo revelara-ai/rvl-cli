@@ -1024,6 +1024,7 @@ fn resolve_structure_lane(retrieved: Option<&Path>, stream: &str, path: &Path) -
                 verdict: f.verdict.as_str().to_string(),
                 reason: f.reason.clone(),
                 class: format!("repo_structure.{}", f.control),
+                scope: None,
             })
             .collect(),
     }

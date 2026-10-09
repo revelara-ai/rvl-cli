@@ -22,6 +22,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A live test that cannot reach its engine (libclang, node and `typescript`,
+  # a JDK, rust-analyzer, Go, python3, the .NET SDK) prints SKIP and passes on
+  # a workstation. With this set it fails instead (crates/rvl-testgate), so a
+  # green run here means every language lane executed. The `check` job
+  # provisions each engine below; a runner that lacks one is red, not quiet.
+  RVLSCAN_REQUIRE_ENGINES: "1"
 
 # Runner selection follows the org convention: the `CI_RUNNER` variable selects
 # the self-hosted fleet, and an unset variable falls back to GitHub-hosted.
@@ -57,7 +63,9 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          # rust-analyzer is the engine of the Rust lane (rustindex runs it),
+          # and rust-src is the standard library source it indexes against.
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy,rust-analyzer,rust-src
 
       # On self-hosted runners the cargo registry and target dir persist on
       # local disk between jobs, so the GHA cache is a redundant multi-GB round
@@ -86,6 +94,54 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
+
+      # The engines of the other lanes. The live tests build goindex with the
+      # Go toolchain, run tsindex under node against its own `typescript`, and
+      # run javaindex in source-file mode on a JDK. None of these was installed
+      # in this job before po-av01j.99: the tests found whatever the runner
+      # image had, and skipped the rest.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+          cache: ${{ vars.CI_RUNNER == '' }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: helpers/tsindex/package.json
+
+      - name: Install the tsindex dependencies
+        working-directory: helpers/tsindex
+        run: npm ci
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # cindex loads libclang at process START (clang-sys `runtime`), so the
+      # build above succeeds on a runner with no libclang and proves nothing
+      # about the C/C++ lane. This puts the engine a release ships, pinned and
+      # checksummed in crates/cindex/libclang.pin, beside the cindex the tests
+      # run. No package manager and no sudo, and the goldens are held to the
+      # same library users get.
+      - name: Fetch the pinned libclang
+        # A block scalar: the sed expression holds a colon and a space, which
+        # ends a plain YAML scalar and makes the whole workflow unparseable.
+        run: |
+          ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
+
+      # Assert the engine, not the build. The tests fail on a missing engine
+      # too (RVLSCAN_REQUIRE_ENGINES), but this says which one in one line.
+      - name: Every engine is available
+        run: |
+          target/debug/cindex --engine-check
+          (cd helpers/tsindex && node -e "require('typescript')")
+          go version
+          javac -version
+          rust-analyzer --version
+          python3 --version
+          dotnet --version
 
       - name: Test
         run: cargo test --workspace

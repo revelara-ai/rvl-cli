@@ -205,11 +205,14 @@ fn goindex_binary(dir: &Path) -> Option<PathBuf> {
             if std::env::var_os("CI").is_some() {
                 panic!("goindex failed to build: {stderr}");
             }
-            eprintln!("SKIP: goindex failed to build (set CI=1 to make this fatal): {stderr}");
+            rvl_testgate::skip(
+                "goindex_binary",
+                format_args!("goindex failed to build (set CI=1 to make this fatal): {stderr}"),
+            );
             None
         }
         Err(e) => {
-            eprintln!("SKIP: `go` not available: {e}");
+            rvl_testgate::skip("goindex_binary", format_args!("`go` not available: {e}"));
             None
         }
     }

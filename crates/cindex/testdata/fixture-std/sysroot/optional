@@ -1,0 +1,21 @@
+// Vendored STUB of <optional>: the libc++ shape, where every standard type
+// sits in the inline namespace std::__1.
+#ifndef FIXTURE_STD_OPTIONAL
+#define FIXTURE_STD_OPTIONAL
+
+namespace std {
+inline namespace __1 {
+
+template <typename T>
+class optional {
+ public:
+  T &value() & { return val_; }
+
+ private:
+  T val_ = T();
+};
+
+}  // namespace __1
+}  // namespace std
+
+#endif  // FIXTURE_STD_OPTIONAL

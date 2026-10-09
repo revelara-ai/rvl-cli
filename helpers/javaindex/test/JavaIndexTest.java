@@ -250,6 +250,38 @@ class JavaIndexTest {
                 "full-load and --files retrieval agree per file (invariance): full="
                         + fullServiceKeys + " inc=" + incServiceKeys);
 
+        // --- misuse shapes: overbroad_catch ---
+        List<Map<String, Object>> misuse = new ArrayList<>();
+        for (Map<String, Object> rec : retrieve("--retrieve", "--root",
+                "testdata/fixture_misuse", "--name", "fx")) {
+            if ("misuse_shape".equals(rec.get("site_kind"))) {
+                misuse.add(rec);
+            }
+        }
+        // One packet per (function, identity), and nothing for the bounded
+        // forms: a narrow type, a handler that throws, a swallow, and a
+        // local class with the name of the root type.
+        check(misuse.size() == 3, "three overbroad_catch packets, got " + misuse.size()
+                + ": " + siteKeys(misuse));
+        checkOverbroad(misuse, "broad", "java.lang.Exception", "2", 17L);
+        checkOverbroad(misuse, "broad", "java.lang.Throwable", "1", 27L);
+        checkOverbroad(misuse, "alsoBroad", "java.lang.Exception", "1", 36L);
+        for (Map<String, Object> s : misuse) {
+            check(!"bounded".equals(s.get("symbol")) && !"local".equals(s.get("symbol")),
+                    "a bounded form is not an overbroad catch: " + s.get("site_key"));
+        }
+        // The handler that logs in the classic fixture is one, and the
+        // swallow next to it stays with the emission lane only.
+        List<Map<String, Object>> classicMisuse = new ArrayList<>();
+        for (Map<String, Object> s : sites) {
+            if ("misuse_shape".equals(siteKind(s))) {
+                classicMisuse.add(s);
+            }
+        }
+        check(classicMisuse.size() == 1, "one overbroad catch in the classic fixture, got "
+                + siteKeys(classicMisuse));
+        checkOverbroad(classicMisuse, "work", "java.lang.Exception", "1", 21L);
+
         unsizedConstructions();
 
         if (failures > 0) {
@@ -496,6 +528,59 @@ class JavaIndexTest {
             }
         }
         return null;
+    }
+
+    static List<String> siteKeys(List<Map<String, Object>> sites) {
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> s : sites) {
+            out.add((String) s.get("site_key"));
+        }
+        return out;
+    }
+
+    static String constArgValue(Map<String, Object> site, String name, String how) {
+        for (Object o : (List<?>) site.get("const_args")) {
+            Map<?, ?> a = (Map<?, ?>) o;
+            if (name.equals(a.get("name")) && how.equals(a.get("how"))) {
+                return (String) a.get("value");
+            }
+        }
+        return null;
+    }
+
+    // checkOverbroad: exactly one overbroad_catch aggregate for (symbol,
+    // identity), with the fields the misuse contract requires.
+    static void checkOverbroad(List<Map<String, Object>> misuse, String symbol,
+            String identity, String count, long line) {
+        String what = "overbroad_catch " + symbol + "/" + identity;
+        Map<String, Object> hit = null;
+        int n = 0;
+        for (Map<String, Object> s : misuse) {
+            if (symbol.equals(s.get("symbol")) && identity.equals(s.get("client_type"))) {
+                hit = s;
+                n++;
+            }
+        }
+        check(n == 1, what + ": want one packet, got " + n);
+        if (hit == null) {
+            return;
+        }
+        check("overbroad_catch".equals(constArgValue(hit, "misuse_class", "aggregate")),
+                what + ": misuse_class rides const_args as an aggregate");
+        check(count.equals(constArgValue(hit, "misuse_count", "aggregate")),
+                what + ": misuse_count is " + count + ", got "
+                        + constArgValue(hit, "misuse_count", "aggregate"));
+        check(((Long) hit.get("line_number")) == line,
+                what + ": line is that of the first occurrence (" + line + "), got "
+                        + hit.get("line_number"));
+        check("catch".equals(hit.get("func")), what + ": func is `catch`");
+        check("".equals(hit.get("receiver")), what + ": no receiver");
+        check("".equals(hit.get("enclosing_function_body")),
+                what + ": an aggregate carries no function body");
+        check(Boolean.TRUE.equals(prov(hit).get("client_type_resolved")),
+                what + ": the caught type is checker-resolved");
+        check(((String) hit.get("site_key")).endsWith(":" + line + ":" + identity + ":catch"),
+                what + ": site_key follows the formula, got " + hit.get("site_key"));
     }
 
     static String emissionCount(Map<String, Object> agg) {

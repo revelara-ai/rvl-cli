@@ -36,7 +36,7 @@ the part that must not be built again.
 | 7a | M1: container without requests, or without a memory limit | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:352`, `crates/rvl-config/src/key_ledger.rs:136` | None needed | `kubernetes container.resources.requests.cpu` and `kubernetes container.resources.requests.memory` on RC-024, `kubernetes container.resources.limits.memory` on RC-067. All expect `present`. |
 | 7b | M1: container without a CPU limit | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:354`, `crates/rvl-config/src/key_ledger.rs:135` | `po-av01j.44` | `kubernetes container.resources.limits.cpu` is emitted and has no spec. A CPU limit is contested practice, so this needs a decision before a spec. |
 | 8a | H1: swallowed error | SHIPPED | `helpers/goindex/emission.go:360`, `crates/rvl-emission/src/lib.rs:109` | None needed | The G4 emission lane. The Go, Python, and TypeScript helpers emit swallow aggregates, and three `violates` specs map them to RC-027. The finding is one advisory row per control with at most five evidence sites. |
-| 8b | H2/H3: overbroad catch, discarded error value | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `helpers/goindex/misuse.go:134`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `overbroad_catch` and the Go helper emits `discarded_error`, as `misuse_shape` aggregates. No `misuse_shapes` spec is in the corpus, so the lane judges nothing yet. A handler that 8a counts as a swallow is not reported again. The other helpers do not emit the packet. |
+| 8b | H2/H3: overbroad catch, discarded error value | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `helpers/goindex/misuse.go:134`, `helpers/javaindex/javaindex.java:1176`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-08 by `po-6c0v8.17`. The Python and Java helpers emit `overbroad_catch` and the Go helper emits `discarded_error`, as `misuse_shape` aggregates. The Java identities are `java.lang.Exception` and `java.lang.Throwable`. No `misuse_shapes` spec is in the corpus, so the lane judges nothing yet. A handler that 8a counts as a swallow is not reported again. The other helpers do not emit the packet. |
 | 9 | F2: cache with no eviction, TTL, or size cap | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:87`, `helpers/pyindex/pyindex.py:1367`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Same packet as M6. Emitted for go-cache, `functools.lru_cache`, `functools.cache`, and, since `po-6c0v8.14`, the Caffeine builder (`javaindex`). |
 | 10a | K2: container without a liveness or readiness probe | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:368`, `crates/rvl-config/src/key_ledger.rs:133` | None needed | `kubernetes container.liveness-probe` and `kubernetes container.readiness-probe` on RC-020. |
 | 10b | K2: container without a startup probe | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:370`, `crates/rvl-config/src/key_ledger.rs:140` | `po-av01j.44` | `kubernetes container.startup-probe` is emitted and has no spec. |
@@ -44,7 +44,8 @@ the part that must not be built again.
 | 11 | F3: unbounded read of a body, file, or result set | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:356`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Go `io.ReadAll` is emitted with the calls its argument passes through. It is still not a G1 call site, so the retrieval census counts it as before. Python reads are not emitted. |
 | 12a | Q25: mutable image tag | SHIPPED | `crates/rvl-config/src/dep_manifests.rs:768`, `crates/rvl-config/src/kubernetes/manifest.rs:390` | None needed | `dep-manifests dockerfile.base_image_pin` and `kubernetes container.image.pin` on RC-041. Both expect `digest` or `tag`. |
 | 12b | Q26: container with no security context | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:377`, `crates/rvl-config/src/key_ledger.rs:139` | None needed | `kubernetes container.security-context` on RC-044, presence only. This is not a root-container check: see 12c. |
-| 12c | Q26: container runs as root, fat base image | GENUINELY-NEW | `crates/rvl-config/src/dep_manifests.rs:674` | `po-6c0v8.6` | The Dockerfile retriever reads `FROM` only. Nothing reads `USER`, the value of `runAsNonRoot`, or the size class of a base image. |
+| 12c | Q26: container runs as root (Dockerfile `USER`) | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/dep_manifests.rs:908`, `crates/rvl-config/src/key_ledger.rs:101` | `po-6c0v8.19` | Updated 2026-10-08 by `po-6c0v8.6`. `dep-manifests dockerfile.final_stage_user` is emitted once for each Dockerfile and has no spec. The value is `root`, `non-root`, or `absent`, from the last `USER` of the final stage. A final stage that is built `FROM` an earlier stage has the user of that stage. `absent` is not a verdict of root: with no `USER`, the base image sets the user, and the provenance names that image. No value is emitted for a `USER` that reads a build argument with no default in the file, or an `ENV`. |
+| 12d | Q26: `runAsNonRoot` value, fat base image | GENUINELY-NEW | `crates/rvl-config/src/kubernetes/manifest.rs:739`, `crates/rvl-config/src/dep_manifests.rs:701` | `po-6c0v8.20` | Split from 12c on 2026-10-08. `kubernetes container.security-context` is judged for presence only: nothing reads the value of `runAsNonRoot`. Nothing reads the size class of a base image. That check needs a decision first: is a list of image names an acceptable classifier? |
 | 13 | I1: unstructured or print-style logging | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/misuse_shapes.go:78`, `helpers/pyindex/pyindex.py:1094`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.11` | Updated 2026-10-07 by `po-6c0v8.4`. The Go and Python helpers emit `print_logging` for print functions that write to a standard stream. Stdlib `log.Print*` and `logging` calls are not emitted: G4 counts them as log emissions that can satisfy RC-027, and that boundary is not arbitrated. The default severity is `low`, and the corpus sets it. |
 | 14 | J7: average latency in place of a histogram | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/misuse_shapes.go:78`, `helpers/pyindex/pyindex.py:1094`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.11` | Updated 2026-10-07 by `po-6c0v8.4`. The Go and Python helpers emit `latency_scalar_metric` at the registration call of a Prometheus gauge or counter with a latency name. Other metric clients are not read. |
 | 15 | G5/G6: sync-over-async, blocking in async | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `blocking_in_async` and `sync_over_async` for a table of module-level functions. A blocking method on a client object is not emitted. Go has no async functions. |
@@ -107,6 +108,10 @@ SHIPPED. The manifest carries the path of the liveness probe, and the scan
 joins it to the handler in the same repository. Three retriever gaps stay
 (12c, 18b, 19c).
 
+**Update, 2026-10-08 (`po-6c0v8.17`).** The Java helper emits
+`overbroad_catch` (row 8b). The status of the row does not change: no spec
+judges the class.
+
 ## What to build, and what not to build
 
 **Do not build.** A timeout detector, a secret detector, a swallowed-error
@@ -130,7 +135,7 @@ Four classes had no bead. Each is now a child of the epic:
 | Bead | Class | Row |
 | --- | --- | --- |
 | `po-6c0v8.5` | K3: liveness handler touches a dependency. Landed on 2026-10-08. | 10c |
-| `po-6c0v8.6` | Q26: Dockerfile `USER`, `runAsNonRoot` value, fat base | 12c |
+| `po-6c0v8.6` | Q26: Dockerfile `USER`. Landed on 2026-10-08. The `runAsNonRoot` value and the fat base are in `po-6c0v8.20`. | 12c, 12d |
 | `po-6c0v8.7` | Q21/Q22: no dependency scanning or SAST job | 18b |
 | `po-6c0v8.8` | O8: workload with no PDB or anti-affinity | 19c |
 
@@ -138,6 +143,14 @@ Four classes had no bead. Each is now a child of the epic:
 LANE-WIRED-NEEDS-CORPUS. The Kubernetes retriever emits the three facts. The
 specs are corpus work in `po-av01j.44`, as for rows 7b, 10b, and 19b. The
 retriever gaps that are left are 10c, 12c, and 18b.
+
+**Update, 2026-10-08 (`po-6c0v8.6`).** Row 12c is split. The Dockerfile
+retriever emits the user of the final stage, so 12c moved from GENUINELY-NEW
+to LANE-WIRED-NEEDS-CORPUS: the key is in the mint queue (`rvl cache keys`),
+and the spec is corpus work in `po-6c0v8.19`. The new row 12d holds the part
+that was not built: the value of `runAsNonRoot` in a manifest, and the fat
+base image, which waits for a decision (`po-6c0v8.20`). The retriever gaps
+that are left are 12d and 18b.
 
 The control-code block that every wave bead names (`po-av01j.105`) is closed.
 It is no longer a reason to wait.

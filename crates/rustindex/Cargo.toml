@@ -16,6 +16,10 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+[dev-dependencies]
+# The one place a live test may skip; fatal under RVLSCAN_REQUIRE_ENGINES.
+rvl-testgate = { path = "../rvl-testgate" }
+
 # Not its own release app: rustindex rides the rvl archive (po-aml3h). Since
 # po-av01j.154 this crate is a LIBRARY; the executable is a bin target of the
 # rvl package (crates/rvl/src/bin/rustindex.rs). See crates/cindex/Cargo.toml.

@@ -84,6 +84,13 @@ pub struct OutSite {
     pub verdict: String,
     pub reason: String,
     pub class: String,
+    /// The [`rvl_core::ScopeClass`] of the site's file (po-657l6.10), the
+    /// same value an `undecided` row carries, here on every row: a consumer
+    /// that samples resolved rows must be able to tell a migration from
+    /// request-path code. Additive. `None`, and absent from the document, on
+    /// a `structure` row, which describes the repository and has no file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<&'static str>,
 }
 
 /// One ladder row, post-waiver. `severity` is the SECTION the row renders in
@@ -331,12 +338,14 @@ pub fn build(
     let mut covered: BTreeSet<String> = BTreeSet::new();
     for (f, s) in propagated.iter().zip(sites.iter()) {
         let class = rvl_triage::class_key_string(s);
+        let scope = s.scope().as_str();
         site_rows.push(OutSite {
             site_id: f.site_id.clone(),
             snapshot_id: s.snapshot_id.clone(),
             verdict: f.verdict.as_str().to_string(),
             reason: f.reason.clone(),
             class: class.clone(),
+            scope: Some(scope),
         });
         if f.verdict.is_resolved() {
             covered.insert(class);
@@ -345,7 +354,7 @@ pub fn build(
                 site: format!("{}:{}", s.file_path, s.line_number),
                 class,
                 lever: lever_of(&f.reason),
-                scope: s.scope().as_str(),
+                scope,
             });
         }
     }
@@ -765,6 +774,7 @@ mod tests {
             verdict: verdict.into(),
             reason: "r".into(),
             class: format!("repo_structure.{control}"),
+            scope: None,
         };
         let rows = [
             row("RC-033", "violates"),
@@ -812,6 +822,122 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["structure"], serde_json::json!([]));
         assert!(v["coverage"]["structure"].is_null());
+    }
+
+    /// The three paths of the judge replay (po-657l6.10): a runtime module, a
+    /// Django migration, and a Django management command.
+    const SCOPE_FIXTURE: [&str; 3] = [
+        "zerver/lib/outgoing_http.py",
+        "zerver/migrations/0260_missed_message_addresses_from_redis_to_db.py",
+        "zerver/management/commands/deliver_scheduled_emails.py",
+    ];
+
+    fn scope_site(path: &str) -> rvl_core::Site {
+        rvl_core::Site {
+            file_path: path.to_string(),
+            line_number: 7,
+            client_type: "requests".to_string(),
+            method: "get".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The document for `sites`, every one of them judged `verdict`.
+    fn doc_of(
+        sites: &[rvl_core::Site],
+        verdict: rvl_core::Verdict,
+        reason: &str,
+        structure: &[OutSite],
+    ) -> serde_json::Value {
+        let propagated: Vec<_> = sites
+            .iter()
+            .map(|s| rvl_propagate::Finding {
+                site_id: s.site_key(),
+                verdict,
+                reason: reason.to_string(),
+            })
+            .collect();
+        let doc = build(
+            &[],
+            &render::Coverage::default(),
+            None,
+            &propagated,
+            sites,
+            structure,
+            None,
+            None,
+            false,
+        );
+        serde_json::to_value(&doc).unwrap()
+    }
+
+    const VIOLATES: (rvl_core::Verdict, &str) = (rvl_core::Verdict::Violates, "no bound anywhere");
+
+    /// Every `sites` row says where its file lives, resolved rows included:
+    /// `undecided` carries scope for abstains only, so a consumer that samples
+    /// violating rows had no way to tell a migration from request-path code.
+    #[test]
+    fn every_site_row_carries_the_scope_of_its_file() {
+        let sites: Vec<_> = SCOPE_FIXTURE.iter().map(|p| scope_site(p)).collect();
+        let v = doc_of(&sites, VIOLATES.0, VIOLATES.1, &[]);
+        let rows = v["sites"].as_array().unwrap();
+        assert_eq!(rows.len(), SCOPE_FIXTURE.len());
+        for (row, path) in rows.iter().zip(SCOPE_FIXTURE) {
+            assert_eq!(
+                row["scope"],
+                rvl_core::scope_of(path).as_str(),
+                "scope of {path}"
+            );
+        }
+        // Pinned as text too, so a change to `scope_of` shows up here as a
+        // change to the document. A management command is `runtime` to the
+        // path classifier: nothing in its path says otherwise.
+        let scopes: Vec<_> = rows.iter().map(|r| r["scope"].as_str().unwrap()).collect();
+        assert_eq!(scopes, ["runtime", "migration", "runtime"]);
+    }
+
+    /// Repo evidence beats the path in the row as it does in the verdict: the
+    /// row reads `Site::scope`, the one place both are consulted.
+    #[test]
+    fn a_site_row_takes_the_scope_override_over_the_path() {
+        let mut site = scope_site("hatch_build.py");
+        site.scope_override = Some(rvl_core::ScopeClass::DevOnly);
+        let v = doc_of(&[site], VIOLATES.0, VIOLATES.1, &[]);
+        assert_eq!(v["sites"][0]["scope"], "dev_only");
+    }
+
+    /// An abstained site appears in `sites` and in `undecided`; the two rows
+    /// must name one scope.
+    #[test]
+    fn a_site_row_and_its_undecided_row_agree_on_scope() {
+        let sites: Vec<_> = SCOPE_FIXTURE.iter().map(|p| scope_site(p)).collect();
+        let v = doc_of(
+            &sites,
+            rvl_core::Verdict::Abstain,
+            "no spec for requests.get",
+            &[],
+        );
+        let undecided = v["undecided"].as_array().unwrap();
+        assert_eq!(undecided.len(), SCOPE_FIXTURE.len());
+        for (row, u) in v["sites"].as_array().unwrap().iter().zip(undecided) {
+            assert_eq!(row["scope"], u["scope"]);
+        }
+    }
+
+    /// A structure row describes the repository, not a file, so it has no
+    /// scope to report: the key is absent, never a fabricated `runtime`.
+    #[test]
+    fn a_structure_row_has_no_scope() {
+        let row = OutSite {
+            site_id: STRUCTURE_SITE_ID.into(),
+            snapshot_id: "snap".into(),
+            verdict: "violates".into(),
+            reason: "r".into(),
+            class: "repo_structure.RC-033".into(),
+            scope: None,
+        };
+        let v = doc_of(&[], VIOLATES.0, VIOLATES.1, &[row]);
+        assert!(v["structure"][0].get("scope").is_none(), "{v}");
     }
 
     /// Unresolved sites land in `undecided` with the same lever the COVERAGE
