@@ -1064,33 +1064,33 @@ pub fn submit_scan(
     let body = request_body(req, true);
     let url = format!("{}/api/v1/risks/scan", client.api_url);
 
+    let auth = format!("Bearer {}", client.api_key);
+    let mut headers = vec![
+        ("Content-Type", "application/json"),
+        ("Authorization", auth.as_str()),
+    ];
+    if let Some(org) = &client.org_id {
+        headers.push(("X-Organization-ID", org));
+    }
+
     let mut attempt = 0u32;
     loop {
-        let mut r = ureq::request("POST", &url)
-            .timeout(timeout)
-            .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Bearer {}", client.api_key));
-        if let Some(org) = &client.org_id {
-            r = r.set("X-Organization-ID", org);
-        }
-        match r.send_bytes(body.as_bytes()) {
-            Ok(resp) => {
-                let mut buf = Vec::new();
-                resp.into_reader()
-                    .read_to_end(&mut buf)
-                    .map_err(|e| SubmitError::new(format!("read response body: {e}")))?;
-                return serde_json::from_slice(&buf)
-                    .map_err(|e| SubmitError::new(format!("parse response: {e}")));
-            }
-            Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+        let resp = crate::client::send("POST", &url, &headers, Some(body.as_bytes()), timeout)
+            .map_err(|e| SubmitError::new(format!("request failed: {e}")))?;
+        match resp.status().as_u16() {
+            code @ (401 | 403) => {
                 return Err(SubmitError::new(format!(
                     "authentication failed against {} - run '{BIN} login' to reconfigure (status {code})",
                     client.api_url
                 )));
             }
-            Err(ureq::Error::Status(429, resp)) if attempt < MAX_RETRIES => {
-                let mut delay = parse_retry_after(resp.header("Retry-After").unwrap_or(""))
-                    .unwrap_or(Duration::ZERO);
+            429 if attempt < MAX_RETRIES => {
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let mut delay = parse_retry_after(retry_after).unwrap_or(Duration::ZERO);
                 if delay.is_zero() || delay > MAX_BACKOFF {
                     delay = Duration::from_secs(60);
                 }
@@ -1101,9 +1101,8 @@ pub fn submit_scan(
                 std::thread::sleep(delay);
                 attempt += 1;
             }
-            Err(ureq::Error::Status(code, resp)) => {
-                let mut buf = Vec::new();
-                let _ = resp.into_reader().read_to_end(&mut buf);
+            code if code >= 400 => {
+                let buf = crate::client::read_body(resp).unwrap_or_default();
                 let (msg, ecode) = decode_server_error(&buf);
                 let mut err = SubmitError::new(format!(
                     "server error ({code} {ecode}) from {}: {msg}",
@@ -1114,8 +1113,11 @@ pub fn submit_scan(
                 }
                 return Err(err);
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(SubmitError::new(format!("request failed: {t}")))
+            _ => {
+                let buf = crate::client::read_body(resp)
+                    .map_err(|e| SubmitError::new(format!("read response body: {e}")))?;
+                return serde_json::from_slice(&buf)
+                    .map_err(|e| SubmitError::new(format!("parse response: {e}")));
             }
         }
     }

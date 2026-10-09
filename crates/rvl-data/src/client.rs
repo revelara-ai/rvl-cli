@@ -32,31 +32,108 @@ impl Client {
         body: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<Vec<u8>, String> {
-        let mut req = ureq::request(method, url)
-            .timeout(timeout)
-            .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Bearer {}", self.api_key));
+        let auth = format!("Bearer {}", self.api_key);
+        let mut headers = vec![
+            ("Content-Type", "application/json"),
+            ("Authorization", auth.as_str()),
+        ];
         if let Some(org) = &self.org_id {
-            req = req.set("X-Organization-ID", org);
+            headers.push(("X-Organization-ID", org));
         }
-        let result = match body {
-            Some(b) => req.send_bytes(b),
-            None => req.call(),
-        };
-        match result {
-            Ok(resp) => read_body(resp).map_err(|e| format!("read response body: {e}")),
-            Err(ureq::Error::Status(code, resp)) => {
+        match send(method, url, &headers, body, timeout) {
+            Ok(resp) if is_error_status(&resp) => {
+                let code = resp.status().as_u16();
                 let body = read_body(resp).unwrap_or_default();
                 Err(status_error(code, &body))
             }
-            Err(ureq::Error::Transport(t)) => Err(format!("request failed: {t}")),
+            Ok(resp) => read_body(resp).map_err(|e| format!("read response body: {e}")),
+            Err(e) => Err(format!("request failed: {e}")),
         }
     }
 }
 
-fn read_body(resp: ureq::Response) -> std::io::Result<Vec<u8>> {
+pub(crate) type Response = ureq::http::Response<ureq::Body>;
+
+/// A transport failure: the request got no HTTP response. The message
+/// starts with the URL, because the ureq error does not name it.
+#[derive(Debug)]
+pub(crate) struct TransportError {
+    url: String,
+    source: ureq::Error,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.url, self.source)
+    }
+}
+
+/// The agent for one call. Each setting holds a behavior the callers were
+/// written against, where the ureq 3 default is different (po-av01j.236):
+/// - `http_status_as_error(false)`: a 4xx/5xx comes back as a response, so
+///   its body and headers stay readable. The ureq 3 status error drops them.
+///   Callers must check [`is_error_status`].
+/// - `proxy(None)`: ureq 3 reads the proxy variables from the environment
+///   by default. This client never did.
+/// - `max_redirects(5)`: the ureq 2 limit.
+///
+/// The agent is not shared, so no connection is used again for a later call.
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(5)
+        .build()
+        .into()
+}
+
+/// Send one request and return the response for ANY status. `timeout` is
+/// the limit for the full call, the read of the body included.
+pub(crate) fn send(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Response, TransportError> {
+    let mut req = ureq::http::Request::builder().method(method).uri(url);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let agent = agent(timeout);
+    // A POST, PUT or PATCH with no body goes out as an empty body of a known
+    // length (`Content-Length: 0`, as Go's net/http sends it). With `()`,
+    // ureq 3 sends such a request as `Transfer-Encoding: chunked`.
+    let body = match body {
+        None if matches!(method, "POST" | "PUT" | "PATCH") => Some(&[][..]),
+        other => other,
+    };
+    let result = match body {
+        Some(b) => req
+            .body(b)
+            .map_err(ureq::Error::from)
+            .and_then(|r| agent.run(r)),
+        None => req
+            .body(())
+            .map_err(ureq::Error::from)
+            .and_then(|r| agent.run(r)),
+    };
+    result.map_err(|source| TransportError {
+        url: url.to_string(),
+        source,
+    })
+}
+
+/// 4xx and 5xx, the statuses ureq 2 gave back as `Error::Status`.
+pub(crate) fn is_error_status(resp: &Response) -> bool {
+    resp.status().as_u16() >= 400
+}
+
+/// The full body, with no size limit.
+pub(crate) fn read_body(resp: Response) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)?;
+    std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut buf)?;
     Ok(buf)
 }
 
@@ -124,16 +201,22 @@ pub fn resolve_organization_id(cfg: &DataConfig) -> Result<Option<String>, Strin
         return Ok(None);
     }
     let url = format!("{}/api/v1/organizations", cfg.api_url);
-    let result = ureq::get(&url)
-        .timeout(Duration::from_secs(10))
-        .set("Authorization", &format!("Bearer {}", cfg.api_key))
-        .call();
-    let resp = match result {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("fetch organizations failed (status {code})"))
+    let auth = format!("Bearer {}", cfg.api_key);
+    let resp = match send(
+        "GET",
+        &url,
+        &[("Authorization", &auth)],
+        None,
+        Duration::from_secs(10),
+    ) {
+        Ok(r) if is_error_status(&r) => {
+            return Err(format!(
+                "fetch organizations failed (status {})",
+                r.status().as_u16()
+            ))
         }
-        Err(ureq::Error::Transport(t)) => return Err(format!("fetch organizations: {t}")),
+        Ok(r) => r,
+        Err(e) => return Err(format!("fetch organizations: {e}")),
     };
     let body = read_body(resp).map_err(|e| format!("read response body: {e}"))?;
     let orgs: OrgsResponse =
@@ -165,19 +248,18 @@ pub fn resolve_organization_id(cfg: &DataConfig) -> Result<Option<String>, Strin
 /// `ValidateCredentials`.
 pub fn validate_credentials(client: &Client) -> Result<(), String> {
     let url = format!("{}/api/v1/risks/stats", client.api_url);
-    let mut req = ureq::get(&url)
-        .timeout(Duration::from_secs(10))
-        .set("Authorization", &format!("Bearer {}", client.api_key));
+    let auth = format!("Bearer {}", client.api_key);
+    let mut headers = vec![("Authorization", auth.as_str())];
     if let Some(org) = &client.org_id {
-        req = req.set("X-Organization-ID", org);
+        headers.push(("X-Organization-ID", org));
     }
-    match req.call() {
-        Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code @ (401 | 403), _)) => {
-            Err(format!("authentication failed (status {code})"))
-        }
-        Err(ureq::Error::Status(code, _)) => Err(format!("server error (status {code})")),
-        Err(ureq::Error::Transport(t)) => Err(format!("connection failed: {t}")),
+    match send("GET", &url, &headers, None, Duration::from_secs(10)) {
+        Ok(resp) => match resp.status().as_u16() {
+            code @ (401 | 403) => Err(format!("authentication failed (status {code})")),
+            code if code >= 400 => Err(format!("server error (status {code})")),
+            _ => Ok(()),
+        },
+        Err(e) => Err(format!("connection failed: {e}")),
     }
 }
 
@@ -192,13 +274,16 @@ pub fn fetch_team_slugs(client: &Client) -> Option<Vec<String>> {
         return None;
     }
     let url = format!("{}/api/v1/teams/slugs", client.api_url);
-    let mut req = ureq::get(&url)
-        .timeout(Duration::from_secs(5))
-        .set("Authorization", &format!("Bearer {}", client.api_key));
+    let auth = format!("Bearer {}", client.api_key);
+    let mut headers = vec![("Authorization", auth.as_str())];
     if let Some(org) = &client.org_id {
-        req = req.set("X-Organization-ID", org);
+        headers.push(("X-Organization-ID", org));
     }
-    let body = read_body(req.call().ok()?).ok()?;
+    let resp = send("GET", &url, &headers, None, Duration::from_secs(5)).ok()?;
+    if is_error_status(&resp) {
+        return None;
+    }
+    let body = read_body(resp).ok()?;
 
     #[derive(Deserialize)]
     struct SlugsResponse {

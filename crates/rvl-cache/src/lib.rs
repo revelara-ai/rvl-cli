@@ -559,6 +559,32 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// The agent for one fetch: a 30 s limit on each call, the read of the body
+/// included. Two settings hold the behavior that the fetchers were written
+/// against, where the ureq 3 default is different (po-av01j.236):
+/// `proxy(None)` because ureq 3 reads the proxy variables from the
+/// environment by default, and `max_redirects(5)`, the ureq 2 limit.
+/// A 4xx/5xx stays an error (`ureq::Error::StatusCode`).
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .proxy(None)
+        .max_redirects(5)
+        .build()
+        .into()
+}
+
+/// The detached signature as text. A signature is some tens of bytes, so
+/// the limit only stops a server that sends an endless body.
+fn read_sig(resp: ureq::http::Response<ureq::Body>) -> anyhow::Result<String> {
+    Ok(resp
+        .into_body()
+        .into_with_config()
+        .limit(10 * 1024 * 1024)
+        .lossy_utf8(true)
+        .read_to_string()?)
+}
+
 /// HTTP fetcher against the Revelara API: hash-conditional GET on the
 /// artifact, then the detached signature. Org-key auth via bearer token.
 pub struct HttpFetcher {
@@ -573,15 +599,14 @@ impl Fetcher for HttpFetcher {
             self.base_url.trim_end_matches('/')
         );
         let auth = format!("Bearer {}", self.org_key);
-        let mut req = ureq::get(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .set("Authorization", &auth);
+        let agent = http_agent();
+        let mut req = agent.get(&url).header("Authorization", &auth);
         if let Some(h) = current_hash {
-            req = req.set("If-None-Match", &format!("\"{h}\""));
+            req = req.header("If-None-Match", format!("\"{h}\""));
         }
         let resp = match req.call() {
-            // 304 arrives as Ok, NOT as Err: ureq reserves `Error::Status` for
-            // 4xx/5xx. Checking the status here rather than in an Err arm is
+            // 304 arrives as Ok, NOT as Err: ureq reserves `Error::StatusCode`
+            // for 4xx/5xx. Checking the status here rather than in an Err arm is
             // the whole fix (po-av01j.176) — the Err arm below never fired, so
             // every conditional hit fell through, read an EMPTY body, and then
             // failed signature verification against it. That surfaced to users
@@ -589,19 +614,19 @@ impl Fetcher for HttpFetcher {
             // tampering message for a healthy cache hit.
             Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
-            Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
             // 404 on the artifact means "never published", which a user must
             // be able to tell apart from a dead network (po-gcn3q).
-            Err(ureq::Error::Status(404, _)) => return Ok(Fetched::NotPublished { url }),
+            Err(ureq::Error::StatusCode(404)) => return Ok(Fetched::NotPublished { url }),
             Err(e) => return Err(e.into()),
         };
         let mut bytes = Vec::new();
-        resp.into_reader().read_to_end(&mut bytes)?;
-        let sig_b64 = ureq::get(&format!("{url}.sig"))
-            .timeout(std::time::Duration::from_secs(30))
-            .set("Authorization", &auth)
-            .call()?
-            .into_string()?;
+        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut bytes)?;
+        let sig_b64 = read_sig(
+            agent
+                .get(format!("{url}.sig"))
+                .header("Authorization", &auth)
+                .call()?,
+        )?;
         Ok(Fetched::New { bytes, sig_b64 })
     }
 }
@@ -625,9 +650,10 @@ impl Fetcher for OssHttpFetcher {
             "{}/api/v1/scanner/spec-cache/oss",
             self.base_url.trim_end_matches('/')
         );
-        let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(30));
+        let agent = http_agent();
+        let mut req = agent.get(&url);
         if let Some(h) = current_hash {
-            req = req.set("If-None-Match", &format!("\"{h}\""));
+            req = req.header("If-None-Match", format!("\"{h}\""));
         }
         let resp = match req.call() {
             // Same 304-in-the-Ok-arm rule as the commercial fetcher
@@ -635,18 +661,14 @@ impl Fetcher for OssHttpFetcher {
             // and fails verification with a tampering message.
             Ok(r) if r.status() == 304 => return Ok(Fetched::NotModified),
             Ok(r) => r,
-            Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
             // 404 on the artifact means "never published", which a user must
             // be able to tell apart from a dead network (po-gcn3q).
-            Err(ureq::Error::Status(404, _)) => return Ok(Fetched::NotPublished { url }),
+            Err(ureq::Error::StatusCode(404)) => return Ok(Fetched::NotPublished { url }),
             Err(e) => return Err(e.into()),
         };
         let mut bytes = Vec::new();
-        resp.into_reader().read_to_end(&mut bytes)?;
-        let sig_b64 = ureq::get(&format!("{url}.sig"))
-            .timeout(std::time::Duration::from_secs(30))
-            .call()?
-            .into_string()?;
+        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut bytes)?;
+        let sig_b64 = read_sig(agent.get(format!("{url}.sig")).call()?)?;
         Ok(Fetched::New { bytes, sig_b64 })
     }
 }
