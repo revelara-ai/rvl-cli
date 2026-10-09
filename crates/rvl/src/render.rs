@@ -635,6 +635,19 @@ impl Coverage {
     }
 }
 
+/// What the config lane concluded for the settings of one (format, key). The
+/// four counts are the lane's verdicts, so `violates / (violates +
+/// satisfies)` is the fire rate of the spec that judges the key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfigKeyCounts {
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    /// A conditional spec whose guard did not hold: resolved, and neither a
+    /// site that fired nor one that passed.
+    pub not_applicable: usize,
+}
+
 /// Coverage for the G6 config lane, rendered inside the COVERAGE section when
 /// the lane saw anything. Mirrors [`Coverage`]'s lever-based abstain
 /// breakdown, plus the identity-only sightings of unsupported config formats
@@ -660,6 +673,10 @@ pub struct ConfigCoverage {
     /// them and none is wanted (`rvl_config::key_ledger`). Kept out of
     /// `abstain_no_spec` so that lever counts only real authoring gaps.
     pub vocabulary_only: usize,
+    /// Verdict counts per (format, key), over every setting in `total`. The
+    /// ladder names only the violating sites of a class; this also carries
+    /// how many sites of the same key satisfied (po-av01j.133.12).
+    pub by_key: std::collections::BTreeMap<(String, String), ConfigKeyCounts>,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format

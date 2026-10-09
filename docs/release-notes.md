@@ -7,7 +7,24 @@ The full list of changes in a release is on its
 
 To read the installed version, run `rvl --version` or `rvl version`.
 
-## 1.4.0 (not released yet)
+## After 1.4.0 (not released yet)
+
+### `coverage.config.by_key` in the `rvl scan --out` document
+
+**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+and earlier do not write the field, so a consumer must treat a document
+without it as "not measured", not as zero.
+
+`coverage.config.by_key` has one row for each `(format, key)` the config lane
+found a setting for, with the counts `violates`, `satisfies`, `abstain` and
+`not_applicable`. A finding names only the violating sites of a config class.
+With this block, the fire rate of a config spec is
+`violates / (violates + satisfies)`, computed from the scan document alone.
+The counts of all rows sum to `coverage.config.total`. See
+[the out contract](out-contract.md) for the field. The addition is additive:
+the schema stays `rvl-scan/v1`.
+
+## 1.4.0
 
 The first release after `v1.3.0`.
 
