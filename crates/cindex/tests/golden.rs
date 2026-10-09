@@ -727,6 +727,41 @@ fn no_db_syslog_aggregates_at_low_tier() {
     );
 }
 
+/// po-s7tqc: `get`, `lock` and `value` on a standard-library ownership or
+/// reference wrapper hand back what the wrapper already holds. The weak verb
+/// `get` resolves on an out-of-repo type, so before this fix each template
+/// instantiation was its own client type and its own authoring question.
+/// `std::future<T>::get` blocks, so it is the one site of the file.
+#[test]
+fn std_wrapper_accessors_are_not_sites_and_future_get_is() {
+    if !engine_available("std_wrapper_accessors_are_not_sites_and_future_get_is") {
+        return;
+    }
+    let (sites, records) = retrieve(&fixture("fixture-std").join("repo"), &[]);
+    assert_eq!(
+        stats(&records)["tus_incomplete"],
+        0,
+        "the fixture parses clean, so a missing site is an abstention"
+    );
+
+    let found: Vec<(&str, &str, &str)> = sites
+        .iter()
+        .map(|s| {
+            (
+                s["symbol"].as_str().unwrap_or_default(),
+                s["client_type"].as_str().unwrap_or_default(),
+                s["func"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![("await_result", "std::future<int>", "get")],
+        "only the future's blocking get is a site: {sites:?}"
+    );
+    assert_eq!(sites[0]["provenance"]["client_type_resolved"], true);
+}
+
 /// Write a one-file no-db C repo and retrieve it.
 fn retrieve_c_source(src: &str) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let dir = tempfile::tempdir().unwrap();
