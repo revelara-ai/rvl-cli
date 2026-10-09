@@ -24,6 +24,36 @@ The counts of all rows sum to `coverage.config.total`. See
 [the out contract](out-contract.md) for the field. The addition is additive:
 the schema stays `rvl-scan/v1`.
 
+### The config key `dep-manifests dockerfile.final_stage_user`
+
+**Minimum version to probe for: the first release after 1.4.0.**
+
+The config lane reads the `USER` instructions of a Dockerfile and emits one
+setting for each file: the user that the built image starts as. The value is
+one of three classes:
+
+- `root`: the last `USER` of the final stage is `root`, UID `0`, or
+  `ContainerAdministrator`.
+- `non-root`: the last `USER` of the final stage is a different user.
+- `absent`: the final stage has no `USER`, and the earlier stages it is built
+  `FROM` have none. The base image then sets the user. `rvl` does not read
+  the base image, so `absent` is not a verdict that the container runs as
+  root.
+
+A `USER` that reads a build argument with no default in the file, or an
+`ENV`, has no value: the lane abstains.
+
+No spec judges the key in the current artifact, so a scan counts it in
+`coverage.config.abstain.no_spec` and lists it in `no_spec_keys`, and
+`rvl cache keys` shows it as awaiting a spec. A scan of a repository with a
+Dockerfile gets one more row in `coverage.config.by_key` and a
+`coverage.config.total` that is higher by one for each Dockerfile. No finding
+changes.
+
+A Dockerfile line that continues an instruction (after a trailing `\`), and a
+line in the body of a heredoc, are no longer read as instructions. Before, a
+continuation line that started with `FROM` was read as a build stage.
+
 ## 1.4.0
 
 The first release after `v1.3.0`.
