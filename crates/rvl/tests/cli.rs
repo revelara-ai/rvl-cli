@@ -4534,10 +4534,7 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
                 && !matches!(
                     p["site_kind"].as_str(),
                     Some(
-                        "server_entry"
-                            | "emission_point"
-                            | "misuse_shape"
-                            | "unsized_construction"
+                        "server_entry" | "emission_point" | "misuse_shape" | "unsized_construction"
                     )
                 )
         })
