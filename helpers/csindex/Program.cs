@@ -290,6 +290,7 @@ internal static class Retriever
     private const string SiteKindServerEntry = "server_entry";
     private const string SiteKindBackgroundJob = "background_job";
     private const string SiteKindEmission = "emission_point";
+    private const string SiteKindMisuse = "misuse_shape";
 
     // -- G1 client-call selection tables -------------------------------------
     //
@@ -687,6 +688,10 @@ internal static class Retriever
         }
 
         outRecords.AddRange(emissions.Records(snapshot));
+        // After the invocation walk: the misuse lane leaves a handler to the
+        // emission lane when that lane counts it as a swallow, and which
+        // handlers emit is known only now.
+        outRecords.AddRange(MisuseCollector.Records(rootNode, model, emissions, filePath, snapshot));
         return outRecords;
     }
 
@@ -951,6 +956,15 @@ internal static class Retriever
             return -1;
         }
 
+        /// Whether Records() counts this catch as a swallow: it neither emits
+        /// anything recognized nor re-throws. Final only after the invocation
+        /// walk has offered every call.
+        public bool IsSwallow(CatchClauseSyntax node)
+        {
+            var i = _catches.IndexOf(node);
+            return i >= 0 && !_catchEmits[i] && !_catchRethrows[i];
+        }
+
         /// The file's emission aggregates, plus the SWALLOW fact RC-027's
         /// capture-vs-swallow question needs: a catch that neither emits
         /// anything recognized nor re-throws, aggregated per function under
@@ -996,6 +1010,182 @@ internal static class Retriever
                 outRecords.Add(rec);
             }
             return outRecords;
+        }
+    }
+
+    // -- misuse shapes -------------------------------------------------------
+    //
+    // Shapes that are wrong where they stand. They ride the SAME stream,
+    // stamped site_kind: "misuse_shape", as AGGREGATES like the emission
+    // points: one packet per (enclosing function, class, identity), with the
+    // class and the count in const_args. Two classes:
+    //
+    //   overbroad_catch  `catch (Exception)` and a bare `catch`. Identity:
+    //                    System.Exception, or "bare".
+    //   sync_over_async  a synchronous wait on a Task or a ValueTask: `.Result`,
+    //                    `.Wait()` and `GetAwaiter().GetResult()`. Identity:
+    //                    the task type and the member that waits.
+    //
+    // The retrieval/judgment split holds: which control a shape violates, and
+    // which identities are legitimate, is a misuse spec downstream.
+    //
+    // Detection is SEMANTIC, like every other lane here: the caught type and
+    // the member that waits must resolve. A `Result` property or an
+    // `Exception` class of the target's own, and a task type that does not
+    // resolve, emit nothing.
+    //
+    // One written name is read without resolution: `Exception` or
+    // `System.Exception` in a catch, when it binds to NOTHING. A project with
+    // ImplicitUsings has no `using System;` in the file, and this compilation
+    // does not load the project, so the root type itself does not resolve
+    // there. The packet then has client_type_resolved FALSE, the same
+    // low-confidence tier as a strong I/O verb on an unresolved receiver.
+    //
+    // Kept back, because each is a different FACT:
+    //
+    //   - A handler that throws again. It propagates the error.
+    //   - A handler with a `when` filter. The filter narrows the type.
+    //   - A handler the emission lane counts as a swallow. That is the
+    //     catch_clause fact already, and one handler is reported once.
+    //   - `Wait` with an argument. A timeout or a token bounds the wait.
+
+    private static class MisuseCollector
+    {
+        private const string RootException = "System.Exception";
+        private const string AwaiterNamespace = "System.Runtime.CompilerServices";
+
+        // The awaited type behind each BCL awaiter, the plain ones and the
+        // ones `ConfigureAwait` returns.
+        private static readonly Dictionary<string, string> AwaiterTaskTypes = new()
+        {
+            ["TaskAwaiter"] = "System.Threading.Tasks.Task",
+            ["ConfiguredTaskAwaiter"] = "System.Threading.Tasks.Task",
+            ["ValueTaskAwaiter"] = "System.Threading.Tasks.ValueTask",
+            ["ConfiguredValueTaskAwaiter"] = "System.Threading.Tasks.ValueTask",
+        };
+
+        private static readonly HashSet<string> TaskTypes = new(AwaiterTaskTypes.Values);
+
+        private sealed class Agg
+        {
+            public int Line;
+            public string Method;
+            public string Snippet;
+            public int Count;
+            // False when any occurrence was read from the written name.
+            public bool Resolved = true;
+        }
+
+        public static List<Packet> Records(SyntaxNode root, SemanticModel model,
+            EmissionCollector emissions, string filePath, string snapshot)
+        {
+            var aggs = new Dictionary<(string Symbol, string Class, string Identity), Agg>();
+
+            void Note(SyntaxNode node, string cls, string identity, string method, string snippet,
+                bool resolved = true)
+            {
+                var key = (EnclosingFunction(node).Name, cls, identity);
+                if (!aggs.TryGetValue(key, out var agg))
+                {
+                    aggs[key] = agg = new Agg { Line = Line(node), Method = method, Snippet = snippet };
+                }
+                agg.Count++;
+                agg.Resolved &= resolved;
+            }
+
+            foreach (var node in root.DescendantNodes())
+            {
+                switch (node)
+                {
+                    case CatchClauseSyntax handler:
+                        var (caught, resolved) = OverbroadType(handler, model);
+                        if (caught != null && !Rethrows(handler) && !emissions.IsSwallow(handler))
+                        {
+                            Note(handler, "overbroad_catch", caught, "catch", "", resolved);
+                        }
+                        break;
+                    case MemberAccessExpressionSyntax access:
+                        var waited = SyncWaitTarget(access, model);
+                        if (waited != null)
+                        {
+                            // The snippet is the whole wait: `t.Wait()`, not `t.Wait`.
+                            var wait = access.Parent is InvocationExpressionSyntax ? access.Parent : access;
+                            Note(access, "sync_over_async", waited, access.Name.Identifier.ValueText,
+                                Cap(wait.ToString()));
+                        }
+                        break;
+                }
+            }
+
+            var outRecords = new List<Packet>();
+            foreach (var kv in aggs.OrderBy(kv => kv.Value.Line)
+                .ThenBy(kv => kv.Key.Class, StringComparer.Ordinal)
+                .ThenBy(kv => kv.Key.Identity, StringComparer.Ordinal))
+            {
+                var (symbol, cls, identity) = kv.Key;
+                var agg = kv.Value;
+                // Volume control: no function body on aggregates.
+                var rec = NewPacket(snapshot, filePath, agg.Line, symbol, agg.Method, "", identity,
+                    agg.Snippet, "");
+                rec.SiteKind = SiteKindMisuse;
+                rec.ConstArgs = new List<ConstArg>
+                {
+                    new() { Index = 0, Name = "misuse_class", Value = cls, How = "aggregate" },
+                    new() { Index = 0, Name = "misuse_count", Value = agg.Count.ToString(), How = "aggregate" },
+                };
+                rec.Prov.ClientTypeResolved = agg.Resolved;
+                outRecords.Add(rec);
+            }
+            return outRecords;
+        }
+
+        /// The root type a handler catches, "bare" for `catch { }`, or null
+        /// for a handler that is narrower: another type, or a `when` filter.
+        /// Resolved is false when the type is read from the written name.
+        private static (string Caught, bool Resolved) OverbroadType(
+            CatchClauseSyntax handler, SemanticModel model)
+        {
+            if (handler.Filter != null) return (null, false);
+            if (handler.Declaration == null) return ("bare", true);
+            var written = handler.Declaration.Type;
+            var type = model.GetTypeInfo(written).Type;
+            if (type == null || type.TypeKind == TypeKind.Error)
+            {
+                return written.ToString() is "Exception" or "System.Exception"
+                    ? (RootException, false)
+                    : (null, false);
+            }
+            return Identity(type) == RootException ? (RootException, true) : (null, false);
+        }
+
+        /// A throw anywhere in the handler, statement or expression.
+        private static bool Rethrows(CatchClauseSyntax handler) =>
+            handler.Block.DescendantNodes()
+                .Any(n => n is ThrowStatementSyntax or ThrowExpressionSyntax);
+
+        /// The identity of the synchronous wait a member access makes
+        /// ("System.Threading.Tasks.Task.Result"), or null when it is not one.
+        private static string SyncWaitTarget(MemberAccessExpressionSyntax access, SemanticModel model)
+        {
+            var member = access.Name.Identifier.ValueText;
+            if (member is not ("Result" or "Wait" or "GetResult")) return null;
+            var symbol = model.GetSymbolInfo(access).Symbol;
+            var owner = symbol?.ContainingType;
+            if (owner == null) return null;
+            switch (symbol)
+            {
+                case IPropertySymbol when member == "Result" && TaskTypes.Contains(Identity(owner)):
+                    return Identity(owner) + ".Result";
+                case IMethodSymbol wait when member == "Wait" && wait.Parameters.Length == 0
+                    && TaskTypes.Contains(Identity(owner)):
+                    return Identity(owner) + ".Wait";
+                case IMethodSymbol when member == "GetResult"
+                    && owner.ContainingNamespace?.ToDisplayString() == AwaiterNamespace
+                    && AwaiterTaskTypes.TryGetValue(owner.Name, out var taskType):
+                    return taskType + ".GetAwaiter.GetResult";
+                default:
+                    return null;
+            }
         }
     }
 

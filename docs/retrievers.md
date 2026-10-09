@@ -406,10 +406,10 @@ first occurrence.
 
 | Class | Shape | Identity |
 | --- | --- | --- |
-| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught (`Exception`, `BaseException`), or `bare` for `except:`. |
+| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught (`Exception`, `BaseException`, `System.Exception`), or `bare` for `except:` and `catch { }`. |
 | `discarded_error` | A call result of type error is assigned to a discard (`_ = f.Close()`). | The callee: `os.Remove`, `os.File.Close`. `func value` when the call goes through a function value. |
 | `blocking_in_async` | A blocking function is called in the text of an async function. | The callee: `time.sleep`, `requests.get`. |
-| `sync_over_async` | An async function waits synchronously for async work. | The call that waits: `asyncio.run`. |
+| `sync_over_async` | A function waits synchronously for async work. | The call that waits: `asyncio.run`, `System.Threading.Tasks.Task.Result`. |
 | `fire_and_forget` | A task is started as a statement. Nothing holds the task. | The call that starts it: `asyncio.create_task`. |
 | `missing_await` | A coroutine function is called as a statement, or its result is assigned to a name that nothing reads. | `coroutine`. |
 | `retry_shape` | A wait on the failure path of an attempt loop, or the configuration of a retry library. | The shape: `constant_delay`, `no_jitter`, or `unbounded_attempts`. |
@@ -486,9 +486,45 @@ waiver or `rvl suppress` uses that name.
 | --- | --- |
 | `goindex` | `discarded_error`, `retry_shape`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. Go has no typed catch and no async functions, and a Go ORM does not load a relation through the receiver, so it has no other class. |
 | `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`, `retry_shape`, `loop_variable_query`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. |
+| `csindex` | `overbroad_catch`, `sync_over_async`. |
 | The other retrievers | Nothing yet. |
 
+`csindex` has these identities:
+
+| Class | Identity | Shape |
+| --- | --- | --- |
+| `overbroad_catch` | `System.Exception` | `catch (Exception)` or `catch (Exception err)`. |
+| `overbroad_catch` | `bare` | `catch { }`. |
+| `sync_over_async` | `System.Threading.Tasks.Task.Result` | `.Result` on a `Task<T>`. |
+| `sync_over_async` | `System.Threading.Tasks.Task.Wait` | `.Wait()` on a `Task`, with no argument. |
+| `sync_over_async` | `System.Threading.Tasks.Task.GetAwaiter.GetResult` | `.GetAwaiter().GetResult()` on a `Task`, also after `ConfigureAwait`. |
+| `sync_over_async` | `System.Threading.Tasks.ValueTask.Result`, `System.Threading.Tasks.ValueTask.GetAwaiter.GetResult` | The same members on a `ValueTask`. |
+
+`csindex` does not report these forms:
+
+- A handler that names a narrower type, or that has a `when` filter.
+- A handler that throws again.
+- `await` on the task.
+- `Wait` with an argument. A timeout or a cancellation token bounds the wait.
+
+`pyindex` reports `sync_over_async` only in an async function. `csindex`
+reports it in each function: in C#, a synchronous function that waits for a
+task blocks a thread of the pool, and that is the defect.
+
 Limits:
+
+- `csindex` reads a wait only when the type of the task resolves. The helper
+  does not load the project. Thus, in a project with `ImplicitUsings`, a `Task`
+  that the file names without `using System.Threading.Tasks;` does not
+  resolve, and `.Result` on it is not reported. The result of a call that
+  resolves (`client.GetAsync(url).Result`) is reported.
+- `csindex` reads the root type of a catch from the written name `Exception`
+  or `System.Exception` when that name does not resolve. The packet then has
+  `client_type_resolved: false`.
+- `csindex` reports `.Result` on a task that is complete (after
+  `Task.WhenAll`, or in a `ContinueWith` callback). One expression does not
+  show that the task is complete. An `allowed` entry cannot make the
+  difference, because the identity is the same.
 
 - `goindex` reports an assignment to `_` only. It does not report a call
   statement that ignores all its results (`f.Close()`), and it does not

@@ -28,8 +28,12 @@ NuGet packages do not resolve semantically**. Then:
 - a catch clause containing an emission-shaped call on an **unresolved**
   receiver is never counted as a swallow (fail toward abstention, never
   toward accusation);
-- there is **no heuristic tier**: nothing here invents an identity from a
-  name match.
+- a `Task` type that does not resolve emits **no** `sync_over_async` packet;
+- a catch of the written name `Exception` or `System.Exception` that does not
+  resolve (a project with `ImplicitUsings` has no `using System;`) still
+  emits `overbroad_catch`, with `provenance.client_type_resolved` `false`;
+- apart from that one written name, there is **no heuristic tier**: nothing
+  here invents an identity from a name match.
 
 ## Lanes
 
@@ -46,6 +50,21 @@ NuGet packages do not resolve semantically**. Then:
 - **G4** `emission_point` aggregates (one per enclosing function × framework
   × category, count in `const_args`): `ILogger`, Serilog, `ActivitySource`
   (trace), Sentry (error_capture), and `catch_clause` swallow facts.
+
+## Misuse shapes
+
+`site_kind: "misuse_shape"` aggregates, one per enclosing function × class ×
+identity, with `misuse_class` and `misuse_count` in `const_args`. The contract
+and the list of identities are in "Misuse shapes" in `docs/retrievers.md`.
+
+- `overbroad_catch`: `catch (Exception)` (identity `System.Exception`) and a
+  bare `catch` (identity `bare`). Not emitted for a handler that throws again,
+  a handler with a `when` filter, or a handler that the G4 lane already
+  reports as a `catch_clause` swallow.
+- `sync_over_async`: `.Result`, `.Wait()` with no argument, and
+  `.GetAwaiter().GetResult()` on a `Task` or a `ValueTask`. The identity is
+  the task type and the member, for example
+  `System.Threading.Tasks.Task.Result`.
 
 ## Usage
 
@@ -72,6 +91,9 @@ runs under `dotnet`), a `csindex`/`csindex.dll` adjacent to the rvl
 binary, or `PATH`.
 
 ## Fixture
+
+`testdata/fixture_misuse/` holds one function per identity of the misuse
+lane, and one per form that the lane does not report.
 
 `testdata/fixture/` is a minimal compilable app exercising all four lanes.
 Third-party surfaces (Redis, Kafka, gRPC, Hangfire, ASP.NET Core, ...) are
