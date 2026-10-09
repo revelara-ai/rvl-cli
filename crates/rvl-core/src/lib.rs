@@ -745,6 +745,16 @@ pub struct RepoConfig {
     /// by [`RepoConfig::absorb`] alongside the count.
     #[serde(default)]
     pub test_files_skipped_paths: Vec<String>,
+    /// The repo-relative files whose parse raised errors, so the packets
+    /// retrieved from them are a floor and not the whole answer
+    /// (po-av01j.224). Only cindex reports it, as `tus_incomplete_paths` on
+    /// its `retrieval_stats` record, which [`parse_stream`] collects here.
+    /// The packet index flags each file, for the same reason it flags a
+    /// skipped test file: a warm scan reuses the entry and has to say so.
+    /// Concatenated by [`RepoConfig::absorb`]: a batch names the units it
+    /// parsed. Left off the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_incomplete_paths: Vec<String>,
     /// Workspaces that declare dependencies but have no installed tree, as
     /// the helper saw them (po-pk3fp.2). Like `test_files_skipped`, a
     /// retrieval statistic on the repo-scoped record, additive within v2 and
@@ -850,6 +860,8 @@ impl RepoConfig {
         self.test_files_skipped += other.test_files_skipped;
         self.test_files_skipped_paths
             .extend(other.test_files_skipped_paths);
+        self.parse_incomplete_paths
+            .extend(other.parse_incomplete_paths);
         // REPLACED per language, never summed: each helper run reports the
         // whole repo, and a batched stream repeats it once per batch.
         for census in other.retrieval {
@@ -935,6 +947,12 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 }
                 if let Some(paths) = v.get("test_files_skipped_paths").and_then(|p| p.as_array()) {
                     cfg.test_files_skipped_paths
+                        .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
+                }
+                // cindex names the units that parsed with errors on the same
+                // record (po-av01j.224).
+                if let Some(paths) = v.get("tus_incomplete_paths").and_then(|p| p.as_array()) {
+                    cfg.parse_incomplete_paths
                         .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
                 }
             } else if kind == "tu_includes" {
@@ -1234,6 +1252,22 @@ mod tests {
             cfg.test_files_skipped_paths,
             vec!["e2e/login.ts", "tests/test_a.py", "conftest.py"]
         );
+    }
+
+    /// cindex names the translation units that parsed with errors
+    /// (po-av01j.224). The paths are carried, and merged across the records
+    /// of a batched run, so the packet index can flag each file.
+    #[test]
+    fn incomplete_parse_paths_are_carried_and_merged_across_records() {
+        let a = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":2,"tus_parsed":2,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/a.c"],"includes_missing":1,"decls_unresolved":3}"#;
+        let b = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/b.c"],"includes_missing":0,"decls_unresolved":1}"#;
+        let clean = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":0,"tus_incomplete_paths":[]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{a}\n{b}\n{clean}\n"));
+        assert_eq!(cfg.parse_incomplete_paths, vec!["src/a.c", "src/b.c"]);
+
+        // Only the documented carrier is read, like the test-file skip.
+        let other = r#"{"packet_schema":2,"kind":"repo_structure","snapshot_id":"x","tus_incomplete_paths":["x.c"]}"#;
+        assert!(parse_stream(other).1.parse_incomplete_paths.is_empty());
     }
 
     /// cindex writes one `tu_includes` record per parsed TU (po-av01j.53).

@@ -3142,6 +3142,97 @@ fn a_c_header_edit_re_parses_the_tus_that_include_it() {
     );
 }
 
+/// po-av01j.224, end to end with the real cindex: a C file whose header is
+/// missing loses its call sites to clang's error recovery. The full scan
+/// says so in its roll-call; the incremental scan (what the git hooks run)
+/// has no roll-call and reused the unit's index entry as a clean zero. It
+/// must say INCOMPLETE on the cold pass and on the warm pass that re-parses
+/// nothing.
+#[test]
+fn a_hook_scan_of_a_c_file_with_a_missing_header_says_incomplete_cold_and_warm() {
+    let test = "a_hook_scan_of_a_c_file_with_a_missing_header_says_incomplete_cold_and_warm";
+    let Some(cindex) = cindex_helper(test) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src").join("fetch.c"),
+        "#include <curl/no_such_header.h>\nint fetch(void) {\n  CURL *h = curl_easy_init();\n  \
+         CURLcode rc = curl_easy_perform(h);\n  curl_easy_cleanup(h);\n  return (int)rc;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src").join("clean.c"),
+        "int clean(void) { return 0; }\n",
+    )
+    .unwrap();
+
+    for pass in ["cold", "warm"] {
+        let out_path = dir.path().join(format!("findings-{pass}.json"));
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .args(["--incremental", "--specs-file"])
+            .arg(sentinel_seed_specs())
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CINDEX", &cindex)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("HOME", dir.path().join("home"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            scan_reached_a_verdict(&out),
+            "{pass} scan errored: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("C/C++: 1 file INCOMPLETE: parse errors"),
+            "{pass}: the truncated parse must be visible in COVERAGE: {stdout}\n{stderr}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert_eq!(
+            doc["coverage"]["parse_incomplete_files"], 1,
+            "{pass}: {}",
+            doc["coverage"]
+        );
+        if pass == "warm" {
+            assert!(
+                stderr.contains("re-parsed 0 stale"),
+                "the warm pass must have reused the whole index, or this test \
+                 proves nothing about reuse: {stderr}"
+            );
+        }
+    }
+
+    // `rvl index reindex` builds the same index behind a commit. It flags the
+    // file the same way, and says so on the one line it prints.
+    let out = bin()
+        .args(["index", "reindex"])
+        .arg(&repo)
+        .env("RVL_CINDEX", &cindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index2"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "reindex failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("1 file parsed incompletely"),
+        "the warm must say what it could not fully parse: {stdout}"
+    );
+}
+
 /// C e2e: cindex retrieves the compile-db fixture LIVE (detection via
 /// compile_commands.json, helper via RVL_CINDEX), the seed specs judge
 /// the C identities, and the judgments map the surfaced classes to RC-019 /
