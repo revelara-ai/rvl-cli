@@ -4522,8 +4522,9 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
         "the C# golden is missing: regenerate it with \
          RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
     );
-    // Every site record gets an --out row except server_entry registrations
-    // and emission_point aggregates, which their own lanes judge.
+    // Every site record gets an --out row except server_entry registrations,
+    // emission_point aggregates and unsized constructions, which their own
+    // lanes judge.
     let g1_sites = golden
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
@@ -4531,7 +4532,7 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
             p.get("kind").is_none()
                 && !matches!(
                     p["site_kind"].as_str(),
-                    Some("server_entry" | "emission_point")
+                    Some("server_entry" | "emission_point" | "unsized_construction")
                 )
         })
         .count();
@@ -4593,6 +4594,178 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
     assert!(
         stdout.contains("emission.RC-027") && stdout.contains("swallow"),
         "the catch_clause swallow must surface under RC-027: {stdout}"
+    );
+}
+
+/// The unsized-construction packets of the C# golden, by enclosing function.
+/// Two packets in one function fail: the fixture has one construction each.
+fn csharp_golden_unsized() -> std::collections::BTreeMap<String, serde_json::Value> {
+    let golden = std::fs::read_to_string(csharp_retrieved_golden()).unwrap();
+    let mut by_symbol = std::collections::BTreeMap::new();
+    for packet in golden
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|p| p["site_kind"] == "unsized_construction")
+    {
+        let symbol = packet["symbol"].as_str().unwrap().to_string();
+        assert!(
+            by_symbol.insert(symbol.clone(), packet).is_none(),
+            "two unsized packets for {symbol}: one per construction"
+        );
+    }
+    by_symbol
+}
+
+/// C#, the unsized-construction inventory: csindex emits one packet per named
+/// identity (a MemoryCache with no SizeLimit, Channel.CreateUnbounded,
+/// File.ReadAllText and File.ReadAllBytes) with the fields the contract in
+/// docs/retrievers.md requires, and no packet for the bounded form of each.
+/// It reads the committed golden, which
+/// `csindex_live_output_matches_the_committed_golden` binds to the helper.
+#[test]
+fn csindex_emits_one_unsized_packet_per_identity_and_none_for_a_bounded_form() {
+    const CACHE: &str = "Microsoft.Extensions.Caching.Memory.MemoryCache";
+    let sites = csharp_golden_unsized();
+    // (enclosing function, client_type, func, bound_class)
+    let want = [
+        (
+            "UnboundedChannel",
+            "System.Threading.Channels.Channel.CreateUnbounded",
+            "CreateUnbounded",
+            "queue",
+        ),
+        (
+            "WholeText",
+            "System.IO.File.ReadAllText",
+            "ReadAllText",
+            "read",
+        ),
+        (
+            "WholeBytes",
+            "System.IO.File.ReadAllBytes",
+            "ReadAllBytes",
+            "read",
+        ),
+        ("UnsizedCache", CACHE, "MemoryCache", "cache"),
+        ("NullLimitCache", CACHE, "MemoryCache", "cache"),
+        ("WrappedCache", CACHE, "MemoryCache", "cache"),
+        ("InjectedOptionsCache", CACHE, "MemoryCache", "cache"),
+        ("RegisterUnsized", CACHE, "AddMemoryCache", "cache"),
+        ("RegisterUntracked", CACHE, "AddMemoryCache", "cache"),
+    ];
+    let observed = |p: &serde_json::Value, name: &str| -> Option<(String, String)> {
+        p["const_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .map(|a| {
+                (
+                    a["value"].as_str().unwrap().to_string(),
+                    a["how"].as_str().unwrap().to_string(),
+                )
+            })
+    };
+    for (symbol, client_type, func, class) in want {
+        let p = sites
+            .get(symbol)
+            .unwrap_or_else(|| panic!("no unsized packet for {symbol}: {:?}", sites.keys()));
+        assert_eq!(p["client_type"], client_type, "{symbol}");
+        assert_eq!(p["func"], func, "{symbol}");
+        assert_eq!(
+            observed(p, "bound_class"),
+            Some((class.to_string(), "aggregate".to_string())),
+            "{symbol}"
+        );
+        assert_eq!(p["packet_schema"], 2, "{symbol}");
+        assert_eq!(p["lang"], "csharp", "{symbol}");
+        assert_eq!(p["file_path"], "Bounds.cs", "{symbol}");
+        assert_eq!(p["provenance"]["client_type_resolved"], true, "{symbol}");
+        assert!(
+            p["snippet"].as_str().unwrap().contains(func),
+            "{symbol}: the snippet is the construction: {p}"
+        );
+        assert_eq!(
+            p["site_key"].as_str().unwrap(),
+            format!("Bounds.cs:{}:{client_type}:{func}", p["line_number"]),
+            "{symbol}"
+        );
+    }
+    // The bounded form of each identity: a channel with a capacity, a read
+    // through a stream, and a cache whose options carry a SizeLimit (in the
+    // initializer, on the options object, or in the registration lambda).
+    assert_eq!(
+        sites.keys().map(String::as_str).collect::<Vec<_>>(),
+        {
+            let mut names: Vec<&str> = want.iter().map(|w| w.0).collect();
+            names.sort_unstable();
+            names
+        },
+        "BoundedChannel, StreamedRead, SizedCache, LaterSizedCache and RegisterSized \
+         must give no packet"
+    );
+
+    // What the packet says it saw. SizeLimit = null is a value, not a bound.
+    assert_eq!(
+        observed(&sites["NullLimitCache"], "SizeLimit"),
+        Some(("null".to_string(), "literal".to_string()))
+    );
+    // An option that is not a constant is a name: its source text.
+    assert_eq!(
+        observed(&sites["WrappedCache"], "ExpirationScanFrequency"),
+        Some(("ScanEvery".to_string(), "name".to_string()))
+    );
+    assert_eq!(
+        observed(&sites["RegisterUntracked"], "TrackStatistics"),
+        Some(("true".to_string(), "literal".to_string()))
+    );
+    // Options the function cannot see: the scanner abstains on bound_opaque.
+    assert_eq!(
+        observed(&sites["InjectedOptionsCache"], "bound_opaque"),
+        Some(("options".to_string(), "aggregate".to_string()))
+    );
+    for symbol in ["UnsizedCache", "RegisterUnsized", "UnboundedChannel"] {
+        assert_eq!(
+            sites[symbol]["const_args"].as_array().unwrap().len(),
+            1,
+            "{symbol} has nothing to observe but its class: {}",
+            sites[symbol]
+        );
+    }
+}
+
+/// C#, the Rust half of the same lane: the seed construction-bound specs judge
+/// the golden's packets on `client_type` and class, with no dotnet SDK.
+#[test]
+fn scan_surfaces_csharp_unsized_constructions_from_the_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(csharp_retrieved_golden())
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("unsized.queue") && stdout.contains("1 of 1 queue(s)"),
+        "Channel.CreateUnbounded is the unbounded queue: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsized.read") && stdout.contains("2 of 2 whole-body read(s)"),
+        "File.ReadAllText and File.ReadAllBytes are the whole-file reads: {stdout}"
+    );
+    // Six cache packets: five with no SizeLimit in scope, and one whose
+    // options are injected, on which the scanner abstains.
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("5 of 6 cache(s)"),
+        "the injected-options cache is not a finding: {stdout}"
     );
 }
 

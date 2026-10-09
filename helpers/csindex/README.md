@@ -46,6 +46,12 @@ NuGet packages do not resolve semantically**. Then:
 - **G4** `emission_point` aggregates (one per enclosing function × framework
   × category, count in `const_args`): `ILogger`, Serilog, `ActivitySource`
   (trace), Sentry (error_capture), and `catch_clause` swallow facts.
+- **Unsized constructions** (`unsized_construction`, one per construction):
+  `Channel.CreateUnbounded` (queue), `File.ReadAllText` and
+  `File.ReadAllBytes` (read), and a `MemoryCache` whose options set no
+  `SizeLimit`, built with `new MemoryCache(...)` or registered with
+  `AddMemoryCache(...)` (cache). Resolved symbols only. The bounded form of
+  each gives no packet. See "Unsized constructions" in `docs/retrievers.md`.
 
 ## Usage
 
@@ -73,7 +79,8 @@ binary, or `PATH`.
 
 ## Fixture
 
-`testdata/fixture/` is a minimal compilable app exercising all four lanes.
+`testdata/fixture/` is a minimal compilable app exercising all four lanes and the
+unsized-construction inventory (`Bounds.cs`).
 Third-party surfaces (Redis, Kafka, gRPC, Hangfire, ASP.NET Core, ...) are
 **vendored interface stubs** in `Stubs.cs`, so the fixture compiles — and
 csindex resolves its receivers semantically — without any package restore.
