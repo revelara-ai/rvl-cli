@@ -111,6 +111,35 @@ fn job(workflow: &str, id: &str) -> String {
     body.join("\n")
 }
 
+/// The tests below read ci.yml as text, so they pass on a file GitHub cannot
+/// parse. A workflow that is not valid YAML does not run at all: no job
+/// starts, and the run fails in 0 s with no log. That happened to the first
+/// version of this change, where a `run:` value held `host: //p` unquoted.
+#[test]
+fn every_workflow_parses_as_yaml() {
+    let dir = workspace_root().join(".github/workflows");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        seen += 1;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
+        assert!(
+            doc.get("jobs").is_some_and(serde_yaml::Value::is_mapping),
+            "{} has no jobs: mapping",
+            path.display()
+        );
+    }
+    assert!(seen > 0, "no workflow found in {}", dir.display());
+}
+
 #[test]
 fn ci_exports_the_require_engines_switch_to_every_job() {
     let workflow = ci_workflow();

@@ -126,7 +126,10 @@ jobs:
       # run. No package manager and no sudo, and the goldens are held to the
       # same library users get.
       - name: Fetch the pinned libclang
-        run: ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
+        # A block scalar: the sed expression holds a colon and a space, which
+        # ends a plain YAML scalar and makes the whole workflow unparseable.
+        run: |
+          ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
 
       # Assert the engine, not the build. The tests fail on a missing engine
       # too (RVLSCAN_REQUIRE_ENGINES), but this says which one in one line.

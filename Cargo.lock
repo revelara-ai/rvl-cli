@@ -1094,6 +1094,9 @@ dependencies = [
 [[package]]
 name = "rvl-testgate"
 version = "1.4.0"
+dependencies = [
+ "serde_yaml",
+]
 
 [[package]]
 name = "rvl-triage"

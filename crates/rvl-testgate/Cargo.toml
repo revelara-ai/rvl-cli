@@ -12,3 +12,6 @@ publish = false
 # node, a JDK, rust-analyzer, ...). Never a dependency of shipped code.
 [package.metadata.dist]
 dist = false
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
