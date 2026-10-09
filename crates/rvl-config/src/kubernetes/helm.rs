@@ -21,7 +21,7 @@
 //! `helm-unrendered-template` sighting; a chart declaring dependencies not
 //! vendored in-tree abstains entirely with `helm-unvendored-dependencies`.
 
-use super::manifest::{self, get, Emitter, ProvenanceOracle};
+use super::manifest::{self, get, Emitter, ProvenanceOracle, RenderedSet};
 use crate::{render_value, FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde_yaml::Value;
 use std::path::Path;
@@ -637,32 +637,45 @@ pub(crate) fn retrieve(
         chart_version: &chart_version,
     };
 
+    // Render every template before emitting: the chart's documents are one
+    // rendered set, and a workload's PDB usually lives in another template.
     let mut unrendered = 0usize;
+    let mut set = RenderedSet::new();
+    let mut rendered_docs = Vec::new();
     for template_rel in template_files(root, chart_dir) {
         let Ok(text) = std::fs::read_to_string(root.join(&template_rel)) else {
             out.unparseable += 1;
+            set.mark_incomplete();
             continue;
         };
         let Ok(rendered) = render(&text, &ctx) else {
             unrendered += 1;
+            set.mark_incomplete();
             continue;
         };
         let (docs, failed) = manifest::parse_docs(&rendered);
         if failed {
             out.unparseable += 1;
+            set.mark_incomplete();
         }
+        for doc in &docs {
+            set.add(&template_rel, doc);
+        }
+        rendered_docs.push((template_rel, docs));
+    }
+    for (template_rel, docs) in &rendered_docs {
         let oracle = HelmOracle {
-            template: &template_rel,
+            template: template_rel,
             values: &values_rel,
         };
         let mut em = Emitter {
-            file_anchor: &template_rel,
+            file_anchor: template_rel,
             snapshot_id,
             oracle: &oracle,
             out: Vec::new(),
         };
-        for doc in &docs {
-            manifest::packets_from_doc(doc, &mut em);
+        for doc in docs {
+            manifest::packets_from_doc(doc, &set, &mut em);
         }
         out.packets.extend(em.out);
     }
@@ -983,6 +996,90 @@ spec:
         assert!(
             !under_chart_templates(dir.path(), "elsewhere/templates/x.yaml"),
             "a templates dir without a chart is not helm's"
+        );
+    }
+
+    const LABELED_TPL: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+        - name: app
+          image: example/web:v1
+";
+
+    const PDB_TPL: &str = "\
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+";
+
+    fn coverage_chart(root: &Path) {
+        write(root, "chart/Chart.yaml", CHART);
+        write(root, "chart/values.yaml", VALUES);
+        write(root, "chart/templates/deployment.yaml", LABELED_TPL);
+    }
+
+    #[test]
+    fn a_pdb_template_of_the_same_chart_covers_the_rendered_workload() {
+        let dir = tempfile::tempdir().unwrap();
+        coverage_chart(dir.path());
+        write(dir.path(), "chart/templates/pdb.yaml", PDB_TPL);
+        let got = run(dir.path());
+        let p = find(&got, "deployment:web", "workload.pdb-coverage");
+        assert_eq!(p.resolved_value.as_deref(), Some("covered"));
+        assert_eq!(p.resolution, Resolution::Rendered);
+        assert_eq!(p.provenance[0].file, "chart/templates/pdb.yaml");
+        assert_eq!(p.provenance[0].role, "rendered");
+    }
+
+    #[test]
+    fn a_fully_rendered_chart_with_no_selecting_pdb_resolves_coverage_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        coverage_chart(dir.path());
+        let got = run(dir.path());
+        let p = find(&got, "deployment:web", "workload.pdb-coverage");
+        assert_eq!(p.resolved_value.as_deref(), Some("none"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn a_template_the_renderer_declines_leaves_pdb_coverage_unstated() {
+        // The unrendered template may be the PDB: `none` would be a guess.
+        let dir = tempfile::tempdir().unwrap();
+        coverage_chart(dir.path());
+        write(
+            dir.path(),
+            "chart/templates/pdb.yaml",
+            &PDB_TPL.replace(
+                "  minAvailable: 1\n",
+                "  minAvailable: 1\n  {{- range .Values.things }}\n  {{- end }}\n",
+            ),
+        );
+        let got = run(dir.path());
+        assert!(got
+            .sightings
+            .iter()
+            .any(|s| s.format == "helm-unrendered-template"));
+        find(&got, "deployment:web", "workload.replicas");
+        assert!(
+            !got.packets.iter().any(|p| p.key == "workload.pdb-coverage"),
+            "{:?}",
+            got.packets
         );
     }
 }

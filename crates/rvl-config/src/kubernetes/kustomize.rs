@@ -16,7 +16,7 @@
 //! and records a `kubernetes-kustomize-unresolved` sighting: an abstention,
 //! never a guess.
 
-use super::manifest::{self, get, lookup, Emitter, ProvenanceOracle};
+use super::manifest::{self, get, lookup, Emitter, ProvenanceOracle, RenderedSet};
 use crate::{FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +24,13 @@ use std::path::Path;
 
 const MAX_DEPTH: usize = 16;
 const UNRESOLVED: &str = "kubernetes-kustomize-unresolved";
+/// Kustomization fields that add documents the bounded resolver never reads.
+const OPAQUE_SOURCES: &[&str] = &[
+    "components",
+    "generators",
+    "helmCharts",
+    "helmChartInflationGenerator",
+];
 
 /// One stage of a resource's resolution history.
 struct Layer {
@@ -195,6 +202,10 @@ struct Resolver<'a> {
     unparseable: usize,
     /// Kustomization directories on the current resolution stack.
     visiting: BTreeSet<String>,
+    /// A kustomization on the tree names a resource source the resolver does
+    /// not read (components, generators, inflated charts): the resolved list
+    /// may be missing documents, with no resource of ours touched.
+    opaque_sources: bool,
 }
 
 impl Resolver<'_> {
@@ -215,6 +226,9 @@ impl Resolver<'_> {
             return Vec::new();
         }
         let mut resources: Vec<Resource> = Vec::new();
+        if OPAQUE_SOURCES.iter().any(|f| get(kdoc, f).is_some()) {
+            self.opaque_sources = true;
+        }
 
         // resources: (and the legacy bases:) — files, or directories holding
         // a nested kustomization.
@@ -597,8 +611,23 @@ pub(crate) fn retrieve(
         sightings: BTreeMap::new(),
         unparseable: 0,
         visiting: BTreeSet::from([dir_rel.clone()]),
+        opaque_sources: false,
     };
     let resources = resolver.resolve(&dir_rel, &kdoc, rel_path, MAX_DEPTH);
+    // The resolved resource list is the rendered set. Anything the resolver
+    // dropped or never read may have been a PodDisruptionBudget.
+    let mut set = RenderedSet::new();
+    if resolver.opaque_sources || resolver.unparseable > 0 || !resolver.sightings.is_empty() {
+        set.mark_incomplete();
+    }
+    for r in &resources {
+        let origin = r
+            .layers
+            .first()
+            .map(|l| l.file.as_str())
+            .unwrap_or(rel_path);
+        set.add(origin, r.doc());
+    }
     for r in &resources {
         let oracle = KustomizeOracle { layers: &r.layers };
         let mut em = Emitter {
@@ -607,7 +636,7 @@ pub(crate) fn retrieve(
             oracle: &oracle,
             out: Vec::new(),
         };
-        manifest::packets_from_doc(r.doc(), &mut em);
+        manifest::packets_from_doc(r.doc(), &set, &mut em);
         out.packets.extend(em.out);
     }
     out.unparseable = resolver.unparseable;
@@ -927,5 +956,86 @@ spec:
             "unreferenced files keep their standalone facts"
         );
         assert!(!claimed_by_sibling(root, "elsewhere/deployment.yaml"));
+    }
+
+    const LABELED_DEPLOY: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: app
+          image: web:v1
+";
+
+    const WEB_PDB: &str = "\
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: web
+";
+
+    fn coverage(got: &Retrieved) -> Option<&ConfigPacket> {
+        got.packets
+            .iter()
+            .find(|p| p.key == "workload.pdb-coverage")
+    }
+
+    #[test]
+    fn a_pdb_added_by_the_overlay_covers_the_workload_of_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "k8s/base/deployment.yaml", LABELED_DEPLOY);
+        write(
+            root,
+            "k8s/base/kustomization.yaml",
+            "resources:\n  - deployment.yaml\n",
+        );
+        write(root, "k8s/overlays/prod/pdb.yaml", WEB_PDB);
+        write(
+            root,
+            "k8s/overlays/prod/kustomization.yaml",
+            "resources:\n  - ../../base\n  - pdb.yaml\n",
+        );
+        // The base alone renders no budget; the overlay's set has one.
+        let base = run(root, "k8s/base/kustomization.yaml");
+        let p = coverage(&base).expect("the base set is complete");
+        assert_eq!(p.resolved_value.as_deref(), Some("none"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+        let prod = run(root, "k8s/overlays/prod/kustomization.yaml");
+        let p = coverage(&prod).expect("the overlay set has the PDB");
+        assert_eq!(p.resolved_value.as_deref(), Some("covered"));
+        assert_eq!(p.resolution, Resolution::AsAuthored);
+        assert_eq!(p.provenance[0].file, "k8s/overlays/prod/pdb.yaml");
+    }
+
+    #[test]
+    fn a_resource_tree_with_a_hole_leaves_pdb_coverage_unstated() {
+        for hole in [
+            // A remote base is never fetched.
+            "resources:\n  - deployment.yaml\n  - https://example.com/policies\n",
+            // A component adds documents the resolver does not read.
+            "resources:\n  - deployment.yaml\ncomponents:\n  - ../components/pdb\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "app/deployment.yaml", LABELED_DEPLOY);
+            write(root, "app/kustomization.yaml", hole);
+            let got = run(root, "app/kustomization.yaml");
+            find(&got, "deployment:web", "workload.replicas");
+            assert!(coverage(&got).is_none(), "{hole}: {:?}", coverage(&got));
+        }
     }
 }

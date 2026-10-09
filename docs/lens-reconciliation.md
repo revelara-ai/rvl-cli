@@ -54,7 +54,7 @@ the part that must not be built again.
 | 18b | Q21/Q22: no dependency scanning, no SAST in CI | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-structure/src/inventory.rs:61`, `crates/rvl-structure/src/lib.rs:176` | `po-6c0v8.12` | Updated 2026-10-08 by `po-6c0v8.7`. The G7 inventory emits `ci_scans` in the `repo_structure` record: the known dependency-scan and SAST actions and commands seen across all GitHub Actions workflows. `RepoStructure::scanner_seen` reads an absence only when the walk is complete, at least one workflow parsed, and no workflow file, external reusable workflow, or local composite action was left unread. No control judges the fact, so no verdict is emitted. Other CI systems are not read. A scanner that is not in the table is not seen. |
 | 19a | O8: single replica | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:263`, `crates/rvl-config/src/key_ledger.rs:148` | None needed | `kubernetes workload.replicas` on RC-017, at least 2. `kubernetes hpa.min-replicas` has the same spec. |
 | 19b | O8: PodDisruptionBudget values | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:228`, `crates/rvl-config/src/key_ledger.rs:143` | `po-av01j.44` | `kubernetes pdb.min-available` and `kubernetes pdb.max-unavailable` are emitted and have no spec. |
-| 19c | O8: workload with no PDB, no anti-affinity | GENUINELY-NEW | `crates/rvl-config/src/kubernetes/manifest.rs:228` | `po-6c0v8.8` | PDB packets exist only when a PDB object exists. Nothing reports a Deployment that no PDB selects, and nothing reads affinity or topology spread. |
+| 19c | O8: workload with no PDB, no anti-affinity | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:586`, `crates/rvl-config/src/key_ledger.rs:165` | `po-av01j.44` | Updated 2026-10-08 by `po-6c0v8.8`. `kubernetes workload.pdb-coverage`, `kubernetes pod.anti-affinity`, and `kubernetes pod.topology-spread-constraints` are emitted for a Deployment and a StatefulSet and have no spec. Coverage is a selector match in the rendered set: one kustomization, one chart render, or one directory of bare manifests. No coverage packet is emitted when the set has a part that was not read, or when a selector or a namespace is not decided in the repository. |
 | 20 | N1: N+1 query in a loop | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1094`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.11` | Updated 2026-10-07 by `po-6c0v8.4`. The Python helper emits `loop_variable_query`: a query method on a relation of the loop variable, with the loop and the call in one function. The class has the name of that shape, not of the N+1 defect, and the cross-function defect is not reported. Go has no such form. The control is RC-073 (`po-av01j.105`). |
 
 ## What changed against the list the epic started with
@@ -133,6 +133,11 @@ Four classes had no bead. Each is now a child of the epic:
 | `po-6c0v8.6` | Q26: Dockerfile `USER`, `runAsNonRoot` value, fat base | 12c |
 | `po-6c0v8.7` | Q21/Q22: no dependency scanning or SAST job | 18b |
 | `po-6c0v8.8` | O8: workload with no PDB or anti-affinity | 19c |
+
+**Update, 2026-10-08 (`po-6c0v8.8`).** Row 19c moved from GENUINELY-NEW to
+LANE-WIRED-NEEDS-CORPUS. The Kubernetes retriever emits the three facts. The
+specs are corpus work in `po-av01j.44`, as for rows 7b, 10b, and 19b. The
+retriever gaps that are left are 10c, 12c, and 18b.
 
 The control-code block that every wave bead names (`po-av01j.105`) is closed.
 It is no longer a reason to wait.
