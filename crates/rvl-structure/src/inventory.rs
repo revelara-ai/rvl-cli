@@ -2,7 +2,10 @@
 //! it reports what is present (names, counts, markers), never a verdict.
 //! Contents are read locally to detect markers; no source text is stored.
 
-use crate::{EcosystemFacts, ManifestFacts, RepoStructure};
+use crate::{
+    CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, ScannerClass, ScannerFacts,
+};
+use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,65 @@ const NPM_LOCKS: &[&str] = &[
     "bun.lock",
 ];
 
+/// Known scanner actions, lowercase, without the ref. An entry matches the
+/// action itself and any path under it (`snyk/actions/node`, a reusable
+/// workflow of `google/osv-scanner-action`). CodeQL is listed by sub-action:
+/// `github/codeql-action/upload-sarif` uploads a result and scans nothing.
+const SCANNER_ACTIONS: &[(ScannerClass, &str)] = &[
+    (
+        ScannerClass::DependencyScan,
+        "actions/dependency-review-action",
+    ),
+    (ScannerClass::DependencyScan, "actions-rs/audit-check"),
+    (ScannerClass::DependencyScan, "anchore/scan-action"),
+    (ScannerClass::DependencyScan, "aquasecurity/trivy-action"),
+    (
+        ScannerClass::DependencyScan,
+        "dependency-check/dependency-check_action",
+    ),
+    (
+        ScannerClass::DependencyScan,
+        "embarkstudios/cargo-deny-action",
+    ),
+    (ScannerClass::DependencyScan, "golang/govulncheck-action"),
+    (ScannerClass::DependencyScan, "google/osv-scanner-action"),
+    (ScannerClass::DependencyScan, "pypa/gh-action-pip-audit"),
+    (ScannerClass::DependencyScan, "rustsec/audit-check"),
+    (ScannerClass::DependencyScan, "snyk/actions"),
+    (ScannerClass::Sast, "bearer/bearer-action"),
+    (ScannerClass::Sast, "github/codeql-action/analyze"),
+    (ScannerClass::Sast, "github/codeql-action/init"),
+    (ScannerClass::Sast, "pycqa/bandit-action"),
+    (ScannerClass::Sast, "returntocorp/semgrep-action"),
+    (ScannerClass::Sast, "securego/gosec"),
+    (ScannerClass::Sast, "semgrep/semgrep-action"),
+    (ScannerClass::Sast, "sonarsource/sonarcloud-github-action"),
+    (ScannerClass::Sast, "sonarsource/sonarqube-scan-action"),
+];
+
+/// Scanner commands a `run:` step invokes directly. Unambiguous tool names
+/// only: these are matched as substrings of lowercased step text, and a
+/// scanner run as a command must not be reported as absent.
+const SCANNER_COMMANDS: &[(ScannerClass, &str)] = &[
+    (ScannerClass::DependencyScan, "cargo audit"),
+    (ScannerClass::DependencyScan, "cargo deny"),
+    (ScannerClass::DependencyScan, "dependency-check"),
+    (ScannerClass::DependencyScan, "govulncheck"),
+    (ScannerClass::DependencyScan, "grype"),
+    (ScannerClass::DependencyScan, "npm audit"),
+    (ScannerClass::DependencyScan, "osv-scanner"),
+    (ScannerClass::DependencyScan, "pip-audit"),
+    (ScannerClass::DependencyScan, "snyk test"),
+    (ScannerClass::DependencyScan, "trivy"),
+    (ScannerClass::DependencyScan, "yarn audit"),
+    (ScannerClass::Sast, "bandit"),
+    (ScannerClass::Sast, "brakeman"),
+    (ScannerClass::Sast, "codeql database analyze"),
+    (ScannerClass::Sast, "gosec"),
+    (ScannerClass::Sast, "semgrep"),
+    (ScannerClass::Sast, "snyk code"),
+];
+
 const PYPROJECT_LOCKS: &[&str] = &["poetry.lock", "uv.lock", "pdm.lock", "pylock.toml"];
 
 /// Cap on marker content reads: enough for any config file and for the
@@ -90,6 +152,8 @@ struct Acc {
     contract: BTreeSet<String>,
     manifests: Vec<ManifestFacts>,
     runbooks: BTreeSet<String>,
+    ci_scans: CiScanFacts,
+    scanners: BTreeSet<ScannerFacts>,
     walk_complete: bool,
 }
 
@@ -157,6 +221,10 @@ pub fn inventory(root: &Path) -> RepoStructure {
         contract_frameworks: acc.contract.into_iter().collect(),
         manifests: acc.manifests,
         runbook_dirs: acc.runbooks.into_iter().collect(),
+        ci_scans: CiScanFacts {
+            scanners: acc.scanners.into_iter().collect(),
+            ..acc.ci_scans
+        },
         walk_complete: acc.walk_complete,
     }
 }
@@ -319,8 +387,9 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         "collectcoverage",
         "coveragethreshold",
     ];
-    let is_ci_file = (rp.starts_with(".github/workflows/")
-        && (rp.ends_with(".yml") || rp.ends_with(".yaml")))
+    let is_gha_workflow =
+        rp.starts_with(".github/workflows/") && (rp.ends_with(".yml") || rp.ends_with(".yaml"));
+    let is_ci_file = is_gha_workflow
         || rp == ".gitlab-ci.yml"
         || rp == ".circleci/config.yml"
         || rp == "azure-pipelines.yml"
@@ -358,6 +427,11 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         if text.contains("collectCoverage") || text.contains("coverageThreshold") {
             acc.coverage.insert(rp.clone());
         }
+    }
+
+    // --- CI scanners (Q21/Q22): GitHub Actions workflows only ---
+    if is_gha_workflow {
+        scan_workflow(&rp, &read_capped(path), acc);
     }
 
     // --- contract-test frameworks + dependency manifests ---
@@ -449,6 +523,71 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         if d == "ops" || d == "docs/ops" {
             acc.runbooks.insert(d);
         }
+    }
+}
+
+/// Record the known scanners one workflow file runs. A file that is not a
+/// workflow (invalid YAML, or no `jobs` mapping) is counted as unparsed, not
+/// as a workflow with no scanner: nothing was read from it.
+fn scan_workflow(rp: &str, text: &str, acc: &mut Acc) {
+    let jobs = serde_yaml::from_str::<Value>(text)
+        .ok()
+        .and_then(|doc| doc.get("jobs").and_then(Value::as_mapping).cloned());
+    let Some(jobs) = jobs else {
+        acc.ci_scans.workflows_unparsed += 1;
+        return;
+    };
+    acc.ci_scans.workflows_parsed += 1;
+    for job in jobs.values() {
+        // A job that calls a reusable workflow has `uses:` and no steps.
+        if let Some(uses) = job.get("uses").and_then(Value::as_str) {
+            record_uses(rp, uses, acc);
+        }
+        let steps = job.get("steps").and_then(Value::as_sequence);
+        for step in steps.into_iter().flatten() {
+            if let Some(uses) = step.get("uses").and_then(Value::as_str) {
+                record_uses(rp, uses, acc);
+            }
+            if let Some(run) = step.get("run").and_then(Value::as_str) {
+                let run = run.to_ascii_lowercase();
+                for (class, token) in SCANNER_COMMANDS {
+                    if run.contains(token) {
+                        acc.scanners.insert(scanner(*class, token, rp));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scanner(class: ScannerClass, name: &str, workflow: &str) -> ScannerFacts {
+    ScannerFacts {
+        class,
+        name: name.to_string(),
+        workflow: workflow.to_string(),
+    }
+}
+
+/// One `uses:` value, at job or step level: a known scanner, an opaque call
+/// (steps this walk does not read), or an ordinary action.
+fn record_uses(rp: &str, uses: &str, acc: &mut Acc) {
+    // Action names are case-insensitive on GitHub.
+    let action = uses.split('@').next().unwrap_or(uses).to_ascii_lowercase();
+    let known = SCANNER_ACTIONS.iter().find(|(_, known)| {
+        action
+            .strip_prefix(known)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    });
+    if let Some((class, known)) = known {
+        acc.scanners.insert(scanner(*class, known, rp));
+    } else if let Some(local) = action.strip_prefix("./") {
+        // A local reusable workflow is a workflow file this walk reads for
+        // itself. A local composite action is not read.
+        if !local.starts_with(".github/workflows/") {
+            acc.ci_scans.opaque_calls += 1;
+        }
+    } else if action.contains("/.github/workflows/") {
+        acc.ci_scans.opaque_calls += 1;
     }
 }
 

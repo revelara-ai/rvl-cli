@@ -8,6 +8,11 @@
 //! (names, counts, presence) and never a verdict; [`evaluate`] maps those
 //! facts to per-control verdicts with honest abstention.
 //!
+//! The inventory also carries one fact that no control judges yet
+//! (po-6c0v8.7): [`CiScanFacts`], the known dependency-scan and SAST scanners
+//! seen across all GitHub Actions workflows. [`RepoStructure::scanner_seen`]
+//! says when their absence can be read.
+//!
 //! Privacy: facts are shape-only — file names, counts, and presence booleans.
 //! Content is read locally to detect markers (a `#[cfg(test)]` attribute, a
 //! coverage key in a config) but no source text is ever stored in the facts.
@@ -66,6 +71,50 @@ pub struct ManifestFacts {
     pub floating: u32,
 }
 
+/// What a scanner looks for. Serialized kebab-case in the record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScannerClass {
+    /// Known-vulnerability scan of third-party dependencies (Q21).
+    DependencyScan,
+    /// Static application security testing of the repo's own source (Q22).
+    Sast,
+}
+
+/// One known scanner seen in one workflow file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScannerFacts {
+    pub class: ScannerClass,
+    /// The scanner as the recognizer knows it: an action without its ref
+    /// ("github/codeql-action/analyze") or a command ("cargo audit").
+    pub name: String,
+    /// Repo-relative path of the workflow file that runs it.
+    pub workflow: String,
+}
+
+/// Which known dependency-scan and SAST scanners the repository's GitHub
+/// Actions workflows run, with the counts that say whether an absence can be
+/// read from them. A repo-level fact: no per-job or per-step key can carry
+/// "no workflow runs a scanner".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiScanFacts {
+    /// Workflow files that parsed as a workflow (YAML with a `jobs` mapping).
+    #[serde(default)]
+    pub workflows_parsed: u32,
+    /// Workflow files that did not: unreadable, cut by the read cap, invalid
+    /// YAML, or no `jobs` mapping.
+    #[serde(default)]
+    pub workflows_unparsed: u32,
+    /// Calls whose steps this walk does not read: a reusable workflow in
+    /// another repository, or a local composite action. Either can run a
+    /// scanner out of sight.
+    #[serde(default)]
+    pub opaque_calls: u32,
+    /// Sorted and de-duplicated.
+    #[serde(default)]
+    pub scanners: Vec<ScannerFacts>,
+}
+
 /// The repo-scoped structure record. Rides the packet stream as a JSONL line
 /// with `kind: "repo_structure"`, like the `repo_config` record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +136,9 @@ pub struct RepoStructure {
     /// Repo-relative runbook-convention directories present.
     #[serde(default)]
     pub runbook_dirs: Vec<String>,
+    /// Known CI scanners seen across all GitHub Actions workflows.
+    #[serde(default)]
+    pub ci_scans: CiScanFacts,
     /// True when the walk exhausted the tree (no unreadable directories).
     /// Only a complete walk licenses reasoning from absence — mirrors
     /// `Provenance::complete` on call-site packets.
@@ -104,6 +156,7 @@ impl Default for RepoStructure {
             contract_frameworks: Vec::new(),
             manifests: Vec::new(),
             runbook_dirs: Vec::new(),
+            ci_scans: CiScanFacts::default(),
             walk_complete: false,
         }
     }
@@ -113,6 +166,23 @@ impl RepoStructure {
     /// The JSONL line this record contributes to a packet stream.
     pub fn to_jsonl(&self) -> String {
         serde_json::to_string(self).expect("RepoStructure serializes")
+    }
+
+    /// Whether CI runs a known scanner of `class`. `Some(true)` when one was
+    /// seen. `Some(false)` is a decidable absence: the walk was complete, at
+    /// least one workflow parsed, and no workflow file or call was left
+    /// unread. `None` otherwise: a repository with no CI config read here is
+    /// not a repository whose CI lacks a scanner.
+    pub fn scanner_seen(&self, class: ScannerClass) -> Option<bool> {
+        let ci = &self.ci_scans;
+        if ci.scanners.iter().any(|s| s.class == class) {
+            return Some(true);
+        }
+        let decidable = self.walk_complete
+            && ci.workflows_parsed > 0
+            && ci.workflows_unparsed == 0
+            && ci.opaque_calls == 0;
+        decidable.then_some(false)
     }
 }
 
