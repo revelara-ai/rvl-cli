@@ -171,7 +171,7 @@ fn walk(root: &Path) -> Vec<String> {
 /// none. Anything else in the manifest is ignored: an unrecognized shape yields
 /// no evidence and the file stays Runtime.
 fn declared_hatch_hooks(dir: &str, text: &str) -> Vec<String> {
-    let Ok(doc) = text.parse::<toml::Value>() else {
+    let Ok(doc) = text.parse::<toml::Table>() else {
         return Vec::new();
     };
     let Some(build) = doc
@@ -340,6 +340,28 @@ mod tests {
         assert_eq!(scope(&ev, "build/hook.py"), Some(ScopeClass::DevOnly));
         // The default name is NOT also exempted: the declaration replaced it.
         assert_eq!(scope(&ev, "hatch_build.py"), None);
+    }
+
+    #[test]
+    fn a_hook_is_read_from_a_manifest_full_of_unknown_keys() {
+        // A real pyproject.toml is mostly tables this rule does not read. The
+        // parse is of the whole document, so none of them may cost the hook.
+        let hooks = declared_hatch_hooks(
+            "svc",
+            "[project]\nname = \"x\"\nreleased = 2026-10-08T12:00:00Z\nratio = 1.5\n\n\
+             [tool.other]\ninline = { a = 1, b = [\"x\"], c = { d = 07:30:00 } }\n\
+             nested.dotted.key = true\n\n\
+             [[tool.other.items]]\nn = 1\n\n\
+             [tool.hatch.build]\nfuture-key = [1, 2]\n\n\
+             [tool.hatch.build.hooks.custom]\npath = \"./build/hook.py\"\nfuture = 1979-05-27\n\n\
+             [tool.hatch.build.hooks.vcs]\nversion-file = \"_v.py\"\n",
+        );
+        assert_eq!(hooks, vec!["svc/build/hook.py".to_string()]);
+    }
+
+    #[test]
+    fn a_malformed_manifest_declares_no_hook() {
+        assert!(declared_hatch_hooks("", "[tool.hatch.build.hooks.custom\n").is_empty());
     }
 
     #[test]

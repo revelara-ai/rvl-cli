@@ -335,7 +335,9 @@ fn go_mod(cx: &Cx, contents: &str) -> Retrieved {
 
 fn cargo_toml(cx: &Cx, contents: &str) -> Retrieved {
     let mut out = Retrieved::default();
-    let Ok(doc) = contents.parse::<toml::Value>() else {
+    // A manifest is a DOCUMENT: `toml::Table`. Since toml 0.9 `toml::Value`
+    // parses one value, so it refuses every manifest (po-av01j.234).
+    let Ok(doc) = contents.parse::<toml::Table>() else {
         out.unparseable = 1;
         return out;
     };
@@ -482,7 +484,7 @@ fn cargo_req_shape(req: &str) -> &'static str {
 
 fn pyproject(cx: &Cx, contents: &str) -> Retrieved {
     let mut out = Retrieved::default();
-    let Ok(doc) = contents.parse::<toml::Value>() else {
+    let Ok(doc) = contents.parse::<toml::Table>() else {
         out.unparseable = 1;
         return out;
     };
@@ -1115,6 +1117,67 @@ mod tests {
     #[test]
     fn malformed_cargo_toml_degrades_to_unparseable() {
         let got = retrieve("Cargo.toml", "[package\nname=");
+        assert!(got.packets.is_empty());
+        assert_eq!(got.unparseable, 1);
+    }
+
+    /// Keys this parser does not read, in every TOML value type. A manifest
+    /// is mostly such keys, and the parse is of the whole document: one the
+    /// `toml` crate refuses costs every packet of the file (po-av01j.234).
+    const UNKNOWN_KEYS: &str = "\
+released = 2026-10-08T12:00:00Z\n\
+ratio = 1.5\n\
+flags = [true, false]\n\
+nested.dotted.key = \"v\"\n\
+inline = { a = 1, b = [\"x\"], c = { d = 07:30:00 } }\n\
+\n\
+[[unknown.array_of_tables]]\n\
+n = 1\n\
+\n\
+[[unknown.array_of_tables]]\n\
+n = 2\n";
+
+    #[test]
+    fn cargo_toml_reads_known_keys_among_unknown_ones() {
+        let got = retrieve(
+            "Cargo.toml",
+            &format!(
+                "[package]\nname = \"x\"\nedition = \"2021\"\nfuture-key = 1979-05-27\n\n\
+                 [package.metadata.anything]\n{UNKNOWN_KEYS}\n\
+                 [workspace.dependencies]\nserde = \"1\"\nodd = {{ version = \"=1.0.0\", future = 1.0 }}\n\n\
+                 [future-table]\n{UNKNOWN_KEYS}"
+            ),
+        );
+        assert_eq!(got.unparseable, 0, "unknown keys are not a parse failure");
+        let p = find(&got, "package", "cargo_toml.package.edition");
+        assert_eq!(p.resolved_value.as_deref(), Some("2021"));
+        let p = find(
+            &got,
+            "workspace",
+            "cargo_toml.workspace_dependencies.loosest_pin",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some(SHAPE_RANGE));
+    }
+
+    #[test]
+    fn pyproject_reads_known_keys_among_unknown_ones() {
+        let got = retrieve(
+            "pyproject.toml",
+            &format!(
+                "[project]\nname = \"x\"\nrequires-python = \">=3.11\"\n\
+                 dependencies = [\"requests==2.31.0\"]\n\n\
+                 [tool.future]\n{UNKNOWN_KEYS}"
+            ),
+        );
+        assert_eq!(got.unparseable, 0, "unknown keys are not a parse failure");
+        let p = find(&got, "project", "pyproject.requires_python");
+        assert_eq!(p.resolved_value.as_deref(), Some(">=3.11"));
+        assert_eq!(p.resolution, Resolution::AsAuthored);
+    }
+
+    #[test]
+    fn malformed_pyproject_degrades_to_unparseable() {
+        let got = retrieve("pyproject.toml", "[project\nname=");
         assert!(got.packets.is_empty());
         assert_eq!(got.unparseable, 1);
     }
