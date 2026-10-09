@@ -225,6 +225,73 @@ fn scan_out_carries_the_structure_lane_in_its_own_array() {
         .all(|u| !u["class"].as_str().unwrap().starts_with("repo_structure.")));
 }
 
+/// po-657l6.10: every `sites` row of the `--out` document carries the scope
+/// of its file, resolved rows included. The three paths are the ones a judge
+/// replay sampled as violating rows with no way to tell them apart: a runtime
+/// module, a Django migration and a Django management command.
+#[test]
+fn scan_out_site_rows_carry_the_scope_of_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [
+        "zerver/lib/outgoing_http.py",
+        "zerver/migrations/0260_missed_message_addresses_from_redis_to_db.py",
+        "zerver/management/commands/deliver_scheduled_emails.py",
+    ]
+    .map(|rel| dir.path().join(rel));
+    let mut stream = String::new();
+    for (i, path) in paths.iter().enumerate() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "import requests\n\ndef f():\n    requests.get(u)\n").unwrap();
+        stream.push_str(&format!(
+            "{{\"snapshot_id\":\"fixture\",\"file_path\":{:?},\"line_number\":{},\"func\":\"get\",\"client_type\":\"requests\",\"snippet\":\"requests.get(u)\",\"lang\":\"python\"}}\n",
+            path.to_str().unwrap(),
+            4 + i,
+        ));
+    }
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(&packets, stream).unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[{"type":"requests","method":"get","site_count":3,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests has no default timeout"}],"configs":[]}"#).unwrap();
+    let out_path = dir.path().join("scan.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "scan did not run: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = doc["sites"].as_array().expect("sites array");
+    assert_eq!(rows.len(), paths.len(), "{rows:?}");
+    for (row, path) in rows.iter().zip(&paths) {
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            row["scope"],
+            rvl_core::scope_of(path).as_str(),
+            "scope of {path}: {row}"
+        );
+    }
+    let scopes: Vec<_> = rows.iter().map(|r| r["scope"].as_str().unwrap()).collect();
+    assert_eq!(scopes, ["runtime", "migration", "runtime"]);
+    // Additive: the five fields a row had before are still there.
+    for field in ["site_id", "snapshot_id", "verdict", "reason", "class"] {
+        assert!(
+            rows.iter().all(|r| r[field].is_string()),
+            "{field}: {rows:?}"
+        );
+    }
+}
+
 #[test]
 fn scan_with_specs_file_emits_findings_and_coverage() {
     let dir = tempfile::tempdir().unwrap();

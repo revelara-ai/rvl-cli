@@ -9,6 +9,21 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.4.0 (not released yet)
 
+### `scope` on each `sites` row of the `rvl scan --out` document
+
+**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+and earlier do not write the field, so a consumer must treat a row without it
+as "not classified", not as `runtime`.
+
+Each row of `sites` has a `scope`: `runtime`, `migration`, `test_support`,
+`dev_only` or `backfill`. It is the same value that an `undecided` row has for
+the site. `undecided` has only the sites the engine abstained on, so until now
+a consumer that sampled the resolved rows could not tell a migration from
+request-path code. A row of `structure` has no `scope`, because it is about
+the repository and not about a file. See
+[the out contract](out-contract.md) for the field. The addition is additive:
+the schema stays `rvl-scan/v1`.
+
 ### `coverage.config.by_key` in the `rvl scan --out` document
 
 **Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
