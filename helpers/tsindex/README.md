@@ -150,6 +150,26 @@ traced back to that variable, so its fields are missed. (In twenty, the
 for this reason, but the same `query_timeout` fact is still retrieved from the
 inline-literal `new GlobalWorkspaceDataSource({... extra: { query_timeout }})`.)
 
+## Unsized constructions
+
+A `new` of a class that takes a bound when it is built is one packet with
+`site_kind: "unsized_construction"`: `pg.Pool` (class `pool`) and
+`lru-cache.LRUCache` (class `cache`). The list is `BOUND_CONSTRUCTORS` in
+`tsindex.js`. The packet is not a call site.
+
+`const_args` lists what the construction writes. `bound_class` carries the
+class. Each property of the options object is one entry under its own name
+(`max`, `maxSize`, `ttl`): `how: "literal"` or `"named_constant"` with the
+value when it is a constant, `how: "name"` with the source text when it is
+not. A bare number (`new LRU(500)`, the form before lru-cache 7) is `arg0`.
+Options that are not written at the construction (`{ ...base }`, a computed
+key, `new Pool(config)`) are named in one `bound_opaque` entry.
+
+The helper does not decide which option is a bound. A bounded construction is
+also a packet, and it lists its bound. `func` is the class name and `receiver`
+is `""`. A default import of `lru-cache` gets the key `lru-cache.LRUCache` on
+an uninstalled tree also. See "Unsized constructions" in `docs/retrievers.md`.
+
 ## What it skips
 
 Test code is not scanned for API surfaces, the way goindex has always

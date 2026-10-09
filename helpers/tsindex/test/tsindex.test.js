@@ -293,7 +293,7 @@ test('background-job registrations carry site_kind', () => {
   assert.ok(cronSite, `node-cron schedule must be kinded: ${JSON.stringify(jobs.map((j) => j.site_key))}`);
 
   // Classic sites stay classic.
-  const pool = records.find((r) => r.client_type === 'pg.Pool');
+  const pool = records.find((r) => r.client_type === 'pg.Pool' && r.func === 'query');
   assert.strictEqual(pool.site_kind, '');
 });
 
@@ -364,6 +364,145 @@ test('server-entry registrations are inventoried and never leak into G1', () => 
       `server registration leaked into G1: ${JSON.stringify(r)}`,
     );
   }
+});
+
+// ---- Unsized constructions (po-6c0v8.13) ----------------------------------
+// A pg Pool and an lru-cache ride the same stream, one packet per
+// construction, stamped site_kind: "unsized_construction". The class and every
+// option written at the construction ride const_args. A constant is a value;
+// anything else is a NAME (how: "name") and is never resolved.
+
+// Keyed by enclosing function, over the fixture file written for this lane
+// (the other fixture files construct their pools at module scope).
+function unsizedBySymbol(records) {
+  const out = new Map();
+  for (const r of records) {
+    if (r.site_kind !== 'unsized_construction' || r.file_path !== 'src/bounds.ts') continue;
+    assert.ok(!out.has(r.symbol), `two unsized packets for ${r.symbol}: one per construction`);
+    out.set(r.symbol, r);
+  }
+  return out;
+}
+
+function unsizedOne(symbol) {
+  const rec = unsizedBySymbol(retrieveRecords()).get(symbol);
+  assert.ok(rec, `no unsized_construction packet for ${symbol}`);
+  return rec;
+}
+
+function seen(rec) {
+  return rec.const_args
+    .filter((a) => a.how !== 'aggregate')
+    .map((a) => `${a.name}=${a.value}/${a.how}`)
+    .sort();
+}
+
+function aggregateOf(rec, name) {
+  const a = rec.const_args.find((c) => c.name === name && c.how === 'aggregate');
+  return a ? a.value : null;
+}
+
+test('a pg Pool with no max is one unsized_construction packet with the contract fields', () => {
+  const rec = unsizedOne('unsizedPool');
+  assert.strictEqual(rec.client_type, 'pg.Pool');
+  assert.strictEqual(rec.func, 'Pool');
+  assert.strictEqual(rec.receiver, '');
+  assert.strictEqual(rec.file_path, 'src/bounds.ts');
+  assert.strictEqual(rec.packet_schema, 2);
+  assert.strictEqual(rec.site_key, `${rec.file_path}:${rec.line_number}:pg.Pool:Pool`);
+  assert.strictEqual(rec.lang, 'typescript');
+  assert.strictEqual(rec.macro_expansion, false);
+  assert.ok(rec.snippet.startsWith('new Pool('), rec.snippet);
+  assert.deepStrictEqual(rec.callers, []);
+  assert.deepStrictEqual(rec.callees, []);
+  assert.deepStrictEqual(rec.client_construction, []);
+  assert.strictEqual(rec.provenance.client_type_resolved, true);
+  assert.strictEqual(rec.provenance.confidence_tier, 'high');
+  assert.strictEqual(aggregateOf(rec, 'bound_class'), 'pool');
+  assert.strictEqual(aggregateOf(rec, 'bound_opaque'), null);
+  // No `max` among what was seen: the spec reads that as no bound written.
+  assert.deepStrictEqual(seen(rec), ['connectionString=\'postgres://localhost/app\'/literal']);
+
+  // No options at all is the same fact with nothing seen.
+  const bare = unsizedOne('defaultPool');
+  assert.strictEqual(aggregateOf(bare, 'bound_class'), 'pool');
+  assert.deepStrictEqual(seen(bare), []);
+});
+
+test('an lru-cache with no max or maxSize is one unsized_construction packet', () => {
+  const rec = unsizedOne('unsizedCache');
+  assert.strictEqual(rec.client_type, 'lru-cache.LRUCache');
+  assert.strictEqual(rec.func, 'LRUCache');
+  assert.strictEqual(rec.site_key, `${rec.file_path}:${rec.line_number}:lru-cache.LRUCache:LRUCache`);
+  assert.strictEqual(aggregateOf(rec, 'bound_class'), 'cache');
+  assert.deepStrictEqual(seen(rec), ['ttl=60000/literal']);
+
+  // The default import is the same class under the same key.
+  const viaDefault = unsizedOne('defaultImportCache');
+  assert.strictEqual(viaDefault.client_type, 'lru-cache.LRUCache');
+  assert.strictEqual(viaDefault.func, 'LRUCache');
+  assert.deepStrictEqual(seen(viaDefault), []);
+});
+
+test('the bounded form of each never reads as unsized: its bound is in the packet', () => {
+  // The retriever does not judge, so "no packet for the bounded form" is
+  // stated as what the contract can say: no packet WITHOUT its bound.
+  const by = unsizedBySymbol(retrieveRecords());
+  const boundNames = { pool: ['max'], cache: ['max', 'maxSize', 'arg0'] };
+  const unsized = [...by.values()]
+    .filter((r) => {
+      const names = boundNames[aggregateOf(r, 'bound_class')];
+      return (
+        aggregateOf(r, 'bound_opaque') === null &&
+        !r.const_args.some((a) => a.how !== 'aggregate' && names.includes(a.name))
+      );
+    })
+    .map((r) => r.symbol)
+    .sort();
+  assert.deepStrictEqual(unsized, ['defaultImportCache', 'defaultPool', 'unsizedCache', 'unsizedPool']);
+
+  assert.ok(seen(by.get('boundedPool')).includes('max=10/literal'));
+  assert.deepStrictEqual(seen(by.get('boundedCache')), ['max=500/literal']);
+  assert.ok(seen(by.get('sizedCache')).includes('maxSize=1048576/literal'));
+  // lru-cache before v7 takes the limit as a bare number.
+  assert.deepStrictEqual(seen(by.get('numericCache')), ['arg0=500/literal']);
+});
+
+test('a constant option is a value and a non-constant one is a name', () => {
+  const constant = unsizedOne('constantPool');
+  assert.strictEqual(constant.client_type, 'pg.Pool', 'new pg.Pool(...) through a namespace import');
+  assert.deepStrictEqual(seen(constant), ['max=20/named_constant']);
+  assert.deepStrictEqual(seen(unsizedOne('namedPool')), ['max=settings.poolSize/name']);
+  assert.deepStrictEqual(seen(unsizedOne('shorthandCache')), ['max=max/name']);
+});
+
+test('options that are not written out are reported as opaque', () => {
+  const spread = unsizedOne('hiddenPoolOptions');
+  assert.strictEqual(aggregateOf(spread, 'bound_opaque'), '...base');
+  assert.deepStrictEqual(seen(spread), []);
+  const passed = unsizedOne('passedCacheOptions');
+  assert.strictEqual(aggregateOf(passed, 'bound_opaque'), 'settings.cacheOptions');
+  assert.deepStrictEqual(seen(passed), []);
+});
+
+test('a local lookalike class is never an unsized construction', () => {
+  assert.ok(!unsizedBySymbol(retrieveRecords()).has('notAConstruction'));
+});
+
+test('unsized constructions keep their keys on an uninstalled tree', (t) => {
+  const records = retrieveFrom(fixtureWithoutNodeModules(t)).sites;
+  const by = unsizedBySymbol(records);
+  for (const [symbol, type] of [
+    ['unsizedPool', 'pg.Pool'],
+    ['constantPool', 'pg.Pool'],
+    ['unsizedCache', 'lru-cache.LRUCache'],
+    ['defaultImportCache', 'lru-cache.LRUCache'],
+  ]) {
+    assert.ok(by.has(symbol), `no packet for ${symbol} on an uninstalled tree`);
+    assert.strictEqual(by.get(symbol).client_type, type);
+    assert.strictEqual(by.get(symbol).provenance.confidence_tier, 'medium');
+  }
+  assert.ok(!by.has('notAConstruction'));
 });
 
 test('--files restricts output to the listed file (exact path)', () => {
@@ -690,6 +829,14 @@ function retrieveFrom(root, ...extra) {
   const cfgs = all.filter((r) => r.kind === 'repo_config');
   assert.strictEqual(cfgs.length, 1, 'exactly one repo_config record per run');
   return { sites: all.filter((r) => r.kind !== 'repo_config'), cfg: cfgs[0] };
+}
+
+// retrieveFrom, without the unsized-construction inventory: for a test that
+// states exactly which CALL sites a tree yields. A `new Pool()` in that tree
+// is a packet of its own kind, and is asserted in its own tests.
+function callSitesFrom(root, ...extra) {
+  const { sites, cfg } = retrieveFrom(root, ...extra);
+  return { sites: sites.filter((r) => r.site_kind !== 'unsized_construction'), cfg };
 }
 
 function scannedFiles(sites) {
@@ -1039,7 +1186,7 @@ test('path aliases beside real imports do not poison the run', () => {
         '  return [r, h, u];\n' +
         '}\n',
     );
-    const { sites, cfg } = retrieveFrom(tmp);
+    const { sites, cfg } = callSitesFrom(tmp);
     assert.deepStrictEqual(
       sites.map((r) => `${r.client_type}.${r.func}`).sort(),
       ['axios.get', 'pg.Pool.query'],
@@ -1117,7 +1264,7 @@ test('a wildcard re-export of a package is named, never guessed', (t) => {
       'const redis = new Redis();\n' +
       "export async function go() { return [await pool.query('x'), await redis.get('k')]; }\n",
   });
-  const { sites, cfg } = retrieveFrom(dir);
+  const { sites, cfg } = callSitesFrom(dir);
   assert.deepStrictEqual(
     sites.map((r) => `${r.client_type}.${r.func}`),
     ['pg.Pool.query'],
@@ -1183,7 +1330,7 @@ test('a path alias from an extended tsconfig is honored', (t) => {
       'const pool = new Pool();\n' +
       "export async function go() { return [await pool.query('x'), await helper.query('y')]; }\n",
   });
-  const { sites, cfg } = retrieveFrom(dir);
+  const { sites, cfg } = callSitesFrom(dir);
   assert.deepStrictEqual(sites.map((r) => `${r.client_type}.${r.func}`), ['pg.Pool.query']);
   assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
 });
@@ -1201,7 +1348,7 @@ test('a path alias onto in-repo source resolves through it', (t) => {
     'src/use.ts':
       "import { pool } from '@app/db';\nexport async function go() { return pool.query('x'); }\n",
   });
-  const { sites, cfg } = retrieveFrom(dir);
+  const { sites, cfg } = callSitesFrom(dir);
   assert.deepStrictEqual(
     sites.map((r) => `${r.file_path}:${r.client_type}.${r.func}`),
     ['src/use.ts:pg.Pool.query'],
@@ -1282,7 +1429,12 @@ test('a script-free install resolves the abstain where the plain install fails',
     }
   };
   const plain = npm();
-  if (plain === null) return t.skip('npm is not on PATH');
+  if (plain === null) {
+    // CI provisions npm and sets this, so there a skip is a lane nobody ran.
+    const required = process.env.RVLSCAN_REQUIRE_ENGINES;
+    assert.ok(!required || required === '0', 'npm is not on PATH and RVLSCAN_REQUIRE_ENGINES is set');
+    return t.skip('npm is not on PATH');
+  }
   assert.notStrictEqual(plain, 0, 'the dependency must fail to build for this to prove anything');
   abstainMessage(app);
 

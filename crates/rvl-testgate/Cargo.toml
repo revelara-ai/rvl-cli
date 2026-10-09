@@ -1,0 +1,17 @@
+[package]
+name = "rvl-testgate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Test support for rvl: the one place a live test may skip, and the switch that forbids it"
+publish = false
+
+# A dev-dependency of the crates whose tests drive a real engine (libclang,
+# node, a JDK, rust-analyzer, ...). Never a dependency of shipped code.
+[package.metadata.dist]
+dist = false
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

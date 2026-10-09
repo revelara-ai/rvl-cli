@@ -1,7 +1,9 @@
 //! Golden packet tests for the cindex helper, run over the checked-in
 //! fixtures. Engine-dependent tests SKIP (with a log line) when no libclang
 //! can be loaded — the workspace must build and test on machines without a
-//! C toolchain; provisioning the engine is an environment concern.
+//! C toolchain. CI is not such a machine: it sets RVLSCAN_REQUIRE_ENGINES, and
+//! there the same skip is a failure (see `rvl_testgate::skip`), because a
+//! built `cindex` proves nothing about a library it loads at process start.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,15 +54,19 @@ fn fixture(name: &str) -> PathBuf {
     manifest_dir().join("testdata").join(name)
 }
 
-/// True when the runtime engine loads; otherwise logs a SKIP line.
+/// True when the runtime engine loads; otherwise logs a SKIP line, or fails
+/// the test where engines are required.
 fn engine_available(test: &str) -> bool {
     let out = bin().arg("--engine-check").output().expect("run cindex");
     if out.status.success() {
         return true;
     }
-    eprintln!(
-        "SKIP {test}: no libclang available: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
+    rvl_testgate::skip(
+        test,
+        format_args!(
+            "no libclang available: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     );
     false
 }
@@ -725,6 +731,41 @@ fn no_db_syslog_aggregates_at_low_tier() {
         note["provenance"]["client_type_resolved"], false,
         "no-db packets are LOW tier: {note}"
     );
+}
+
+/// po-s7tqc: `get`, `lock` and `value` on a standard-library ownership or
+/// reference wrapper hand back what the wrapper already holds. The weak verb
+/// `get` resolves on an out-of-repo type, so before this fix each template
+/// instantiation was its own client type and its own authoring question.
+/// `std::future<T>::get` blocks, so it is the one site of the file.
+#[test]
+fn std_wrapper_accessors_are_not_sites_and_future_get_is() {
+    if !engine_available("std_wrapper_accessors_are_not_sites_and_future_get_is") {
+        return;
+    }
+    let (sites, records) = retrieve(&fixture("fixture-std").join("repo"), &[]);
+    assert_eq!(
+        stats(&records)["tus_incomplete"],
+        0,
+        "the fixture parses clean, so a missing site is an abstention"
+    );
+
+    let found: Vec<(&str, &str, &str)> = sites
+        .iter()
+        .map(|s| {
+            (
+                s["symbol"].as_str().unwrap_or_default(),
+                s["client_type"].as_str().unwrap_or_default(),
+                s["func"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![("await_result", "std::future<int>", "get")],
+        "only the future's blocking get is a site: {sites:?}"
+    );
+    assert_eq!(sites[0]["provenance"]["client_type_resolved"], true);
 }
 
 /// Write a one-file no-db C repo and retrieve it.
