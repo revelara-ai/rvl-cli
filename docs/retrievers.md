@@ -211,12 +211,12 @@ The packet lists what the retriever saw, in `const_args`:
 | Entry | `how` | Meaning |
 | --- | --- | --- |
 | `bound_class` | `aggregate` | `pool`, `queue`, `cache`, or `read`. |
-| A constructor argument (`arg0`, or its keyword), a property of an options object (`max`), or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
+| A constructor argument (`arg0`, or its keyword), a property of an options object (`max`), a method called on the value (`SetMaxOpenConns`), or a link of its builder chain (`maximumSize`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
 | The same | `name` | The value is not a constant (`cfg.Max`). The packet carries the source text. The scanner credits it as a bound and never resolves it. |
 | A call that the argument of a read passes through (`io.LimitReader`) | `call` | Go reads only. |
 | A method called on the same type somewhere else in the module | `type` | Only on a value that leaves the function. |
 | `bound_escapes` | `aggregate` | The value leaves the constructing function: it is returned, stored, passed to a call, or has no name. |
-| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`, `new Pool({ ...base })`, `new Pool(config)`). |
+| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`, `new Pool({ ...base })`, `new Pool(config)`, `new HikariDataSource(config)`). |
 
 A retriever does not decide which entry is a bound. A `construction_bounds`
 spec does. For one type and class, the spec gives the names that bound the
@@ -243,13 +243,20 @@ class and control, with at most five sites.
 | --- | --- |
 | `goindex` | `pool`: `database/sql` `Open`, `OpenDB`. `cache`: `github.com/patrickmn/go-cache` `New`. `read`: `io.ReadAll`, `io/ioutil.ReadAll`. The list is `bound_constructors` in `helpers/goindex/extractor_corpus.json`. |
 | `pyindex` | `queue`: the `queue` and `asyncio` queue classes, `multiprocessing.Queue`, `collections.deque`. `pool`: `redis.ConnectionPool`, `redis.BlockingConnectionPool`, `sqlalchemy.create_engine`, `psycopg_pool.ConnectionPool`. `cache`: `functools.lru_cache`, `functools.cache`. |
+| `javaindex` | `pool`: `com.zaxxer.hikari.HikariConfig` and `com.zaxxer.hikari.HikariDataSource`, at `new`. `cache`: `com.github.benmanes.caffeine.cache.Caffeine`, at `Caffeine.newBuilder()`. The list is `BOUND_CONSTRUCTORS` in `helpers/javaindex/javaindex.java`. |
 | `tsindex` | `pool`: `pg.Pool`. `cache`: `lru-cache.LRUCache`. The list is `BOUND_CONSTRUCTORS` in `helpers/tsindex/tsindex.js`. |
 | The other retrievers | Nothing yet. |
 
 A retriever reports a construction that has a bound, too. That packet lists
 the bound (`max` with the value `10`), and the spec reads it as bounded.
 
-Four limits:
+For `javaindex`, a `HikariConfig` with `setMaximumPoolSize(10)` is one packet,
+and the packet carries `setMaximumPoolSize` with the value `10`. The spec then
+finds that the pool is bounded. For a Caffeine builder, each link of the chain is one
+entry, up to `build()` or `buildAsync()`. A builder that is built in the same
+expression does not leave the method.
+
+Seven limits:
 
 - `goindex` does not report `make(chan T)`. A Go channel with no capacity
   blocks the sender until a receiver is ready. It is not an unbounded queue.
@@ -261,6 +268,14 @@ Four limits:
   `pg.Pool` and an `lru-cache` take their bound only in the constructor.
 - The retriever reads one function. For a value that leaves the function, the
   only other evidence is a method call on the same type in the same module.
+- `javaindex` reads one method for a local variable and one file for a field.
+- `javaindex` gives `bound_opaque` to a HikariCP constructor that has an
+  argument (a `HikariConfig`, a `Properties`, or a file name). The options are
+  in the argument, so the scanner abstains.
+- `javaindex` finds a type through the type checker or through a single-type
+  import. It does not report a construction below a wildcard import
+  (`import com.zaxxer.hikari.*`). It does not report a pool that a framework
+  builds from properties (Spring Boot `spring.datasource.hikari.*`).
 
 ## The liveness probe join
 

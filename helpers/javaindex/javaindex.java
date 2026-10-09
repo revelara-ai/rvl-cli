@@ -49,6 +49,7 @@ import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.AssignmentTree;
 import com.sun.source.tree.CatchTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ExpressionStatementTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.ImportTree;
@@ -83,6 +84,7 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -90,6 +92,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.DeclaredType;
@@ -287,6 +290,67 @@ class JavaIndex {
             "captureException", "captureMessage", "captureEvent"));
 
     // -----------------------------------------------------------------------
+    // Unsized-construction inventory.
+    //
+    // A connection pool or a cache was built here. One packet per
+    // construction, on the SAME stream, stamped
+    // site_kind: "unsized_construction". The retrieval/judgment split holds:
+    // the packet lists what was OBSERVED on the construction -- the links of
+    // its builder chain, the methods called on the variable it is assigned
+    // to -- and a construction-bound spec downstream says which of them is a
+    // bound and which values of it mean "no limit".
+    //
+    // A constant is reported as a value. Anything else
+    // (setMaximumPoolSize(settings.poolSize())) is reported with how: "name":
+    // its source text, never a resolved value.
+    //
+    // A value that LEAVES the method (returned, stored in a field, passed on,
+    // or never named) can be bounded where this method cannot see. Such a
+    // packet carries bound_escapes, plus every method the module calls on a
+    // receiver of the same type anywhere, labeled how: "type". That label is
+    // evidence to abstain on. It never reads as an in-scope bound.
+    //
+    // Detection is by identity: the constructed type must resolve through the
+    // checker or through a single-type import. A same-named local class and a
+    // wildcard import abstain.
+    // -----------------------------------------------------------------------
+    static final String SITE_KIND_UNSIZED = "unsized_construction";
+
+    // BoundCtor is one row of the table: which construction to inventory.
+    // Like STRONG_IO_METHODS it selects WHICH sites to surface, never what
+    // they mean.
+    static final class BoundCtor {
+        final String boundClass;     // pool | cache
+        final String factory;        // static factory name; null = `new T(...)`
+        final Set<String> terminals; // chain links that end the builder
+
+        BoundCtor(String boundClass, String factory, String... terminals) {
+            this.boundClass = boundClass;
+            this.factory = factory;
+            this.terminals = new HashSet<>(Arrays.asList(terminals));
+        }
+    }
+
+    static final Map<String, BoundCtor> BOUND_CONSTRUCTORS = new LinkedHashMap<>();
+    static {
+        BOUND_CONSTRUCTORS.put("com.zaxxer.hikari.HikariConfig", new BoundCtor("pool", null));
+        BOUND_CONSTRUCTORS.put("com.zaxxer.hikari.HikariDataSource", new BoundCtor("pool", null));
+        BOUND_CONSTRUCTORS.put("com.github.benmanes.caffeine.cache.Caffeine",
+                new BoundCtor("cache", "newBuilder", "build", "buildAsync"));
+    }
+
+    // mentionsBoundType: a cheap per-file gate, so a file that names none of
+    // the table's types pays nothing for this inventory.
+    static boolean mentionsBoundType(String src) {
+        for (String type : BOUND_CONSTRUCTORS.keySet()) {
+            if (src.contains(type.substring(type.lastIndexOf('.') + 1))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
     // Misuse-shape inventory: shapes that are wrong where they stand. They
     // ride the SAME stream, stamped site_kind: "misuse_shape", as AGGREGATES
     // like the emission points: one packet per (enclosing function, class,
@@ -431,6 +495,10 @@ class JavaIndex {
     final Map<Element, Map<String, Object>> constructions = new HashMap<>();
     // repo_config constructions: type FQN -> union of timeout-ish fields.
     final Map<String, TreeSet<String>> repoConfig = new TreeMap<>();
+    // Unsized constructions: table type FQN -> the methods the module calls
+    // on a receiver of that type anywhere (built across ALL units in pass A,
+    // so a --files reload carries the same type-level observations).
+    final Map<String, TreeSet<String>> boundTypeMethods = new HashMap<>();
 
     Trees trees;
     SourcePositions positions;
@@ -728,6 +796,48 @@ class JavaIndex {
                 || fqn.startsWith("java.net.") || fqn.startsWith("com.sun.net.");
     }
 
+    // constructedType: the FQN of `new X(...)` / `new X.Builder()`, via the
+    // checker when it resolves, via imports otherwise; null when neither
+    // works (abstain).
+    String constructedType(TreePath path, NewClassTree node, UnitImports imps) {
+        String fqn = null;
+        try {
+            fqn = checkerFqn(trees.getTypeMirror(path));
+        } catch (Throwable ignore) {
+            // unattributed construction
+        }
+        if (fqn == null) {
+            fqn = attributeType(node.getIdentifier().toString(), imps);
+        }
+        return fqn;
+    }
+
+    // chainAbove: the calls of the fluent chain written on `from`, innermost
+    // first: for `x` in `x.a().b()`, the paths of `x.a()` and `x.a().b()`.
+    static List<TreePath> chainAbove(TreePath from) {
+        List<TreePath> out = new ArrayList<>();
+        TreePath top = from;
+        while (true) {
+            TreePath select = top.getParentPath();
+            TreePath call = select == null ? null : select.getParentPath();
+            if (call == null || !(select.getLeaf() instanceof MemberSelectTree)
+                    || ((MemberSelectTree) select.getLeaf()).getExpression() != top.getLeaf()
+                    || !(call.getLeaf() instanceof MethodInvocationTree)
+                    || ((MethodInvocationTree) call.getLeaf()).getMethodSelect()
+                            != select.getLeaf()) {
+                return out;
+            }
+            out.add(call);
+            top = call;
+        }
+    }
+
+    // linkName: the method name of one chain call (`a` for `x.a()`).
+    static String linkName(TreePath call) {
+        return ((MemberSelectTree) ((MethodInvocationTree) call.getLeaf()).getMethodSelect())
+                .getIdentifier().toString();
+    }
+
     // --- const args (schema v2) ---
 
     // literalText: the source text of a literal token (string literals keep
@@ -812,12 +922,14 @@ class JavaIndex {
         final String src;
         final UnitImports imps;
         final Deque<String> methodStack = new ArrayDeque<>();
+        final boolean boundUnit;
 
         ConstructionScanner(CompilationUnitTree cu, String rel, String src, UnitImports imps) {
             this.cu = cu;
             this.rel = rel;
             this.src = src;
             this.imps = imps;
+            this.boundUnit = mentionsBoundType(src);
         }
 
         @Override
@@ -857,7 +969,7 @@ class JavaIndex {
 
         @Override
         public Void visitNewClass(NewClassTree node, Void p) {
-            String type = constructedType(node);
+            String type = constructedType(getCurrentPath(), node, imps);
             recordBuilderChain(node, type);
             return super.visitNewClass(node, p);
         }
@@ -868,31 +980,30 @@ class JavaIndex {
             if (node.getMethodSelect() instanceof MemberSelectTree) {
                 MemberSelectTree ms = (MemberSelectTree) node.getMethodSelect();
                 String m = ms.getIdentifier().toString();
-                if (m.equals("newBuilder") || m.equals("builder")) {
+                boolean factory = m.equals("newBuilder") || m.equals("builder");
+                if (factory || boundUnit) {
                     TreePath msPath = new TreePath(getCurrentPath(), ms);
                     Resolved r = resolveReceiver(new TreePath(msPath, ms.getExpression()), imps);
-                    if (r.resolved) {
+                    if (r.resolved && factory) {
                         recordBuilderChain(node, r.clientType);
+                    }
+                    // The type-level evidence for an unsized construction
+                    // that leaves its method: a method called on the type,
+                    // and the links of the fluent chain written on it.
+                    BoundCtor bound = r.resolved ? BOUND_CONSTRUCTORS.get(r.clientType) : null;
+                    if (bound != null) {
+                        TreeSet<String> methods =
+                                boundTypeMethods.computeIfAbsent(r.clientType, k -> new TreeSet<>());
+                        if (!m.equals(bound.factory)) {
+                            methods.add(m);
+                        }
+                        for (TreePath link : chainAbove(getCurrentPath())) {
+                            methods.add(linkName(link));
+                        }
                     }
                 }
             }
             return super.visitMethodInvocation(node, p);
-        }
-
-        // constructedType: the FQN of `new X(...)` / `new X.Builder()`, via
-        // the checker when it resolves, via imports otherwise; null when
-        // neither works (abstain).
-        String constructedType(NewClassTree node) {
-            String fqn = null;
-            try {
-                fqn = checkerFqn(trees.getTypeMirror(getCurrentPath()));
-            } catch (Throwable ignore) {
-                // unattributed construction
-            }
-            if (fqn == null) {
-                fqn = attributeType(node.getIdentifier().toString(), imps);
-            }
-            return fqn;
         }
 
         // recordBuilderChain walks UP from a construction/factory node
@@ -948,6 +1059,8 @@ class JavaIndex {
         final UnitImports imps;
         final List<Map<String, Object>> sites = new ArrayList<>();
         final Deque<MethodTree> methodStack = new ArrayDeque<>();
+        final Deque<TreePath> methodPaths = new ArrayDeque<>();
+        final boolean boundUnit;
         // Innermost-catch bookkeeping for the swallow fact.
         final Deque<CatchFrame> catchStack = new ArrayDeque<>();
         // (symbol|framework|category) -> aggregate.
@@ -961,6 +1074,7 @@ class JavaIndex {
             this.rel = rel;
             this.src = src;
             this.imps = imps;
+            this.boundUnit = mentionsBoundType(src);
         }
 
         class CatchFrame {
@@ -1012,11 +1126,26 @@ class JavaIndex {
                 annotationRecord(node, ann);
             }
             methodStack.push(node);
+            methodPaths.push(getCurrentPath());
             try {
                 return super.visitMethod(node, p);
             } finally {
                 methodStack.pop();
+                methodPaths.pop();
             }
+        }
+
+        @Override
+        public Void visitNewClass(NewClassTree node, Void p) {
+            if (boundUnit) {
+                String type = constructedType(getCurrentPath(), node, imps);
+                BoundCtor bound = type == null ? null : BOUND_CONSTRUCTORS.get(type);
+                if (bound != null && bound.factory == null) {
+                    unsizedRecord(node, type, type.substring(type.lastIndexOf('.') + 1), bound,
+                            node.getArguments());
+                }
+            }
+            return super.visitNewClass(node, p);
         }
 
         @Override
@@ -1180,6 +1309,15 @@ class JavaIndex {
             TreePath recvPath = new TreePath(msPath, ms.getExpression());
             Resolved r = resolveReceiver(recvPath, imps);
 
+            // An unsized construction by static factory
+            // (Caffeine.newBuilder()) is builder configuration: one
+            // unsized_construction record, never a G1 site.
+            BoundCtor bound = r.resolved ? BOUND_CONSTRUCTORS.get(r.clientType) : null;
+            if (bound != null && method.equals(bound.factory)) {
+                unsizedRecord(node, r.clientType, method, bound, node.getArguments());
+                return;
+            }
+
             // G2 call-form registrations are checked FIRST: a matched
             // registration emits one server_entry record, never a G1 site.
             Set<String> serverMethods = SERVER_ENTRY_CALLS.get(r.clientType);
@@ -1253,6 +1391,211 @@ class JavaIndex {
                 return "error_capture";
             }
             return null;
+        }
+
+        // --- unsized constructions ---
+
+        // unsizedRecord emits the packet for the construction at the current
+        // path: its class, the options seen on it, and how it leaves.
+        void unsizedRecord(ExpressionTree node, String type, String func, BoundCtor bound,
+                List<? extends ExpressionTree> args) {
+            List<Object> ca = new ArrayList<>();
+            ca.add(constArg(0, "bound_class", bound.boundClass, "aggregate"));
+            Set<String> seen = new HashSet<>();
+
+            // A constructor argument (a HikariConfig, a Properties, a file
+            // name) carries options that are not written out here.
+            List<String> opaque = new ArrayList<>();
+            for (ExpressionTree a : args) {
+                opaque.add(text(cu, a, src));
+            }
+
+            boolean[] built = new boolean[1];
+            TreePath top = walkChain(getCurrentPath(), bound, ca, seen, built);
+            String escapes = "";
+            if (!built[0]) {
+                TreePath parent = top.getParentPath();
+                Tree holder = parent.getLeaf();
+                TreePath target = null;
+                if (holder instanceof VariableTree
+                        && ((VariableTree) holder).getInitializer() == top.getLeaf()) {
+                    target = parent;
+                } else if (holder instanceof AssignmentTree
+                        && ((AssignmentTree) holder).getExpression() == top.getLeaf()) {
+                    target = new TreePath(parent, ((AssignmentTree) holder).getVariable());
+                } else if (!(holder instanceof ExpressionStatementTree)) {
+                    // Returned, passed to a call, or otherwise never named.
+                    escapes = "unnamed";
+                }
+                if (target != null) {
+                    Element el = elementOf(target);
+                    if (!(el instanceof VariableElement)) {
+                        // No attribution: the uses of the target cannot be
+                        // followed, so nothing is claimed about them.
+                        escapes = "stored";
+                        opaque.add("unresolved target");
+                    } else {
+                        // A local is followed through its method. A field is
+                        // followed through its file, and is visible outside
+                        // the method by construction.
+                        boolean field = el.getKind() == ElementKind.FIELD;
+                        TreePath scope = field || methodPaths.isEmpty()
+                                ? new TreePath(cu) : methodPaths.peek();
+                        TargetUses uses = new TargetUses(el, bound, ca, seen);
+                        uses.scan(scope, null);
+                        escapes = field ? "stored" : (uses.leaves ? "leaves" : "");
+                    }
+                }
+            }
+            if (!opaque.isEmpty()) {
+                ca.add(constArg(0, "bound_opaque", String.join(", ", opaque), "aggregate"));
+            }
+            if (!escapes.isEmpty()) {
+                ca.add(constArg(0, "bound_escapes", escapes, "aggregate"));
+                for (String m : boundTypeMethods.getOrDefault(type, new TreeSet<>())) {
+                    ca.add(constArg(0, m, "", "type"));
+                }
+            }
+
+            Map<String, Object> rec = baseRecord(lineOf(cu, node), symbol(), func, "", type,
+                    text(cu, top.getLeaf(), src), "");
+            rec.put("site_kind", SITE_KIND_UNSIZED);
+            rec.put("const_args", ca);
+            rec.put("provenance", provenance(true, "high"));
+            sites.add(rec);
+        }
+
+        Element elementOf(TreePath path) {
+            try {
+                return trees.getElement(path);
+            } catch (Throwable ignore) {
+                return null; // no attribution
+            }
+        }
+
+        // walkChain reports each link of the fluent chain written above
+        // `from` (`.expireAfterWrite(...).maximumSize(...)`) as an
+        // observation, and returns the path of the whole chain. It stops at a
+        // terminal link (`build()`), which is not an option: built[0] says the
+        // builder ended inside the expression.
+        TreePath walkChain(TreePath from, BoundCtor bound, List<Object> ca, Set<String> seen,
+                boolean[] built) {
+            TreePath top = from;
+            for (TreePath call : chainAbove(from)) {
+                top = call;
+                if (bound.terminals.contains(linkName(call))) {
+                    built[0] = true;
+                    break;
+                }
+                observe(linkName(call), call, ca, seen);
+            }
+            return top;
+        }
+
+        // observe reports one method called on the construction: its first
+        // argument as a value when it is a constant, as a NAME (its source
+        // text) when it is not.
+        void observe(String name, TreePath callPath, List<Object> ca, Set<String> seen) {
+            List<? extends ExpressionTree> args =
+                    ((MethodInvocationTree) callPath.getLeaf()).getArguments();
+            String value = "";
+            String how = "name";
+            if (!args.isEmpty()) {
+                ExpressionTree arg = args.get(0);
+                String literal = literalText(cu, arg, src);
+                String named = literal != null ? null
+                        : namedConstantText(new TreePath(callPath, arg), arg);
+                if (literal != null) {
+                    value = literalValue(arg, literal);
+                    how = "literal";
+                } else if (named != null) {
+                    value = named;
+                    how = "named_constant";
+                } else {
+                    value = text(cu, arg, src);
+                }
+            }
+            if (seen.add(name + "\u0000" + value + "\u0000" + how)) {
+                ca.add(constArg(0, name, value, how));
+            }
+        }
+
+        // literalValue: a numeric literal as its value (10_000 -> 10000, so a
+        // spec's unbounded_values compare against one spelling); any other
+        // literal as its source text.
+        String literalValue(ExpressionTree arg, String sourceText) {
+            if (arg instanceof LiteralTree && ((LiteralTree) arg).getValue() instanceof Number) {
+                return String.valueOf(((LiteralTree) arg).getValue());
+            }
+            if (arg instanceof UnaryTree) {
+                ExpressionTree operand = ((UnaryTree) arg).getExpression();
+                if (((LiteralTree) operand).getValue() instanceof Number) {
+                    String sign = arg.getKind() == Tree.Kind.UNARY_MINUS ? "-" : "";
+                    return sign + ((LiteralTree) operand).getValue();
+                }
+            }
+            return sourceText;
+        }
+
+        // TargetUses follows one variable by element identity through a
+        // scope: a method called on it is an observation, and any other use
+        // of it (returned, passed to a call, assigned on) means it leaves.
+        class TargetUses extends TreePathScanner<Void, Void> {
+            final Element target;
+            final BoundCtor bound;
+            final List<Object> ca;
+            final Set<String> seen;
+            // Uses that are not an escape: a method receiver, and the left
+            // side of an assignment.
+            final Set<Tree> benign = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+            boolean leaves;
+
+            TargetUses(Element target, BoundCtor bound, List<Object> ca, Set<String> seen) {
+                this.target = target;
+                this.bound = bound;
+                this.ca = ca;
+                this.seen = seen;
+            }
+
+            @Override
+            public Void visitMethodInvocation(MethodInvocationTree node, Void p) {
+                if (node.getMethodSelect() instanceof MemberSelectTree) {
+                    MemberSelectTree ms = (MemberSelectTree) node.getMethodSelect();
+                    TreePath recv = new TreePath(new TreePath(getCurrentPath(), ms),
+                            ms.getExpression());
+                    if (elementOf(recv) == target) {
+                        benign.add(ms.getExpression());
+                        walkChain(recv, bound, ca, seen, new boolean[1]);
+                    }
+                }
+                return super.visitMethodInvocation(node, p);
+            }
+
+            @Override
+            public Void visitAssignment(AssignmentTree node, Void p) {
+                if (elementOf(new TreePath(getCurrentPath(), node.getVariable())) == target) {
+                    benign.add(node.getVariable());
+                }
+                return super.visitAssignment(node, p);
+            }
+
+            @Override
+            public Void visitIdentifier(IdentifierTree node, Void p) {
+                use(node);
+                return super.visitIdentifier(node, p);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Void p) {
+                use(node);
+                return super.visitMemberSelect(node, p);
+            }
+
+            void use(Tree node) {
+                if (!benign.contains(node) && elementOf(getCurrentPath()) == target) {
+                    leaves = true;
+                }
+            }
         }
 
         Map<String, Object> classicRecord(MethodInvocationTree node, MemberSelectTree ms,
