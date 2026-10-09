@@ -124,6 +124,47 @@ namespace Microsoft.Extensions.DependencyInjection
         public static IServiceCollection AddHostedService<T>(this IServiceCollection services)
             where T : class => services;
     }
+
+    public static class MemoryCacheServiceCollectionExtensions
+    {
+        public static IServiceCollection AddMemoryCache(this IServiceCollection services) => services;
+        public static IServiceCollection AddMemoryCache(this IServiceCollection services,
+            Action<Microsoft.Extensions.Caching.Memory.MemoryCacheOptions> setupAction) => services;
+    }
+}
+
+namespace Microsoft.Extensions.Options
+{
+    public interface IOptions<out TOptions> where TOptions : class
+    {
+        TOptions Value { get; }
+    }
+
+    public static class Options
+    {
+        public static IOptions<TOptions> Create<TOptions>(TOptions options) where TOptions : class => null;
+    }
+}
+
+namespace Microsoft.Extensions.Caching.Memory
+{
+    public interface IMemoryCache : IDisposable
+    {
+    }
+
+    public class MemoryCacheOptions : Microsoft.Extensions.Options.IOptions<MemoryCacheOptions>
+    {
+        public long? SizeLimit { get; set; }
+        public TimeSpan ExpirationScanFrequency { get; set; }
+        public bool TrackStatistics { get; set; }
+        MemoryCacheOptions Microsoft.Extensions.Options.IOptions<MemoryCacheOptions>.Value => this;
+    }
+
+    public class MemoryCache : IMemoryCache
+    {
+        public MemoryCache(Microsoft.Extensions.Options.IOptions<MemoryCacheOptions> optionsAccessor) { }
+        public void Dispose() { }
+    }
 }
 
 namespace Hangfire

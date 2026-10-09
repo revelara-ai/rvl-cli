@@ -291,6 +291,7 @@ internal static class Retriever
     private const string SiteKindBackgroundJob = "background_job";
     private const string SiteKindEmission = "emission_point";
     private const string SiteKindMisuse = "misuse_shape";
+    private const string SiteKindUnsized = "unsized_construction";
 
     // -- G1 client-call selection tables -------------------------------------
     //
@@ -428,6 +429,37 @@ internal static class Retriever
     {
         "LogError", "LogCritical", "Error", "Fatal",
     };
+
+    // -- unsized-construction tables ----------------------------------------
+    //
+    // An object that takes a bound was built here. Like every table above
+    // these select WHICH constructions to surface. Whether one is unbounded
+    // is spec knowledge downstream (ConstructionBoundSpec), with one
+    // exception that the lane's contract for C# asks for: a MemoryCache
+    // whose options set SizeLimit is the bounded form and is not reported.
+
+    // "<containing type>.<method>" of a static method -> bound class. The
+    // key is also the packet's client_type, the identity a spec joins on.
+    private static readonly Dictionary<string, string> BoundFactories = new()
+    {
+        ["System.Threading.Channels.Channel.CreateUnbounded"] = "queue",
+        ["System.IO.File.ReadAllText"] = "read",
+        ["System.IO.File.ReadAllBytes"] = "read",
+    };
+
+    // The method names above, so that only a call spelled like one of them
+    // pays for symbol resolution.
+    private static readonly HashSet<string> BoundCallNames = new()
+    {
+        "CreateUnbounded", "ReadAllText", "ReadAllBytes", "AddMemoryCache",
+    };
+
+    private const string MemoryCacheType = "Microsoft.Extensions.Caching.Memory.MemoryCache";
+    private const string MemoryCacheOptionsType = "Microsoft.Extensions.Caching.Memory.MemoryCacheOptions";
+    private const string MemoryCacheRegistration =
+        "Microsoft.Extensions.DependencyInjection.MemoryCacheServiceCollectionExtensions.AddMemoryCache";
+    private const string OptionsCreate = "Microsoft.Extensions.Options.Options.Create";
+    private const string MemoryCacheSizeLimit = "SizeLimit";
 
     private static readonly HashSet<string> SkipDirs = new()
     {
@@ -692,7 +724,265 @@ internal static class Retriever
         // emission lane when that lane counts it as a swallow, and which
         // handlers emit is known only now.
         outRecords.AddRange(MisuseCollector.Records(rootNode, model, emissions, filePath, snapshot));
+        outRecords.AddRange(UnsizedConstructions(rootNode, model, filePath, snapshot));
         return outRecords;
+    }
+
+    // -- unsized constructions ----------------------------------------------
+
+    /// One packet per construction of an object that takes a bound: an
+    /// unbounded channel, a whole-file read, a MemoryCache with no SizeLimit.
+    /// Every identity is matched on a RESOLVED symbol. A type from an
+    /// unrestored package does not resolve, and the construction is then
+    /// omitted: this lane has no name-match tier.
+    ///
+    /// No packet carries bound_escapes. A channel and a file read have no
+    /// setter, and MemoryCacheOptions is read when the cache is built, so
+    /// nothing outside the constructing function can bound the value later.
+    private static List<Packet> UnsizedConstructions(
+        SyntaxNode rootNode, SemanticModel model, string filePath, string snapshot)
+    {
+        var outRecords = new List<Packet>();
+        foreach (var node in rootNode.DescendantNodes())
+        {
+            string clientType = null, func = null, boundClass = null;
+            List<ConstArg> seen = null;
+            switch (node)
+            {
+                case InvocationExpressionSyntax inv:
+                    var called = inv.Expression is MemberAccessExpressionSyntax member ? member.Name : inv.Expression;
+                    if (called is not SimpleNameSyntax simple || !BoundCallNames.Contains(simple.Identifier.ValueText))
+                    {
+                        continue;
+                    }
+                    var callee = StaticCallee(model, inv);
+                    if (callee == null) continue;
+                    var args = inv.ArgumentList.Arguments;
+                    if (BoundFactories.TryGetValue(callee, out boundClass))
+                    {
+                        clientType = callee;
+                        seen = new List<ConstArg>();
+                        // A read takes a path, not an option: nothing to observe.
+                        for (int i = 0; boundClass != "read" && i < args.Count; i++)
+                        {
+                            seen.Add(Observation(model, i,
+                                args[i].NameColon?.Name.Identifier.ValueText ?? $"arg{i}", args[i].Expression));
+                        }
+                    }
+                    else if (callee == MemoryCacheRegistration)
+                    {
+                        clientType = MemoryCacheType;
+                        boundClass = "cache";
+                        // Reduced extension form: the receiver is not an argument.
+                        seen = args.Count == 0
+                            ? new List<ConstArg>()
+                            : SetupLambdaOptions(model, args[^1].Expression);
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                    func = callee[(callee.LastIndexOf('.') + 1)..];
+                    break;
+                case BaseObjectCreationExpressionSyntax creation:
+                    if (!IsType(model, creation, MemoryCacheType)) continue;
+                    clientType = MemoryCacheType;
+                    func = "MemoryCache";
+                    boundClass = "cache";
+                    var ctorArgs = creation.ArgumentList?.Arguments;
+                    seen = ctorArgs is { Count: > 0 }
+                        ? CacheOptions(model, ctorArgs.Value[0].Expression, creation)
+                        : new List<ConstArg>();
+                    break;
+                default:
+                    continue;
+            }
+            if (boundClass == "cache" && seen.Any(o => o.Name == MemoryCacheSizeLimit && !IsNullLiteral(o)))
+            {
+                continue;
+            }
+
+            var rec = NewPacket(snapshot, filePath, Line(node), EnclosingFunction(node).Name, func,
+                "", clientType, Cap(node.ToString()), "");
+            rec.SiteKind = SiteKindUnsized;
+            rec.Prov.ClientTypeResolved = true;
+            rec.ConstArgs.Add(new ConstArg { Name = "bound_class", Value = boundClass, How = "aggregate" });
+            rec.ConstArgs.AddRange(seen);
+            outRecords.Add(rec);
+        }
+        return outRecords;
+    }
+
+    private static bool IsNullLiteral(ConstArg obs) => obs.How == "literal" && obs.Value == "null";
+
+    /// "<containing type>.<method>" for a call that resolves to a static
+    /// method (an extension method included), or null. When overload
+    /// resolution fails on an argument, the candidates still name the method.
+    private static string StaticCallee(SemanticModel model, InvocationExpressionSyntax inv)
+    {
+        var info = model.GetSymbolInfo(inv);
+        if ((info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) is not IMethodSymbol method) return null;
+        method = method.ReducedFrom ?? method;
+        if (!method.IsStatic || method.ContainingType == null) return null;
+        return Identity(method.ContainingType) + "." + method.Name;
+    }
+
+    private static bool IsType(SemanticModel model, ExpressionSyntax expr, string identity)
+    {
+        var type = model.GetTypeInfo(expr).Type;
+        return type != null && type.TypeKind != TypeKind.Error && Identity(type) == identity;
+    }
+
+    /// One option as an observation: its value when the compiler folds it to
+    /// a constant, its source text as a NAME when it does not.
+    private static ConstArg Observation(SemanticModel model, int index, string name, ExpressionSyntax value)
+    {
+        var constant = model.GetConstantValue(value);
+        if (!constant.HasValue)
+        {
+            return new ConstArg { Index = index, Name = name, Value = value.ToString(), How = "name" };
+        }
+        if (value is LiteralExpressionSyntax lit)
+        {
+            return new ConstArg { Index = index, Name = name, Value = lit.Token.Text, How = "literal" };
+        }
+        var text = constant.Value switch
+        {
+            null => "null",
+            bool b => b ? "true" : "false",
+            IFormattable f => f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
+            var other => other.ToString(),
+        };
+        return new ConstArg { Index = index, Name = name, Value = text, How = "named_constant" };
+    }
+
+    private static ConstArg Opaque(SyntaxNode unseen) =>
+        new() { Name = "bound_opaque", Value = Cap(unseen.ToString()), How = "aggregate" };
+
+    /// `x.Prop = value` where `x` is `target`: the option an assignment sets.
+    private static ConstArg AssignedOption(SemanticModel model, AssignmentExpressionSyntax assign, ISymbol target)
+    {
+        if (!assign.IsKind(SyntaxKind.SimpleAssignmentExpression)
+            || assign.Left is not MemberAccessExpressionSyntax ma
+            || ma.Expression is not IdentifierNameSyntax id
+            || !SymbolEqualityComparer.Default.Equals(model.GetSymbolInfo(id).Symbol, target))
+        {
+            return null;
+        }
+        return Observation(model, 0, ma.Name.Identifier.ValueText, assign.Right);
+    }
+
+    /// The options every `x.Prop = value` in `scope` sets on `target`, plus
+    /// bound_opaque when `target` is used in any other way except at
+    /// `allowed` (reassigned, passed to a call): its options are then not all
+    /// written where this function can see them.
+    private static List<ConstArg> OptionsSetOn(
+        SemanticModel model, SyntaxNode scope, ISymbol target, SyntaxNode allowed)
+    {
+        var seen = new List<ConstArg>();
+        SyntaxNode leak = null;
+        foreach (var id in scope.DescendantNodes().OfType<IdentifierNameSyntax>())
+        {
+            if (id == allowed || id.Identifier.ValueText != target.Name
+                || !SymbolEqualityComparer.Default.Equals(model.GetSymbolInfo(id).Symbol, target))
+            {
+                continue;
+            }
+            if (id.Parent is MemberAccessExpressionSyntax ma && ma.Expression == id)
+            {
+                if (ma.Parent is AssignmentExpressionSyntax assign && assign.Left == ma)
+                {
+                    var obs = AssignedOption(model, assign, target);
+                    if (obs != null)
+                    {
+                        seen.Add(obs);
+                        continue;
+                    }
+                }
+                else if (ma.Parent is not InvocationExpressionSyntax)
+                {
+                    continue; // a read of one option
+                }
+            }
+            leak ??= id.Parent;
+        }
+        if (leak != null) seen.Add(Opaque(leak));
+        return seen;
+    }
+
+    /// What the function shows of the options a MemoryCache is built from.
+    /// Seen in full: `new MemoryCacheOptions { ... }` written inline, wrapped
+    /// in Options.Create, or held in a local that is only configured and then
+    /// passed here. Anything else (a parameter, a field, a call) is
+    /// bound_opaque.
+    private static List<ConstArg> CacheOptions(SemanticModel model, ExpressionSyntax arg, SyntaxNode construction)
+    {
+        while (true)
+        {
+            if (arg is ParenthesizedExpressionSyntax paren)
+            {
+                arg = paren.Expression;
+            }
+            else if (arg is InvocationExpressionSyntax wrap && StaticCallee(model, wrap) == OptionsCreate
+                && wrap.ArgumentList.Arguments.Count == 1)
+            {
+                arg = wrap.ArgumentList.Arguments[0].Expression;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (arg is BaseObjectCreationExpressionSyntax inline && IsType(model, inline, MemoryCacheOptionsType))
+        {
+            return InitializerOptions(model, inline);
+        }
+
+        if (arg is IdentifierNameSyntax id && model.GetSymbolInfo(id).Symbol is ILocalSymbol local
+            && local.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is VariableDeclaratorSyntax decl
+            && decl.Initializer?.Value is BaseObjectCreationExpressionSyntax built
+            && IsType(model, built, MemoryCacheOptionsType))
+        {
+            var function = construction.Ancestors().FirstOrDefault(a =>
+                a is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax)
+                ?? construction.SyntaxTree.GetRoot();
+            var seen = InitializerOptions(model, built);
+            seen.AddRange(OptionsSetOn(model, function, local, id));
+            return seen;
+        }
+
+        return new List<ConstArg> { Opaque(arg) };
+    }
+
+    private static List<ConstArg> InitializerOptions(SemanticModel model, BaseObjectCreationExpressionSyntax creation)
+    {
+        var seen = new List<ConstArg>();
+        foreach (var expr in creation.Initializer?.Expressions ?? default)
+        {
+            if (expr is AssignmentExpressionSyntax { Left: IdentifierNameSyntax prop } assign)
+            {
+                seen.Add(Observation(model, 0, prop.Identifier.ValueText, assign.Right));
+            }
+        }
+        return seen;
+    }
+
+    /// The options an `AddMemoryCache(options => ...)` lambda sets. A setup
+    /// action that is not a lambda written here is bound_opaque.
+    private static List<ConstArg> SetupLambdaOptions(SemanticModel model, ExpressionSyntax setup)
+    {
+        var parameter = setup switch
+        {
+            SimpleLambdaExpressionSyntax lambda => lambda.Parameter,
+            ParenthesizedLambdaExpressionSyntax { ParameterList.Parameters.Count: 1 } p => p.ParameterList.Parameters[0],
+            _ => null,
+        };
+        if (parameter == null || model.GetDeclaredSymbol(parameter) is not { } symbol)
+        {
+            return new List<ConstArg> { Opaque(setup) };
+        }
+        return OptionsSetOn(model, ((LambdaExpressionSyntax)setup).Body, symbol, allowed: null);
     }
 
     // -- receiver resolution -------------------------------------------------
