@@ -1,0 +1,42 @@
+// Vendored STUB of <memory>: the libstdc++ shape, where shared_ptr inherits
+// get() from the __shared_ptr base and weak_ptr sits on __weak_ptr.
+#ifndef FIXTURE_STD_MEMORY
+#define FIXTURE_STD_MEMORY
+
+namespace std {
+
+template <typename T>
+class unique_ptr {
+ public:
+  T *get() const noexcept { return ptr_; }
+  T *operator->() const noexcept { return ptr_; }
+
+ private:
+  T *ptr_ = nullptr;
+};
+
+template <typename T, int Lp = 0>
+class __shared_ptr {
+ public:
+  T *get() const noexcept { return ptr_; }
+  T *operator->() const noexcept { return ptr_; }
+
+ private:
+  T *ptr_ = nullptr;
+};
+
+template <typename T>
+class shared_ptr : public __shared_ptr<T> {};
+
+template <typename T, int Lp = 0>
+class __weak_ptr {};
+
+template <typename T>
+class weak_ptr : public __weak_ptr<T> {
+ public:
+  shared_ptr<T> lock() const noexcept { return shared_ptr<T>(); }
+};
+
+}  // namespace std
+
+#endif  // FIXTURE_STD_MEMORY
