@@ -23,6 +23,7 @@ pub mod config;
 pub mod control;
 pub mod display;
 pub mod evidence;
+pub mod factor;
 pub mod feedback;
 pub mod gojson;
 pub mod incident;

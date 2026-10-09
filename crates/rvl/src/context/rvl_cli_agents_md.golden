@@ -20,6 +20,10 @@ Add `--format=json` to any of these for machine-readable output.
 - `rvl control list --limit=100` — reliability controls catalog
 - `rvl control show RC-XXX` — control details and evidence status
 
+**Causal factors:**
+- `rvl factor list --top10` — the Reliability Top 10 of the causal factor catalog
+- `rvl factor show CF-XXXX` — causal factor details, linked controls and related risks
+
 **Knowledge:**
 - `rvl knowledge search "<query>" --limit=5` — search incidents and patterns
 - `rvl knowledge enrich --query="<query>"` — enriched context with patterns and procedures

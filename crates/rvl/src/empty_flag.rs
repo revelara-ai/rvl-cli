@@ -190,6 +190,12 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // rvl-native scope filters; they follow the filter rule.
     ("control show", "team", Empty::Absent),
     ("control show", "service", Empty::Absent),
+    // ---------------- factor (rvl-native, no rvl-cli counterpart) ----------------
+    // A typed clap argument (1 to 7), so the empty value fails the parse.
+    ("factor list", "category", Empty::Error),
+    // The same guarded validator as `control --format`.
+    ("factor list", "format", Empty::Absent),
+    ("factor show", "format", Empty::Absent),
     // ---------------- incident (internal/commands/incident.go) ----------------
     ("incident search", "limit", Empty::Error), // incident.go:152
     // incident.go:163 calls ValidateFormat UNGUARDED — the one --format in

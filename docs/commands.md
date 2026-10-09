@@ -172,6 +172,8 @@ These talk to the Revelara API and need credentials.
 | --- | --- |
 | `rvl risk <list\|ready\|show\|context\|stale\|resolve\|accept>` | Manage risk lifecycle. |
 | `rvl control <list\|show>` | Query the reliability controls catalog. |
+| `rvl factor list [--category <1-7>] [--top10]` | List the causal factor catalog: the contributing conditions found in public incident reports. |
+| `rvl factor show <CODE>` | Show one causal factor: its quotes, its controls by relation, and the related risks of your organization. |
 | `rvl evidence <submit\|list\|verify>` | Manage control evidence. |
 | `rvl compliance report` | Compliance readiness scorecard for a framework. Readiness framing only, never certification. |
 | `rvl knowledge <search\|graph-search\|facts\|procedures\|patterns\|relationships\|graph\|foresight\|enrich\|health>` | Query the organizational knowledge base. |
