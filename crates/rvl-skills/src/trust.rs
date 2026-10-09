@@ -177,6 +177,16 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_golden_value_is_pinned() {
+        // A user copies this string into the trust env var, so it must read
+        // the same from every build (po-av01j.235).
+        assert_eq!(
+            fingerprint(&[7; 32]),
+            "sha256:4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0"
+        );
+    }
+
+    #[test]
     fn an_unknown_server_is_first_use_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);

@@ -58,7 +58,7 @@ pub struct ConsumptionRecord {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Where the ledger lives for a given gate set: a single `consumed.jsonl`

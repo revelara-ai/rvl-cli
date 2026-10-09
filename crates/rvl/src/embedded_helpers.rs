@@ -191,6 +191,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sha256_is_the_published_digest() {
+        // po-av01j.235: the rewrite check compares this against bytes on disk.
+        assert_eq!(
+            sha256(b"helper"),
+            "e81d3b0e9d82feaaf5f6e55bdff24731d7eee08632ffa63801e6397290c5d20a"
+        );
+    }
+
+    #[test]
     fn cache_root_is_versioned_under_home() {
         let _g = env_lock();
         let dir = tempfile::tempdir().unwrap();
