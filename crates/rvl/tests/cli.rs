@@ -1768,6 +1768,62 @@ fn scan_runs_the_dep_manifests_family_with_seed_specs() {
     );
 }
 
+/// The Dockerfile final-stage user is a judgeable fact: a spec that wants
+/// `non-root` turns a root final stage into a finding, and stays silent on a
+/// Dockerfile whose final stage drops privileges.
+#[test]
+fn scan_judges_the_dockerfile_final_stage_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("api")).unwrap();
+    std::fs::create_dir_all(root.join("worker")).unwrap();
+    std::fs::write(
+        root.join("api/Dockerfile"),
+        "FROM golang:1.22 AS build\nUSER builder\nFROM alpine:3.20\nUSER root\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("worker/Dockerfile"),
+        "FROM golang:1.22 AS build\nFROM alpine:3.20\nUSER 65532:65532\n",
+    )
+    .unwrap();
+    let specs = root.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"dep-manifests","key":"dockerfile.final_stage_user","expect":{"kind":"one_of","values":["non-root"]},"confidence":0.9,"control":"RC-044","severity":"medium","fix":"add a USER instruction with an unprivileged user to the final stage","rationale":"a process that runs as root in the container widens a container escape"}
+        ]
+    }"#).unwrap();
+    let doc = root.join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&doc)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.contains("dep-manifests dockerfile.final_stage_user"),
+        "a root final stage must surface: {stdout} {stderr}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&doc).unwrap()).unwrap();
+    let row = doc["coverage"]["config"]["by_key"]
+        .as_array()
+        .expect("coverage.config.by_key")
+        .iter()
+        .find(|r| r["key"] == "dockerfile.final_stage_user")
+        .unwrap_or_else(|| panic!("no by_key row for the user fact: {doc}"));
+    assert_eq!(row["violates"], 1, "api/Dockerfile runs as root: {row}");
+    assert_eq!(row["satisfies"], 1, "worker/Dockerfile does not: {row}");
+}
+
 // --- G6 Prometheus/sloth family (po-av01j.21) ---
 
 /// A repo with a literal Prometheus rules file (one alert missing `for:` and
