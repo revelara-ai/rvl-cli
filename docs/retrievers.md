@@ -243,9 +243,20 @@ class and control, with at most five sites.
 | --- | --- |
 | `goindex` | `pool`: `database/sql` `Open`, `OpenDB`. `cache`: `github.com/patrickmn/go-cache` `New`. `read`: `io.ReadAll`, `io/ioutil.ReadAll`. The list is `bound_constructors` in `helpers/goindex/extractor_corpus.json`. |
 | `pyindex` | `queue`: the `queue` and `asyncio` queue classes, `multiprocessing.Queue`, `collections.deque`. `pool`: `redis.ConnectionPool`, `redis.BlockingConnectionPool`, `sqlalchemy.create_engine`, `psycopg_pool.ConnectionPool`. `cache`: `functools.lru_cache`, `functools.cache`. |
+| `csindex` | `queue`: `System.Threading.Channels.Channel.CreateUnbounded`. `read`: `System.IO.File.ReadAllText`, `System.IO.File.ReadAllBytes`. `cache`: `Microsoft.Extensions.Caching.Memory.MemoryCache`, built with `new MemoryCache(...)` or registered with `AddMemoryCache(...)`. The name in each case is the `client_type` of the packet. |
 | The other retrievers | Nothing yet. |
 
-Three limits:
+`csindex` reports a `MemoryCache` only when its options do not set
+`SizeLimit`. It reads the options from `new MemoryCacheOptions { ... }` (also
+inside `Options.Create`), from a local options object that the function
+configures, and from the lambda of `AddMemoryCache`. Each option that it sees
+is an entry in `const_args`. `SizeLimit = null` is reported, with the value
+`null`. If the options come from a place that the function does not show (a
+parameter, a field, a method group), the packet has `bound_opaque`. A
+`csindex` packet never has `bound_escapes`: `MemoryCacheOptions` is read when
+the cache is built, and a channel and a file read have no setter.
+
+Five limits:
 
 - `goindex` does not report `make(chan T)`. A Go channel with no capacity
   blocks the sender until a receiver is ready. It is not an unbounded queue.
@@ -253,6 +264,14 @@ Three limits:
   `response.read()` from a read that has a limit.
 - The retriever reads one function. For a value that leaves the function, the
   only other evidence is a method call on the same type in the same module.
+- `csindex` does not report the bounded forms: `Channel.CreateBounded`, a read
+  through a stream, and a `MemoryCache` with a `SizeLimit`. It also does not
+  report `File.ReadAllTextAsync`, `File.ReadAllBytesAsync` or
+  `File.ReadAllLines`.
+- `csindex` reports a construction only when Roslyn resolves the type. It does
+  not load the project file. Thus a file that uses `File` through the implicit
+  usings of the SDK (no `using System.IO;`), or a `MemoryCache` from a package
+  that is not in the scanned tree, gives no packet.
 
 ## The liveness probe join
 

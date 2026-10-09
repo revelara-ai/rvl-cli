@@ -33,6 +33,18 @@
      "rationale": "lru_cache(maxsize=None) never evicts; the default maxsize is 128"},
     {"type": "functools.cache", "class": "cache", "control": "RC-067",
      "bounded_by": [], "confidence": 0.9,
-     "rationale": "functools.cache is lru_cache(maxsize=None): it has no bound to set"}
+     "rationale": "functools.cache is lru_cache(maxsize=None): it has no bound to set"},
+    {"type": "System.Threading.Channels.Channel.CreateUnbounded", "class": "queue", "control": "RC-067",
+     "bounded_by": [], "confidence": 0.9,
+     "rationale": "an unbounded channel has no capacity to set; Channel.CreateBounded is the bounded form"},
+    {"type": "Microsoft.Extensions.Caching.Memory.MemoryCache", "class": "cache", "control": "RC-067",
+     "bounded_by": ["SizeLimit"], "unbounded_values": ["null"], "confidence": 0.9,
+     "rationale": "MemoryCache has no size cap unless MemoryCacheOptions.SizeLimit is set"},
+    {"type": "System.IO.File.ReadAllText", "class": "read", "control": "RC-067",
+     "bounded_by": [], "confidence": 0.9,
+     "rationale": "ReadAllText holds the whole file in memory; it takes no limit"},
+    {"type": "System.IO.File.ReadAllBytes", "class": "read", "control": "RC-067",
+     "bounded_by": [], "confidence": 0.9,
+     "rationale": "ReadAllBytes holds the whole file in memory; it takes no limit"}
   ]
 }
