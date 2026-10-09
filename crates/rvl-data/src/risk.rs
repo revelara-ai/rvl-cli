@@ -752,6 +752,14 @@ fn render_risk_show(d: &RiskDetail) -> String {
             }
             let _ = writeln!(out);
         }
+        // The detail response has no factors, and a second request for one
+        // line is not worth it. The factors come through the controls, so
+        // the pointer has a use only when the risk has mapped controls.
+        let _ = writeln!(
+            out,
+            "Related causal factors: run '{BIN} risk context {}'.",
+            r.risk_code
+        );
     }
     out
 }
@@ -1336,6 +1344,38 @@ mod tests {
         let got = compose_context_json(ctx, detail, None).unwrap();
         assert!(got.contains("\"real\": true"), "{got}");
         assert!(!got.contains("from-ctx"), "{got}");
+    }
+
+    #[test]
+    fn context_compose_keeps_the_factors_key() {
+        // The JSON path merges the keys of the context body verbatim, so
+        // the related factors reach the output with no struct in between.
+        let ctx = br#"{"risk":{"risk_code":"R-046"},"factors":[{"code":"CF-0021","name":"Retry amplification","via_control":"RC-060","relation":"prevents","public_incidents":42,"public_organizations":17,"top10_slot":2}]}"#;
+        let got = compose_context_json(ctx, br#"{"risk_code":"R-046"}"#, None).unwrap();
+        let v: Value = serde_json::from_str(&got).unwrap();
+        let f = &v["factors"][0];
+        assert_eq!(f["code"], "CF-0021");
+        assert_eq!(f["via_control"], "RC-060");
+        assert_eq!(f["relation"], "prevents");
+        assert_eq!(f["public_incidents"], 42);
+        assert_eq!(f["top10_slot"], 2);
+        assert_eq!(v["detail"]["risk_code"], "R-046");
+    }
+
+    #[test]
+    fn risk_show_points_at_risk_context_for_the_related_factors() {
+        let mut d: RiskDetail = serde_json::from_str(
+            r#"{"risk_code":"R-046","title":"t","mapped_controls":[{"control_code":"RC-060","name":"Background Process Safety"}]}"#,
+        )
+        .unwrap();
+        let out = render_risk_show(&d);
+        assert!(
+            out.ends_with("\nRelated causal factors: run 'rvl risk context R-046'.\n"),
+            "{out}"
+        );
+        // No mapped control, no factor to reach: no line.
+        d.mapped_controls.clear();
+        assert!(!render_risk_show(&d).contains("Related causal factors"));
     }
 
     #[test]

@@ -321,6 +321,20 @@ const RELATIONS: [(&str, &str); 4] = [
 ];
 
 /// The text of `factor show`. A section with no rows is not printed.
+/// The public counts of a factor as one phrase, for a line that names the
+/// factor inside another command (`risk context`, `control show`).
+pub(crate) fn public_counts_phrase(
+    incidents: i64,
+    organizations: i64,
+    slot: Option<i64>,
+) -> String {
+    let mut s = format!("{incidents} public reports at {organizations} organizations");
+    if let Some(slot) = slot {
+        let _ = write!(s, ", Top 10 slot {slot}");
+    }
+    s
+}
+
 pub fn render_detail(d: &FactorDetail) -> String {
     let f = &d.factor;
     let mut out = String::new();

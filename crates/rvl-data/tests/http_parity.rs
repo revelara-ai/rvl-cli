@@ -1476,6 +1476,42 @@ fn control_show_team_scope_breakdown_renders_worst_of() {
 }
 
 #[test]
+fn control_show_puts_the_factors_between_the_risks_and_the_scope_section() {
+    let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts","linked_risks":[{"risk_code":"R-046"}],"factors":[{"code":"CF-0021","name":"Retry amplification","relation":"prevents","contested":false,"public_incidents":42,"public_organizations":17,"top10_slot":2},{"code":"CF-0033","name":"Alert fatigue","relation":"induces","contested":true,"public_incidents":5,"public_organizations":4}]}"#;
+    let scope_raw =
+        r#"{"control_code":"RC-018","org_status":"evidenced","teams":[],"unknown_evidence":0}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/controls/by-code/RC-018", 200, show_raw),
+        (
+            "GET /api/v1/controls/by-code/RC-018/scope-status?team=payments",
+            200,
+            scope_raw,
+        ),
+    ]);
+    let out =
+        rvl_data::control::show_output(&server.client(), "RC-018", Some("payments"), None, None)
+            .unwrap();
+    assert!(
+        out.contains(
+            "\nRelated Risks: R-046\n\
+             \nRelated Causal Factors:\n\
+             \x20 Addresses:\n\
+             \x20   CF-0021 Retry amplification (prevents): 42 public reports at 17 organizations, Top 10 slot 2\n\
+             \x20 Can induce:\n\
+             \x20   CF-0033 Alert fatigue: 5 public reports at 4 organizations (contested)\n\
+             \nScope Status (per team):\n"
+        ),
+        "{out}"
+    );
+
+    // --format=json is the server body, factors included, with no change.
+    let server = MockServer::start(vec![("GET /api/v1/controls/by-code/RC-018", 200, show_raw)]);
+    let out = rvl_data::control::show_output(&server.client(), "RC-018", None, None, Some("json"))
+        .unwrap();
+    assert_eq!(out, format!("{show_raw}\n"));
+}
+
+#[test]
 fn control_show_service_scope_breakdown_encodes_the_filter() {
     let show_raw = r#"{"id":"c1","control_code":"RC-018","name":"Timeouts"}"#;
     let scope_raw =

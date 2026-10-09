@@ -119,6 +119,37 @@ The embedded context block that `rvl init` writes to `AGENTS.md` and
 `CLAUDE.md` has a new line for the flag in the "Causal factors" list. The
 addition is additive: no command or field changed.
 
+### Related causal factors in `rvl risk context` and `rvl control show`
+
+**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+and earlier do not print the section. To probe, run `rvl control show <CODE>`
+or `rvl risk context <CODE>` and look for the heading
+`Related Causal Factors:`. The heading is absent on an older `rvl`. It is also
+absent when the server sends no factors, so read the `factors` key of
+`--format=json` to tell the two apart.
+
+The text output of three commands shows the causal factors of the catalog
+that the server now sends in the `factors` array.
+
+- `rvl risk context <CODE>` has a section `Related Causal Factors:` directly
+  after the causal analysis. Each line has the factor code, the name, the
+  control the relation came through, the relation, the public counts, and the
+  Top 10 slot when the factor has one. The factors are derived from the mapped
+  controls. They are not a classification of the risk.
+- `rvl control show <CODE>` has a block `Related Causal Factors:` after
+  `Related Risks`. The group `Addresses:` has the factors the control
+  prevents, detects or mitigates. The group `Can induce:` has the factors the
+  control can cause. A link that the adjudication did not agree on has the
+  mark `(contested)`.
+- `rvl risk show <CODE>` has one new last line when the risk has mapped
+  controls: `Related causal factors: run 'rvl risk context <CODE>'.` The
+  command makes no new request.
+
+`--format=json` did not change: it prints the `factors` key as the server
+sends it. A server that does not send `factors` gives the same text output as
+before, apart from the new line of `rvl risk show`. The addition is additive:
+no line or field was removed.
+
 ## 1.4.0
 
 The first release after `v1.3.0`.

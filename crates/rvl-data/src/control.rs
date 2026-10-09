@@ -4,7 +4,8 @@
 
 use crate::client::Client;
 use crate::display;
-use crate::gojson::{compact, compact_raw, path_escape, query_encode, G};
+use crate::factor::public_counts_phrase;
+use crate::gojson::{compact, compact_raw, null_as_default, path_escape, query_encode, G};
 use crate::{CmdResult, Failure, BIN};
 use rvl_core::flag::{absent_if_empty, EmptyFlag};
 use serde::Deserialize;
@@ -69,8 +70,33 @@ pub struct Control {
     pub treatment: String,
     #[serde(default)]
     pub weight: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub linked_risks: Vec<ControlLinkedRisk>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub factors: Vec<ControlFactorRef>,
+}
+
+/// A catalog causal factor linked to the control.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ControlFactorRef {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub name: String,
+    /// `prevents`, `detects`, `mitigates`, or `induces` (the control can
+    /// cause the factor).
+    #[serde(default)]
+    pub relation: String,
+    /// True when the adjudication models did not agree with the link.
+    #[serde(default)]
+    pub contested: bool,
+    #[serde(default)]
+    pub public_incidents: i64,
+    #[serde(default)]
+    pub public_organizations: i64,
+    /// Slot in the Reliability Top 10 of the current edition.
+    #[serde(default)]
+    pub top10_slot: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -349,6 +375,64 @@ pub fn org_scope_summary_line(st: Option<&ControlScopeStatus>) -> String {
     )
 }
 
+/// The causal factors linked to the control, or "" when it has none. A
+/// factor the control can cause is kept apart from the ones it addresses,
+/// because the two say opposite things about the control.
+pub fn render_control_factors(factors: &[ControlFactorRef]) -> String {
+    let mut out = String::new();
+    if factors.is_empty() {
+        return out;
+    }
+    let addresses =
+        |f: &ControlFactorRef| matches!(f.relation.as_str(), "prevents" | "detects" | "mitigates");
+    let induces = |f: &ControlFactorRef| f.relation == "induces";
+    let _ = writeln!(out, "\nRelated Causal Factors:");
+    // (heading, members, print the relation). "Other" keeps a link whose
+    // relation a newer server added, so no row is lost.
+    let groups: [(&str, Vec<&ControlFactorRef>, bool); 3] = [
+        (
+            "Addresses",
+            factors.iter().filter(|f| addresses(f)).collect(),
+            true,
+        ),
+        (
+            "Can induce",
+            factors.iter().filter(|f| induces(f)).collect(),
+            false,
+        ),
+        (
+            "Other",
+            factors
+                .iter()
+                .filter(|f| !addresses(f) && !induces(f))
+                .collect(),
+            true,
+        ),
+    ];
+    for (heading, members, with_relation) in groups {
+        if members.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "  {heading}:");
+        for f in members {
+            let _ = write!(out, "    {} {}", f.code, f.name);
+            if with_relation {
+                let _ = write!(out, " ({})", f.relation);
+            }
+            let _ = write!(
+                out,
+                ": {}",
+                public_counts_phrase(f.public_incidents, f.public_organizations, f.top10_slot)
+            );
+            if f.contested {
+                out.push_str(" (contested)");
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub fn show_output(
     client: &Client,
     code: &str,
@@ -434,6 +518,7 @@ pub fn show_output(
             .collect();
         let _ = writeln!(out, "\nRelated Risks: {}", codes.join(", "));
     }
+    out.push_str(&render_control_factors(&c.factors));
 
     // Scope-aware status. With --team/--service, render the full per-team
     // breakdown (already fetched above, errors fatal). Without flags, a
@@ -518,6 +603,81 @@ mod tests {
         );
         assert!(validate_format(&Some("json".into())).is_ok());
         assert!(validate_format(&None).is_ok());
+    }
+
+    fn factor_ref(code: &str, relation: &str) -> ControlFactorRef {
+        ControlFactorRef {
+            code: code.into(),
+            name: format!("name of {code}"),
+            relation: relation.into(),
+            public_incidents: 42,
+            public_organizations: 17,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn factors_render_in_an_addresses_group_and_a_can_induce_group() {
+        let out = render_control_factors(&[
+            ControlFactorRef {
+                top10_slot: Some(2),
+                ..factor_ref("CF-0021", "prevents")
+            },
+            factor_ref("CF-0033", "induces"),
+            ControlFactorRef {
+                contested: true,
+                ..factor_ref("CF-0040", "detects")
+            },
+            factor_ref("CF-0041", "mitigates"),
+        ]);
+        assert_eq!(
+            out,
+            "\nRelated Causal Factors:\n\
+             \x20 Addresses:\n\
+             \x20   CF-0021 name of CF-0021 (prevents): 42 public reports at 17 organizations, Top 10 slot 2\n\
+             \x20   CF-0040 name of CF-0040 (detects): 42 public reports at 17 organizations (contested)\n\
+             \x20   CF-0041 name of CF-0041 (mitigates): 42 public reports at 17 organizations\n\
+             \x20 Can induce:\n\
+             \x20   CF-0033 name of CF-0033: 42 public reports at 17 organizations\n"
+        );
+    }
+
+    #[test]
+    fn factors_mark_a_contested_induces_link_and_print_no_empty_group() {
+        let out = render_control_factors(&[ControlFactorRef {
+            contested: true,
+            ..factor_ref("CF-0033", "induces")
+        }]);
+        assert!(out.contains("  Can induce:\n    CF-0033 "), "{out}");
+        assert!(out.trim_end().ends_with("(contested)"), "{out}");
+        assert!(!out.contains("Addresses:"), "{out}");
+
+        let out = render_control_factors(&[factor_ref("CF-0021", "prevents")]);
+        assert!(!out.contains("Can induce:"), "{out}");
+        assert!(!out.contains("(contested)"), "{out}");
+    }
+
+    #[test]
+    fn factors_block_is_empty_for_no_factors_and_null_reads_as_none() {
+        assert_eq!(render_control_factors(&[]), "");
+        for body in [
+            r#"{"control_code":"RC-018","factors":null,"linked_risks":null}"#,
+            r#"{"control_code":"RC-018"}"#,
+        ] {
+            let c: Control = serde_json::from_str(body).unwrap();
+            assert!(c.factors.is_empty() && c.linked_risks.is_empty());
+        }
+    }
+
+    #[test]
+    fn factors_with_a_relation_this_version_does_not_know_are_not_lost() {
+        let out = render_control_factors(&[factor_ref("CF-0050", "amplifies")]);
+        assert_eq!(
+            out,
+            "\nRelated Causal Factors:\n\
+             \x20 Other:\n\
+             \x20   CF-0050 name of CF-0050 (amplifies): 42 public reports at 17 organizations\n"
+        );
     }
 
     fn scope_status_fixture() -> ControlScopeStatus {

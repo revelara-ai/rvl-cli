@@ -13,8 +13,11 @@
 //!
 //! Section set and ordering follow `renderRiskContext` exactly; the
 //! per-section functions keep the Go names so the two files diff by eye.
+//! The one exception is "Related Causal Factors", which the Go render never
+//! had: it is an addition, directly after the causal analysis.
 
 use crate::display;
+use crate::factor::public_counts_phrase;
 use crate::gojson::null_as_default;
 use crate::risk::{CategoryCoverage, CoverageStats, MappedControl, RiskDetail};
 use serde::Deserialize;
@@ -291,6 +294,29 @@ pub struct ScoreFactorResp {
     pub source: String,
 }
 
+/// A catalog causal factor that the risk reaches through one of its mapped
+/// controls. Not the free-text `causal_factors` of the STPA analysis, and
+/// not a score factor.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct RelatedFactor {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub name: String,
+    /// The control code the relation came through.
+    #[serde(default)]
+    pub via_control: String,
+    #[serde(default)]
+    pub relation: String,
+    #[serde(default)]
+    pub public_incidents: i64,
+    #[serde(default)]
+    pub public_organizations: i64,
+    /// Slot in the Reliability Top 10 of the current edition.
+    #[serde(default)]
+    pub top10_slot: Option<i64>,
+}
+
 /// The `/context` payload.
 #[derive(Debug, Default, Deserialize)]
 pub struct RiskContextResponse {
@@ -313,6 +339,8 @@ pub struct RiskContextResponse {
     pub score_factors_old: Vec<ScoreFactorResp>,
     #[serde(default)]
     pub grounding_provenance: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub factors: Vec<RelatedFactor>,
 }
 
 /// The three payloads that back the render: detail (primary), context
@@ -380,6 +408,7 @@ pub fn render_risk_context(v: &RiskContextView) -> String {
     render_score_math(&mut sb, r);
     render_grounding_and_narrative(&mut sb, v);
     render_stpa_causal(&mut sb, r);
+    render_related_factors(&mut sb, v);
     render_services_line(&mut sb, r);
     render_related_findings(&mut sb, r);
     render_corroborating(&mut sb, r);
@@ -818,6 +847,41 @@ fn render_stpa_causal(sb: &mut String, r: &RiskDetail) {
     }
 }
 
+/// The catalog factors the mapped controls address. Not in the Go render:
+/// the section is an addition, placed next to the causal analysis.
+fn render_related_factors(sb: &mut String, v: &RiskContextView) {
+    let Some(ctx) = v.context.as_ref() else {
+        return;
+    };
+    // The server sends prevents, detects and mitigates here. A row that
+    // says a control induces the factor is not one the controls address, so
+    // it has no place under this heading.
+    let factors: Vec<&RelatedFactor> = ctx
+        .factors
+        .iter()
+        .filter(|f| f.relation != "induces")
+        .collect();
+    if factors.is_empty() {
+        return;
+    }
+    let _ = writeln!(sb, "\nRelated Causal Factors:\n{RULE}");
+    let _ = writeln!(
+        sb,
+        "Derived from the mapped controls. One control can address several factors."
+    );
+    for f in factors {
+        let _ = writeln!(
+            sb,
+            "  {} {} (via {}, {}): {}",
+            f.code,
+            f.name,
+            f.via_control,
+            f.relation,
+            public_counts_phrase(f.public_incidents, f.public_organizations, f.top10_slot)
+        );
+    }
+}
+
 fn render_score_factors(sb: &mut String, ctx: Option<&RiskContextResponse>) {
     let Some(ctx) = ctx else { return };
     let factors = if ctx.score_factors.is_empty() {
@@ -1064,6 +1128,113 @@ mod tests {
             updated_at: "2026-08-11T00:00:00Z".into(),
             ..Default::default()
         }
+    }
+
+    fn related_factor() -> RelatedFactor {
+        RelatedFactor {
+            code: "CF-0021".into(),
+            name: "Retry amplification".into(),
+            via_control: "RC-060".into(),
+            relation: "prevents".into(),
+            public_incidents: 42,
+            public_organizations: 17,
+            top10_slot: Some(2),
+        }
+    }
+
+    fn view_with_factors(factors: Vec<RelatedFactor>) -> RiskContextView {
+        RiskContextView {
+            detail: Some(detail()),
+            context: Some(RiskContextResponse {
+                factors,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn related_factors_section_renders_one_line_per_factor() {
+        let out = render_risk_context(&view_with_factors(vec![
+            related_factor(),
+            RelatedFactor {
+                code: "CF-0107".into(),
+                name: "Stale runbook".into(),
+                via_control: "RC-018".into(),
+                relation: "mitigates".into(),
+                public_incidents: 5,
+                public_organizations: 4,
+                top10_slot: None,
+            },
+        ]));
+        assert!(
+            out.contains(&format!(
+                "\nRelated Causal Factors:\n{RULE}\n\
+                 Derived from the mapped controls. One control can address several factors.\n\
+                 \x20 CF-0021 Retry amplification (via RC-060, prevents): \
+                 42 public reports at 17 organizations, Top 10 slot 2\n\
+                 \x20 CF-0107 Stale runbook (via RC-018, mitigates): \
+                 5 public reports at 4 organizations\n"
+            )),
+            "{out}"
+        );
+        // The free-text STPA list and the score section keep their headings.
+        assert!(!out.contains("  Causal Factors:\n"), "{out}");
+    }
+
+    #[test]
+    fn related_factors_section_is_omitted_when_empty() {
+        let out = render_risk_context(&view_with_factors(vec![]));
+        assert!(!out.contains("Related Causal Factors"), "{out}");
+        // No context payload at all: the same.
+        let out = render_risk_context(&RiskContextView {
+            detail: Some(detail()),
+            ..Default::default()
+        });
+        assert!(!out.contains("Related Causal Factors"), "{out}");
+    }
+
+    #[test]
+    fn related_factors_tolerates_null_and_an_absent_key() {
+        for body in [
+            r#"{"risk":{"risk_code":"R-046"},"factors":null}"#,
+            r#"{"risk":{"risk_code":"R-046"}}"#,
+        ] {
+            let view = view_from_bodies(body.as_bytes(), b"", None).expect("context parses");
+            assert!(view.context.as_ref().unwrap().factors.is_empty());
+            let out = render_risk_context(&view);
+            assert!(out.contains("Risk Context: R-046"), "{out}");
+            assert!(!out.contains("Related Causal Factors"), "{out}");
+        }
+        // A row that has only a code still parses and renders.
+        let view = view_from_bodies(
+            br#"{"risk":{"risk_code":"R-046"},"factors":[{"code":"CF-0003"}]}"#,
+            b"",
+            None,
+        )
+        .unwrap();
+        let out = render_risk_context(&view);
+        assert!(out.contains("\n  CF-0003 "), "{out}");
+    }
+
+    #[test]
+    fn related_factors_has_no_induces_group_on_a_risk() {
+        // The server sends only prevents, detects and mitigates on a risk.
+        // A row that says induces is not something the controls address.
+        let induced = RelatedFactor {
+            code: "CF-0033".into(),
+            name: "Alert fatigue".into(),
+            relation: "induces".into(),
+            ..related_factor()
+        };
+        let out = render_risk_context(&view_with_factors(vec![related_factor(), induced.clone()]));
+        assert!(out.contains("CF-0021"), "{out}");
+        assert!(!out.contains("CF-0033"), "{out}");
+        assert!(!out.contains("Can induce"), "{out}");
+        assert!(!out.contains("induces"), "{out}");
+
+        let out = render_risk_context(&view_with_factors(vec![induced]));
+        assert!(!out.contains("Related Causal Factors"), "{out}");
     }
 
     #[test]
@@ -1347,6 +1518,7 @@ mod tests {
 
         let ctx = RiskContextResponse {
             grounding_provenance: "Grounded in the public incident corpus.".into(),
+            factors: vec![related_factor()],
             score_factors: vec![ScoreFactorResp {
                 description: "Pattern".into(),
                 points: 29,
@@ -1434,6 +1606,9 @@ mod tests {
             "\nScore Math:\n",
             "\nGrounding:\n",
             "\nCausal Analysis (STPA-inspired):\n",
+            // Not in the Go render: a deliberate addition, placed directly
+            // after the causal analysis.
+            "\nRelated Causal Factors:\n",
             "\nServices: ",
             "\nRelated Findings:\n",
             "\nCorroborating Incidents:\n",
