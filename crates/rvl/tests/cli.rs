@@ -557,7 +557,10 @@ fn scan_without_retrieved_runs_the_go_helper() {
             );
         }
         Err(e) => {
-            eprintln!("SKIP scan_without_retrieved_runs_the_go_helper: `go` not available: {e}");
+            rvl_testgate::skip(
+                "scan_without_retrieved_runs_the_go_helper",
+                format_args!("`go` not available: {e}"),
+            );
             return;
         }
     }
@@ -1224,7 +1227,10 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
             );
         }
         Err(e) => {
-            eprintln!("SKIP: go toolchain not available: {e}");
+            rvl_testgate::skip(
+                "build_goindex",
+                format_args!("go toolchain not available: {e}"),
+            );
             None
         }
     }
@@ -2798,7 +2804,10 @@ fn live_python_scan_surfaces_unsized_constructions() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP live_python_scan_surfaces_unsized_constructions: no python3");
+        rvl_testgate::skip(
+            "live_python_scan_surfaces_unsized_constructions",
+            "no python3",
+        );
         return;
     }
     let pyindex = helpers_dir().join("pyindex");
@@ -2871,7 +2880,10 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_violates_a_sentinel_timeout_argument_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_violates_a_sentinel_timeout_argument_end_to_end",
+            "no python3",
+        );
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -2951,7 +2963,10 @@ fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_does_not_flag_put_on_an_unbounded_queue_end_to_end",
+            "no python3",
+        );
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -3030,7 +3045,10 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_decides_python_background_job_sites_end_to_end",
+            "no python3",
+        );
         return;
     }
     let manifest = manifest_dir();
@@ -3069,15 +3087,19 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
+        rvl_testgate::skip(
+            "scan_decides_typescript_background_job_sites_end_to_end",
+            "no node",
+        );
         return;
     }
     let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
-        eprintln!(
-            "SKIP scan_decides_typescript_background_job_sites_end_to_end: run `npm install` in helpers/tsindex first"
+        rvl_testgate::skip(
+            "scan_decides_typescript_background_job_sites_end_to_end",
+            "run `npm install` in helpers/tsindex first",
         );
         return;
     }
@@ -3106,13 +3128,17 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
 /// verify its libclang engine loads. None (with a SKIP log line) when the
 /// binary is missing or no libclang is installed — the e2e is exercised
 /// wherever the engine exists, and the environment gap is loud, not silent.
+/// Under RVLSCAN_REQUIRE_ENGINES (CI) the gap is a failure, not a SKIP.
 fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
         .join("cindex");
     if !bin.is_file() {
-        eprintln!("SKIP {test}: cindex not built (run `cargo build -p rvl --bin cindex`)");
+        rvl_testgate::skip(
+            test,
+            "cindex not built (run `cargo build -p rvl --bin cindex`)",
+        );
         return None;
     }
     match std::process::Command::new(&bin)
@@ -3121,14 +3147,14 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     {
         Ok(out) if out.status.success() => Some(bin),
         Ok(out) => {
-            eprintln!(
-                "SKIP {test}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+            rvl_testgate::skip(
+                test,
+                format_args!("{}", String::from_utf8_lossy(&out.stderr).trim()),
             );
             None
         }
         Err(e) => {
-            eprintln!("SKIP {test}: cannot run cindex: {e}");
+            rvl_testgate::skip(test, format_args!("cannot run cindex: {e}"));
             None
         }
     }
@@ -3574,11 +3600,14 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
     match ready {
         Ok(out) if out.status.success() => {}
         Ok(_) => {
-            eprintln!("SKIP live_ts_scan: tsindex needs `npm install` (typescript missing)");
+            rvl_testgate::skip(
+                "live_ts_scan",
+                "tsindex needs `npm install` (typescript missing)",
+            );
             return;
         }
         Err(e) => {
-            eprintln!("SKIP live_ts_scan: node not available: {e}");
+            rvl_testgate::skip("live_ts_scan", format_args!("node not available: {e}"));
             return;
         }
     }
@@ -3628,7 +3657,7 @@ fn javaindex_ready() -> Option<std::path::PathBuf> {
     match std::process::Command::new("javac").arg("-version").output() {
         Ok(out) if out.status.success() => {}
         _ => {
-            eprintln!("SKIP java scan: no JDK (javac not available)");
+            rvl_testgate::skip("java scan", "no JDK (javac not available)");
             return None;
         }
     }
@@ -3748,7 +3777,10 @@ fn live_rust_scan_runs_the_rustindex_helper() {
     match Command::new("rust-analyzer").arg("--version").output() {
         Ok(o) if o.status.success() => {}
         _ => {
-            eprintln!("SKIP live_rust_scan: rust-analyzer not available (rustup component)");
+            rvl_testgate::skip(
+                "live_rust_scan",
+                "rust-analyzer not available (rustup component)",
+            );
             return;
         }
     }
@@ -3778,7 +3810,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
                 );
             }
             Err(e) => {
-                eprintln!("SKIP live_rust_scan: cargo not available: {e}");
+                rvl_testgate::skip("live_rust_scan", format_args!("cargo not available: {e}"));
                 return;
             }
         }
@@ -4401,7 +4433,7 @@ fn build_csindex_with(
             if std::env::var_os("CI").is_some() {
                 return Err("no dotnet SDK under CI: the C# live tests cannot run".to_string());
             }
-            eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
+            rvl_testgate::skip("csindex e2e", "no dotnet SDK (set CI=1 to make this fatal)");
             return Ok(None);
         }
         Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
@@ -4463,9 +4495,10 @@ fn build_csindex_with(
                     "NuGet restore could not reach its feed (NU1301) under CI: {shown}\n{output}"
                 ));
             }
-            eprintln!(
-                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
-                 run `make helpers-csindex` once with network to fill the cache"
+            rvl_testgate::skip(
+                "csindex e2e",
+                "NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache",
             );
             return Ok(None);
         }
@@ -4884,7 +4917,7 @@ fn scan_python_repo(
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip("scan_python_repo", "no python3");
         return None;
     }
     let out_path = root.join("findings.json");
@@ -5011,7 +5044,7 @@ fn warm_python_scan(
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip("warm_python_scan", "no python3");
         return None;
     }
     let out_path = dir.join(format!("findings{pass}.json"));
@@ -5094,7 +5127,10 @@ fn index_reindex_flags_skipped_test_files_for_the_warm_scan() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip(
+            "index_reindex_flags_skipped_test_files_for_the_warm_scan",
+            "no python3",
+        );
         return;
     }
     let out = bin()
@@ -8118,7 +8154,7 @@ fn node_helper_runs_with_a_raised_heap_limit() {
     let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
                   process.exit(1);\n";
     let Some(text) = scan_with_fake_tsindex(script, "777") else {
-        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        rvl_testgate::skip("node_helper_runs_with_a_raised_heap_limit", "no node");
         return;
     };
     assert!(
@@ -8135,7 +8171,10 @@ fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
     let script = "const hold = [];\n\
                   for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
     let Some(text) = scan_with_fake_tsindex(script, "32") else {
-        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        rvl_testgate::skip(
+            "node_helper_heap_exhaustion_names_the_limit_and_the_override",
+            "no node",
+        );
         return;
     };
     assert!(

@@ -1,7 +1,9 @@
 //! Golden packet tests for the cindex helper, run over the checked-in
 //! fixtures. Engine-dependent tests SKIP (with a log line) when no libclang
 //! can be loaded — the workspace must build and test on machines without a
-//! C toolchain; provisioning the engine is an environment concern.
+//! C toolchain. CI is not such a machine: it sets RVLSCAN_REQUIRE_ENGINES, and
+//! there the same skip is a failure (see `rvl_testgate::skip`), because a
+//! built `cindex` proves nothing about a library it loads at process start.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,15 +54,19 @@ fn fixture(name: &str) -> PathBuf {
     manifest_dir().join("testdata").join(name)
 }
 
-/// True when the runtime engine loads; otherwise logs a SKIP line.
+/// True when the runtime engine loads; otherwise logs a SKIP line, or fails
+/// the test where engines are required.
 fn engine_available(test: &str) -> bool {
     let out = bin().arg("--engine-check").output().expect("run cindex");
     if out.status.success() {
         return true;
     }
-    eprintln!(
-        "SKIP {test}: no libclang available: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
+    rvl_testgate::skip(
+        test,
+        format_args!(
+            "no libclang available: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     );
     false
 }

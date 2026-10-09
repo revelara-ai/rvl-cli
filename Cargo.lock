@@ -177,6 +177,7 @@ version = "1.4.0"
 dependencies = [
  "anyhow",
  "clang-sys",
+ "rvl-testgate",
  "serde",
  "serde_json",
  "tempfile",
@@ -818,6 +819,7 @@ dependencies = [
  "hex",
  "protobuf",
  "rvl-core",
+ "rvl-testgate",
  "scip",
  "serde_json",
  "sha2 0.11.0",
@@ -900,6 +902,7 @@ dependencies = [
  "rvl-skills",
  "rvl-spec",
  "rvl-structure",
+ "rvl-testgate",
  "rvl-triage",
  "serde",
  "serde_json",
@@ -1087,6 +1090,10 @@ dependencies = [
  "serde_yaml",
  "tempfile",
 ]
+
+[[package]]
+name = "rvl-testgate"
+version = "1.4.0"
 
 [[package]]
 name = "rvl-triage"

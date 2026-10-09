@@ -145,7 +145,7 @@ struct Fixture {
 fn fixture(test: &str) -> Option<Fixture> {
     for tool in ["python3", "tar", "xz", "unzip", "curl"] {
         if !have(tool) {
-            eprintln!("SKIP {test}: `{tool}` not on PATH");
+            rvl_testgate::skip(test, format_args!("`{tool}` not on PATH"));
             return None;
         }
     }
