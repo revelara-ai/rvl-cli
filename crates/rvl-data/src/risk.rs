@@ -43,6 +43,9 @@ pub enum RiskCmd {
         /// known ones
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         team: Option<String>,
+        /// Only risks related to this causal factor (CF-XXXX)
+        #[arg(long)]
+        factor: Option<String>,
         /// Output format: table (default) or json
         #[arg(long)]
         format: Option<String>,
@@ -323,6 +326,7 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 category,
                 service,
                 team,
+                factor,
                 format,
                 limit,
             } => {
@@ -332,6 +336,8 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                 // `--team` is rvl-native: its empty value is rejected at parse
                 // time, because an empty team read as "no filter" would widen
                 // a per-team view to the whole register without a word.
+                // `--factor` is rvl-native and follows the filter rule: an
+                // empty one is not a filter. The server checks the code form.
                 let (_, client) = crate::client::load_and_resolve()?;
                 list_output(
                     &client,
@@ -339,6 +345,7 @@ pub fn run(cmd: RiskCmd) -> std::process::ExitCode {
                     category.empty_is_absent(),
                     service.empty_is_absent(),
                     team.as_deref(),
+                    factor.empty_is_absent(),
                     limit,
                     format.empty_is_absent(),
                 )
@@ -408,16 +415,21 @@ fn is_compound_code(code: &str) -> bool {
 
 // --- list ---
 
+#[allow(clippy::too_many_arguments)]
 pub fn list_output(
     client: &Client,
     status: Option<&str>,
     category: Option<&str>,
     service: Option<&str>,
     team: Option<&str>,
+    factor: Option<&str>,
     limit: u32,
     format: Option<&str>,
 ) -> CmdResult {
     let mut pairs = vec![("limit", limit.to_string())];
+    if let Some(f) = factor {
+        pairs.push(("factor", f.to_string()));
+    }
     if let Some(s) = status {
         pairs.push(("status", s.to_string()));
     }
@@ -466,7 +478,7 @@ pub fn list_output(
     }
     if resp.total > resp.risks.len() as i64 {
         eprintln!(
-            "\nNote: showing first {} of {} total risks. Raise --limit or use --status / --category / --service / --team to narrow.",
+            "\nNote: showing first {} of {} total risks. Raise --limit or use --status / --category / --service / --team / --factor to narrow.",
             resp.risks.len(),
             resp.total
         );
