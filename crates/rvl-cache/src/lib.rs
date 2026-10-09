@@ -750,6 +750,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sha256_hex_matches_the_published_vectors() {
+        // FIPS 180-2 vectors. Stored artifact hashes, skills checksums and
+        // key fingerprints all go through this helper, so its output must not
+        // move when the sha2 crate does (po-av01j.235).
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn calendar_halves_round_trip() {
         for day in [-719468, 0, 11017, 20664, 30000] {
             let s = civil_from_days(day);

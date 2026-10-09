@@ -150,6 +150,12 @@ pub struct Coverage {
     /// Same rule as `generated_skipped`: reported, never silent. Only
     /// languages with a non-zero count are listed.
     pub test_files_skipped: Vec<TestFilesSkipped>,
+    /// Files a helper parsed only partly, per language (po-av01j.224). The
+    /// packets from such a file are a floor: the parser dropped what it
+    /// could not build. The full scan says so in the roll-call (`Partial`);
+    /// the incremental path has no roll-call and reads the count off the
+    /// packet index. Only languages with a non-zero count are listed.
+    pub parse_incomplete: Vec<ParseIncomplete>,
     /// Workspaces whose declared dependencies were not installed, per
     /// language (po-pk3fp.15). The lane still scanned, from import syntax,
     /// which is a weaker scan than one that resolved types from the
@@ -376,6 +382,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         && cov.retrievers.is_empty()
         && cov.generated_skipped == 0
         && cov.test_files_skipped.is_empty()
+        && cov.parse_incomplete.is_empty()
         && cov.dependencies_uninstalled.is_empty()
     {
         return String::new();
@@ -461,6 +468,27 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
         );
         let _ = writeln!(o, "{}", paint(&line, "2", color));
     }
+    // Files parsed only partly (po-av01j.224): one line per language, in the
+    // warning color, because the counts above it are a floor for those
+    // files. Not repeated for a lane the roll-call already printed as
+    // partial, which says the same with its causes.
+    for p in cov.parse_incomplete.iter().filter(|p| p.count > 0) {
+        let in_roll_call = cov
+            .lang_status
+            .iter()
+            .any(|s| s.lang == p.lang && matches!(s.state, LangState::Partial));
+        if in_roll_call {
+            continue;
+        }
+        let line = format!(
+            "  {}: {} file{} INCOMPLETE: parse errors (a header not found or an \
+             undeclared identifier); calls clang could not build are not counted",
+            p.lang,
+            p.count,
+            if p.count == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
+    }
     // A lane that scanned without its installed dependencies (po-pk3fp.15):
     // the roll-call's "N sites" is the same for a tree resolved from the
     // packages and one resolved from import syntax, so the weaker scan is
@@ -483,6 +511,13 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
 /// installed, so the helper resolved their client types from import syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependenciesUninstalled {
+    pub lang: String,
+    pub count: usize,
+}
+
+/// How many of one language's files the helper parsed only partly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIncomplete {
     pub lang: String,
     pub count: usize,
 }
@@ -600,6 +635,19 @@ impl Coverage {
     }
 }
 
+/// What the config lane concluded for the settings of one (format, key). The
+/// four counts are the lane's verdicts, so `violates / (violates +
+/// satisfies)` is the fire rate of the spec that judges the key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfigKeyCounts {
+    pub violates: usize,
+    pub satisfies: usize,
+    pub abstain: usize,
+    /// A conditional spec whose guard did not hold: resolved, and neither a
+    /// site that fired nor one that passed.
+    pub not_applicable: usize,
+}
+
 /// Coverage for the G6 config lane, rendered inside the COVERAGE section when
 /// the lane saw anything. Mirrors [`Coverage`]'s lever-based abstain
 /// breakdown, plus the identity-only sightings of unsupported config formats
@@ -625,6 +673,10 @@ pub struct ConfigCoverage {
     /// them and none is wanted (`rvl_config::key_ledger`). Kept out of
     /// `abstain_no_spec` so that lever counts only real authoring gaps.
     pub vocabulary_only: usize,
+    /// Verdict counts per (format, key), over every setting in `total`. The
+    /// ladder names only the violating sites of a class; this also carries
+    /// how many sites of the same key satisfied (po-av01j.133.12).
+    pub by_key: std::collections::BTreeMap<(String, String), ConfigKeyCounts>,
     /// Config files a retriever claimed but could not parse.
     pub unparseable_files: usize,
     /// Sightings: (format identity, file count, a retriever for the format

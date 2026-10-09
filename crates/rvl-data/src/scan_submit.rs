@@ -1874,6 +1874,18 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_key_golden_value_is_pinned() {
+        // The server dedups a retry on this key, so a key that moves between
+        // two builds of rvl breaks dedup for every scan in flight. The value
+        // is the first 16 bytes of sha256 over the canonical body; it was
+        // taken on sha2 0.10 and checked against sha256sum (po-av01j.235).
+        assert_eq!(
+            derive_idempotency_key(&base_request()),
+            "76b0b689231a8e8b1e325feeb8c5c06d"
+        );
+    }
+
+    #[test]
     fn idempotency_key_is_stable_32_hex() {
         let req = base_request();
         let k1 = derive_idempotency_key(&req);

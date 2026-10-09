@@ -294,6 +294,80 @@ fn a_skipped_test_file_is_flagged_and_reused_like_any_entry() {
     assert!(!idx.lookup(&t, &h_t).unwrap().unwrap().test_skipped);
 }
 
+/// A translation unit that parsed with errors is recorded AS incomplete
+/// (po-av01j.224). Its packets are a floor, and without the flag a warm scan
+/// reuses the entry as a clean parse on every later pass.
+#[test]
+fn an_incompletely_parsed_file_is_flagged_and_reused_like_any_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = PacketIndex::open(&dir.path().join("index.redb")).unwrap();
+    let broken = write(dir.path(), "broken.c", "#include <gone.h>\n");
+    let clean = write(dir.path(), "clean.c", "int x;\n");
+    let h_b = hash_file(&broken).unwrap();
+    let h_c = hash_file(&clean).unwrap();
+    // An incomplete parse still carries the sites that did resolve.
+    idx.put_incomplete_with_deps(
+        &broken,
+        &h_b,
+        &[site("broken.c", 2, "posix.socket", "send")],
+        &[],
+    )
+    .unwrap();
+    idx.put_with_deps(&clean, &h_c, &[], &[]).unwrap();
+
+    let files = [broken.clone(), clean.clone()];
+    let plan = idx.plan_reload_with(&files, |_| true);
+    assert_eq!(plan.unchanged, files.to_vec(), "both are reusable");
+    let got = idx.lookup(&broken, &h_b).unwrap().unwrap();
+    assert!(got.parse_incomplete);
+    assert_eq!(got.sites.len(), 1);
+    assert!(!idx.lookup(&clean, &h_c).unwrap().unwrap().parse_incomplete);
+    assert!(
+        idx.planned(&broken, &h_b)
+            .unwrap()
+            .unwrap()
+            .parse_incomplete
+    );
+
+    // Re-recording the file as cleanly parsed clears the flag.
+    idx.put_with_deps(&broken, &h_b, &[], &[]).unwrap();
+    assert!(!idx.lookup(&broken, &h_b).unwrap().unwrap().parse_incomplete);
+}
+
+/// An entry written before the flag existed does not say whether its parse
+/// was complete. Where the caller needs that record (a C/C++ source), the
+/// entry is retrieved again, once, instead of being reused as a clean parse.
+#[test]
+fn an_entry_written_before_the_incomplete_flag_is_retrieved_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    let tu = write(dir.path(), "old.c", "int x;\n");
+    let h = hash_file(&tu).unwrap();
+    // The value shape of the release before the flag: dependencies
+    // recorded, no `parse_incomplete`.
+    put_raw_entry(
+        &path,
+        &tu,
+        &serde_json::json!({
+            "hash": h,
+            "packet_schema": rvl_core::PACKET_SCHEMA,
+            "test_skipped": false,
+            "sites": [],
+            "deps": [],
+        }),
+    );
+    let idx = PacketIndex::open(&path).unwrap();
+    let files = [tu.clone()];
+    assert_eq!(
+        idx.plan_reload_with(&files, |_| true).changed,
+        files.to_vec(),
+        "an entry with no record of its parse is not trusted"
+    );
+    // A language that never reports an incomplete parse reuses it as before.
+    assert_eq!(idx.plan_reload(&files).unchanged, files.to_vec());
+    assert!(!idx.lookup(&tu, &h).unwrap().unwrap().parse_incomplete);
+}
+
 // --- dependency (header -> TU) invalidation, po-av01j.53 ---
 
 #[test]

@@ -16,7 +16,7 @@
 //! MULTIPLIED where per-site error is isolated. Hence the confidence floor
 //! below, and hence `depends` never collapsing to `yes`.
 
-use rvl_core::{RepoConfig, Verdict};
+use rvl_core::{RepoConfig, Site, Verdict};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -1108,8 +1108,37 @@ impl SpecCache {
     pub fn api(&self, key: &(String, String)) -> Option<&ApiSpec> {
         self.apis.get(key)
     }
+    /// The API spec that governs a site. The framework type is tried first:
+    /// the server keys ONE spec on it for every concrete type of the
+    /// framework (`django.db.models.Manager.get` for each model's
+    /// `objects.get`), and a lookup by client type alone matches none of
+    /// them. The client type is the fallback, and the only key of a site
+    /// that carries no framework type.
+    pub fn api_for(&self, site: &Site) -> Option<&ApiSpec> {
+        site.spec_types()
+            .find_map(|t| self.api(&(t.to_string(), site.method.clone())))
+    }
     pub fn config(&self, type_name: &str) -> Option<&ConfigSpec> {
         self.configs.get(type_name)
+    }
+    /// The config spec of a site's own type, and the type name it is keyed
+    /// on. The client type goes FIRST here, the reverse of
+    /// [`SpecCache::api_for`]: a config keyed on the concrete type is the
+    /// more specific statement, and a bound the repository declared for that
+    /// type must not be shadowed by a config for the whole framework.
+    pub fn config_for<'a>(&'a self, site: &'a Site) -> Option<(&'a ConfigSpec, &'a str)> {
+        let mut types: Vec<&str> = site.spec_types().collect();
+        types.reverse();
+        types
+            .into_iter()
+            .find_map(|t| self.config(t).map(|c| (c, t)))
+    }
+    /// [`SpecCache::call_family`] for a site: the first of its spec types
+    /// that names a family. The framework type goes first because a concrete
+    /// type's name is the application's (`app.models.CacheEntry.objects`),
+    /// and the keyword classifier would read it as another family.
+    pub fn call_family_for(&self, api: &ApiSpec, site: &Site) -> Option<Family> {
+        site.spec_types().find_map(|t| self.call_family(api, t))
     }
     /// The I/O family of a call, which names the one repo-level client bound
     /// that may broaden to it. The authored tag on the call's own API spec
@@ -1398,7 +1427,7 @@ pub fn spec_gate(spec: Option<&ApiSpec>) -> Option<(Verdict, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rvl_core::ConfigFact;
+    use rvl_core::{ConfigFact, Site};
 
     fn api(blocking: Blocking, confidence: f64) -> ApiSpec {
         ApiSpec {
@@ -1488,6 +1517,7 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            parse_incomplete_paths: Vec::new(),
             retrieval: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
@@ -1608,6 +1638,7 @@ mod tests {
                 .collect(),
             test_files_skipped: 0,
             test_files_skipped_paths: Vec::new(),
+            parse_incomplete_paths: Vec::new(),
             retrieval: Vec::new(),
             dependency_trees_uninstalled: 0,
             dependency_trees_uninstalled_paths: Vec::new(),
@@ -1738,6 +1769,112 @@ mod tests {
             Some(&ServedBound::Agreed(Bounds::WholeCall))
         );
         assert_eq!(got.get(&Family::Http), None);
+    }
+
+    #[test]
+    fn api_for_tries_the_framework_type_then_the_client_type() {
+        let spec_of = |t: &str, confidence| ApiSpec {
+            type_name: t.into(),
+            method: "get".into(),
+            ..api(Blocking::Yes, confidence)
+        };
+        let site = Site {
+            client_type: "app.models.X.objects".into(),
+            framework_type: "django.db.models.Manager".into(),
+            method: "get".into(),
+            ..Default::default()
+        };
+        let cache = |apis| {
+            SpecCache::from_file(SpecFile {
+                apis,
+                configs: vec![],
+                scopes: vec![],
+                config_keys: vec![],
+                server: vec![],
+                emissions: vec![],
+                construction_bounds: vec![],
+                decorators: vec![],
+                misuse_shapes: vec![],
+            })
+        };
+        // Both keyed: the framework spec wins.
+        let both = cache(vec![
+            spec_of("app.models.X.objects", 0.7),
+            spec_of("django.db.models.Manager", 0.9),
+        ]);
+        assert_eq!(
+            both.api_for(&site).unwrap().type_name,
+            "django.db.models.Manager"
+        );
+        // Only the concrete type keyed: the fallback.
+        let concrete = cache(vec![spec_of("app.models.X.objects", 0.7)]);
+        assert_eq!(
+            concrete.api_for(&site).unwrap().type_name,
+            "app.models.X.objects"
+        );
+        // A site with no framework type never matches a framework spec.
+        let plain = Site {
+            framework_type: String::new(),
+            ..site.clone()
+        };
+        let framework = cache(vec![spec_of("django.db.models.Manager", 0.9)]);
+        assert!(framework.api_for(&plain).is_none());
+        assert!(framework.api_for(&site).is_some());
+        // Another method of the framework type is another spec.
+        let other = Site {
+            method: "filter".into(),
+            ..site
+        };
+        assert!(framework.api_for(&other).is_none());
+    }
+
+    #[test]
+    fn config_for_tries_the_client_type_then_the_framework_type() {
+        let site = Site {
+            client_type: "app.models.X.objects".into(),
+            framework_type: "orm.Repository".into(),
+            ..Default::default()
+        };
+        let framework = tagged("orm.Repository", None, 0.9);
+        let concrete = tagged("app.models.X.objects", None, 0.9);
+        let only_framework = cache_of(vec![framework.clone()]);
+        assert_eq!(
+            only_framework.config_for(&site).map(|(_, t)| t),
+            Some("orm.Repository")
+        );
+        let both = cache_of(vec![framework, concrete]);
+        assert_eq!(
+            both.config_for(&site).map(|(_, t)| t),
+            Some("app.models.X.objects")
+        );
+        assert!(cache_of(vec![]).config_for(&site).is_none());
+    }
+
+    #[test]
+    fn call_family_for_reads_the_framework_type_before_the_client_type() {
+        // `app.models.CacheEntry.objects` holds the keyword of another
+        // family. The framework type says what the receiver is.
+        let site = Site {
+            client_type: "app.models.CacheEntry.objects".into(),
+            framework_type: "orm.Repository".into(),
+            method: "get".into(),
+            ..Default::default()
+        };
+        let spec = api(Blocking::Yes, 0.9);
+        let with_cfg = cache_of(vec![tagged("orm.Repository", Some(Family::Database), 0.9)]);
+        assert_eq!(
+            with_cfg.call_family_for(&spec, &site),
+            Some(Family::Database)
+        );
+        // No framework type: exactly call_family on the client type.
+        let plain = Site {
+            framework_type: String::new(),
+            ..site
+        };
+        assert_eq!(
+            with_cfg.call_family_for(&spec, &plain),
+            with_cfg.call_family(&spec, &plain.client_type)
+        );
     }
 
     #[test]

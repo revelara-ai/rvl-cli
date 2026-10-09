@@ -101,3 +101,17 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&base).unwrap();
     base
 }
+
+#[test]
+fn sha256_hex_is_lowercase_hex_of_the_published_digest() {
+    // The ledger compares these strings across runs, so a record written by
+    // an older build must still match one computed today (po-av01j.235).
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        sha256_hex(b"gold rows here"),
+        "c231b8bc6c632f4fec744ebef86bd4051ce25d89530050edab7d63a9647627e6"
+    );
+}

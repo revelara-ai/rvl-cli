@@ -93,6 +93,12 @@ struct Entry {
     /// before the flag existed still decodes.
     #[serde(default)]
     test_skipped: bool,
+    /// The helper parsed this file only partly: `sites` holds what did
+    /// resolve, and is a floor. `Some(false)` is a parse the helper did not
+    /// report as incomplete. `None` on an entry written before the flag
+    /// existed, which is "unknown", not "complete".
+    #[serde(default)]
+    parse_incomplete: Option<bool>,
     sites: Vec<Site>,
     /// The files this entry's packets also depend on, as (index key, content
     /// hash at indexing time): for a C/C++ translation unit, the headers it
@@ -244,6 +250,31 @@ impl PacketIndex {
         sites: &[Site],
         deps: &[PathBuf],
     ) -> anyhow::Result<()> {
+        self.put_parsed(file, hash, sites, deps, false)
+    }
+
+    /// [`PacketIndex::put_with_deps`], for a file the helper parsed only
+    /// partly. Reused on the next pass like any entry, with the packets that
+    /// did resolve, but counted as an incomplete parse rather than as a
+    /// clean one.
+    pub fn put_incomplete_with_deps(
+        &self,
+        file: &Path,
+        hash: &str,
+        sites: &[Site],
+        deps: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        self.put_parsed(file, hash, sites, deps, true)
+    }
+
+    fn put_parsed(
+        &self,
+        file: &Path,
+        hash: &str,
+        sites: &[Site],
+        deps: &[PathBuf],
+        parse_incomplete: bool,
+    ) -> anyhow::Result<()> {
         let deps = deps
             .iter()
             .map(|d| (key_of(d), hash_file(d).unwrap_or_default()))
@@ -254,6 +285,7 @@ impl PacketIndex {
                 hash: hash.to_string(),
                 packet_schema: PACKET_SCHEMA,
                 test_skipped: false,
+                parse_incomplete: Some(parse_incomplete),
                 sites: sites.to_vec(),
                 deps: Some(deps),
             },
@@ -270,6 +302,7 @@ impl PacketIndex {
                 hash: hash.to_string(),
                 packet_schema: PACKET_SCHEMA,
                 test_skipped: true,
+                parse_incomplete: Some(false),
                 sites: Vec::new(),
                 deps: Some(Vec::new()),
             },
@@ -375,7 +408,9 @@ impl PacketIndex {
     /// depend on other files. Where `needs_deps` says so (a C/C++ source,
     /// whose packets change with its headers), an entry written before
     /// dependencies were recorded counts as changed: nothing says which
-    /// headers it saw, so it is retrieved again, once.
+    /// headers it saw, so it is retrieved again, once. The same holds for an
+    /// entry written before the incomplete-parse flag: nothing says whether
+    /// its packets are the whole answer.
     pub fn plan_reload_with(
         &self,
         files: &[PathBuf],
@@ -390,7 +425,9 @@ impl PacketIndex {
                     .ok()
                     .flatten()
                     .filter(|e| e.current_at(&h) && e.deps_fresh(&mut memo))
-                    .is_some_and(|e| e.deps.is_some() || !needs_deps(f)),
+                    .is_some_and(|e| {
+                        (e.deps.is_some() && e.parse_incomplete.is_some()) || !needs_deps(f)
+                    }),
                 Err(_) => false,
             };
             if reusable {
@@ -488,6 +525,9 @@ pub struct Indexed {
     /// The helper declined to read the file as test material; `sites` is
     /// empty because nothing was retrieved, not because nothing was found.
     pub test_skipped: bool,
+    /// The helper parsed the file only partly; `sites` is a floor. False for
+    /// an entry that does not say.
+    pub parse_incomplete: bool,
 }
 
 impl From<Entry> for Indexed {
@@ -495,6 +535,7 @@ impl From<Entry> for Indexed {
         Indexed {
             sites: e.sites,
             test_skipped: e.test_skipped,
+            parse_incomplete: e.parse_incomplete.unwrap_or(false),
         }
     }
 }

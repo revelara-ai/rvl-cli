@@ -2,7 +2,9 @@
 //! abstain cases, driven through the real walker on tempdir trees.
 
 use rvl_core::Verdict;
-use rvl_structure::{evaluate, inventory, parse_record, RepoStructure, StructureFinding};
+use rvl_structure::{
+    evaluate, inventory, parse_record, RepoStructure, ScannerClass, StructureFinding,
+};
 use std::path::Path;
 
 fn write(root: &Path, rel: &str, content: &str) {
@@ -573,6 +575,212 @@ fn rc006_absence_abstains_runbooks_may_live_elsewhere() {
         f.reason
     );
     assert!(f.weak);
+}
+
+// --- CI scanner inventory (Q21/Q22): a repo-level fact, no verdict ---
+
+const WF_BUILD_ONLY: &str = "on: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: make test\n";
+
+#[test]
+fn ci_scans_record_known_scanner_actions_across_all_workflows() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".github/workflows/ci.yml", WF_BUILD_ONLY);
+    write(
+        dir.path(),
+        ".github/workflows/deps.yaml",
+        "on: [pull_request]\njobs:\n  review:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/dependency-review-action@v4\n",
+    );
+    write(
+        dir.path(),
+        ".github/workflows/codeql.yml",
+        "on: [push]\njobs:\n  analyze:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: github/codeql-action/init@v3\n      - uses: GitHub/CodeQL-Action/analyze@v3\n",
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.workflows_parsed, 3);
+    assert_eq!(facts.ci_scans.workflows_unparsed, 0);
+    let seen: Vec<(ScannerClass, &str, &str)> = facts
+        .ci_scans
+        .scanners
+        .iter()
+        .map(|s| (s.class, s.name.as_str(), s.workflow.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                ScannerClass::DependencyScan,
+                "actions/dependency-review-action",
+                ".github/workflows/deps.yaml"
+            ),
+            (
+                ScannerClass::Sast,
+                "github/codeql-action/analyze",
+                ".github/workflows/codeql.yml"
+            ),
+            (
+                ScannerClass::Sast,
+                "github/codeql-action/init",
+                ".github/workflows/codeql.yml"
+            ),
+        ]
+    );
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), Some(true));
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), Some(true));
+}
+
+#[test]
+fn ci_scans_absence_is_decidable_when_a_workflow_parsed_and_none_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".github/workflows/ci.yml", WF_BUILD_ONLY);
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.workflows_parsed, 1);
+    assert!(facts.ci_scans.scanners.is_empty());
+    assert_eq!(
+        facts.scanner_seen(ScannerClass::DependencyScan),
+        Some(false)
+    );
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), Some(false));
+}
+
+#[test]
+fn ci_scans_absence_is_undecidable_without_ci_config() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    // Another CI system is not read for scanners: it licenses nothing.
+    write(dir.path(), ".gitlab-ci.yml", "test:\n  script: make test\n");
+    let facts = inventory(dir.path());
+    assert!(facts.walk_complete);
+    assert_eq!(facts.ci_scans.workflows_parsed, 0);
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), None);
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), None);
+}
+
+#[test]
+fn ci_scans_one_class_seen_does_not_decide_the_other_as_present() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/ci.yml",
+        "on: [push]\njobs:\n  scan:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: golang/govulncheck-action@v1\n",
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), Some(true));
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), Some(false));
+}
+
+#[test]
+fn ci_scans_a_scanner_run_as_a_command_is_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/ci.yml",
+        "on: [push]\njobs:\n  audit:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cargo install cargo-audit\n          cargo audit\n      - run: semgrep ci\n",
+    );
+    let facts = inventory(dir.path());
+    let names: Vec<&str> = facts
+        .ci_scans
+        .scanners
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["cargo audit", "semgrep"]);
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), Some(true));
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), Some(true));
+}
+
+#[test]
+fn ci_scans_unparsed_workflow_blocks_reasoning_from_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".github/workflows/ci.yml", WF_BUILD_ONLY);
+    write(
+        dir.path(),
+        ".github/workflows/broken.yml",
+        "jobs:\n  a: [unclosed\n",
+    );
+    // Valid YAML that is not a workflow (no jobs) is not a parsed workflow.
+    write(dir.path(), ".github/workflows/notes.yml", "just: a note\n");
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.workflows_parsed, 1);
+    assert_eq!(facts.ci_scans.workflows_unparsed, 2);
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), None);
+}
+
+#[test]
+fn ci_scans_opaque_calls_block_reasoning_from_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/ci.yml",
+        "on: [push]\njobs:\n  shared:\n    uses: org/shared/.github/workflows/security.yml@v2\n  local:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/scan\n",
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.workflows_parsed, 1);
+    assert_eq!(facts.ci_scans.opaque_calls, 2);
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), None);
+}
+
+#[test]
+fn ci_scans_a_local_reusable_workflow_is_walked_not_opaque() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/ci.yml",
+        "on: [push]\njobs:\n  shared:\n    uses: ./.github/workflows/build.yml\n",
+    );
+    write(
+        dir.path(),
+        ".github/workflows/build.yml",
+        "on: [workflow_call]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make build\n",
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.workflows_parsed, 2);
+    assert_eq!(facts.ci_scans.opaque_calls, 0);
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), Some(false));
+}
+
+#[test]
+fn ci_scans_a_known_reusable_scanner_workflow_is_seen_not_opaque() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/osv.yml",
+        "on: [push]\njobs:\n  osv:\n    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2\n",
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.ci_scans.opaque_calls, 0);
+    assert_eq!(facts.ci_scans.scanners[0].name, "google/osv-scanner-action");
+    assert_eq!(facts.scanner_seen(ScannerClass::DependencyScan), Some(true));
+}
+
+#[test]
+fn ci_scans_truncated_walk_never_licenses_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".github/workflows/ci.yml", WF_BUILD_ONLY);
+    let mut facts = inventory(dir.path());
+    facts.walk_complete = false;
+    assert_eq!(facts.scanner_seen(ScannerClass::Sast), None);
+}
+
+#[test]
+fn ci_scans_a_record_without_the_fact_still_parses_and_decides_nothing() {
+    let old = r#"{"kind":"repo_structure","snapshot_id":"s","ecosystems":[],"walk_complete":true}"#;
+    let parsed = parse_record(old).expect("an older record still parses");
+    assert_eq!(parsed.ci_scans.workflows_parsed, 0);
+    assert_eq!(parsed.scanner_seen(ScannerClass::Sast), None);
+}
+
+#[test]
+fn ci_scans_round_trip_through_a_packet_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/ci.yml",
+        "on: [push]\njobs:\n  scan:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: aquasecurity/trivy-action@0.28.0\n",
+    );
+    let facts = inventory(dir.path());
+    let line = facts.to_jsonl();
+    assert!(line.contains(r#""class":"dependency-scan""#), "{line}");
+    assert_eq!(parse_record(&line).expect("round trip"), facts);
 }
 
 // --- record round-trip through the packet schema ---

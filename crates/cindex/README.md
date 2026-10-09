@@ -108,6 +108,10 @@ generating the db is user-run tooling (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
   `tus_incomplete_paths`), and `includes_missing` / `decls_unresolved` say
   why. An incomplete TU still emits the sites that DID resolve, but its zero
   is never reported as a clean one: `rvl scan` shows the lane as `partial`.
+  On the incremental path, which has no roll-call, the packet index flags
+  each path in `tus_incomplete_paths` and COVERAGE prints
+  `C/C++: <n> files INCOMPLETE` on every pass, including one that re-parses
+  nothing (po-av01j.224).
   `calls_callee_unresolved` counts only calls clang formed whose callee did
   not resolve; it is not a completeness claim (it was `calls_unresolved`).
 - Files not listed in the db are not scanned: the gate population for C/C++

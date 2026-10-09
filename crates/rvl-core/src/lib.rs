@@ -336,6 +336,15 @@ pub struct Site {
     pub receiver: String,
     #[serde(default)]
     pub client_type: String,
+    /// The framework class the receiver is an instance of, when the retriever
+    /// proved one: `django.db.models.Manager` beside the client type
+    /// `zerver.models.Message.objects`. Empty when there is none. The server
+    /// keys a spec on it, so the spec lookup tries it before `client_type`
+    /// ([`Site::spec_types`]). It is not part of the site's identity:
+    /// `site_key` and the class key stay on `client_type`. Additive within
+    /// the v2 packet train.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub framework_type: String,
     #[serde(default)]
     pub snippet: String,
     #[serde(default)]
@@ -543,6 +552,20 @@ impl Site {
         };
         (t, self.method.clone())
     }
+    /// The type names a spec for this site may be keyed on, in lookup order:
+    /// the framework type when the retriever proved one, then the client
+    /// type (`?` when unresolved, as in [`Site::api_key`]).
+    pub fn spec_types(&self) -> impl Iterator<Item = &str> {
+        let client = if self.client_type.is_empty() {
+            "?"
+        } else {
+            self.client_type.as_str()
+        };
+        Some(self.framework_type.as_str())
+            .filter(|t| !t.is_empty())
+            .into_iter()
+            .chain(std::iter::once(client))
+    }
     /// Where this site lives. Repo evidence first ([`Site::scope_override`]),
     /// the path second ([`scope_of`]). THE ONLY correct way to ask: reading
     /// `scope_of(&site.file_path)` directly skips the evidence and re-files a
@@ -722,6 +745,16 @@ pub struct RepoConfig {
     /// by [`RepoConfig::absorb`] alongside the count.
     #[serde(default)]
     pub test_files_skipped_paths: Vec<String>,
+    /// The repo-relative files whose parse raised errors, so the packets
+    /// retrieved from them are a floor and not the whole answer
+    /// (po-av01j.224). Only cindex reports it, as `tus_incomplete_paths` on
+    /// its `retrieval_stats` record, which [`parse_stream`] collects here.
+    /// The packet index flags each file, for the same reason it flags a
+    /// skipped test file: a warm scan reuses the entry and has to say so.
+    /// Concatenated by [`RepoConfig::absorb`]: a batch names the units it
+    /// parsed. Left off the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_incomplete_paths: Vec<String>,
     /// Workspaces that declare dependencies but have no installed tree, as
     /// the helper saw them (po-pk3fp.2). Like `test_files_skipped`, a
     /// retrieval statistic on the repo-scoped record, additive within v2 and
@@ -827,6 +860,8 @@ impl RepoConfig {
         self.test_files_skipped += other.test_files_skipped;
         self.test_files_skipped_paths
             .extend(other.test_files_skipped_paths);
+        self.parse_incomplete_paths
+            .extend(other.parse_incomplete_paths);
         // REPLACED per language, never summed: each helper run reports the
         // whole repo, and a batched stream repeats it once per batch.
         for census in other.retrieval {
@@ -912,6 +947,12 @@ pub fn parse_stream(text: &str) -> (Vec<Site>, RepoConfig, usize) {
                 }
                 if let Some(paths) = v.get("test_files_skipped_paths").and_then(|p| p.as_array()) {
                     cfg.test_files_skipped_paths
+                        .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
+                }
+                // cindex names the units that parsed with errors on the same
+                // record (po-av01j.224).
+                if let Some(paths) = v.get("tus_incomplete_paths").and_then(|p| p.as_array()) {
+                    cfg.parse_incomplete_paths
                         .extend(paths.iter().filter_map(|p| p.as_str().map(String::from)));
                 }
             } else if kind == "tu_includes" {
@@ -1213,6 +1254,22 @@ mod tests {
         );
     }
 
+    /// cindex names the translation units that parsed with errors
+    /// (po-av01j.224). The paths are carried, and merged across the records
+    /// of a batched run, so the packet index can flag each file.
+    #[test]
+    fn incomplete_parse_paths_are_carried_and_merged_across_records() {
+        let a = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":2,"tus_parsed":2,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/a.c"],"includes_missing":1,"decls_unresolved":3}"#;
+        let b = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":1,"tus_incomplete_paths":["src/b.c"],"includes_missing":0,"decls_unresolved":1}"#;
+        let clean = r#"{"kind":"retrieval_stats","packet_schema":2,"snapshot_id":"x","lang":"c_cpp","tus_total":1,"tus_parsed":1,"tus_failed":0,"tus_incomplete":0,"tus_incomplete_paths":[]}"#;
+        let (_, cfg, _) = parse_stream(&format!("{a}\n{b}\n{clean}\n"));
+        assert_eq!(cfg.parse_incomplete_paths, vec!["src/a.c", "src/b.c"]);
+
+        // Only the documented carrier is read, like the test-file skip.
+        let other = r#"{"packet_schema":2,"kind":"repo_structure","snapshot_id":"x","tus_incomplete_paths":["x.c"]}"#;
+        assert!(parse_stream(other).1.parse_incomplete_paths.is_empty());
+    }
+
     /// cindex writes one `tu_includes` record per parsed TU (po-av01j.53).
     /// They are carried on the repo-scoped record, concatenated across
     /// helper runs, and never fall through into Site parsing.
@@ -1433,6 +1490,33 @@ mod tests {
             "a repo-scoped record must not become an empty Site"
         );
         assert_eq!(skipped, 0, "another record kind is not a parse failure");
+    }
+
+    #[test]
+    fn framework_type_round_trips_and_is_absent_when_unset() {
+        let line = r#"{"file_path":"a.py","line_number":1,"func":"get","client_type":"app.models.X.objects","framework_type":"django.db.models.Manager"}"#;
+        let site: Site = serde_json::from_str(line).unwrap();
+        assert_eq!(site.framework_type, "django.db.models.Manager");
+        assert_eq!(
+            site.spec_types().collect::<Vec<_>>(),
+            vec!["django.db.models.Manager", "app.models.X.objects"]
+        );
+        // The identity of the site stays on the client type.
+        assert_eq!(site.site_key(), "a.py:1:app.models.X.objects:get");
+        let back: Site = serde_json::from_str(&serde_json::to_string(&site).unwrap()).unwrap();
+        assert_eq!(back.framework_type, "django.db.models.Manager");
+
+        // A stream from a retriever that does not emit the field.
+        let plain: Site = serde_json::from_str(
+            r#"{"file_path":"a.go","line_number":1,"func":"Do","client_type":"c"}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.spec_types().collect::<Vec<_>>(), vec!["c"]);
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("framework_type"));
+        let unresolved = Site::default();
+        assert_eq!(unresolved.spec_types().collect::<Vec<_>>(), vec!["?"]);
     }
 
     #[test]

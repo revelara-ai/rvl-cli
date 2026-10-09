@@ -109,6 +109,7 @@ fn cov() -> Coverage {
         abstain_no_spec: 0,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        parse_incomplete: Vec::new(),
         dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
@@ -169,6 +170,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         abstain_no_spec: 1,
         generated_skipped: 0,
         test_files_skipped: Vec::new(),
+        parse_incomplete: Vec::new(),
         dependencies_uninstalled: Vec::new(),
         abstain_bounds: 0,
         abstain_judge: 0,
@@ -234,6 +236,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -282,6 +285,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -321,6 +325,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -356,6 +361,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -390,6 +396,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -429,6 +436,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -452,6 +460,40 @@ fn hook_ladder_shows_counts_not_named_incidents() {
 }
 
 // --- config lane coverage ---
+
+// The per-key verdict counts are for the `--out` document (po-av01j.133.12).
+// The COVERAGE block stays one line per lever, however many keys a repo has.
+#[test]
+fn per_key_counts_do_not_change_the_coverage_block() {
+    let plain = ConfigCoverage {
+        resolved: 2,
+        total: 3,
+        abstain_no_spec: 1,
+        ..Default::default()
+    };
+    let mut keyed = plain.clone();
+    keyed.by_key.insert(
+        (
+            "github-actions".to_string(),
+            "job.timeout-minutes".to_string(),
+        ),
+        ConfigKeyCounts {
+            violates: 1,
+            satisfies: 1,
+            abstain: 1,
+            not_applicable: 0,
+        },
+    );
+    let counted: usize = keyed
+        .by_key
+        .values()
+        .map(|n| n.violates + n.satisfies + n.abstain + n.not_applicable)
+        .sum();
+    assert_eq!(counted, keyed.total);
+    let block =
+        |cc: &ConfigCoverage| render_ladder(&[], Coverage::default(), Some(cc), "0.1s", false);
+    assert_eq!(block(&plain), block(&keyed));
+}
 
 #[test]
 fn unjudged_keys_are_named_not_just_counted() {
@@ -514,6 +556,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
         vocabulary_only: 0,
         unparseable_files: 1,
         no_spec_keys: Default::default(),
+        by_key: Default::default(),
         sightings: vec![
             ("circleci".to_string(), 1, false),
             ("terraform".to_string(), 4, false),
@@ -533,6 +576,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             abstain_no_spec: 0,
             generated_skipped: 0,
             test_files_skipped: Vec::new(),
+            parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
             abstain_bounds: 0,
             abstain_judge: 0,
@@ -578,6 +622,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 abstain_no_spec: 0,
                 generated_skipped: 0,
                 test_files_skipped: Vec::new(),
+                parse_incomplete: Vec::new(),
                 dependencies_uninstalled: Vec::new(),
                 abstain_bounds: 0,
                 abstain_judge: 0,
@@ -1128,6 +1173,58 @@ fn skipped_test_files_are_reported_per_language_and_zero_is_silent() {
         !quiet.contains("test file"),
         "zero must print nothing: {quiet}"
     );
+}
+
+// --- files parsed incompletely (po-av01j.224) ---
+
+#[test]
+fn incompletely_parsed_files_are_reported_per_language_in_the_warning_color() {
+    // The incremental path has no roll-call, so this line is the only place
+    // a hook scan can say that a file's zero is not a complete zero.
+    let mut c = cov();
+    c.parse_incomplete = vec![ParseIncomplete {
+        lang: "C/C++".into(),
+        count: 1,
+    }];
+    let out = render_lang_status(&c, false);
+    assert!(
+        out.contains(
+            "  C/C++: 1 file INCOMPLETE: parse errors (a header not found or an \
+             undeclared identifier); calls clang could not build are not counted"
+        ),
+        "got: {out}"
+    );
+    assert!(
+        render_lang_status(&c, true).contains("\u{1b}[33m"),
+        "an incomplete parse changes what the numbers mean: yellow"
+    );
+    c.parse_incomplete[0].count = 3;
+    assert!(
+        render_lang_status(&c, false).contains("  C/C++: 3 files INCOMPLETE: "),
+        "plural for many"
+    );
+    assert!(
+        !render_lang_status(&cov(), false).contains("INCOMPLETE"),
+        "zero must print nothing"
+    );
+}
+
+#[test]
+fn the_incomplete_line_is_not_repeated_under_a_roll_call_that_says_it() {
+    // The full scan's roll-call already marks the lane partial, with the
+    // causes. Saying it twice would read as two different problems.
+    let mut c = cov();
+    c.lang_status = vec![LangStatus {
+        lang: "C/C++".into(),
+        state: LangState::Partial,
+        detail: "0 sites, INCOMPLETE: 1 of 1 translation unit had parse errors".into(),
+    }];
+    c.parse_incomplete = vec![ParseIncomplete {
+        lang: "C/C++".into(),
+        count: 1,
+    }];
+    let out = render_lang_status(&c, false);
+    assert_eq!(out.matches("INCOMPLETE").count(), 1, "got: {out}");
 }
 
 // --- the retrieval denominator (po-av01j.219) ---

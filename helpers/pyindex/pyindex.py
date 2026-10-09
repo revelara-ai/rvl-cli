@@ -1744,6 +1744,49 @@ class ModuleSummary(object):
             self._visit(child, *here)
 
 
+# ---------------------------------------------------------------------------
+# framework_type (po-av01j.225).
+#
+# `Message.objects.get(...)` has the client_type `zerver.models.Message.objects`:
+# one type per model, so a spec keyed on it covers one model. framework_type
+# names the framework class the receiver is an instance of, and it rides
+# beside client_type so one spec (django.db.models.Manager.get) covers every
+# model's manager. client_type and site_key do not change.
+#
+# It is stamped only on proof: the receiver's owner must resolve, through the
+# repo-wide graph, to a class that descends from the framework's base. An
+# `objects` attribute of any other class gets nothing. The same shape is
+# planned for SQLAlchemy session/query; add a row here, not a new code path.
+# ---------------------------------------------------------------------------
+
+# framework_type -> (base classes whose descendants own the receiver,
+#                    attributes of such a class that hold the receiver).
+_FRAMEWORK_RECEIVERS = {
+    "django.db.models.Manager": (
+        frozenset({
+            "django.db.models.Model",
+            "django.db.models.base.Model",
+            "django.contrib.auth.models.AbstractUser",
+            "django.contrib.auth.models.AbstractBaseUser",
+            "django.contrib.auth.base_user.AbstractBaseUser",
+        }),
+        frozenset({"objects", "_default_manager", "_base_manager"}),
+    ),
+}
+
+
+def _framework_owner(recv):
+    """The dotted owner of a receiver that may be a framework object:
+    `Order` for `Order.objects`. None when no row of _FRAMEWORK_RECEIVERS
+    names the receiver's last attribute."""
+    if not isinstance(recv, ast.Attribute):
+        return None
+    if not any(recv.attr in attrs
+               for _, attrs in _FRAMEWORK_RECEIVERS.values()):
+        return None
+    return _dotted(recv.value)
+
+
 class CallGraph(object):
     """Caller and callee edges over every module added, resolved once."""
 
@@ -1754,9 +1797,17 @@ class CallGraph(object):
         self.callers = {}     # _Func -> [_Func], in module path order
         self.callees = {}     # _Func -> [_Func], in call order
         self.pending = []     # (record, _Func) waiting for the walk
+        # (record, module, owner, attribute, _Func or None) waiting for the
+        # owner's class to be resolved.
+        self.framework_pending = []
 
     def add(self, summary):
         self.modules.append(summary)
+
+    def wants_framework(self, record, mod, owner, attr, fn):
+        """Stamp framework_type on this record once the graph is complete,
+        if `owner` turns out to be a class of a known framework."""
+        self.framework_pending.append((record, mod, owner, attr, fn))
 
     def wants(self, record, fn):
         """Fill this record's ancestry once the graph is complete."""
@@ -1876,6 +1927,36 @@ class CallGraph(object):
             ent = self._member(ent, part, hops)
         return ent
 
+    def _descends(self, mod, qual, bases, seen, hops=0):
+        """Whether class `qual` has one of the dotted `bases` among its
+        ancestors. In-repo bases are followed; a base outside the repo is
+        compared by its import-resolved name."""
+        key = (mod.file, qual)
+        if key in seen or hops > MAX_RESOLVE_HOPS:
+            return False
+        seen.add(key)
+        for base in mod.classes.get(qual, ()):
+            ent = self._resolve(mod, base, None, (), hops + 1)
+            if ent is None:
+                continue
+            if ent[0] == "mod" and ent[1] in bases:
+                return True
+            if ent[0] == "class" and self._descends(
+                    ent[1], ent[2], bases, seen, hops + 1):
+                return True
+        return False
+
+    def _framework_type(self, mod, owner, attr, fn):
+        self_cls = fn.self_cls if fn is not None else None
+        scopes = fn.scopes if fn is not None else ()
+        ent = self._resolve(mod, owner, self_cls, scopes)
+        if ent is None or ent[0] != "class":
+            return None
+        for framework, (bases, attrs) in sorted(_FRAMEWORK_RECEIVERS.items()):
+            if attr in attrs and self._descends(ent[1], ent[2], bases, set()):
+                return framework
+        return None
+
     def _call_target(self, fn, callee):
         dotted, method = callee
         ent = self._resolve(fn.module, dotted, fn.self_cls, fn.scopes)
@@ -1966,6 +2047,11 @@ class CallGraph(object):
                 "hit_caller_budget": len(anc) > len(callers),
             })
         self.pending = []
+        for record, mod, owner, attr, fn in self.framework_pending:
+            framework = self._framework_type(mod, owner, attr, fn)
+            if framework is not None:
+                record["framework_type"] = framework
+        self.framework_pending = []
 
 
 def _parse(abs_path, file_path):
@@ -2153,10 +2239,14 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
             "lang": "python",
         }
         out.append(record)
+        fn = None
         if summary is not None and func_node is not None:
             fn = summary.by_pos.get((func_node.lineno, func_node.col_offset))
             if fn is not None:
                 graph.wants(record, fn)
+        owner = _framework_owner(recv)
+        if summary is not None and owner is not None:
+            graph.wants_framework(record, summary, owner, recv.attr, fn)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
     # G4 emission inventory rides the same stream (po-av01j.5).
     swallowed = set()
@@ -2333,7 +2423,7 @@ def run_retrieve(root, snapshot, files_arg, include_tests=False):
             continue
         parsed += 1
         records.extend(got)
-    if files_arg and graph.pending:
+    if files_arg and (graph.pending or graph.framework_pending):
         # The incremental path emits packets for the listed files only, but a
         # caller lives wherever it lives: the graph still spans the tree, so a
         # reloaded file gets the packets a full run would give it. The other

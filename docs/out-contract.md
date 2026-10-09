@@ -54,6 +54,7 @@ The orchestrator uses it to:
     "abstain": { "no_spec": 90, "bounds": 40, "judge": 30, "other": 6 },
     "generated_skipped": 3,
     "test_files_skipped": 12,
+    "parse_incomplete_files": 0,
     "dependency_trees_uninstalled": 0,
     "degraded_note": null,
     "lang_status": [ { "lang": "go", "state": "scanned", "detail": "1240" } ],
@@ -71,6 +72,10 @@ The orchestrator uses it to:
       "abstain": { "no_spec": 15, "outside_repo": 3, "other": 2,
                    "vocabulary_only": 4 },
       "no_spec_keys": ["github_actions permissions"],
+      "by_key": [
+        { "format": "github-actions", "key": "job.timeout-minutes",
+          "violates": 4, "satisfies": 9, "abstain": 0, "not_applicable": 0 }
+      ],
       "unparseable_files": 0
     },
     "retrieval": [
@@ -128,6 +133,14 @@ The orchestrator uses it to:
     (`1 file`), and the row has no `degraded[]` entry because nothing failed. `partial` means the helper ran but some units parsed only
     partly (for C/C++, usually a header that is not installed), so the site
     count is a floor: `detail` reads `<n> sites, INCOMPLETE: <why>`.
+  - `parse_incomplete_files`: how many files a retriever parsed only partly,
+    summed across languages. Only the C/C++ retriever reports it. Non-zero
+    means the site counts are a floor for those files. It is
+    repository-wide on every path: a warm (`--incremental`) scan has no
+    `lang_status` roll-call, so it counts the files its packet index flagged
+    when they were first retrieved as well as the ones it re-parsed this
+    pass, and COVERAGE prints `C/C++: <n> files INCOMPLETE: ...`. It never
+    changes `exit`. Additive.
   - `by_language[]`: `resolved`, `total` and `no_spec` split by the language
     of the file each site is in (`other` when no retriever claims the
     extension). `corpus_gap` is true when the language resolves almost
@@ -172,6 +185,19 @@ The orchestrator uses it to:
     so they are counted apart from `no_spec` and never appear in
     `no_spec_keys`. `rvl cache keys` lists which keys carry the marker and
     why.
+  - `config.by_key`: the config lane's verdict counts for each
+    `(format, key)` it found a setting for, ordered by format, then key:
+    `violates`, `satisfies`, `abstain`, `not_applicable`. A finding names
+    only the violating sites of a class; this block also says how many
+    settings of the same key satisfied, so the fire rate of the spec that
+    judges a key is `violates / (violates + satisfies)`. `not_applicable`
+    counts the settings a conditional spec did not apply to (its guard did
+    not hold): they are resolved, and they are not part of that
+    denominator. A key with no spec, or a vocabulary-only key, has a row
+    with only `abstain`. The four counts of all rows sum to `config.total`;
+    `violates + satisfies + not_applicable` sums to `config.resolved`, and
+    `abstain` sums to the four `config.abstain` counts. The counts are
+    pre-waiver engine truth, as `sites` is.
   - `structure`: the repo-structure lane's verdict counts (`total`,
     `violates`, `satisfies`, `abstain`, `not_applicable`), one control each.
     It mirrors the `structure:` line of the COVERAGE block. Null when the

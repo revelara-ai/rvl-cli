@@ -283,6 +283,18 @@ A warm scan re-parses a C or C++ source file when the file changed or when
 a header it includes changed. `rvl index reindex --files` accepts a header
 and re-parses the source files that include it.
 
+`cindex` also names, on its `retrieval_stats` record, the translation units
+that parsed with errors (`tus_incomplete_paths`). The packet index flags each
+one, so a warm scan that reuses the entry still prints `C/C++: 1 file
+INCOMPLETE: ...` in COVERAGE and `--out` carries
+`coverage.parse_incomplete_files`. Without the flag the unit was reused as a
+clean parse with zero sites. The flag describes the last parse. A header that
+was not found is not a recorded dependency, so to install the header does not
+clear the flag: the unit is parsed again only when the file or a header it
+includes changes. A full `rvl scan` (without `--incremental`) parses every
+unit and shows the current state. An index entry for a C or C++ file that
+was written before the flag existed is parsed again one time.
+
 `tsindex` also reports, on the same `repo_config` record, the workspaces
 that declare dependencies with no installed tree
 (`dependency_trees_uninstalled`, with the directories beside it as
