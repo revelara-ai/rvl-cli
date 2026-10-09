@@ -326,12 +326,13 @@ mod tests {
         p
     }
 
-    /// The exact files rvl-cli writes into an empty repo, captured by
-    /// running its own `plugin.EnsureAgentsMd` / `plugin.EnsureClaudeMd`
-    /// against a fresh directory with no served plugin content on disk (so
-    /// both sides use their baked-in fallback). Byte parity here is the
-    /// whole point: a repo initialized by either binary must be maintained
-    /// by the other without the block churning.
+    /// The record of this repository's own context block: the exact files
+    /// this binary writes into an empty repo when no served plugin content
+    /// is on disk, so it uses its embedded copy. The goldens began as a
+    /// capture from the older Go CLI. That CLI is archived, so byte parity
+    /// with it no longer applies, and a change to the embedded block
+    /// changes the goldens with it. The test still catches a change to the
+    /// block that nobody intended.
     const GOLDEN_AGENTS_MD: &str = include_str!("context/rvl_cli_agents_md.golden");
     const GOLDEN_CLAUDE_MD: &str = include_str!("context/rvl_cli_claude_md.golden");
 

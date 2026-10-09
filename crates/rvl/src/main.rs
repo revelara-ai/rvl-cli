@@ -509,6 +509,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
+    /// Query the causal factor catalog (list, show)
+    Factor {
+        #[command(subcommand)]
+        cmd: rvl_data::factor::FactorCmd,
+    },
     // `compliance report` is rvl-cli's `rvl report` readiness scorecard,
     // renamed because this binary already spells `report` for the scan
     // privacy-payload preview (po-av01j.185 item 2).
@@ -7083,6 +7088,7 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         Cmd::Risk { cmd } => return Ok(rvl_data::risk::run(cmd)),
         Cmd::Control { cmd } => return Ok(rvl_data::control::run(cmd)),
+        Cmd::Factor { cmd } => return Ok(rvl_data::factor::run(cmd)),
         Cmd::Compliance { cmd } => return Ok(rvl_data::compliance::run(cmd)),
         Cmd::Knowledge { cmd } => return Ok(rvl_data::knowledge::run(cmd)),
         Cmd::Incident { cmd } => return Ok(rvl_data::incident::run(cmd)),
@@ -7506,6 +7512,7 @@ fn run() -> anyhow::Result<ExitCode> {
         | Cmd::Status
         | Cmd::Risk { .. }
         | Cmd::Control { .. }
+        | Cmd::Factor { .. }
         | Cmd::Compliance { .. }
         | Cmd::Knowledge { .. }
         | Cmd::Incident { .. }

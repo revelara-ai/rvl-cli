@@ -69,6 +69,34 @@ A Dockerfile line that continues an instruction (after a trailing `\`), and a
 line in the body of a heredoc, are no longer read as instructions. Before, a
 continuation line that started with `FROM` was read as a build stage.
 
+### `rvl factor list` and `rvl factor show`
+
+**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+and earlier do not have the command: `rvl factor --help` exits 2 there and
+exits 0 on a version that has it.
+
+The two commands read the causal factor catalog of the Revelara platform, in
+the same form as `rvl control list` and `rvl control show`.
+
+- `rvl factor list [--category <1-7>] [--top10] [--format table|json]` lists
+  the factors with the Top 10 slot, the public incident count, the public
+  organization count, the category number and the name.
+- `rvl factor show <CODE> [--format table|json]` shows one factor: the
+  definition, the public counts, the quotes, the controls by relation
+  (prevents, detects, mitigates, can induce), the tell and the guards when the
+  entry has them, and the related risks of your organization. The code is
+  accepted in any case. A merged code prints `Merged into <code>` and exits 0.
+
+A public count is the number of public reports that describe the condition.
+It is not a rate of occurrence. `--format=json` prints the response of the
+server unchanged. A `--category` outside 1 to 7 exits 2 with no request. The
+commands need a server that has the causal factor endpoints; an older server
+answers 404, and the command exits 1.
+
+The embedded context block that `rvl init` writes to `AGENTS.md` and
+`CLAUDE.md` has a new "Causal factors" list with the two commands. The
+addition is additive: no command or field changed.
+
 ## 1.4.0
 
 The first release after `v1.3.0`.
