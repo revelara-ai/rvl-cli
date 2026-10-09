@@ -32,12 +32,13 @@ fn rustindex() -> &'static str {
 }
 
 /// Skip, don't fail, when the rustup component is absent: the convention the
-/// goindex/tsindex fixture suites already follow.
+/// goindex/tsindex fixture suites already follow. `rvl_testgate::skip` makes
+/// it a failure where engines are required (CI).
 fn rust_analyzer_available() -> bool {
     match Command::new("rust-analyzer").arg("--version").output() {
         Ok(o) if o.status.success() => true,
         _ => {
-            eprintln!("SKIP rust_nested_workspace: rust-analyzer not available");
+            rvl_testgate::skip("rust_nested_workspace", "rust-analyzer not available");
             false
         }
     }

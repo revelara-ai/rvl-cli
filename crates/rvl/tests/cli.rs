@@ -225,6 +225,73 @@ fn scan_out_carries_the_structure_lane_in_its_own_array() {
         .all(|u| !u["class"].as_str().unwrap().starts_with("repo_structure.")));
 }
 
+/// po-657l6.10: every `sites` row of the `--out` document carries the scope
+/// of its file, resolved rows included. The three paths are the ones a judge
+/// replay sampled as violating rows with no way to tell them apart: a runtime
+/// module, a Django migration and a Django management command.
+#[test]
+fn scan_out_site_rows_carry_the_scope_of_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [
+        "zerver/lib/outgoing_http.py",
+        "zerver/migrations/0260_missed_message_addresses_from_redis_to_db.py",
+        "zerver/management/commands/deliver_scheduled_emails.py",
+    ]
+    .map(|rel| dir.path().join(rel));
+    let mut stream = String::new();
+    for (i, path) in paths.iter().enumerate() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "import requests\n\ndef f():\n    requests.get(u)\n").unwrap();
+        stream.push_str(&format!(
+            "{{\"snapshot_id\":\"fixture\",\"file_path\":{:?},\"line_number\":{},\"func\":\"get\",\"client_type\":\"requests\",\"snippet\":\"requests.get(u)\",\"lang\":\"python\"}}\n",
+            path.to_str().unwrap(),
+            4 + i,
+        ));
+    }
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(&packets, stream).unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[{"type":"requests","method":"get","site_count":3,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests has no default timeout"}],"configs":[]}"#).unwrap();
+    let out_path = dir.path().join("scan.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        scan_reached_a_verdict(&out),
+        "scan did not run: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = doc["sites"].as_array().expect("sites array");
+    assert_eq!(rows.len(), paths.len(), "{rows:?}");
+    for (row, path) in rows.iter().zip(&paths) {
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            row["scope"],
+            rvl_core::scope_of(path).as_str(),
+            "scope of {path}: {row}"
+        );
+    }
+    let scopes: Vec<_> = rows.iter().map(|r| r["scope"].as_str().unwrap()).collect();
+    assert_eq!(scopes, ["runtime", "migration", "runtime"]);
+    // Additive: the five fields a row had before are still there.
+    for field in ["site_id", "snapshot_id", "verdict", "reason", "class"] {
+        assert!(
+            rows.iter().all(|r| r[field].is_string()),
+            "{field}: {rows:?}"
+        );
+    }
+}
+
 #[test]
 fn scan_with_specs_file_emits_findings_and_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -557,7 +624,10 @@ fn scan_without_retrieved_runs_the_go_helper() {
             );
         }
         Err(e) => {
-            eprintln!("SKIP scan_without_retrieved_runs_the_go_helper: `go` not available: {e}");
+            rvl_testgate::skip(
+                "scan_without_retrieved_runs_the_go_helper",
+                format_args!("`go` not available: {e}"),
+            );
             return;
         }
     }
@@ -1224,7 +1294,10 @@ fn build_goindex(dir: &std::path::Path) -> Option<std::path::PathBuf> {
             );
         }
         Err(e) => {
-            eprintln!("SKIP: go toolchain not available: {e}");
+            rvl_testgate::skip(
+                "build_goindex",
+                format_args!("go toolchain not available: {e}"),
+            );
             None
         }
     }
@@ -1693,6 +1766,62 @@ fn scan_runs_the_dep_manifests_family_with_seed_specs() {
         stdout.contains("dep-manifests go_mod.toolchain"),
         "toolchain-less go.mod must surface: {stdout}"
     );
+}
+
+/// The Dockerfile final-stage user is a judgeable fact: a spec that wants
+/// `non-root` turns a root final stage into a finding, and stays silent on a
+/// Dockerfile whose final stage drops privileges.
+#[test]
+fn scan_judges_the_dockerfile_final_stage_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("api")).unwrap();
+    std::fs::create_dir_all(root.join("worker")).unwrap();
+    std::fs::write(
+        root.join("api/Dockerfile"),
+        "FROM golang:1.22 AS build\nUSER builder\nFROM alpine:3.20\nUSER root\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("worker/Dockerfile"),
+        "FROM golang:1.22 AS build\nFROM alpine:3.20\nUSER 65532:65532\n",
+    )
+    .unwrap();
+    let specs = root.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"dep-manifests","key":"dockerfile.final_stage_user","expect":{"kind":"one_of","values":["non-root"]},"confidence":0.9,"control":"RC-044","severity":"medium","fix":"add a USER instruction with an unprivileged user to the final stage","rationale":"a process that runs as root in the container widens a container escape"}
+        ]
+    }"#).unwrap();
+    let doc = root.join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&doc)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.contains("dep-manifests dockerfile.final_stage_user"),
+        "a root final stage must surface: {stdout} {stderr}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&doc).unwrap()).unwrap();
+    let row = doc["coverage"]["config"]["by_key"]
+        .as_array()
+        .expect("coverage.config.by_key")
+        .iter()
+        .find(|r| r["key"] == "dockerfile.final_stage_user")
+        .unwrap_or_else(|| panic!("no by_key row for the user fact: {doc}"));
+    assert_eq!(row["violates"], 1, "api/Dockerfile runs as root: {row}");
+    assert_eq!(row["satisfies"], 1, "worker/Dockerfile does not: {row}");
 }
 
 // --- G6 Prometheus/sloth family (po-av01j.21) ---
@@ -2798,7 +2927,10 @@ fn live_python_scan_surfaces_unsized_constructions() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP live_python_scan_surfaces_unsized_constructions: no python3");
+        rvl_testgate::skip(
+            "live_python_scan_surfaces_unsized_constructions",
+            "no python3",
+        );
         return;
     }
     let pyindex = helpers_dir().join("pyindex");
@@ -2871,7 +3003,10 @@ fn scan_violates_a_sentinel_timeout_argument_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_violates_a_sentinel_timeout_argument_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_violates_a_sentinel_timeout_argument_end_to_end",
+            "no python3",
+        );
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -2951,7 +3086,10 @@ fn scan_does_not_flag_put_on_an_unbounded_queue_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_does_not_flag_put_on_an_unbounded_queue_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_does_not_flag_put_on_an_unbounded_queue_end_to_end",
+            "no python3",
+        );
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -3030,7 +3168,10 @@ fn scan_decides_python_background_job_sites_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_decides_python_background_job_sites_end_to_end: no python3");
+        rvl_testgate::skip(
+            "scan_decides_python_background_job_sites_end_to_end",
+            "no python3",
+        );
         return;
     }
     let manifest = manifest_dir();
@@ -3069,15 +3210,19 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP scan_decides_typescript_background_job_sites_end_to_end: no node");
+        rvl_testgate::skip(
+            "scan_decides_typescript_background_job_sites_end_to_end",
+            "no node",
+        );
         return;
     }
     let manifest = manifest_dir();
     let workspace = manifest.parent().and_then(|p| p.parent()).unwrap();
     let tsindex_dir = workspace.join("helpers").join("tsindex");
     if !tsindex_dir.join("node_modules").join("typescript").is_dir() {
-        eprintln!(
-            "SKIP scan_decides_typescript_background_job_sites_end_to_end: run `npm install` in helpers/tsindex first"
+        rvl_testgate::skip(
+            "scan_decides_typescript_background_job_sites_end_to_end",
+            "run `npm install` in helpers/tsindex first",
         );
         return;
     }
@@ -3106,13 +3251,17 @@ fn scan_decides_typescript_background_job_sites_end_to_end() {
 /// verify its libclang engine loads. None (with a SKIP log line) when the
 /// binary is missing or no libclang is installed — the e2e is exercised
 /// wherever the engine exists, and the environment gap is loud, not silent.
+/// Under RVLSCAN_REQUIRE_ENGINES (CI) the gap is a failure, not a SKIP.
 fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
         .join("cindex");
     if !bin.is_file() {
-        eprintln!("SKIP {test}: cindex not built (run `cargo build -p rvl --bin cindex`)");
+        rvl_testgate::skip(
+            test,
+            "cindex not built (run `cargo build -p rvl --bin cindex`)",
+        );
         return None;
     }
     match std::process::Command::new(&bin)
@@ -3121,14 +3270,14 @@ fn cindex_helper(test: &str) -> Option<std::path::PathBuf> {
     {
         Ok(out) if out.status.success() => Some(bin),
         Ok(out) => {
-            eprintln!(
-                "SKIP {test}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+            rvl_testgate::skip(
+                test,
+                format_args!("{}", String::from_utf8_lossy(&out.stderr).trim()),
             );
             None
         }
         Err(e) => {
-            eprintln!("SKIP {test}: cannot run cindex: {e}");
+            rvl_testgate::skip(test, format_args!("cannot run cindex: {e}"));
             None
         }
     }
@@ -3574,11 +3723,14 @@ fn live_ts_scan_surfaces_llm_observability_gap() {
     match ready {
         Ok(out) if out.status.success() => {}
         Ok(_) => {
-            eprintln!("SKIP live_ts_scan: tsindex needs `npm install` (typescript missing)");
+            rvl_testgate::skip(
+                "live_ts_scan",
+                "tsindex needs `npm install` (typescript missing)",
+            );
             return;
         }
         Err(e) => {
-            eprintln!("SKIP live_ts_scan: node not available: {e}");
+            rvl_testgate::skip("live_ts_scan", format_args!("node not available: {e}"));
             return;
         }
     }
@@ -3628,7 +3780,7 @@ fn javaindex_ready() -> Option<std::path::PathBuf> {
     match std::process::Command::new("javac").arg("-version").output() {
         Ok(out) if out.status.success() => {}
         _ => {
-            eprintln!("SKIP java scan: no JDK (javac not available)");
+            rvl_testgate::skip("java scan", "no JDK (javac not available)");
             return None;
         }
     }
@@ -3727,6 +3879,47 @@ fn live_java_scan_surfaces_g4_emission_findings() {
     );
 }
 
+/// Java, live end to end: javaindex inventories the misuse fixture's catch
+/// clauses, and the seed specs judge them. The count pins the rules: a narrow
+/// type, a handler that throws, a handler the emission lane counts as a
+/// swallow, and a local class with the name `Exception` are not overbroad
+/// catches.
+#[test]
+fn live_java_scan_surfaces_overbroad_catches() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(
+            helpers_dir()
+                .join("javaindex")
+                .join("testdata")
+                .join("fixture_misuse"),
+        )
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("misuse.overbroad_catch")
+            && stdout.contains(
+                "4 handler(s) catch the root exception type and do not re-raise, in 2 function(s)"
+            ),
+        "three catches of Exception and one of Throwable, in two methods: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
 // --- Rust G1 lane (po-av01j.11) ---
 
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /
@@ -3748,7 +3941,10 @@ fn live_rust_scan_runs_the_rustindex_helper() {
     match Command::new("rust-analyzer").arg("--version").output() {
         Ok(o) if o.status.success() => {}
         _ => {
-            eprintln!("SKIP live_rust_scan: rust-analyzer not available (rustup component)");
+            rvl_testgate::skip(
+                "live_rust_scan",
+                "rust-analyzer not available (rustup component)",
+            );
             return;
         }
     }
@@ -3778,7 +3974,7 @@ fn live_rust_scan_runs_the_rustindex_helper() {
                 );
             }
             Err(e) => {
-                eprintln!("SKIP live_rust_scan: cargo not available: {e}");
+                rvl_testgate::skip("live_rust_scan", format_args!("cargo not available: {e}"));
                 return;
             }
         }
@@ -4402,7 +4598,7 @@ fn build_csindex_with(
             if std::env::var_os("CI").is_some() {
                 return Err("no dotnet SDK under CI: the C# live tests cannot run".to_string());
             }
-            eprintln!("SKIP csindex e2e: no dotnet SDK (set CI=1 to make this fatal)");
+            rvl_testgate::skip("csindex e2e", "no dotnet SDK (set CI=1 to make this fatal)");
             return Ok(None);
         }
         Err(e) => return Err(format!("`dotnet --version` did not run: {e}")),
@@ -4464,9 +4660,10 @@ fn build_csindex_with(
                     "NuGet restore could not reach its feed (NU1301) under CI: {shown}\n{output}"
                 ));
             }
-            eprintln!(
-                "SKIP csindex e2e: NuGet restore could not reach its feed (NU1301); \
-                 run `make helpers-csindex` once with network to fill the cache"
+            rvl_testgate::skip(
+                "csindex e2e",
+                "NuGet restore could not reach its feed (NU1301); \
+                 run `make helpers-csindex` once with network to fill the cache",
             );
             return Ok(None);
         }
@@ -5051,7 +5248,7 @@ fn scan_python_repo(
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip("scan_python_repo", "no python3");
         return None;
     }
     let out_path = root.join("findings.json");
@@ -5178,7 +5375,7 @@ fn warm_python_scan(
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip("warm_python_scan", "no python3");
         return None;
     }
     let out_path = dir.join(format!("findings{pass}.json"));
@@ -5261,7 +5458,10 @@ fn index_reindex_flags_skipped_test_files_for_the_warm_scan() {
         .output()
         .is_err()
     {
-        eprintln!("SKIP: no python3");
+        rvl_testgate::skip(
+            "index_reindex_flags_skipped_test_files_for_the_warm_scan",
+            "no python3",
+        );
         return;
     }
     let out = bin()
@@ -8285,7 +8485,7 @@ fn node_helper_runs_with_a_raised_heap_limit() {
     let script = "process.stderr.write('execArgv=' + process.execArgv.join(' ') + '\\n');\n\
                   process.exit(1);\n";
     let Some(text) = scan_with_fake_tsindex(script, "777") else {
-        eprintln!("SKIP node_helper_runs_with_a_raised_heap_limit: no node");
+        rvl_testgate::skip("node_helper_runs_with_a_raised_heap_limit", "no node");
         return;
     };
     assert!(
@@ -8302,7 +8502,10 @@ fn node_helper_heap_exhaustion_names_the_limit_and_the_override() {
     let script = "const hold = [];\n\
                   for (;;) hold.push(new Array(1e5).fill(hold.length));\n";
     let Some(text) = scan_with_fake_tsindex(script, "32") else {
-        eprintln!("SKIP node_helper_heap_exhaustion_names_the_limit_and_the_override: no node");
+        rvl_testgate::skip(
+            "node_helper_heap_exhaustion_names_the_limit_and_the_override",
+            "no node",
+        );
         return;
     };
     assert!(

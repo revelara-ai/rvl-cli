@@ -64,6 +64,10 @@ flate2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+# The one place a live test may skip: a missing engine (libclang, node, a JDK,
+# ...) is a SKIP line on a workstation and a failure under
+# RVLSCAN_REQUIRE_ENGINES, which CI sets (po-av01j.99).
+rvl-testgate = { path = "../rvl-testgate" }
 
 # RELEASE PACKAGING (po-aml3h). A scan needs its retriever helpers, and before
 # this each of cindex/rustindex was its own dist "app" — its own archive, its

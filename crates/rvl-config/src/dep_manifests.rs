@@ -6,6 +6,13 @@
 //! `go_mod.toolchain`, `dockerfile.base_image_pin`) so one spec judges one
 //! key identity everywhere.
 //!
+//! A Dockerfile also emits `dockerfile.final_stage_user`, once: the user the
+//! built image starts as, from the last `USER` of the final stage (through
+//! the earlier stages it is built `FROM`). The value is a class, `root` /
+//! `non-root` / `absent`, never the account name. `absent` is a fact about
+//! the file and not a verdict of root: with no `USER`, the base image decides,
+//! and the base image is not in the repository.
+//!
 //! ALTITUDE BOUNDARY (do not blur it): the G7 repo-structure lane
 //! (`rvl-structure`, po-av01j.7) owns STRUCTURAL dependency hygiene —
 //! lockfile presence/consistency per manifest and the aggregate pin counts
@@ -673,22 +680,84 @@ fn requirement_shape(line: &str) -> &'static str {
 
 // --- Dockerfile -----------------------------------------------------------
 
+/// Final-stage user classes: the closed vocabulary of
+/// `dockerfile.final_stage_user`. No `USER` anywhere in the stage chain is
+/// [`crate::ABSENT_RENDERING`].
+const USER_ROOT: &str = "root";
+const USER_NON_ROOT: &str = "non-root";
+
+/// The user one build stage ends with, and what decided it.
+#[derive(Clone)]
+struct StageUser {
+    /// `root`, `non-root` or `absent`; `None` when only the build invocation
+    /// knows the value.
+    class: Option<&'static str>,
+    /// The line that decides: the last `USER`, or the stage's `FROM` when
+    /// there is none.
+    line: u32,
+    provenance: Vec<ProvenanceStep>,
+}
+
 fn dockerfile(cx: &Cx, contents: &str) -> Retrieved {
     let mut out = Retrieved::default();
     let mut arg_defaults: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut stage_aliases: Vec<String> = Vec::new();
-    let mut stage_idx = 0usize;
-    let mut saw_from = false;
+    // Names an ENV sets. ENV wins over ARG in a substitution, and its value
+    // is not tracked, so a USER that reads one of these is not resolved.
+    let mut env_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stage_of_alias: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // One entry per FROM, in order. The index is the stage index.
+    let mut stage_users: Vec<StageUser> = Vec::new();
+
+    // Physical lines that are not instructions: the rest of a continued
+    // instruction, and the body of a heredoc.
+    let mut escape = '\\';
+    let mut saw_instruction = false;
+    let mut continued = false;
+    let mut takes_heredoc = false;
+    let mut heredocs: std::collections::VecDeque<Heredoc> = std::collections::VecDeque::new();
 
     for (line_no, raw) in contents.lines().enumerate() {
+        if !continued {
+            if let Some(open) = heredocs.front() {
+                if open.ends_at(raw) {
+                    heredocs.pop_front();
+                }
+                continue;
+            }
+        }
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             continue;
         }
+        if let Some(comment) = line.strip_prefix('#') {
+            // `# escape=` is a parser directive only before the first
+            // instruction. A comment does not end a continued instruction.
+            if !saw_instruction {
+                if let Some(c) = escape_directive(comment) {
+                    escape = c;
+                }
+            }
+            continue;
+        }
+        saw_instruction = true;
+        let is_continuation = continued;
+        continued = line.ends_with(escape);
+        if is_continuation {
+            if takes_heredoc {
+                heredocs.extend(line.split_whitespace().filter_map(Heredoc::parse));
+            }
+            continue;
+        }
+
         let mut tokens = line.split_whitespace();
         let Some(instr) = tokens.next() else { continue };
         let instr = instr.to_ascii_uppercase();
+        takes_heredoc = matches!(instr.as_str(), "RUN" | "COPY" | "ADD");
+        if takes_heredoc {
+            heredocs.extend(tokens.clone().filter_map(Heredoc::parse));
+        }
 
         if instr == "ARG" {
             // ARG NAME=default — the in-file default a ${NAME} FROM resolves
@@ -698,10 +767,38 @@ fn dockerfile(cx: &Cx, contents: &str) -> Retrieved {
             }
             continue;
         }
+        if instr == "ENV" {
+            // ENV NAME=value ... or the legacy ENV NAME value.
+            let pairs: Vec<&str> = tokens.collect();
+            match pairs.first() {
+                Some(first) if !first.contains('=') => {
+                    env_names.insert(first.to_string());
+                }
+                _ => env_names.extend(
+                    pairs
+                        .iter()
+                        .filter_map(|t| t.split_once('='))
+                        .map(|(name, _)| name.to_string()),
+                ),
+            }
+            continue;
+        }
+        if instr == "USER" {
+            // A USER before the first FROM is not valid and belongs to no stage.
+            if let Some(stage) = stage_users.last_mut() {
+                *stage = authored_user(
+                    cx,
+                    tokens.next(),
+                    &arg_defaults,
+                    &env_names,
+                    (line_no + 1) as u32,
+                );
+            }
+            continue;
+        }
         if instr != "FROM" {
             continue;
         }
-        saw_from = true;
 
         // FROM [--platform=...] <image> [AS <name>]
         let mut rest: Vec<&str> = tokens.collect();
@@ -711,16 +808,38 @@ fn dockerfile(cx: &Cx, contents: &str) -> Retrieved {
         };
         // An alias from a PRIOR line makes this FROM an internal stage
         // reference, not a base image.
-        let is_internal = stage_aliases.contains(&image.to_ascii_lowercase());
+        let parent = stage_of_alias.get(&image.to_ascii_lowercase()).copied();
+        let stage_idx = stage_users.len();
         if let Some(pos) = rest.iter().position(|t| t.eq_ignore_ascii_case("as")) {
             if let Some(alias) = rest.get(pos + 1) {
-                stage_aliases.push(alias.to_ascii_lowercase());
+                stage_of_alias.insert(alias.to_ascii_lowercase(), stage_idx);
             }
         }
         let unit = format!("stage:{stage_idx}");
-        stage_idx += 1;
 
-        if is_internal || image.eq_ignore_ascii_case("scratch") {
+        // The stage starts with the user of what it is built FROM: the user
+        // of an earlier stage, or the base image's own, which this file does
+        // not state.
+        let from = ProvenanceStep::new(cx.rel_path, &format!("FROM {image}"), "reference");
+        stage_users.push(match parent {
+            Some(parent) => {
+                let mut user = stage_users[parent].clone();
+                if let Some(decider) = user.provenance.last_mut() {
+                    if decider.role == "explicit" {
+                        decider.role = "inherited".to_string();
+                    }
+                }
+                user.provenance.insert(0, from);
+                user
+            }
+            None => StageUser {
+                class: Some(crate::ABSENT_RENDERING),
+                line: (line_no + 1) as u32,
+                provenance: vec![from, ProvenanceStep::new(cx.rel_path, "USER", "absent")],
+            },
+        });
+
+        if parent.is_some() || image.eq_ignore_ascii_case("scratch") {
             continue; // internal stage ref, or the reserved empty base
         }
 
@@ -776,12 +895,162 @@ fn dockerfile(cx: &Cx, contents: &str) -> Retrieved {
         out.packets.push(p);
     }
 
-    if !saw_from {
+    // The image a Dockerfile builds is its last stage, so that stage's user
+    // is the user the container starts as.
+    match stage_users.pop() {
+        Some(user) => {
+            let resolution = match user.class {
+                Some(_) => Resolution::AsAuthored,
+                None => Resolution::Unresolvable,
+            };
+            let mut p = cx.packet(
+                &format!("stage:{}", stage_users.len()),
+                "dockerfile.final_stage_user",
+                user.class.map(str::to_string),
+                resolution,
+                user.provenance,
+            );
+            p.line = user.line;
+            out.packets.push(p);
+        }
         // Matched the Dockerfile path shape but has no FROM: not a build
         // definition this lane recognizes.
-        out.unparseable = 1;
+        None => out.unparseable = 1,
     }
     out
+}
+
+/// The user a `USER <user>[:<group>]` instruction sets. A `$NAME` user
+/// resolves through the in-file ARG defaults, as a FROM image does; a value
+/// that only the build invocation or an ENV can give is not guessed.
+fn authored_user(
+    cx: &Cx,
+    arg: Option<&str>,
+    arg_defaults: &std::collections::HashMap<String, String>,
+    env_names: &std::collections::HashSet<String>,
+    line: u32,
+) -> StageUser {
+    let authored = ProvenanceStep::new(
+        cx.rel_path,
+        &format!("USER {}", arg.unwrap_or_default()),
+        "explicit",
+    );
+    let unresolved = |source: &str, role: &str| StageUser {
+        class: None,
+        line,
+        provenance: vec![authored.clone(), ProvenanceStep::new("", source, role)],
+    };
+    let name = user_name(arg.unwrap_or_default());
+    if name.is_empty() {
+        return StageUser {
+            class: None,
+            line,
+            provenance: vec![authored],
+        };
+    }
+    let mut provenance = Vec::new();
+    let name = if name.contains('$') {
+        match resolve_arg(name, arg_defaults) {
+            Some((var, _)) if env_names.contains(&var) => {
+                return unresolved("environment variable", "non-literal");
+            }
+            Some((var, value)) => {
+                provenance.push(ProvenanceStep::new(
+                    cx.rel_path,
+                    &format!("ARG {var}={value}"),
+                    "arg-default",
+                ));
+                value
+            }
+            None => return unresolved("build argument", "build-arg"),
+        }
+    } else {
+        name.to_string()
+    };
+    provenance.push(authored);
+    // Root is UID 0 by number or by its Linux name. The Windows counterpart
+    // is the ContainerAdministrator account.
+    let is_root =
+        name == "root" || name == "ContainerAdministrator" || name.parse::<u64>() == Ok(0);
+    StageUser {
+        class: Some(if is_root { USER_ROOT } else { USER_NON_ROOT }),
+        line,
+        provenance,
+    }
+}
+
+/// The user part of a `USER` argument: quotes off, and the `:<group>` off.
+/// A `:` inside `${NAME:-fallback}` is not the group separator.
+fn user_name(arg: &str) -> &str {
+    let arg = arg.trim_matches(['"', '\'']);
+    let mut depth = 0usize;
+    for (i, c) in arg.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return &arg[..i],
+            _ => {}
+        }
+    }
+    arg
+}
+
+/// The character a `# escape=<c>` parser directive sets, given the comment
+/// text after the `#`.
+fn escape_directive(comment: &str) -> Option<char> {
+    let (name, value) = comment.split_once('=')?;
+    if !name.trim().eq_ignore_ascii_case("escape") {
+        return None;
+    }
+    match value.trim() {
+        "\\" => Some('\\'),
+        "`" => Some('`'),
+        _ => None,
+    }
+}
+
+/// An open heredoc of a RUN, COPY or ADD: its body runs up to the line that
+/// is the delimiter, and no line of the body is an instruction.
+struct Heredoc {
+    delimiter: String,
+    /// `<<-`: leading tabs do not count.
+    strip_tabs: bool,
+}
+
+impl Heredoc {
+    /// A whole word of the form `[fd]<<[-]DELIM`, with DELIM optionally
+    /// quoted. A shell `<<` shift and a `<<<` here-string are not that word.
+    fn parse(word: &str) -> Option<Self> {
+        let rest = word
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix("<<")?;
+        let (strip_tabs, rest) = match rest.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        let delimiter = ['"', '\'']
+            .into_iter()
+            .find_map(|q| rest.strip_prefix(q)?.strip_suffix(q))
+            .unwrap_or(rest);
+        let mut chars = delimiter.chars();
+        let first = chars.next()?;
+        ((first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| Self {
+            delimiter: delimiter.to_string(),
+            strip_tabs,
+        })
+    }
+
+    fn ends_at(&self, raw: &str) -> bool {
+        let line = raw.trim_end_matches('\r');
+        let line = if self.strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        line == self.delimiter
+    }
 }
 
 /// Substitute a `${NAME}` / `${NAME:-fallback}` / `$NAME` image token through
@@ -1330,13 +1599,13 @@ n = 2\n";
             "Dockerfile",
             "FROM golang:1.22 AS builder\nFROM builder AS test\nFROM scratch\n",
         );
-        assert_eq!(
-            got.packets.len(),
-            1,
-            "only the real base emits: {:?}",
-            got.packets
-        );
-        assert_eq!(got.packets[0].unit, "stage:0");
+        let pins: Vec<&ConfigPacket> = got
+            .packets
+            .iter()
+            .filter(|p| p.key == "dockerfile.base_image_pin")
+            .collect();
+        assert_eq!(pins.len(), 1, "only the real base emits: {:?}", got.packets);
+        assert_eq!(pins[0].unit, "stage:0");
     }
 
     #[test]
@@ -1365,5 +1634,205 @@ n = 2\n";
         let got = retrieve("Dockerfile", "# empty scaffold\nRUN echo hi\n");
         assert!(got.packets.is_empty());
         assert_eq!(got.unparseable, 1);
+    }
+
+    // --- Dockerfile final-stage USER ---
+
+    const USER_KEY: &str = "dockerfile.final_stage_user";
+
+    /// The one final-stage user packet of a Dockerfile.
+    fn final_user(contents: &str) -> ConfigPacket {
+        let got = retrieve("Dockerfile", contents);
+        let mut users = got.packets.iter().filter(|p| p.key == USER_KEY);
+        let p = users
+            .next()
+            .unwrap_or_else(|| panic!("no {USER_KEY} packet in {:?}", got.packets));
+        assert!(users.next().is_none(), "one user fact per Dockerfile");
+        p.clone()
+    }
+
+    #[test]
+    fn final_stage_user_is_root_non_root_or_absent() {
+        for (user, want) in [
+            ("root", "root"),
+            ("0", "root"),
+            ("root:root", "root"),
+            ("0:0", "root"),
+            ("0:1000", "root"),
+            ("ROOT", "non-root"), // user names are case-sensitive on Linux
+            ("ContainerAdministrator", "root"),
+            ("app", "non-root"),
+            ("1000", "non-root"),
+            ("65532:65532", "non-root"),
+            ("nobody:0", "non-root"),
+            ("\"app\"", "non-root"),
+            ("ContainerUser", "non-root"),
+        ] {
+            let p = final_user(&format!("FROM alpine:3.20\nUSER {user}\n"));
+            assert_eq!(p.resolved_value.as_deref(), Some(want), "USER {user}");
+            assert_eq!(p.resolution, Resolution::AsAuthored);
+            assert_eq!(p.unit, "stage:0");
+            assert_eq!(p.line, 2, "the packet points at the USER line");
+        }
+
+        let absent = final_user("# build\nFROM alpine:3.20\nRUN true\n");
+        assert_eq!(absent.resolved_value.as_deref(), Some("absent"));
+        assert_eq!(absent.resolution, Resolution::AsAuthored);
+        assert_eq!(absent.line, 2, "an absent USER points at the stage's FROM");
+        assert_eq!(absent.provenance.last().unwrap().role, "absent");
+        assert!(
+            absent
+                .provenance
+                .iter()
+                .any(|s| s.key_path.contains("alpine:3.20")),
+            "the base image that decides the user is in the chain: {:?}",
+            absent.provenance
+        );
+    }
+
+    #[test]
+    fn the_last_user_of_the_final_stage_wins() {
+        // Drop to root to install, then back to an unprivileged user.
+        let p = final_user("FROM alpine:3.20\nUSER app\nUSER root\nRUN apk add curl\nUSER app\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 5);
+
+        let p = final_user("FROM alpine:3.20\nUSER app\nuser root\n");
+        assert_eq!(
+            p.resolved_value.as_deref(),
+            Some("root"),
+            "instructions are case-insensitive, and the last one decides"
+        );
+    }
+
+    #[test]
+    fn a_user_in_an_earlier_stage_does_not_reach_the_final_stage() {
+        let p = final_user(
+            "FROM golang:1.22 AS build\nUSER builder\nRUN make\nFROM alpine:3.20\nCOPY --from=build /app /app\n",
+        );
+        assert_eq!(p.unit, "stage:1");
+        assert_eq!(p.resolved_value.as_deref(), Some("absent"));
+        assert_eq!(p.line, 4);
+    }
+
+    #[test]
+    fn a_final_stage_built_from_an_earlier_stage_inherits_its_user() {
+        let p = final_user(
+            "FROM alpine:3.20 AS base\nUSER app\nFROM golang:1.22 AS build\nUSER root\nFROM base\nCOPY --from=build /app /app\n",
+        );
+        assert_eq!(p.unit, "stage:2");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 2, "the packet points at the USER that decides");
+        assert_eq!(p.provenance.last().unwrap().role, "inherited");
+
+        // The final stage's own USER overrides the inherited one.
+        let p = final_user("FROM alpine:3.20 AS base\nUSER app\nFROM base\nUSER root\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("root"));
+        assert_eq!(p.line, 4);
+
+        // Inherited absence names the external base at the root of the chain.
+        let p = final_user("FROM alpine:3.20 AS base\nRUN true\nFROM base AS mid\nFROM mid\n");
+        assert_eq!(p.unit, "stage:2");
+        assert_eq!(p.resolved_value.as_deref(), Some("absent"));
+        assert!(p
+            .provenance
+            .iter()
+            .any(|s| s.key_path.contains("alpine:3.20")));
+    }
+
+    #[test]
+    fn a_scratch_final_stage_still_reports_its_user() {
+        let p =
+            final_user("FROM golang:1.22 AS build\nFROM scratch\nCOPY --from=build /app /app\n");
+        assert_eq!(p.unit, "stage:1");
+        assert_eq!(p.resolved_value.as_deref(), Some("absent"));
+
+        let p = final_user("FROM scratch\nCOPY app /app\nUSER 65532:65532\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+    }
+
+    #[test]
+    fn a_user_from_an_arg_default_resolves_and_a_bare_build_arg_abstains() {
+        let p = final_user("FROM alpine:3.20\nARG UID=1000\nARG GID=1000\nUSER ${UID}:${GID}\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.resolution, Resolution::AsAuthored);
+        assert_eq!(p.provenance[0].role, "arg-default");
+
+        let p = final_user("FROM alpine:3.20\nARG UID=0\nUSER $UID\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("root"));
+
+        // Only the build invocation knows: abstain, never guess.
+        for user in ["$UID", "${APP_USER}", "app${SUFFIX}"] {
+            let p = final_user(&format!("FROM alpine:3.20\nARG UID\nUSER {user}\n"));
+            assert_eq!(p.resolution, Resolution::Unresolvable, "USER {user}");
+            assert_eq!(p.resolved_value, None, "USER {user}");
+            assert_eq!(p.provenance.last().unwrap().role, "build-arg");
+            assert_eq!(p.line, 3);
+        }
+
+        // ENV wins over an ARG default of the same name, and its value is
+        // not tracked: abstain.
+        for env in ["ENV UID=1000", "ENV UID 1000", "ENV A=b UID=1000"] {
+            let p = final_user(&format!("FROM alpine:3.20\nARG UID=0\n{env}\nUSER $UID\n"));
+            assert_eq!(p.resolution, Resolution::Unresolvable, "{env}");
+            assert_eq!(p.resolved_value, None, "{env}");
+        }
+
+        // A later unresolvable USER is not hidden by an earlier literal one.
+        let p = final_user("FROM alpine:3.20\nUSER app\nUSER $RUN_AS\n");
+        assert_eq!(p.resolution, Resolution::Unresolvable);
+    }
+
+    #[test]
+    fn user_text_that_is_not_an_instruction_is_not_read() {
+        // A continuation line of a RUN.
+        let p =
+            final_user("FROM alpine:3.20\nUSER app\nRUN adduser \\\n  USER root \\\n  && true\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 2);
+
+        // A comment inside a continuation does not end it.
+        let p = final_user("FROM alpine:3.20\nUSER app\nRUN true \\\n  # note\n  USER root\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+
+        // A heredoc body.
+        let p = final_user(
+            "FROM alpine:3.20\nUSER app\nRUN <<EOF\nUSER root\nEOF\nCOPY <<-\"CONF\" /etc/app.conf\nUSER root\n\tCONF\n",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 2);
+
+        // An instruction after the heredoc ends is read again.
+        let p = final_user("FROM alpine:3.20\nRUN <<EOF\necho hi\nEOF\nUSER app\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 5);
+
+        // A shell `<<` that is not a heredoc does not swallow the file.
+        let p = final_user("FROM alpine:3.20\nRUN echo $((1 << 2))\nUSER app\n");
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+
+        // With the backtick escape directive, a trailing backslash is a path.
+        let p = final_user(
+            "# escape=`\nFROM mcr.microsoft.com/windows/nanoserver:ltsc2022\nWORKDIR C:\\app\\\nUSER ContainerUser\n",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert_eq!(p.line, 4);
+    }
+
+    #[test]
+    fn a_from_on_a_continuation_line_is_not_a_stage() {
+        let got = retrieve(
+            "Dockerfile",
+            "FROM alpine:3.20\nRUN echo \\\n  from ubuntu:latest\nUSER app\n",
+        );
+        assert_eq!(got.packets.len(), 2, "{:?}", got.packets);
+        assert_eq!(find(&got, "stage:0", USER_KEY).line, 4);
+    }
+
+    #[test]
+    fn a_user_with_no_value_abstains() {
+        let p = final_user("FROM alpine:3.20\nUSER\n");
+        assert_eq!(p.resolution, Resolution::Unresolvable);
+        assert_eq!(p.resolved_value, None);
     }
 }

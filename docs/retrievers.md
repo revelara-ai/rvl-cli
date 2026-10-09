@@ -211,12 +211,12 @@ The packet lists what the retriever saw, in `const_args`:
 | Entry | `how` | Meaning |
 | --- | --- | --- |
 | `bound_class` | `aggregate` | `pool`, `queue`, `cache`, or `read`. |
-| A constructor argument (`arg0`, or its keyword) or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
+| A constructor argument (`arg0`, or its keyword), a property of an options object (`max`), or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
 | The same | `name` | The value is not a constant (`cfg.Max`). The packet carries the source text. The scanner credits it as a bound and never resolves it. |
 | A call that the argument of a read passes through (`io.LimitReader`) | `call` | Go reads only. |
 | A method called on the same type somewhere else in the module | `type` | Only on a value that leaves the function. |
 | `bound_escapes` | `aggregate` | The value leaves the constructing function: it is returned, stored, passed to a call, or has no name. |
-| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`). |
+| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`, `new Pool({ ...base })`, `new Pool(config)`). |
 
 A retriever does not decide which entry is a bound. A `construction_bounds`
 spec does. For one type and class, the spec gives the names that bound the
@@ -243,14 +243,22 @@ class and control, with at most five sites.
 | --- | --- |
 | `goindex` | `pool`: `database/sql` `Open`, `OpenDB`. `cache`: `github.com/patrickmn/go-cache` `New`. `read`: `io.ReadAll`, `io/ioutil.ReadAll`. The list is `bound_constructors` in `helpers/goindex/extractor_corpus.json`. |
 | `pyindex` | `queue`: the `queue` and `asyncio` queue classes, `multiprocessing.Queue`, `collections.deque`. `pool`: `redis.ConnectionPool`, `redis.BlockingConnectionPool`, `sqlalchemy.create_engine`, `psycopg_pool.ConnectionPool`. `cache`: `functools.lru_cache`, `functools.cache`. |
+| `tsindex` | `pool`: `pg.Pool`. `cache`: `lru-cache.LRUCache`. The list is `BOUND_CONSTRUCTORS` in `helpers/tsindex/tsindex.js`. |
 | The other retrievers | Nothing yet. |
 
-Three limits:
+A retriever reports a construction that has a bound, too. That packet lists
+the bound (`max` with the value `10`), and the spec reads it as bounded.
+
+Four limits:
 
 - `goindex` does not report `make(chan T)`. A Go channel with no capacity
   blocks the sender until a receiver is ready. It is not an unbounded queue.
 - `pyindex` does not report reads. It has no receiver types, so it cannot tell
   `response.read()` from a read that has a limit.
+- `tsindex` reads the options only where the construction writes them. An
+  options object that is built in another statement (`new Pool(config)`) is
+  reported as `bound_opaque`. `tsindex` does not report `bound_escapes`: a
+  `pg.Pool` and an `lru-cache` take their bound only in the constructor.
 - The retriever reads one function. For a value that leaves the function, the
   only other evidence is a method call on the same type in the same module.
 
@@ -406,7 +414,7 @@ first occurrence.
 
 | Class | Shape | Identity |
 | --- | --- | --- |
-| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught (`Exception`, `BaseException`, `System.Exception`), or `bare` for `except:` and `catch { }`. |
+| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught. Python: `Exception`, `BaseException`, or `bare` for `except:`. Java: `java.lang.Exception`, `java.lang.Throwable`. C#: `System.Exception`, or `bare` for `catch { }`. |
 | `discarded_error` | A call result of type error is assigned to a discard (`_ = f.Close()`). | The callee: `os.Remove`, `os.File.Close`. `func value` when the call goes through a function value. |
 | `blocking_in_async` | A blocking function is called in the text of an async function. | The callee: `time.sleep`, `requests.get`. |
 | `sync_over_async` | A function waits synchronously for async work. | The call that waits: `asyncio.run`, `System.Threading.Tasks.Task.Result`. |
@@ -486,6 +494,7 @@ waiver or `rvl suppress` uses that name.
 | --- | --- |
 | `goindex` | `discarded_error`, `retry_shape`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. Go has no typed catch and no async functions, and a Go ORM does not load a relation through the receiver, so it has no other class. |
 | `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`, `retry_shape`, `loop_variable_query`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. |
+| `javaindex` | `overbroad_catch`. |
 | `csindex` | `overbroad_catch`, `sync_over_async`. |
 | The other retrievers | Nothing yet. |
 
@@ -538,6 +547,11 @@ Limits:
 - A call in a lambda or in a nested function that is not async is not
   reported as `blocking_in_async`. It runs where that function is called, for
   example in a worker thread.
+- `javaindex` reads the caught type from the compiler, not from the name. A
+  class of the repository with the name `Exception` is not reported. In a
+  multi-catch that names the two root types, the identity is
+  `java.lang.Throwable`. A `throw` at any position in the handler, a lambda
+  included, keeps the handler out.
 - For `retry_shape`, `goindex` reads loops only. It does not read the
   configuration of a retry library. `pyindex` reads loops and `tenacity`
   configurations. In Python, the failure path is an exception: a loop that

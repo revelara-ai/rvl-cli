@@ -105,6 +105,16 @@ propagation.
   `catch_clause` identity (the Java sibling of `except_handler` /
   `recover_block`), `func: "catch"`.
 
+- **`misuse_shape`** — AGGREGATES, one per (enclosing function, class,
+  identity), with `misuse_class`/`misuse_count` in `const_args`
+  (`how: "aggregate"`). One class: `overbroad_catch`, a catch clause whose
+  type is `java.lang.Exception` or `java.lang.Throwable`, with the caught
+  type as the identity and `func: "catch"`. The type is checker-resolved,
+  so a local class with the name `Exception` is not reported. A handler
+  with a `throw` in it propagates the error and is not reported. A handler
+  that the emission lane counts as a `catch_clause` swallow is not reported
+  again. See "Misuse shapes" in `docs/retrievers.md`.
+
 ### Client-detection policy (volume control, fully mechanical)
 
 Java always resolves the JDK platform, so "the receiver resolved" is not by
@@ -138,7 +148,7 @@ From this directory, with a JDK:
 Plain Java, no JUnit (the helper's toolchain rule is "a JDK and nothing
 else"). It spawns the helper as a subprocess exactly the way rvl does
 and asserts: schema negotiation, `site_key` formula + uniqueness, the
-typed/attributed/unresolved tier behavior, noise suppression, all three site
+typed/attributed/unresolved tier behavior, noise suppression, all four site
 kinds, `const_args` evidence, the `repo_config` constructions, and
 **retrieval invariance** — a full load and a `--files` incremental reload
 emit identical packets for the same file (all units stay in the analysis in
@@ -149,3 +159,8 @@ hand-written minimal source stubs (the analog of tsindex's vendored `.d.ts`
 stubs): they let the checker exercise the fully-typed third-party path with
 zero network, while `jedis`/`quartz`/`slf4j`/Spring imports are deliberately
 stub-less to exercise the import-attribution path.
+
+`testdata/fixture_misuse/` holds one method per rule of the misuse-shape
+inventory: the catches of a root type, and beside them the forms that must
+not be emitted (a narrow type, a handler that throws, a swallow, and a local
+class with the name `Exception`).

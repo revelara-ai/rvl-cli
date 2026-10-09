@@ -87,7 +87,8 @@ The orchestrator uses it to:
   },
   "sites": [
     { "site_id": "...", "snapshot_id": "...", "verdict": "violates",
-      "reason": "no bound anywhere", "class": "net/http.Client.Do" }
+      "reason": "no bound anywhere", "class": "net/http.Client.Do",
+      "scope": "runtime" }
   ],
   "undecided": [
     { "site": "queue/worker.go:88", "class": "redis.pipeline",
@@ -119,7 +120,17 @@ The orchestrator uses it to:
   The eval harness' per-site (verdict, reason) contract lives here;
   `undecided` and `covered_classes` are precomputed projections of these rows
   so an orchestrator never needs to know which verdict strings count as
-  resolved.
+  resolved. Each row also has `scope` (`runtime` | `migration` |
+  `test_support` | `dev_only` | `backfill`), the same value an `undecided`
+  row has for the site. `undecided` has only the abstains, so `scope` on a
+  `sites` row is how a consumer that samples resolved rows (a judge that
+  replays `violates` rows, for example) tells a migration from request-path
+  code. The scope is a fact about where the file is, not a verdict: the
+  engine derives it from the path, and from the manifest when the manifest
+  declares a build hook. A path that no rule matches is `runtime`. A Django
+  `management/commands/` module is one of these. A document from a release
+  that does not write the field has no `scope` key: read that as "not
+  classified", not as `runtime`.
 - `coverage` mirrors the COVERAGE block one-to-one, abstains broken out by
   the lever that closes each (no-spec = mint, bounds = retrieval
   depth/declared bounds, judge = per-site judge). The roll-calls are included
@@ -204,7 +215,8 @@ The orchestrator uses it to:
     lane did not run.
 - `structure` is the repo-structure lane: one eval row per control (RC-033,
   RC-057, RC-058, RC-034, RC-070, RC-006) in that order, with the same five
-  fields as a `sites` row. `site_id` is always `repo`, because the lane
+  fields as a `sites` row and no `scope`: a row is about the repository, not
+  about a file. `site_id` is always `repo`, because the lane
   judges the repository and not a location, so `class`
   (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
   `satisfies`, `abstain` and `not_applicable` included, and the rows are
