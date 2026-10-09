@@ -36,7 +36,7 @@ the part that must not be built again.
 | 7a | M1: container without requests, or without a memory limit | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:352`, `crates/rvl-config/src/key_ledger.rs:136` | None needed | `kubernetes container.resources.requests.cpu` and `kubernetes container.resources.requests.memory` on RC-024, `kubernetes container.resources.limits.memory` on RC-067. All expect `present`. |
 | 7b | M1: container without a CPU limit | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:354`, `crates/rvl-config/src/key_ledger.rs:135` | `po-av01j.44` | `kubernetes container.resources.limits.cpu` is emitted and has no spec. A CPU limit is contested practice, so this needs a decision before a spec. |
 | 8a | H1: swallowed error | SHIPPED | `helpers/goindex/emission.go:360`, `crates/rvl-emission/src/lib.rs:109` | None needed | The G4 emission lane. The Go, Python, and TypeScript helpers emit swallow aggregates, and three `violates` specs map them to RC-027. The finding is one advisory row per control with at most five evidence sites. |
-| 8b | H2/H3: overbroad catch, discarded error value | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `helpers/goindex/misuse.go:134`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `overbroad_catch` and the Go helper emits `discarded_error`, as `misuse_shape` aggregates. No `misuse_shapes` spec is in the corpus, so the lane judges nothing yet. A handler that 8a counts as a swallow is not reported again. The other helpers do not emit the packet. |
+| 8b | H2/H3: overbroad catch, discarded error value | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `helpers/goindex/misuse.go:134`, `helpers/javaindex/javaindex.java:1047`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-08 by `po-6c0v8.17`. The Python and Java helpers emit `overbroad_catch` and the Go helper emits `discarded_error`, as `misuse_shape` aggregates. The Java identities are `java.lang.Exception` and `java.lang.Throwable`. No `misuse_shapes` spec is in the corpus, so the lane judges nothing yet. A handler that 8a counts as a swallow is not reported again. The other helpers do not emit the packet. |
 | 9 | F2: cache with no eviction, TTL, or size cap | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:87`, `helpers/pyindex/pyindex.py:1367`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Same packet as M6. Emitted for go-cache, `functools.lru_cache`, and `functools.cache`. |
 | 10a | K2: container without a liveness or readiness probe | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:368`, `crates/rvl-config/src/key_ledger.rs:133` | None needed | `kubernetes container.liveness-probe` and `kubernetes container.readiness-probe` on RC-020. |
 | 10b | K2: container without a startup probe | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:370`, `crates/rvl-config/src/key_ledger.rs:140` | `po-av01j.44` | `kubernetes container.startup-probe` is emitted and has no spec. |
@@ -106,6 +106,10 @@ recomputed.
 SHIPPED. The manifest carries the path of the liveness probe, and the scan
 joins it to the handler in the same repository. Three retriever gaps stay
 (12c, 18b, 19c).
+
+**Update, 2026-10-08 (`po-6c0v8.17`).** The Java helper emits
+`overbroad_catch` (row 8b). The status of the row does not change: no spec
+judges the class.
 
 ## What to build, and what not to build
 
