@@ -492,6 +492,33 @@ const WEAK_VERBS: &[&str] = &[
     "exec", "wait", "recv",
 ];
 
+/// Standard-library ownership and reference wrappers, each with the accessor
+/// that hands back what it already holds. The accessor does no I/O, and every
+/// template instantiation would otherwise be its own client type (po-s7tqc).
+/// `__shared_ptr` and `__weak_ptr` are the libstdc++ bases that declare the
+/// members. `std::future<T>::get` is absent on purpose: it blocks.
+const STD_WRAPPER_ACCESSORS: &[(&str, &str)] = &[
+    ("unique_ptr", "get"),
+    ("shared_ptr", "get"),
+    ("__shared_ptr", "get"),
+    ("weak_ptr", "lock"),
+    ("__weak_ptr", "lock"),
+    ("reference_wrapper", "get"),
+    ("optional", "value"),
+];
+
+/// True for an accessor of a standard-library wrapper. `namespace` is the
+/// class's namespace path and `class` its template name, so an instantiation
+/// matches whatever its arguments are. The inline namespaces of the standard
+/// libraries (`std::__1`, `std::__cxx11`) count as `std`; a user's own
+/// `app::unique_ptr` does not.
+fn std_wrapper_accessor(namespace: &str, class: &str, method: &str) -> bool {
+    let mut parts = namespace.split("::");
+    parts.next() == Some("std")
+        && parts.all(|p| p.starts_with("__"))
+        && STD_WRAPPER_ACCESSORS.contains(&(class, method))
+}
+
 // --- G4 emission identities ---
 
 /// Mirrors `rvl_core::SITE_KIND_EMISSION`.
@@ -1136,6 +1163,13 @@ unsafe fn handle_call(call: CXCursor, st: &mut WalkState) {
                     return; // C++ without a db is a documented abstention
                 }
                 let class_cur = clang_getCursorSemanticParent(callee);
+                if std_wrapper_accessor(
+                    &namespace_path(class_cur),
+                    &cx_string(clang_getCursorSpelling(class_cur)),
+                    &method,
+                ) {
+                    return; // hands back what the wrapper holds: no I/O
+                }
                 let type_name = cx_string(clang_getTypeSpelling(clang_getCursorType(class_cur)));
                 let is_virtual = clang_CXXMethod_isVirtual(callee) != 0;
                 let lower = method.to_ascii_lowercase();
@@ -1757,6 +1791,40 @@ mod tests {
             emission_framework(true, "std::stringstream", "stream"),
             None
         );
+    }
+
+    #[test]
+    fn std_wrapper_accessors_are_named_by_identity() {
+        for (class, method) in [
+            ("unique_ptr", "get"),
+            ("shared_ptr", "get"),
+            ("__shared_ptr", "get"),
+            ("weak_ptr", "lock"),
+            ("reference_wrapper", "get"),
+            ("optional", "value"),
+        ] {
+            assert!(
+                std_wrapper_accessor("std", class, method),
+                "{class}::{method}"
+            );
+        }
+        // libc++ and libstdc++ inline namespaces are still `std`.
+        assert!(std_wrapper_accessor("std::__1", "unique_ptr", "get"));
+        assert!(std_wrapper_accessor("std::__cxx11", "optional", "value"));
+        // A future's get blocks; it is a client call.
+        assert!(!std_wrapper_accessor("std", "future", "get"));
+        assert!(!std_wrapper_accessor("std", "shared_future", "get"));
+        // The accessor is tied to its own wrapper, and the wrapper to `std`.
+        assert!(!std_wrapper_accessor("std", "unique_ptr", "reset"));
+        assert!(!std_wrapper_accessor("std", "optional", "get"));
+        assert!(!std_wrapper_accessor("app", "unique_ptr", "get"));
+        assert!(!std_wrapper_accessor("app::std", "unique_ptr", "get"));
+        assert!(!std_wrapper_accessor(
+            "std::experimental",
+            "optional",
+            "value"
+        ));
+        assert!(!std_wrapper_accessor("", "unique_ptr", "get"));
     }
 
     #[test]

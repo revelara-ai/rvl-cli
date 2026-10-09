@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "arguments": ["c++", "-std=c++17", "-isystem", "../sysroot", "-c", "src/owners.cpp"],
+    "file": "src/owners.cpp"
+  }
+]

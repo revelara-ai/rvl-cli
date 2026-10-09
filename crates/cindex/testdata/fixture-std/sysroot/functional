@@ -1,0 +1,18 @@
+// Vendored STUB of <functional>: std::reference_wrapper only.
+#ifndef FIXTURE_STD_FUNCTIONAL
+#define FIXTURE_STD_FUNCTIONAL
+
+namespace std {
+
+template <typename T>
+class reference_wrapper {
+ public:
+  T &get() const noexcept { return *ptr_; }
+
+ private:
+  T *ptr_ = nullptr;
+};
+
+}  // namespace std
+
+#endif  // FIXTURE_STD_FUNCTIONAL

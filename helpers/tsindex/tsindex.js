@@ -219,6 +219,120 @@ function isJobCtor(clientType) {
   return JOB_CTOR_TYPES.some((e) => clientType === e.pkg + '.' + e.type);
 }
 
+// ---------------------------------------------------------------------------
+// Unsized-construction inventory (po-6c0v8.13).
+//
+// A connection pool or a cache was built here. One packet per construction,
+// on the SAME stream, stamped site_kind: "unsized_construction". The
+// retrieval/judgment split holds: the packet lists the constructor's options
+// as OBSERVED, and a construction-bound spec downstream says which of them is
+// a bound and which values of it mean "no limit". So a bounded construction
+// is still a packet: one that lists its bound.
+//
+// TypeScript has no keyword arguments; these constructors take an options
+// object, and each property written in it is reported under its own name
+// (`max`), the way pyindex reports a keyword. A constant is reported as a
+// value. Anything else (max: settings.poolSize) is reported with how: "name"
+// -- its source text, never a resolved value.
+//
+// Detection is TYPE-RESOLVED: the constructed class must resolve to a table
+// entry. A local class that only looks like one is skipped.
+// ---------------------------------------------------------------------------
+
+// Mirrors rvl_core::SITE_KIND_UNSIZED.
+const SITE_KIND_UNSIZED = 'unsized_construction';
+
+// Constructed `<pkg>.<Type>` -> class. Like the I/O-method allowlists this
+// selects WHICH sites to surface, never what they mean.
+const BOUND_CONSTRUCTORS = new Map([
+  ['pg.Pool', 'pool'],
+  ['lru-cache.LRUCache', 'cache'],
+]);
+
+// Packages whose default export IS a table entry. On an uninstalled tree a
+// default import has only its local name (`import LRU from 'lru-cache'`
+// resolves to `lru-cache.LRU`), so the package names the class and the key
+// stays the one the checker gives.
+const BOUND_DEFAULT_EXPORTS = new Map([['lru-cache', 'lru-cache.LRUCache']]);
+
+// boundConstructorType returns the table key a `new` expression's class
+// resolves to, with its resolution, or null when it is not in the table.
+function boundConstructorType(node, checker, program) {
+  const callee = node.expression;
+  if (!callee) return null;
+  // Resolved on the new-expression, not the callee: syntax then names the
+  // class through a namespace import too (`new pg.Pool()` -> pg.Pool).
+  const res = resolveClientType(node, checker, program);
+  if (!res.resolved) return null;
+  if (BOUND_CONSTRUCTORS.has(res.clientType)) return res;
+  if (res.tier !== 'medium' || !ts.isIdentifier(callee)) return null;
+  const target = aliasTarget(symbolAt(callee, checker), checker);
+  const bind = target && target.bind;
+  if (!bind || bind.kind !== 'default') return null;
+  const clientType = BOUND_DEFAULT_EXPORTS.get(bind.pkg);
+  return clientType ? { ...res, clientType } : null;
+}
+
+// boundObservation reports one option as an observation: a value when it is
+// a constant, a NAME (its source text) when it is not.
+function boundObservation(index, name, node, checker) {
+  const lit = literalText(node);
+  if (lit !== null) return { index, name, value: lit, how: 'literal' };
+  const named = namedConstantText(node, checker);
+  if (named !== null) return { index, name, value: named, how: 'named_constant' };
+  return { index, name, value: cap(node.getText()), how: 'name' };
+}
+
+// isNumberTyped reports whether the checker types an expression as a number:
+// the bare-number form of a limit (`new LRU(n)`), as opposed to an options
+// object held in a variable.
+function isNumberTyped(node, checker) {
+  try {
+    return !!(checker.getTypeAtLocation(node).flags & ts.TypeFlags.NumberLike);
+  } catch (_e) {
+    return false;
+  }
+}
+
+// boundConstArgs lists what a construction's arguments say, after the
+// bound_class entry. Options that are not written out (a spread, a computed
+// key, an options object built somewhere else) cannot be listed, so they are
+// named in one bound_opaque entry: a bound may be among them.
+function boundConstArgs(cls, node, checker) {
+  const out = [{ index: 0, name: 'bound_class', value: cls, how: 'aggregate' }];
+  const opaque = [];
+  const args = node.arguments || [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = ts.isParenthesizedExpression(args[i]) ? args[i].expression : args[i];
+    if (ts.isSpreadElement(arg)) {
+      opaque.push(arg.getText());
+    } else if (ts.isObjectLiteralExpression(arg)) {
+      for (const p of arg.properties) {
+        const written = !ts.isSpreadAssignment(p) && !(p.name && ts.isComputedPropertyName(p.name));
+        const name = written ? propertyName(p) : '';
+        if (!name) {
+          opaque.push(p.getText());
+        } else if (ts.isPropertyAssignment(p)) {
+          out.push(boundObservation(i, name, p.initializer, checker));
+        } else if (ts.isShorthandPropertyAssignment(p)) {
+          out.push(boundObservation(i, name, p.name, checker));
+        } else {
+          // A method or an accessor: the option is set, to nothing constant.
+          out.push({ index: i, name, value: cap(p.getText()), how: 'name' });
+        }
+      }
+    } else {
+      const seen = boundObservation(i, 'arg' + i, arg, checker);
+      if (seen.how !== 'name' || isNumberTyped(arg, checker)) out.push(seen);
+      else opaque.push(arg.getText());
+    }
+  }
+  if (opaque.length) {
+    out.push({ index: 0, name: 'bound_opaque', value: cap(opaque.join(', ')), how: 'aggregate' });
+  }
+  return out;
+}
+
 // G2 server-entry detection (po-av01j.3).
 //
 // Server-entry sites (HTTP handler registrations, route definitions,
@@ -1707,6 +1821,9 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
         // G3: some constructions ARE handler registrations (bullmq Worker).
         const rec = jobSiteFromNew(node, sf, relPath, snapshot, checker, program);
         if (rec) records.push(rec);
+        // Unsized-construction inventory: pools and caches.
+        const unsized = unsizedSiteFromNew(node, sf, relPath, snapshot, checker, program);
+        if (unsized) records.push(unsized);
       } else if (ts.isMethodDeclaration(node)) {
         // G2: NestJS route decorators register the decorated class method.
         records.push(...nestRouteRecords(node, sf, relPath, snapshot, checker));
@@ -2080,6 +2197,46 @@ function jobSiteFromNew(node, sf, relPath, snapshot, checker, program) {
     provenance: {
       client_type_resolved: true,
       confidence_tier: tier,
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// unsizedSiteFromNew emits the unsized-construction record for a `new` of a
+// class in BOUND_CONSTRUCTORS, or null for any other new-expression. `func`
+// is the class name, as in goindex and pyindex; `receiver` is empty, since a
+// construction has none.
+function unsizedSiteFromNew(node, sf, relPath, snapshot, checker, program) {
+  const res = boundConstructorType(node, checker, program);
+  if (!res) return null;
+
+  const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit()
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: line + 1,
+    symbol: enclosingFunction(node).name,
+    func: res.clientType.slice(res.clientType.lastIndexOf('.') + 1),
+    receiver: '',
+    client_type: res.clientType,
+    client_version: res.version,
+    snippet: cap(node.getText()),
+    enclosing_function_body: '',
+    callers: [],
+    callees: [],
+    const_args: boundConstArgs(BOUND_CONSTRUCTORS.get(res.clientType), node, checker),
+    macro_expansion: false,
+    site_kind: SITE_KIND_UNSIZED,
+    client_construction: [],
+    provenance: {
+      client_type_resolved: true,
+      confidence_tier: res.tier,
       callers_total: 0,
       callers_included: 0,
       callees_total: 0,

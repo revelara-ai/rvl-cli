@@ -86,7 +86,10 @@ impl Fixture {
 #[test]
 fn a_helper_that_differs_from_the_shipped_copy_is_named_as_drift() {
     if !python3_present() {
-        eprintln!("skipping: no python3 on this machine");
+        rvl_testgate::skip(
+            "a_helper_that_differs_from_the_shipped_copy_is_named_as_drift",
+            "no python3 on this machine",
+        );
         return;
     }
     let f = Fixture::new();
@@ -118,7 +121,10 @@ fn a_helper_that_differs_from_the_shipped_copy_is_named_as_drift() {
 #[test]
 fn an_identical_copy_of_the_shipped_helper_is_not_drift() {
     if !python3_present() {
-        eprintln!("skipping: no python3 on this machine");
+        rvl_testgate::skip(
+            "an_identical_copy_of_the_shipped_helper_is_not_drift",
+            "no python3 on this machine",
+        );
         return;
     }
     let f = Fixture::new();
@@ -166,7 +172,10 @@ fn a_helper_that_predates_the_handshake_is_named_as_older() {
 #[test]
 fn a_native_helper_that_reports_the_shipped_version_is_not_drift() {
     if !python3_present() {
-        eprintln!("skipping: no python3 on this machine");
+        rvl_testgate::skip(
+            "a_native_helper_that_reports_the_shipped_version_is_not_drift",
+            "no python3 on this machine",
+        );
         return;
     }
     let reply = Command::new("python3")
