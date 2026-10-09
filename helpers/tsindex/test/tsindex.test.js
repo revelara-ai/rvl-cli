@@ -1282,7 +1282,12 @@ test('a script-free install resolves the abstain where the plain install fails',
     }
   };
   const plain = npm();
-  if (plain === null) return t.skip('npm is not on PATH');
+  if (plain === null) {
+    // CI provisions npm and sets this, so there a skip is a lane nobody ran.
+    const required = process.env.RVLSCAN_REQUIRE_ENGINES;
+    assert.ok(!required || required === '0', 'npm is not on PATH and RVLSCAN_REQUIRE_ENGINES is set');
+    return t.skip('npm is not on PATH');
+  }
   assert.notStrictEqual(plain, 0, 'the dependency must fail to build for this to prove anything');
   abstainMessage(app);
 

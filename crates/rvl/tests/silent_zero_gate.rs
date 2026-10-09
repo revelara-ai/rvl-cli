@@ -327,7 +327,10 @@ fn require_goindex() -> bool {
     if goindex_binary().is_some() {
         return true;
     }
-    eprintln!("SKIP: no goindex binary next to the rvl under test (build it with `make install`)");
+    rvl_testgate::skip(
+        "require_goindex",
+        "no goindex binary next to the rvl under test (build it with `make install`)",
+    );
     false
 }
 
