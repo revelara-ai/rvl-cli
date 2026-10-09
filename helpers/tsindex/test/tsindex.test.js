@@ -1294,3 +1294,102 @@ test('a script-free install resolves the abstain where the plain install fails',
   );
   assert.strictEqual(cfg.dependency_trees_uninstalled, 0);
 });
+
+// --- Misuse shapes: missing_await (po-6c0v8.16) ------------------------------
+//
+// A call whose type is a thenable, made as a statement, is the missing_await
+// fact. It rides the same stream as an AGGREGATE stamped
+// site_kind: "misuse_shape": one packet per (enclosing function, class,
+// identity), with the class and the count in const_args.
+
+function misuseRecords(root) {
+  const recs = root ? retrieveFrom(root).sites : retrieveRecords();
+  return recs.filter((r) => r.site_kind === 'misuse_shape');
+}
+
+function misuseIn(records, symbol, identity) {
+  return records.filter((r) => r.symbol === symbol && r.client_type === identity);
+}
+
+test('a floating promise is one missing_await packet per function and identity', () => {
+  const misuse = misuseRecords();
+  const promise = misuseIn(misuse, 'floats', 'promise');
+  assert.strictEqual(promise.length, 1, JSON.stringify(misuse));
+  const rec = promise[0];
+  assert.strictEqual(constByName(rec, 'misuse_class'), 'missing_await');
+  // save(id), audit('saved'), (save(id + 1)), and the one-argument .then
+  assert.strictEqual(constByName(rec, 'misuse_count'), '4');
+  for (const a of rec.const_args) assert.strictEqual(a.how, 'aggregate');
+  // The line and the snippet are those of the first occurrence.
+  assert.strictEqual(rec.file_path, 'src/floating.ts');
+  assert.strictEqual(rec.snippet, 'save(id)');
+  assert.strictEqual(rec.func, 'save');
+  const src = fs.readFileSync(path.join(FIXTURE_ROOT, 'src', 'floating.ts'), 'utf8').split('\n');
+  assert.strictEqual(src[rec.line_number - 1].trim(), 'save(id);');
+  // An aggregate carries no body and no call graph, and it is not a client.
+  assert.strictEqual(rec.receiver, '');
+  assert.strictEqual(rec.enclosing_function_body, '');
+  assert.deepStrictEqual(rec.callers, []);
+  assert.deepStrictEqual(rec.callees, []);
+  assert.deepStrictEqual(rec.client_construction, []);
+  assert.strictEqual(rec.macro_expansion, false);
+  assert.strictEqual(rec.packet_schema, 2);
+  assert.strictEqual(rec.lang, 'typescript');
+  assert.strictEqual(rec.provenance.client_type_resolved, true);
+  assert.strictEqual(rec.site_key, `${rec.file_path}:${rec.line_number}:promise:save`);
+});
+
+test('a floating thenable that is not a Promise has its own identity', () => {
+  const misuse = misuseRecords();
+  const thenable = misuseIn(misuse, 'floats', 'thenable');
+  assert.strictEqual(thenable.length, 1, JSON.stringify(misuse));
+  assert.strictEqual(constByName(thenable[0], 'misuse_class'), 'missing_await');
+  assert.strictEqual(constByName(thenable[0], 'misuse_count'), '1');
+  assert.strictEqual(thenable[0].snippet, "rows('users')");
+  assert.strictEqual(thenable[0].func, 'rows');
+});
+
+test('a floating promise from a method call is reported in its own function', () => {
+  const close = misuseIn(misuseRecords(), 'close', 'promise');
+  assert.strictEqual(close.length, 1);
+  assert.strictEqual(constByName(close[0], 'misuse_count'), '1');
+  assert.strictEqual(close[0].func, 'flush');
+});
+
+test('a promise that is awaited, returned, assigned, voided or handled is not a fact', () => {
+  const misuse = misuseRecords();
+  // `bounded` holds the bounded form of each identity, a call that is not a
+  // thenable, and a call with no type. `settled` returns from an arrow body.
+  for (const symbol of ['bounded', 'settled']) {
+    assert.deepStrictEqual(misuse.filter((r) => r.symbol === symbol), []);
+  }
+  // The fixture has no other floating call: these four packets are all.
+  assert.deepStrictEqual(
+    misuse.map((r) => `${r.symbol}:${r.client_type}`).sort(),
+    ['close:promise', 'floats:promise', 'floats:thenable', 'generic:promise'],
+  );
+});
+
+test('a generic callee is judged at each call, not by the first call seen', () => {
+  // pass(id) comes first and is not a thenable; pass(save(id)) is. An answer
+  // cached for the callee would make the result depend on the order.
+  const generic = misuseIn(misuseRecords(), 'generic', 'promise');
+  assert.strictEqual(generic.length, 1);
+  assert.strictEqual(constByName(generic[0], 'misuse_count'), '1');
+  assert.strictEqual(generic[0].snippet, 'pass(save(id))');
+});
+
+test('misuse packets do not leak into the client lane or the emission lane', () => {
+  const others = retrieveRecords().filter(
+    (r) => r.file_path === 'src/floating.ts' && r.site_kind !== 'misuse_shape',
+  );
+  assert.deepStrictEqual(others, []);
+});
+
+test('an uninstalled tree reports the same floating promises of in-repo functions', (t) => {
+  const got = misuseRecords(fixtureWithoutNodeModules(t));
+  assert.deepStrictEqual(
+    got.map((r) => `${r.symbol}:${r.client_type}:${constByName(r, 'misuse_count')}`).sort(),
+    ['close:promise:1', 'floats:promise:4', 'floats:thenable:1', 'generic:promise:1'],
+  );
+});

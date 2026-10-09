@@ -1286,6 +1286,168 @@ function emissionRecord(agg, relPath, snapshot) {
 }
 
 // ---------------------------------------------------------------------------
+// Misuse-shape inventory (po-6c0v8.16).
+//
+// A shape of code that is wrong where it stands rides the SAME packet stream,
+// stamped site_kind: "misuse_shape", as an AGGREGATE like an emission point:
+// one packet per (enclosing function, class, identity), with the class and
+// the count in const_args (misuse_class / misuse_count, how: "aggregate").
+//
+// tsindex reads one class, `missing_await`: a call made as a statement whose
+// type is a thenable. Nothing holds the result, so its rejection has no
+// handler and its work is not finished when the caller continues. The
+// identity is `promise` for the Promise of the standard library and
+// `thenable` for any other type with a `then` member (a query builder), so
+// a spec can judge one and allow the other.
+//
+// A promise that is awaited, returned, assigned or marked with `void` is not
+// a statement call, and is not a fact. A chain that ends in a rejection
+// handler -- `.catch(fn)` or `.then(ok, fail)` -- is not a fact either.
+// Whether the shape is a finding is a misuse spec downstream.
+// ---------------------------------------------------------------------------
+
+// Mirrors rvl_core::SITE_KIND_MISUSE.
+const SITE_KIND_MISUSE = 'misuse_shape';
+
+// thenableIdentity names the awaitable in a type: `promise`, `thenable`, or
+// null. Unlike callReturnsThenable this fails CLOSED. There a wrong "no"
+// drops a client site; here a wrong "yes" is a false report, so `any`,
+// `unknown` and an unreadable type are not a fact. A union counts when any
+// constituent is awaitable (`T | Promise<T>`, and `Promise<T> | undefined`
+// from an optional call).
+function thenableIdentity(type, program, checker) {
+  if (!type || type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return null;
+  let identity = null;
+  try {
+    const parts = type.isUnion && type.isUnion() ? type.types : [type];
+    for (const part of parts) {
+      if (!checker.getPropertyOfType(part, 'then')) continue;
+      const sym = part.getSymbol && part.getSymbol();
+      const std =
+        sym &&
+        (sym.name === 'Promise' || sym.name === 'PromiseLike') &&
+        (sym.declarations || []).some((d) =>
+          program.isSourceFileDefaultLibrary(d.getSourceFile()),
+        );
+      if (std) return 'promise';
+      identity = 'thenable';
+    }
+  } catch (_e) {
+    return null;
+  }
+  return identity;
+}
+
+// Keyed by the callee's symbol. The checker materializes a type per call
+// site, and that is the cost callReturnsThenable's cache exists to avoid.
+// The answer is reused only where it cannot differ between calls: the callee
+// has one declaration, and its declared return type has no type parameter in
+// it. A generic or overloaded callee is computed at each call, so the result
+// never depends on which call the helper saw first.
+const _floatingCache = new Map();
+
+function floatingIdentity(call, program, checker) {
+  const callee = call.expression;
+  const nameNode = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
+  let sym = null;
+  try {
+    if (ts.isIdentifier(nameNode) || ts.isPrivateIdentifier(nameNode)) {
+      sym = checker.getSymbolAtLocation(nameNode) || null;
+      if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+    }
+  } catch (_e) {
+    sym = null;
+  }
+  if (sym && _floatingCache.has(sym)) return _floatingCache.get(sym);
+  try {
+    const decls = (sym && sym.declarations) || [];
+    if (decls.length === 1 && ts.isFunctionLike(decls[0])) {
+      const sig = checker.getSignatureFromDeclaration(decls[0]);
+      const ret = sig && checker.getReturnTypeOfSignature(sig);
+      const parts = ret && ret.isUnion && ret.isUnion() ? ret.types : [ret];
+      if (ret && !parts.some((p) => p.flags & ts.TypeFlags.Instantiable)) {
+        const answer = thenableIdentity(ret, program, checker);
+        _floatingCache.set(sym, answer);
+        return answer;
+      }
+    }
+    return thenableIdentity(checker.getTypeAtLocation(call), program, checker);
+  } catch (_e) {
+    return null;
+  }
+}
+
+// rejectionHandled reports whether a statement call is the end of a chain
+// that handles the rejection: `.catch(fn)`, `.then(ok, fail)`, or a
+// `.finally(fn)` on such a chain.
+function rejectionHandled(call) {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee)) return false;
+  const name = callee.name.text;
+  if (name === 'catch') return call.arguments.length >= 1;
+  if (name === 'then') return call.arguments.length >= 2;
+  if (name === 'finally') {
+    let inner = callee.expression;
+    while (ts.isParenthesizedExpression(inner)) inner = inner.expression;
+    return ts.isCallExpression(inner) && rejectionHandled(inner);
+  }
+  return false;
+}
+
+// floatingCall returns {call, identity, method} when an expression statement
+// is a call that leaves a thenable unheld, or null.
+function floatingCall(stmt, program, checker) {
+  let expr = stmt.expression;
+  while (ts.isParenthesizedExpression(expr)) expr = expr.expression;
+  if (!ts.isCallExpression(expr) || rejectionHandled(expr)) return null;
+  const identity = floatingIdentity(expr, program, checker);
+  if (!identity) return null;
+  const callee = expr.expression;
+  const method = ts.isPropertyAccessExpression(callee)
+    ? callee.name.text
+    : ts.isIdentifier(callee)
+      ? callee.text
+      : '';
+  return { call: expr, identity, method };
+}
+
+// misuseRecord builds one aggregate packet, in the shape of emissionRecord.
+function misuseRecord(agg, relPath, snapshot) {
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit(), like every packet
+    site_kind: SITE_KIND_MISUSE,
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: agg.line,
+    symbol: agg.symbol,
+    func: agg.method,
+    receiver: '',
+    client_type: agg.identity,
+    snippet: agg.snippet,
+    enclosing_function_body: '',
+    callers: [],
+    callees: [],
+    client_construction: [],
+    const_args: [
+      { index: 0, name: 'misuse_class', value: agg.cls, how: 'aggregate' },
+      { index: 0, name: 'misuse_count', value: String(agg.count), how: 'aggregate' },
+    ],
+    macro_expansion: false,
+    provenance: {
+      // The identity is the checker's answer, never a guess from the text.
+      client_type_resolved: true,
+      confidence_tier: 'high',
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Program construction + file discovery
 // ---------------------------------------------------------------------------
 
@@ -1488,8 +1650,34 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
       agg.count++;
     };
 
+    // Per-file misuse state: aggregates keyed (function, class, identity).
+    const misuse = new Map();
+    const noteMisuse = (node, cls, identity, method) => {
+      const enc = enclosingFunction(node);
+      const key = `${enc.name}\0${cls}\0${identity}`;
+      let agg = misuse.get(key);
+      if (!agg) {
+        const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+        agg = {
+          line: line + 1,
+          method,
+          snippet: cap(node.getText()),
+          cls,
+          identity,
+          symbol: enc.name,
+          count: 0,
+        };
+        misuse.set(key, agg);
+      }
+      agg.count++;
+    };
+
     const visit = (node) => {
       if (ts.isCatchClause(node)) catchClauses.push(node);
+      if (ts.isExpressionStatement(node)) {
+        const fl = floatingCall(node, program, checker);
+        if (fl) noteMisuse(fl.call, 'missing_await', fl.identity, fl.method);
+      }
       if (
         ts.isCallExpression(node) &&
         ts.isPropertyAccessExpression(node.expression)
@@ -1535,6 +1723,9 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
     }
     for (const agg of [...aggs.values()].sort((a, b) => a.line - b.line)) {
       records.push(emissionRecord(agg, relPath, snapshot));
+    }
+    for (const agg of [...misuse.values()].sort((a, b) => a.line - b.line)) {
+      records.push(misuseRecord(agg, relPath, snapshot));
     }
   }
 

@@ -411,7 +411,7 @@ first occurrence.
 | `blocking_in_async` | A blocking function is called in the text of an async function. | The callee: `time.sleep`, `requests.get`. |
 | `sync_over_async` | An async function waits synchronously for async work. | The call that waits: `asyncio.run`. |
 | `fire_and_forget` | A task is started as a statement. Nothing holds the task. | The call that starts it: `asyncio.create_task`. |
-| `missing_await` | A coroutine function is called as a statement, or its result is assigned to a name that nothing reads. | `coroutine`. |
+| `missing_await` | A coroutine function is called as a statement, or its result is assigned to a name that nothing reads. In TypeScript, a call whose type is a thenable is made as a statement (a floating promise). | `coroutine` from `pyindex`. From `tsindex`, `promise` for the `Promise` of the standard library, and `thenable` for any other type that has a `then` member, such as a query builder. |
 | `retry_shape` | A wait on the failure path of an attempt loop, or the configuration of a retry library. | The shape: `constant_delay`, `no_jitter`, or `unbounded_attempts`. |
 | `loop_variable_query` | A query method is called on a relation of a loop variable (`for c in customers: c.orders.all()`). | The method: `all`, `filter`, `first`. |
 | `sql_concat_in_call` | A query call has SQL text that is built in the argument: a concatenation, a format call, or an f-string. | The query method: `database/sql.DB.Query`, `execute`. |
@@ -486,6 +486,7 @@ waiver or `rvl suppress` uses that name.
 | --- | --- |
 | `goindex` | `discarded_error`, `retry_shape`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. Go has no typed catch and no async functions, and a Go ORM does not load a relation through the receiver, so it has no other class. |
 | `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`, `retry_shape`, `loop_variable_query`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. |
+| `tsindex` | `missing_await`, with the identities `promise` and `thenable`. |
 | The other retrievers | Nothing yet. |
 
 Limits:
@@ -514,6 +515,17 @@ Limits:
   list, because `str.count` and `dict.get` are more frequent.
 - For `latency_scalar_metric`, the retrievers know the Prometheus client
   only, and the name of the metric must be a string constant.
+- `tsindex` reports a `missing_await` only for a call that is a statement.
+  A promise that is awaited, returned, assigned, or marked with `void` is not
+  reported. A chain that ends in a rejection handler (`.catch(fn)`,
+  `.then(ok, fail)`) is not reported. A promise that is assigned to a name
+  that nothing reads is not reported, although `pyindex` reports that form.
+- `tsindex` gets the type from the type checker. A call with the type `any`
+  or `unknown` is not reported. Thus, in a tree with no installed
+  `node_modules`, only the async functions of the repository are seen.
+- `tsindex` gives the name of the function that contains the call. A call in
+  an anonymous callback has an empty name, and all such calls in one file are
+  in one packet.
 
 ## Scanning a prebuilt packet stream
 

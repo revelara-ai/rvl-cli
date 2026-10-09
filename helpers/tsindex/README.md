@@ -73,6 +73,34 @@ is a `receiver.method(...)` call. Every record carries:
 - `callers`, `callees` — **empty arrays** (see below).
 - `lang` — `"typescript"`.
 
+## Misuse shapes: `missing_await`
+
+A call that is a statement, and whose type is a thenable, is a floating
+promise. Nothing holds the result, so a rejection has no handler. tsindex
+reports it on the same stream as an aggregate with `site_kind:
+"misuse_shape"`: one packet for each enclosing function and identity. The
+contract is in [docs/retrievers.md](../../docs/retrievers.md), section
+"Misuse shapes".
+
+- `client_type` is the identity: `promise` for the `Promise` or `PromiseLike`
+  of the standard library, and `thenable` for any other type that has a
+  `then` member.
+- `const_args` has `misuse_class` (`missing_await`) and `misuse_count`, with
+  `how: "aggregate"`.
+- `func` is the name of the callee. The line and the snippet are those of the
+  first occurrence.
+
+These forms are not reported: `await f()`, `return f()`, `const p = f()`,
+`void f()`, `f().catch(fn)`, and `f().then(ok, fail)`.
+
+The type test fails closed. A call with the type `any` or `unknown` is not
+reported, because a wrong report is worse here than a missed one. This is the
+opposite of `callReturnsThenable`, which keeps a client site when the type is
+not known. The answer is kept for each callee symbol when the callee has one
+declaration and a return type with no type parameter. A generic or overloaded
+callee is computed at each call, so the result does not depend on the order of
+the calls.
+
 ## The `repo_config` record (one per run)
 
 In addition to the per-site packets, tsindex emits **exactly one** repo-scoped
@@ -257,6 +285,8 @@ Measured on this helper's own fixture, identical source and `tsconfig`, only
 po-pk3fp.2. po-pk3fp.10 added a cross-module file (5 sites) and the awaited
 LLM calls: 36 installed, 33 uninstalled, and every uninstalled key either
 equals its installed key or is the same site one level coarser.
+po-6c0v8.16 added `floating.ts`, which has 4 misuse packets and no call
+site: 40 installed, 37 uninstalled.
 An installed tree is bit-identical to before — the fallback runs only after the
 checker has failed. An installed tree is still strictly better (versions, the
 awaitability filter, chained and callback-typed receivers), which is why a
@@ -376,6 +406,8 @@ ioredis) resolves at tier `high` with a package-qualified `client_type`, that a
 construction is retrievable, that two calls on one line with different client
 types keep distinct keys, that an unresolved strong-verb call still emits at
 `low`, and that noise (`.push`/`.map`/`.toString`) is not emitted.
+`testdata/fixture/src/floating.ts` holds each floating form and the bounded
+form of each, for the `missing_await` tests.
 `testdata/fixture-tests/` holds one file per test-path convention beside
 three production files, for the tests that pin what is skipped, what is
 counted, and what `--include-tests` restores.
