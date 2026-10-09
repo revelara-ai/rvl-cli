@@ -211,12 +211,12 @@ The packet lists what the retriever saw, in `const_args`:
 | Entry | `how` | Meaning |
 | --- | --- | --- |
 | `bound_class` | `aggregate` | `pool`, `queue`, `cache`, or `read`. |
-| A constructor argument (`arg0`, or its keyword) or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
+| A constructor argument (`arg0`, or its keyword), a property of an options object (`max`), or a method called on the value (`SetMaxOpenConns`) | `literal` or `named_constant` | The value is a constant. The packet carries the value. |
 | The same | `name` | The value is not a constant (`cfg.Max`). The packet carries the source text. The scanner credits it as a bound and never resolves it. |
 | A call that the argument of a read passes through (`io.LimitReader`) | `call` | Go reads only. |
 | A method called on the same type somewhere else in the module | `type` | Only on a value that leaves the function. |
 | `bound_escapes` | `aggregate` | The value leaves the constructing function: it is returned, stored, passed to a call, or has no name. |
-| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`). |
+| `bound_opaque` | `aggregate` | Some options are not written out (`Queue(**opts)`, `new Pool({ ...base })`, `new Pool(config)`). |
 
 A retriever does not decide which entry is a bound. A `construction_bounds`
 spec does. For one type and class, the spec gives the names that bound the
@@ -243,14 +243,22 @@ class and control, with at most five sites.
 | --- | --- |
 | `goindex` | `pool`: `database/sql` `Open`, `OpenDB`. `cache`: `github.com/patrickmn/go-cache` `New`. `read`: `io.ReadAll`, `io/ioutil.ReadAll`. The list is `bound_constructors` in `helpers/goindex/extractor_corpus.json`. |
 | `pyindex` | `queue`: the `queue` and `asyncio` queue classes, `multiprocessing.Queue`, `collections.deque`. `pool`: `redis.ConnectionPool`, `redis.BlockingConnectionPool`, `sqlalchemy.create_engine`, `psycopg_pool.ConnectionPool`. `cache`: `functools.lru_cache`, `functools.cache`. |
+| `tsindex` | `pool`: `pg.Pool`. `cache`: `lru-cache.LRUCache`. The list is `BOUND_CONSTRUCTORS` in `helpers/tsindex/tsindex.js`. |
 | The other retrievers | Nothing yet. |
 
-Three limits:
+A retriever reports a construction that has a bound, too. That packet lists
+the bound (`max` with the value `10`), and the spec reads it as bounded.
+
+Four limits:
 
 - `goindex` does not report `make(chan T)`. A Go channel with no capacity
   blocks the sender until a receiver is ready. It is not an unbounded queue.
 - `pyindex` does not report reads. It has no receiver types, so it cannot tell
   `response.read()` from a read that has a limit.
+- `tsindex` reads the options only where the construction writes them. An
+  options object that is built in another statement (`new Pool(config)`) is
+  reported as `bound_opaque`. `tsindex` does not report `bound_escapes`: a
+  `pg.Pool` and an `lru-cache` take their bound only in the constructor.
 - The retriever reads one function. For a value that leaves the function, the
   only other evidence is a method call on the same type in the same module.
 
