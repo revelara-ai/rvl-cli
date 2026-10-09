@@ -3727,6 +3727,47 @@ fn live_java_scan_surfaces_g4_emission_findings() {
     );
 }
 
+/// Java, live end to end: javaindex inventories the misuse fixture's catch
+/// clauses, and the seed specs judge them. The count pins the rules: a narrow
+/// type, a handler that throws, a handler the emission lane counts as a
+/// swallow, and a local class with the name `Exception` are not overbroad
+/// catches.
+#[test]
+fn live_java_scan_surfaces_overbroad_catches() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(
+            helpers_dir()
+                .join("javaindex")
+                .join("testdata")
+                .join("fixture_misuse"),
+        )
+        .arg("--specs-file")
+        .arg(misuse_seed_specs())
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("misuse.overbroad_catch")
+            && stdout.contains(
+                "4 handler(s) catch the root exception type and do not re-raise, in 2 function(s)"
+            ),
+        "three catches of Exception and one of Throwable, in two methods: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "misuse findings are advisory: {stdout}"
+    );
+}
+
 // --- Rust G1 lane (po-av01j.11) ---
 
 /// The hand-authored SEED Rust spec corpus (test-grade; RC-019 at reqwest /

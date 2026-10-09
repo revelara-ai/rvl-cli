@@ -406,7 +406,7 @@ first occurrence.
 
 | Class | Shape | Identity |
 | --- | --- | --- |
-| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught (`Exception`, `BaseException`), or `bare` for `except:`. |
+| `overbroad_catch` | A handler catches the root exception type and does not raise again. | The type that is caught. Python: `Exception`, `BaseException`, or `bare` for `except:`. Java: `java.lang.Exception`, `java.lang.Throwable`. |
 | `discarded_error` | A call result of type error is assigned to a discard (`_ = f.Close()`). | The callee: `os.Remove`, `os.File.Close`. `func value` when the call goes through a function value. |
 | `blocking_in_async` | A blocking function is called in the text of an async function. | The callee: `time.sleep`, `requests.get`. |
 | `sync_over_async` | An async function waits synchronously for async work. | The call that waits: `asyncio.run`. |
@@ -486,6 +486,7 @@ waiver or `rvl suppress` uses that name.
 | --- | --- |
 | `goindex` | `discarded_error`, `retry_shape`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. Go has no typed catch and no async functions, and a Go ORM does not load a relation through the receiver, so it has no other class. |
 | `pyindex` | `overbroad_catch`, `blocking_in_async`, `sync_over_async`, `fire_and_forget`, `missing_await`, `retry_shape`, `loop_variable_query`, `sql_concat_in_call`, `print_logging`, `latency_scalar_metric`. |
+| `javaindex` | `overbroad_catch`. |
 | The other retrievers | Nothing yet. |
 
 Limits:
@@ -502,6 +503,11 @@ Limits:
 - A call in a lambda or in a nested function that is not async is not
   reported as `blocking_in_async`. It runs where that function is called, for
   example in a worker thread.
+- `javaindex` reads the caught type from the compiler, not from the name. A
+  class of the repository with the name `Exception` is not reported. In a
+  multi-catch that names the two root types, the identity is
+  `java.lang.Throwable`. A `throw` at any position in the handler, a lambda
+  included, keeps the handler out.
 - For `retry_shape`, `goindex` reads loops only. It does not read the
   configuration of a retry library. `pyindex` reads loops and `tenacity`
   configurations. In Python, the failure path is an exception: a loop that
