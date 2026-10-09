@@ -250,11 +250,205 @@ class JavaIndexTest {
                 "full-load and --files retrieval agree per file (invariance): full="
                         + fullServiceKeys + " inc=" + incServiceKeys);
 
+        unsizedConstructions();
+
         if (failures > 0) {
             System.err.println(failures + " assertion(s) FAILED");
             System.exit(1);
         }
         System.out.println("javaindex tests OK (" + sites.size() + " sites)");
+    }
+
+    // --- unsized constructions: pools and caches ride the same stream, one
+    // packet per construction, stamped site_kind: "unsized_construction". The
+    // class and everything seen on the construction ride const_args. A
+    // constant is a value; anything else is a NAME (how: "name") ---
+
+    static void unsizedConstructions() throws Exception {
+        List<Map<String, Object>> all = retrieve("--retrieve", "--root",
+                "testdata/fixture_bounds", "--name", "fx");
+        Map<String, List<Map<String, Object>>> bySymbol = new LinkedHashMap<>();
+        Set<String> keys = new HashSet<>();
+        for (Map<String, Object> s : all) {
+            if (s.containsKey("kind")) {
+                continue;
+            }
+            check(keys.add((String) s.get("site_key")),
+                    "site_key unique in the bounds fixture: " + s.get("site_key"));
+            if ("unsized_construction".equals(siteKind(s))) {
+                bySymbol.computeIfAbsent((String) s.get("symbol"), k -> new ArrayList<>()).add(s);
+            } else {
+                check(!"newBuilder".equals(s.get("func")),
+                        "Caffeine.newBuilder() is a construction, not also a G1 site: "
+                                + s.get("site_key"));
+            }
+        }
+
+        // One packet per named identity, with the fields the contract requires.
+        String hikariConfig = "com.zaxxer.hikari.HikariConfig";
+        String hikariSource = "com.zaxxer.hikari.HikariDataSource";
+        String caffeine = "com.github.benmanes.caffeine.cache.Caffeine";
+        Map<String, Object> cfg = oneUnsized(bySymbol, "unsizedConfig");
+        if (cfg != null) {
+            check(hikariConfig.equals(cfg.get("client_type")), "HikariConfig identity, got "
+                    + cfg.get("client_type"));
+            check("HikariConfig".equals(cfg.get("func")), "a constructor's func is the class name");
+            check("pool".equals(aggregate(cfg, "bound_class")), "HikariConfig is class pool");
+            check(((Long) cfg.get("packet_schema")) == 2L, "packet_schema on an unsized packet");
+            check((cfg.get("file_path") + ":" + cfg.get("line_number") + ":" + hikariConfig
+                    + ":HikariConfig").equals(cfg.get("site_key")), "site_key formula holds");
+            check("src/com/example/Pools.java".equals(cfg.get("file_path")), "file_path");
+            check(((String) cfg.get("snippet")).contains("new HikariConfig()"), "snippet");
+            check(Boolean.TRUE.equals(prov(cfg).get("client_type_resolved")),
+                    "an import-attributed construction is resolved");
+            check(seen(cfg).equals(java.util.Arrays.asList(
+                    "setJdbcUrl=\"jdbc:postgresql://db/app\"/literal", "validate=/name")),
+                    "every method called on the local is seen, and no bound: " + seen(cfg));
+            check(aggregate(cfg, "bound_escapes") == null, "a local that stays does not escape");
+            check(aggregate(cfg, "bound_opaque") == null, "nothing is opaque");
+        }
+        Map<String, Object> source = oneUnsized(bySymbol, "unsizedSource");
+        if (source != null) {
+            check(hikariSource.equals(source.get("client_type")), "HikariDataSource identity");
+            check("pool".equals(aggregate(source, "bound_class")), "HikariDataSource is class pool");
+            check(!names(source).contains("setMaximumPoolSize"), "no pool size is seen");
+            check(aggregate(source, "bound_escapes") == null, "the data source stays local");
+        }
+        Map<String, Object> cache = oneUnsized(bySymbol, "unsizedCache");
+        if (cache != null) {
+            check(caffeine.equals(cache.get("client_type")), "Caffeine identity");
+            check("newBuilder".equals(cache.get("func")), "a factory's func is the factory");
+            check("cache".equals(aggregate(cache, "bound_class")), "Caffeine is class cache");
+            check(seen(cache).isEmpty(), "build() ends the builder and is not an option: "
+                    + seen(cache));
+            check(aggregate(cache, "bound_escapes") == null,
+                    "a builder that is built in the expression does not escape");
+        }
+        Map<String, Object> expiring = oneUnsized(bySymbol, "expiringOnly");
+        if (expiring != null) {
+            check(seen(expiring).equals(java.util.Arrays.asList("expireAfterWrite=10/literal")),
+                    "an expiry is seen, a size is not: " + seen(expiring));
+        }
+
+        // The bounded form of each: the packet carries the bound. A constant
+        // is a value, anything else is a name and is never resolved.
+        checkSeen(bySymbol, "literalConfig", "setMaximumPoolSize=10/literal");
+        checkSeen(bySymbol, "constantConfig", "setMaximumPoolSize=20/named_constant");
+        checkSeen(bySymbol, "namedConfig", "setMaximumPoolSize=settings.poolSize()/name");
+        checkSeen(bySymbol, "sizedSource", "setMaximumPoolSize=5/literal");
+        checkSeen(bySymbol, "sizedCache", "maximumSize=10000/literal");
+        checkSeen(bySymbol, "weightedCache", "maximumWeight=1000000/named_constant");
+        checkSeen(bySymbol, "namedSize", "maximumSize=settings.cacheSize()/name");
+        checkSeen(bySymbol, "stepwise", "maximumSize=50/literal");
+        Map<String, Object> stepwise = oneUnsized(bySymbol, "stepwise");
+        if (stepwise != null) {
+            check(aggregate(stepwise, "bound_escapes") == null,
+                    "a local builder used only as a receiver does not escape");
+        }
+
+        // A value that leaves the method: bound_escapes, plus the methods the
+        // module calls on the type anywhere, labeled how: "type".
+        checkEscapes(bySymbol, "leavesConfig", "leaves", "setMaximumPoolSize");
+        checkEscapes(bySymbol, "storedSource", "stored", "setMaximumPoolSize");
+        checkEscapes(bySymbol, "builderLeaves", "leaves", "maximumSize");
+        Map<String, Object> stored = oneUnsized(bySymbol, "storedSource");
+        if (stored != null) {
+            check(seen(stored).contains("setJdbcUrl=\"jdbc:postgresql://db/app\"/literal"),
+                    "a setter on the field in the same method is seen in scope: " + seen(stored));
+            check(!seen(stored).contains("setMaximumPoolSize=5/literal"),
+                    "another construction's setter is never an in-scope observation");
+        }
+
+        // Options that are not written out: the constructor takes them.
+        Map<String, Object> from = oneUnsized(bySymbol, "fromConfig");
+        if (from != null) {
+            check("cfg".equals(aggregate(from, "bound_opaque")),
+                    "new HikariDataSource(cfg) is opaque: " + aggregate(from, "bound_opaque"));
+            check("unnamed".equals(aggregate(from, "bound_escapes")), "a returned value is unnamed");
+        }
+
+        // An unattributed lookalike is never guessed at.
+        check(!bySymbol.containsKey("lookalike"), "a local class named HikariConfig is skipped");
+        check(!bySymbol.containsKey("wildcard"), "a wildcard import abstains");
+
+        // Retrieval invariance: the type-level evidence comes from ALL units,
+        // so a --files reload of one file carries the same observations.
+        List<Map<String, Object>> onlyCaches = retrieve("--retrieve", "--root",
+                "testdata/fixture_bounds", "--name", "fx", "--files",
+                "src/com/example/Caches.java");
+        for (Map<String, Object> s : onlyCaches) {
+            Map<String, Object> full = oneUnsized(bySymbol, "builderLeaves");
+            if (full != null && "builderLeaves".equals(s.get("symbol"))) {
+                check(s.get("const_args").equals(full.get("const_args")),
+                        "--files keeps the type-level observations: " + s.get("const_args"));
+            }
+        }
+        long reloaded = onlyCaches.stream()
+                .filter(s -> "unsized_construction".equals(siteKind(s))).count();
+        check(reloaded == 6, "--files emits the six Caches.java constructions, got " + reloaded);
+    }
+
+    static Map<String, Object> oneUnsized(Map<String, List<Map<String, Object>>> bySymbol,
+            String symbol) {
+        List<Map<String, Object>> recs = bySymbol.get(symbol);
+        check(recs != null && recs.size() == 1, "exactly one unsized packet for " + symbol
+                + ", got " + (recs == null ? 0 : recs.size()));
+        return recs == null || recs.isEmpty() ? null : recs.get(0);
+    }
+
+    // seen: the in-scope observations, as sorted "name=value/how".
+    static List<String> seen(Map<String, Object> rec) {
+        List<String> out = new ArrayList<>();
+        for (Object o : (List<?>) rec.get("const_args")) {
+            Map<?, ?> a = (Map<?, ?>) o;
+            if (!"aggregate".equals(a.get("how")) && !"type".equals(a.get("how"))) {
+                out.add(a.get("name") + "=" + a.get("value") + "/" + a.get("how"));
+            }
+        }
+        java.util.Collections.sort(out);
+        return out;
+    }
+
+    static Set<String> names(Map<String, Object> rec) {
+        Set<String> out = new HashSet<>();
+        for (Object o : (List<?>) rec.get("const_args")) {
+            out.add((String) ((Map<?, ?>) o).get("name"));
+        }
+        return out;
+    }
+
+    static String aggregate(Map<String, Object> rec, String name) {
+        for (Object o : (List<?>) rec.get("const_args")) {
+            Map<?, ?> a = (Map<?, ?>) o;
+            if (name.equals(a.get("name")) && "aggregate".equals(a.get("how"))) {
+                return (String) a.get("value");
+            }
+        }
+        return null;
+    }
+
+    static void checkSeen(Map<String, List<Map<String, Object>>> bySymbol, String symbol,
+            String want) {
+        Map<String, Object> rec = oneUnsized(bySymbol, symbol);
+        if (rec != null) {
+            check(seen(rec).contains(want), symbol + " carries " + want + ": " + seen(rec));
+        }
+    }
+
+    static void checkEscapes(Map<String, List<Map<String, Object>>> bySymbol, String symbol,
+            String how, String typeMethod) {
+        Map<String, Object> rec = oneUnsized(bySymbol, symbol);
+        if (rec == null) {
+            return;
+        }
+        check(how.equals(aggregate(rec, "bound_escapes")), symbol + " escapes as " + how
+                + ", got " + aggregate(rec, "bound_escapes"));
+        boolean typed = false;
+        for (Object o : (List<?>) rec.get("const_args")) {
+            Map<?, ?> a = (Map<?, ?>) o;
+            typed |= typeMethod.equals(a.get("name")) && "type".equals(a.get("how"));
+        }
+        check(typed, symbol + " carries " + typeMethod + " with how: type");
     }
 
     // --- assertions and lookups ---

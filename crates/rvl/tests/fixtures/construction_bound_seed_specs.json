@@ -33,6 +33,15 @@
      "rationale": "lru_cache(maxsize=None) never evicts; the default maxsize is 128"},
     {"type": "functools.cache", "class": "cache", "control": "RC-067",
      "bounded_by": [], "confidence": 0.9,
-     "rationale": "functools.cache is lru_cache(maxsize=None): it has no bound to set"}
+     "rationale": "functools.cache is lru_cache(maxsize=None): it has no bound to set"},
+    {"type": "com.zaxxer.hikari.HikariConfig", "class": "pool", "control": "RC-055",
+     "bounded_by": ["setMaximumPoolSize"], "confidence": 0.9,
+     "rationale": "test-grade stand-in: a HikariCP pool with no setMaximumPoolSize runs on the library default, not on a size chosen for the database; the production corpus decides if that default counts as a bound"},
+    {"type": "com.zaxxer.hikari.HikariDataSource", "class": "pool", "control": "RC-055",
+     "bounded_by": ["setMaximumPoolSize"], "confidence": 0.9,
+     "rationale": "test-grade stand-in: HikariDataSource extends HikariConfig, so the same setter sizes it"},
+    {"type": "com.github.benmanes.caffeine.cache.Caffeine", "class": "cache", "control": "RC-067",
+     "bounded_by": ["maximumSize", "maximumWeight"], "confidence": 0.9,
+     "rationale": "a Caffeine cache with no maximumSize and no maximumWeight has no size limit"}
   ]
 }

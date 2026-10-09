@@ -3697,6 +3697,57 @@ fn scan_decides_java_sites_end_to_end() {
     );
 }
 
+/// Java, live end to end: javaindex inventories the bounds fixture's HikariCP
+/// pools and Caffeine caches, and the seed specs judge them. The counts pin
+/// the rules: a construction with its bound set is a packet and not a finding,
+/// a non-constant bound is credited, and a value that leaves the method, or a
+/// constructor that takes its options as an argument, is not a finding.
+#[test]
+fn live_java_scan_surfaces_unsized_constructions() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .arg("scan")
+        .arg(
+            helpers_dir()
+                .join("javaindex")
+                .join("testdata")
+                .join("fixture_bounds"),
+        )
+        .arg("--specs-file")
+        .arg(construction_bound_seed_specs())
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    // Nine pools: a HikariConfig and a HikariDataSource with no size set,
+    // four with setMaximumPoolSize, and three the scanner abstains on (two
+    // leave the method, one takes a config it cannot see).
+    assert!(
+        stdout.contains("unsized.pool") && stdout.contains("2 of 9 connection pool(s)"),
+        "only the two pools with no size in scope are findings: {stdout}"
+    );
+    // Seven caches: the bare builder and the expiry-only builder have no
+    // size, four set maximumSize or maximumWeight, one builder is returned.
+    assert!(
+        stdout.contains("unsized.cache") && stdout.contains("2 of 7 cache(s)"),
+        "only the two builders with no size are findings: {stdout}"
+    );
+    assert!(
+        !stdout.contains("settings."),
+        "a non-constant bound is a name, its text is never reported as a value: {stdout}"
+    );
+    assert!(
+        !stdout.contains("BLOCKING"),
+        "construction-bound findings are advisory: {stdout}"
+    );
+}
+
 /// Java, live end to end: javaindex inventories the fixture's emissions (the
 /// slf4j aggregates, the swallowing catch), and the seed specs surface the
 /// RC-027 swallow gap in the ladder.
