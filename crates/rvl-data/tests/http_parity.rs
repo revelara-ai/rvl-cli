@@ -341,9 +341,17 @@ fn risk_list_json_is_raw_body_passthrough() {
     // passthrough must not re-encode.
     let raw = r#"{"total":1,"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":5,"status":"applicable","linked_services":[]}],"page":1,"limit":50}"#;
     let server = MockServer::start(vec![("GET /api/v1/risks?limit=50", 200, raw)]);
-    let out =
-        rvl_data::risk::list_output(&server.client(), None, None, None, None, 50, Some("json"))
-            .unwrap();
+    let out = rvl_data::risk::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        50,
+        Some("json"),
+    )
+    .unwrap();
     assert_eq!(out, format!("{raw}\n"));
 }
 
@@ -361,7 +369,8 @@ fn risk_list_prints_the_list_when_a_risk_has_null_list_fields() {
         NULL_LIST_FIELDS_BODY,
     )]);
     let out =
-        rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None).unwrap();
+        rvl_data::risk::list_output(&server.client(), None, None, None, None, None, 1000, None)
+            .unwrap();
     assert!(out.contains("Total Risks: 2"), "{out}");
     assert!(out.contains("R-1") && out.contains("Null lists"), "{out}");
     assert!(out.contains("R-2") && out.contains("Plain"), "{out}");
@@ -412,7 +421,8 @@ fn risk_list_with_a_null_risks_array_is_an_empty_list() {
         r#"{"risks":null,"total":0,"page":1,"limit":1000}"#,
     )]);
     let out =
-        rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None).unwrap();
+        rvl_data::risk::list_output(&server.client(), None, None, None, None, None, 1000, None)
+            .unwrap();
     assert_eq!(out, "No risks found.\n");
 }
 
@@ -429,6 +439,7 @@ fn risk_list_encodes_filters_like_go_url_values() {
         Some("applicable"),
         Some("fault_tolerance"),
         Some("a&b"),
+        None,
         None,
         1000,
         None,
@@ -457,6 +468,7 @@ fn risk_list_team_is_sent_as_the_team_query_param() {
         None,
         None,
         Some("pay&ments"),
+        None,
         1000,
         None,
     )
@@ -477,6 +489,7 @@ fn risk_list_unknown_team_surfaces_the_server_message_and_fails() {
         None,
         None,
         Some("paymnets"),
+        None,
         1000,
         None,
     )
@@ -503,11 +516,65 @@ fn risk_list_known_team_with_no_risks_is_an_empty_list_not_an_error() {
         None,
         None,
         Some("checkout"),
+        None,
         1000,
         None,
     )
     .unwrap();
     assert_eq!(out, "No risks found.\n");
+}
+
+// --- risk list --factor ---
+
+/// The server's answer to a value that is not a causal factor code.
+const BAD_FACTOR_400: &str =
+    r#"{"error":"validation_error","message":"factor must be a causal factor code (CF-XXXX)"}"#;
+
+#[test]
+fn risk_list_sends_factor() {
+    let raw = r#"{"risks":[{"id":"a","risk_code":"R-1","title":"T","category":"c","score":5,"status":"applicable","linked_services":[]}],"total":1,"page":1,"limit":1000}"#;
+    let server = MockServer::start(vec![
+        ("GET /api/v1/risks?factor=CF-0021&limit=1000", 200, raw),
+        ("GET /api/v1/risks?limit=1000", 200, raw),
+    ]);
+    let client = server.client();
+    let out =
+        rvl_data::risk::list_output(&client, None, None, None, None, Some("CF-0021"), 1000, None)
+            .unwrap();
+    assert!(out.contains("R-1"), "{out}");
+    rvl_data::risk::list_output(&client, None, None, None, None, None, 1000, None).unwrap();
+
+    let reqs = server.recorded();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].path, "/api/v1/risks?factor=CF-0021&limit=1000");
+    assert!(!reqs[1].path.contains("factor"), "{}", reqs[1].path);
+}
+
+#[test]
+fn risk_list_bad_factor_surfaces_the_server_message_and_fails() {
+    let server = MockServer::start(vec![(
+        "GET /api/v1/risks?factor=nonsense&limit=1000",
+        400,
+        BAD_FACTOR_400,
+    )]);
+    let f = rvl_data::risk::list_output(
+        &server.client(),
+        None,
+        None,
+        None,
+        None,
+        Some("nonsense"),
+        1000,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(f.code, 1);
+    assert!(
+        f.msg
+            .contains("factor must be a causal factor code (CF-XXXX)"),
+        "{}",
+        f.msg
+    );
 }
 
 #[test]
@@ -879,7 +946,7 @@ fn feedback_submit_server_error_names_the_category_noun() {
 #[test]
 fn auth_error_message_matches_rvl_cli_401_contract() {
     let server = MockServer::start(vec![("GET /api/v1/risks?limit=1000", 401, "{}")]);
-    let f = rvl_data::risk::list_output(&server.client(), None, None, None, None, 1000, None)
+    let f = rvl_data::risk::list_output(&server.client(), None, None, None, None, None, 1000, None)
         .unwrap_err();
     assert_eq!(f.code, 1);
     assert!(

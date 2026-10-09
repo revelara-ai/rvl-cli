@@ -172,6 +172,8 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // register (`--team="$TEAM"` with TEAM unset). Rejected at parse time.
     ("risk list", "team", Empty::Error),
     ("risk ready", "team", Empty::Error),
+    // rvl-native; it follows the filter rule. The server checks the code form.
+    ("risk list", "factor", Empty::Absent),
     ("risk show", "format", Empty::Absent),    // risk.go:751
     ("risk context", "format", Empty::Absent), // risk.go:920
     // risk.go:1097/1152: `--reason=` OVERRIDES the "Resolved" default and is
