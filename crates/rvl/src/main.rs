@@ -1048,10 +1048,16 @@ fn resolve_structure_findings(
 /// scanner cannot see. The waiver key is `server_entry.RC-XXX`, so
 /// `rvl suppress` and `.revelara.yaml` waivers work on these like any
 /// other finding.
+///
+/// The liveness-probe join rides the same seam (po-6c0v8.5): `probes` are the
+/// liveness `httpGet` paths the config lane read from this repository's
+/// manifests, joined here to the lane's route inventory.
 fn server_to_findings(
-    findings: &[rvl_propagate::server_entry::ServerEntryFinding],
+    server: &ServerLane,
+    probes: &[rvl_propagate::probe_handler::LivenessProbe],
 ) -> Vec<render::Finding> {
-    findings
+    server
+        .findings
         .iter()
         .filter(|f| f.verdict == rvl_core::Verdict::Violates)
         .map(|f| {
@@ -1080,7 +1086,45 @@ fn server_to_findings(
                 gate_exempt: false,
             }
         })
+        .chain(liveness_handler_finding(&server.routes, probes))
         .collect()
+}
+
+/// What the G2 server-entry lane hands back: its control findings, and the
+/// route inventory the liveness-probe join reads once the config lane has
+/// run.
+struct ServerLane {
+    findings: Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+    routes: Vec<rvl_propagate::probe_handler::RouteHandler>,
+}
+
+/// The ladder row for liveness probes whose handler calls a dependency: one
+/// class for the repository, however many probes and handlers repeat it.
+/// Only a resolved join surfaces; every abstention stays out of the ladder.
+/// ADVISORY like the rest of the lane, and waivable under
+/// `server_entry.liveness-probe-handler-io`.
+fn liveness_handler_finding(
+    routes: &[rvl_propagate::probe_handler::RouteHandler],
+    probes: &[rvl_propagate::probe_handler::LivenessProbe],
+) -> Option<render::Finding> {
+    use rvl_propagate::probe_handler;
+    let class = probe_handler::class_of(&probe_handler::join(probes, routes))?;
+    Some(render::Finding {
+        id: render::finding_id(probe_handler::CLASS_RULE),
+        site: class.sites.first().cloned().unwrap_or_default(),
+        description: class.description,
+        disposition: "surface".into(),
+        severity: probe_handler::SEVERITY.into(),
+        incident_count: 0,
+        critical_count: 0,
+        control: probe_handler::CONTROL.into(),
+        fix: probe_handler::FIX.into(),
+        site_count: class.sites.len(),
+        example_sites: class.sites.into_iter().take(3).collect(),
+        class_rule: probe_handler::CLASS_RULE.into(),
+        suppressed: false,
+        gate_exempt: false,
+    })
 }
 
 // --- single-command scan: language detection + helper orchestration (po-3t3oj.25) ---
@@ -3166,14 +3210,14 @@ fn resolve_packet_stream(
 /// findings and triaged items, the G1 sites they are index-aligned with
 /// (server-entry sites are partitioned out), the loaded spec cache so callers
 /// can run the G6 config lane against the same specs, and the G2 server-entry
-/// lane's control findings (po-av01j.3), and whether the commercial tier
+/// lane's control findings (po-av01j.3) and route inventory, and whether the commercial tier
 /// loaded with an empty API corpus over real call sites.
 type ResolvedScan = (
     Vec<rvl_propagate::Finding>,
     Vec<rvl_triage::TriagedItem>,
     Vec<rvl_core::Site>,
     rvl_spec::SpecCache,
-    Vec<rvl_propagate::server_entry::ServerEntryFinding>,
+    ServerLane,
     bool,
 );
 
@@ -3534,7 +3578,10 @@ fn findings_from_sites(
     let served = cache.served_bound(repo_cfg);
     let client = cache.client_bound_by_family(repo_cfg);
     let findings = rvl_propagate::propagate_all(&sites, &cache, &served, &client);
-    let server_findings = rvl_propagate::server_entry::evaluate(&server_sites, &cache);
+    let server = ServerLane {
+        findings: rvl_propagate::server_entry::evaluate(&server_sites, &cache),
+        routes: rvl_propagate::probe_handler::route_handlers(&server_sites, &sites),
+    };
 
     if verbose {
         let server_note = if server_sites.is_empty() {
@@ -3585,14 +3632,7 @@ fn findings_from_sites(
         &unsized_sites,
         cache.construction_bound_specs(),
     ));
-    Ok((
-        findings,
-        items,
-        sites,
-        cache,
-        server_findings,
-        empty_api_corpus,
-    ))
+    Ok((findings, items, sites, cache, server, empty_api_corpus))
 }
 
 /// Map misuse-lane violations into triage items. The class key is (`misuse`,
@@ -3910,9 +3950,9 @@ fn run_scan(
         ladder: mut structure,
         rows: structure_rows,
     } = resolve_structure_lane(retrieved, &stream.text, path);
-    structure.extend(server_to_findings(&server));
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    structure.extend(server_to_findings(&server, &lane.liveness_probes));
     let blended = blend.then(|| blend::run(path, None, &findings, &sites, stdout_color(color)));
     render_scan_output(
         state_path,
@@ -5418,10 +5458,10 @@ fn run_scan_incremental(
     } else {
         resolve_structure_lane(None, "", path)
     };
-    structure.extend(server_to_findings(&server));
     // Config files are not content-hash indexed (parsing them is cheap): the
     // lane simply re-runs on every warm scan, so it can never be stale.
     let mut lane = config_lane::run(path, &specs, &snapshot_name(path));
+    structure.extend(server_to_findings(&server, &lane.liveness_probes));
     if changed_only {
         // po-av01j.140: SCOPE THE GATE, NOT THE REPORT. A config finding is
         // usually a repo-wide FACT ("18 of 18 workflows declare permissions"),
@@ -5562,10 +5602,11 @@ fn run_explain(
     }
     let mut ladder_findings = triage_to_findings(&items, Some(&specs));
     ladder_findings.extend(resolve_structure_findings(retrieved, &stream.text, path));
-    ladder_findings.extend(server_to_findings(&server));
     // Config-lane ids resolve here too: the fresh scan mirrors what the
     // ladder printed, config rows included.
-    ladder_findings.extend(config_lane::run(path, &specs, &snapshot_name(path)).findings);
+    let lane = config_lane::run(path, &specs, &snapshot_name(path));
+    ladder_findings.extend(server_to_findings(&server, &lane.liveness_probes));
+    ladder_findings.extend(lane.findings);
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -5632,10 +5673,9 @@ fn run_suppress(
                     &stream.text,
                     scan_path,
                 ));
-                ladder_findings.extend(server_to_findings(&server));
-                ladder_findings.extend(
-                    config_lane::run(scan_path, &specs, &snapshot_name(scan_path)).findings,
-                );
+                let lane = config_lane::run(scan_path, &specs, &snapshot_name(scan_path));
+                ladder_findings.extend(server_to_findings(&server, &lane.liveness_probes));
+                ladder_findings.extend(lane.findings);
                 let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
                     eprintln!(
                         "no finding with id '{id}' in the last scan or in a fresh scan of {}; \

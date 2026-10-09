@@ -10,8 +10,10 @@
 
 use crate::render;
 use rvl_config::key_ledger::{self, KeyState};
+use rvl_config::kubernetes::manifest::LIVENESS_HTTP_GET_PATH_KEY;
 use rvl_core::Verdict;
 use rvl_data::BIN;
+use rvl_propagate::probe_handler::LivenessProbe;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -22,6 +24,10 @@ pub struct LaneOutput {
     /// Ladder rows for violating config classes (grouped, not per-packet).
     pub findings: Vec<render::Finding>,
     pub coverage: render::ConfigCoverage,
+    /// The liveness probe `httpGet` paths in the repo's Kubernetes manifests:
+    /// the manifest half of the probe-to-handler join, which the scan
+    /// completes against the server-entry lane's route inventory.
+    pub liveness_probes: Vec<LivenessProbe>,
 }
 
 /// The class rule a config finding is grouped and waived by.
@@ -143,9 +149,23 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         })
         .collect();
 
+    let liveness_probes = retrieval
+        .packets
+        .iter()
+        .filter(|p| p.format == "kubernetes" && p.key == LIVENESS_HTTP_GET_PATH_KEY)
+        .filter_map(|p| {
+            Some(LivenessProbe {
+                file_path: p.file_path.clone(),
+                unit: p.unit.clone(),
+                path: p.resolved_value.clone()?,
+            })
+        })
+        .collect();
+
     LaneOutput {
         findings: ladder,
         coverage,
+        liveness_probes,
     }
 }
 

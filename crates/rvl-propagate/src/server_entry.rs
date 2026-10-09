@@ -63,7 +63,7 @@ const MIDDLEWARE_METHODS: &[&str] = &[
     "after_request",
 ];
 
-fn is_middleware_attachment(site: &Site) -> bool {
+pub(crate) fn is_middleware_attachment(site: &Site) -> bool {
     MIDDLEWARE_METHODS.contains(&site.method.to_ascii_lowercase().as_str())
 }
 
@@ -82,7 +82,7 @@ fn is_pathish(s: &str) -> bool {
 /// schema-v2 constant arguments (each language's quoting stripped). Fallback
 /// when no const arg resolved: quoted path strings in the snippet, so a
 /// stream from a retriever without const-arg support still yields paths.
-fn route_paths(site: &Site) -> Vec<String> {
+pub(crate) fn route_paths(site: &Site) -> Vec<String> {
     let mut out: Vec<String> = site
         .const_args
         .iter()
