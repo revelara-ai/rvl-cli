@@ -105,6 +105,20 @@ propagation.
   `catch_clause` identity (the Java sibling of `except_handler` /
   `recover_block`), `func: "catch"`.
 
+- **`unsized_construction`**: one packet per construction of an object that
+  takes a bound. `pool`: `new HikariConfig(...)` and `new
+  HikariDataSource(...)` (HikariCP). `cache`: `Caffeine.newBuilder()`. The
+  class rides `const_args` as `bound_class`. Each link of the builder chain,
+  and each method called on the variable that holds the value, rides
+  `const_args` under the method name: a constant as its value (`how:
+  "literal"` or `"named_constant"`), anything else as its source text (`how:
+  "name"`). A value that leaves the method carries `bound_escapes`, and the
+  methods that the repo calls on the same type anywhere (`how: "type"`). A
+  HikariCP constructor with an argument carries `bound_opaque`. The packet
+  never says which entry is a bound: a `construction_bounds` spec does. See
+  "Unsized constructions" in `docs/retrievers.md`. `Caffeine.newBuilder()`
+  is this packet only, never also a G1 site.
+
 - **`misuse_shape`** — AGGREGATES, one per (enclosing function, class,
   identity), with `misuse_class`/`misuse_count` in `const_args`
   (`how: "aggregate"`). One class: `overbroad_catch`, a catch clause whose
@@ -149,7 +163,8 @@ Plain Java, no JUnit (the helper's toolchain rule is "a JDK and nothing
 else"). It spawns the helper as a subprocess exactly the way rvl does
 and asserts: schema negotiation, `site_key` formula + uniqueness, the
 typed/attributed/unresolved tier behavior, noise suppression, all four site
-kinds, `const_args` evidence, the `repo_config` constructions, and
+kinds, the unsized-construction packets (over `testdata/fixture_bounds/`),
+`const_args` evidence, the `repo_config` constructions, and
 **retrieval invariance** — a full load and a `--files` incremental reload
 emit identical packets for the same file (all units stay in the analysis in
 both modes; `--files` only filters emission).

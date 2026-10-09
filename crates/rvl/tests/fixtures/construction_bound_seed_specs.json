@@ -45,6 +45,15 @@
      "rationale": "ReadAllText holds the whole file in memory; it takes no limit"},
     {"type": "System.IO.File.ReadAllBytes", "class": "read", "control": "RC-067",
      "bounded_by": [], "confidence": 0.9,
-     "rationale": "ReadAllBytes holds the whole file in memory; it takes no limit"}
+     "rationale": "ReadAllBytes holds the whole file in memory; it takes no limit"},
+    {"type": "com.zaxxer.hikari.HikariConfig", "class": "pool", "control": "RC-055",
+     "bounded_by": ["setMaximumPoolSize"], "confidence": 0.9,
+     "rationale": "test-grade stand-in: a HikariCP pool with no setMaximumPoolSize runs on the library default, not on a size chosen for the database; the production corpus decides if that default counts as a bound"},
+    {"type": "com.zaxxer.hikari.HikariDataSource", "class": "pool", "control": "RC-055",
+     "bounded_by": ["setMaximumPoolSize"], "confidence": 0.9,
+     "rationale": "test-grade stand-in: HikariDataSource extends HikariConfig, so the same setter sizes it"},
+    {"type": "com.github.benmanes.caffeine.cache.Caffeine", "class": "cache", "control": "RC-067",
+     "bounded_by": ["maximumSize", "maximumWeight"], "confidence": 0.9,
+     "rationale": "a Caffeine cache with no maximumSize and no maximumWeight has no size limit"}
   ]
 }
