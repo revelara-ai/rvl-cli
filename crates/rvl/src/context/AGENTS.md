@@ -22,6 +22,7 @@ Add `--format=json` to any of these for machine-readable output.
 **Causal factors:**
 - `rvl factor list --top10` — the Reliability Top 10 of the causal factor catalog
 - `rvl factor show CF-XXXX` — causal factor details, linked controls and related risks
+- `rvl risk list --factor CF-XXXX` — your organization's risks related to a causal factor
 
 **Knowledge:**
 - `rvl knowledge search "<query>" --limit=5` — search incidents and patterns

@@ -97,6 +97,28 @@ The embedded context block that `rvl init` writes to `AGENTS.md` and
 `CLAUDE.md` has a new "Causal factors" list with the two commands. The
 addition is additive: no command or field changed.
 
+### `--factor` on `rvl risk list`
+
+**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+and earlier do not have the flag: the output of `rvl risk list --help` has
+the text `--factor` only on a version that has it.
+
+`rvl risk list --factor <CODE>` lists the risks of your organization that are
+related to one causal factor. These are the same risks that
+`rvl factor show <CODE>` shows as related risks. The code goes to the server
+as the query parameter `factor`, and the server does the filtering. You can
+use the flag together with `--status`, `--category`, `--service` and `--team`.
+
+A value that is not a code form (`CF-XXXX`) exits 1 with the message of the
+server. A code that no catalog entry has prints `No risks found.` and exits 0.
+An empty value (`--factor=`) is not a filter. The flag needs a server that has
+the `factor` filter; an older server does not know the parameter and can
+return the list without the filter.
+
+The embedded context block that `rvl init` writes to `AGENTS.md` and
+`CLAUDE.md` has a new line for the flag in the "Causal factors" list. The
+addition is additive: no command or field changed.
+
 ## 1.4.0
 
 The first release after `v1.3.0`.
