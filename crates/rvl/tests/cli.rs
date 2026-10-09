@@ -4523,7 +4523,8 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
          RVL_UPDATE_GOLDEN=1 cargo test -p rvl --test cli csindex_live_output",
     );
     // Every site record gets an --out row except server_entry registrations,
-    // emission_point aggregates and unsized constructions, which their own
+    // the emission_point and misuse_shape aggregates and unsized
+    // constructions, which their own
     // lanes judge.
     let g1_sites = golden
         .lines()
@@ -4532,7 +4533,9 @@ fn scan_decides_csharp_g1_sites_from_a_retrieved_stream() {
             p.get("kind").is_none()
                 && !matches!(
                     p["site_kind"].as_str(),
-                    Some("server_entry" | "emission_point" | "unsized_construction")
+                    Some(
+                        "server_entry" | "emission_point" | "misuse_shape" | "unsized_construction"
+                    )
                 )
         })
         .count();
@@ -5061,6 +5064,172 @@ fn csindex_live_output_matches_the_committed_golden() {
         live.lines().nth(first_diff).unwrap_or("<end of stream>"),
         golden.lines().nth(first_diff).unwrap_or("<end of stream>"),
     );
+}
+
+/// C#, misuse shapes: csindex over `testdata/fixture_misuse` emits one
+/// `misuse_shape` aggregate per (function, class, identity), with the fields
+/// the contract in docs/retrievers.md requires, and nothing for the bounded
+/// form of each shape.
+#[test]
+fn csindex_emits_one_misuse_packet_per_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(csindex_dll) = build_csindex(dir.path()) else {
+        return;
+    };
+    let fixture = helper_fixture("csindex").with_file_name("fixture_misuse");
+    let out = std::process::Command::new("dotnet")
+        .arg(&csindex_dll)
+        .args(["--retrieve", "--root"])
+        .arg(&fixture)
+        .args(["--name", "fx"])
+        .output()
+        .expect("failed to run csindex");
+    assert!(
+        out.status.success(),
+        "csindex --retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let packets: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let const_arg = |p: &serde_json::Value, name: &str| -> String {
+        p["const_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name && a["how"] == "aggregate")
+            .unwrap_or_else(|| panic!("no aggregate const_arg {name}: {p}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // (symbol, class, identity) -> (packet, count)
+    let mut shapes = std::collections::BTreeMap::new();
+    for p in &packets {
+        if p["site_kind"] != "misuse_shape" {
+            continue;
+        }
+        let key = (
+            p["symbol"].as_str().unwrap().to_string(),
+            const_arg(p, "misuse_class"),
+            p["client_type"].as_str().unwrap().to_string(),
+        );
+        let count: u32 = const_arg(p, "misuse_count").parse().unwrap();
+        assert!(
+            shapes.insert(key.clone(), (p.clone(), count)).is_none(),
+            "one packet per key: {key:?}"
+        );
+    }
+
+    let task = "System.Threading.Tasks.Task";
+    let expected: [(&str, &str, String, &str, u32); 7] = [
+        (
+            "CatchesRoot",
+            "overbroad_catch",
+            "System.Exception".into(),
+            "catch",
+            2,
+        ),
+        ("CatchesBare", "overbroad_catch", "bare".into(), "catch", 1),
+        // ImplicitUsings.cs has no `using System;`: the root type is read
+        // from its written name, in the low-confidence tier.
+        (
+            "CatchesUnresolvedRoot",
+            "overbroad_catch",
+            "System.Exception".into(),
+            "catch",
+            1,
+        ),
+        (
+            "WaitsOnResult",
+            "sync_over_async",
+            format!("{task}.Result"),
+            "Result",
+            2,
+        ),
+        (
+            "WaitsOnWait",
+            "sync_over_async",
+            format!("{task}.Wait"),
+            "Wait",
+            1,
+        ),
+        (
+            "WaitsOnGetResult",
+            "sync_over_async",
+            format!("{task}.GetAwaiter.GetResult"),
+            "GetResult",
+            2,
+        ),
+        (
+            "WaitsOnValueTask",
+            "sync_over_async",
+            "System.Threading.Tasks.ValueTask.Result".into(),
+            "Result",
+            1,
+        ),
+    ];
+    for (symbol, class, identity, func, count) in &expected {
+        let key = (symbol.to_string(), class.to_string(), identity.clone());
+        let (p, got) = shapes
+            .get(&key)
+            .unwrap_or_else(|| panic!("no packet for {key:?}; have {:?}", shapes.keys()));
+        assert_eq!(got, count, "misuse_count of {key:?}");
+        assert_eq!(p["func"], *func, "{p}");
+        assert_eq!(p["packet_schema"], 2, "{p}");
+        assert_eq!(p["lang"], "csharp", "{p}");
+        let unresolved = *symbol == "CatchesUnresolvedRoot";
+        let file = if unresolved {
+            "ImplicitUsings.cs"
+        } else {
+            "Shapes.cs"
+        };
+        assert_eq!(p["file_path"], file, "{p}");
+        assert_eq!(p["enclosing_function_body"], "", "no body on an aggregate");
+        assert_eq!(p["provenance"]["client_type_resolved"], !unresolved, "{p}");
+        let line = p["line_number"].as_u64().unwrap();
+        assert_eq!(
+            p["site_key"],
+            format!("{file}:{line}:{identity}:{func}"),
+            "{p}"
+        );
+    }
+    // The line and the snippet are those of the FIRST occurrence.
+    let (root, _) = &shapes[&(
+        "CatchesRoot".to_string(),
+        "overbroad_catch".to_string(),
+        "System.Exception".to_string(),
+    )];
+    assert_eq!(root["line_number"], 48, "{root}");
+    let (result, _) = &shapes[&(
+        "WaitsOnResult".to_string(),
+        "sync_over_async".to_string(),
+        format!("{task}.Result"),
+    )];
+    assert_eq!(result["snippet"], "task.Result", "{result}");
+
+    // Nothing else: the bounded form of each shape, a handler that throws
+    // again, the emission lane's swallow, a narrow type that does not
+    // resolve, and the same member names on a type that is not a task emit
+    // no misuse packet.
+    assert_eq!(
+        shapes.len(),
+        expected.len(),
+        "unexpected misuse packets: {:?}",
+        shapes.keys()
+    );
+    // The swallow rides the stream once, as the emission lane's aggregate.
+    let swallows = packets
+        .iter()
+        .filter(|p| {
+            p["site_kind"] == "emission_point"
+                && p["symbol"] == "Swallows"
+                && p["client_type"] == "catch_clause"
+        })
+        .count();
+    assert_eq!(swallows, 1);
 }
 
 /// C#, live end to end: csindex retrieves the fixture (Roslyn engine), and
