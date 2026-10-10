@@ -342,6 +342,13 @@ enum Cmd {
         /// Write the exact `Report` JSON payload to this file.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Show the spec-authoring queue in place of the payload: every
+        /// finding with no spec, the surfaces the repository declares itself
+        /// and the unresolved ones included, each with its computed quadrant
+        /// (deterministic, transferable) and the lane it goes to. LOCAL ONLY:
+        /// this view is not the payload and names what the payload leaves out.
+        #[arg(long, conflicts_with_all = ["out", "combine"])]
+        queue: bool,
         /// Scan nothing: read report payloads written by `--out` (one per
         /// repository) and rank their surfaces by how many of the
         /// repositories have each one, then by site count. `--json` and
@@ -5741,14 +5748,18 @@ fn run_report(
     incremental: bool,
     json: bool,
     out: Option<&std::path::Path>,
+    queue: bool,
 ) -> anyhow::Result<ExitCode> {
     // Reporting is local-only today: this command shows/writes the payload; it
     // does not transmit it.
-    eprintln!(
-        "note: reporting is local-only; this shows exactly what a scan WOULD send \
-         to the spec factory (shape + language + counts only), it does not \
-         transmit anything"
-    );
+    // The queue view is not the payload, so it does not claim to be.
+    if !queue {
+        eprintln!(
+            "note: reporting is local-only; this shows exactly what a scan WOULD send \
+             to the spec factory (shape + language + counts only), it does not \
+             transmit anything"
+        );
+    }
 
     // Same resolve->scan pipeline scan uses, via the shared building blocks.
     let (findings, sites) = if incremental && retrieved.is_none() {
@@ -5791,6 +5802,16 @@ fn run_report(
         )?;
         (findings, sites)
     };
+
+    if queue {
+        let queue = report::build_queue(&sites, &findings);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&queue)?);
+        } else {
+            print!("{}", render_queue_human(&queue));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let report = report::build_report(&sites, &findings, env!("CARGO_PKG_VERSION"));
     let payload = serde_json::to_string_pretty(&report)?;
@@ -5944,6 +5965,100 @@ fn render_combined_human(c: &report::CombinedReport) -> String {
         c.repo_internal_surfaces,
         c.repo_internal_sites,
     ));
+    s
+}
+
+/// The spec-authoring queue as a table: one row per finding with no spec, its
+/// two gates and the lane they route it to. The header says that this is not
+/// the payload, because it names surfaces the payload only counts.
+fn render_queue_human(q: &report::AuthoringQueue) -> String {
+    use rvl_core::authoring::Lane;
+    use std::fmt::Write as _;
+    const NO_LANG: &str = "-";
+    const UNRESOLVED: &str = "(unresolved)";
+    let mut s = String::new();
+    s.push_str(
+        "The spec-authoring queue: every finding with no spec, and where it goes.\n\
+         LOCAL ONLY. This is not the report payload: it names the surfaces that this \
+         repository declares itself, and it is never sent.\n\n\
+         A finding gets a spec only if it is deterministic (the client type resolved, so a \
+         rule has an identity to key on) and transferable (the API is not declared in this \
+         repository). Every other finding goes to no spec and stays with the agent lenses.\n\n",
+    );
+    if q.entries.is_empty() {
+        s.push_str("No findings without a spec: the queue is empty.\n");
+        return s;
+    }
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let w = q
+        .entries
+        .iter()
+        .map(|e| e.site_count.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max("sites".len());
+    let lw = q
+        .entries
+        .iter()
+        .map(|e| e.lang.len())
+        .max()
+        .unwrap_or(0)
+        .max("lang".len());
+    let nw = q
+        .entries
+        .iter()
+        .map(|e| e.routing.lane.label().len())
+        .max()
+        .unwrap_or(0)
+        .max("lane".len());
+    let (dw, tw) = ("deterministic".len(), "transferable".len());
+    let _ = writeln!(
+        s,
+        "  {:>w$}  {:<lw$}  {:<dw$}  {:<tw$}  {:<nw$}  surface",
+        "sites", "lang", "deterministic", "transferable", "lane"
+    );
+    let _ = writeln!(
+        s,
+        "  {}  {}  {}  {}  {}  -------",
+        "-".repeat(w),
+        "-".repeat(lw),
+        "-".repeat(dw),
+        "-".repeat(tw),
+        "-".repeat(nw)
+    );
+    for e in &q.entries {
+        let lang = if e.lang.is_empty() { NO_LANG } else { &e.lang };
+        // An unresolved client type is empty or `invalid type`. Neither reads
+        // as a name in a table, so the row says what it is.
+        let client_type = if e.routing.deterministic {
+            e.client_type.as_str()
+        } else {
+            UNRESOLVED
+        };
+        let _ = writeln!(
+            s,
+            "  {:>w$}  {:<lw$}  {:<dw$}  {:<tw$}  {:<nw$}  {}.{}",
+            e.site_count,
+            lang,
+            yes_no(e.routing.deterministic),
+            yes_no(e.routing.transferable),
+            e.routing.lane.label(),
+            client_type,
+            e.method
+        );
+    }
+    let to_spec = q
+        .entries
+        .iter()
+        .filter(|e| e.routing.lane == Lane::ApiSpec)
+        .count();
+    let _ = writeln!(
+        s,
+        "\n{} finding(s) with no spec: {} to the API spec lane (G1), {} to no spec.",
+        q.entries.len(),
+        to_spec,
+        q.entries.len() - to_spec
+    );
     s
 }
 
@@ -7448,6 +7563,7 @@ fn run() -> anyhow::Result<ExitCode> {
             incremental,
             json,
             out,
+            queue,
             combine,
         } if combine.is_empty() => run_report(
             &store,
@@ -7460,6 +7576,7 @@ fn run() -> anyhow::Result<ExitCode> {
             incremental,
             json,
             out.as_deref(),
+            queue,
         ),
         Cmd::Report {
             json, out, combine, ..

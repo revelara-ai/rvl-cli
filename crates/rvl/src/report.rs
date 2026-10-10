@@ -50,6 +50,7 @@
 //! a source-bearing field here breaks those tests (and the open-source privacy
 //! contract) on purpose.
 
+use rvl_core::authoring::{self, KeysOn, Routing};
 use rvl_core::Site;
 use rvl_propagate::Finding;
 
@@ -203,12 +204,38 @@ fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Build the shape-only report. `findings` and `sites` are index-aligned
-/// (`propagate_all` maps sites 1:1), so each unknown finding names its site by
-/// position. For each unknown surface we take ONLY `client_type`, `method` and
-/// the normalized `lang` from the site — never the snippet, enclosing body, file
-/// path, or line — dedup by (client_type, method), and sum the per-shape site
-/// counts.
+/// Every unknown finding, grouped by (client_type, method). `findings` and
+/// `sites` are index-aligned (`propagate_all` maps sites 1:1), so each unknown
+/// finding names its site by position. A group whose client type did not
+/// resolve is kept, under the text the retriever gave: the payload counts it
+/// and the queue routes it.
+///
+/// ONLY the public API identity, its language and the repo-internal mark are
+/// read from a site here, so nothing else can leak into either view.
+/// BTreeMap keeps assembly deterministic before the final sort.
+fn unknown_groups(
+    sites: &[Site],
+    findings: &[Finding],
+) -> std::collections::BTreeMap<(String, String), GroupAcc> {
+    let mut groups: std::collections::BTreeMap<(String, String), GroupAcc> =
+        std::collections::BTreeMap::new();
+    for (f, s) in findings.iter().zip(sites.iter()) {
+        if !is_unknown(&f.reason) {
+            continue;
+        }
+        let key = (s.client_type.clone(), s.method.clone());
+        let acc = groups.entry(key).or_default();
+        acc.site_count += 1;
+        acc.in_repo |= s.provenance.api_in_repo;
+        acc.observe(&s.lang);
+    }
+    groups
+}
+
+/// Build the shape-only report. For each unknown surface we take ONLY
+/// `client_type`, `method` and the normalized `lang` from the site — never the
+/// snippet, enclosing body, file path, or line — dedup by (client_type,
+/// method), and sum the per-shape site counts.
 ///
 /// Language is a property of the SITES, and the group is what gets reported, so
 /// it is folded: a group whose sites all agree reports that language, a group
@@ -229,27 +256,15 @@ fn count(n: usize) -> u32 {
 /// Sorted deterministically: highest `site_count` first, ties broken by
 /// `client_type` then `method`, so the payload (and its audit) is reproducible.
 pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str) -> Report {
-    // Accumulate per (client_type, method). BTreeMap keeps assembly
-    // deterministic before the final sort.
-    let mut groups: std::collections::BTreeMap<(String, String), GroupAcc> =
-        std::collections::BTreeMap::new();
     let mut unresolved_sites: u32 = 0;
-    for (f, s) in findings.iter().zip(sites.iter()) {
-        if !is_unknown(&f.reason) {
-            continue;
+    let mut groups = unknown_groups(sites, findings);
+    groups.retain(|(client_type, _), acc| {
+        let unmintable = is_unmintable(client_type);
+        if unmintable {
+            unresolved_sites = unresolved_sites.saturating_add(count(acc.site_count));
         }
-        // ONLY the public API identity and its language cross over. Nothing
-        // else on the site is read here, so nothing else can leak.
-        if is_unmintable(&s.client_type) {
-            unresolved_sites = unresolved_sites.saturating_add(1);
-            continue;
-        }
-        let key = (s.client_type.clone(), s.method.clone());
-        let acc = groups.entry(key).or_default();
-        acc.site_count += 1;
-        acc.in_repo |= s.provenance.api_in_repo;
-        acc.observe(&s.lang);
-    }
+        !unmintable
+    });
 
     let (internal, shared): (Vec<_>, Vec<_>) = groups.into_iter().partition(|(_, acc)| acc.in_repo);
     let repo_internal_surfaces = count(internal.len());
@@ -278,6 +293,72 @@ pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str)
         unresolved_sites,
         repo_internal_surfaces,
         repo_internal_sites,
+    }
+}
+
+/// One finding of the spec-authoring queue: an unknown API identity, how many
+/// sites have it, and where it goes.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct QueueEntry {
+    /// As the retriever gave it. Empty or `invalid type` when the receiver
+    /// did not resolve.
+    pub client_type: String,
+    pub method: String,
+    pub lang: String,
+    pub site_count: usize,
+    pub routing: Routing,
+}
+
+/// The spec-authoring queue of one scan: EVERY unknown finding, with its
+/// computed quadrant and lane.
+///
+/// THIS IS NOT THE REPORT PAYLOAD and is never sent. It names the surfaces the
+/// scanned repository declares itself, which [`Report`] only counts, because a
+/// person who routes findings must see which ones were routed away from a
+/// spec. `local_only` is always true and is serialized, so a file of this
+/// shape says what it is. It carries no source, path or line number.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct AuthoringQueue {
+    pub local_only: bool,
+    pub entries: Vec<QueueEntry>,
+}
+
+/// Build the spec-authoring queue from the findings [`build_report`] reads.
+///
+/// The two gates are the two exclusions of the payload, read as answers:
+///
+///   * DETERMINISTIC: the client type resolved, so there is an identity a
+///     rule can be keyed on ([`is_unmintable`] says it did not);
+///   * TRANSFERABLE: no site marks the called API as declared in the scanned
+///     repository (`provenance.api_in_repo`). A retriever that does not set
+///     the mark is read as "not in the repository", as it is for the payload.
+///
+/// So the entries routed to the API spec lane are exactly the surfaces of the
+/// payload, and each excluded count of the payload is here as named rows.
+///
+/// Sorted by quadrant, spec lane first, then as the payload is.
+pub fn build_queue(sites: &[Site], findings: &[Finding]) -> AuthoringQueue {
+    let mut entries: Vec<QueueEntry> = unknown_groups(sites, findings)
+        .into_iter()
+        .map(|((client_type, method), acc)| QueueEntry {
+            routing: authoring::route(KeysOn::ApiCall, !is_unmintable(&client_type), !acc.in_repo),
+            client_type,
+            method,
+            site_count: acc.site_count,
+            lang: acc.reported_lang(),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a.routing
+            .quadrant
+            .cmp(&b.routing.quadrant)
+            .then_with(|| b.site_count.cmp(&a.site_count))
+            .then_with(|| a.client_type.cmp(&b.client_type))
+            .then_with(|| a.method.cmp(&b.method))
+    });
+    AuthoringQueue {
+        local_only: true,
+        entries,
     }
 }
 
@@ -858,5 +939,139 @@ mod tests {
         let c = combine_reports(&[a]);
         assert_eq!(c.surfaces[0].repo_count, 1);
         assert_eq!(c.surfaces[0].site_count, 3);
+    }
+
+    fn queue_row<'a>(q: &'a AuthoringQueue, client_type: &str) -> &'a QueueEntry {
+        q.entries
+            .iter()
+            .find(|e| e.client_type == client_type)
+            .unwrap_or_else(|| panic!("no {client_type:?} in {q:?}"))
+    }
+
+    // One finding per quadrant. The repo-internal one is the case the routing
+    // exists for: a queue constructor one repository declares and calls from
+    // many places resolves cleanly, so a rule could decide every site, and no
+    // other repository will ever have a site for the spec to judge.
+    #[test]
+    fn the_queue_routes_one_finding_in_each_quadrant() {
+        use rvl_core::authoring::{Lane, Quadrant};
+        let mut unresolved_in_repo = unknown_site("invalid type", "push");
+        unresolved_in_repo.provenance.api_in_repo = true;
+        let sites = vec![
+            site_with_lang("net/http.Client", "Do", "go"),
+            in_repo_site("example.com/broker/server", "newIPQueue"),
+            in_repo_site("example.com/broker/server", "newIPQueue"),
+            site_with_lang("", "post", "typescript"),
+            unresolved_in_repo,
+            // Decided, so it is not in the queue at all.
+            unknown_site("db.Pool", "Query"),
+        ];
+        let mut findings = no_spec(5);
+        findings.push(finding("satisfies: bounded by context deadline"));
+        let q = build_queue(&sites, &findings);
+        assert_eq!(q.entries.len(), 4, "{q:?}");
+
+        let shared = queue_row(&q, "net/http.Client");
+        assert_eq!(shared.routing.quadrant, Quadrant::DeterministicTransferable);
+        assert_eq!(shared.routing.lane, Lane::ApiSpec);
+
+        let internal = queue_row(&q, "example.com/broker/server");
+        assert_eq!(internal.method, "newIPQueue");
+        assert_eq!(internal.site_count, 2);
+        assert!(internal.routing.deterministic, "the identity resolved");
+        assert!(!internal.routing.transferable, "one repository has it");
+        assert_eq!(
+            internal.routing.quadrant,
+            Quadrant::DeterministicNotTransferable
+        );
+        assert_eq!(internal.routing.lane, Lane::Agent);
+
+        let unresolved = queue_row(&q, "");
+        assert_eq!(
+            unresolved.routing.quadrant,
+            Quadrant::TransferableNotDeterministic
+        );
+        assert_eq!(unresolved.routing.lane, Lane::Agent);
+
+        let neither = queue_row(&q, "invalid type");
+        assert_eq!(neither.routing.quadrant, Quadrant::Neither);
+        assert_eq!(neither.routing.lane, Lane::Agent);
+    }
+
+    // The queue and the payload read the same findings with the same two
+    // tests, so the rows routed to the API spec lane are exactly the surfaces
+    // the payload carries.
+    #[test]
+    fn the_api_spec_lane_of_the_queue_is_the_report_payload() {
+        use rvl_core::authoring::Lane;
+        let sites = vec![
+            site_with_lang("net/http.Client", "Do", "go"),
+            site_with_lang("db.Pool", "Query", "go"),
+            site_with_lang("db.Pool", "Query", "go"),
+            in_repo_site("example.com/shop/ledger.Writer", "Post"),
+            unknown_site("", "post"),
+        ];
+        let findings = no_spec(5);
+        let report = build_report(&sites, &findings, "test");
+        let lane: Vec<ReportSurface> = build_queue(&sites, &findings)
+            .entries
+            .into_iter()
+            .filter(|e| e.routing.lane == Lane::ApiSpec)
+            .map(|e| ReportSurface {
+                client_type: e.client_type,
+                method: e.method,
+                lang: e.lang,
+                site_count: e.site_count,
+            })
+            .collect();
+        assert_eq!(lane, report.surfaces);
+    }
+
+    // Mintable work leads, and inside a quadrant the order is the payload's.
+    #[test]
+    fn the_queue_lists_the_spec_lane_first_then_by_site_count() {
+        let sites = vec![
+            in_repo_site("example.com/shop/ledger.Writer", "Post"),
+            in_repo_site("example.com/shop/ledger.Writer", "Post"),
+            in_repo_site("example.com/shop/ledger.Writer", "Post"),
+            site_with_lang("b.T", "M", "go"),
+            site_with_lang("a.T", "M", "go"),
+            site_with_lang("a.T", "M", "go"),
+        ];
+        let names: Vec<String> = build_queue(&sites, &no_spec(6))
+            .entries
+            .into_iter()
+            .map(|e| e.client_type)
+            .collect();
+        assert_eq!(names, vec!["a.T", "b.T", "example.com/shop/ledger.Writer"]);
+    }
+
+    // The queue names what the payload refuses to, so it says on its face
+    // that it is not the payload. It still carries no source, path or line.
+    #[test]
+    fn the_queue_is_marked_local_and_carries_no_source() {
+        let sites = vec![
+            unknown_site("db.Pool", "Query"),
+            site_with_lang("db.Pool", "Query", SENTINEL_SNIPPET),
+        ];
+        let q = build_queue(&sites, &no_spec(2));
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["local_only"], true);
+        let json = v.to_string();
+        for leaked in [SENTINEL_SNIPPET, SENTINEL_BODY, SENTINEL_PATH] {
+            assert!(!json.contains(leaked), "{leaked} is in the queue: {json}");
+        }
+        assert!(!json.contains(&SENTINEL_LINE.to_string()), "{json}");
+        let mut keys: Vec<&str> = v["entries"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["client_type", "lang", "method", "routing", "site_count"]
+        );
     }
 }

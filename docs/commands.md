@@ -17,6 +17,7 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
 | `rvl report --combine <FILE>...` | Read report payloads written by `rvl report --out`, one per repository, and rank the surfaces by how many repositories have each one. See [Privacy](privacy.md#combine-the-reports-of-several-repositories). |
 | `rvl index <init\|reindex\|status>` | Incremental-scan packet index (content-hash keyed). `reindex --detach` rebuilds in the background. |
+| `rvl report [PATH] --queue` | List every finding with no spec, with its computed quadrant (deterministic, transferable) and the lane it goes to. Local only: this view is not the payload. See [Privacy](privacy.md#the-spec-authoring-queue). |
 | `rvl sync` | Refresh the spec cache from the Revelara API (async-safe, never blocks a scan). With no key, syncs the OSS vocabulary tier; with a key, both tiers. Rarely needed by hand: `init` syncs, and scans start a background check every six hours. An HTTP 404 is reported as "the server has not published a spec cache", separate from `fetch failed` (network or server error). |
 | `rvl cache <import\|status\|keys>` | Spec-cache maintenance, including air-gapped import of a signed artifact. `keys` lists every config key the retrievers emit and where it stands against the installed specs: specced, awaiting a spec, or vocabulary only (emitted as evidence, never judged). |
 

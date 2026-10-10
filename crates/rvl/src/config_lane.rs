@@ -169,6 +169,22 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
     }
 }
 
+/// The two gates of a routed key as words, for the text report.
+fn quadrant_label(r: rvl_core::authoring::Routing) -> String {
+    let gate = |pass: bool, name: &str| {
+        if pass {
+            name.to_string()
+        } else {
+            format!("not {name}")
+        }
+    };
+    format!(
+        "{}, {}",
+        gate(r.deterministic, "deterministic"),
+        gate(r.transferable, "transferable")
+    )
+}
+
 /// The standing mint queue as text, for `rvl cache keys`: every key the
 /// retrievers can emit, split by where it stands against the installed specs.
 /// Unlike a scan's `unjudged keys` line this does not depend on what one repo
@@ -196,7 +212,16 @@ pub fn render_key_report(q: &key_ledger::MintQueue, artifact_loaded: bool) -> St
         let mut any = false;
         for row in q.keys.iter().filter(|r| r.state == state) {
             any = true;
-            if row.reason.is_empty() {
+            if let Some(r) = row.routing {
+                let _ = writeln!(
+                    o,
+                    "  {} {}  [{} -> {}]",
+                    row.format,
+                    row.key,
+                    quadrant_label(r),
+                    r.lane.label()
+                );
+            } else if row.reason.is_empty() {
                 let _ = writeln!(o, "  {} {}", row.format, row.key);
             } else {
                 let _ = writeln!(o, "  {} {} \u{2014} {}", row.format, row.key, row.reason);
@@ -485,6 +510,16 @@ mod tests {
         );
         let at = |needle: &str| line(needle).unwrap_or_else(|| panic!("no {needle} in {text}"));
         assert!((queue..vocab).contains(&at("github-actions workflow.concurrency")));
+        // Every queued key states its computed route; no other row does.
+        let routed = "deterministic, transferable -> config key spec (G6)";
+        for (i, l) in text.lines().enumerate() {
+            let is_key = l.starts_with("  ") && !l.contains("(none)");
+            assert_eq!(
+                l.contains(routed),
+                is_key && (queue..vocab).contains(&i),
+                "{l}"
+            );
+        }
         assert!((vocab..specced).contains(&at("terraform module.source ")));
         // A guard predicate is a fact a conditional spec asks about, never a
         // key awaiting a spec of its own (po-av01j.133.10).

@@ -9,6 +9,20 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.4.0 (not released yet)
 
+### `rvl report --queue`, and `routing` on `rvl cache keys --json`
+
+**Minimum version to probe for: the first release after 1.4.0.**
+
+`rvl report --queue` lists every finding with no spec, with a computed
+`routing`: the two gates `deterministic` and `transferable`, the `quadrant`
+they make, and the `lane` (`api_spec`, `config_key_spec` or `agent`). The
+view is local and is not the report payload, which does not change. See
+[Privacy](privacy.md#the-spec-authoring-queue).
+
+In `rvl cache keys --json`, a key whose `state` is `mint_queue` has the same
+`routing` object. A key in a different state does not have the field. The
+text output shows the route at the end of each key that awaits a spec.
+
 ### `rvl report` leaves out repo-internal surfaces, and `--combine` ranks across repositories
 
 **Minimum version to probe for: the first release after 1.4.0.**

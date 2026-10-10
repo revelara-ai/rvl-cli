@@ -56,6 +56,44 @@ count for each, and never a name.
 
 The table that `rvl report` prints states both counts below the surfaces.
 
+### The spec-authoring queue
+
+```bash
+rvl report [PATH] --queue          # table: one row per finding with no spec
+rvl report [PATH] --queue --json   # the same rows as JSON
+```
+
+`--queue` shows every finding with no spec, and where it goes. It is a local
+view and it is not the payload: it names the repo-internal surfaces that the
+payload only counts, and `rvl` never sends it. You cannot use `--queue` with
+`--out` or `--combine`. The JSON has `"local_only": true`.
+
+A finding becomes a spec only if it passes two gates. `rvl` computes both
+from facts that the retriever states:
+
+- **Deterministic.** The client type resolved, so a rule has an identity to
+  key on.
+- **Transferable.** The retriever did not mark the called API as declared in
+  the scanned repository (`provenance.api_in_repo`). A retriever that does not
+  set the mark is read as "not in the repository".
+
+| deterministic | transferable | `quadrant` | `lane` |
+| --- | --- | --- | --- |
+| yes | yes | `deterministic_transferable` | `api_spec` (an API spec, lane G1) |
+| yes | no | `deterministic_not_transferable` | `agent` (no spec) |
+| no | yes | `transferable_not_deterministic` | `agent` (no spec) |
+| no | no | `neither` | `agent` (no spec) |
+
+The rows in the `api_spec` lane are the surfaces of the payload. A function
+that one repository declares and calls from many sites is deterministic and
+not transferable: a rule can decide each site, and no other repository has a
+site for the spec to judge. Such a finding is not waiting for a spec. It
+stays with the agent lenses.
+
+Each row has `client_type`, `method`, `lang`, `site_count` and `routing`.
+`routing` has `deterministic`, `transferable`, `quadrant` and `lane`. The
+table shows an unresolved client type as `(unresolved)`.
+
 ### Combine the reports of several repositories
 
 ```sh

@@ -24,6 +24,7 @@
 //! (and so every retriever test) on an undeclared key, and the tests below
 //! fail on a constructor that bypasses it or an entry nothing emits.
 
+use rvl_core::authoring::{self, KeysOn, Routing};
 use rvl_spec::SpecCache;
 use serde::Serialize;
 
@@ -275,6 +276,9 @@ pub struct KeyRow {
     pub state: KeyState,
     /// Why the key is not judged; empty unless `state` is `vocabulary_only`.
     pub reason: &'static str,
+    /// Where the key is authored; present only when `state` is `mint_queue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Routing>,
 }
 
 /// The whole ledger classified against one artifact.
@@ -312,6 +316,11 @@ pub fn mint_queue(specs: &SpecCache) -> MintQueue {
             key: e.key,
             state,
             reason,
+            // A ledger key passes both gates by what the ledger is: a
+            // retriever emits it from one file, and it is a key of a public
+            // format that every repository using the format has.
+            routing: (state == KeyState::MintQueue)
+                .then(|| authoring::route(KeysOn::ConfigKey, true, true)),
         });
     }
     out
@@ -526,5 +535,25 @@ mod tests {
         let q = mint_queue(&SpecCache::default());
         assert_eq!(q.specced, 0);
         assert_eq!(q.mint_queue + q.vocabulary_only, q.emitted);
+    }
+
+    // A ledger key is emitted by a retriever from one file, and it is a key
+    // of a public format, so a key awaiting a spec passes both gates and goes
+    // to the config key lane. A key that is specced or not judged is not
+    // waiting for a route.
+    #[test]
+    fn every_key_awaiting_a_spec_is_routed_to_the_config_key_lane() {
+        use rvl_core::authoring::{Lane, Quadrant};
+        let q = mint_queue(&specs_for(&[("github-actions", "job.timeout-minutes")]));
+        for row in &q.keys {
+            match row.state {
+                KeyState::MintQueue => {
+                    let r = row.routing.unwrap_or_else(|| panic!("{row:?}"));
+                    assert_eq!(r.quadrant, Quadrant::DeterministicTransferable);
+                    assert_eq!(r.lane, Lane::ConfigKeySpec);
+                }
+                _ => assert_eq!(row.routing, None, "{row:?}"),
+            }
+        }
     }
 }
