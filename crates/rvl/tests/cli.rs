@@ -133,6 +133,15 @@ fn cache_keys_json_accounts_for_every_emitted_key() {
     assert!(keys.iter().any(|k| k["format"] == "terraform"
         && k["key"] == "module.source"
         && k["state"] == "vocabulary_only"));
+    // A key awaiting a spec states its computed route; no other key has one.
+    for k in keys {
+        if k["state"] == "mint_queue" {
+            assert_eq!(k["routing"]["quadrant"], "deterministic_transferable");
+            assert_eq!(k["routing"]["lane"], "config_key_spec", "{k}");
+        } else {
+            assert!(k.get("routing").is_none(), "{k}");
+        }
+    }
 }
 
 #[test]
@@ -5356,6 +5365,127 @@ fn report_leaves_out_repo_internal_and_unresolved_surfaces_and_counts_them() {
         "{human}"
     );
     assert!(!human.contains("example.com/shop"), "{human}");
+}
+
+/// `rvl report --queue` lists every finding with no spec, with its computed
+/// quadrant and lane. A surface the repository declares itself is named here,
+/// as deterministic and not transferable, and routed to no spec lane.
+#[test]
+fn report_queue_shows_the_quadrant_and_lane_of_every_unknown_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, specs) = write_scan_fixtures(dir.path());
+    let src = dir.path().join("svc").join("unknown.go");
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    for (line, func, client_type, in_repo) in [
+        (31, "newIPQueue", "example.com/broker/server", true),
+        (32, "newIPQueue", "example.com/broker/server", true),
+        (33, "post", "", false),
+        (34, "push", "invalid type", true),
+    ] {
+        stream.push_str(
+            &serde_json::json!({
+                "snapshot_id": "fixture",
+                "file_path": src.to_str().unwrap(),
+                "line_number": line,
+                "func": func,
+                "client_type": client_type,
+                "snippet": "q := newIPQueue(s)",
+                "lang": "go",
+                "provenance": {"api_in_repo": in_repo},
+            })
+            .to_string(),
+        );
+        stream.push('\n');
+    }
+    std::fs::write(&packets_path, stream).unwrap();
+
+    let run = |extra: &[&str]| {
+        bin()
+            .args(["report", "--retrieved"])
+            .arg(&packets_path)
+            .arg("--specs-file")
+            .arg(&specs)
+            .args(extra)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl")
+    };
+
+    let out = run(&["--queue", "--json"]);
+    let json = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "report --queue failed: {json}");
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["local_only"], true, "{json}");
+    let entries = doc["entries"].as_array().unwrap();
+    let routed: Vec<(&str, &str, u64, &str, &str)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["client_type"].as_str().unwrap(),
+                e["method"].as_str().unwrap(),
+                e["site_count"].as_u64().unwrap(),
+                e["routing"]["quadrant"].as_str().unwrap(),
+                e["routing"]["lane"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        routed,
+        vec![
+            (
+                "x.Unknown",
+                "Mystery",
+                1,
+                "deterministic_transferable",
+                "api_spec"
+            ),
+            (
+                "example.com/broker/server",
+                "newIPQueue",
+                2,
+                "deterministic_not_transferable",
+                "agent"
+            ),
+            ("", "post", 1, "transferable_not_deterministic", "agent"),
+            ("invalid type", "push", 1, "neither", "agent"),
+        ],
+        "{json}"
+    );
+    assert_eq!(entries[1]["routing"]["deterministic"], true);
+    assert_eq!(entries[1]["routing"]["transferable"], false);
+
+    let out = run(&["--queue"]);
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{human}");
+    let row = |needle: &str| {
+        human
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} row in {human}"))
+    };
+    let internal = row("example.com/broker/server.newIPQueue");
+    assert!(
+        internal.contains("yes") && internal.contains("no") && internal.contains("agent"),
+        "{internal}"
+    );
+    assert!(
+        row("x.Unknown.Mystery").contains("API spec (G1)"),
+        "{human}"
+    );
+    assert!(row("(unresolved).post").contains("agent"), "{human}");
+    assert!(
+        human.contains("4 finding(s) with no spec: 1 to the API spec lane (G1), 3 to no spec."),
+        "{human}"
+    );
+    assert!(human.contains("not the report payload"), "{human}");
+
+    // The queue is not the payload, so it cannot be written as one.
+    let out = run(&["--queue", "--out", "payload.json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--queue with --out is a usage error"
+    );
 }
 
 /// `rvl report --combine` reads one payload per repository and ranks by how

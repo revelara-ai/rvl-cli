@@ -8,6 +8,7 @@
 //! twice in the Python prototype and both times produced a matcher that failed
 //! its own sanity check.
 
+pub mod authoring;
 pub mod flag;
 
 use serde::{Deserialize, Serialize};
