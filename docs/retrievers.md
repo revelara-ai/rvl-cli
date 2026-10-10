@@ -612,6 +612,24 @@ Limits:
   an anonymous callback has an empty name, and all such calls in one file are
   in one packet.
 
+## Calls into the repository's own code
+
+A retriever can set `provenance.api_in_repo: true` on a packet. It means
+that the called function or method is declared in the scanned repository.
+`rvl report` uses the mark to keep the surface out of its payload, because a
+spec for one repository's own function helps no other repository.
+
+- The mark is about the called function, not the receiver type. A repository
+  type that embeds `*sql.DB` has the `ExecContext` of `database/sql`, and
+  that call is not marked.
+- `goindex` sets the mark when the package of the called function is in a
+  module of the repository. It reads the module path from each `go.mod` it
+  loads, so a call from one module of a monorepo into another is marked.
+- `javaindex` sets the mark when the checker resolves the called method to a
+  declaration in the scanned source. A method inherited from a dependency
+  class does not resolve without a classpath, and is not marked.
+- The other retrievers do not set the mark. An absent field means false.
+
 ## Scanning a prebuilt packet stream
 
 To scan a prebuilt packet stream instead of running a helper, pass the escape

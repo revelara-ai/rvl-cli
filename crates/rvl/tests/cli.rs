@@ -5287,6 +5287,176 @@ fn scan_decides_csharp_sites_end_to_end() {
 
 // --- the shape-only report on the wire (po-av01j.63) ---
 
+/// A surface the scanned repository declares itself (`provenance.api_in_repo`)
+/// stays out of the report payload, with its count stated, and so does a site
+/// whose client type never resolved. The human view says both.
+#[test]
+fn report_leaves_out_repo_internal_and_unresolved_surfaces_and_counts_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (packets_path, specs) = write_scan_fixtures(dir.path());
+    let src = dir.path().join("svc").join("unknown.go");
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    for (line, client_type, in_repo) in [
+        (31, "example.com/shop/internal/ledger.Writer", true),
+        (32, "example.com/shop/internal/ledger.Writer", true),
+        (33, "", false),
+    ] {
+        stream.push_str(
+            &serde_json::json!({
+                "snapshot_id": "fixture",
+                "file_path": src.to_str().unwrap(),
+                "line_number": line,
+                "func": "Post",
+                "client_type": client_type,
+                "snippet": "w.Post(e)",
+                "lang": "go",
+                "provenance": {"api_in_repo": in_repo},
+            })
+            .to_string(),
+        );
+        stream.push('\n');
+    }
+    std::fs::write(&packets_path, stream).unwrap();
+
+    let run = |extra: &[&str]| {
+        let out = bin()
+            .args(["report", "--retrieved"])
+            .arg(&packets_path)
+            .arg("--specs-file")
+            .arg(&specs)
+            .args(extra)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "report failed: {stdout}");
+        stdout
+    };
+
+    let json = run(&["--json"]);
+    let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(payload["repo_internal_surfaces"], 1, "{json}");
+    assert_eq!(payload["repo_internal_sites"], 2, "{json}");
+    assert_eq!(payload["unresolved_sites"], 1, "{json}");
+    let surfaces = payload["surfaces"].as_array().unwrap();
+    assert_eq!(surfaces.len(), 1, "only the dependency surface: {json}");
+    assert_eq!(surfaces[0]["client_type"], "x.Unknown");
+    assert!(
+        !json.contains("example.com/shop"),
+        "a repo-internal name left the machine: {json}"
+    );
+
+    let human = run(&[]);
+    assert!(
+        human.contains("1 repo-internal surface(s) at 2 site(s)"),
+        "{human}"
+    );
+    assert!(
+        human.contains("1 site(s) whose client type did not resolve"),
+        "{human}"
+    );
+    assert!(!human.contains("example.com/shop"), "{human}");
+}
+
+/// `rvl report --combine` reads one payload per repository and ranks by how
+/// many repositories have a surface, before how many sites.
+#[test]
+fn report_combine_ranks_surfaces_by_how_many_reports_have_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.json");
+    let b = dir.path().join("b.json");
+    std::fs::write(
+        &a,
+        r#"{"unresolved_sites":2,"repo_internal_surfaces":3,"repo_internal_sites":9,
+            "scanner_version":"1.0.0","surfaces":[
+            {"client_type":"vendor/big.Client","method":"Call","lang":"go","site_count":500},
+            {"client_type":"net/http.Client","method":"Do","lang":"go","site_count":2}]}"#,
+    )
+    .unwrap();
+    // No counts at all: a payload from before the counts existed still reads.
+    std::fs::write(
+        &b,
+        r#"{"scanner_version":"0.9.0","surfaces":[
+            {"client_type":"net/http.Client","method":"Do","lang":"go","site_count":1}]}"#,
+    )
+    .unwrap();
+    let combined_path = dir.path().join("combined.json");
+
+    let out = bin()
+        .args(["report", "--json", "--out"])
+        .arg(&combined_path)
+        .arg("--combine")
+        .arg(&a)
+        .arg(&b)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "combine failed: {stdout} {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["reports"], 2);
+    assert_eq!(v["unresolved_sites"], 2);
+    assert_eq!(v["repo_internal_surfaces"], 3);
+    assert_eq!(v["repo_internal_sites"], 9);
+    assert_eq!(v["surfaces"][0]["client_type"], "net/http.Client");
+    assert_eq!(v["surfaces"][0]["repo_count"], 2);
+    assert_eq!(v["surfaces"][0]["site_count"], 3);
+    assert_eq!(v["surfaces"][1]["client_type"], "vendor/big.Client");
+    assert_eq!(v["surfaces"][1]["repo_count"], 1);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&combined_path).unwrap()).unwrap();
+    assert_eq!(written, v, "--out writes what --json prints");
+
+    let out = bin()
+        .args(["report", "--combine"])
+        .arg(&a)
+        .arg(&b)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{human}");
+    let shared = human.find("net/http.Client.Do").expect("shared surface");
+    let big = human.find("vendor/big.Client.Call").expect("big surface");
+    assert!(shared < big, "the shared surface is listed first: {human}");
+    assert!(
+        human.contains("2 unknown API surface(s), 1 in more than one report."),
+        "{human}"
+    );
+    assert!(
+        human.contains("3 repo-internal surface(s) at 9 site(s)"),
+        "{human}"
+    );
+}
+
+/// A combine input that is not a report payload fails the command and names
+/// the file. Skipping it would lower every count without saying so.
+#[test]
+fn report_combine_refuses_an_input_that_is_not_a_report_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.json");
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&good, r#"{"scanner_version":"1.0.0","surfaces":[]}"#).unwrap();
+    std::fs::write(&bad, "not json").unwrap();
+    for second in [bad.clone(), dir.path().join("missing.json")] {
+        let out = bin()
+            .args(["report", "--combine"])
+            .arg(&good)
+            .arg(&second)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!out.status.success(), "must fail: {stderr}");
+        assert!(
+            stderr.contains(second.file_name().unwrap().to_str().unwrap()),
+            "the error names the file: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "no partial ranking is printed");
+    }
+}
+
 /// End to end through the real binary: the report payload names the language
 /// each surface was written in, and a shape seen in TWO languages names
 /// NEITHER. Unit tests cover the fold; this covers the plumbing — the language

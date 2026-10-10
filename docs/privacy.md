@@ -37,6 +37,42 @@ rvl report [PATH] --out shape.json  # write that JSON payload to a file
 Reporting is local-only today: `rvl report` shows or writes the payload, it
 does not transmit it.
 
+### What the report leaves out
+
+Two kinds of unknown surface are not in the payload. The report gives a
+count for each, and never a name.
+
+- **Repo-internal surfaces.** When a retriever marks a call as a call to a
+  function that the scanned repository declares
+  (`provenance.api_in_repo`), the surface is the repository's own code. A
+  spec for it helps no other repository, and its name identifies the
+  repository. The payload has `repo_internal_surfaces` and
+  `repo_internal_sites` in place of the surfaces. The Go and Java retrievers
+  set the mark. A surface from a retriever that does not set it is reported
+  as before.
+- **Unresolved client types.** A site with an empty client type has no API
+  identity to report. The payload has `unresolved_sites` in place of those
+  sites. A large number tells you that retrieval did not resolve receivers.
+
+The table that `rvl report` prints states both counts below the surfaces.
+
+### Combine the reports of several repositories
+
+```sh
+rvl report repo-a --out a.json
+rvl report repo-b --out b.json
+rvl report --combine a.json b.json          # ranked table
+rvl report --combine a.json b.json --json   # the combined list as JSON
+```
+
+`--combine` does not scan. It reads report payloads and lists each surface
+with `repo_count`, the number of payloads that have the surface, and
+`site_count`, the sum of the sites. The order is `repo_count` first, then
+`site_count`. One repository that calls an API many times cannot push that
+API above an API that many repositories share. The combined list also sums
+the three counts above. If a file is not a report payload, the command
+fails and names the file.
+
 The "code never leaves" claim above is scoped to the deterministic scan and
 this report preview. The one surface that deliberately sends more is below.
 

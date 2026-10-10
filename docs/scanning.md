@@ -546,6 +546,10 @@ rvl report --json     # the exact JSON the wire would carry
 Reporting is local-only today: `rvl report` shows or writes the payload, it
 does not transmit it. `RVL_OFFLINE=1` disables every network fetch.
 
+The report leaves out surfaces that your repository declares itself and
+sites whose client type did not resolve. It gives a count for each. See
+[Privacy](privacy.md#what-the-report-leaves-out).
+
 Separately, `rvl scan --service <name>` is an explicit submission mode that
 sends findings, including file paths and repo metadata, to your
 organization's risk register. It is a deliberate, flag-gated operation on a

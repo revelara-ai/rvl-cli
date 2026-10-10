@@ -93,6 +93,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.DeclaredType;
@@ -1606,8 +1607,29 @@ class JavaIndex {
             rec.put("const_args",
                     constArgsOf(cu, getCurrentPath(), node.getArguments(), src));
             rec.put("client_construction", constructionFor(recvPath));
-            rec.put("provenance", provenance(r.resolved, r.tier));
+            Map<String, Object> prov = provenance(r.resolved, r.tier);
+            if (declaredInRepo(elementOf(getCurrentPath()))) {
+                prov.put("api_in_repo", true);
+            }
+            rec.put("provenance", prov);
             return rec;
+        }
+
+        // declaredInRepo: the called method resolved to a declaration in the
+        // scanned source, so the surface is the repository's own code and not
+        // an API that other repositories share. Asked of the METHOD, never of
+        // the receiver type: a repository class that extends a dependency
+        // class inherits methods that are not in the repository, and with no
+        // classpath those do not resolve at all, which reads as false.
+        boolean declaredInRepo(Element callee) {
+            if (!(callee instanceof ExecutableElement)) {
+                return false;
+            }
+            try {
+                return trees.getTree(callee) != null;
+            } catch (Throwable ignore) {
+                return false; // no attribution
+            }
         }
 
         List<Object> constructionFor(TreePath recvPath) {

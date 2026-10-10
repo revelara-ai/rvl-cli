@@ -342,6 +342,17 @@ enum Cmd {
         /// Write the exact `Report` JSON payload to this file.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Scan nothing: read report payloads written by `--out` (one per
+        /// repository) and rank their surfaces by how many of the
+        /// repositories have each one, then by site count. `--json` and
+        /// `--out` then print and write the combined list.
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 1..,
+            conflicts_with_all = ["path", "retrieved", "specs_file", "oss_only", "incremental"]
+        )]
+        combine: Vec<PathBuf>,
     },
     /// Explain one finding as an evidence block: the sites it covers, the
     /// control, and the fix. Takes the same inputs as `scan` plus the finding
@@ -5799,6 +5810,143 @@ fn run_report(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `report --combine`: read one report payload per repository and print the
+/// surfaces ranked by how many repositories have them. Reads files only: no
+/// scan, no cache, nothing transmitted. An input that cannot be read as a
+/// report payload fails the command, because a skipped repository would
+/// silently lower every count the ranking is made from.
+fn run_report_combine(
+    files: &[PathBuf],
+    json: bool,
+    out: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    let mut reports = Vec::with_capacity(files.len());
+    for f in files {
+        let text = std::fs::read_to_string(f)
+            .with_context(|| format!("reading report payload {}", f.display()))?;
+        let report: report::Report = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{} is not a report payload (write one with `rvl report --out`)",
+                f.display()
+            )
+        })?;
+        reports.push(report);
+    }
+    let combined = report::combine_reports(&reports);
+    let payload = serde_json::to_string_pretty(&combined)?;
+
+    if let Some(p) = out {
+        std::fs::write(p, &payload)
+            .with_context(|| format!("writing combined report JSON to {}", p.display()))?;
+        eprintln!("wrote combined report to {}", p.display());
+    }
+    if json {
+        println!("{payload}");
+    } else {
+        print!("{}", render_combined_human(&combined));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The lines that state what was left out of a report and why. The surfaces
+/// they count are not listed anywhere, so without these lines an excluded
+/// surface would be invisible in the human view.
+fn excluded_note(unresolved_sites: u32, internal_surfaces: u32, internal_sites: u32) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    if internal_surfaces > 0 {
+        let _ = writeln!(
+            s,
+            "Not reported: {internal_surfaces} repo-internal surface(s) at {internal_sites} \
+             site(s). The scanned repository declares them itself, so their names stay local."
+        );
+    }
+    if unresolved_sites > 0 {
+        let _ = writeln!(
+            s,
+            "Not reported: {unresolved_sites} site(s) whose client type did not resolve. \
+             There is no API identity to report for them."
+        );
+    }
+    s
+}
+
+/// The human-readable combined view: `repos  sites  lang  client_type.method`,
+/// most widely shared first.
+fn render_combined_human(c: &report::CombinedReport) -> String {
+    use std::fmt::Write as _;
+    const NO_LANG: &str = "-";
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "Unknown API surfaces across {} report(s), ranked by how many reports have each one.
+",
+        c.reports
+    );
+    if c.surfaces.is_empty() {
+        s.push_str(
+            "No unknown API surfaces in these reports.
+",
+        );
+    } else {
+        let rw = c
+            .surfaces
+            .iter()
+            .map(|r| r.repo_count.to_string().len())
+            .max()
+            .unwrap_or(1)
+            .max("repos".len());
+        let w = c
+            .surfaces
+            .iter()
+            .map(|r| r.site_count.to_string().len())
+            .max()
+            .unwrap_or(1)
+            .max("sites".len());
+        let lw = c
+            .surfaces
+            .iter()
+            .map(|r| r.lang.len().max(NO_LANG.len()))
+            .max()
+            .unwrap_or(NO_LANG.len())
+            .max("lang".len());
+        let _ = writeln!(
+            s,
+            "  {:>rw$}  {:>w$}  {:<lw$}  surface",
+            "repos", "sites", "lang"
+        );
+        let _ = writeln!(
+            s,
+            "  {:>rw$}  {:>w$}  {:<lw$}  -------",
+            "-".repeat(rw),
+            "-".repeat(w),
+            "-".repeat(lw)
+        );
+        for r in &c.surfaces {
+            let lang = if r.lang.is_empty() { NO_LANG } else { &r.lang };
+            let _ = writeln!(
+                s,
+                "  {:>rw$}  {:>w$}  {:<lw$}  {}.{}",
+                r.repo_count, r.site_count, lang, r.client_type, r.method
+            );
+        }
+        let shared = c.surfaces.iter().filter(|r| r.repo_count > 1).count();
+        let _ = writeln!(
+            s,
+            "
+{} unknown API surface(s), {} in more than one report.",
+            c.surfaces.len(),
+            shared
+        );
+    }
+    s.push_str(&excluded_note(
+        c.unresolved_sites,
+        c.repo_internal_surfaces,
+        c.repo_internal_sites,
+    ));
+    s
+}
+
 /// The human-readable report: an explicit header stating precisely what would
 /// leave and that it carries no source/paths, the
 /// `site_count  lang  client_type.method` table, and a total-surface footer.
@@ -5815,8 +5963,14 @@ fn render_report_human(report: &report::Report) -> String {
          ever leaves this machine.\n\n",
     );
 
+    let excluded = excluded_note(
+        report.unresolved_sites,
+        report.repo_internal_surfaces,
+        report.repo_internal_sites,
+    );
     if report.surfaces.is_empty() {
         s.push_str("No unknown API surfaces: nothing would be reported.\n");
+        s.push_str(&excluded);
         return s;
     }
 
@@ -5884,6 +6038,7 @@ fn render_report_human(report: &report::Report) -> String {
              language and naming either would be wrong."
         );
     }
+    s.push_str(&excluded);
     s
 }
 
@@ -7293,7 +7448,8 @@ fn run() -> anyhow::Result<ExitCode> {
             incremental,
             json,
             out,
-        } => run_report(
+            combine,
+        } if combine.is_empty() => run_report(
             &store,
             &keyset,
             &cfg.index_dir,
@@ -7305,6 +7461,9 @@ fn run() -> anyhow::Result<ExitCode> {
             json,
             out.as_deref(),
         ),
+        Cmd::Report {
+            json, out, combine, ..
+        } => run_report_combine(&combine, json, out.as_deref()),
         Cmd::Explain {
             id,
             path,

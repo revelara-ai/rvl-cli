@@ -112,6 +112,9 @@ struct GroupAcc {
     /// Set once two DIFFERENT languages have been seen. A mixed group states
     /// no language at all rather than picking a winner.
     mixed: bool,
+    /// Set once any site says the called API is declared in the scanned
+    /// repository. The mark belongs to the surface, so one site is enough.
+    in_repo: bool,
 }
 
 impl GroupAcc {
@@ -160,6 +163,12 @@ pub struct Report {
     /// is unchanged.
     #[serde(default)]
     pub unresolved_sites: u32,
+    /// Surfaces the scanned repository declares itself, and the sites behind
+    /// them. See [`build_report`]. Counts only: the names stay on the machine.
+    #[serde(default)]
+    pub repo_internal_surfaces: u32,
+    #[serde(default)]
+    pub repo_internal_sites: u32,
     pub scanner_version: String,
     pub surfaces: Vec<ReportSurface>,
 }
@@ -172,22 +181,6 @@ fn is_unknown(reason: &str) -> bool {
     reason.starts_with("no spec")
 }
 
-/// Build the shape-only report. `findings` and `sites` are index-aligned
-/// (`propagate_all` maps sites 1:1), so each unknown finding names its site by
-/// position. For each unknown surface we take ONLY `client_type`, `method` and
-/// the normalized `lang` from the site — never the snippet, enclosing body, file
-/// path, or line — dedup by (client_type, method), and sum the per-shape site
-/// counts.
-///
-/// Language is a property of the SITES, and the group is what gets reported, so
-/// it is folded: a group whose sites all agree reports that language, a group
-/// that spans two reports none. Grouping stays keyed on (client_type, method)
-/// only — adding the language to the key would split one API into two surfaces
-/// whose specs then collide downstream, where spec identity is (api_type,
-/// method) end to end.
-///
-/// Sorted deterministically: highest `site_count` first, ties broken by
-/// `client_type` then `method`, so the payload (and its audit) is reproducible.
 /// Is this client type UNMINTABLE -- an identity a spec could never be keyed on
 /// (po-av01j.146)?
 ///
@@ -206,6 +199,35 @@ fn is_unmintable(client_type: &str) -> bool {
     t.is_empty() || t.starts_with("invalid type") || t.starts_with('<')
 }
 
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Build the shape-only report. `findings` and `sites` are index-aligned
+/// (`propagate_all` maps sites 1:1), so each unknown finding names its site by
+/// position. For each unknown surface we take ONLY `client_type`, `method` and
+/// the normalized `lang` from the site — never the snippet, enclosing body, file
+/// path, or line — dedup by (client_type, method), and sum the per-shape site
+/// counts.
+///
+/// Language is a property of the SITES, and the group is what gets reported, so
+/// it is folded: a group whose sites all agree reports that language, a group
+/// that spans two reports none. Grouping stays keyed on (client_type, method)
+/// only — adding the language to the key would split one API into two surfaces
+/// whose specs then collide downstream, where spec identity is (api_type,
+/// method) end to end.
+///
+/// REPO-INTERNAL SURFACES DO NOT SHIP (po-av01j.146). A surface whose called
+/// API the scanned repository declares itself (`provenance.api_in_repo`) is
+/// useful to exactly one repository, so a spec for it is worthless in a shared
+/// corpus; measured across five repositories these were 122 of 245 surfaces.
+/// Its name also identifies the repository, which this payload promises not to
+/// do. Such a surface is excluded and counted, in surfaces and in sites. A
+/// retriever that does not set the mark changes nothing: its surfaces ship as
+/// they did before.
+///
+/// Sorted deterministically: highest `site_count` first, ties broken by
+/// `client_type` then `method`, so the payload (and its audit) is reproducible.
 pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str) -> Report {
     // Accumulate per (client_type, method). BTreeMap keeps assembly
     // deterministic before the final sort.
@@ -219,16 +241,21 @@ pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str)
         // ONLY the public API identity and its language cross over. Nothing
         // else on the site is read here, so nothing else can leak.
         if is_unmintable(&s.client_type) {
-            unresolved_sites += 1;
+            unresolved_sites = unresolved_sites.saturating_add(1);
             continue;
         }
         let key = (s.client_type.clone(), s.method.clone());
         let acc = groups.entry(key).or_default();
         acc.site_count += 1;
+        acc.in_repo |= s.provenance.api_in_repo;
         acc.observe(&s.lang);
     }
 
-    let mut surfaces: Vec<ReportSurface> = groups
+    let (internal, shared): (Vec<_>, Vec<_>) = groups.into_iter().partition(|(_, acc)| acc.in_repo);
+    let repo_internal_surfaces = count(internal.len());
+    let repo_internal_sites = count(internal.iter().map(|(_, acc)| acc.site_count).sum());
+
+    let mut surfaces: Vec<ReportSurface> = shared
         .into_iter()
         .map(|((client_type, method), acc)| ReportSurface {
             client_type,
@@ -249,7 +276,109 @@ pub fn build_report(sites: &[Site], findings: &[Finding], scanner_version: &str)
         scanner_version: scanner_version.to_string(),
         surfaces,
         unresolved_sites,
+        repo_internal_surfaces,
+        repo_internal_sites,
     }
+}
+
+/// One surface in a combined view of several reports: the same shape-only
+/// identity, with the number of reports it appears in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CombinedSurface {
+    pub client_type: String,
+    pub method: String,
+    /// Folded across the reports by the rule one report uses across its sites:
+    /// the one language they agree on, or empty.
+    #[serde(default)]
+    pub lang: String,
+    /// How many of the combined reports carry this surface.
+    pub repo_count: usize,
+    /// The sites behind it, summed over those reports.
+    pub site_count: usize,
+}
+
+/// Several [`Report`]s as one ranked list. Made from report payloads only, so
+/// it can carry nothing a report could not.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CombinedReport {
+    /// How many reports were combined.
+    pub reports: usize,
+    pub unresolved_sites: u32,
+    pub repo_internal_surfaces: u32,
+    pub repo_internal_sites: u32,
+    pub surfaces: Vec<CombinedSurface>,
+}
+
+/// Combine one report per repository and rank the surfaces by RECURRENCE: how
+/// many repositories have the surface, then how many sites.
+///
+/// One report can only rank by site count, and site count inside one
+/// repository is what a single heavy user maximizes. A surface that many
+/// repositories share is the one a shared spec pays for, and only a combined
+/// view can know that.
+///
+/// The inputs are files and are not trusted to be what [`build_report`] would
+/// write today: an unmintable identity is moved to the count again, and the
+/// language is normalized again.
+pub fn combine_reports(reports: &[Report]) -> CombinedReport {
+    #[derive(Default)]
+    struct Acc {
+        group: GroupAcc,
+        repo_count: usize,
+    }
+    let mut groups: std::collections::BTreeMap<(String, String), Acc> =
+        std::collections::BTreeMap::new();
+    let mut combined = CombinedReport {
+        reports: reports.len(),
+        unresolved_sites: 0,
+        repo_internal_surfaces: 0,
+        repo_internal_sites: 0,
+        surfaces: Vec::new(),
+    };
+    for r in reports {
+        combined.unresolved_sites = combined.unresolved_sites.saturating_add(r.unresolved_sites);
+        combined.repo_internal_surfaces = combined
+            .repo_internal_surfaces
+            .saturating_add(r.repo_internal_surfaces);
+        combined.repo_internal_sites = combined
+            .repo_internal_sites
+            .saturating_add(r.repo_internal_sites);
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &r.surfaces {
+            if is_unmintable(&s.client_type) {
+                combined.unresolved_sites = combined
+                    .unresolved_sites
+                    .saturating_add(count(s.site_count));
+                continue;
+            }
+            let key = (s.client_type.clone(), s.method.clone());
+            let acc = groups.entry(key.clone()).or_default();
+            acc.group.site_count = acc.group.site_count.saturating_add(s.site_count);
+            acc.group.observe(&s.lang);
+            if seen.insert(key) {
+                acc.repo_count += 1;
+            }
+        }
+    }
+
+    combined.surfaces = groups
+        .into_iter()
+        .map(|((client_type, method), acc)| CombinedSurface {
+            client_type,
+            method,
+            repo_count: acc.repo_count,
+            site_count: acc.group.site_count,
+            lang: acc.group.reported_lang(),
+        })
+        .collect();
+    combined.surfaces.sort_by(|a, b| {
+        b.repo_count
+            .cmp(&a.repo_count)
+            .then_with(|| b.site_count.cmp(&a.site_count))
+            .then_with(|| a.client_type.cmp(&b.client_type))
+            .then_with(|| a.method.cmp(&b.method))
+    });
+    combined
 }
 
 #[cfg(test)]
@@ -552,5 +681,182 @@ mod tests {
         assert_eq!(r.surfaces.len(), 1, "only the real surface ships");
         assert_eq!(r.surfaces[0].client_type, "net/http.Client");
         assert_eq!(r.unresolved_sites, 2, "the rest are counted, not hidden");
+    }
+
+    fn in_repo_site(client: &str, method: &str) -> Site {
+        let mut s = site_with_lang(client, method, "go");
+        s.provenance.api_in_repo = true;
+        s
+    }
+
+    fn no_spec(n: usize) -> Vec<Finding> {
+        (0..n).map(|_| finding("no spec")).collect()
+    }
+
+    // A surface the scanned repository declares itself is useful to that one
+    // repository only, and its name identifies the repository. It does not
+    // ship; it is counted.
+    #[test]
+    fn repo_internal_surfaces_are_excluded_and_counted() {
+        let sites = vec![
+            in_repo_site("example.com/shop/internal/storage.SQLXDB", "Lookup"),
+            in_repo_site("example.com/shop/internal/storage.SQLXDB", "Lookup"),
+            in_repo_site("example.com/shop/internal/ledger.Writer", "Post"),
+            site_with_lang("net/http.Client", "Do", "go"),
+        ];
+        let r = build_report(&sites, &no_spec(4), "test");
+        assert_eq!(r.surfaces.len(), 1, "only the dependency surface ships");
+        assert_eq!(r.surfaces[0].client_type, "net/http.Client");
+        assert_eq!(r.repo_internal_surfaces, 2);
+        assert_eq!(r.repo_internal_sites, 3);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("example.com/shop"),
+            "a repo-internal type name is repo-identifying and must not ship: {json}"
+        );
+    }
+
+    // The mark belongs to the surface. A stream where only some sites of one
+    // shape carry it still describes one repo-internal surface, and no part
+    // of it ships.
+    #[test]
+    fn one_marked_site_makes_the_whole_surface_repo_internal() {
+        let sites = vec![
+            in_repo_site("example.com/shop/ledger.Writer", "Post"),
+            site_with_lang("example.com/shop/ledger.Writer", "Post", "go"),
+        ];
+        let r = build_report(&sites, &no_spec(2), "test");
+        assert!(r.surfaces.is_empty());
+        assert_eq!(r.repo_internal_surfaces, 1);
+        assert_eq!(r.repo_internal_sites, 2);
+    }
+
+    #[test]
+    fn the_report_serializes_exactly_its_counts_version_and_surfaces() {
+        let v = serde_json::to_value(build_report(&[], &[], "1.0.0")).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "repo_internal_sites",
+                "repo_internal_surfaces",
+                "scanner_version",
+                "surfaces",
+                "unresolved_sites"
+            ]
+        );
+    }
+
+    fn report_of(surfaces: &[(&str, &str, &str, usize)]) -> Report {
+        Report {
+            unresolved_sites: 0,
+            repo_internal_surfaces: 0,
+            repo_internal_sites: 0,
+            scanner_version: "test".into(),
+            surfaces: surfaces
+                .iter()
+                .map(|(client_type, method, lang, site_count)| ReportSurface {
+                    client_type: (*client_type).into(),
+                    method: (*method).into(),
+                    lang: (*lang).into(),
+                    site_count: *site_count,
+                })
+                .collect(),
+        }
+    }
+
+    // Site count inside one repository is what a single heavy user maximizes.
+    // A surface two repositories share outranks one that a single repository
+    // calls 500 times.
+    #[test]
+    fn combined_surfaces_rank_by_repository_count_before_site_count() {
+        let a = report_of(&[
+            ("vendor/big.Client", "Call", "go", 500),
+            ("net/http.Client", "Do", "go", 2),
+        ]);
+        let b = report_of(&[("net/http.Client", "Do", "go", 1)]);
+        let c = combine_reports(&[a, b]);
+        assert_eq!(c.reports, 2);
+        assert_eq!(
+            c.surfaces,
+            vec![
+                CombinedSurface {
+                    client_type: "net/http.Client".into(),
+                    method: "Do".into(),
+                    lang: "go".into(),
+                    repo_count: 2,
+                    site_count: 3,
+                },
+                CombinedSurface {
+                    client_type: "vendor/big.Client".into(),
+                    method: "Call".into(),
+                    lang: "go".into(),
+                    repo_count: 1,
+                    site_count: 500,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_ties_break_on_site_count_then_name() {
+        let a = report_of(&[
+            ("b.T", "M", "go", 1),
+            ("a.T", "M", "go", 1),
+            ("c.T", "M", "go", 9),
+        ]);
+        let names: Vec<String> = combine_reports(&[a])
+            .surfaces
+            .into_iter()
+            .map(|s| s.client_type)
+            .collect();
+        assert_eq!(names, vec!["c.T", "a.T", "b.T"]);
+    }
+
+    #[test]
+    fn combining_sums_the_excluded_counts_of_every_input() {
+        let mut a = report_of(&[]);
+        a.unresolved_sites = 3;
+        a.repo_internal_surfaces = 2;
+        a.repo_internal_sites = 7;
+        let mut b = report_of(&[]);
+        b.unresolved_sites = 1;
+        b.repo_internal_surfaces = 5;
+        b.repo_internal_sites = 6;
+        let c = combine_reports(&[a, b]);
+        assert_eq!(c.unresolved_sites, 4);
+        assert_eq!(c.repo_internal_surfaces, 7);
+        assert_eq!(c.repo_internal_sites, 13);
+    }
+
+    // The inputs are files, so they are checked again: a payload written by a
+    // build that still shipped unresolved identities must not put them back
+    // in the queue, and its language must not carry anything but a name.
+    #[test]
+    fn combining_checks_its_inputs_again() {
+        let a = report_of(&[
+            ("invalid type", "Get", "go", 4),
+            ("", "post", "typescript", 2),
+            ("HttpClient", "Send", "csharp", 1),
+            ("db.Pool", "Query", SENTINEL_SNIPPET, 1),
+        ]);
+        let b = report_of(&[("HttpClient", "Send", "java", 1)]);
+        let c = combine_reports(&[a, b]);
+        assert_eq!(c.unresolved_sites, 6);
+        assert_eq!(c.surfaces.len(), 2);
+        assert_eq!(c.surfaces[0].client_type, "HttpClient");
+        assert_eq!(c.surfaces[0].repo_count, 2);
+        assert_eq!(c.surfaces[0].lang, "", "two languages, neither is claimed");
+        assert_eq!(c.surfaces[1].lang, "", "a snippet is not a language");
+    }
+
+    // One payload that lists a shape twice is still one repository.
+    #[test]
+    fn a_shape_listed_twice_in_one_payload_is_one_repository() {
+        let a = report_of(&[("db.Pool", "Query", "go", 1), ("db.Pool", "Query", "go", 2)]);
+        let c = combine_reports(&[a]);
+        assert_eq!(c.surfaces[0].repo_count, 1);
+        assert_eq!(c.surfaces[0].site_count, 3);
     }
 }

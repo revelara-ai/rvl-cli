@@ -129,6 +129,7 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("report", "retrieved", Empty::Error),
     ("report", "specs-file", Empty::Error),
     ("report", "out", Empty::Error),
+    ("report", "combine", Empty::Error),
     ("explain", "retrieved", Empty::Error),
     ("explain", "specs-file", Empty::Error),
     ("explain", "judgments", Empty::Error),
