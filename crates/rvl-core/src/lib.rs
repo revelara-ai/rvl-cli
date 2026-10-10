@@ -241,6 +241,15 @@ pub struct Provenance {
     pub hit_caller_budget: bool,
     #[serde(default)]
     pub client_type_resolved: bool,
+    /// The called function or method is declared inside the scanned
+    /// repository, so the surface is the repository's own code and not an API
+    /// other repositories share. A dependency method reached through a
+    /// repository type (promoted from an embedded field, inherited from a
+    /// dependency superclass) is NOT in the repository. Absent means the
+    /// retriever did not say, which is read as false. Additive within the v2
+    /// packet train.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub api_in_repo: bool,
     /// Python only: how many definitions the callee name matched. Ambiguity is
     /// the normal case without static types, so it is reported rather than
     /// silently inherited.

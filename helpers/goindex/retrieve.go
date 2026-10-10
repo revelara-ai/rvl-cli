@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -98,6 +99,12 @@ type Provenance struct {
 	HitDepthCap     bool       `json:"hit_depth_cap"`
 	HitCallerBudget bool       `json:"hit_caller_budget"`
 	ClientTypeKnown bool       `json:"client_type_resolved"`
+	// The called function is declared in the scanned repository, so the
+	// surface is the repository's own code and not an API that other
+	// repositories share. Asked of the CALLEE, not of the receiver type: a
+	// repository type that embeds *sql.DB has database/sql's ExecContext, and
+	// that call is not in the repository. Absent on the wire when false.
+	APIInRepo bool `json:"api_in_repo,omitempty"`
 	CalleesTotal    int        `json:"callees_total"`
 	CalleesIncluded int        `json:"callees_included"`
 
@@ -606,7 +613,7 @@ var lastRepoConfig RepoConfig
 // The census is this module's retrieval denominator (see RetrievalCensus),
 // counted in the same walk that emits the sites so the two cannot disagree
 // about which functions were visited.
-func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, census RetrievalCensus, loaded bool, err error) {
+func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites []RetrievedSite, census RetrievalCensus, loaded bool, err error) {
 	pkgs, err := packages.Load(loadConfig(moduleDir), "./...")
 	// A LOAD THAT FAILED IS NOT A SCAN THAT FOUND NOTHING (po-av01j.209).
 	// This arm used to print "load failed:" and return nil, and main then
@@ -1003,6 +1010,8 @@ func runRetrieveModule(moduleDir, root, name string) (sites []RetrievedSite, cen
 						CallersTotal: len(anc), AncestryDepth: depth,
 						ChainRoots: roots, HitDepthCap: hitDepth,
 						ClientTypeKnown: rs.Prov.ClientTypeKnown,
+						APIInRepo: jobType == "" && callee.Pkg() != nil &&
+							inRepo(repoMods, callee.Pkg().Path()),
 					}
 					// Count the WHOLE traced ancestry, not just the emitted
 					// slice: how many callers were shown is a budget artefact,
@@ -1265,6 +1274,37 @@ func discoverModules(root string) []string {
 	return mods
 }
 
+// modulePaths returns the module path each discovered go.mod declares. These
+// are the import-path prefixes of the scanned repository's own packages, taken
+// over EVERY module so that a call from one service of a monorepo into another
+// is still a call into the repository. A go.mod that cannot be read
+// contributes nothing: its packages are then not marked, which leaves their
+// packets as they were before the mark existed.
+func modulePaths(moduleDirs []string) []string {
+	var paths []string
+	for _, dir := range moduleDirs {
+		b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err != nil {
+			continue
+		}
+		if p := modfile.ModulePath(b); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// inRepo reports whether the package at pkgPath belongs to one of the
+// repository's modules: the module path itself or a path below it.
+func inRepo(repoMods []string, pkgPath string) bool {
+	for _, m := range repoMods {
+		if pkgPath == m || strings.HasPrefix(pkgPath, m+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // runRetrieve loads every module under `root` and concatenates their sites
 // (po-av01j.131).
 //
@@ -1322,9 +1362,10 @@ func repoConfigFor(scan moduleScan, name string) RepoConfig {
 // retained and main still treats it as fatal.
 func runRetrieveAll(root, name string) ([]RetrievedSite, moduleScan) {
 	scan := moduleScan{Discovered: discoverModules(root), Census: newRetrievalCensus()}
+	repoMods := modulePaths(scan.Discovered)
 	var all []RetrievedSite
 	for _, m := range scan.Discovered {
-		sites, census, loaded, err := runRetrieveModule(m, root, name)
+		sites, census, loaded, err := runRetrieveModule(m, root, name, repoMods)
 		switch {
 		case err != nil:
 			if scan.Err == nil {

@@ -9,6 +9,23 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.4.0 (not released yet)
 
+### `rvl report` leaves out repo-internal surfaces, and `--combine` ranks across repositories
+
+**Minimum version to probe for: the first release after 1.4.0.**
+
+The `rvl report` payload has two new fields, `repo_internal_surfaces` and
+`repo_internal_sites`. A surface that the scanned repository declares itself
+is not in `surfaces`; it is in these counts. The Go and Java retrievers mark
+such a call with `provenance.api_in_repo: true` on the packet. The field is
+additive and is absent when false, so the packet schema stays `2`. A
+consumer that reads `surfaces` sees fewer rows for a Go or Java repository
+and must not read the missing rows as "now covered by a spec".
+
+`rvl report --combine <FILE>...` reads report payloads and writes a combined
+list. Each row has `client_type`, `method`, `lang`, `repo_count` and
+`site_count`, in the order `repo_count` then `site_count`. See
+[Privacy](privacy.md#combine-the-reports-of-several-repositories).
+
 ### `scope` on each `sites` row of the `rvl scan --out` document
 
 **Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0

@@ -128,6 +128,26 @@ class JavaIndexTest {
                     "the folded REFRESH_SQL constant rides const_args as named_constant");
         }
 
+        // --- api_in_repo: the called method is declared in the scanned source ---
+        Map<String, Object> local = byTypeFunc(sites, "com.example.Local.Ledger", "post");
+        check(local != null, "a call to a method the repository declares is a site");
+        if (local != null) {
+            check(Boolean.TRUE.equals(prov(local).get("api_in_repo")),
+                    "a method declared in the repository is marked api_in_repo");
+        }
+        if (jdbc != null) {
+            check(!prov(jdbc).containsKey("api_in_repo"),
+                    "a JDK method is not in the repository, and a false mark is absent");
+        }
+        if (jedis != null) {
+            check(!prov(jedis).containsKey("api_in_repo"),
+                    "an import-attributed dependency method is not in the repository");
+        }
+        if (unknown != null) {
+            check(!prov(unknown).containsKey("api_in_repo"),
+                    "an unresolved call is never marked api_in_repo");
+        }
+
         // --- G1: noise never emits ---
         for (Map<String, Object> s : sites) {
             String f = (String) s.get("func");

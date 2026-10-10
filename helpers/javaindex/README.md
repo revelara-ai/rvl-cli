@@ -76,6 +76,10 @@ snippets), `const_args` + `macro_expansion: false` (schema v2; Java has no
 macros), `site_kind`, `provenance`
 (`client_type_resolved`/`confidence_tier`), and `lang: "java"`.
 
+A classic site also has `provenance.api_in_repo: true` when the checker
+resolves the called method to a declaration in the scanned source. The field
+is absent in all other cases.
+
 `const_args` carries literal tokens (`how: "literal"`, source-level
 rendering with string quotes) and checker-folded constants — a
 `static final` with a constant initializer — as `how: "named_constant"`.
