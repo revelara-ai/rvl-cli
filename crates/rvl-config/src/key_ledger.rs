@@ -158,6 +158,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "container.resources.limits.memory"),
     judged("kubernetes", "container.resources.requests.cpu"),
     judged("kubernetes", "container.resources.requests.memory"),
+    judged("kubernetes", "container.run-as-user-class"),
     judged("kubernetes", "container.security-context"),
     judged("kubernetes", "container.startup-probe"),
     judged("kubernetes", "hpa.max-replicas"),

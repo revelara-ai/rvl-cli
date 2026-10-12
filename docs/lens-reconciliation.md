@@ -43,9 +43,10 @@ the part that must not be built again.
 | 10c | K3: liveness probe whose handler touches a dependency | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:386`, `crates/rvl-propagate/src/probe_handler.rs:77` | `po-6c0v8.5` | Updated 2026-10-08 by `po-6c0v8.5`. The Kubernetes retriever emits the `httpGet` path of a liveness probe as `kubernetes container.liveness-probe.http-get.path`. The scan joins it to a route in the same repository and reports `server_entry.liveness-probe-handler-io` on RC-020 when the handler holds a G1 call site. No spec is necessary. The join abstains when the path or the handler is not resolved, and it does not follow a call from the handler into another function. See [The liveness probe join](retrievers.md#the-liveness-probe-join). |
 | 11 | F3: unbounded read of a body, file, or result set | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/bounds.go:356`, `crates/rvl-bounds/src/lib.rs:153` | `po-6c0v8.9` | Updated 2026-10-04 by `po-6c0v8.2`. Go `io.ReadAll` is emitted with the calls its argument passes through. It is also a G1 call site now, with the origin of its reader in `framework_type`, so the retrieval census counts it as a candidate. Python reads are not emitted. |
 | 12a | Q25: mutable image tag | SHIPPED | `crates/rvl-config/src/dep_manifests.rs:768`, `crates/rvl-config/src/kubernetes/manifest.rs:390` | None needed | `dep-manifests dockerfile.base_image_pin` and `kubernetes container.image.pin` on RC-041. Both expect `digest` or `tag`. |
-| 12b | Q26: container with no security context | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:377`, `crates/rvl-config/src/key_ledger.rs:139` | None needed | `kubernetes container.security-context` on RC-044, presence only. This is not a root-container check: see 12c. |
+| 12b | Q26: container with no security context | SHIPPED | `crates/rvl-config/src/kubernetes/manifest.rs:377`, `crates/rvl-config/src/key_ledger.rs:139` | None needed | `kubernetes container.security-context` on RC-044, presence only. This is not a root-container check: see 12c and 12d. |
 | 12c | Q26: container runs as root (Dockerfile `USER`) | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/dep_manifests.rs:908`, `crates/rvl-config/src/key_ledger.rs:101` | `po-6c0v8.19` | Updated 2026-10-08 by `po-6c0v8.6`. `dep-manifests dockerfile.final_stage_user` is emitted once for each Dockerfile and has no spec. The value is `root`, `non-root`, or `absent`, from the last `USER` of the final stage. A final stage that is built `FROM` an earlier stage has the user of that stage. `absent` is not a verdict of root: with no `USER`, the base image sets the user, and the provenance names that image. No value is emitted for a `USER` that reads a build argument with no default in the file, or an `ENV`. |
-| 12d | Q26: `runAsNonRoot` value, fat base image | GENUINELY-NEW | `crates/rvl-config/src/kubernetes/manifest.rs:739`, `crates/rvl-config/src/dep_manifests.rs:701` | `po-6c0v8.20` | Split from 12c on 2026-10-08. `kubernetes container.security-context` is judged for presence only: nothing reads the value of `runAsNonRoot`. Nothing reads the size class of a base image. That check needs a decision first: is a list of image names an acceptable classifier? |
+| 12d | Q26: container runs as root (`runAsUser`, `runAsNonRoot`) | LANE-WIRED-NEEDS-CORPUS | `crates/rvl-config/src/kubernetes/manifest.rs:813`, `crates/rvl-config/src/key_ledger.rs:161` | `po-6c0v8.21` | Updated 2026-10-11 by `po-6c0v8.20`. `kubernetes container.run-as-user-class` is emitted once for each container and has no spec. The value is `root`, `non-root`, or `absent`. Each field is the container value over the pod value. The effective `runAsUser` decides first: `0` is `root`, a different UID is `non-root`. With no `runAsUser`, an effective `runAsNonRoot: true` is `non-root`. `absent` is not a verdict of root: the image sets the user. No value is emitted for a `runAsUser` that is not a UID or a `runAsNonRoot` that is not a boolean. |
+| 12e | Q26: fat base image | GENUINELY-NEW | `crates/rvl-config/src/dep_manifests.rs:701` | `po-6c0v8.22` | Split from 12d on 2026-10-11. Nothing reads the size class of a base image. That check needs a decision first: is a list of image names an acceptable classifier? |
 | 13 | I1: unstructured or print-style logging | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/misuse_shapes.go:78`, `helpers/pyindex/pyindex.py:1094`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.11` | Updated 2026-10-07 by `po-6c0v8.4`. The Go and Python helpers emit `print_logging` for print functions that write to a standard stream. Stdlib `log.Print*` and `logging` calls are not emitted: G4 counts them as log emissions that can satisfy RC-027, and that boundary is not arbitrated. The default severity is `low`, and the corpus sets it. |
 | 14 | J7: average latency in place of a histogram | LANE-WIRED-NEEDS-CORPUS | `helpers/goindex/misuse_shapes.go:78`, `helpers/pyindex/pyindex.py:1094`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.11` | Updated 2026-10-07 by `po-6c0v8.4`. The Go and Python helpers emit `latency_scalar_metric` at the registration call of a Prometheus gauge or counter with a latency name. Other metric clients are not read. |
 | 15 | G5/G6: sync-over-async, blocking in async | LANE-WIRED-NEEDS-CORPUS | `helpers/pyindex/pyindex.py:1167`, `crates/rvl-misuse/src/lib.rs:169` | `po-6c0v8.10` | Updated 2026-10-04 by `po-6c0v8.3`. The Python helper emits `blocking_in_async` and `sync_over_async` for a table of module-level functions. A blocking method on a client object is not emitted. Go has no async functions. |
@@ -135,7 +136,7 @@ Four classes had no bead. Each is now a child of the epic:
 | Bead | Class | Row |
 | --- | --- | --- |
 | `po-6c0v8.5` | K3: liveness handler touches a dependency. Landed on 2026-10-08. | 10c |
-| `po-6c0v8.6` | Q26: Dockerfile `USER`. Landed on 2026-10-08. The `runAsNonRoot` value and the fat base are in `po-6c0v8.20`. | 12c, 12d |
+| `po-6c0v8.6` | Q26: Dockerfile `USER`. Landed on 2026-10-08. The `runAsNonRoot` value landed on 2026-10-11 in `po-6c0v8.20`. The fat base is in `po-6c0v8.22`. | 12c, 12d, 12e |
 | `po-6c0v8.7` | Q21/Q22: no dependency scanning or SAST job | 18b |
 | `po-6c0v8.8` | O8: workload with no PDB or anti-affinity | 19c |
 
@@ -151,6 +152,14 @@ and the spec is corpus work in `po-6c0v8.19`. The new row 12d holds the part
 that was not built: the value of `runAsNonRoot` in a manifest, and the fat
 base image, which waits for a decision (`po-6c0v8.20`). The retriever gaps
 that are left are 12d and 18b.
+
+**Update, 2026-10-11 (`po-6c0v8.20`).** Row 12d is split. The Kubernetes
+retriever emits the user class of each container, from the effective
+`runAsUser` and `runAsNonRoot`, so 12d moved from GENUINELY-NEW to
+LANE-WIRED-NEEDS-CORPUS: the key is in the mint queue (`rvl cache keys`), and
+the spec is corpus work in `po-6c0v8.21`. The new row 12e holds the fat base
+image, which was not built and waits for a decision (`po-6c0v8.22`). The
+retriever gaps that are left are 12e and 18b.
 
 The control-code block that every wave bead names (`po-av01j.105`) is closed.
 It is no longer a reason to wait.

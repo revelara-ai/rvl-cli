@@ -18,6 +18,9 @@
 //!     (default none), `container.liveness-probe.http-get.path` (authored
 //!     only, vocabulary: the manifest half of the probe-to-handler join),
 //!     `container.security-context` (default none),
+//!     `container.run-as-user-class` (derived: `root` | `non-root` |
+//!     `absent`, from the effective `runAsUser` and `runAsNonRoot`, the
+//!     container value over the pod value; see [`run_as_user_class`]),
 //!     `container.image.pin` (derived shape: digest | tag | latest — never
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
@@ -49,6 +52,9 @@ use std::path::Path;
 /// The key that carries a liveness probe's `httpGet` path: the manifest half
 /// of the probe-to-handler join (`rvl_propagate::probe_handler`).
 pub const LIVENESS_HTTP_GET_PATH_KEY: &str = "container.liveness-probe.http-get.path";
+
+/// The key that carries the user a container is declared to run as.
+const RUN_AS_USER_CLASS_KEY: &str = "container.run-as-user-class";
 
 pub(super) fn get<'a>(m: &'a Mapping, key: &str) -> Option<&'a Value> {
     m.get(Value::String(key.to_string()))
@@ -424,6 +430,63 @@ impl Pdb {
     }
 }
 
+/// The effective value of one `securityContext` field of a container: the
+/// container's own value, else the pod's. Kubernetes merges the two field by
+/// field, so a container that sets `runAsUser` still takes `runAsNonRoot`
+/// from its pod. A null is an unset field.
+fn effective_security_field<'a>(
+    doc: &'a Value,
+    cpath: &str,
+    pod_path: &str,
+    field: &str,
+) -> Option<(String, &'a Value)> {
+    [cpath, pod_path].into_iter().find_map(|scope| {
+        let path = format!("{scope}.securityContext.{field}");
+        let v = lookup(doc, &path).filter(|v| !v.is_null())?;
+        Some((path, v))
+    })
+}
+
+/// The user class a container is declared to run as, with the path of the
+/// field that decided it (`None` when no field did):
+///
+///   * `root`: the effective `runAsUser` is 0.
+///   * `non-root`: the effective `runAsUser` is a different UID, or there is
+///     none and the effective `runAsNonRoot` is true (the kubelet then
+///     refuses to start an image that runs as UID 0).
+///   * `absent`: neither field decides, so the image sets the user. That is
+///     not a verdict of root, and it is the same word the Dockerfile
+///     `final_stage_user` key uses for the same case.
+///
+/// `runAsUser` decides before `runAsNonRoot`: a manifest that asks for UID 0
+/// and for `runAsNonRoot: true` does not start, and what it declares is root.
+/// `Err` is a field whose value is not a UID or a boolean: the API rejects
+/// the manifest, so there is no effective user to report.
+fn run_as_user_class(
+    doc: &Value,
+    cpath: &str,
+    pod_path: &str,
+) -> Result<(&'static str, Option<String>), ()> {
+    let user = effective_security_field(doc, cpath, pod_path, "runAsUser");
+    let non_root = effective_security_field(doc, cpath, pod_path, "runAsNonRoot");
+    // Read both before either decides: one unreadable field is enough to
+    // abstain, whichever field would have won.
+    let uid = match &user {
+        Some((_, v)) => Some(v.as_u64().ok_or(())?),
+        None => None,
+    };
+    let enforced = match &non_root {
+        Some((_, v)) => v.as_bool().ok_or(())?,
+        None => false,
+    };
+    Ok(match (uid, user, non_root) {
+        (Some(0), Some((path, _)), _) => ("root", Some(path)),
+        (Some(_), Some((path, _)), _) => ("non-root", Some(path)),
+        (_, _, Some((path, _))) if enforced => ("non-root", Some(path)),
+        _ => ("absent", None),
+    })
+}
+
 /// Kinds that run replicas a disruption budget and a placement rule protect.
 fn replicated(kind: &str) -> bool {
     matches!(kind, "Deployment" | "StatefulSet")
@@ -743,6 +806,22 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             "none",
         );
 
+        // The security context above is judged for presence. This is the
+        // value half: a context that is present and still asks for UID 0.
+        match run_as_user_class(doc, &cpath, &prefix) {
+            Ok((class, Some(path))) => {
+                em.derived(&cunit, RUN_AS_USER_CLASS_KEY, &path, &path, class);
+            }
+            Ok((class, None)) => em.absent(
+                &cunit,
+                RUN_AS_USER_CLASS_KEY,
+                &format!("{cpath}.securityContext.runAsUser"),
+                "runAsUser (the image sets the user)",
+                class,
+            ),
+            Err(()) => {}
+        }
+
         if let Some(image) = get(cm, "image").and_then(Value::as_str) {
             let pin = image_pin(image);
             // The pin SHAPE is the fact; the image reference itself never
@@ -1009,6 +1088,119 @@ spec:
             .map(|p| p.unit.as_str())
             .collect();
         assert_eq!(carried, vec!["container:deployment/web/app"]);
+    }
+
+    /// A Deployment `web` with one pod-level and one container-level
+    /// `securityContext` body (each a YAML flow mapping, or empty for none).
+    fn run_as(pod: &str, container: &str) -> Retrieved {
+        let pod = if pod.is_empty() {
+            String::new()
+        } else {
+            format!("      securityContext: {pod}\n")
+        };
+        let container = if container.is_empty() {
+            String::new()
+        } else {
+            format!("          securityContext: {container}\n")
+        };
+        packets(&format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n{pod}      containers:\n        - name: app\n          image: web:v1\n{container}"
+        ))
+    }
+
+    const APP: &str = "container:deployment/web/app";
+
+    fn user_class(got: &Retrieved) -> Option<&ConfigPacket> {
+        got.packets.iter().find(|p| p.key == RUN_AS_USER_CLASS_KEY)
+    }
+
+    #[test]
+    fn run_as_user_class_reads_the_value_and_not_the_presence() {
+        for (pod, container, want) in [
+            ("", "{runAsUser: 0}", "root"),
+            ("", "{runAsUser: 10001}", "non-root"),
+            ("", "{runAsNonRoot: true}", "non-root"),
+            ("{runAsUser: 0}", "", "root"),
+            ("{runAsUser: 1000, runAsNonRoot: true}", "", "non-root"),
+            // The declared user decides: the kubelet refuses to start this
+            // container, and the manifest still asks for UID 0.
+            ("", "{runAsUser: 0, runAsNonRoot: true}", "root"),
+        ] {
+            let got = run_as(pod, container);
+            let p = find(&got, APP, RUN_AS_USER_CLASS_KEY);
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some(want),
+                "pod `{pod}` container `{container}`"
+            );
+            assert_eq!(p.resolution, Resolution::AsAuthored);
+        }
+    }
+
+    #[test]
+    fn run_as_user_class_takes_the_container_value_over_the_pod_value() {
+        let got = run_as("{runAsUser: 1000}", "{runAsUser: 0}");
+        let p = find(&got, APP, RUN_AS_USER_CLASS_KEY);
+        assert_eq!(p.resolved_value.as_deref(), Some("root"));
+        assert!(
+            p.provenance[0].key_path.contains("containers[app]"),
+            "the chain names the field that decided: {:?}",
+            p.provenance
+        );
+
+        let got = run_as("{runAsNonRoot: true}", "{runAsNonRoot: false}");
+        let p = find(&got, APP, RUN_AS_USER_CLASS_KEY);
+        assert_eq!(p.resolved_value.as_deref(), Some("absent"));
+
+        // A pod-level value governs a container that sets none, and the
+        // chain names the pod field.
+        let got = run_as("{runAsNonRoot: true}", "{allowPrivilegeEscalation: false}");
+        let p = find(&got, APP, RUN_AS_USER_CLASS_KEY);
+        assert_eq!(p.resolved_value.as_deref(), Some("non-root"));
+        assert!(
+            p.provenance[0]
+                .key_path
+                .ends_with("spec.securityContext.runAsNonRoot"),
+            "{:?}",
+            p.provenance
+        );
+    }
+
+    #[test]
+    fn a_security_context_that_sets_no_user_leaves_the_user_to_the_image() {
+        for (pod, container) in [
+            ("", ""),
+            ("{fsGroup: 2000}", "{readOnlyRootFilesystem: true}"),
+            ("", "{runAsNonRoot: false}"),
+        ] {
+            let got = run_as(pod, container);
+            let p = find(&got, APP, RUN_AS_USER_CLASS_KEY);
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("absent"),
+                "pod `{pod}` container `{container}`"
+            );
+            assert_eq!(p.resolution, Resolution::PlatformDefault);
+        }
+    }
+
+    #[test]
+    fn a_run_as_value_of_the_wrong_type_abstains() {
+        for (pod, container) in [
+            ("", "{runAsUser: app}"),
+            ("", "{runAsUser: -1}"),
+            ("{runAsNonRoot: maybe}", ""),
+            // A container value that cannot be read hides the pod value it
+            // would have overridden.
+            ("{runAsUser: 1000}", "{runAsUser: [0]}"),
+        ] {
+            let got = run_as(pod, container);
+            assert!(
+                user_class(&got).is_none(),
+                "pod `{pod}` container `{container}`: {:?}",
+                user_class(&got)
+            );
+        }
     }
 
     #[test]

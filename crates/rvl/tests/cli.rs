@@ -1833,6 +1833,59 @@ fn scan_judges_the_dockerfile_final_stage_user() {
     assert_eq!(row["satisfies"], 1, "worker/Dockerfile does not: {row}");
 }
 
+/// The effective user of a Kubernetes container is a judgeable fact: a spec
+/// that wants `non-root` turns a container that sets a securityContext and
+/// still runs as UID 0 into a finding.
+#[test]
+fn scan_judges_the_kubernetes_run_as_user_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("k8s")).unwrap();
+    std::fs::write(
+        root.join("k8s/api.yaml"),
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  template:\n    spec:\n      securityContext:\n        runAsNonRoot: true\n      containers:\n        - name: app\n          image: api:v1\n        - name: agent\n          image: agent:v1\n          securityContext:\n            runAsUser: 0\n",
+    )
+    .unwrap();
+    let specs = root.join("specs.json");
+    std::fs::write(&specs, r#"{
+        "apis":[],
+        "configs":[],
+        "config_keys":[
+            {"format":"kubernetes","key":"container.run-as-user-class","expect":{"kind":"one_of","values":["non-root"]},"confidence":0.9,"control":"RC-044","severity":"medium","fix":"set runAsNonRoot: true, or a runAsUser that is not 0","rationale":"a process that runs as root in the container widens a container escape"}
+        ]
+    }"#).unwrap();
+    let doc = root.join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(root)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&doc)
+        .env("RVL_CACHE_DIR", root.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.contains("kubernetes container.run-as-user-class"),
+        "a container that runs as UID 0 must surface: {stdout} {stderr}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&doc).unwrap()).unwrap();
+    let row = doc["coverage"]["config"]["by_key"]
+        .as_array()
+        .expect("coverage.config.by_key")
+        .iter()
+        .find(|r| r["key"] == "container.run-as-user-class")
+        .unwrap_or_else(|| panic!("no by_key row for the user class: {doc}"));
+    assert_eq!(
+        row["violates"], 1,
+        "the agent container runs as root: {row}"
+    );
+    assert_eq!(row["satisfies"], 1, "the app container does not: {row}");
+}
+
 // --- G6 Prometheus/sloth family (po-av01j.21) ---
 
 /// A repo with a literal Prometheus rules file (one alert missing `for:` and

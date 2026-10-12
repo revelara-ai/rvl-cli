@@ -7,6 +7,41 @@ The full list of changes in a release is on its
 
 To read the installed version, run `rvl --version` or `rvl version`.
 
+## After 1.5.0 (not released yet)
+
+### The config key `kubernetes container.run-as-user-class`
+
+**Minimum version to probe for: the first release after 1.5.0.**
+
+The config lane reads `runAsUser` and `runAsNonRoot` in a Kubernetes manifest
+and emits one setting for each container: the user that the container is
+declared to run as. Kubernetes takes each of the two fields from the
+`securityContext` of the container and, when the container does not set it,
+from the `securityContext` of the pod. The value is one of three classes:
+
+- `root`: the effective `runAsUser` is `0`.
+- `non-root`: the effective `runAsUser` is a different UID. With no
+  `runAsUser`, the effective `runAsNonRoot` is `true`.
+- `absent`: no field decides, so the image sets the user. `rvl` does not read
+  the image, so `absent` is not a verdict that the container runs as root.
+
+`runAsUser` decides before `runAsNonRoot`. A container with `runAsUser: 0`
+and `runAsNonRoot: true` does not start, and its class is `root`.
+
+A `runAsUser` that is not a UID, or a `runAsNonRoot` that is not a boolean,
+has no value: the lane abstains.
+
+The keys `container.security-context` and `pod.security-context` do not
+change. They report that a security context is present, and a manifest that
+sets one and runs as UID 0 satisfies them. The new key reports that case.
+
+No spec judges the key in the current artifact, so a scan counts it in
+`coverage.config.abstain.no_spec` and lists it in `no_spec_keys`, and
+`rvl cache keys` shows it as awaiting a spec. A scan of a repository with a
+Kubernetes workload gets one more row in `coverage.config.by_key` and a
+`coverage.config.total` that is higher by one for each container. No finding
+changes.
+
 ## After 1.4.0 (not released yet)
 
 ### `rvl report --queue`, and `routing` on `rvl cache keys --json`
