@@ -207,6 +207,22 @@ module to every site using it, so one `Timeout`-bearing literal is evidence
 for every `http.Client` call in the repo. The reason names the file and line
 it came from.
 
+### Go reads of a whole reader
+
+`goindex` reports `io.ReadAll` and `io/ioutil.ReadAll` as call sites. The call
+has no client, so the packet has `client_type` `io` (or `io/ioutil`) and the
+reader expression in `receiver`. What bounds the read is the reader, so the
+packet names where the reader comes from in `framework_type`:
+`net/http.Response.Body` for a response body, `net/http.Request.Body` for a
+request body, `os.File` for a file. A spec keyed on that name and `ReadAll`
+applies to those reads only. `goindex` follows the reader through a local
+that is assigned once and through a call that takes one reader, such as
+`io.LimitReader(resp.Body, n)`. When it cannot find the origin, for example
+for an `io.Reader` parameter, the field is absent and only a spec keyed on
+`io` applies. The same call is also an unsized construction of class `read`
+(see below): that packet is about the size of the read, and this one is
+about how long it can block.
+
 ## Unsized constructions
 
 Some objects take a bound when they are built: a connection pool has a

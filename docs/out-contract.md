@@ -80,7 +80,7 @@ The orchestrator uses it to:
     },
     "retrieval": [
       { "lang": "go", "calls_resolved": 18233, "candidates": 412,
-        "unretrieved": { "io.ReadAll": 3 } }
+        "unretrieved": { "io.Copy": 3 } }
     ],
     "structure": { "total": 6, "violates": 1, "satisfies": 3, "abstain": 1,
                    "not_applicable": 1 }
@@ -179,7 +179,7 @@ The orchestrator uses it to:
     is every call in non-test code whose callee the type checker resolved
     (crude by design: most are not I/O); `unretrieved` counts calls the
     helper's corpus knows are I/O and its tables do not retrieve, keyed by
-    surface (`io.ReadAll`). The counts are whole-repo even under
+    surface (`io.Copy` is an example), and is `{}` when there is none. The counts are whole-repo even under
     `--incremental`, but a warm pass that re-parsed no file of a language has
     no row for it: absent means not measured this run, never zero.
   - `dependency_trees_uninstalled`: workspaces that declare dependencies

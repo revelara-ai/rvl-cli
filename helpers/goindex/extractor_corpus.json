@@ -6,14 +6,20 @@
     "surface missing here is invisible to every number the scanner reports.",
     "known_unretrieved is the completeness measure: I/O the tables do not retrieve,",
     "counted per scan as existing-but-not-retrieved so the gap is a number.",
-    "Moving an entry from known_unretrieved into io_methods is a retrieval change",
-    "and needs specs for the new sites, or every one of them abstains as no_spec.",
+    "Moving an entry out of known_unretrieved into a retrieved table is a retrieval",
+    "change and needs specs for the new sites, or every one of them abstains as",
+    "no_spec.",
+    "reader_calls are package-level functions that read from the reader given as",
+    "their first argument. io_methods matches a method name on any type, so these",
+    "are matched by package and name instead. The call names no client: the site",
+    "carries the origin of the reader, because the reader is what bounds the read.",
     "bound_constructors selects the unsized-construction inventory: package-level",
     "functions that build an object which takes a bound (class pool, queue, cache)",
     "or that read a whole body (class read). It says where to look, not what a",
     "bound is: the packet lists the setters and options seen, and a",
-    "construction-bound spec judges them. io.ReadAll is in both lists on purpose:",
-    "it is still not a G1 call site, and it is an unsized read."
+    "construction-bound spec judges them. io.ReadAll is in reader_calls too, on",
+    "purpose: the call site asks how long the read can block, and the unsized",
+    "read asks how much it can hold."
   ],
   "io_methods": [
     "Query", "QueryRow", "Exec",
@@ -35,12 +41,11 @@
     {"match": "prefix", "path": "github.com/getsentry/sentry-go", "category": "error_capture"},
     {"match": "prefix", "path": "go.opentelemetry.io/otel", "category": "trace"}
   ],
-  "known_unretrieved": [
-    {"package": "io", "func": "ReadAll",
-     "why": "reads a whole body with no size or time bound of its own; po-av01j.149 found three on nats-server that no number reported"},
-    {"package": "io/ioutil", "func": "ReadAll",
-     "why": "the deprecated spelling of io.ReadAll, still common in older trees"}
+  "reader_calls": [
+    {"package": "io", "func": "ReadAll"},
+    {"package": "io/ioutil", "func": "ReadAll"}
   ],
+  "known_unretrieved": [],
   "bound_constructors": [
     {"class": "pool", "package": "database/sql", "func": "Open"},
     {"class": "pool", "package": "database/sql", "func": "OpenDB"},

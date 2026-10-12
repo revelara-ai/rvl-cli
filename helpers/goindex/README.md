@@ -43,12 +43,30 @@ Every emitted record carries:
 The candidate-extractor tables -- the G1 I/O method names and the G4 emission
 framework list -- are corpus data in `extractor_corpus.json`, embedded at build
 time, not code constants (po-av01j.219). Its `known_unretrieved` list names I/O
-the tables deliberately do not retrieve (`io.ReadAll`), and every `-retrieve`
+the tables do not retrieve yet (it is empty now), and every `-retrieve`
 run counts those calls on the `repo_config` record's `retrieval` census beside
 `candidates` (call sites emitted) and `calls_resolved` (every call whose callee
 type-resolved). That census is the retrieval denominator: coverage is
 resolution over what these tables retrieve, and the census is how much they
 retrieve. It is computed before any `-files` filter, so it is always whole-repo.
+
+`reader_calls` in the same file lists package functions that read from the
+reader they are given: `io.ReadAll` and `io/ioutil.ReadAll`. Each call is a
+call site with `client_type` the package path (`io`), `func` `ReadAll`, and
+`receiver` the reader expression (`resp.Body`). The call names no client, and
+the reader is what bounds the read, so the record also carries
+`framework_type`: where the reader comes from. A reader is followed back
+through a local that is assigned once and through a call that takes one reader
+(`bufio.NewReader(resp.Body)`, `io.LimitReader(resp.Body, n)`). The origin is
+then the concrete type (`os.File`), or the owner type and field for an
+interface held in a struct field (`net/http.Response.Body`,
+`net/http.Request.Body`). The field is absent when the origin is not known,
+for example an `io.Reader` parameter. rvl looks an API spec up by
+`framework_type` first and then by `client_type`, so a spec keyed on
+`net/http.Response.Body` and `ReadAll` covers a response body read and does
+not cover a file read. `client_construction` holds the values that reach the
+variable the reader comes from, such as the call that returned the response.
+`framework_type` is not part of `site_key`.
 
 The same file holds `bound_constructors`: the functions whose calls are
 emitted as `site_kind: "unsized_construction"` packets (a connection pool, a

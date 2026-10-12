@@ -188,6 +188,12 @@ type RetrievedSite struct {
 	Method     string `json:"func"`
 	Receiver   string `json:"receiver"`
 	ClientType string `json:"client_type"`
+	// FrameworkType is set on a reader call (io.ReadAll) only: where the
+	// reader comes from, as "net/http.Response.Body" or "os.File". The call
+	// names no client, and the reader is what bounds the read, so this is the
+	// identity a spec is keyed on. rvl tries it before ClientType. Absent when
+	// the origin is not known. It is not part of the site key.
+	FrameworkType string `json:"framework_type,omitempty"`
 
 	CallSite  string `json:"snippet"`
 	Enclosing string `json:"enclosing_function_body"`
@@ -956,7 +962,8 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 					// A background-job registration surface (G3) or a classic
 					// I/O call (G1); anything else is not a site.
 					jobType := jobFrameworkType(callee)
-					if jobType == "" && !ioMethods[callee.Name()] {
+					isReader := jobType == "" && len(c.Args) > 0 && isReaderCall(callee)
+					if jobType == "" && !isReader && !ioMethods[callee.Name()] {
 						if surface, known := knownUnretrieved(callee); known {
 							census.Unretrieved[surface]++
 						}
@@ -993,6 +1000,14 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 					} else if t := info.TypeOf(sel.X); t != nil {
 						rs.ClientType = strings.TrimPrefix(t.String(), "*")
 						rs.Prov.ClientTypeKnown = true
+					}
+					// A reader call has no receiver value. The reader it is
+					// given stands in: its text, where it comes from, and
+					// (below) the values that reach it.
+					var readerRoot *types.Var
+					if isReader {
+						rs.Receiver = types.ExprString(c.Args[0])
+						rs.FrameworkType, readerRoot = readerOrigin(info, fd.Body, c.Args[0])
 					}
 					if jobType != "" {
 						rs.SiteKind = "background_job"
@@ -1065,8 +1080,12 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 
 					// The values that reach this receiver, when the type checker
 					// can say which: see trace.go.
+					traced := readerRoot
 					if !pkgRecv {
-						switch got, st := reach.trace(varOf(info, sel.X), funcs, src, 0); st {
+						traced = varOf(info, sel.X)
+					}
+					if traced != nil {
+						switch got, st := reach.trace(traced, funcs, src, 0); st {
 						case traceOK:
 							rs.ConstructionScope = "receiver"
 							if len(got) > maxCtorsEmitted {
