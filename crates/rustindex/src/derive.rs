@@ -951,6 +951,19 @@ mod tests {
     }
 
     #[test]
+    fn statement_snippet_carries_a_timeout_wrapper_around_the_call() {
+        // The wrapper opens lines above the call it bounds and is awaited
+        // lines below it. A consumer reads the bound off this statement, so
+        // the snippet has to reach both ends.
+        let src = "async fn f() {\n    let resp = tokio::time::timeout(\n        d,\n        client.get(\"u\").send(),\n    )\n    .await??;\n    resp\n}\n";
+        let doc = doc_from(src);
+        // Site on the `.send()` line (0-based line 3).
+        let snip = statement_snippet(&doc, 3);
+        assert!(snip.contains("tokio::time::timeout("), "snippet: {snip}");
+        assert!(snip.contains(".await??;"), "snippet: {snip}");
+    }
+
+    #[test]
     fn receiver_reads_the_dotted_chain() {
         let src = "self.client.get(url)";
         let off = src.find("get").unwrap();

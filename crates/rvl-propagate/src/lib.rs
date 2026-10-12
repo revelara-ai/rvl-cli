@@ -170,6 +170,88 @@ fn decorator_bounds(deco: &str, specs: &SpecCache) -> bool {
     false
 }
 
+/// A timeout wrapper around the awaited call itself:
+/// `tokio::time::timeout(d, client.get(url).send()).await`.
+///
+/// The wrapper drops the future it holds when the time is up, and that cancels
+/// the call, so it bounds the whole call. The evidence is the call sitting
+/// inside the wrapper's own parentheses in the call's statement. The enclosing
+/// function is deliberately not read: a `timeout` around some other future in
+/// the same body says nothing about this one, which is the body-presence
+/// false pass [`has_deadline_call`] is known for.
+///
+/// The wrapper is the free function `timeout` or `timeout_at`, written with
+/// its `time::` path or imported bare. A method (`.timeout(d)`) is a builder
+/// setting or an unrelated value, and the call_arg mechanism answers for it.
+/// A wrapper that is not awaited is never polled, so it earns nothing.
+fn wrapped_in_timeout(site: &Site) -> bool {
+    if site.lang != "rust" || site.method.is_empty() {
+        return false;
+    }
+    let src = site.snippet.as_str();
+    idents(src).any(|(at, ident)| {
+        let before = &src[..at];
+        if !matches!(ident, "timeout" | "timeout_at")
+            || before.ends_with('.')
+            || (before.ends_with("::") && !before.ends_with("time::"))
+        {
+            return false;
+        }
+        let Some((args, rest)) = paren_group(&src[at + ident.len()..]) else {
+            return false;
+        };
+        rest.trim_start().starts_with(".await")
+            && idents(args)
+                .any(|(i, name)| name == site.method && args[i + name.len()..].starts_with('('))
+    })
+}
+
+/// Every identifier in `src`, with the byte offset it starts at.
+fn idents(src: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let at = from + src[from..].find(is_ident_char)?;
+        let len = src[at..]
+            .find(|c| !is_ident_char(c))
+            .unwrap_or(src.len() - at);
+        from = at + len;
+        Some((at, &src[at..from]))
+    })
+}
+
+/// The argument text of a call and the text after its closing parenthesis,
+/// when `after` (the text following the callee's name) opens with `(` and the
+/// parentheses balance. A parenthesis inside a string literal does not count.
+fn paren_group(after: &str) -> Option<(&str, &str)> {
+    if !after.starts_with('(') {
+        return None;
+    }
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, c) in after.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&after[1..i], &after[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The value a keyword argument is given, when `after` (the text following
 /// its name) opens with `=` or `:`: the token up to whitespace or an
 /// argument/call delimiter. None when the name is not being assigned.
@@ -1062,6 +1144,12 @@ fn judge(
                         }
                     }
                 }
+            }
+            // A decorator on the enclosing function is ambient and was read
+            // above for every spec. A wrapper around the call is not: whether
+            // cancelling the awaited call bounds THIS API is the spec's answer.
+            Mechanism::Decorator if wrapped_in_timeout(site) => {
+                whole.push("timeout wrapper around the awaited call".into());
             }
             _ => {}
         }
@@ -3054,6 +3142,163 @@ mod tests {
         // And a spec for a DIFFERENT decorator does not reach this one.
         s.enclosing_function_body = "@retry(timeout=0)\ndef f():\n    db.query()".into();
         assert!(credits_decorator(&s, &cache_with_celery_decorator_spec()));
+    }
+
+    /// A Rust call site and a cache whose one spec governs it, bounded by the
+    /// given mechanisms.
+    fn rust_call(method: &str, snippet: &str, bounded_by: Vec<Mechanism>) -> (Site, SpecCache) {
+        let s = Site {
+            file_path: "src/fetch.rs".into(),
+            line_number: 2,
+            method: method.into(),
+            client_type: "reqwest".into(),
+            lang: "rust".into(),
+            snippet: snippet.into(),
+            enclosing_function_body: format!("async fn fetch() {{\n    {snippet}\n}}"),
+            ..Default::default()
+        };
+        let specs = SpecCache::from_file(SpecFile {
+            apis: vec![ApiSpec {
+                type_name: "reqwest".into(),
+                method: method.into(),
+                blocking: Blocking::Yes,
+                bounded_by,
+                confidence: 0.9,
+                rationale: String::new(),
+                site_count: 1,
+                site_kinds: vec![],
+                unbounded_sentinels: vec![],
+                default_bound: DefaultBound::Unknown,
+                blocking_intent: BlockingIntent::Incidental,
+                family: None,
+                capacity_arg: None,
+            }],
+            ..Default::default()
+        });
+        (s, specs)
+    }
+
+    fn rust_verdict(method: &str, snippet: &str, bounded_by: Vec<Mechanism>) -> Finding {
+        let (s, specs) = rust_call(method, snippet, bounded_by);
+        propagate(&s, &specs, &ServedBound::None, &HashMap::new())
+    }
+
+    #[test]
+    fn a_rust_call_awaited_inside_a_tokio_timeout_is_bounded() {
+        // tokio::time::timeout drops the future it wraps when the duration
+        // elapses, which cancels the request: a whole-call bound.
+        for snippet in [
+            "let r = tokio::time::timeout(d, reqwest::get(url)).await?;",
+            "let r = time::timeout(d, reqwest::get(url)).await;",
+            "let r = timeout(Duration::from_secs(5), reqwest::get(url)).await??;",
+            "let r = tokio::time::timeout_at(deadline, reqwest::get(url)).await?;",
+            "match tokio::time::timeout(d, reqwest::get(url))\n        .await\n    {",
+        ] {
+            let f = rust_verdict("get", snippet, vec![Mechanism::Decorator]);
+            assert_eq!(f.verdict, Verdict::Satisfies, "{snippet}: {}", f.reason);
+            assert!(f.reason.contains("timeout wrapper"), "{}", f.reason);
+        }
+    }
+
+    #[test]
+    fn a_wrapped_builder_chain_is_bounded_across_lines() {
+        let f = rust_verdict(
+            "send",
+            "let resp = tokio::time::timeout(\n        d,\n        client.get(url).send(),\n    )\n    .await??;",
+            vec![Mechanism::Decorator],
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    }
+
+    #[test]
+    fn the_same_rust_call_with_no_wrapper_violates() {
+        let f = rust_verdict(
+            "get",
+            "let r = reqwest::get(url).await?;",
+            vec![Mechanism::Decorator],
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_timeout_elsewhere_in_the_function_does_not_bound_the_call() {
+        // Wrapping the call expression is the evidence. A timeout around some
+        // other future in the same body says nothing about this call.
+        let (mut s, specs) = rust_call(
+            "get",
+            "let r = reqwest::get(url).await?;",
+            vec![Mechanism::Decorator],
+        );
+        s.enclosing_function_body = "async fn fetch() {\n    tokio::time::timeout(d, warm_up()).await?;\n    let r = reqwest::get(url).await?;\n}".into();
+        let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn only_a_wrapper_around_the_call_itself_counts() {
+        for (method, snippet) in [
+            // The call is outside the wrapper's parentheses.
+            (
+                "get",
+                "let r = (tokio::time::timeout(d, warm_up()).await, reqwest::get(url).await);",
+            ),
+            // A wrapper nobody awaits is never polled, so it bounds nothing here.
+            (
+                "get",
+                "let pending = tokio::time::timeout(d, reqwest::get(url));",
+            ),
+            // `.timeout(d)` is a method of some other value, not the wrapper.
+            // Whether it bounds the call is the call_arg question.
+            ("send", "let r = client.get(url).timeout(d).send().await?;"),
+            (
+                "send",
+                "let r = limits.timeout(client.get(url).send()).await?;",
+            ),
+            // A longer name that ends in `timeout` is another function.
+            ("get", "let r = no_timeout(d, reqwest::get(url)).await?;"),
+        ] {
+            let f = rust_verdict(method, snippet, vec![Mechanism::Decorator]);
+            assert_eq!(f.verdict, Verdict::Violates, "{snippet}: {}", f.reason);
+        }
+    }
+
+    #[test]
+    fn a_parenthesis_in_a_string_does_not_end_the_wrapper() {
+        let f = rust_verdict(
+            "get",
+            "let r = timeout(d, reqwest::get(\"http://h/a)b\")).await?;",
+            vec![Mechanism::Decorator],
+        );
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        let f = rust_verdict(
+            "get",
+            "let r = (timeout(d, warm(\"(\")).await, reqwest::get(url).await);",
+            vec![Mechanism::Decorator],
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_timeout_wrapper_is_credited_only_when_the_spec_lists_it() {
+        // Whether a cancelling wrapper bounds this API is the spec's answer.
+        let f = rust_verdict(
+            "get",
+            "let r = tokio::time::timeout(d, reqwest::get(url)).await?;",
+            vec![Mechanism::ClientConfig],
+        );
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn a_timeout_wrapper_is_read_on_rust_sites_only() {
+        let (mut s, specs) = rust_call(
+            "get",
+            "r = timeout(d, reqwest.get(url)).await",
+            vec![Mechanism::Decorator],
+        );
+        s.lang = "python".into();
+        let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
     }
 
     #[test]

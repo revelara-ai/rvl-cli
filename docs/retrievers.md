@@ -173,6 +173,16 @@ earns no credit. The scan then keeps looking for other bounds instead of
 reporting a violation, because the call can still carry its own. With no
 matching decorator spec, any value earns credit, as before.
 
+For a Rust call, the `decorator` mechanism also covers a timeout wrapper
+around the awaited call: `tokio::time::timeout(d, client.get(url).send()).await`
+or `tokio::time::timeout_at(deadline, ...)`. The wrapper drops the future
+when the time is up, which cancels the call, so it is a whole-call bound.
+The credit needs three things: the API spec lists `decorator`, the call is
+inside the wrapper's own parentheses in the same statement, and the wrapper
+is awaited. A `timeout` around another future in the same function earns
+nothing, and neither does a `.timeout(d)` method, which is the `call_arg`
+question.
+
 An API spec can name a `capacity_arg`, the constructor argument that gives
 the receiver a finite capacity (`{"name": "maxsize", "position": 0}` for
 `queue.Queue.put`). Such a call blocks only when the receiver can fill, so
