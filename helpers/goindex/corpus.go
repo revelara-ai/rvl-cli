@@ -5,7 +5,8 @@
 // measured their completeness -- so "94% resolved" on nats-server was a
 // statement about these tables, not about the repo. They now live in
 // extractor_corpus.json beside a known_unretrieved list, and the retrieval
-// census counts what the tables leave out.
+// census counts what the tables leave out. reader_calls is the third
+// retrieval table: package functions that read from a reader (io.ReadAll).
 package main
 
 import (
@@ -31,8 +32,16 @@ type unretrievedEntry struct {
 	Why     string `json:"why"`
 }
 
+// readerCall names a package-level function that reads from the reader given
+// as its first argument.
+type readerCall struct {
+	Package string `json:"package"`
+	Func    string `json:"func"`
+}
+
 type extractorCorpus struct {
 	IOMethods          []string           `json:"io_methods"`
+	ReaderCalls        []readerCall       `json:"reader_calls"`
 	EmissionFrameworks []frameworkEntry   `json:"emission_frameworks"`
 	KnownUnretrieved   []unretrievedEntry `json:"known_unretrieved"`
 	BoundConstructors  []boundConstructor `json:"bound_constructors"`
@@ -58,9 +67,20 @@ func parseExtractorCorpus(raw []byte) (extractorCorpus, error) {
 			return c, fmt.Errorf("extractor corpus: bad emission framework entry %+v", f)
 		}
 	}
+	readers := map[readerCall]bool{}
+	for _, r := range c.ReaderCalls {
+		if r.Package == "" || r.Func == "" {
+			return c, fmt.Errorf("extractor corpus: bad reader_calls entry %+v", r)
+		}
+		readers[r] = true
+	}
 	for _, u := range c.KnownUnretrieved {
 		if u.Package == "" || u.Func == "" {
 			return c, fmt.Errorf("extractor corpus: bad known_unretrieved entry %+v", u)
+		}
+		if readers[readerCall{u.Package, u.Func}] {
+			return c, fmt.Errorf("extractor corpus: %s.%s is in reader_calls and known_unretrieved",
+				u.Package, u.Func)
 		}
 		// A surface cannot be both retrieved and counted as missed.
 		if methods[u.Func] {
@@ -107,13 +127,32 @@ func emissionFramework(pkgPath string) (string, bool) {
 	return "", false
 }
 
+// packageFunc reports whether callee is a package-level function, not a method.
+func packageFunc(callee *types.Func) bool {
+	if callee.Pkg() == nil {
+		return false
+	}
+	sig, ok := callee.Type().(*types.Signature)
+	return ok && sig.Recv() == nil
+}
+
+// isReaderCall reports whether callee is in the corpus's reader_calls table.
+func isReaderCall(callee *types.Func) bool {
+	if !packageFunc(callee) {
+		return false
+	}
+	for _, r := range extractor.ReaderCalls {
+		if callee.Pkg().Path() == r.Package && callee.Name() == r.Func {
+			return true
+		}
+	}
+	return false
+}
+
 // knownUnretrieved names a package-level function the corpus lists as I/O the
 // tables do not retrieve, keyed "<import path>.<func>".
 func knownUnretrieved(callee *types.Func) (string, bool) {
-	if callee.Pkg() == nil {
-		return "", false
-	}
-	if sig, ok := callee.Type().(*types.Signature); !ok || sig.Recv() != nil {
+	if !packageFunc(callee) {
 		return "", false
 	}
 	for _, u := range extractor.KnownUnretrieved {

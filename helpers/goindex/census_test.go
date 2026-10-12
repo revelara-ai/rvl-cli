@@ -11,23 +11,49 @@ import (
 // denominator beside the resolution one, so a gap in the tables is a number
 // instead of an absence.
 
-func TestCensusCountsReadAllAsExistingButNotRetrieved(t *testing.T) {
-	sites, scan := runRetrieveAll("testdata/fixture", "fixture")
+func TestCensusNoLongerCountsReadAllAsNotRetrieved(t *testing.T) {
+	// io.ReadAll used to be the known-unretrieved surface. It is a call site
+	// now, so it is a candidate and no longer a gap.
+	_, scan := runRetrieveAll("testdata/fixture", "fixture")
 	if scan.Err != nil {
 		t.Fatal(scan.Err)
-	}
-	for _, s := range sites {
-		if s.SiteKind == "" && s.Method == "ReadAll" {
-			t.Fatalf("io.ReadAll is not in the io_methods table and must not be emitted as a call site: %+v", s)
-		}
 	}
 	c := scan.Census
 	if c.Lang != Lang {
 		t.Fatalf("census lang = %q, want %q", c.Lang, Lang)
 	}
-	if got := c.Unretrieved["io.ReadAll"]; got != 1 {
-		t.Fatalf("want ONE io.ReadAll counted as existing-but-not-retrieved, got %d (%v)",
-			got, c.Unretrieved)
+	if len(c.Unretrieved) != 0 {
+		t.Fatalf("no surface of the fixture is known and not retrieved, got %v", c.Unretrieved)
+	}
+}
+
+func TestCensusCountsAKnownUnretrievedSurface(t *testing.T) {
+	// The mechanism stays: a surface the corpus lists as known I/O that the
+	// tables do not retrieve is counted, not emitted.
+	saved := extractor
+	defer func() { extractor = saved }()
+	extractor.KnownUnretrieved = []unretrievedEntry{{Package: "os", Func: "Open", Why: "test"}}
+	sites, scan := runRetrieveAll("testdata/fixture", "fixture")
+	if scan.Err != nil {
+		t.Fatal(scan.Err)
+	}
+	if got := scan.Census.Unretrieved["os.Open"]; got != 1 {
+		t.Fatalf("want ONE os.Open counted as existing-but-not-retrieved, got %d (%v)",
+			got, scan.Census.Unretrieved)
+	}
+	for _, s := range sites {
+		if s.SiteKind == "" && s.Method == "Open" {
+			t.Fatalf("a known-unretrieved surface must not be emitted: %+v", s)
+		}
+	}
+}
+
+func TestExtractorCorpusRefusesASurfaceThatIsBothRetrievedAndCountedAsMissed(t *testing.T) {
+	raw := []byte(`{"io_methods":["Do"],"emission_frameworks":[{"match":"exact","path":"log","category":"log"}],
+		"reader_calls":[{"package":"io","func":"ReadAll"}],
+		"known_unretrieved":[{"package":"io","func":"ReadAll","why":"x"}]}`)
+	if _, err := parseExtractorCorpus(raw); err == nil {
+		t.Fatal("io.ReadAll in reader_calls and known_unretrieved must be an error")
 	}
 }
 
@@ -90,13 +116,10 @@ func TestExtractorCorpusCarriesTheTablesThatUsedToBeCode(t *testing.T) {
 			t.Fatalf("io_methods lost %q", m)
 		}
 	}
-	if ioMethods["ReadAll"] {
-		t.Fatal("ReadAll is a known-unretrieved surface, not a retrieved one")
-	}
 	if len(extractor.EmissionFrameworks) == 0 {
 		t.Fatal("the emission framework list must come from the corpus")
 	}
-	if len(extractor.KnownUnretrieved) == 0 {
-		t.Fatal("the corpus must name the known-unretrieved I/O surfaces it measures completeness by")
+	if len(extractor.ReaderCalls) == 0 {
+		t.Fatal("the reader-call list must come from the corpus")
 	}
 }

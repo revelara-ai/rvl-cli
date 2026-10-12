@@ -472,3 +472,133 @@ func (ix *reachIndex) trace(v *types.Var, funcs map[string]*retFunc, src *srcInd
 	}
 	return out, traceOK
 }
+
+// readerOriginMaxDepth bounds how many copies and wrapping calls are followed
+// from a reader back to where it comes from.
+const readerOriginMaxDepth = 4
+
+// readerOrigin says where the reader x comes from, and the variable to trace
+// for the values that reach it. A reader is followed back first: a local with
+// one assignment in body is whatever was assigned to it, and a call given
+// exactly one reader is that reader, so bufio.NewReader(resp.Body) and
+// io.LimitReader(resp.Body, n) both come from resp.Body. Where the following
+// stops, the origin is the static type when that is a concrete named type
+// ("os.File"), or the owner's type and the field name when it is an interface
+// held in a struct field ("net/http.Response.Body"). Anything else, an
+// interface parameter included, has no known origin and returns "".
+//
+// This names where the bytes come from. Whether reading from there can block,
+// and what bounds it, is for the spec keyed on the name.
+func readerOrigin(info *types.Info, body *ast.BlockStmt, x ast.Expr) (string, *types.Var) {
+	seen := map[types.Object]bool{}
+	var follow func(x ast.Expr, depth int) (string, *types.Var)
+	follow = func(x ast.Expr, depth int) (string, *types.Var) {
+		x = ast.Unparen(x)
+		if u, ok := x.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			x = ast.Unparen(u.X)
+		}
+		if depth > readerOriginMaxDepth {
+			return "", nil
+		}
+		var next ast.Expr
+		switch e := x.(type) {
+		case *ast.Ident:
+			if v, ok := info.ObjectOf(e).(*types.Var); ok && !seen[v] {
+				seen[v] = true
+				next = soleAssignment(info, body, v)
+			}
+		case *ast.CallExpr:
+			readers := 0
+			for _, a := range e.Args {
+				if hasReadMethod(info.TypeOf(a)) {
+					next = a
+					readers++
+				}
+			}
+			if readers != 1 {
+				next = nil
+			}
+		}
+		if next != nil {
+			if name, root := follow(next, depth+1); name != "" {
+				return name, root
+			}
+		}
+		if _, isCall := x.(*ast.CallExpr); isCall {
+			// A call's result can be a tuple; its caller names the type.
+			return "", nil
+		}
+		if name := concreteNamed(info.TypeOf(x)); name != "" {
+			return name, varOf(info, x)
+		}
+		if sel, ok := x.(*ast.SelectorExpr); ok {
+			field, ok := info.ObjectOf(sel.Sel).(*types.Var)
+			if owner := concreteNamed(info.TypeOf(sel.X)); ok && field.IsField() && owner != "" {
+				return owner + "." + field.Name(), varOf(info, sel.X)
+			}
+		}
+		return "", nil
+	}
+	return follow(x, 0)
+}
+
+// soleAssignment is the expression assigned to the local v when body assigns
+// it exactly once, or nil. The first result of a call that yields several
+// (zr, err := gzip.NewReader(r)) counts; any other result does not.
+func soleAssignment(info *types.Info, body *ast.BlockStmt, v *types.Var) ast.Expr {
+	var rhs ast.Expr
+	n := 0
+	ast.Inspect(body, func(x ast.Node) bool {
+		st, ok := x.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, lhs := range st.Lhs {
+			id, ok := lhs.(*ast.Ident)
+			if !ok || info.ObjectOf(id) != v {
+				continue
+			}
+			n++
+			switch {
+			case len(st.Rhs) == len(st.Lhs):
+				rhs = st.Rhs[i]
+			case i == 0:
+				rhs = st.Rhs[0]
+			default:
+				rhs = nil
+			}
+		}
+		return true
+	})
+	if n != 1 {
+		return nil
+	}
+	return rhs
+}
+
+// concreteNamed is the name of t, through one pointer, when t is a named type
+// that is not an interface; "" otherwise.
+func concreteNamed(t types.Type) string {
+	if t == nil {
+		return ""
+	}
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok || types.IsInterface(named) {
+		return ""
+	}
+	return typeKey(named)
+}
+
+// hasReadMethod reports whether a value of type t has a Read method, which is
+// what makes it usable as an io.Reader.
+func hasReadMethod(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	obj, _, _ := types.LookupFieldOrMethod(t, true, nil, "Read")
+	_, ok := obj.(*types.Func)
+	return ok
+}

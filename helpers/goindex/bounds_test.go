@@ -169,9 +169,17 @@ func TestUnbufferedChannelIsNotAnUnsizedConstruction(t *testing.T) {
 
 func TestUnsizedPacketsCarryASiteKeyAndStayOutOfTheCensus(t *testing.T) {
 	sites, scan := runRetrieveAll("testdata/boundsfixture", "bounds")
-	if scan.Census.Candidates != 0 {
-		t.Fatalf("the fixture has no G1 call site; unsized packets are not candidates: %d",
-			scan.Census.Candidates)
+	// The five io.ReadAll calls are call sites too. The unsized packets for
+	// the same calls are not candidates.
+	calls := 0
+	for _, s := range sites {
+		if s.SiteKind == "" {
+			calls++
+		}
+	}
+	if calls != 5 || scan.Census.Candidates != calls {
+		t.Fatalf("want the 5 ReadAll call sites as the only candidates, got %d sites and %d candidates",
+			calls, scan.Census.Candidates)
 	}
 	var sb strings.Builder
 	encodeRetrieved(&sb, sites)
