@@ -527,7 +527,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: rvl_data::control::ControlCmd,
     },
-    /// Query the causal factor catalog (list, show)
+    /// Query the causal factor catalog (list, show, lookup)
     Factor {
         #[command(subcommand)]
         cmd: rvl_data::factor::FactorCmd,

@@ -2,13 +2,17 @@
 //! form as `control list` / `control show`. Both JSON modes are raw
 //! server-body passthrough. The wire shapes are the `CausalFactor*` schemas
 //! of the Revelara API.
+//!
+//! `factor lookup` is the command a coding agent runs before it changes a
+//! file: free text in, the matching factors out as plain text. It sends the
+//! description and the limit, and nothing about the repository.
 
 use crate::client::Client;
 use crate::display;
 use crate::gojson::{null_as_default, path_escape, query_encode};
 use crate::{CmdResult, Failure, BIN};
 use rvl_core::flag::{absent_if_empty, EmptyFlag};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Printed wherever a public count is shown. A count is the number of
@@ -36,6 +40,17 @@ pub enum FactorCmd {
         /// Causal factor code (CF-XXXX)
         code: String,
         /// Output format: table (default) or json
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Look up the causal factors that apply to a change, from a description of it
+    Lookup {
+        /// What the change does, in free text
+        description: String,
+        /// Maximum factors to return (1-5)
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=5))]
+        limit: u8,
+        /// Output format: table (default, plain text) or json
         #[arg(long)]
         format: Option<String>,
     },
@@ -167,6 +182,49 @@ pub struct FactorList {
     pub edition: String,
 }
 
+/// One catalog entry that matches a description. The server sends `card`
+/// for an entry with an evaluated card, and `definition` for each other
+/// entry.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct FactorMatch {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub category: i64,
+    /// How well the entry matches the description, 0 to 1.
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub public_incidents: i64,
+    #[serde(default)]
+    pub public_organizations: i64,
+    #[serde(default)]
+    pub top10_slot: Option<i64>,
+    #[serde(default)]
+    pub card: String,
+    #[serde(default)]
+    pub definition: String,
+}
+
+/// The matches of `factor lookup`, best match first.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct FactorLookup {
+    #[serde(default)]
+    pub edition: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub factors: Vec<FactorMatch>,
+}
+
+/// The request body of `factor lookup`. These two keys are all that the
+/// command sends about the change.
+#[derive(Serialize)]
+struct LookupRequest<'a> {
+    description: &'a str,
+    limit: u8,
+}
+
 pub fn run(cmd: FactorCmd) -> std::process::ExitCode {
     let res = (|| -> CmdResult {
         match cmd {
@@ -189,6 +247,20 @@ pub fn run(cmd: FactorCmd) -> std::process::ExitCode {
                 check_not_other_code(&code)?;
                 let (_, client) = crate::client::load_and_resolve()?;
                 show_output(&client, &code, format.empty_is_absent())
+            }
+            FactorCmd::Lookup {
+                description,
+                limit,
+                format,
+            } => {
+                let format = absent_if_empty(format);
+                validate_format(&format)?;
+                // Checked before the credentials are read, so the usage
+                // error does not depend on a login. clap rejects a --limit
+                // outside 1 to 5 before this function runs.
+                check_description(&description)?;
+                let (_, client) = crate::client::load_and_resolve()?;
+                lookup_output(&client, &description, limit, format.empty_is_absent())
             }
         }
     })();
@@ -221,6 +293,17 @@ fn check_not_other_code(code: &str) -> Result<(), Failure> {
         "Note: \"{code}\" is a {kind} code, not a causal factor code (CF-XXXX).\n\
          Use \"{BIN} {command} {code}\" to see it."
     )))
+}
+
+/// A description with no text cannot match a factor, so no request is sent.
+fn check_description(description: &str) -> Result<(), Failure> {
+    if description.trim().is_empty() {
+        return Err(Failure::usage(format!(
+            "Error: the description is empty.\n\
+             Usage: {BIN} factor lookup \"<what the change does>\""
+        )));
+    }
+    Ok(())
 }
 
 pub fn list_output(
@@ -308,6 +391,54 @@ pub fn show_output(client: &Client, code: &str, format: Option<&str>) -> CmdResu
     let detail: FactorDetail = serde_json::from_slice(&body)
         .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
     Ok(render_detail(&detail))
+}
+
+pub fn lookup_output(
+    client: &Client,
+    description: &str,
+    limit: u8,
+    format: Option<&str>,
+) -> CmdResult {
+    // A POST, so that the description is in the body and not in a URL.
+    let url = format!("{}/api/v1/causal-factors/lookup", client.api_url);
+    let request = serde_json::to_vec(&LookupRequest { description, limit })
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+    let body = client
+        .request("POST", &url, Some(&request))
+        .map_err(|e| Failure::runtime(format!("Error: {e}")))?;
+
+    if format == Some("json") {
+        return Ok(format!("{}\n", String::from_utf8_lossy(&body)));
+    }
+
+    let resp: FactorLookup = serde_json::from_slice(&body)
+        .map_err(|e| Failure::runtime(format!("Error parsing response: {e}")))?;
+    Ok(render_lookup(&resp))
+}
+
+/// The text of `factor lookup`, written for an agent to read: the card of
+/// each factor as the server wrote it, or the code, the name and the
+/// definition of a factor with no card. One blank line separates the
+/// factors. There is no table and no decoration.
+pub fn render_lookup(resp: &FactorLookup) -> String {
+    if resp.factors.is_empty() {
+        return "No causal factor matches this description.\n".to_string();
+    }
+    let blocks: Vec<String> = resp
+        .factors
+        .iter()
+        .map(|m| {
+            let card = m.card.trim();
+            if card.is_empty() {
+                format!("{} - {}\n{}", m.code, m.name, m.definition.trim())
+                    .trim_end()
+                    .to_string()
+            } else {
+                card.to_string()
+            }
+        })
+        .collect();
+    format!("{}\n", blocks.join("\n\n"))
 }
 
 /// The relations of a control to a factor, in print order, with the heading
@@ -482,6 +613,60 @@ mod tests {
 
         assert!(check_not_other_code("CF-0021").is_ok());
         assert!(check_not_other_code("cf-0021").is_ok());
+    }
+
+    #[test]
+    fn an_empty_or_blank_description_is_a_usage_error() {
+        for description in ["", "   ", "\n\t"] {
+            let f = check_description(description).unwrap_err();
+            assert_eq!(f.code, 2, "{description:?}");
+            assert!(f.msg.contains("the description is empty"), "{}", f.msg);
+            assert!(f.msg.contains("rvl factor lookup"), "{}", f.msg);
+        }
+        assert!(check_description("add a retry").is_ok());
+    }
+
+    #[test]
+    fn lookup_render_prints_the_card_or_the_definition_with_one_blank_line_between() {
+        let out = render_lookup(&FactorLookup {
+            edition: "2026.2".into(),
+            factors: vec![
+                FactorMatch {
+                    code: "CF-0021".into(),
+                    name: "Unbounded retry".into(),
+                    // A card that ends in a newline does not add a blank line.
+                    card: "CF-0021 Unbounded retry\nGuard: cap the attempts.\n".into(),
+                    ..Default::default()
+                },
+                FactorMatch {
+                    code: "CF-0107".into(),
+                    name: "Stale runbook".into(),
+                    definition: "The runbook is out of date.".into(),
+                    ..Default::default()
+                },
+                FactorMatch {
+                    code: "CF-0003".into(),
+                    name: "No definition".into(),
+                    ..Default::default()
+                },
+            ],
+        });
+        assert_eq!(
+            out,
+            "CF-0021 Unbounded retry\nGuard: cap the attempts.\n\
+             \n\
+             CF-0107 - Stale runbook\nThe runbook is out of date.\n\
+             \n\
+             CF-0003 - No definition\n"
+        );
+    }
+
+    #[test]
+    fn lookup_render_of_no_match() {
+        assert_eq!(
+            render_lookup(&FactorLookup::default()),
+            "No causal factor matches this description.\n"
+        );
     }
 
     #[test]

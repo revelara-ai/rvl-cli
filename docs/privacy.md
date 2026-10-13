@@ -1,10 +1,11 @@
 # Privacy
 
 Code never leaves the machine. `rvl` is open source, so this claim
-can be verified in the code. This page covers the two channels that exist
+can be verified in the code. This page covers the channels that exist
 and what each can carry: the shape-only report attached to the deterministic
-scan, and the explicitly separate, flag-gated
-[submission mode](#submission-mode).
+scan, the explicitly separate, flag-gated
+[submission mode](#submission-mode), and the
+[platform queries](#platform-queries), which send only what the caller typed.
 
 When a scan reports the unknown API surfaces it could not decide (no spec
 exists yet), the payload carries only the API shape (`client_type`,
@@ -131,3 +132,32 @@ Use `--dry-run` to validate and print the exact submit summary without
 sending anything. The shape-only report contract above is unaffected:
 nothing from submission mode feeds it, and nothing in the deterministic
 scan feeds submission mode.
+
+## Platform queries
+
+The data commands (`rvl risk`, `rvl control`, `rvl factor`, `rvl knowledge`
+and the others in the same group) ask the Revelara API a question. Each one
+sends the arguments that the caller typed, with the API key and the
+organization ID. None of them reads a file of the repository.
+
+`rvl factor lookup "<what the change does>"` is the one that sends free
+text. A coding agent runs it before it changes a file, so this is what it
+sends:
+
+- The request is `POST /api/v1/causal-factors/lookup`. The body has two
+  keys and no other: `description`, the text that the caller wrote, and
+  `limit`, a number from 1 to 5.
+- The command sends no file content, no file path, no repository name, and
+  no git data. It does not read the working directory. The headers are the
+  API key, the organization ID and the content type.
+- The description is in the body, not in the URL, so it is not in a request
+  line that a proxy can log.
+- The server does not keep the description. It logs the length of the
+  description and the codes that it returned, and it counts the returned
+  codes for each organization and day.
+
+The description is free text, so it carries what the caller puts in it.
+Describe what the change does. Do not paste source code or a secret into it.
+
+An empty description is a usage error: the command exits 2 and sends
+nothing.

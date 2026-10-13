@@ -174,6 +174,7 @@ These talk to the Revelara API and need credentials.
 | --- | --- |
 | `rvl risk <list\|ready\|show\|context\|stale\|resolve\|accept>` | Manage risk lifecycle. |
 | `rvl control <list\|show>` | Query the reliability controls catalog. |
+| `rvl factor lookup "<what the change does>" [--limit <1-5>]` | Look up the causal factors that apply to a change, from a description of it. A coding agent runs this before it changes a file. The output is plain text: the card of each factor, or its code, name and definition. |
 | `rvl factor list [--category <1-7>] [--top10]` | List the causal factor catalog: the contributing conditions found in public incident reports. |
 | `rvl factor show <CODE>` | Show one causal factor: its quotes, its controls by relation, and the related risks of your organization. |
 | `rvl risk list --factor <CODE>` | List the risks of your organization that are related to one causal factor. The server does the filtering. |
