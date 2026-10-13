@@ -9169,3 +9169,25 @@ fn oss_only_refuses_the_dev_overrides_that_bypass_the_tiers() {
         );
     }
 }
+
+// --- causal factor lookup ---
+
+/// An empty description is a usage error. It is decided before the
+/// credentials are read, so the exit code is 2 with no login and no server.
+#[test]
+fn factor_lookup_with_an_empty_description_exits_2() {
+    let home = tempfile::tempdir().unwrap();
+    for description in ["", "  "] {
+        let out = bin()
+            .args(["factor", "lookup", description])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env_remove("RVL_API_KEY")
+            .output()
+            .expect("failed to run rvl");
+        assert_eq!(out.status.code(), Some(2), "{description:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("the description is empty"), "{stderr}");
+        assert!(out.stdout.is_empty());
+    }
+}

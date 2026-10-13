@@ -1,19 +1,30 @@
-//! Hermetic HTTP tests of `factor list` and `factor show` against a mock
-//! backend: no live API calls, ever. The mock speaks just enough HTTP/1.1
-//! for ureq and records the path of every request.
+//! Hermetic HTTP tests of `factor list`, `factor show` and `factor lookup`
+//! against a mock backend: no live API calls, ever. The mock speaks just
+//! enough HTTP/1.1 for ureq and records the path, the headers and the body
+//! of every request.
 
 use rvl_data::client::Client;
-use rvl_data::factor::{list_output, show_output};
-use std::io::{BufRead, BufReader, Write};
+use rvl_data::factor::{list_output, lookup_output, show_output};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 /// A canned route: exact "METHOD /path?query" -> (status, body).
 type Routes = Vec<(&'static str, u16, &'static str)>;
 
+/// One request as the mock received it.
+#[derive(Clone)]
+struct Recorded {
+    /// "METHOD /path?query".
+    line: String,
+    /// Each header as (name in lower case, value).
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
 struct MockServer {
     base_url: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Recorded>>>,
 }
 
 impl MockServer {
@@ -23,7 +34,7 @@ impl MockServer {
     fn start(routes: Routes) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
         let reqs = Arc::clone(&requests);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -44,6 +55,11 @@ impl MockServer {
 
     /// Each request as "METHOD /path?query", in arrival order.
     fn recorded(&self) -> Vec<String> {
+        self.full().into_iter().map(|r| r.line).collect()
+    }
+
+    /// Each request with its headers and its body, in arrival order.
+    fn full(&self) -> Vec<Recorded> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -51,7 +67,7 @@ impl MockServer {
 fn handle(
     stream: std::net::TcpStream,
     routes: &Routes,
-    reqs: &Arc<Mutex<Vec<String>>>,
+    reqs: &Arc<Mutex<Vec<Recorded>>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -59,14 +75,25 @@ fn handle(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    // A GET has no body, so the headers are read and dropped.
+    let mut headers = Vec::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
         if line.trim_end().is_empty() {
             break;
         }
+        if let Some((name, value)) = line.trim_end().split_once(':') {
+            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+        }
     }
+    // A GET has no Content-Length, so its body is empty.
+    let len = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
 
     let key = format!("{method} {path}");
     let (status, resp_body) = routes
@@ -74,7 +101,11 @@ fn handle(
         .find(|(route, _, _)| *route == key)
         .map(|(_, s, b)| (*s, *b))
         .unwrap_or((404, ""));
-    reqs.lock().unwrap().push(key);
+    reqs.lock().unwrap().push(Recorded {
+        line: key,
+        headers,
+        body,
+    });
 
     let reason = match status {
         200 => "OK",
@@ -255,4 +286,139 @@ fn factor_show_tolerates_null_lists() {
     }
     let out = list_output(&server.client(), None, false, None).unwrap();
     assert_eq!(out, "No causal factors found.\n");
+}
+
+const LOOKUP_PATH: &str = "POST /api/v1/causal-factors/lookup";
+
+const LOOKUP_BODY: &str = r#"{"edition":"2026.2","factors":[{"code":"CF-0021","name":"Unbounded retry","category":3,"score":0.91,"public_incidents":42,"public_organizations":17,"top10_slot":2,"card":"CF-0021 Unbounded retry\nTell: a loop around a network call with no attempt counter.\nGuard: cap the attempts."},{"code":"CF-0107","name":"Stale runbook","category":6,"score":0.4,"public_incidents":5,"public_organizations":4,"definition":"The runbook is out of date."}]}"#;
+
+#[test]
+fn factor_lookup_sends_the_description_and_the_limit_in_a_post_body_with_no_other_key() {
+    let server = MockServer::start(vec![(LOOKUP_PATH, 200, LOOKUP_BODY)]);
+    let description = "add a retry around the \"payment\" call";
+    lookup_output(&server.client(), description, 2, None).unwrap();
+
+    let requests = server.full();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    // The method and the path, with no query: the description is not in a URL.
+    assert_eq!(req.line, LOOKUP_PATH);
+
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("a JSON body");
+    let object = body.as_object().expect("a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["description", "limit"]);
+    assert_eq!(body["description"], description);
+    assert_eq!(body["limit"], 2);
+
+    // The headers are the ones every data command sends, plus what the HTTP
+    // library adds. None of them can carry a path or a repository name.
+    let cwd = std::env::current_dir().unwrap();
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    let repo_name = repo_root.file_name().unwrap().to_str().unwrap();
+    for (name, value) in &req.headers {
+        assert!(
+            [
+                "host",
+                "content-type",
+                "content-length",
+                "authorization",
+                "x-organization-id",
+                "accept",
+                "accept-encoding",
+                "user-agent",
+            ]
+            .contains(&name.as_str()),
+            "unexpected header {name}: {value}"
+        );
+        for secret in [
+            cwd.to_str().unwrap(),
+            repo_root.to_str().unwrap(),
+            repo_name,
+        ] {
+            assert!(
+                !value.contains(secret),
+                "header {name} carries {secret:?}: {value}"
+            );
+        }
+    }
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(header("authorization"), Some("Bearer pk_test_key"));
+    assert_eq!(header("x-organization-id"), Some("org-uuid-1"));
+}
+
+#[test]
+fn factor_lookup_prints_the_card_text() {
+    let server = MockServer::start(vec![(LOOKUP_PATH, 200, LOOKUP_BODY)]);
+    let out = lookup_output(&server.client(), "add a retry", 3, None).unwrap();
+    // The card comes first, as the server wrote it, then one blank line.
+    assert!(
+        out.starts_with(
+            "CF-0021 Unbounded retry\n\
+             Tell: a loop around a network call with no attempt counter.\n\
+             Guard: cap the attempts.\n\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn factor_lookup_prints_the_definition_for_an_item_with_no_card() {
+    let server = MockServer::start(vec![(LOOKUP_PATH, 200, LOOKUP_BODY)]);
+    let out = lookup_output(&server.client(), "add a retry", 3, None).unwrap();
+    assert!(
+        out.ends_with("\n\nCF-0107 - Stale runbook\nThe runbook is out of date.\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn factor_lookup_prints_the_no_match_line_for_an_empty_list() {
+    let server = MockServer::start(vec![(
+        LOOKUP_PATH,
+        200,
+        r#"{"edition":"2026.2","factors":[]}"#,
+    )]);
+    let out = lookup_output(&server.client(), "rename a variable", 3, None).unwrap();
+    assert_eq!(out, "No causal factor matches this description.\n");
+
+    // The server can send null for an empty list.
+    let server = MockServer::start(vec![(
+        LOOKUP_PATH,
+        200,
+        r#"{"edition":"2026.2","factors":null}"#,
+    )]);
+    let out = lookup_output(&server.client(), "rename a variable", 3, None).unwrap();
+    assert_eq!(out, "No causal factor matches this description.\n");
+}
+
+#[test]
+fn factor_lookup_json_is_raw_passthrough() {
+    let server = MockServer::start(vec![(LOOKUP_PATH, 200, LOOKUP_BODY)]);
+    let out = lookup_output(&server.client(), "add a retry", 3, Some("json")).unwrap();
+    assert_eq!(out, format!("{LOOKUP_BODY}\n"));
+}
+
+#[test]
+fn factor_lookup_error_is_a_runtime_failure_with_the_client_message() {
+    let server = MockServer::start(vec![(
+        LOOKUP_PATH,
+        400,
+        r#"{"error":"bad_request","message":"the description is too long"}"#,
+    )]);
+    let f = lookup_output(&server.client(), "add a retry", 3, None).unwrap_err();
+    assert_eq!(f.code, 1);
+    assert_eq!(
+        f.msg,
+        "Error: server error (400): bad_request: the description is too long"
+    );
 }

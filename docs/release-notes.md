@@ -9,6 +9,41 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.5.0 (not released yet)
 
+### `rvl factor lookup`
+
+**Minimum version to probe for: the first release after 1.5.0.** `rvl` 1.5.0
+and earlier do not have the subcommand: `rvl factor lookup --help` exits 2
+there and exits 0 on a version that has it.
+
+`rvl factor lookup "<what the change does>" [--limit <1-5>] [--format table|json]`
+is the command a coding agent runs before it changes a file. It sends the
+description to the causal factor catalog of the Revelara platform and prints
+the factors that apply to the change, best match first.
+
+- The text output is plain text for an agent to read. A factor that has a
+  card prints the card text. Each other factor prints `<CODE> - <name>` and
+  then its definition. One blank line separates the factors. There is no
+  table and no header.
+- When no factor matches, the command prints
+  `No causal factor matches this description.` and exits 0.
+- `--limit` is 1 to 5, and the default is 3. A value outside the range exits
+  2 with no request.
+- An empty description exits 2 with no request.
+- `--format=json` prints the response of the server unchanged: `edition` and
+  `factors`. Each factor has `code`, `name`, `category`, `score`,
+  `public_incidents` and `public_organizations`, and either `card` or
+  `definition`.
+
+The request body has the description and the limit, and no other key. The
+command sends no file content, no path and no repository data. See
+[Privacy](privacy.md#platform-queries). The command needs a server that has
+the lookup endpoint; an older server answers 404, and the command exits 1.
+
+The embedded context block that `rvl init` writes to `AGENTS.md` and
+`CLAUDE.md` has a new first line in the "Causal factors" list, which tells
+an agent to run the command before it changes a file. The addition is
+additive: no command or field changed.
+
 ### The config key `kubernetes container.run-as-user-class`
 
 **Minimum version to probe for: the first release after 1.5.0.**

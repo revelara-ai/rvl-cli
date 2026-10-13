@@ -199,6 +199,9 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // The same guarded validator as `control --format`.
     ("factor list", "format", Empty::Absent),
     ("factor show", "format", Empty::Absent),
+    // A typed clap argument (1 to 5), so the empty value fails the parse.
+    ("factor lookup", "limit", Empty::Error),
+    ("factor lookup", "format", Empty::Absent),
     // ---------------- incident (internal/commands/incident.go) ----------------
     ("incident search", "limit", Empty::Error), // incident.go:152
     // incident.go:163 calls ValidateFormat UNGUARDED — the one --format in

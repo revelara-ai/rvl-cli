@@ -20,6 +20,7 @@ Add `--format=json` to any of these for machine-readable output.
 - `rvl control show RC-XXX` — control details and evidence status
 
 **Causal factors:**
+- `rvl factor lookup "<what the change does>"` — run this before you change a file; it returns the causal factors from public incident reports that apply to the change
 - `rvl factor list --top10` — the Reliability Top 10 of the causal factor catalog
 - `rvl factor show CF-XXXX` — causal factor details, linked controls and related risks
 - `rvl risk list --factor CF-XXXX` — your organization's risks related to a causal factor
