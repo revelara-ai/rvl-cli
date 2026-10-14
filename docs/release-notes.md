@@ -26,7 +26,7 @@ the factors that apply to the change, best match first.
   table and no header.
 - When no factor matches, the command prints
   `No causal factor matches this description.` and exits 0.
-- `--limit` is 1 to 5, and the default is 3. A value outside the range exits
+- `--limit` is 1 to 5, and the default is 5. A value outside the range exits
   2 with no request.
 - An empty description exits 2 with no request.
 - `--format=json` prints the response of the server unchanged: `edition` and
