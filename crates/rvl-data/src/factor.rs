@@ -48,7 +48,7 @@ pub enum FactorCmd {
         /// What the change does, in free text
         description: String,
         /// Maximum factors to return (1-5)
-        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=5))]
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(1..=5))]
         limit: u8,
         /// Output format: table (default, plain text) or json
         #[arg(long)]

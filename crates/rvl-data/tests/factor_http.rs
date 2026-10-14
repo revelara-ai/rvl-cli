@@ -4,7 +4,7 @@
 //! of every request.
 
 use rvl_data::client::Client;
-use rvl_data::factor::{list_output, lookup_output, show_output};
+use rvl_data::factor::{list_output, lookup_output, show_output, FactorCmd};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -291,6 +291,31 @@ fn factor_show_tolerates_null_lists() {
 const LOOKUP_PATH: &str = "POST /api/v1/causal-factors/lookup";
 
 const LOOKUP_BODY: &str = r#"{"edition":"2026.2","factors":[{"code":"CF-0021","name":"Unbounded retry","category":3,"score":0.91,"public_incidents":42,"public_organizations":17,"top10_slot":2,"card":"CF-0021 Unbounded retry\nTell: a loop around a network call with no attempt counter.\nGuard: cap the attempts."},{"code":"CF-0107","name":"Stale runbook","category":6,"score":0.4,"public_incidents":5,"public_organizations":4,"definition":"The runbook is out of date."}]}"#;
+
+#[derive(clap::Parser)]
+struct FactorCli {
+    #[command(subcommand)]
+    cmd: FactorCmd,
+}
+
+#[test]
+fn factor_lookup_sends_limit_5_when_the_flag_is_absent() {
+    use clap::Parser as _;
+    let cli = FactorCli::try_parse_from(["factor", "lookup", "add a retry"]).unwrap();
+    let FactorCmd::Lookup {
+        description, limit, ..
+    } = cli.cmd
+    else {
+        panic!("not a lookup");
+    };
+    assert_eq!(limit, 5);
+
+    let server = MockServer::start(vec![(LOOKUP_PATH, 200, LOOKUP_BODY)]);
+    lookup_output(&server.client(), &description, limit, None).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&server.full()[0].body).expect("a JSON body");
+    assert_eq!(body["limit"], 5);
+}
 
 #[test]
 fn factor_lookup_sends_the_description_and_the_limit_in_a_post_body_with_no_other_key() {
