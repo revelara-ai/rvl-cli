@@ -53,6 +53,11 @@ pub struct ConsumptionRecord {
     /// RFC3339-ish UTC stamp. Free-form on purpose: this is a human audit
     /// trail, and a parse failure here must never be able to block a gate.
     pub run_at: String,
+    /// The person who gave the go. `None` only on lines written before the go
+    /// existed; every record this build writes carries both fields.
+    pub operator: Option<String>,
+    /// sha256 of the adjudication-report.md the operator read and approved.
+    pub report_sha256: Option<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -163,4 +168,55 @@ pub fn append_consumption(path: &Path, rec: &ConsumptionRecord) -> Result<(), Re
         Refusal::EvidenceUnreadable(format!("cannot append to ledger {}: {e}", path.display()))
     })?;
     Ok(())
+}
+
+/// Consume a gate set on an operator's go: the one irreversible act of a gate
+/// run, so everything here happens BEFORE scoring.
+///
+/// The go is for the report the operator read. A hash that is not the hash of
+/// `<set>/adjudication-report.md` as it is on disk now refuses before the
+/// ledger is read or written: a set that was adjudicated again needs a new go,
+/// and a refused go leaves the set unconsumed. A set with no report (NOT
+/// MINTED, NOT QUALIFIED) has nothing to hash and cannot be given a go.
+pub fn consume(
+    set_dir: &Path,
+    ledger_path: &Path,
+    set_id: &str,
+    target: f64,
+    operator: &str,
+    report_sha256: &str,
+    run_at: String,
+) -> Result<ConsumptionRecord, Refusal> {
+    let operator = operator.trim();
+    if operator.is_empty() {
+        return Err(Refusal::NoOperator);
+    }
+    let hash = |name: &str| -> Result<String, Refusal> {
+        let p = set_dir.join(name);
+        std::fs::read(&p)
+            .map(|b| sha256_hex(&b))
+            .map_err(|e| Refusal::EvidenceUnreadable(format!("{} for hashing: {e}", p.display())))
+    };
+    let report = hash("adjudication-report.md")?;
+    let given = report_sha256.trim().to_ascii_lowercase();
+    if given != report {
+        return Err(Refusal::ReportHashMismatch {
+            set_id: set_id.to_string(),
+            given,
+            actual: report,
+        });
+    }
+    let verdicts_sha256 = hash("verdicts.jsonl")?;
+    check_unconsumed(&read_ledger(ledger_path)?, set_id, &verdicts_sha256)?;
+    let rec = ConsumptionRecord {
+        set_id: set_id.to_string(),
+        verdicts_sha256,
+        manifest_sha256: hash("manifest.yaml")?,
+        target,
+        run_at,
+        operator: Some(operator.to_string()),
+        report_sha256: Some(report),
+    };
+    append_consumption(ledger_path, &rec)?;
+    Ok(rec)
 }

@@ -155,6 +155,15 @@ pub enum Refusal {
     /// the manifest's self-declaration; this one is a fact the gate process
     /// wrote itself and therefore the one that can actually be trusted.
     AlreadyConsumed { set_id: String, reason: String },
+    /// The go names a report hash that is not the hash of the set's
+    /// adjudication-report.md: the operator approved some other report.
+    ReportHashMismatch {
+        set_id: String,
+        given: String,
+        actual: String,
+    },
+    /// The go names no operator. The ledger records who consumed the set.
+    NoOperator,
     /// sample_size below the n>=50 bar (po-ipkfg.1).
     SampleTooSmall(usize),
     /// The scored rows clear the bar on raw n but not after the cluster
@@ -230,6 +239,11 @@ impl std::fmt::Display for Refusal {
                 f,
                 "refused: {set_id} is already consumed ({reason}). Gate sets are single-use per version; mint a fresh set rather than re-running this one."
             ),
+            Refusal::ReportHashMismatch { set_id, given, actual } => write!(
+                f,
+                "refused: the go for {set_id} is for report sha256 {given}, but its adjudication-report.md is sha256 {actual}. Read the report in the set and give the go for that hash."
+            ),
+            Refusal::NoOperator => write!(f, "refused: --operator is blank; the go must name the person who gives it"),
             Refusal::SampleTooSmall(n) => write!(f, "refused: sample_size {n} < {MIN_SAMPLE}"),
             Refusal::EffectiveSampleTooSmall {
                 n,

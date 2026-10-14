@@ -127,6 +127,15 @@ enum Cmd {
         /// machine that ran the gate does not stop the next machine.
         #[arg(long)]
         ledger: Option<PathBuf>,
+        /// Name of the operator who gives the go to consume the set. Recorded
+        /// in the ledger.
+        #[arg(long)]
+        operator: String,
+        /// sha256 of the set's adjudication-report.md that the operator read.
+        /// The run refuses, before it consumes the set, when the report in the
+        /// set has another hash.
+        #[arg(long)]
+        report_sha256: String,
         /// Retriever packet stream for the pinned repos, retrieved AT the
         /// manifest's frozen_sha (po-av01j.95). With this the gate measures the
         /// ENGINE; without it, it can only re-read the panel's static file.
@@ -705,6 +714,8 @@ specs borrowed by method for {borrowed} rows",
             grounding_manifest,
             target,
             ledger,
+            operator,
+            report_sha256,
             retrieved,
             specs,
         } => {
@@ -773,36 +784,26 @@ specs borrowed by method for {borrowed} rows",
             // run unconsumed, which is the tune-and-retry loop that made the
             // old `consumed: true` self-declaration worthless.
             let ledger_path = ledger.unwrap_or_else(|| consumption::default_ledger_path(&set));
-            let verdicts_sha = match std::fs::read(set.join("verdicts.jsonl")) {
-                Ok(b) => consumption::sha256_hex(&b),
-                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
-                    "verdicts.jsonl for hashing: {e}"
-                ))),
-            };
-            let manifest_sha = match std::fs::read(set.join("manifest.yaml")) {
-                Ok(b) => consumption::sha256_hex(&b),
-                Err(e) => refuse(&gate::Refusal::EvidenceUnreadable(format!(
-                    "manifest.yaml for hashing: {e}"
-                ))),
-            };
-            let prior = match consumption::read_ledger(&ledger_path) {
-                Ok(l) => l,
+            let consumed = match consumption::consume(
+                &set,
+                &ledger_path,
+                &manifest.set_id,
+                target,
+                &operator,
+                &report_sha256,
+                now_utc_rfc3339(),
+            ) {
+                Ok(rec) => rec,
                 Err(r) => refuse(&r),
             };
-            if let Err(r) = consumption::check_unconsumed(&prior, &manifest.set_id, &verdicts_sha) {
-                refuse(&r);
-            }
-            let record = consumption::ConsumptionRecord {
-                set_id: manifest.set_id.clone(),
-                verdicts_sha256: verdicts_sha,
-                manifest_sha256: manifest_sha,
-                target,
-                run_at: now_utc_rfc3339(),
-            };
-            if let Err(r) = consumption::append_consumption(&ledger_path, &record) {
-                refuse(&r);
-            }
-            println!("  consumed: recorded in {}", ledger_path.display());
+            println!(
+                "  consumed: go by {} for report sha256 {}, recorded in {}",
+                consumed.operator.expect("consume records the operator"),
+                consumed
+                    .report_sha256
+                    .expect("consume records the report hash"),
+                ledger_path.display()
+            );
 
             // MEASURE THE ENGINE, not the file (po-av01j.95). Without
             // --retrieved/--specs the only thing available is the panel's
