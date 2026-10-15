@@ -46,6 +46,10 @@ post-announce-jobs = ["./slsa-provenance"]
 # slsa-github-generator documents: read the run, an OIDC token to sign with,
 # and write access to upload the provenance to the release.
 github-custom-job-permissions = { "publish-cask" = { contents = "read" }, "slsa-provenance" = { actions = "read", id-token = "write", contents = "write" } }
+# No source.tar.gz on the release. The cask installs only the per-target
+# archives and nothing reads the tarball; ci/check-release-plan.sh fails the
+# build if the plan lists one again.
+source-tarball = false
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests

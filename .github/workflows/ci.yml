@@ -79,6 +79,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The release ships the rvl app alone. The guard reads the plan dist
+      # would release from this tree, so a new app, anything of the evaluation
+      # harness or a source tarball fails here and not at tag time. Pinned to the
+      # cargo-dist-version in dist-workspace.toml.
+      - name: Install dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+
+      - name: Release plan holds the rvl app alone
+        shell: bash
+        run: dist plan --output-format=json > "$RUNNER_TEMP/plan.json" && ci/check-release-plan.sh "$RUNNER_TEMP/plan.json"
+
       # Builds cindex so the C/C++ live e2e runs instead of skipping itself.
       # A helper the suite never builds is a lane the suite never covers.
       # Both helpers are bin targets of the `rvl` PACKAGE (their crates are

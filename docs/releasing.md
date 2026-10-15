@@ -18,6 +18,11 @@ and commented in place: `installers = []` (dist 0.32 can only emit a Homebrew
 `github-build-setup`, which splices `.github/build-setup.yml` into each
 per-target build job.
 
+A release ships the `rvl` app and nothing else: no other app and no source
+tarball (`source-tarball = false`). CI runs `dist plan` on every change and
+`ci/check-release-plan.sh` fails it when the plan lists a second app, anything
+of the evaluation harness, or a source tarball.
+
 ## Shipping the retriever helpers
 
 Each helper reaches a released `rvl` by the cheapest route its nature allows,
@@ -62,7 +67,7 @@ so a fresh install scans with no setup:
 
 Each release publishes two supply-chain assets beside the archives:
 
-- **`rvl.cdx.xml`** (and `rvl-eval.cdx.xml`), a CycloneDX SBOM of the Rust
+- **`rvl.cdx.xml`**, a CycloneDX SBOM of the Rust
   dependency tree.
   `cargo-cyclonedx = true` in `dist-workspace.toml` makes the generated
   workflow build it in the global-artifacts job. It lists crates only. The Go

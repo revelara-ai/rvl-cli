@@ -226,9 +226,8 @@ The orchestrator uses it to:
   count call sites only. The array is empty when the lane did not run
   (`--changed-only`, or a `--retrieved` stream with no `repo_structure`
   record). An empty array never means that the repository satisfies the
-  controls. To score the lane, run
-  `rvl-eval score --lane structure --findings <scan.json> --gold <gold.json>`;
-  a gold case id is a control code (`RC-033`) or the full class.
+  controls. To score the lane against a gold set, key each gold case by a
+  control code (`RC-033`) or by the full class.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime

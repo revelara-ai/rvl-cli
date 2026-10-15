@@ -95,11 +95,10 @@ sets are single-use, minted at first gate and re-verified at cutover. Both
 numbers are cluster-adjusted: the bound is taken at the effective sample size
 `n_eff = n / deff`, not at raw n, and a run with `n_eff < 50` is refused.
 Sites cluster by (repo, spec class), because one spec decides every site of
-its class, and `deff` is the Kish design effect of that clustering
-(`crates/rvl-eval/src/stats.rs`). `rvl-eval gate` prints n, n_clusters, deff
-and n_eff next to the bound. No language holds a passing claim under this
-rule today: the one minted set, eval-go-v1, is withdrawn. The
-gate machinery is language-generic (`rvl-eval gate`, `language: rust` in the
+its class, and `deff` is the Kish design effect of that clustering. The gate
+report prints n, n_clusters, deff and n_eff next to the bound. No language
+holds a passing claim under this rule today: the one minted set, eval-go-v1,
+is withdrawn. The gate machinery is language-generic (`language: rust` in the
 manifest); minting + adjudication is HITL and tracked as its own bead under
 the epic. The seed spec corpus (`crates/rvl/tests/testdata/
 rust_seed_specs.json`) is test-grade and permanently gate-ineligible.
