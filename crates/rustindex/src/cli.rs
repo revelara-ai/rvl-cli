@@ -111,6 +111,7 @@ fn execute() -> anyhow::Result<()> {
     // heuristic tier -- and since po-pk3fp.11 that abstention is PER
     // WORKSPACE: a polyglot monorepo keeps the crates that did load.
     let ra = crate::ra::discover()?;
+    let crate_limit = crate::ra::max_crates()?;
     let workspaces = crate::workspace::discover_workspaces(&root);
     if workspaces.is_empty() {
         return Err(crate::ra::Abstain(format!(
@@ -153,6 +154,9 @@ fn execute() -> anyhow::Result<()> {
     // --files filter stay repo-relative whatever nesting the repo uses.
     let mut sites = Vec::new();
     let mut indexed: Vec<&str> = Vec::new();
+    // Workspaces left out because rust-analyzer's memory would grow past the
+    // bound (po-av01j.252), with the reason rvl reports the lane partial by.
+    let mut too_large: Vec<(&str, String)> = Vec::new();
     let mut repo_config = rvl_core::RepoConfig {
         snapshot_id: snapshot.clone(),
         ..Default::default()
@@ -161,6 +165,20 @@ fn execute() -> anyhow::Result<()> {
         // An incremental run names repo-relative files; a workspace holding
         // none of them would cost a cold rust-analyzer load for nothing.
         if !crate::workspace::wanted(&ws.rel, only) {
+            continue;
+        }
+        if ws.crates > crate_limit {
+            let reason = format!(
+                "workspace {} ({} crates) is over the {crate_limit}-crate limit",
+                display_rel(&ws.rel),
+                ws.crates
+            );
+            eprintln!(
+                "rustindex: WARNING: {reason} and is NOT indexed, to bound rust-analyzer \
+                 memory; set {} to raise the limit",
+                crate::ra::ENV_MAX_CRATES
+            );
+            too_large.push((&ws.rel, reason));
             continue;
         }
         indexed.push(&ws.rel);
@@ -209,9 +227,10 @@ fn execute() -> anyhow::Result<()> {
         .loaded
         .iter()
         .map(|ws| {
-            serde_json::json!({
+            let mut rec = serde_json::json!({
                 "path": ws.rel,
                 "loaded": true,
+                "crates": ws.crates,
                 // False on an incremental run that named no file here: the
                 // workspace loaded, and its sites were deliberately not read.
                 "indexed": indexed.contains(&ws.rel.as_str()),
@@ -221,7 +240,11 @@ fn execute() -> anyhow::Result<()> {
                     "sha256": ws.lock.sha256,
                     "bytes": ws.lock.bytes,
                 },
-            })
+            });
+            if let Some((_, reason)) = too_large.iter().find(|(rel, _)| *rel == ws.rel) {
+                rec["too_large"] = serde_json::Value::from(reason.as_str());
+            }
+            rec
         })
         .collect();
     workspace_records.extend(
@@ -251,6 +274,8 @@ fn execute() -> anyhow::Result<()> {
         "workspaces_loaded": load.loaded.len(),
         "workspaces_indexed": indexed.len(),
         "workspaces_declined": load.declined.len(),
+        "crate_limit": crate_limit,
+        "workspaces_too_large": too_large.len(),
     });
     writeln!(out, "{}", serde_json::to_string(&prov)?)?;
     Ok(())

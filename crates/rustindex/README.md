@@ -40,6 +40,16 @@ with the reason — never a heuristic tier. A missing committed `Cargo.lock`
 is reported on stderr and the generated lockfile's sha256/size are snapshotted
 into the provenance record.
 
+## Memory bound
+
+rust-analyzer's memory grows with the crates it loads, dependencies included
+(about 12 MB per crate; a 2015-crate workspace went past 25 GB). A workspace
+whose `cargo metadata` graph has more than 600 crates (`RVL_RUSTINDEX_MAX_CRATES`
+overrides) is not indexed. The run still succeeds; the provenance record gives
+the workspace's `crates` and its `too_large` reason, and `rvl scan` reports the
+Rust lane as partial with that reason. `rust-analyzer scip` ignores the settings
+that would otherwise lower memory (proc macros, build scripts, cache priming).
+
 ## What it emits
 
 One JSON object per line, `packet_schema: 2`, `lang: "rust"`, plus `site_key`

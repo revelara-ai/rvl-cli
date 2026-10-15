@@ -4044,21 +4044,16 @@ fn rust_seed_specs() -> std::path::PathBuf {
         .join("rust_seed_specs.json")
 }
 
-/// Rust, live end to end: `rvl scan <fixture>` must detect Rust, run the
-/// rustindex helper (a workspace binary — built by cargo next to rvl, the
-/// same adjacency a release ships), and feed its packets through the pipeline
-/// with the seed specs. Skipped when rust-analyzer is unavailable, matching
-/// the goindex skip convention.
-#[test]
-fn live_rust_scan_runs_the_rustindex_helper() {
+/// The rustindex helper and the offline fixture workspace, or None (a skip)
+/// when rust-analyzer is unavailable, matching the goindex skip convention.
+/// The helper is a bin of this same package, so cargo has normally built it
+/// next to rvl already.
+fn rustindex_and_fixture(test: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     match Command::new("rust-analyzer").arg("--version").output() {
         Ok(o) if o.status.success() => {}
         _ => {
-            rvl_testgate::skip(
-                "live_rust_scan",
-                "rust-analyzer not available (rustup component)",
-            );
-            return;
+            rvl_testgate::skip(test, "rust-analyzer not available (rustup component)");
+            return None;
         }
     }
     let workspace = manifest_dir()
@@ -4066,8 +4061,6 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
-    // The helper is a bin of this same package, so cargo has already built it
-    // next to rvl before running this test.
     let rustindex = std::path::Path::new(env!("CARGO_BIN_EXE_rvl"))
         .parent()
         .unwrap()
@@ -4087,8 +4080,8 @@ fn live_rust_scan_runs_the_rustindex_helper() {
                 );
             }
             Err(e) => {
-                rvl_testgate::skip("live_rust_scan", format_args!("cargo not available: {e}"));
-                return;
+                rvl_testgate::skip(test, format_args!("cargo not available: {e}"));
+                return None;
             }
         }
     }
@@ -4098,7 +4091,18 @@ fn live_rust_scan_runs_the_rustindex_helper() {
         .join("testdata")
         .join("fixture");
     assert!(fixture.join("Cargo.toml").is_file(), "fixture missing");
+    Some((rustindex, fixture))
+}
 
+/// Rust, live end to end: `rvl scan <fixture>` must detect Rust, run the
+/// rustindex helper (a workspace binary — built by cargo next to rvl, the
+/// same adjacency a release ships), and feed its packets through the pipeline
+/// with the seed specs.
+#[test]
+fn live_rust_scan_runs_the_rustindex_helper() {
+    let Some((rustindex, fixture)) = rustindex_and_fixture("live_rust_scan") else {
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let out = bin()
         .arg("scan")
@@ -4123,6 +4127,56 @@ fn live_rust_scan_runs_the_rustindex_helper() {
     assert!(
         stdout.contains("COVERAGE"),
         "ladder must render a coverage section: {stdout}"
+    );
+}
+
+/// A cargo workspace above the crate limit is not handed to rust-analyzer,
+/// whose memory grows with the crates it loads (about 12 MB each; 2015 crates
+/// took a runner past 25 GB). The scan still finishes, and the Rust lane says
+/// it is PARTIAL and why, in the roll-call and in the `--out` document, so
+/// its zero is never read as "scanned and clean".
+#[test]
+fn a_rust_workspace_over_the_crate_limit_is_reported_partial_not_loaded() {
+    let Some((rustindex, fixture)) = rustindex_and_fixture("rust_crate_limit") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("scan.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--specs-file")
+        .arg(rust_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_RUSTINDEX", &rustindex)
+        .env("RVL_RUSTINDEX_MAX_CRATES", "1")
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout
+            .contains("Rust 0 sites, INCOMPLETE: workspace . (7 crates) is over the 1-crate limit"),
+        "the roll-call names the lane partial with its reason: {stdout}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rust = doc["coverage"]["lang_status"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["lang"] == "Rust")
+        .unwrap_or_else(|| panic!("Rust lane missing from --out: {doc}"));
+    assert_eq!(rust["state"], "partial", "{rust}");
+    assert!(
+        rust["detail"]
+            .as_str()
+            .unwrap()
+            .contains("RVL_RUSTINDEX_MAX_CRATES"),
+        "the reason names the lever: {rust}"
     );
 }
 

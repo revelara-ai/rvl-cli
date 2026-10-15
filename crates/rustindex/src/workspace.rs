@@ -94,6 +94,8 @@ pub struct Loaded {
     /// The directory relative to the scan root, `/`-separated; empty at the root.
     pub rel: String,
     pub lock: crate::ra::LockfileProvenance,
+    /// Crates in the resolved graph, dependencies included.
+    pub crates: usize,
 }
 
 /// A workspace that FAILED to load and is therefore not indexed.
@@ -125,10 +127,11 @@ pub fn load_workspaces(root: &Path, dirs: &[PathBuf]) -> Load {
         // Sampled BEFORE the gate: cargo metadata writes a lockfile.
         let pre_existing = dir.join("Cargo.lock").is_file();
         match crate::ra::require_workspace_loads(dir) {
-            Ok(()) => out.loaded.push(Loaded {
+            Ok(crates) => out.loaded.push(Loaded {
                 dir: dir.clone(),
                 rel,
                 lock: crate::ra::lockfile_provenance(dir, pre_existing),
+                crates,
             }),
             Err(e) => out.declined.push(Declined {
                 rel,
@@ -325,6 +328,10 @@ mod tests {
                 .map(|l| l.rel.as_str())
                 .collect::<Vec<_>>(),
             vec!["good"]
+        );
+        assert_eq!(
+            load.loaded[0].crates, 1,
+            "the crate count is what rust-analyzer would load"
         );
         assert_eq!(
             load.declined

@@ -2588,6 +2588,32 @@ fn incomplete_parse_note(stream: &str) -> Option<String> {
     ))
 }
 
+/// Did rustindex leave a cargo workspace out because of its size? Read off the
+/// `rust_workspace_provenance` record: rust-analyzer's memory grows with the
+/// crates it loads, so a workspace over the crate limit is not indexed
+/// (po-av01j.252). Its sites are missing, and the roll-call must say so.
+///
+/// Returns the one-line explanation, or None when every wanted workspace was
+/// indexed or the helper does not report the field.
+fn rust_too_large_note(stream: &str) -> Option<String> {
+    let reasons: Vec<String> = stream
+        .lines()
+        .filter(|l| l.contains("\"rust_workspace_provenance\""))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"] == "rust_workspace_provenance")
+        .flat_map(|v| v["workspaces"].as_array().cloned().unwrap_or_default())
+        .filter_map(|w| w["too_large"].as_str().map(str::to_string))
+        .collect();
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}; not indexed, to bound rust-analyzer memory (RVL_RUSTINDEX_MAX_CRATES raises the \
+         limit)",
+        reasons.join("; ")
+    ))
+}
+
 /// Derive the snapshot tag for a scan target: the canonical base name of
 /// `path`, falling back to "repo" when that is unavailable (e.g. `.` at `/`).
 fn snapshot_name(path: &Path) -> String {
@@ -3170,7 +3196,9 @@ fn resolve_packet_stream(
                 let sites = out.matches("\"site_key\"").count();
                 // ...unless the helper says part of what it parsed was lost
                 // to parse errors: then the count is a floor, not an answer.
-                status.push(match incomplete_parse_note(&out) {
+                // Same for a Rust workspace rustindex left out for its size.
+                let note = incomplete_parse_note(&out).or_else(|| rust_too_large_note(&out));
+                status.push(match note {
                     None => render::LangStatus {
                         lang: lang.to_string(),
                         state: render::LangState::Scanned,
@@ -8897,6 +8925,28 @@ mod tests {
         let note = incomplete_parse_note(&batched).unwrap();
         assert!(note.contains("2 of 2 translation units"), "{note}");
         assert!(note.contains("2 headers not found"), "{note}");
+    }
+
+    /// po-av01j.252: rustindex records a workspace it did not hand to
+    /// rust-analyzer because of its size. The lane is then partial, with the
+    /// reason; a run that indexed everything is not.
+    #[test]
+    fn an_oversized_rust_workspace_is_read_off_the_provenance_record() {
+        let clean = r#"{"kind":"rust_workspace_provenance","crate_limit":600,"workspaces_too_large":0,"workspaces":[{"path":"","crates":7,"indexed":true}]}"#;
+        assert_eq!(rust_too_large_note(clean), None);
+        // A helper that predates the field is not accused of anything.
+        let old =
+            r#"{"kind":"rust_workspace_provenance","workspaces":[{"path":"","indexed":true}]}"#;
+        assert_eq!(rust_too_large_note(old), None);
+        let big = r#"{"kind":"rust_workspace_provenance","crate_limit":600,"workspaces_too_large":2,"workspaces":[{"path":"","crates":2015,"indexed":false,"too_large":"workspace . (2015 crates) is over the 600-crate limit"},{"path":"x","crates":3,"indexed":true},{"path":"y","crates":900,"indexed":false,"too_large":"workspace y (900 crates) is over the 600-crate limit"}]}"#;
+        assert_eq!(
+            rust_too_large_note(big).as_deref(),
+            Some(
+                "workspace . (2015 crates) is over the 600-crate limit; workspace y (900 crates) \
+                 is over the 600-crate limit; not indexed, to bound rust-analyzer memory \
+                 (RVL_RUSTINDEX_MAX_CRATES raises the limit)"
+            )
+        );
     }
 
     #[test]
