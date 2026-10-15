@@ -261,3 +261,50 @@ fn a_workspace_at_the_scan_root_is_unchanged() {
         "the pre-existing top-level lockfile record is kept: {prov:#?}"
     );
 }
+
+/// A workspace over the crate limit is never handed to rust-analyzer: its
+/// memory grows with the crates it loads, and a 2015-crate workspace took a
+/// runner past 25 GB. The run still succeeds and the provenance record says
+/// which workspace was not indexed and why, so rvl can report the lane as
+/// partial instead of clean.
+#[test]
+fn a_workspace_over_the_crate_limit_is_recorded_and_not_indexed() {
+    if !rust_analyzer_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    copy_fixture(tmp.path());
+    let out = Command::new(rustindex())
+        .args(["--retrieve", "--root"])
+        .arg(tmp.path())
+        .env("RVL_RUSTINDEX_MAX_CRATES", "6")
+        .output()
+        .expect("failed to run rustindex");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let packets: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        !packets.iter().any(|p| p.get("site_key").is_some()),
+        "an oversized workspace yields no sites: {packets:#?}"
+    );
+    let prov = provenance(&packets);
+    assert_eq!(prov["crate_limit"], 6, "{prov:#}");
+    assert_eq!(prov["workspaces_indexed"], 0, "{prov:#}");
+    assert_eq!(prov["workspaces_too_large"], 1, "{prov:#}");
+    let ws = &prov["workspaces"][0];
+    assert_eq!(ws["crates"], 7, "{ws:#}");
+    assert_eq!(ws["indexed"], false, "{ws:#}");
+    assert!(
+        ws["too_large"]
+            .as_str()
+            .is_some_and(|r| r.contains("7 crates") && r.contains("6-crate limit")),
+        "{ws:#}"
+    );
+}

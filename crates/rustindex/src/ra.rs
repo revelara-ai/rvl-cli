@@ -158,7 +158,10 @@ impl std::error::Error for Abstain {}
 /// dependency resolution, and by extension build scripts and the proc-macro
 /// server rust-analyzer runs on top of it. A workspace that fails to load
 /// ABSTAINS: decline, never fall back to a heuristic tier.
-pub fn require_workspace_loads(root: &Path) -> anyhow::Result<()> {
+///
+/// Returns the number of crates in the resolved graph, dependencies included:
+/// rust-analyzer loads every one of them, and its memory grows with that count.
+pub fn require_workspace_loads(root: &Path) -> anyhow::Result<usize> {
     let out = Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .current_dir(root)
@@ -175,7 +178,35 @@ pub fn require_workspace_loads(root: &Path) -> anyhow::Result<()> {
         ))
         .into());
     }
-    Ok(())
+    let meta: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing cargo metadata output")?;
+    let packages = meta["packages"]
+        .as_array()
+        .context("cargo metadata output has no packages array")?;
+    Ok(packages.len())
+}
+
+/// Env var overriding [`DEFAULT_MAX_CRATES`].
+pub const ENV_MAX_CRATES: &str = "RVL_RUSTINDEX_MAX_CRATES";
+
+/// The largest crate graph handed to rust-analyzer. Its `scip` run held about
+/// 12 MB per crate (2.0 GB for 172 crates; a 2015-crate workspace was killed
+/// past 25 GB), and `scip` ignores the settings that would lower that (proc
+/// macros, build scripts, cache priming). 600 crates stays under 8 GB.
+pub const DEFAULT_MAX_CRATES: usize = 600;
+
+/// The crate limit: [`ENV_MAX_CRATES`] when set, else [`DEFAULT_MAX_CRATES`].
+/// A value that is not a positive integer is an error, never ignored.
+pub fn max_crates() -> anyhow::Result<usize> {
+    match std::env::var(ENV_MAX_CRATES) {
+        Err(_) => Ok(DEFAULT_MAX_CRATES),
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .with_context(|| format!("{ENV_MAX_CRATES}={v} is not a positive integer")),
+    }
 }
 
 /// Lockfile provenance: whether `Cargo.lock` pre-existed, and the sha256 of
