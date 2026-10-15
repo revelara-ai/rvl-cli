@@ -32,8 +32,8 @@ die() { printf 'render-cask: %s\n' "$*" >&2; exit 1; }
 dir=$1
 [ -d "$dir" ] || die "not a directory: $dir"
 
-# The cargo-dist app whose archives back the cask. The workspace also builds
-# `rvl-eval`, which must never end up in the tap.
+# The cargo-dist app whose archives back the cask, and the only app in the
+# release (ci/check-release-plan.sh).
 APP=rvl
 CASK_TOKEN=rvl
 

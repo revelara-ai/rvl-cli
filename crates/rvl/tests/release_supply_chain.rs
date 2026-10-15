@@ -10,7 +10,10 @@
 //!   * that workflow pins slsa-github-generator by release tag and uploads the
 //!     provenance to the release;
 //!   * `ci/slsa-subjects.sh` attests the file set the release uploads, and
-//!     refuses an empty one.
+//!     refuses an empty one;
+//!   * `ci/check-release-plan.sh` holds the release plan to the `rvl` app
+//!     alone: no other app, nothing of the evaluation harness, and no source
+//!     tarball.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -201,4 +204,101 @@ fn subjects_refuse_an_empty_release() {
     );
     assert!(out.stdout.is_empty(), "nothing may be attested on failure");
     assert!(String::from_utf8_lossy(&out.stderr).contains("no release artifacts"));
+}
+
+/// A `dist plan --output-format=json` manifest cut down to the fields the guard
+/// reads: one release per app, and every artifact by name and kind.
+fn plan(apps: &[&str], source_tarball: bool) -> String {
+    let mut artifacts = serde_json::Map::new();
+    let releases: Vec<serde_json::Value> = apps
+        .iter()
+        .map(|app| {
+            let mut names = vec![
+                format!("{app}-x86_64-unknown-linux-gnu.tar.xz"),
+                format!("{app}.cdx.xml"),
+            ];
+            if source_tarball {
+                names.push("source.tar.gz".into());
+            }
+            for name in &names {
+                let kind = match name.as_str() {
+                    "source.tar.gz" => "source-tarball",
+                    n if n.ends_with(".cdx.xml") => "sbom",
+                    _ => "executable-zip",
+                };
+                artifacts.insert(
+                    name.clone(),
+                    serde_json::json!({ "name": name, "kind": kind }),
+                );
+            }
+            serde_json::json!({ "app_name": app, "artifacts": names })
+        })
+        .collect();
+    serde_json::json!({ "releases": releases, "artifacts": artifacts }).to_string()
+}
+
+fn check_plan(plan: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan-dist-manifest.json");
+    std::fs::write(&path, plan).unwrap();
+    Command::new("bash")
+        .arg(repo_root().join("ci/check-release-plan.sh"))
+        .arg(&path)
+        .output()
+        .expect("run ci/check-release-plan.sh")
+}
+
+#[test]
+fn release_plan_guard_passes_a_plan_of_rvl_alone() {
+    let out = check_plan(&plan(&["rvl"], false));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn release_plan_guard_fails_when_the_eval_harness_is_in_the_plan() {
+    // What `dist plan` printed while the harness was a workspace member. The
+    // name is concatenated so a search of the tree for it finds nothing.
+    const HARNESS: &str = concat!("rvl", "-eval");
+    let out = check_plan(&plan(&["rvl", HARNESS], false));
+    assert!(!out.status.success(), "the harness app must fail the guard");
+    assert!(String::from_utf8_lossy(&out.stderr).contains(HARNESS));
+}
+
+#[test]
+fn release_plan_guard_fails_on_any_app_but_rvl() {
+    let out = check_plan(&plan(&["rvl", "rvl-other"], false));
+    assert!(!out.status.success(), "a second app must fail the guard");
+}
+
+#[test]
+fn release_plan_guard_fails_on_a_source_tarball() {
+    let out = check_plan(&plan(&["rvl"], true));
+    assert!(
+        !out.status.success(),
+        "a source tarball must fail the guard"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("source tarball"));
+}
+
+#[test]
+fn dist_config_builds_no_source_tarball() {
+    assert!(
+        live_lines(&read("dist-workspace.toml")).contains(&"source-tarball = false"),
+        "dist-workspace.toml must set `source-tarball = false`"
+    );
+}
+
+#[test]
+fn ci_runs_the_release_plan_guard_on_the_real_plan() {
+    let ci = read(".github/workflows/ci.yml");
+    let job = job_body(&ci, "check");
+    assert!(
+        job.iter()
+            .any(|l| l.contains("dist plan") && l.contains("ci/check-release-plan.sh")),
+        "ci.yml `check` must pipe `dist plan` into ci/check-release-plan.sh: {job:?}"
+    );
 }

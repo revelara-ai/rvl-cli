@@ -136,7 +136,6 @@ not Rust.
 | `rvl-structure` | The repo-structure lane: test conventions, coverage config, dep-manifest hygiene, runbook presence. |
 | `rvl-data` | The platform commands (`risk`, `control`, `evidence`, `knowledge`, …), held to byte-identical JSON parity with the Go CLI via golden tests. |
 | `rvl-skills` | Skill and lens distribution into coding-agent harnesses. Download-only by construction. |
-| `rvl-eval` | Destination-gate metrics and provenance enforcement. Its own binary, not linked into `rvl`, and deliberately excluded from the release tap. |
 | `cindex`, `rustindex` | The C/C++ (libclang) and Rust (rust-analyzer SCIP) retrievers, as libraries; their executables are bins of the `rvl` package. |
 
 `helpers/` holds the out-of-process retrievers, one directory per language,

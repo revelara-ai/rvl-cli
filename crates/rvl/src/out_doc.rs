@@ -72,11 +72,11 @@ pub struct OutDoc {
     pub blend: Option<crate::blend::BlendSummary>,
 }
 
-/// One per-site eval row. Field names match the old top-level array (and the
-/// rvl-eval `run` emitter) exactly, so harness consumers migrate by reading
-/// `.sites` instead of the document root, nothing else. The `structure` rows
-/// reuse the shape with `site_id` fixed to [`STRUCTURE_SITE_ID`] and `class`
-/// set to `repo_structure.RC-XXX`, so the one findings loader reads both.
+/// One per-site eval row. Field names match the old top-level array exactly,
+/// so harness consumers migrate by reading `.sites` instead of the document
+/// root, nothing else. The `structure` rows reuse the shape with `site_id`
+/// fixed to [`STRUCTURE_SITE_ID`] and `class` set to `repo_structure.RC-XXX`,
+/// so the one findings loader reads both.
 #[derive(Clone, Debug, Serialize)]
 pub struct OutSite {
     pub site_id: String,

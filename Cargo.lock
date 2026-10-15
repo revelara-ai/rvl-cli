@@ -999,25 +999,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rvl-eval"
-version = "1.5.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "rand",
- "rvl-core",
- "rvl-propagate",
- "rvl-spec",
- "rvl-triage",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.11.0",
- "tempfile",
-]
-
-[[package]]
 name = "rvl-index"
 version = "1.5.0"
 dependencies = [
