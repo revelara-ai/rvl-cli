@@ -310,6 +310,13 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     // stpa.go:524-530 Atoi("") fails and exits 2 BEFORE any network call
     // (po-cj4s7), which clap's typed range parse reproduces.
     ("stpa list-ucas", "limit", Empty::Error),
+    // rvl-native: named contexts. A context name, URL, key or org that is
+    // empty names nothing, and reading it as "not given" would pick another
+    // server silently, so clap's NonEmptyStringValueParser rejects it (exit 2).
+    ("", "context", Empty::Error),
+    ("config set-context", "url", Empty::Error),
+    ("config set-context", "key", Empty::Error),
+    ("config set-context", "org", Empty::Error),
 ];
 
 /// Normalize THIS binary's own commands (the ones whose flags are consumed in

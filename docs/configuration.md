@@ -22,6 +22,52 @@ The keys this binary reads are:
 Unknown keys are tolerated everywhere, so the same file can carry settings for
 other consumers.
 
+## Named contexts
+
+One `~/.revelara/config.yaml` can hold more than one server or organization
+as named contexts, like kubectl:
+
+```yaml
+current_context: prod
+contexts:
+  prod:
+    api_url: https://api.revelara.ai
+    api_key: pk_...
+    org_name: example.com
+  staging:
+    api_url: https://staging.example.com
+    api_key: pk_...
+    org_name: example.com
+```
+
+A file with only the top-level `api_url`, `api_key` and `org_name` keys works
+as before, as an unnamed context. `rvl` never rewrites the file into the new
+format by itself.
+
+Every command uses the same selection, highest first:
+
+1. the global `--context <name>` flag, on any command (`rvl --context staging scan`);
+2. `RVL_CONTEXT`;
+3. `current_context` in the file;
+4. the top-level keys.
+
+`RVL_API_KEY`, `RVL_API_URL` and `RVL_ORG_NAME` still win over the values of
+the selected context. A name that is not in `contexts` is an error that lists
+the known contexts; `rvl` never falls back to another context or to the
+production URL. A context with no `api_url` is an error too. A malformed
+config file is an error for every command.
+
+| Command | What it does |
+| --- | --- |
+| `rvl config get-contexts` | List the contexts: name, API URL, organization. `*` marks the selected one. A key is never printed. |
+| `rvl config use-context <name>` | Write `current_context`. No other key changes. |
+| `rvl config set-context <name> [--url <url>] [--key <key>] [--org <org>]` | Create or update one context. A new context needs `--url`. The URL must be `https://`, or `http://` to a loopback host; to use another `http://` server, edit the file. |
+
+`rvl config set`, `rvl config show` and `rvl login` work on the selected
+context, or on the top-level keys when no context is selected. `rvl status`
+prints `Context: <name>` on its second line when a context is selected.
+`rvl logout` removes the whole file, every context included.
+
 ## Environment variables
 
 Environment variables win over `~/.revelara/config.yaml`, which is what makes
@@ -32,6 +78,7 @@ headless and CI use work with no config file at all.
 | `RVL_API_KEY` | API key (config `api_key`) |
 | `RVL_API_URL` | API endpoint (config `api_url`) |
 | `RVL_ORG_NAME` | Organization name (config `org_name`) |
+| `RVL_CONTEXT` | Named context to use (below `--context`, above `current_context`); see [Named contexts](#named-contexts) |
 | `RVL_OFFLINE=1` | Kill switch for every network fetch, including the background spec-cache check |
 | `RVL_SPEC_VERSION` | Pin the spec cache content_version for `scan` (same as `--spec-version`); see below |
 | `CI` | When set (and not `0`/`false`), a scan does not start the background spec-cache check |

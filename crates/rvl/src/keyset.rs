@@ -3,7 +3,7 @@
 //! A RELEASE BUILD TRUSTS THE PINNED KEYS AND NOTHING ELSE. The keys are
 //! compiled in (`rvl_cache::PINNED_KEYSET_HEX`) so that no file, flag or
 //! environment variable can widen what a shipped binary accepts; see
-//! `shared_config.rs` for why a config-file keyset is refused.
+//! `rvl_data::config` for why a config-file keyset is refused.
 //!
 //! A DEBUG BUILD ALSO READS `RVL_TEST_KEYSET_HEX` (po-97wqs). The private
 //! halves of the pinned keys are not in this repo, by design, so without a

@@ -160,9 +160,9 @@ with one of those names, write it as a path: `rvl scan ./digest`.
 | `rvl hook <install\|doctor>` | Install or check the git-hook scan gate. |
 | `rvl skills <install\|update\|status>` | Install the Revelara workflow skills and lenses into your coding-agent harness. |
 | `rvl plugin <install\|update\|list\|remove\|editors\|agents>` | The same machinery under rvl-cli's plugin vocabulary, per harness. |
-| `rvl config <show\|set>` | View and edit CLI configuration (`~/.revelara/config.yaml`). |
+| `rvl config <show\|set\|get-contexts\|use-context\|set-context>` | View and edit CLI configuration (`~/.revelara/config.yaml`), including its named contexts. See [Configuration](configuration.md#named-contexts). |
 | `rvl login` / `rvl logout` | Configure or remove Revelara API credentials. |
-| `rvl status` | Check connection and authentication status. |
+| `rvl status` | Check connection and authentication status. The output names the selected context. |
 | `rvl completion <bash\|zsh\|fish>` | Generate shell completion scripts. |
 | `rvl version` | Print the version (`--version` also works). |
 

@@ -214,7 +214,7 @@ fn status_output_reports_connected() {
         api_key: "pk_test_key_12345".into(),
         org_name: "acme".into(),
     };
-    let out = rvl_data::auth::status_output(&cfg, &server.client(), "0.1.0").unwrap();
+    let out = rvl_data::auth::status_output(None, &cfg, &server.client(), "0.1.0").unwrap();
     assert!(out.contains("Status: Connected"), "{out}");
     assert!(out.contains("Organization: acme"), "{out}");
     assert!(!out.contains("pk_test_key_12345"), "key must be masked");
@@ -228,7 +228,7 @@ fn status_output_connection_failure_exits_1() {
         api_key: "pk".into(),
         org_name: String::new(),
     };
-    let f = rvl_data::auth::status_output(&cfg, &server.client(), "0.1.0").unwrap_err();
+    let f = rvl_data::auth::status_output(None, &cfg, &server.client(), "0.1.0").unwrap_err();
     assert_eq!(f.code, 1);
     assert_eq!(
         f.msg,

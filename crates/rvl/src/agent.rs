@@ -204,25 +204,10 @@ pub fn load_org_force_deny() -> bool {
 
 /// The user's agent selection from `~/.revelara/config.yaml` (`agent:` key):
 /// "claude" | "copilot" | "auto" | absent (= auto). Names an INSTALLED agent
-/// only — no keys, no endpoints, ever (po-ipkfg.20 clause 6). Read with its
-/// own tolerant view so `shared_config`'s api_url/api_key security contract
-/// stays untouched.
-pub fn user_agent_selection() -> String {
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct UserView {
-        agent: String,
-    }
-    let Some(home) = std::env::var_os("HOME") else {
-        return String::new();
-    };
-    let path = Path::new(&home).join(".revelara").join("config.yaml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return String::new();
-    };
-    serde_yaml::from_str::<UserView>(&text)
-        .unwrap_or_default()
-        .agent
+/// only — no keys, no endpoints, ever (po-ipkfg.20 clause 6). Read through
+/// the one config resolver, so a malformed file is an error here too.
+pub fn user_agent_selection() -> Result<String, String> {
+    rvl_data::config::resolve().map(|r| r.agent)
 }
 
 // --- consent matrix ---
@@ -933,8 +918,15 @@ pub fn run_hook_adjudication(
         // Median case: nothing undecided in the delta, no invocation at all.
         return None;
     }
+    let selection = match user_agent_selection() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: agent adjudication skipped: config could not be read: {e}");
+            return None;
+        }
+    };
     let env_cmd = std::env::var("RVL_AGENT_CMD").ok();
-    let Some(adapter) = resolve_adapter(&user_agent_selection(), env_cmd.as_deref()) else {
+    let Some(adapter) = resolve_adapter(&selection, env_cmd.as_deref()) else {
         eprintln!(
             "note: agent adjudication is enabled for {} but no approved agent was found \
              (claude/copilot on PATH, `agent:` in ~/.revelara/config.yaml, or RVL_AGENT_CMD)",

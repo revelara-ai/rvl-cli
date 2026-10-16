@@ -412,9 +412,12 @@ pub fn run(
     ) {
         return unavailable(&sel, why, gate, color);
     }
+    let selection = match agent::user_agent_selection() {
+        Ok(s) => s,
+        Err(e) => return unavailable(&sel, &format!("config could not be read: {e}"), gate, color),
+    };
     let env_cmd = std::env::var("RVL_AGENT_CMD").ok();
-    let Some(adapter) = agent::resolve_adapter(&agent::user_agent_selection(), env_cmd.as_deref())
-    else {
+    let Some(adapter) = agent::resolve_adapter(&selection, env_cmd.as_deref()) else {
         return unavailable(
             &sel,
             "no approved agent found (claude/copilot on PATH, `agent:` in \
