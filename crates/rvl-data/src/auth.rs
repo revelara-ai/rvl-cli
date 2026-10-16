@@ -136,14 +136,15 @@ pub fn run_logout() -> ExitCode {
 /// a callback because the skills machinery lives in `rvl-skills`, which
 /// this crate does not (and should not) depend on.
 pub fn run_status(version: &str, plugins: impl FnOnce() -> Option<String>) -> ExitCode {
-    let (cfg, client) = match crate::client::load_and_resolve() {
+    let (resolved, client) = match crate::client::load_resolved() {
         Ok(v) => v,
         Err(f) => {
             eprintln!("{}", f.msg);
             return ExitCode::from(f.code);
         }
     };
-    match status_output(&cfg, &client, version) {
+    let (context, cfg) = (resolved.context.as_deref(), &resolved.cfg);
+    match status_output(context, cfg, &client, version) {
         Ok(out) => {
             print!("{out}");
             // rvl-cli puts the whole update block on stderr so a piped
@@ -162,7 +163,7 @@ pub fn run_status(version: &str, plugins: impl FnOnce() -> Option<String>) -> Ex
         Err(f) => {
             // The pre-check config lines still printed in rvl-cli before the
             // failing connection check; mirror that ordering.
-            print!("{}", status_header(&cfg, version));
+            print!("{}", status_header(context, cfg, version));
             println!("\nChecking connection...");
             eprintln!("{}", f.msg);
             ExitCode::from(f.code)
@@ -170,11 +171,15 @@ pub fn run_status(version: &str, plugins: impl FnOnce() -> Option<String>) -> Ex
     }
 }
 
-/// The config header `status` always prints, network-free.
-pub fn status_header(cfg: &DataConfig, version: &str) -> String {
+/// The config header `status` always prints, network-free. `context` is
+/// the selected named context, `None` for the top-level profile.
+pub fn status_header(context: Option<&str>, cfg: &DataConfig, version: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "Revelara CLI v{version} ({BIN})");
+    if let Some(name) = context {
+        let _ = writeln!(out, "Context: {name}");
+    }
     let _ = writeln!(out, "API URL: {}", cfg.api_url);
     if cfg.api_key.len() > 8 {
         let _ = writeln!(
@@ -193,9 +198,14 @@ pub fn status_header(cfg: &DataConfig, version: &str) -> String {
 }
 
 /// The full `status` output, or the connection failure.
-pub fn status_output(cfg: &DataConfig, client: &Client, version: &str) -> CmdResult {
+pub fn status_output(
+    context: Option<&str>,
+    cfg: &DataConfig,
+    client: &Client,
+    version: &str,
+) -> CmdResult {
     use std::fmt::Write as _;
-    let mut out = status_header(cfg, version);
+    let mut out = status_header(context, cfg, version);
     if let Err(e) = validate_credentials(client) {
         return Err(Failure::runtime(format!("Connection failed: {e}")));
     }
@@ -262,8 +272,9 @@ mod tests {
             api_key: "pk_live_abcdef123456".into(),
             org_name: "acme".into(),
         };
-        let out = status_header(&cfg, "0.1.0");
+        let out = status_header(None, &cfg, "0.1.0");
         assert!(out.contains("API URL: https://api.revelara.ai\n"));
+        assert!(!out.contains("Context:"));
         assert!(out.contains("API Key: pk_l...3456\n"), "{out}");
         assert!(out.contains("Organization: acme\n"));
         assert!(
@@ -279,8 +290,18 @@ mod tests {
             api_key: "short".into(),
             org_name: String::new(),
         };
-        let out = status_header(&cfg, "0.1.0");
+        let out = status_header(None, &cfg, "0.1.0");
         assert!(out.contains("API Key: (set)\n"));
         assert!(!out.contains("Organization:"));
+    }
+
+    #[test]
+    fn status_header_names_the_context_on_its_second_line() {
+        let cfg = DataConfig {
+            api_url: "http://cluster.local".into(),
+            ..DataConfig::default()
+        };
+        let out = status_header(Some("minikube"), &cfg, "0.1.0");
+        assert_eq!(out.lines().nth(1), Some("Context: minikube"), "{out}");
     }
 }

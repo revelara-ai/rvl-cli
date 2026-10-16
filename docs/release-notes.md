@@ -9,6 +9,29 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.5.0 (not released yet)
 
+### Named contexts in `~/.revelara/config.yaml`
+
+**Minimum version to probe for: the first release after 1.6.0.**
+`rvl config get-contexts --help` exits 0 on a version that has the feature
+and exits 2 on an earlier one.
+
+- The config file can hold named `contexts` and a `current_context`. A file
+  with only the top-level `api_url`, `api_key` and `org_name` keys works with
+  no change.
+- The global flag `--context <name>` and the variable `RVL_CONTEXT` select a
+  context for any command. `RVL_API_KEY`, `RVL_API_URL` and `RVL_ORG_NAME`
+  still win over the context's values.
+- An unknown context name is an error:
+  `unknown context "<name>"; known contexts: <names>`.
+- New commands: `rvl config get-contexts`, `rvl config use-context <name>`
+  and `rvl config set-context <name> --url --key --org`.
+- `rvl status` prints `Context: <name>` on its second line when a context is
+  selected.
+- Changed: a malformed config file now fails `scan`, `sync` and the other
+  scan commands with an error. Before, they ignored the file.
+
+See [Configuration](configuration.md#named-contexts).
+
 ### `rvl factor lookup`
 
 **Minimum version to probe for: the first release after 1.5.0.** `rvl` 1.5.0

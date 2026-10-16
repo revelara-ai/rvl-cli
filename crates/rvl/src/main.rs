@@ -21,7 +21,6 @@ mod out_doc;
 mod render;
 mod report;
 mod service_check;
-mod shared_config;
 mod waiver;
 
 use anyhow::Context as _;
@@ -56,6 +55,11 @@ const EXIT_BLOCKED: u8 = 3;
 #[derive(Parser)]
 #[command(name = rvl_data::BIN, version, about = "Revelara reliability scanner")]
 struct Cli {
+    /// Named context from ~/.revelara/config.yaml to use for this command
+    /// (beats RVL_CONTEXT and current_context; see `rvl config get-contexts`)
+    #[arg(long, global = true, value_name = "NAME",
+          value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    context: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -800,12 +804,12 @@ enum CacheCmd {
     },
 }
 
-/// All runtime configuration, resolved once. `base_url` and `org_key` layer
-/// three sources (scanner-specific env / shared rvl-cli env / shared config
-/// file) over a default; that merge happens in this constructor and nowhere
-/// else. The signing keyset is deliberately NOT here: pinned keys are compiled
-/// in, and a configurable keyset would be the verification bypass the
-/// distribution contract forbids. `shared_config` reads ONLY api_url/api_key.
+/// All runtime configuration, resolved once. `base_url` and `org_key` come
+/// from `rvl_data::config::resolve`, the one reader of the config file and
+/// the `RVL_*` overrides, so `--context` reaches every command. The signing
+/// keyset is deliberately NOT here: pinned keys are compiled in, and a
+/// configurable keyset would be the verification bypass the distribution
+/// contract forbids.
 struct Config {
     cache_dir: PathBuf,
     index_dir: PathBuf,
@@ -814,11 +818,8 @@ struct Config {
     org_key: String,
 }
 
-/// The production default API endpoint, matching rvl-cli's `DefaultAPIURL`.
-const DEFAULT_API_URL: &str = "https://api.revelara.ai";
-
 impl Config {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
         let cache_dir = std::env::var_os("RVL_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -836,36 +837,14 @@ impl Config {
                 home.join(".revelara").join("cache").join("index")
             });
 
-        // Read the shared rvl-cli config file once (missing/malformed → empty).
-        let shared = shared_config::load_shared_config();
-
-        // Precedence (highest first), for BOTH values:
-        //   base_url: RVL_API_URL > file api_url > default
-        //   org_key:  RVL_API_KEY > file api_key > (empty)
-        // There is ONE env name per value: the scan surface and the data
-        // surface read the same variable the sibling rvl-cli already uses.
-        // Empty strings are skipped so an exported-but-empty env var never
-        // shadows a real value from a lower-precedence source.
-        let base_url = shared_config::first_nonempty(&[
-            std::env::var("RVL_API_URL").ok(),
-            shared.api_url.clone(),
-            Some(DEFAULT_API_URL.to_string()),
-        ])
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-
-        let org_key = shared_config::first_nonempty(&[
-            std::env::var("RVL_API_KEY").ok(),
-            shared.api_key.clone(),
-        ])
-        .unwrap_or_default();
-
-        Self {
+        let resolved = rvl_data::config::resolve().map_err(anyhow::Error::msg)?;
+        Ok(Self {
             cache_dir,
             index_dir,
             offline: offline_from_env(std::env::var("RVL_OFFLINE").ok().as_deref()),
-            base_url,
-            org_key,
-        }
+            base_url: resolved.cfg.api_url,
+            org_key: resolved.cfg.api_key,
+        })
     }
 }
 
@@ -7183,6 +7162,9 @@ fn run() -> anyhow::Result<ExitCode> {
     // `empty_flag::SEMANTICS` for the per-flag audit, and
     // `empty_flag::normalize` for this binary's own commands.
     let mut cli = Cli::parse_from(std::env::args());
+    if let Some(name) = cli.context.take() {
+        rvl_data::config::set_context_flag(name);
+    }
     if let Some(cmd) = cli.cmd.as_mut() {
         empty_flag::normalize(cmd);
     }
@@ -7328,7 +7310,7 @@ fn run() -> anyhow::Result<ExitCode> {
             yes,
             no_context_files,
         } => {
-            let cfg = Config::from_env();
+            let cfg = Config::from_env()?;
             return Ok(init::run(
                 init::InitArgs {
                     project,
@@ -7375,7 +7357,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // credential check passes: it makes its own server call, and
         // rvl-cli does not reach out for it on a failed connection either.
         Cmd::Status => {
-            let cfg = Config::from_env();
+            let cfg = Config::from_env()?;
             return Ok(rvl_data::auth::run_status(
                 env!("CARGO_PKG_VERSION"),
                 || {
@@ -7433,7 +7415,7 @@ fn run() -> anyhow::Result<ExitCode> {
             return Ok(code);
         }
     }
-    let cfg = Config::from_env();
+    let cfg = Config::from_env()?;
     let store = CacheStore::open(&cfg.cache_dir)?;
     let keyset = keyset::trusted_keyset()?;
     let state_path = last_scan_path(&cfg.cache_dir);

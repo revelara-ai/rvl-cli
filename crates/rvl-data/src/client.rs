@@ -3,7 +3,7 @@
 //! user-facing error messages (401 vs 403 are deliberately distinct; the
 //! spec's `{error, message}` envelope is preferred over raw bodies).
 
-use crate::config::DataConfig;
+use crate::config::{DataConfig, Resolved};
 use crate::{Failure, BIN};
 use serde::Deserialize;
 use std::time::Duration;
@@ -297,26 +297,28 @@ pub fn fetch_team_slugs(client: &Client) -> Option<Vec<String>> {
 /// Load config and resolve the org, mirroring `api.LoadAndResolveConfig`:
 /// every failure is a printed message + exit 1.
 pub fn load_and_resolve() -> Result<(DataConfig, Client), Failure> {
-    let cfg = match crate::config::load() {
-        Ok(c) => c,
-        Err(e) => return Err(Failure::runtime(format!("Error loading config: {e}"))),
-    };
-    let Some(cfg) = cfg else {
+    load_resolved().map(|(r, client)| (r.cfg, client))
+}
+
+/// [`load_and_resolve`], keeping the selected context name.
+pub fn load_resolved() -> Result<(Resolved, Client), Failure> {
+    let resolved = crate::config::resolve()
+        .map_err(|e| Failure::runtime(format!("Error loading config: {e}")))?;
+    let cfg = &resolved.cfg;
+    if cfg.api_key.is_empty() {
         return Err(Failure::runtime(format!(
             "Error: Not configured. Run '{BIN} login' first, or set RVL_API_KEY for \
              headless/CI use."
         )));
-    };
-    let org_id = match resolve_organization_id(&cfg) {
-        Ok(id) => id,
-        Err(e) => return Err(Failure::runtime(format!("Error: {e}"))),
-    };
+    }
+    let org_id =
+        resolve_organization_id(cfg).map_err(|e| Failure::runtime(format!("Error: {e}")))?;
     let client = Client {
         api_url: cfg.api_url.clone(),
         api_key: cfg.api_key.clone(),
         org_id,
     };
-    Ok((cfg, client))
+    Ok((resolved, client))
 }
 
 #[cfg(test)]

@@ -512,24 +512,28 @@ const TS_PROBE: &str =
 /// nobody runs.
 fn config_checks() -> Vec<Check> {
     let mut out = Vec::new();
-    match rvl_data::config::load() {
+    match rvl_data::config::resolve() {
         Err(e) => out.push(
             Check::new("config", Status::Fail, "config file")
                 .detail(format!("could not be read: {e}"))
                 .remedy(format!("run `{BIN} login`")),
         ),
-        Ok(None) => out.push(
+        Ok(r) if r.cfg.api_key.is_empty() => out.push(
             Check::new("config", Status::Warn, "credentials")
                 .detail("not configured; deterministic scans still run against the spec cache")
                 .remedy(format!(
                     "run `{BIN} login`, or set RVL_API_KEY for headless/CI use"
                 )),
         ),
-        Ok(Some(cfg)) => {
+        Ok(r) => {
             // The exact lines `status` prints, from `status`'s own formatter.
-            for line in rvl_data::auth::status_header(&cfg, env!("CARGO_PKG_VERSION"))
-                .lines()
-                .skip(1)
+            for line in rvl_data::auth::status_header(
+                r.context.as_deref(),
+                &r.cfg,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .lines()
+            .skip(1)
             {
                 let (label, detail) = line.split_once(": ").unwrap_or((line, ""));
                 out.push(
@@ -547,7 +551,12 @@ fn config_checks() -> Vec<Check> {
 }
 
 fn spec_cache_checks() -> Vec<Check> {
-    let cfg = Config::from_env();
+    let cfg = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return vec![Check::new("spec cache", Status::Fail, "config").detail(e.to_string())]
+        }
+    };
     let mut out = Vec::new();
     let store = match rvl_cache::CacheStore::open(&cfg.cache_dir) {
         Ok(s) => s,
@@ -730,7 +739,13 @@ fn announce(what: &str) {
 
 fn apply_fixes(root: &Path) {
     let langs = detect_languages(root);
-    let cfg = Config::from_env();
+    let cfg = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("doctor --fix: config could not be read, nothing done: {e}");
+            return;
+        }
+    };
     let mut acted = false;
     // RVL_OFFLINE is the binary's kill switch for reaching the network,
     // and it binds here too: an npm install and a spec-cache sync are both

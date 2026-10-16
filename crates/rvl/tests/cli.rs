@@ -7429,8 +7429,154 @@ fn config_bin(home: &std::path::Path) -> Command {
     cmd.env("HOME", home)
         .env_remove("RVL_API_KEY")
         .env_remove("RVL_API_URL")
-        .env_remove("RVL_ORG_NAME");
+        .env_remove("RVL_ORG_NAME")
+        .env_remove("RVL_CONTEXT");
     cmd
+}
+
+/// Two named contexts in one file. No org_name, so `status` makes no org
+/// lookup and prints its header before the (refused) connection check.
+const TWO_CONTEXTS: &str = "\
+current_context: prod
+contexts:
+  prod:
+    api_url: http://127.0.0.1:1
+    api_key: pk_prod_abcdef123456
+  minikube:
+    api_url: http://localhost:1
+    api_key: pk_mini_abcdef123456
+";
+
+/// A local URL whose server drops every connection at once, so `status`
+/// fails fast instead of waiting for a connect timeout.
+fn closing_server() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            drop(conn);
+        }
+    });
+    url
+}
+
+#[test]
+fn context_flag_selects_the_server_for_every_command_from_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    let (prod, mini) = (closing_server(), closing_server());
+    std::fs::write(
+        home.join(".revelara/config.yaml"),
+        TWO_CONTEXTS
+            .replace("http://127.0.0.1:1", &prod)
+            .replace("http://localhost:1", &mini),
+    )
+    .unwrap();
+
+    for (args, name, url) in [
+        (vec!["--context", "minikube", "status"], "minikube", &mini),
+        (vec!["--context", "prod", "status"], "prod", &prod),
+        (vec!["status", "--context", "minikube"], "minikube", &mini),
+        (vec!["status"], "prod", &prod),
+    ] {
+        let out = config_bin(home).args(&args).output().unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!("Context: {name}\nAPI URL: {url}\n")),
+            "{args:?}: {stdout}"
+        );
+        assert!(!stdout.contains("abcdef123456"), "key printed: {stdout}");
+    }
+
+    let out = config_bin(home)
+        .env("RVL_CONTEXT", "minikube")
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .starts_with(&format!("api_url: {mini}\n")));
+
+    let out = config_bin(home)
+        .args(["--context", "staging", "status"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("unknown context \"staging\"; known contexts: minikube, prod"),
+        "{stderr}"
+    );
+
+    // An unknown context fails a scan too, instead of reaching production.
+    let out = config_bin(home)
+        .args(["--context", "staging", "sync"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("known contexts"));
+}
+
+#[test]
+fn config_context_commands_list_switch_and_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    let cfg_path = home.join(".revelara/config.yaml");
+    std::fs::write(&cfg_path, TWO_CONTEXTS).unwrap();
+
+    let out = config_bin(home)
+        .args(["config", "get-contexts"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("*        prod"), "{stdout}");
+    assert!(!stdout.contains("pk_"), "a key must never print: {stdout}");
+
+    let out = config_bin(home)
+        .args(["config", "use-context", "minikube"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        TWO_CONTEXTS.replace("current_context: prod", "current_context: minikube")
+    );
+
+    let out = config_bin(home)
+        .args([
+            "config",
+            "set-context",
+            "dev",
+            "--url",
+            "https://dev.example.com",
+            "--key",
+            "pk_dev",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = config_bin(home)
+        .args(["--context", "dev", "config", "show"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .starts_with("api_url: https://dev.example.com\n"));
+
+    let out = config_bin(home)
+        .args(["config", "use-context", "nope"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
