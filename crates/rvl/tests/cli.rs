@@ -7606,6 +7606,42 @@ fn config_show_masks_the_api_key() {
     );
 }
 
+/// The upgrade needs no action: a file with no contexts reads as context
+/// `default`, and no read rewrites it (po-jetj: a migration that ran on
+/// every invocation moved files during `--help` and unknown commands).
+#[test]
+fn a_file_with_no_contexts_reads_as_default_and_no_read_rewrites_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    let cfg_path = home.join(".revelara/config.yaml");
+    let url = closing_server();
+    let legacy = format!("api_url: {url}\napi_key: pk_live_abcdef123456\n");
+    std::fs::write(&cfg_path, &legacy).unwrap();
+
+    let out = config_bin(home).arg("status").output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("Context: default\nAPI URL: {url}\n")),
+        "{stdout}"
+    );
+    let out = config_bin(home)
+        .args(["config", "get-contexts"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("*        default"), "{stdout}");
+
+    for args in [
+        vec!["config", "show"],
+        vec!["--help"],
+        vec!["no-such-command"],
+    ] {
+        config_bin(home).args(&args).output().unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), legacy);
+}
+
 #[test]
 fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -7630,18 +7666,12 @@ fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
     );
     assert_eq!(stdout, "Set org_name = my-org\n");
 
-    let text = std::fs::read_to_string(&cfg_path).unwrap();
-    assert!(
-        text.contains("org_name: my-org\n"),
-        "value not persisted: {text}"
-    );
-    assert!(
-        text.contains("future_key: keep-me\n"),
-        "unknown key clobbered on rewrite: {text}"
-    );
-    assert!(
-        text.contains("api_key: pk_live_abcdef123456\n"),
-        "sibling key lost on rewrite: {text}"
+    // The first write moves a file with no contexts into context `default`,
+    // keeping the unknown key and the sibling values.
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "future_key: keep-me\ncontexts:\n  default:\n    api_url: https://api.revelara.ai\n    \
+         api_key: pk_live_abcdef123456\n    org_name: my-org\ncurrent_context: default\n"
     );
 
     // Round-trip: show reads back the value just set.

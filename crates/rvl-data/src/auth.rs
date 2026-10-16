@@ -163,7 +163,7 @@ pub fn run_status(version: &str, plugins: impl FnOnce() -> Option<String>) -> Ex
 }
 
 /// The config header `status` always prints, network-free. `context` is
-/// the selected named context, `None` for the top-level profile.
+/// the selected named context, `None` when the file selects none.
 pub fn status_header(context: Option<&str>, cfg: &DataConfig, version: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

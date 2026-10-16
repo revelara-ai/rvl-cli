@@ -4,14 +4,17 @@
 //! [`resolve`]; a test in `tests/one_resolver.rs` fails when a second reader
 //! appears.
 //!
-//! The file holds an unnamed top-level profile (`api_url`, `api_key`,
-//! `org_name`, the format rvl-cli writes) and any number of named
-//! `contexts`, kubectl style. Selection, highest first: the global
-//! `--context` flag, `RVL_CONTEXT`, the file's `current_context`, the
-//! top-level keys. A selected name that is not in `contexts` is an error that
-//! lists the known names, never a fall back to another profile. The per-value
-//! overrides `RVL_API_KEY` / `RVL_API_URL` / `RVL_ORG_NAME` still beat the
-//! selected profile: the CI use case has no config file at all.
+//! The file holds named `contexts`, kubectl style. Selection, highest
+//! first: the global `--context` flag, `RVL_CONTEXT`, the file's
+//! `current_context`. A selected name that is not in `contexts` is an error
+//! that lists the known names, never a fall back to another profile. The
+//! per-value overrides `RVL_API_KEY` / `RVL_API_URL` / `RVL_ORG_NAME` still
+//! beat the selected profile: the CI use case has no config file at all.
+//!
+//! A file written before named contexts holds one profile in top-level
+//! `api_url` / `api_key` / `org_name`. [`canonical`] reads it as context
+//! `default`, so nothing past it sees that shape, and no read rewrites the
+//! file: the first command that writes the file anyway stores the new shape.
 //!
 //! SECURITY: this module reads/writes ONLY `api_url` / `api_key` /
 //! `org_name` (plus the context selection and the `agent` name). Signing-key
@@ -32,7 +35,12 @@ use std::sync::OnceLock;
 /// The production default API endpoint, matching rvl-cli's `DefaultAPIURL`.
 pub const DEFAULT_API_URL: &str = "https://api.revelara.ai";
 
-/// One server profile: the top-level keys, or one entry of `contexts`.
+/// The context that holds the profile of a file written before named
+/// contexts, and the one `login` and `config set` write when none is
+/// selected.
+const DEFAULT_CONTEXT: &str = "default";
+
+/// One server profile: one entry of `contexts`.
 /// Unknown keys are tolerated and preserved-by-ignoring.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataConfig {
@@ -44,11 +52,9 @@ pub struct DataConfig {
     pub org_name: String,
 }
 
-/// The read view of the whole file.
+/// The read view of the whole file, after [`canonical`].
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
-    #[serde(flatten)]
-    top: DataConfig,
     #[serde(default)]
     current_context: String,
     #[serde(default)]
@@ -62,7 +68,7 @@ struct ConfigFile {
 /// The outcome of [`resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// The selected context, `None` for the top-level profile.
+    /// The selected context, `None` when the file selects none.
     pub context: Option<String>,
     /// The values after the env overrides. `api_key` is empty when no key
     /// was found anywhere: deterministic scans still run, data commands
@@ -86,11 +92,70 @@ pub fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".revelara").join("config.yaml"))
 }
 
-fn parse_file(text: Option<&str>) -> Result<ConfigFile, String> {
-    match text {
-        Some(t) if !t.trim().is_empty() => serde_yaml::from_str(t).map_err(|e| e.to_string()),
-        _ => Ok(ConfigFile::default()),
+/// The file as a mapping in the contexts shape. Top-level `api_url` /
+/// `api_key` / `org_name` (the shape before named contexts) move into
+/// context `default`, which becomes the selection when the file has none.
+/// The old shape resolved a missing `api_url` to the production URL, and a
+/// context does not, so the moved profile gets it written out. Pure: the
+/// caller writes the result only when it writes the file anyway.
+fn canonical(text: Option<&str>) -> Result<Mapping, String> {
+    let mut root: Mapping = match text {
+        Some(t) if !t.trim().is_empty() => serde_yaml::from_str(t).map_err(|e| e.to_string())?,
+        _ => return Ok(Mapping::new()),
+    };
+    let mut profile = Mapping::new();
+    for key in ["api_url", "api_key", "org_name"] {
+        if let Some(v) = root.shift_remove(key) {
+            profile.insert(key.into(), v);
+        }
     }
+    if profile.is_empty() {
+        return Ok(root);
+    }
+    seed_api_url(&mut profile);
+    order_known_keys(&mut profile);
+    let contexts = contexts_mut(&mut root)?;
+    if contexts.contains_key(DEFAULT_CONTEXT) {
+        return Err(format!(
+            "the config file has top-level api_url/api_key/org_name and a context named \
+             {DEFAULT_CONTEXT:?}; move the top-level keys into a context with \
+             '{BIN} config set-context <name>' and delete them"
+        ));
+    }
+    contexts.insert(DEFAULT_CONTEXT.into(), profile.into());
+    select_if_unset(&mut root, DEFAULT_CONTEXT);
+    Ok(root)
+}
+
+/// A missing or empty string value.
+fn is_unset(v: Option<&Value>) -> bool {
+    v.is_none_or(|v| v.as_str() == Some(""))
+}
+
+/// Write the production URL into a profile that has no `api_url`.
+fn seed_api_url(profile: &mut Mapping) {
+    if is_unset(profile.get("api_url")) {
+        profile.insert("api_url".into(), DEFAULT_API_URL.into());
+    }
+}
+
+/// Make `name` the current context when the file selects none.
+fn select_if_unset(root: &mut Mapping, name: &str) {
+    if is_unset(root.get("current_context")) {
+        root.insert("current_context".into(), name.into());
+    }
+}
+
+/// The `contexts` mapping, created when absent.
+fn contexts_mut(root: &mut Mapping) -> Result<&mut Mapping, String> {
+    root.entry("contexts".into())
+        .or_insert_with(|| Mapping::new().into())
+        .as_mapping_mut()
+        .ok_or_else(|| "`contexts` is not a mapping".to_string())
+}
+
+fn parse_file(text: Option<&str>) -> Result<ConfigFile, String> {
+    serde_yaml::from_value(Value::Mapping(canonical(text)?)).map_err(|e| e.to_string())
 }
 
 fn unknown_context(name: &str, file: &ConfigFile) -> String {
@@ -104,8 +169,8 @@ fn unknown_context(name: &str, file: &ConfigFile) -> String {
 }
 
 /// The selected context name: `--context` > `RVL_CONTEXT` >
-/// `current_context`, or `None` for the top-level profile. `env` must
-/// already treat empty values as absent.
+/// `current_context`, or `None`. `env` must already treat empty values as
+/// absent.
 fn selected_context(
     file: &ConfigFile,
     flag: Option<&str>,
@@ -135,7 +200,7 @@ pub fn resolve_from(
     let context = selected_context(&file, flag, &env)?;
     let mut cfg = match &context {
         Some(name) => file.contexts[name].clone(),
-        None => file.top.clone(),
+        None => DataConfig::default(),
     };
     if let Some(v) = env("RVL_API_KEY") {
         cfg.api_key = v;
@@ -205,13 +270,14 @@ fn selected_on_disk(existing: Option<&str>) -> Result<Option<String>, String> {
     )
 }
 
-/// Persist the profile `login` collected into the selected context (or the
-/// top-level keys), keeping every other key of the file.
+/// Persist the profile `login` collected into the selected context (or
+/// `default` when none is selected), keeping every other key of the file.
 pub fn save(cfg: &DataConfig) -> Result<(), String> {
     let path = config_path().ok_or("cannot determine home directory")?;
     let existing = read_text()?;
     let context = selected_on_disk(existing.as_deref())?;
-    let text = edit_yaml(existing.as_deref(), context.as_deref(), |m| {
+    let target = context.as_deref().unwrap_or(DEFAULT_CONTEXT);
+    let text = edit_yaml(existing.as_deref(), Some(target), |m| {
         for (k, v) in [
             ("api_url", &cfg.api_url),
             ("api_key", &cfg.api_key),
@@ -435,7 +501,7 @@ pub fn show_output(cfg: Option<&DataConfig>) -> String {
 }
 
 /// `config set <key> <value>`: validate, rewrite the selected context (or
-/// the top-level keys), echo the set value (`api_key` as its `key_state`). Unlike
+/// `default`), echo the set value (`api_key` as its `key_state`). Unlike
 /// rvl-cli (which marshals its fixed struct and so drops any field it does
 /// not know), the rewrite is a read-modify-write of the raw YAML mapping:
 /// unknown keys already in `~/.revelara/config.yaml` are preserved verbatim.
@@ -450,9 +516,10 @@ fn run_set(key: &str, value: &str) -> CmdResult {
 /// Pure core of `config set`: validate the key/value and return the new
 /// file text. Field order matches rvl-cli's marshal order (`api_url`,
 /// `api_key`, `org_name`) with unknown keys following in their original
-/// order. With no context, `api_url` is seeded with the production default
-/// when absent, mirroring rvl-cli's `Config{APIURL: DefaultAPIURL}`
-/// bootstrap; a context gets no such seed.
+/// order. With no context selected, the value goes into `default`, whose
+/// `api_url` is seeded with the production default when absent, mirroring
+/// rvl-cli's `Config{APIURL: DefaultAPIURL}` bootstrap; a selected context
+/// gets no such seed.
 pub fn set_in_text(
     existing: Option<&str>,
     context: Option<&str>,
@@ -470,15 +537,10 @@ pub fn set_in_text(
             )))
         }
     }
-    edit_yaml(existing, context, |m| {
+    edit_yaml(existing, Some(context.unwrap_or(DEFAULT_CONTEXT)), |m| {
         m.insert(key.into(), value.into());
-        let api_url_empty = match m.get("api_url") {
-            Some(Value::String(s)) => s.is_empty(),
-            Some(_) => false,
-            None => true,
-        };
-        if context.is_none() && api_url_empty {
-            m.insert("api_url".into(), DEFAULT_API_URL.into());
+        if context.is_none() {
+            seed_api_url(m);
         }
         order_known_keys(m);
     })
@@ -486,31 +548,25 @@ pub fn set_in_text(
 }
 
 /// Apply `edit` to the top-level mapping (`context` `None`) or to
-/// `contexts.<context>` (created when absent), and return the new text.
+/// `contexts.<context>` (created when absent, and selected when the file
+/// selects none), and return the new text in the [`canonical`] shape.
 /// Every key `edit` does not touch is kept.
 fn edit_yaml(
     existing: Option<&str>,
     context: Option<&str>,
     edit: impl FnOnce(&mut Mapping),
 ) -> Result<String, String> {
-    let mut root: Mapping = match existing {
-        Some(t) if !t.trim().is_empty() => serde_yaml::from_str(t).map_err(|e| e.to_string())?,
-        _ => Mapping::new(),
-    };
+    let mut root = canonical(existing)?;
     match context {
         None => edit(&mut root),
         Some(name) => {
-            let contexts = root
-                .entry("contexts".into())
-                .or_insert_with(|| Mapping::new().into())
-                .as_mapping_mut()
-                .ok_or("`contexts` is not a mapping")?;
-            let target = contexts
+            let target = contexts_mut(&mut root)?
                 .entry(name.into())
                 .or_insert_with(|| Mapping::new().into())
                 .as_mapping_mut()
                 .ok_or_else(|| format!("context {name:?} is not a mapping"))?;
             edit(target);
+            select_if_unset(&mut root, name);
         }
     }
     serde_yaml::to_string(&root).map_err(|e| e.to_string())
@@ -732,19 +788,27 @@ mod tests {
     }
 
     #[test]
-    fn set_preserves_unknown_yaml_keys() {
-        let existing = "api_url: https://x.test\napi_key: pk_file\nfuture_key: keep-me\n";
+    fn the_first_write_moves_the_top_level_keys_into_context_default() {
+        // No api_url: the old file resolved to the production URL, so the
+        // moved context gets it written out. Other keys stay where they are.
+        let existing = "api_key: pk_file\nagent: claude\nfuture_key: keep-me\n";
         let out = set_in_text(Some(existing), None, "org_name", "my-org").unwrap();
         assert_eq!(
             out,
-            "api_url: https://x.test\napi_key: pk_file\norg_name: my-org\nfuture_key: keep-me\n"
+            "agent: claude\nfuture_key: keep-me\ncontexts:\n  default:\n    \
+             api_url: https://api.revelara.ai\n    api_key: pk_file\n    org_name: my-org\n\
+             current_context: default\n"
         );
     }
 
     #[test]
-    fn set_from_no_file_seeds_default_api_url() {
+    fn set_from_no_file_writes_context_default_with_the_production_url() {
         let out = set_in_text(None, None, "org_name", "acme").unwrap();
-        assert_eq!(out, "api_url: https://api.revelara.ai\norg_name: acme\n");
+        assert_eq!(
+            out,
+            "contexts:\n  default:\n    api_url: https://api.revelara.ai\n    org_name: acme\n\
+             current_context: default\n"
+        );
     }
 
     #[test]
@@ -786,8 +850,6 @@ mod tests {
     // --- named contexts ---
 
     const TWO_CONTEXTS: &str = "\
-api_url: https://top.test
-api_key: pk_top
 current_context: prod
 contexts:
   prod:
@@ -829,12 +891,51 @@ contexts:
     }
 
     #[test]
-    fn no_selection_uses_the_top_level_keys() {
+    fn top_level_keys_beside_contexts_become_context_default() {
         let text = "api_url: https://top.test\napi_key: pk_top\ncontexts:\n  prod:\n    api_url: https://p.test\n";
         let r = resolve_from(Some(text), None, no_env).unwrap();
-        assert_eq!(r.context, None);
+        assert_eq!(r.context.as_deref(), Some("default"));
         assert_eq!(r.cfg.api_url, "https://top.test");
         assert_eq!(r.cfg.api_key, "pk_top");
+
+        // A selected context stays selected; the top-level keys stay usable.
+        let text = format!("{text}current_context: prod\n");
+        let r = resolve_from(Some(&text), None, no_env).unwrap();
+        assert_eq!(r.context.as_deref(), Some("prod"));
+        let r = resolve_from(Some(&text), Some("default"), no_env).unwrap();
+        assert_eq!(r.cfg.api_key, "pk_top");
+    }
+
+    #[test]
+    fn top_level_keys_and_a_context_named_default_is_an_error() {
+        let text = "api_key: pk_top\ncontexts:\n  default:\n    api_url: https://d.test\n";
+        let err = resolve_from(Some(text), None, no_env).unwrap_err();
+        assert!(
+            err.contains("top-level api_url/api_key/org_name and a context named \"default\""),
+            "{err}"
+        );
+        assert!(set_in_text(Some(text), None, "org_name", "x").is_err());
+    }
+
+    #[test]
+    fn the_migrated_form_is_a_fixed_point_and_resolves_the_same() {
+        for text in [
+            "",
+            "agent: claude\n",
+            "api_key: pk\n",
+            "api_url: https://x.test\napi_key: pk\norg_name: acme\nagent: claude\n",
+            "api_url: https://top.test\ncontexts:\n  prod:\n    api_url: https://p.test\n",
+            "api_url: https://top.test\ncurrent_context: prod\ncontexts:\n  prod:\n    api_url: https://p.test\n",
+            TWO_CONTEXTS,
+        ] {
+            let once = edit_yaml(Some(text), None, |_| {}).unwrap();
+            assert_eq!(edit_yaml(Some(&once), None, |_| {}).unwrap(), once, "{text}");
+            assert_eq!(
+                resolve_from(Some(&once), None, no_env),
+                resolve_from(Some(text), None, no_env),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -853,7 +954,7 @@ contexts:
         let env = env_of(&[("RVL_CONTEXT", "nope")]);
         assert!(resolve_from(Some(TWO_CONTEXTS), None, &env).is_err());
         let err = resolve_from(Some("api_key: pk\n"), Some("prod"), no_env).unwrap_err();
-        assert_eq!(err, "unknown context \"prod\"; known contexts: (none)");
+        assert_eq!(err, "unknown context \"prod\"; known contexts: default");
         let err = resolve_from(None, Some("prod"), no_env).unwrap_err();
         assert_eq!(err, "unknown context \"prod\"; known contexts: (none)");
     }
@@ -866,17 +967,32 @@ contexts:
     }
 
     #[test]
-    fn old_single_server_file_still_resolves() {
+    fn a_file_with_no_contexts_reads_as_context_default() {
         let r = resolve_from(
             Some("api_url: https://x.test\napi_key: pk_file\norg_name: acme\nagent: claude\n"),
             None,
             no_env,
         )
         .unwrap();
-        assert_eq!(r.context, None);
-        assert_eq!(r.cfg.api_url, "https://x.test");
-        assert_eq!(r.cfg.org_name, "acme");
+        assert_eq!(r.context.as_deref(), Some("default"));
+        assert_eq!(
+            r.cfg,
+            DataConfig {
+                api_url: "https://x.test".into(),
+                api_key: "pk_file".into(),
+                org_name: "acme".into(),
+            }
+        );
         assert_eq!(r.agent, "claude");
+    }
+
+    #[test]
+    fn a_file_with_no_contexts_and_no_api_url_keeps_the_production_url() {
+        for text in ["api_key: pk\n", "api_url: ''\napi_key: pk\n"] {
+            let r = resolve_from(Some(text), None, no_env).unwrap();
+            assert_eq!(r.context.as_deref(), Some("default"), "{text}");
+            assert_eq!(r.cfg.api_url, DEFAULT_API_URL, "{text}");
+        }
     }
 
     #[test]
@@ -893,7 +1009,8 @@ contexts:
         .unwrap();
         assert_eq!(
             out,
-            "api_url: https://x.test\nfuture: keep\ncontexts:\n  a:\n    api_url: https://a.test\ncurrent_context: a\n"
+            "future: keep\ncontexts:\n  a:\n    api_url: https://a.test\n  default:\n    \
+             api_url: https://x.test\ncurrent_context: a\n"
         );
         let err = use_context_in_text(TWO_CONTEXTS, "qa").unwrap_err();
         assert!(err.contains("known contexts: prod, staging"), "{err}");
@@ -903,9 +1020,11 @@ contexts:
     fn set_context_creates_and_updates_one_context() {
         let out = set_context_in_text(None, "dev", Some("https://dev.test"), Some("pk_dev"), None)
             .unwrap();
+        // The first context of a file with none selected becomes the selection.
         assert_eq!(
             out,
-            "contexts:\n  dev:\n    api_url: https://dev.test\n    api_key: pk_dev\n"
+            "contexts:\n  dev:\n    api_url: https://dev.test\n    api_key: pk_dev\n\
+             current_context: dev\n"
         );
         let out =
             set_context_in_text(Some(TWO_CONTEXTS), "prod", None, None, Some("other")).unwrap();
