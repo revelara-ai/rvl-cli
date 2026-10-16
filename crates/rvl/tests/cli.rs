@@ -7442,7 +7442,7 @@ contexts:
   prod:
     api_url: http://127.0.0.1:1
     api_key: pk_prod_abcdef123456
-  minikube:
+  staging:
     api_url: http://localhost:1
     api_key: pk_mini_abcdef123456
 ";
@@ -7475,9 +7475,9 @@ fn context_flag_selects_the_server_for_every_command_from_one_file() {
     .unwrap();
 
     for (args, name, url) in [
-        (vec!["--context", "minikube", "status"], "minikube", &mini),
+        (vec!["--context", "staging", "status"], "staging", &mini),
         (vec!["--context", "prod", "status"], "prod", &prod),
-        (vec!["status", "--context", "minikube"], "minikube", &mini),
+        (vec!["status", "--context", "staging"], "staging", &mini),
         (vec!["status"], "prod", &prod),
     ] {
         let out = config_bin(home).args(&args).output().unwrap();
@@ -7490,7 +7490,7 @@ fn context_flag_selects_the_server_for_every_command_from_one_file() {
     }
 
     let out = config_bin(home)
-        .env("RVL_CONTEXT", "minikube")
+        .env("RVL_CONTEXT", "staging")
         .args(["config", "show"])
         .output()
         .unwrap();
@@ -7499,19 +7499,19 @@ fn context_flag_selects_the_server_for_every_command_from_one_file() {
         .starts_with(&format!("api_url: {mini}\n")));
 
     let out = config_bin(home)
-        .args(["--context", "staging", "status"])
+        .args(["--context", "qa", "status"])
         .output()
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("unknown context \"staging\"; known contexts: minikube, prod"),
+        stderr.contains("unknown context \"qa\"; known contexts: prod, staging"),
         "{stderr}"
     );
 
     // An unknown context fails a scan too, instead of reaching production.
     let out = config_bin(home)
-        .args(["--context", "staging", "sync"])
+        .args(["--context", "qa", "sync"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -7538,13 +7538,13 @@ fn config_context_commands_list_switch_and_add() {
     assert!(!stdout.contains("pk_"), "a key must never print: {stdout}");
 
     let out = config_bin(home)
-        .args(["config", "use-context", "minikube"])
+        .args(["config", "use-context", "staging"])
         .output()
         .unwrap();
     assert!(out.status.success());
     assert_eq!(
         std::fs::read_to_string(&cfg_path).unwrap(),
-        TWO_CONTEXTS.replace("current_context: prod", "current_context: minikube")
+        TWO_CONTEXTS.replace("current_context: prod", "current_context: staging")
     );
 
     let out = config_bin(home)
@@ -7598,7 +7598,7 @@ fn config_show_masks_the_api_key() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(
         stdout,
-        "api_url: https://api.revelara.ai\napi_key: pk_l...3456\norg_name: acme\n"
+        "api_url: https://api.revelara.ai\napi_key: (set)\norg_name: acme\n"
     );
     assert!(
         !stdout.contains("pk_live_abcdef123456"),
@@ -7652,7 +7652,7 @@ fn config_set_round_trips_and_preserves_unknown_yaml_keys() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("org_name: my-org\n"), "{stdout}");
-    assert!(stdout.contains("api_key: pk_l...3456\n"), "{stdout}");
+    assert!(stdout.contains("api_key: (set)\n"), "{stdout}");
 }
 
 #[test]

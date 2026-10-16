@@ -88,7 +88,7 @@ pub struct Keyset {
 ///
 /// 1. The dev key: public half of the ed25519 keypair the spec factory signs
 ///    dev caches with (minted 2026-08-02; private half held out of band in
-///    the minikube secret spec-signing-dev). Stays pinned for local/dev
+///    the dev cluster secret spec-signing-dev). Stays pinned for local/dev
 ///    caches.
 /// 2. The PRODUCTION key (minted 2026-08-17, po-av01j.79): private half lives
 ///    only in GCP Secret Manager (revelara-prod-spec-signing-key) and reaches

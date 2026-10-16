@@ -331,9 +331,8 @@ fn rewrite(edit: impl FnOnce(Option<&str>) -> Result<(String, String), Failure>)
     Ok(msg)
 }
 
-/// `config show`: print the resolved configuration with the API key
-/// masked exactly the way rvl-cli does (`abcd...wxyz`, or `(set)` for
-/// short keys).
+/// `config show`: print the resolved configuration, with the API key
+/// shown only as its `key_state`.
 fn run_show() -> CmdResult {
     let cfg = load().map_err(|e| Failure::runtime(format!("Error: {e}")))?;
     Ok(show_output(cfg.as_ref()))
@@ -419,8 +418,8 @@ pub fn set_context_in_text(
     .map_err(runtime)
 }
 
-/// The `config show` body, pure for tests. Mirrors rvl-cli's field order
-/// and masking: `api_url`, masked `api_key`, `org_name`.
+/// The `config show` body, pure for tests: `api_url`, `api_key` as its
+/// `key_state`, `org_name`.
 pub fn show_output(cfg: Option<&DataConfig>) -> String {
     use std::fmt::Write as _;
     let Some(cfg) = cfg else {
@@ -430,22 +429,13 @@ pub fn show_output(cfg: Option<&DataConfig>) -> String {
     };
     let mut out = String::new();
     let _ = writeln!(out, "api_url: {}", cfg.api_url);
-    if cfg.api_key.len() > 8 {
-        let _ = writeln!(
-            out,
-            "api_key: {}...{}",
-            &cfg.api_key[..4],
-            &cfg.api_key[cfg.api_key.len() - 4..]
-        );
-    } else {
-        let _ = writeln!(out, "api_key: (set)");
-    }
+    let _ = writeln!(out, "api_key: {}", key_state(&cfg.api_key));
     let _ = writeln!(out, "org_name: {}", cfg.org_name);
     out
 }
 
 /// `config set <key> <value>`: validate, rewrite the selected context (or
-/// the top-level keys), echo the set value (masked for `api_key`). Unlike
+/// the top-level keys), echo the set value (`api_key` as its `key_state`). Unlike
 /// rvl-cli (which marshals its fixed struct and so drops any field it does
 /// not know), the rewrite is a read-modify-write of the raw YAML mapping:
 /// unknown keys already in `~/.revelara/config.yaml` are preserved verbatim.
@@ -539,17 +529,23 @@ fn order_known_keys(m: &mut Mapping) {
     *m = ordered;
 }
 
-/// Mask sensitive values before echoing them back, matching rvl-cli's
-/// `maskConfigValue`: `api_key` echoes as its first 8 chars + `...` (or
-/// `[set]` when short); every other key echoes unchanged.
+/// Echo a `config set` value: every key unchanged except `api_key`,
+/// which echoes as its `key_state`.
 pub fn mask_set_echo(key: &str, value: &str) -> String {
-    if key != "api_key" {
-        return value.to_string();
+    if key == "api_key" {
+        return key_state(value).to_string();
     }
-    if value.len() > 12 && value.is_char_boundary(8) {
-        return format!("{}...", &value[..8]);
+    value.to_string()
+}
+
+/// The only form in which an API key is ever printed: whether it is set.
+/// No character of the key reaches output, so no log can leak a part of it.
+pub fn key_state(key: &str) -> &'static str {
+    if key.is_empty() {
+        "(not set)"
+    } else {
+        "(set)"
     }
-    "[set]".to_string()
 }
 
 /// Reject `api_url` values that would send the bearer API key in
@@ -691,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn show_output_masks_the_key_exactly_like_rvl_cli() {
+    fn show_output_prints_no_part_of_the_key() {
         let cfg = DataConfig {
             api_url: "https://api.revelara.ai".into(),
             api_key: "pk_live_abcdef123456".into(),
@@ -699,7 +695,7 @@ mod tests {
         };
         assert_eq!(
             show_output(Some(&cfg)),
-            "api_url: https://api.revelara.ai\napi_key: pk_l...3456\norg_name: acme\n"
+            "api_url: https://api.revelara.ai\napi_key: (set)\norg_name: acme\n"
         );
     }
 
@@ -769,11 +765,8 @@ mod tests {
     #[test]
     fn set_echo_masks_only_the_api_key() {
         assert_eq!(mask_set_echo("org_name", "acme"), "acme");
-        assert_eq!(
-            mask_set_echo("api_key", "pk_live_abcdef123456"),
-            "pk_live_..."
-        );
-        assert_eq!(mask_set_echo("api_key", "short"), "[set]");
+        assert_eq!(mask_set_echo("api_key", "pk_live_abcdef123456"), "(set)");
+        assert_eq!(mask_set_echo("api_key", ""), "(not set)");
     }
 
     #[test]
@@ -801,8 +794,8 @@ contexts:
     api_url: https://api.revelara.ai
     api_key: pk_prod
     org_name: revelara.ai
-  minikube:
-    api_url: http://cluster.local
+  staging:
+    api_url: https://staging.example.com
     api_key: pk_mini
     org_name: dev-org
 ";
@@ -822,13 +815,13 @@ contexts:
         assert_eq!(r.context.as_deref(), Some("prod"));
         assert_eq!(r.cfg.api_url, "https://api.revelara.ai");
 
-        let env = env_of(&[("RVL_CONTEXT", "minikube")]);
+        let env = env_of(&[("RVL_CONTEXT", "staging")]);
         let r = resolve_from(Some(TWO_CONTEXTS), None, &env).unwrap();
-        assert_eq!(r.context.as_deref(), Some("minikube"));
-        assert_eq!(r.cfg.api_url, "http://cluster.local");
+        assert_eq!(r.context.as_deref(), Some("staging"));
+        assert_eq!(r.cfg.api_url, "https://staging.example.com");
         assert_eq!(r.cfg.api_key, "pk_mini");
 
-        let env = env_of(&[("RVL_CONTEXT", "minikube")]);
+        let env = env_of(&[("RVL_CONTEXT", "staging")]);
         let r = resolve_from(Some(TWO_CONTEXTS), Some("prod"), &env).unwrap();
         assert_eq!(r.context.as_deref(), Some("prod"));
         assert_eq!(r.cfg.api_key, "pk_prod");
@@ -847,19 +840,16 @@ contexts:
     #[test]
     fn per_value_env_beats_the_selected_context() {
         let env = env_of(&[("RVL_API_KEY", "pk_env"), ("RVL_ORG_NAME", "env-org")]);
-        let r = resolve_from(Some(TWO_CONTEXTS), Some("minikube"), &env).unwrap();
-        assert_eq!(r.cfg.api_url, "http://cluster.local");
+        let r = resolve_from(Some(TWO_CONTEXTS), Some("staging"), &env).unwrap();
+        assert_eq!(r.cfg.api_url, "https://staging.example.com");
         assert_eq!(r.cfg.api_key, "pk_env");
         assert_eq!(r.cfg.org_name, "env-org");
     }
 
     #[test]
     fn unknown_context_errors_with_the_known_names() {
-        let err = resolve_from(Some(TWO_CONTEXTS), Some("staging"), no_env).unwrap_err();
-        assert_eq!(
-            err,
-            "unknown context \"staging\"; known contexts: minikube, prod"
-        );
+        let err = resolve_from(Some(TWO_CONTEXTS), Some("qa"), no_env).unwrap_err();
+        assert_eq!(err, "unknown context \"qa\"; known contexts: prod, staging");
         let env = env_of(&[("RVL_CONTEXT", "nope")]);
         assert!(resolve_from(Some(TWO_CONTEXTS), None, &env).is_err());
         let err = resolve_from(Some("api_key: pk\n"), Some("prod"), no_env).unwrap_err();
@@ -891,10 +881,10 @@ contexts:
 
     #[test]
     fn use_context_changes_only_current_context() {
-        let out = use_context_in_text(TWO_CONTEXTS, "minikube").unwrap();
+        let out = use_context_in_text(TWO_CONTEXTS, "staging").unwrap();
         assert_eq!(
             out,
-            TWO_CONTEXTS.replace("current_context: prod", "current_context: minikube")
+            TWO_CONTEXTS.replace("current_context: prod", "current_context: staging")
         );
         let out = use_context_in_text(
             "api_url: https://x.test\nfuture: keep\ncontexts:\n  a:\n    api_url: https://a.test\n",
@@ -905,8 +895,8 @@ contexts:
             out,
             "api_url: https://x.test\nfuture: keep\ncontexts:\n  a:\n    api_url: https://a.test\ncurrent_context: a\n"
         );
-        let err = use_context_in_text(TWO_CONTEXTS, "staging").unwrap_err();
-        assert!(err.contains("known contexts: minikube, prod"), "{err}");
+        let err = use_context_in_text(TWO_CONTEXTS, "qa").unwrap_err();
+        assert!(err.contains("known contexts: prod, staging"), "{err}");
     }
 
     #[test]
@@ -933,7 +923,7 @@ contexts:
 
     #[test]
     fn set_writes_into_the_selected_context() {
-        let out = set_in_text(Some(TWO_CONTEXTS), Some("minikube"), "org_name", "new-org").unwrap();
+        let out = set_in_text(Some(TWO_CONTEXTS), Some("staging"), "org_name", "new-org").unwrap();
         assert_eq!(
             out,
             TWO_CONTEXTS.replace("org_name: dev-org", "org_name: new-org")
@@ -945,13 +935,13 @@ contexts:
         let out = get_contexts_output(Some(TWO_CONTEXTS), None, no_env).unwrap();
         assert_eq!(
             out,
-            "CURRENT  NAME      API URL                  ORG\n\
-             \x20        minikube  http://cluster.local     dev-org\n\
-             *        prod      https://api.revelara.ai  revelara.ai\n"
+            "CURRENT  NAME     API URL                      ORG\n\
+             *        prod     https://api.revelara.ai      revelara.ai\n\
+             \x20        staging  https://staging.example.com  dev-org\n"
         );
         assert!(!out.contains("pk_"));
-        let out = get_contexts_output(Some(TWO_CONTEXTS), Some("minikube"), no_env).unwrap();
-        assert!(out.contains("*        minikube"), "{out}");
+        let out = get_contexts_output(Some(TWO_CONTEXTS), Some("staging"), no_env).unwrap();
+        assert!(out.contains("*        staging"), "{out}");
         assert!(get_contexts_output(None, None, no_env)
             .unwrap()
             .starts_with("No contexts"));

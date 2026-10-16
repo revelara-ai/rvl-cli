@@ -36,16 +36,7 @@ pub fn run_login() -> ExitCode {
     };
 
     if !cfg.api_key.is_empty() {
-        if cfg.api_key.len() > 12 {
-            let masked = format!(
-                "{}...{}",
-                &cfg.api_key[..8],
-                &cfg.api_key[cfg.api_key.len() - 4..]
-            );
-            print!("API Key [{masked}] (Enter to keep): ");
-        } else {
-            print!("API Key [set] (Enter to keep): ");
-        }
+        print!("API Key [set] (Enter to keep): ");
     } else {
         print!("API Key: ");
     }
@@ -181,16 +172,7 @@ pub fn status_header(context: Option<&str>, cfg: &DataConfig, version: &str) -> 
         let _ = writeln!(out, "Context: {name}");
     }
     let _ = writeln!(out, "API URL: {}", cfg.api_url);
-    if cfg.api_key.len() > 8 {
-        let _ = writeln!(
-            out,
-            "API Key: {}...{}",
-            &cfg.api_key[..4],
-            &cfg.api_key[cfg.api_key.len() - 4..]
-        );
-    } else {
-        let _ = writeln!(out, "API Key: (set)");
-    }
+    let _ = writeln!(out, "API Key: {}", crate::config::key_state(&cfg.api_key));
     if !cfg.org_name.is_empty() {
         let _ = writeln!(out, "Organization: {}", cfg.org_name);
     }
@@ -266,7 +248,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_header_masks_the_key() {
+    fn status_header_prints_no_part_of_the_key() {
         let cfg = DataConfig {
             api_url: "https://api.revelara.ai".into(),
             api_key: "pk_live_abcdef123456".into(),
@@ -275,7 +257,11 @@ mod tests {
         let out = status_header(None, &cfg, "0.1.0");
         assert!(out.contains("API URL: https://api.revelara.ai\n"));
         assert!(!out.contains("Context:"));
-        assert!(out.contains("API Key: pk_l...3456\n"), "{out}");
+        assert!(out.contains("API Key: (set)\n"), "{out}");
+        assert!(
+            !out.contains("pk_l") && !out.contains("3456"),
+            "no part of the key may print: {out}"
+        );
         assert!(out.contains("Organization: acme\n"));
         assert!(
             !out.contains("pk_live_abcdef123456"),
@@ -284,24 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn status_header_short_key_prints_set() {
+    fn status_header_without_a_key_prints_not_set() {
         let cfg = DataConfig {
             api_url: "u".into(),
-            api_key: "short".into(),
-            org_name: String::new(),
+            ..DataConfig::default()
         };
         let out = status_header(None, &cfg, "0.1.0");
-        assert!(out.contains("API Key: (set)\n"));
+        assert!(out.contains("API Key: (not set)\n"), "{out}");
         assert!(!out.contains("Organization:"));
     }
 
     #[test]
     fn status_header_names_the_context_on_its_second_line() {
         let cfg = DataConfig {
-            api_url: "http://cluster.local".into(),
+            api_url: "https://staging.example.com".into(),
             ..DataConfig::default()
         };
-        let out = status_header(Some("minikube"), &cfg, "0.1.0");
-        assert_eq!(out.lines().nth(1), Some("Context: minikube"), "{out}");
+        let out = status_header(Some("staging"), &cfg, "0.1.0");
+        assert_eq!(out.lines().nth(1), Some("Context: staging"), "{out}");
     }
 }

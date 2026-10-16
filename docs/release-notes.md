@@ -29,6 +29,9 @@ and exits 2 on an earlier one.
   selected.
 - Changed: a malformed config file now fails `scan`, `sync` and the other
   scan commands with an error. Before, they ignored the file.
+- Changed: `rvl status`, `rvl config show`, `rvl config set api_key` and
+  `rvl login` no longer print any characters of the API key. They print
+  `(set)` or `(not set)`. Before, they printed the first and last characters.
 
 See [Configuration](configuration.md#named-contexts).
 
