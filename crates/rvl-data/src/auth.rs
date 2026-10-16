@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn status_header_names_the_context_on_its_second_line() {
         let cfg = DataConfig {
-            api_url: "https://staging.example.com".into(),
+            api_url: "https://api.example.com".into(),
             ..DataConfig::default()
         };
         let out = status_header(Some("staging"), &cfg, "0.1.0");

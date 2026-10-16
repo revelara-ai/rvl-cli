@@ -796,7 +796,7 @@ contexts:
     org_name: revelara.ai
   staging:
     api_url: https://staging.example.com
-    api_key: pk_mini
+    api_key: pk_staging
     org_name: dev-org
 ";
 
@@ -819,7 +819,7 @@ contexts:
         let r = resolve_from(Some(TWO_CONTEXTS), None, &env).unwrap();
         assert_eq!(r.context.as_deref(), Some("staging"));
         assert_eq!(r.cfg.api_url, "https://staging.example.com");
-        assert_eq!(r.cfg.api_key, "pk_mini");
+        assert_eq!(r.cfg.api_key, "pk_staging");
 
         let env = env_of(&[("RVL_CONTEXT", "staging")]);
         let r = resolve_from(Some(TWO_CONTEXTS), Some("prod"), &env).unwrap();

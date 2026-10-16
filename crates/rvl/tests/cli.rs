@@ -7444,7 +7444,7 @@ contexts:
     api_key: pk_prod_abcdef123456
   staging:
     api_url: http://localhost:1
-    api_key: pk_mini_abcdef123456
+    api_key: pk_staging_abcdef123456
 ";
 
 /// A local URL whose server drops every connection at once, so `status`
@@ -7465,19 +7465,19 @@ fn context_flag_selects_the_server_for_every_command_from_one_file() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     std::fs::create_dir_all(home.join(".revelara")).unwrap();
-    let (prod, mini) = (closing_server(), closing_server());
+    let (prod, staging) = (closing_server(), closing_server());
     std::fs::write(
         home.join(".revelara/config.yaml"),
         TWO_CONTEXTS
             .replace("http://127.0.0.1:1", &prod)
-            .replace("http://localhost:1", &mini),
+            .replace("http://localhost:1", &staging),
     )
     .unwrap();
 
     for (args, name, url) in [
-        (vec!["--context", "staging", "status"], "staging", &mini),
+        (vec!["--context", "staging", "status"], "staging", &staging),
         (vec!["--context", "prod", "status"], "prod", &prod),
-        (vec!["status", "--context", "staging"], "staging", &mini),
+        (vec!["status", "--context", "staging"], "staging", &staging),
         (vec!["status"], "prod", &prod),
     ] {
         let out = config_bin(home).args(&args).output().unwrap();
@@ -7496,7 +7496,7 @@ fn context_flag_selects_the_server_for_every_command_from_one_file() {
         .unwrap();
     assert!(String::from_utf8(out.stdout)
         .unwrap()
-        .starts_with(&format!("api_url: {mini}\n")));
+        .starts_with(&format!("api_url: {staging}\n")));
 
     let out = config_bin(home)
         .args(["--context", "qa", "status"])
