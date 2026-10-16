@@ -16,8 +16,14 @@ To read the installed version, run `rvl --version` or `rvl version`.
 and exits 2 on an earlier one.
 
 - The config file can hold named `contexts` and a `current_context`. A file
-  with only the top-level `api_url`, `api_key` and `org_name` keys works with
-  no change.
+  with only the top-level `api_url`, `api_key` and `org_name` keys needs no
+  change: `rvl` reads it as the context `default` and selects it. No command
+  that only reads the file rewrites it. The first `login`, `config set`,
+  `config set-context` or `config use-context` stores it in the contexts
+  form, and after that `rvl` 1.6.0 and earlier read no credentials from it.
+- `rvl login` and `rvl config set` with no context selected write the
+  context `default`. A write into a context selects it when the file selects
+  none.
 - The global flag `--context <name>` and the variable `RVL_CONTEXT` select a
   context for any command. `RVL_API_KEY`, `RVL_API_URL` and `RVL_ORG_NAME`
   still win over the context's values.

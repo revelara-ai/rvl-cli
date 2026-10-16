@@ -40,16 +40,21 @@ contexts:
     org_name: example.com
 ```
 
-A file with only the top-level `api_url`, `api_key` and `org_name` keys works
-as before, as an unnamed context. `rvl` never rewrites the file into the new
-format by itself.
+A file from before named contexts, with only the top-level `api_url`,
+`api_key` and `org_name` keys, needs no change: `rvl` reads it as a context
+named `default` and selects it. A file with no `api_url` keeps the
+production URL. Commands that only read the file (`scan`, `status`,
+`config show`, `config get-contexts`) never rewrite it. The first command
+that writes the file anyway (`login`, `config set`, `config set-context`,
+`config use-context`) stores it in the contexts form. Other keys, such as
+`agent`, stay as they are. `rvl` 1.6.0 and earlier read no credentials from
+a file in the contexts form.
 
 Every command uses the same selection, highest first:
 
 1. the global `--context <name>` flag, on any command (`rvl --context staging scan`);
 2. `RVL_CONTEXT`;
-3. `current_context` in the file;
-4. the top-level keys.
+3. `current_context` in the file.
 
 `RVL_API_KEY`, `RVL_API_URL` and `RVL_ORG_NAME` still win over the values of
 the selected context. A name that is not in `contexts` is an error that lists
@@ -64,8 +69,10 @@ config file is an error for every command.
 | `rvl config set-context <name> [--url <url>] [--key <key>] [--org <org>]` | Create or update one context. A new context needs `--url`. The URL must be `https://`, or `http://` to a loopback host; to use another `http://` server, edit the file. |
 
 `rvl config set`, `rvl config show` and `rvl login` work on the selected
-context, or on the top-level keys when no context is selected. `rvl status`
-prints `Context: <name>` on its second line when a context is selected.
+context. When no context is selected, `rvl login` and `rvl config set` write
+the context `default`. A write into a context selects it when the file
+selects none. `rvl status` prints `Context: <name>` on its second line when
+a context is selected.
 `rvl logout` removes the whole file, every context included.
 
 ## Environment variables
