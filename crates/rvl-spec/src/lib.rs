@@ -929,6 +929,22 @@ pub struct SpecFile {
     /// cache without it judges no misuse shape.
     #[serde(default)]
     pub misuse_shapes: Vec<MisuseSpec>,
+    /// The causal factor codes of each control. Additive both ways, like the
+    /// sections above: a cache without it gives no finding any factors, and
+    /// the publisher omits the key when it has nothing to publish.
+    #[serde(default)]
+    pub control_factors: Vec<ControlFactors>,
+}
+
+/// The causal factors one control addresses: the codes (`CF-0007`) a finding
+/// of `control` carries. The publisher writes one entry per control, sorted,
+/// with only the factors the control prevents, mitigates or detects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlFactors {
+    /// The control code (`RC-019`), the merge key.
+    pub control: String,
+    #[serde(default)]
+    pub factors: Vec<String>,
 }
 
 /// A misuse-shape spec: what an error-handling or async shape MEANS, for the
@@ -999,6 +1015,7 @@ pub struct SpecCache {
     construction_bounds: Vec<ConstructionBoundSpec>,
     decorators: Vec<DecoratorSpec>,
     misuse_shapes: Vec<MisuseSpec>,
+    control_factors: HashMap<String, Vec<String>>,
 }
 
 impl SpecCache {
@@ -1030,7 +1047,19 @@ impl SpecCache {
         for m in f.misuse_shapes {
             c.merge_misuse(m);
         }
+        for cf in f.control_factors {
+            c.control_factors.insert(cf.control, cf.factors);
+        }
         c
+    }
+
+    /// The causal factor codes of `control`, empty when the cache names none
+    /// (an older cache, or a control with no published factor).
+    pub fn control_factors(&self, control: &str) -> &[String] {
+        self.control_factors
+            .get(control)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// Insert a misuse-shape spec, keeping the higher-confidence entry per
@@ -1270,6 +1299,9 @@ impl SpecCache {
         for v in other.misuse_shapes {
             self.merge_misuse(v);
         }
+        // No confidence to compare: the overlay's entry for a control
+        // replaces the baseline's.
+        self.control_factors.extend(other.control_factors);
     }
 
     /// What the repo's own construction sites impose on served requests.
@@ -1501,6 +1533,7 @@ mod tests {
                 .collect(),
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -1622,6 +1655,7 @@ mod tests {
             configs,
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -1795,6 +1829,7 @@ mod tests {
                 construction_bounds: vec![],
                 decorators: vec![],
                 misuse_shapes: vec![],
+                control_factors: vec![],
             })
         };
         // Both keyed: the framework spec wins.
@@ -2019,6 +2054,7 @@ mod tests {
             configs: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         });
         let mut better = api(Blocking::No, 0.95);
         better.rationale = "local".into();
@@ -2032,6 +2068,7 @@ mod tests {
             configs: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         }));
         let got = base.api(&("t".into(), "Do".into())).unwrap();
         assert_eq!(got.blocking, Blocking::No);
@@ -2125,6 +2162,50 @@ mod tests {
                 then: Box::new(ConfigExpect::Present),
             }
         );
+    }
+
+    #[test]
+    fn control_factors_section_gives_each_control_its_codes() {
+        let cache = SpecCache::load(
+            r#"{"apis": [], "control_factors": [
+                {"control": "RC-019", "factors": ["CF-0007", "CF-0021"]},
+                {"control": "RC-020", "factors": ["CF-0003"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.control_factors("RC-019"), ["CF-0007", "CF-0021"]);
+        assert_eq!(cache.control_factors("RC-020"), ["CF-0003"]);
+        assert!(
+            cache.control_factors("RC-069").is_empty(),
+            "no entry, no factors"
+        );
+        assert!(cache.control_factors("").is_empty());
+    }
+
+    #[test]
+    fn spec_file_without_control_factors_section_still_parses() {
+        // The publisher omits the key when nothing publishes, and every cache
+        // older than the section lacks it: no factors, no error.
+        let cache = SpecCache::load(r#"{"apis": [], "configs": []}"#).unwrap();
+        assert!(cache.control_factors("RC-019").is_empty());
+    }
+
+    #[test]
+    fn overlay_control_factors_replace_the_baseline_entry_per_control() {
+        let mk = |entries: &[(&str, &str)]| SpecFile {
+            control_factors: entries
+                .iter()
+                .map(|(c, f)| ControlFactors {
+                    control: (*c).into(),
+                    factors: vec![(*f).into()],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut base = SpecCache::from_file(mk(&[("RC-019", "CF-0007"), ("RC-020", "CF-0003")]));
+        base.merge(SpecCache::from_file(mk(&[("RC-019", "CF-0021")])));
+        assert_eq!(base.control_factors("RC-019"), ["CF-0021"], "overlay wins");
+        assert_eq!(base.control_factors("RC-020"), ["CF-0003"], "baseline kept");
     }
 
     #[test]
@@ -2748,6 +2829,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         });
         base.merge(SpecCache::from_file(SpecFile {
             apis: vec![],
@@ -2769,6 +2851,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         }));
         let specs = base.emission_specs();
         assert_eq!(specs.len(), 2, "same identity merges, new identity appends");
@@ -3031,6 +3114,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         }));
         assert_eq!(c.api_count(), 1);
         assert_eq!(c.config_count(), 1);

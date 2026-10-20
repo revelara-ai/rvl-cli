@@ -145,6 +145,7 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
                 class_rule: class_rule(&format, &key),
                 suppressed: false,
                 gate_exempt: false,
+                factors: Vec::new(),
             }
         })
         .collect();

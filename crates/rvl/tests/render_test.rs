@@ -24,6 +24,7 @@ fn f(id_seed: &str, sev: &str, disp: &str, crit: u32) -> Finding {
         class_rule: "pkg.T.M".into(),
         suppressed: false,
         gate_exempt: false,
+        factors: Vec::new(),
     }
 }
 
@@ -1547,4 +1548,40 @@ fn gated_operation_follows_the_hook_name() {
     for hook in [None, Some("pre-commit"), Some("pre-psuh")] {
         assert_eq!(GatedOperation::from_hook(hook), GatedOperation::Commit);
     }
+}
+
+// --- causal factors ---
+
+#[test]
+fn ladder_detail_line_shows_the_control_factor_codes() {
+    let mut with = f("cf1", "medium", "surface", 0);
+    with.factors = vec!["CF-0007".into(), "CF-0021".into()];
+    let out = render_ladder(&[with], cov(), None, "0.1s", false);
+    assert!(
+        out.contains("control RC-019 (factors CF-0007, CF-0021) \u{00b7} explain:"),
+        "{out}"
+    );
+}
+
+#[test]
+fn ladder_detail_line_without_factors_is_unchanged() {
+    let out = render_ladder(
+        &[f("cf2", "medium", "surface", 0)],
+        cov(),
+        None,
+        "0.1s",
+        false,
+    );
+    assert!(out.contains("control RC-019 \u{00b7} explain:"), "{out}");
+    assert!(!out.contains("factors"), "{out}");
+}
+
+#[test]
+fn explain_lists_the_control_factor_codes() {
+    let mut with = f("cf3", "medium", "surface", 0);
+    with.factors = vec!["CF-0007".into(), "CF-0021".into()];
+    let out = render_explain(&with, &[], false);
+    assert!(out.contains("  factors: CF-0007, CF-0021\n"), "{out}");
+    let out = render_explain(&f("cf4", "medium", "surface", 0), &[], false);
+    assert!(!out.contains("factors"), "{out}");
 }

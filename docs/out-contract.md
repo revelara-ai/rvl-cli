@@ -45,7 +45,8 @@ The orchestrator uses it to:
       "fix": "wrap in context.WithTimeout",
       "site_count": 3,
       "suppressed": false,
-      "gate_exempt": false
+      "gate_exempt": false,
+      "factors": ["CF-0007", "CF-0021"]
     }
   ],
   "coverage": {
@@ -267,6 +268,12 @@ The orchestrator uses it to:
   `emission.`, `unsized.`, `repo_structure.`, `config.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
   The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
+- `findings[].factors` is the list of causal factor codes (`CF-0007`) of
+  the row's `control`, read from the spec cache's `control_factors`
+  section. It is `[]` when the row has no control, when the cache names
+  no factor for the control, and when the cache predates the section. A
+  document from a release that does not write the field has no `factors`
+  key: read that as "not reported", not as "no factors".
 - `findings[].subject` is what the row is about, in the shape the server's
   scan submission reads (`{"kind", "value"}`). An orchestrator that submits
   an engine row copies it to the finding unchanged, so that the identity of
