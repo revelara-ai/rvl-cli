@@ -952,9 +952,21 @@ fn triage_to_findings(
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
                 suppressed: false,
                 gate_exempt: false,
+                factors: Vec::new(),
             }
         })
         .collect()
+}
+
+/// Stamp each ladder finding with its control's causal factor codes from the
+/// spec cache. One pass over the assembled ladder, so every lane's rows get
+/// them the same way. A finding with no control, or a cache without the
+/// `control_factors` section, keeps an empty list.
+fn stamp_factors(findings: &mut [render::Finding], specs: Option<&rvl_spec::SpecCache>) {
+    let Some(specs) = specs else { return };
+    for f in findings.iter_mut().filter(|f| !f.control.is_empty()) {
+        f.factors = specs.control_factors(&f.control).to_vec();
+    }
 }
 
 // --- G7 repo-structure lane (po-av01j.7) ---
@@ -989,6 +1001,7 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,
+                factors: Vec::new(),
             }
         })
         .collect()
@@ -1087,6 +1100,7 @@ fn server_to_findings(
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,
+                factors: Vec::new(),
             }
         })
         .chain(liveness_handler_finding(&server.routes, probes))
@@ -1127,6 +1141,7 @@ fn liveness_handler_finding(
         class_rule: probe_handler::CLASS_RULE.into(),
         suppressed: false,
         gate_exempt: false,
+        factors: Vec::new(),
     })
 }
 
@@ -3602,6 +3617,7 @@ fn findings_from_sites(
                     .collect(),
                 decorators: vec![],
                 misuse_shapes: vec![],
+                control_factors: vec![],
             };
             cache.merge(rvl_spec::SpecCache::from_file(overlay));
         }
@@ -4239,6 +4255,8 @@ fn render_scan_output(
             }
         }
     }
+
+    stamp_factors(&mut ladder_findings, specs);
 
     // Persist the ladder so the printed `explain:`/`suppress:` hints resolve
     // verbatim, from any directory, without re-running this scan's inputs.
@@ -5638,6 +5656,7 @@ fn run_explain(
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     ladder_findings.extend(server_to_findings(&server, &lane.liveness_probes));
     ladder_findings.extend(lane.findings);
+    stamp_factors(&mut ladder_findings, Some(&specs));
     let Some(f) = ladder_findings.iter().find(|f| f.id == id) else {
         eprintln!(
             "no finding with id '{id}' in the last scan or in a fresh scan of {}; \
@@ -10599,6 +10618,7 @@ mod tests {
             class_rule: "kysely.SelectQueryBuilder.execute".into(),
             suppressed: false,
             gate_exempt: false,
+            factors: Vec::new(),
         }
     }
 

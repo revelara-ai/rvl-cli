@@ -86,6 +86,12 @@ pub struct Finding {
     /// information.
     #[serde(default)]
     pub gate_exempt: bool,
+    /// The causal factor codes (`CF-0007`) of `control`, from the spec
+    /// cache's `control_factors`. Empty when the control has none or the
+    /// cache predates the section; defaulted so an older last-scan state
+    /// still loads.
+    #[serde(default)]
+    pub factors: Vec<String>,
 }
 
 /// The git operation a blocking verdict stops (po-av01j.207). The verdict line
@@ -1159,7 +1165,11 @@ fn write_finding_line(o: &mut String, f: &Finding, color: bool) {
     let _ = writeln!(o, "    {}", paint(&meta, "2", color));
     let mut tail = String::new();
     if !f.control.is_empty() {
-        let _ = write!(tail, "control {} \u{00b7} ", f.control);
+        let _ = write!(tail, "control {}", f.control);
+        if !f.factors.is_empty() {
+            let _ = write!(tail, " (factors {})", f.factors.join(", "));
+        }
+        let _ = write!(tail, " \u{00b7} ");
     }
     let _ = write!(tail, "explain: {BIN} explain {}", f.id);
     let _ = writeln!(o, "    {}", paint(&tail, "2", color));
@@ -1195,6 +1205,14 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
     }
     if !f.control.is_empty() {
         let _ = writeln!(o, "  {}: {}", paint("control", "1", color), f.control);
+    }
+    if !f.factors.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {}: {}",
+            paint("factors", "1", color),
+            f.factors.join(", ")
+        );
     }
     if !f.fix.is_empty() {
         let _ = writeln!(o, "  {}: {}", paint("fix", "1", color), f.fix);

@@ -41,6 +41,22 @@ and exits 2 on an earlier one.
 
 See [Configuration](configuration.md#named-contexts).
 
+### Causal factor codes on findings
+
+**Minimum version to probe for: the first release after 1.6.0.** Probe
+for the `factors` key on a `findings[]` row of an `--out` document; an
+earlier release writes no such key.
+
+- Each `--out` finding has `factors`, the list of causal factor codes
+  (`CF-0007`) of its control, read from the spec cache's `control_factors`
+  section. It is `[]` when the cache has no factor for the control or has
+  no such section.
+- The ladder's detail line shows the codes after the control:
+  `control RC-019 (factors CF-0007, CF-0021)`. `rvl explain` prints them
+  on a `factors:` line. Only the codes are shown, not the factor names.
+
+See [the `--out` contract](out-contract.md).
+
 ## 1.6.0 (2026-10-15)
 
 The first release after `v1.5.0`.

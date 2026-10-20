@@ -1070,6 +1070,127 @@ fn scan_surfaces_server_entry_findings_from_a_retrieved_stream() {
     );
 }
 
+/// Scan a route registration with no health endpoint and no rate limiter
+/// against `specs`, writing `--out` into `dir`. Returns the ladder (stdout)
+/// and the `--out` document.
+fn scan_server_entry_with_specs(dir: &std::path::Path, specs: &str) -> (String, serde_json::Value) {
+    let (packets_path, _) = write_scan_fixtures(dir);
+    let mut stream = std::fs::read_to_string(&packets_path).unwrap();
+    stream.push_str(&server_entry_line(
+        "routes.go",
+        10,
+        r#"mux.HandleFunc("/users", usersHandler)"#,
+    ));
+    stream.push('\n');
+    std::fs::write(&packets_path, stream).unwrap();
+    let specs_path = dir.join("server_specs.json");
+    std::fs::write(&specs_path, specs).unwrap();
+    let out_path = dir.join("findings.json");
+    let out = bin()
+        .args(["scan", "--retrieved"])
+        .arg(&packets_path)
+        .arg("--specs-file")
+        .arg(&specs_path)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "scan failed: {stdout} {stderr}");
+    let doc = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    (stdout, doc)
+}
+
+/// The `--out` row of the finding whose control is `control`.
+fn out_finding<'a>(doc: &'a serde_json::Value, control: &str) -> &'a serde_json::Value {
+    doc["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["control"] == control)
+        .unwrap_or_else(|| panic!("no {control} finding: {doc}"))
+}
+
+/// A finding of a control that the spec cache's `control_factors` section
+/// names carries those codes in `--out`, on the ladder's detail line and in
+/// `explain`. A control with no entry carries none.
+#[test]
+fn scan_findings_carry_the_control_factors_of_the_spec_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut specs: serde_json::Value = serde_json::from_str(SERVER_SPECS_SEED).unwrap();
+    specs["control_factors"] = serde_json::json!([
+        {"control": "RC-020", "factors": ["CF-0007", "CF-0021"]},
+        {"control": "RC-099", "factors": ["CF-0001"]},
+    ]);
+    let (stdout, doc) = scan_server_entry_with_specs(dir.path(), &specs.to_string());
+
+    let rc020 = out_finding(&doc, "RC-020");
+    assert_eq!(
+        rc020["factors"],
+        serde_json::json!(["CF-0007", "CF-0021"]),
+        "{doc}"
+    );
+    assert_eq!(
+        out_finding(&doc, "RC-069")["factors"],
+        serde_json::json!([]),
+        "a control with no entry has no factors: {doc}"
+    );
+    assert!(
+        stdout.contains("control RC-020 (factors CF-0007, CF-0021)"),
+        "the detail line shows the codes: {stdout}"
+    );
+    assert!(
+        !stdout.contains("CF-0001"),
+        "only the finding's own control's codes: {stdout}"
+    );
+
+    let id = rc020["id"].as_str().unwrap();
+    let out = bin()
+        .args(["explain", id])
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let explained = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "explain failed: {explained}");
+    assert!(
+        explained.contains("factors: CF-0007, CF-0021"),
+        "explain lists the codes: {explained}"
+    );
+}
+
+/// A spec cache without the `control_factors` section, as every cache before
+/// it is, scans exactly as before: the same findings, each with no factors.
+#[test]
+fn scan_without_a_control_factors_section_scans_as_before() {
+    let with_dir = tempfile::tempdir().unwrap();
+    let mut specs: serde_json::Value = serde_json::from_str(SERVER_SPECS_SEED).unwrap();
+    specs["control_factors"] = serde_json::json!([
+        {"control": "RC-020", "factors": ["CF-0007"]},
+    ]);
+    let (_, with) = scan_server_entry_with_specs(with_dir.path(), &specs.to_string());
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!SERVER_SPECS_SEED.contains("control_factors"));
+    let (stdout, doc) = scan_server_entry_with_specs(dir.path(), SERVER_SPECS_SEED);
+    let findings = doc["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "fixture must produce findings: {doc}");
+    for f in findings {
+        assert_eq!(f["factors"], serde_json::json!([]), "{doc}");
+    }
+    assert!(!stdout.contains("factors"), "{stdout}");
+    let ids = |d: &serde_json::Value| -> Vec<String> {
+        d["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(&doc), ids(&with), "the section changes no finding");
+}
+
 /// po-6c0v8.5: a liveness probe path in a manifest of the scanned repository
 /// is joined to the route that serves it. A handler that holds an I/O call
 /// site is an advisory finding. A probe path that no route serves abstains.

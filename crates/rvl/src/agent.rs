@@ -647,6 +647,7 @@ pub fn gate_findings(
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,
+                factors: Vec::new(),
             })
         })
         .collect()

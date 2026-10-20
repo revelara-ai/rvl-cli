@@ -1322,6 +1322,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -1364,6 +1365,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -1409,6 +1411,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -1663,6 +1666,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         });
         let f = propagate(&s, &specs, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies);
@@ -1834,6 +1838,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 
@@ -2066,6 +2071,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         }));
         let f = propagate(&s, &cache, &ServedBound::None, &HashMap::new());
         assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
@@ -2445,6 +2451,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         });
         let site = Site {
             file_path: "a.ts".into(),
@@ -2947,6 +2954,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         });
         let client = HashMap::from([(
             Family::Database,
@@ -3416,6 +3424,7 @@ mod tests {
             }],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         };
         let specs = SpecCache::from_file(f.clone());
         assert_eq!(
@@ -3485,6 +3494,7 @@ mod tests {
             construction_bounds: vec![],
             decorators: vec![],
             misuse_shapes: vec![],
+            control_factors: vec![],
         })
     }
 

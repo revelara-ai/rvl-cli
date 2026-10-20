@@ -114,6 +114,9 @@ pub struct OutFinding {
     pub site_count: usize,
     pub suppressed: bool,
     pub gate_exempt: bool,
+    /// The causal factor codes of `control`. Empty when the spec cache
+    /// names none.
+    pub factors: Vec<String>,
 }
 
 /// The subject of a finding, in the wire shape the server reads
@@ -330,6 +333,7 @@ pub fn build(
             site_count: f.site_count,
             suppressed: f.suppressed,
             gate_exempt: f.gate_exempt,
+            factors: f.factors.clone(),
         })
         .collect();
 
@@ -488,6 +492,7 @@ mod tests {
             class_rule: "t.m".into(),
             suppressed: false,
             gate_exempt: false,
+            factors: Vec::new(),
         };
         let blocked = render::blocking_count(std::slice::from_ref(&f)) > 0;
         let doc = build(
@@ -538,6 +543,7 @@ mod tests {
             class_rule: "github.com/cli/cli/v2/api.Client.Do".into(),
             suppressed: false,
             gate_exempt: false,
+            factors: Vec::new(),
         };
         let doc = build(
             std::slice::from_ref(&f),
@@ -569,6 +575,7 @@ mod tests {
             class_rule: class.into(),
             suppressed: false,
             gate_exempt: false,
+            factors: Vec::new(),
         }
     }
 
