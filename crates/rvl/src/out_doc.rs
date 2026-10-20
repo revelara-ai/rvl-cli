@@ -63,6 +63,14 @@ pub struct OutDoc {
     /// stream with no `repo_structure` record). The violations among them
     /// are also ladder rows in `findings`, post-waiver.
     pub structure: Vec<OutSite>,
+    /// One row per config setting the config lane read, with its verdict,
+    /// control and rule: the sites behind `coverage.config.by_key`.
+    /// Pre-waiver, ordered by (format, file, line, resource, key), at most
+    /// [`crate::config_lane::CONFIG_SITES_CAP`] rows. Empty when the lane did
+    /// not run. Additive.
+    pub config_sites: Vec<crate::config_lane::ConfigSite>,
+    /// The settings the cap left out of `config_sites`.
+    pub config_sites_overflow: usize,
     /// The hook-adjudication agent block verbatim when `--hook` ran; null
     /// otherwise. Provenance-tagged and separate, exactly as rendered.
     pub hook_agent: Option<String>,
@@ -310,6 +318,7 @@ pub fn build(
     propagated: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
     structure: &[OutSite],
+    config_sites: Option<&crate::config_lane::ConfigSites>,
     hook_agent_block: Option<&str>,
     blend: Option<&crate::blend::BlendSummary>,
     blocked: bool,
@@ -464,6 +473,8 @@ pub fn build(
         undecided,
         covered_classes: covered.into_iter().collect(),
         structure: structure.to_vec(),
+        config_sites: config_sites.map(|c| c.rows.clone()).unwrap_or_default(),
+        config_sites_overflow: config_sites.map_or(0, |c| c.overflow),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
         blend: blend.cloned(),
     }
@@ -502,6 +513,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
             blocked,
@@ -554,6 +566,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             false,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
@@ -587,6 +600,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
             false,
@@ -670,7 +684,7 @@ mod tests {
             candidates: 97,
             unretrieved,
         }];
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
         let v = serde_json::to_value(&doc.coverage).unwrap();
         assert_eq!(v["retrieval"][0]["lang"], "go");
         assert_eq!(v["retrieval"][0]["candidates"], 97);
@@ -721,6 +735,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             false,
         );
         let v = serde_json::to_value(&doc).unwrap();
@@ -757,7 +772,7 @@ mod tests {
             by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
             ..Default::default()
         };
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
         let v = serde_json::to_value(&doc.coverage.by_language).unwrap();
         assert_eq!(
             v,
@@ -767,7 +782,7 @@ mod tests {
             ])
         );
         cov.empty_api_corpus = true;
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
         assert!(!doc.coverage.by_language[1].corpus_gap);
     }
 
@@ -794,7 +809,18 @@ mod tests {
             ),
             ..Default::default()
         };
-        let doc = build(&[], &coverage, None, &[], &[], &rows, None, None, false);
+        let doc = build(
+            &[],
+            &coverage,
+            None,
+            &[],
+            &[],
+            &rows,
+            None,
+            None,
+            None,
+            false,
+        );
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["structure"].as_array().unwrap().len(), 3);
         assert_eq!(v["structure"][0]["site_id"], "repo");
@@ -822,6 +848,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
             false,
@@ -871,6 +898,7 @@ mod tests {
             &propagated,
             sites,
             structure,
+            None,
             None,
             None,
             false,

@@ -14,6 +14,7 @@ use rvl_config::kubernetes::manifest::LIVENESS_HTTP_GET_PATH_KEY;
 use rvl_core::Verdict;
 use rvl_data::BIN;
 use rvl_propagate::probe_handler::LivenessProbe;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -28,6 +29,69 @@ pub struct LaneOutput {
     /// the manifest half of the probe-to-handler join, which the scan
     /// completes against the server-entry lane's route inventory.
     pub liveness_probes: Vec<LivenessProbe>,
+    /// One row per config setting with its verdict, for the `--out`
+    /// document's `config_sites[]`. Capped at [`CONFIG_SITES_CAP`].
+    pub sites: ConfigSites,
+}
+
+/// At most this many `config_sites` rows per scan. A large monorepo emits a
+/// few thousand settings; past the cap the rows are counted, not listed.
+pub const CONFIG_SITES_CAP: usize = 5000;
+
+/// A setting's value is cut to this many characters in a `config_sites` row,
+/// with `\u{2026}` appended. A Prometheus `expr` can run to kilobytes.
+pub const CONFIG_VALUE_MAX_CHARS: usize = 200;
+
+/// One config setting and what the lane concluded about it: the per-site
+/// sample the `coverage.config.by_key` counts are made of. The derived order
+/// is the document order: format, file, line, resource, key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ConfigSite {
+    pub format: String,
+    pub file: String,
+    /// Best-effort line of the setting; 0 = unknown.
+    pub line: u32,
+    /// The config unit the setting belongs to, e.g. `deployment:api`,
+    /// `job:build`, `workflow`.
+    pub resource: String,
+    pub key: String,
+    /// The effective value, cut to [`CONFIG_VALUE_MAX_CHARS`]. Null when the
+    /// value lives outside the repo.
+    pub value: Option<String>,
+    pub verdict: &'static str,
+    /// The control of the spec that judged the setting; empty when no spec
+    /// did.
+    pub control: String,
+    /// The rule phrase of the verdict's reason, cut like `value`: for a
+    /// violation, the same phrase its ladder row is grouped by. A satisfied
+    /// reason can carry the value, so it is bounded too.
+    pub rule: String,
+}
+
+/// The `config_sites` rows of one scan and how many the cap left out.
+#[derive(Debug, Default)]
+pub struct ConfigSites {
+    pub rows: Vec<ConfigSite>,
+    pub overflow: usize,
+}
+
+impl ConfigSites {
+    /// Sort `rows` into document order, so the rows the cap keeps do not
+    /// depend on retrieval order, then keep the first `cap`.
+    fn capped(mut rows: Vec<ConfigSite>, cap: usize) -> Self {
+        rows.sort();
+        let overflow = rows.len().saturating_sub(cap);
+        rows.truncate(cap);
+        Self { rows, overflow }
+    }
+}
+
+/// `value` cut to [`CONFIG_VALUE_MAX_CHARS`] characters, on a char boundary.
+fn bounded_value(value: &str) -> String {
+    match value.char_indices().nth(CONFIG_VALUE_MAX_CHARS) {
+        Some((at, _)) => format!("{}\u{2026}", &value[..at]),
+        None => value.to_string(),
+    }
 }
 
 /// The class rule a config finding is grouped and waived by.
@@ -44,6 +108,16 @@ fn rule_phrase(reason: &str) -> &str {
 
 /// Run the config lane over `root` with the already-loaded specs.
 pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneOutput {
+    run_capped(root, specs, snapshot_id, CONFIG_SITES_CAP)
+}
+
+/// [`run`] with the `config_sites` cap as a parameter, so a test can reach it.
+fn run_capped(
+    root: &Path,
+    specs: &rvl_spec::SpecCache,
+    snapshot_id: &str,
+    sites_cap: usize,
+) -> LaneOutput {
     let retrieval = rvl_config::retrieve_repo(root, snapshot_id);
     let findings = rvl_config::eval::evaluate_all(&retrieval.packets, &retrieval.predicates, specs);
 
@@ -67,8 +141,20 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         sites: Vec<String>,
     }
     let mut classes: BTreeMap<(String, String, String), Class> = BTreeMap::new();
+    let mut sites = Vec::with_capacity(findings.len());
 
     for (f, p) in findings.iter().zip(retrieval.packets.iter()) {
+        sites.push(ConfigSite {
+            format: p.format.clone(),
+            file: p.file_path.clone(),
+            line: p.line,
+            resource: p.unit.clone(),
+            key: p.key.clone(),
+            value: p.resolved_value.as_deref().map(bounded_value),
+            verdict: f.verdict.as_str(),
+            control: f.control.clone(),
+            rule: bounded_value(rule_phrase(&f.reason)),
+        });
         let counts = coverage
             .by_key
             .entry((p.format.clone(), p.key.clone()))
@@ -167,6 +253,7 @@ pub fn run(root: &Path, specs: &rvl_spec::SpecCache, snapshot_id: &str) -> LaneO
         findings: ladder,
         coverage,
         liveness_probes,
+        sites: ConfigSites::capped(sites, sites_cap),
     }
 }
 
@@ -536,6 +623,56 @@ mod tests {
         let q = rvl_config::key_ledger::mint_queue(&SpecCache::default());
         let text = render_key_report(&q, false);
         assert!(text.contains("no spec cache installed"), "{text}");
+    }
+
+    // Every setting is a row, whatever its verdict, and the cap keeps the
+    // first rows in (format, file, line, resource, key) order and counts the
+    // rest.
+    #[test]
+    fn config_sites_are_one_row_per_setting_and_the_cap_counts_overflow() {
+        let dir = repo_with_workflow(
+            "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    runs-on: x\n    timeout-minutes: 5\n",
+        );
+        let all = run(dir.path(), &specs("high"), "snap");
+        assert_eq!(all.sites.rows.len(), all.coverage.total);
+        assert_eq!(all.sites.overflow, 0);
+        let b = all
+            .sites
+            .rows
+            .iter()
+            .find(|r| r.key == "job.timeout-minutes" && r.resource == "job:b")
+            .expect("job b's timeout row");
+        assert_eq!(b.file, ".github/workflows/ci.yml");
+        assert_eq!(b.line, 0, "the workflow retriever records no line");
+        assert_eq!(b.value.as_deref(), Some("5"));
+        assert_eq!(b.verdict, "satisfies");
+        assert_eq!(b.control, "RC-013");
+        let unspecced = all
+            .sites
+            .rows
+            .iter()
+            .find(|r| r.key == "workflow.concurrency")
+            .expect("an unspecced setting is a row too");
+        assert_eq!(unspecced.verdict, "abstain");
+        assert_eq!(unspecced.control, "");
+
+        let capped = run_capped(dir.path(), &specs("high"), "snap", 2);
+        assert_eq!(capped.sites.rows, all.sites.rows[..2]);
+        assert_eq!(capped.sites.overflow, all.sites.rows.len() - 2);
+        // The cap bounds the rows only: counts and findings still see every
+        // setting.
+        assert_eq!(capped.coverage.total, all.coverage.total);
+        assert_eq!(capped.findings.len(), all.findings.len());
+    }
+
+    #[test]
+    fn a_long_value_is_cut_on_a_char_boundary() {
+        let short = "x".repeat(CONFIG_VALUE_MAX_CHARS);
+        assert_eq!(bounded_value(&short), short);
+        let long = "\u{00e9}".repeat(CONFIG_VALUE_MAX_CHARS + 50);
+        let cut = bounded_value(&long);
+        assert_eq!(cut.chars().count(), CONFIG_VALUE_MAX_CHARS + 1);
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
     }
 
     #[test]

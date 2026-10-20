@@ -4306,6 +4306,7 @@ fn render_scan_output(
             findings,
             sites,
             structure_rows,
+            config.map(|lane| &lane.sites),
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
