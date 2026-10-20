@@ -15,6 +15,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Display;
+use std::path::Path;
 
 /// Set (to anything but empty or `0`) where every engine is provisioned, so a
 /// test that cannot reach its engine fails instead of skipping. CI sets it.
@@ -43,6 +44,50 @@ pub fn skip(test: &str, why: impl Display) {
         );
     }
     eprintln!("SKIP {test}: {why}");
+}
+
+/// Write `body` to `path` as an executable that may be run at once, even
+/// while other threads of this test process are spawning children.
+///
+/// A file this process writes is open for writing while it is written, and a
+/// child forked by another thread in that window holds the write descriptor
+/// until its own exec. The kernel refuses to exec a file that anyone holds
+/// open for writing, so running it fails with "Text file busy". Renaming does
+/// not help on its own: the inherited descriptor follows the inode, not the
+/// name. So the bytes are written by a `/bin/sh` child, whose descriptor no
+/// fork of ours can inherit, under a temporary name; this process then sets
+/// the mode and renames it into place, so `path` never exists half-written
+/// or without its execute bit.
+///
+/// `body` travels as an argument, which bounds it at the kernel's per-argument
+/// limit (128 KiB on Linux): ample for a test stub, not for a binary.
+#[cfg(unix)]
+pub fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let name = path.file_name().expect("an executable needs a file name");
+    let tmp = path.with_file_name(format!(".{}.partial", name.to_string_lossy()));
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s' "$2" > "$1""#, "write_executable"])
+        .arg(&tmp)
+        .arg(body)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("writing {}: /bin/sh did not start: {e}", tmp.display()));
+    assert!(
+        status.success(),
+        "writing {}: /bin/sh {status}",
+        tmp.display()
+    );
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("rename {} to {}: {e}", tmp.display(), path.display()));
+}
+
+/// Without execute bits there is nothing to race: write the file.
+#[cfg(not(unix))]
+pub fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 #[cfg(test)]

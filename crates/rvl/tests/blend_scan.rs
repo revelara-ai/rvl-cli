@@ -206,3 +206,74 @@ fn blend_is_refused_on_the_hook_path() {
         "the refusal must name why, not be a clap parse error: {err}"
     );
 }
+
+/// Gate mode: an agent row carries the control of the question the agent
+/// answered, read from the site's class judgment, and so blocks. A site whose
+/// class maps to no control yields an advisory row, and COVERAGE says why.
+#[test]
+fn gate_rows_carry_the_question_control_and_a_row_without_one_is_advisory() {
+    let fx = fixture();
+    let other_go = fx.dir.path().join("svc").join("other.go");
+    std::fs::write(&other_go, "package svc\n\nfunc o() { y.Call() }\n").unwrap();
+    let mut packets = std::fs::read_to_string(&fx.packets).unwrap();
+    packets.push_str(&format!(
+        "{{\"snapshot_id\":\"fixture\",\"file_path\":{p:?},\"line_number\":30,\"func\":\"Call\",\"client_type\":\"y.Other\",\"snippet\":\"y.Call()\",\"lang\":\"go\"}}\n",
+        p = other_go.to_str().unwrap(),
+    ));
+    std::fs::write(&fx.packets, packets).unwrap();
+    let other_key = format!("{}:30:y.Other:Call", other_go.to_str().unwrap());
+    std::fs::write(
+        fx.dir.path().join(".revelara.yaml"),
+        "scanner:\n  agent_verdicts: gate\n",
+    )
+    .unwrap();
+    let judgments = fx.dir.path().join("judgments.json");
+    std::fs::write(
+        &judgments,
+        r#"[{"api":"x.Unknown.Mystery","scope":"runtime","verdict":"surface","severity":"high","control":"RC-019"}]"#,
+    )
+    .unwrap();
+    let reply = format!(
+        r#"[{{"site":"{}","verdict":"violates","reason":"Mystery dials with no deadline"}},{{"site":"{}","verdict":"violates","reason":"Call waits forever"}}]"#,
+        fx.undecided_key, other_key
+    );
+    let cmd = stub_agent(fx.dir.path(), &reply, 0);
+    let out_json = fx.dir.path().join("out.json");
+    let (out, all) = scan(
+        &fx,
+        &[
+            "--blend",
+            "--judgments",
+            judgments.to_str().unwrap(),
+            "--out",
+            out_json.to_str().unwrap(),
+        ],
+        &[("RVL_AGENT_CMD", &cmd)],
+    );
+    assert!(
+        !out.status.success(),
+        "the row with a control blocks: {all}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_json).unwrap()).unwrap();
+    let row = |class: &str| {
+        doc["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["class"] == class)
+            .unwrap_or_else(|| panic!("no {class} row: {doc}"))
+            .clone()
+    };
+    let judged = row("agent.x.Unknown.Mystery");
+    assert_eq!(judged["control"], "RC-019", "{judged}");
+    assert_eq!(judged["severity"], "blocking", "{judged}");
+    let bare = row("agent.y.Other.Call");
+    assert_eq!(bare["control"], "", "{bare}");
+    assert_eq!(bare["severity"], "advisory", "{bare}");
+    assert!(
+        all.contains("1 agent violation advisory, not blocking")
+            && all.contains("no control maps to the site's API class"),
+        "COVERAGE says why the row is advisory: {all}"
+    );
+}

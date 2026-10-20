@@ -3265,6 +3265,9 @@ type ResolvedScan = (
     rvl_spec::SpecCache,
     ServerLane,
     bool,
+    // The judgments that graded the scan; the agent lanes read the control
+    // of an agent-answered site's class from them.
+    Vec<rvl_triage::ClassJudgment>,
 );
 
 /// Did the commercial spec cache load with ZERO API specs while there were
@@ -3679,7 +3682,15 @@ fn findings_from_sites(
         &unsized_sites,
         cache.construction_bound_specs(),
     ));
-    Ok((findings, items, sites, cache, server, empty_api_corpus))
+    Ok((
+        findings,
+        items,
+        sites,
+        cache,
+        server,
+        empty_api_corpus,
+        judgments,
+    ))
 }
 
 /// Map misuse-lane violations into triage items. The class key is (`misuse`,
@@ -3935,7 +3946,7 @@ fn run_scan(
             Some(path),
             true,
         ) {
-            Ok((_, _, _, specs, _, _)) => Some(specs),
+            Ok((_, _, _, specs, _, _, _)) => Some(specs),
             Err(e) if specs_file.is_none() => {
                 eprintln!(
                     "warning: the config lane did not run ({e:#}); \
@@ -3980,16 +3991,17 @@ fn run_scan(
         );
     }
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
-    let (findings, mut items, sites, specs, server, empty_api_corpus) = resolve_findings(
-        store,
-        keyset,
-        &stream.text,
-        specs_file,
-        judgments,
-        tiers,
-        Some(path),
-        true,
-    )?;
+    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
+        resolve_findings(
+            store,
+            keyset,
+            &stream.text,
+            specs_file,
+            judgments,
+            tiers,
+            Some(path),
+            true,
+        )?;
     items.extend(citems);
     // Structure + server-entry lanes join the ladder at the same seam: both
     // are control-mapped advisory findings outside the per-class triage.
@@ -4000,7 +4012,16 @@ fn run_scan(
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
-    let blended = blend.then(|| blend::run(path, None, &findings, &sites, stdout_color(color)));
+    let blended = blend.then(|| {
+        blend::run(
+            path,
+            None,
+            &findings,
+            &sites,
+            &judgments,
+            stdout_color(color),
+        )
+    });
     render_scan_output(
         state_path,
         path,
@@ -4204,6 +4225,12 @@ fn render_scan_output(
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
     coverage.by_lang = lang_coverage(findings, sites);
     coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
+    coverage.agent_no_control = hook_agent
+        .map(|a| a.gate_findings.as_slice())
+        .into_iter()
+        .chain(blended.map(|b| b.gate_findings.as_slice()))
+        .map(agent::no_control_count)
+        .sum();
     coverage.structure =
         render::StructureCoverage::from_verdicts(structure_rows.iter().map(|r| r.verdict.as_str()));
     for f in findings.iter().filter(|f| !f.verdict.is_resolved()) {
@@ -4279,6 +4306,7 @@ fn render_scan_output(
             findings,
             sites,
             structure_rows,
+            config.map(|lane| &lane.sites),
             hook_agent
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
@@ -5464,18 +5492,19 @@ fn run_scan_incremental(
     } else {
         scan.sites
     };
-    let (findings, mut items, sites, specs, server, empty_api_corpus) = findings_from_sites(
-        store,
-        keyset,
-        scan_sites,
-        &scan.repo_cfg,
-        0,
-        specs_file,
-        judgments,
-        tiers,
-        Some(path),
-        true,
-    )?;
+    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
+        findings_from_sites(
+            store,
+            keyset,
+            scan_sites,
+            &scan.repo_cfg,
+            0,
+            specs_file,
+            judgments,
+            tiers,
+            Some(path),
+            true,
+        )?;
     // The content lane is cheap (one regex pass over the tree) and its rules
     // change with the binary, not the sources, so it runs FULL on every warm
     // scan rather than riding the packet index.
@@ -5539,6 +5568,7 @@ fn run_scan_incremental(
             &changed_files,
             &findings,
             &sites,
+            &judgments,
             &agent::telemetry_path_from_state(state_path),
             env!("CARGO_PKG_VERSION"),
             stdout_color(color),
@@ -5553,6 +5583,7 @@ fn run_scan_incremental(
             changed_only.then_some(changed_files.as_slice()),
             &findings,
             &sites,
+            &judgments,
             stdout_color(color),
         )
     });
@@ -5634,16 +5665,17 @@ fn run_explain(
     // a degraded language must not stop it printing the finding the user asked
     // about. Strictness belongs to `scan`, which is what gates.
     let stream = resolve_packet_stream(retrieved, path, false, false)?;
-    let (_findings, mut items, _sites, specs, server, _empty_api_corpus) = resolve_findings(
-        store,
-        keyset,
-        &stream.text,
-        specs_file,
-        judgments,
-        TierFilter::Both,
-        Some(path),
-        false,
-    )?;
+    let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
+        resolve_findings(
+            store,
+            keyset,
+            &stream.text,
+            specs_file,
+            judgments,
+            TierFilter::Both,
+            Some(path),
+            false,
+        )?;
     // Mirror the scan's content lane so a `secret.*` finding id resolves in
     // the live fallback too (skipped for --retrieved, same as scan).
     if retrieved.is_none() {
@@ -5702,7 +5734,7 @@ fn run_suppress(
             None => {
                 let scan_path = path.unwrap_or(&cwd);
                 let stream = resolve_packet_stream(retrieved, scan_path, false, false)?;
-                let (_findings, mut items, _sites, specs, server, _empty_api_corpus) =
+                let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
                     resolve_findings(
                         store,
                         keyset,
@@ -5801,31 +5833,33 @@ fn run_report(
         // Server-entry sites were partitioned out of `sites` inside the
         // pipeline: they are control-level spec questions, never candidates
         // for the shape-only API-surface report.
-        let (findings, _items, sites, _specs, _server, _empty_api_corpus) = findings_from_sites(
-            store,
-            keyset,
-            scan.sites,
-            &scan.repo_cfg,
-            0,
-            specs_file,
-            None,
-            tiers,
-            Some(path),
-            false,
-        )?;
+        let (findings, _items, sites, _specs, _server, _empty_api_corpus, _judgments) =
+            findings_from_sites(
+                store,
+                keyset,
+                scan.sites,
+                &scan.repo_cfg,
+                0,
+                specs_file,
+                None,
+                tiers,
+                Some(path),
+                false,
+            )?;
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(retrieved, path, false, false)?;
-        let (findings, _items, sites, _specs, _server, _empty_api_corpus) = resolve_findings(
-            store,
-            keyset,
-            &stream.text,
-            specs_file,
-            None,
-            tiers,
-            Some(path),
-            false,
-        )?;
+        let (findings, _items, sites, _specs, _server, _empty_api_corpus, _judgments) =
+            resolve_findings(
+                store,
+                keyset,
+                &stream.text,
+                specs_file,
+                None,
+                tiers,
+                Some(path),
+                false,
+            )?;
         (findings, sites)
     };
 
@@ -8590,19 +8624,16 @@ mod tests {
     /// repo-scoped record, so the lane reads as scanned with zero sites.
     #[cfg(unix)]
     fn recording_helper(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let ran = dir.join(format!("{name}.ran"));
         let script = dir.join(name);
-        std::fs::write(
+        rvl_testgate::write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\ntouch '{}'\necho '{}'\n",
                 ran.display(),
                 r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[]}"#
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (script, ran)
     }
 

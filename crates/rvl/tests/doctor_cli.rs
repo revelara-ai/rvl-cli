@@ -80,12 +80,10 @@ fn write(path: &Path, body: &str) {
 /// Like [`write`], and executable: for stubs the doctor will actually RUN
 /// (the cindex `--engine-check` probe), not merely resolve.
 fn write_exec(path: &Path, body: &str) {
-    write(path, body);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
     }
+    rvl_testgate::write_executable(path, body);
 }
 
 /// A repo with the two lanes that survive manual setup BY DESIGN (C#, which

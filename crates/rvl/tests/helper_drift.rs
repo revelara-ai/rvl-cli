@@ -59,12 +59,7 @@ impl Fixture {
 
     fn write_helper(&self, name: &str, body: &str) -> PathBuf {
         let p = self.dir.path().join(name);
-        std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        rvl_testgate::write_executable(&p, body);
         p
     }
 

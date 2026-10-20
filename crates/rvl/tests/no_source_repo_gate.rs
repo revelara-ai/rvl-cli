@@ -59,20 +59,14 @@ fn path_with_rvl(dir: &Path) -> std::ffi::OsString {
     let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
     let wrapper = bin.join("rvl");
-    std::fs::write(
+    rvl_testgate::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nexec {} \"$@\" --specs-file {}\n",
             env!("CARGO_BIN_EXE_rvl"),
             specs.display()
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     match std::env::var_os("PATH") {
         Some(p) => {
             let mut dirs = vec![bin.clone()];

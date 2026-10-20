@@ -184,20 +184,14 @@ impl GoRepo {
         // is also what makes the installed shim resolve to the binary under
         // test.
         let wrapper = bin.join("rvl");
-        std::fs::write(
+        rvl_testgate::write_executable(
             &wrapper,
-            format!(
+            &format!(
                 "#!/bin/sh\nexec {} \"$@\" --specs-file {}\n",
                 env!("CARGO_BIN_EXE_rvl"),
                 specs.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         GoRepo { dir, root, bin }
     }
 
@@ -227,12 +221,7 @@ impl GoRepo {
     /// resolution classifies it Executable and no interpreter is needed.
     fn with_helper_stub(&self, name: &str, body: &str) -> PathBuf {
         let stub = self.dir.path().join(name);
-        std::fs::write(&stub, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        rvl_testgate::write_executable(&stub, body);
         stub
     }
 

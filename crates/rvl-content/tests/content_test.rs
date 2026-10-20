@@ -125,6 +125,20 @@ fn shannon_entropy_known_values() {
     assert!(shannon_entropy(&generic_secret()) > 3.5);
 }
 
+/// The entropy of a value is one number, to the bit: a threshold decision on
+/// it cannot change between two scans of one tree. A reordering of the same
+/// characters has the same counts, so it must give the same bits too.
+#[test]
+fn shannon_entropy_is_the_same_bits_for_the_same_counts() {
+    let s = generic_secret();
+    let reversed: String = s.chars().rev().collect();
+    let first = shannon_entropy(&s).to_bits();
+    for _ in 0..32 {
+        assert_eq!(shannon_entropy(&s).to_bits(), first);
+    }
+    assert_eq!(shannon_entropy(&reversed).to_bits(), first);
+}
+
 // --- redaction: the raw secret must never appear anywhere ---
 
 #[test]

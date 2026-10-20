@@ -507,6 +507,13 @@ same asymmetric rules: `satisfies` clears a site, `violates` is an
 agent-tagged advisory warning, and only `scanner.agent_verdicts: gate` lets
 it block. The deterministic findings and the `--out` eval rows never change.
 
+In gate mode, an agent row carries the control of the question the agent
+answered: the control that the class judgment of the site names, which is
+the control a deterministic row for the site would carry. A row whose class
+maps to no control stays advisory, because it cannot be waived by control,
+tracked on the coverage page, or tied to a causal factor. `COVERAGE` counts
+these rows and says why. The hook adjudication follows the same rule.
+
 Typing `--blend` is the consent for that run. These still refuse it:
 `RVL_NO_AGENT=1`, the org kill switch, and an explicit
 `scanner.use_agent: deny` in `.revelara.yaml`.

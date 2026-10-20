@@ -106,20 +106,14 @@ impl PyRepo {
         // is also what makes the installed shim resolve to the binary under
         // test.
         let wrapper = bin.join("rvl");
-        std::fs::write(
+        rvl_testgate::write_executable(
             &wrapper,
-            format!(
+            &format!(
                 "#!/bin/sh\nexec {} \"$@\" --specs-file {}\n",
                 env!("CARGO_BIN_EXE_rvl"),
                 specs.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         PyRepo { dir, root, bin }
     }
 
@@ -360,20 +354,14 @@ fn a_repo_with_no_supported_source_still_reads_clean() {
     let specs = dir.path().join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
     let wrapper = bin.join("rvl");
-    std::fs::write(
+    rvl_testgate::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nexec {} \"$@\" --specs-file {}\n",
             env!("CARGO_BIN_EXE_rvl"),
             specs.display()
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     let envs = |c: &mut Command| {
         c.env("PATH", bin.clone().into_os_string())
             .env("HOME", dir.path().join("home"))

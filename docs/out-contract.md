@@ -100,6 +100,13 @@ The orchestrator uses it to:
     { "site_id": "repo", "snapshot_id": "...", "verdict": "violates",
       "reason": "no test files for go", "class": "repo_structure.RC-033" }
   ],
+  "config_sites": [
+    { "format": "kubernetes", "file": "k8s/api.yaml", "line": 0,
+      "resource": "deployment:api", "key": "workload.replicas", "value": "1",
+      "verdict": "violates", "control": "RC-001",
+      "rule": "below the minimum of 2" }
+  ],
+  "config_sites_overflow": 0,
   "hook_agent": null,
   "blend": null
 }
@@ -229,6 +236,35 @@ The orchestrator uses it to:
   record). An empty array never means that the repository satisfies the
   controls. To score the lane against a gold set, key each gold case by a
   control code (`RC-033`) or by the full class.
+- `config_sites` is the config lane, one row per setting it read, whatever
+  the verdict: the sites behind the `coverage.config.by_key` counts, so a
+  consumer can sample them. The rows are pre-waiver engine truth. When no
+  row overflowed the cap, the rows of one `(format, key)` have the same
+  verdict counts as its `by_key` row. The fields:
+  - `format` and `key`: the config format and the key, as in `by_key`.
+  - `file`: the repo-relative file the setting is anchored to.
+  - `line`: the line of the setting, or `0` when the retriever does not
+    record one. Today only the Dockerfile retriever records lines; the YAML,
+    HCL and TOML retrievers write `0`.
+  - `resource`: the parsed unit the setting belongs to, `<kind>:<name>`
+    (`deployment:api`, `job:build`, `container:deployment/api/app`), or a
+    bare unit for a file-wide setting (`workflow`, `manifest`).
+  - `value`: the effective value as the lane judged it, at most 200
+    characters; a longer value is cut there and ends with `…`. Null when the
+    value is set outside the repository.
+  - `verdict`: `violates` | `satisfies` | `abstain` | `not_applicable`.
+  - `control`: the control of the spec that judged the setting, empty when
+    no spec did.
+  - `rule`: the reason's rule phrase, the text before any `:` detail. For a
+    violation it is the phrase the ladder row's `description` ends with; for
+    an abstention it says why (`no config spec for kubernetes.pod.anti-affinity`).
+    A satisfied reason can hold the value, so `rule` is cut at 200
+    characters in the same way as `value`.
+  The rows are ordered by format, file, line, resource, then key. A scan
+  lists at most 5000 of them; `config_sites_overflow` counts the settings
+  past that cap, so `config_sites` plus `config_sites_overflow` equals
+  `coverage.config.total`. Both are empty and `0` when the config lane did
+  not run. Additive.
 - `undecided` lists each site the engine reached and abstained on, with its
   lever and its path-derived scope (`runtime` | `migration` | `test_support`
   | `dev_only` | `backfill`). Scope exists so a consumer can rank runtime
@@ -291,7 +327,11 @@ The orchestrator uses it to:
 ## What this contract deliberately excludes
 
 - No source content, no secret values: sites are `path:line` references. The
-  document stays within the same privacy posture as the ladder itself. (The
+  document stays within the same privacy posture as the ladder itself. The
+  one value it carries is `config_sites[].value`, the effective value of a
+  setting a config retriever emits (a timeout, a replica count, an image
+  pin), cut to 200 characters. The retrievers emit no environment variable,
+  secret or credential setting. (The
   shape-only factory report remains a separate channel with a stricter
   contract; nothing here feeds it.)
 - No agent/lens findings: this document is deterministic-engine truth only.

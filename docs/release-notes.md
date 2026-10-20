@@ -9,6 +9,17 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Agent gate rows carry a control
+
+Under `scanner.agent_verdicts: gate`, a ladder row from an agent `violates`
+verdict (`agent.<type>.<method>`) now has the `control` of the site's class
+judgment in `--out` and in `rvl explain`. Before, the field was empty.
+
+- Changed: a gate row whose class maps to no control is advisory, and
+  `COVERAGE` prints
+  `<n> agent violation(s) advisory, not blocking — no control maps to the site's API class, ...`.
+  Before, every gate row blocked.
+
 ### Named contexts in `~/.revelara/config.yaml`
 
 **Minimum version to probe for: the first release after 1.6.0.**
@@ -56,6 +67,25 @@ earlier release writes no such key.
   on a `factors:` line. Only the codes are shown, not the factor names.
 
 See [the `--out` contract](out-contract.md).
+
+### `config_sites` in the `rvl scan --out` document
+
+**Minimum version to probe for: the first release after 1.6.0.** A document
+from an earlier version has no `config_sites` key. Read that as "not
+reported", not as "no config settings".
+
+- `config_sites[]` has one row for each config setting the config lane read,
+  whatever its verdict: `format`, `file`, `line`, `resource`, `key`,
+  `value`, `verdict`, `control` and `rule`. These are the settings that
+  `coverage.config.by_key` counts.
+- `line` is `0` when the retriever records no line. Today only Dockerfile
+  rows have a line.
+- `value` and `rule` are cut at 200 characters.
+- A scan lists at most 5000 rows. `config_sites_overflow` counts the
+  settings that the cap left out.
+
+The schema is still `rvl-scan/v1`; the fields are additive. See
+[the `--out` contract](out-contract.md#field-semantics).
 
 ## 1.6.0 (2026-10-15)
 

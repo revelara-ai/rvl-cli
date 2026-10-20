@@ -68,6 +68,7 @@ pub fn select_undecided(
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
     changed: Option<&[String]>,
+    judgments: &[rvl_triage::ClassJudgment],
 ) -> Selection {
     let changed: Option<std::collections::HashSet<&str>> =
         changed.map(|c| c.iter().map(String::as_str).collect());
@@ -95,6 +96,7 @@ pub fn select_undecided(
             client_type: s.client_type.clone(),
             method: s.method.clone(),
             reason: f.reason.clone(),
+            control: rvl_triage::control_for(s, &f.reason, judgments),
         });
     }
     sel
@@ -400,9 +402,10 @@ pub fn run(
     changed: Option<&[String]>,
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
+    judgments: &[rvl_triage::ClassJudgment],
     color: bool,
 ) -> BlendOutput {
-    let sel = select_undecided(findings, sites, changed);
+    let sel = select_undecided(findings, sites, changed, judgments);
     let gate = agent::RepoAgentConfig::load(repo_root).gate_verdicts;
     let env_no_agent = std::env::var("RVL_NO_AGENT").ok().as_deref() == Some("1");
     if let Some(why) = veto(
@@ -462,7 +465,7 @@ mod tests {
     fn batch(n: usize) -> Selection {
         let findings: Vec<_> = (0..n).map(|_| abstain("no spec")).collect();
         let sites: Vec<_> = (0..n).map(|i| site("svc/a.go", i as u32 + 1)).collect();
-        select_undecided(&findings, &sites, None)
+        select_undecided(&findings, &sites, None, &[])
     }
 
     struct Fake {
@@ -521,7 +524,7 @@ mod tests {
             site("svc/a_test.go", 3),
             site("migrations/001.go", 4),
         ];
-        let sel = select_undecided(&findings, &sites, None);
+        let sel = select_undecided(&findings, &sites, None, &[]);
         assert_eq!(sel.batch.len(), 1, "{sel:?}");
         assert_eq!(sel.batch[0].file_line, "svc/a.go:1");
         assert_eq!(sel.out_of_scope, 2, "test + migration skipped on purpose");
@@ -533,7 +536,7 @@ mod tests {
         let findings = vec![abstain("no spec"), abstain("no spec")];
         let sites = vec![site("svc/a.go", 1), site("svc/b.go", 2)];
         let changed = vec!["svc/b.go".to_string()];
-        let sel = select_undecided(&findings, &sites, Some(&changed));
+        let sel = select_undecided(&findings, &sites, Some(&changed), &[]);
         assert_eq!(sel.batch.len(), 1);
         assert_eq!(sel.batch[0].file_line, "svc/b.go:2");
     }

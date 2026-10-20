@@ -109,6 +109,27 @@ fn normalize_judgment_api(api: &str) -> &str {
     a.strip_suffix("()").unwrap_or(a).trim_end()
 }
 
+/// The judgment that grades class `k`, or None when no judgment names it.
+/// Most specific wins, never file order (po-av01j.96). A wrong match does not
+/// just suppress: it also stamps the class with another judgment's severity,
+/// fix text and RC control code.
+pub fn judgment_for<'a>(k: &ClassKey, judgments: &'a [ClassJudgment]) -> Option<&'a ClassJudgment> {
+    judgments
+        .iter()
+        .filter_map(|j| judgment_match_rank(j, k).map(|rank| (rank, j.api.len(), j)))
+        .max_by_key(|(rank, len, _)| (*rank, *len))
+        .map(|(_, _, j)| j)
+}
+
+/// The control of the class a site belongs to: the control a deterministic
+/// row for the same site would carry. Empty when no judgment names the class,
+/// or the judgment names no control.
+pub fn control_for(site: &Site, reason: &str, judgments: &[ClassJudgment]) -> String {
+    judgment_for(&class_of(site, reason), judgments)
+        .map(|j| j.control.clone())
+        .unwrap_or_default()
+}
+
 /// The client-type half of `api` given the method it must end with, or None if
 /// it does not end with that method at a dot boundary.
 ///
@@ -189,21 +210,10 @@ pub fn triage(
         }
     }
 
-    let judge = |k: &ClassKey| -> Option<&ClassJudgment> {
-        // Most specific wins, never file order (po-av01j.96). A wrong match
-        // does not just suppress: it also stamps the class with another
-        // judgment's severity, fix text and RC control code.
-        judgments
-            .iter()
-            .filter_map(|j| judgment_match_rank(j, k).map(|rank| (rank, j.api.len(), j)))
-            .max_by_key(|(rank, len, _)| (*rank, *len))
-            .map(|(_, _, j)| j)
-    };
-
     let mut out: Vec<TriagedItem> = classes
         .into_iter()
         .map(|(k, ids)| {
-            let j = judge(&k);
+            let j = judgment_for(&k, judgments);
             TriagedItem {
                 disposition: j
                     .map(|j| j.verdict.clone())

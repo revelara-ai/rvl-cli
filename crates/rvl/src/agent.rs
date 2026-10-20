@@ -360,6 +360,10 @@ pub struct UndecidedSite {
     pub method: String,
     /// The engine's abstain reason (why it could not decide).
     pub reason: String,
+    /// The control of the question the agent answers for this site: the
+    /// control its class judgment names, the same one a deterministic row for
+    /// the site would carry. Empty when no judgment maps the class to one.
+    pub control: String,
 }
 
 /// Batch priority of a scope, lowest first: a runtime site is on a request
@@ -397,6 +401,7 @@ pub fn delta_undecided(
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
     changed_files: &[String],
+    judgments: &[rvl_triage::ClassJudgment],
 ) -> (Vec<UndecidedSite>, usize) {
     let changed: std::collections::HashSet<&str> =
         changed_files.iter().map(String::as_str).collect();
@@ -431,6 +436,7 @@ pub fn delta_undecided(
             client_type: s.client_type.clone(),
             method: s.method.clone(),
             reason: f.reason.clone(),
+            control: rvl_triage::control_for(s, &f.reason, judgments),
         })
         .collect();
     (all, truncated)
@@ -619,6 +625,12 @@ pub fn apply_verdicts(sites: &[UndecidedSite], outcome: &Outcome) -> Adjudicatio
 /// rows are agent-tagged in the description and waivable under the
 /// `agent.<client_type>.<method>` rule, a namespace disjoint from every
 /// deterministic class key.
+///
+/// A row carries the control of the question the agent answered. A site whose
+/// class maps to no control yields an ADVISORY row (disposition `unjudged`):
+/// a blocking finding must be waivable by control, tracked on the coverage
+/// page and tied to a causal factor, and a row with no control can be none
+/// of those. The coverage block says why ([`no_control_count`]).
 pub fn gate_findings(
     adj: &Adjudication,
     sites: &[UndecidedSite],
@@ -632,15 +644,20 @@ pub fn gate_findings(
         .filter_map(|v| {
             let s = sites.iter().find(|s| s.site_key == v.site_key)?;
             let class_rule = format!("agent.{}.{}", s.client_type, s.method);
+            let disposition = if s.control.is_empty() {
+                "unjudged"
+            } else {
+                "surface"
+            };
             Some(render::Finding {
                 id: render::finding_id(&class_rule),
                 site: s.file_line.clone(),
                 description: format!("agent: {}", v.reason),
-                disposition: "surface".to_string(),
+                disposition: disposition.to_string(),
                 severity: "high".to_string(),
                 incident_count: 0,
                 critical_count: 0,
-                control: String::new(),
+                control: s.control.clone(),
                 fix: String::new(),
                 site_count: 1,
                 example_sites: Vec::new(),
@@ -651,6 +668,12 @@ pub fn gate_findings(
             })
         })
         .collect()
+}
+
+/// How many agent gate rows carry no control, and so stay advisory. Counted
+/// over the rows [`gate_findings`] produced; the coverage block reports it.
+pub fn no_control_count(rows: &[render::Finding]) -> usize {
+    rows.iter().filter(|f| f.control.is_empty()).count()
 }
 
 /// Render the agent block, printed after the ladder. Its own section on
@@ -898,6 +921,7 @@ pub fn run_hook_adjudication(
     changed_files: &[String],
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
+    judgments: &[rvl_triage::ClassJudgment],
     telemetry_file: &Path,
     scanner_version: &str,
     color: bool,
@@ -914,7 +938,7 @@ pub fn run_hook_adjudication(
         // never chat on every commit.
         Consent::Disabled { .. } => return None,
     };
-    let (batch, truncated) = delta_undecided(findings, sites, changed_files);
+    let (batch, truncated) = delta_undecided(findings, sites, changed_files, judgments);
     if batch.is_empty() {
         // Median case: nothing undecided in the delta, no invocation at all.
         return None;
@@ -971,6 +995,7 @@ mod tests {
             client_type: ct.to_string(),
             method: m.to_string(),
             reason: "no spec for this API".to_string(),
+            control: "RC-019".to_string(),
         }
     }
 
@@ -1167,7 +1192,7 @@ scanner:
             core_site("unchanged.go", 3, "c.C", "Do"),
         ];
         let changed = vec!["changed.go".to_string()];
-        let (batch, truncated) = delta_undecided(&findings, &sites, &changed);
+        let (batch, truncated) = delta_undecided(&findings, &sites, &changed, &[]);
         // Only the undecided site in the CHANGED file: the decided site is
         // untouchable and the unchanged file is out of delta scope.
         assert_eq!(batch.len(), 1);
@@ -1182,7 +1207,7 @@ scanner:
         let sites: Vec<_> = (0..n)
             .map(|i| core_site("f.go", i as u32, "x.X", "Do"))
             .collect();
-        let (batch, truncated) = delta_undecided(&findings, &sites, &["f.go".to_string()]);
+        let (batch, truncated) = delta_undecided(&findings, &sites, &["f.go".to_string()], &[]);
         assert_eq!(batch.len(), MAX_BATCH_SITES);
         assert_eq!(truncated, 3);
     }
@@ -1208,7 +1233,7 @@ scanner:
     fn runtime_sites_keep_their_slots_and_test_support_is_truncated() {
         let k = 4;
         let (findings, sites) = mixed_scope_input(k);
-        let (batch, truncated) = delta_undecided(&findings, &sites, &mixed_scope_changed());
+        let (batch, truncated) = delta_undecided(&findings, &sites, &mixed_scope_changed(), &[]);
         assert_eq!(truncated, k);
         let sent: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
         for i in 1..=MAX_BATCH_SITES {
@@ -1232,7 +1257,7 @@ scanner:
         ];
         let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
         let changed: Vec<String> = sites.iter().map(|s| s.file_path.clone()).collect();
-        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        let (batch, _) = delta_undecided(&findings, &sites, &changed, &[]);
         let order: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
         assert_eq!(
             order,
@@ -1255,7 +1280,7 @@ scanner:
         let sites = vec![hook, core_site("b/client.py", 1, "x.X", "Do")];
         let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
         let changed: Vec<String> = sites.iter().map(|s| s.file_path.clone()).collect();
-        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        let (batch, _) = delta_undecided(&findings, &sites, &changed, &[]);
         assert_eq!(batch[0].file_line, "b/client.py:1");
     }
 
@@ -1271,7 +1296,7 @@ scanner:
         sites.extend((0..9).map(|i| core_site("unchanged.go", i, "wide.W", "Do")));
         let findings: Vec<_> = sites.iter().map(|_| abstain_finding("no spec")).collect();
         let changed = vec!["a.go".to_string(), "b.go".to_string()];
-        let (batch, _) = delta_undecided(&findings, &sites, &changed);
+        let (batch, _) = delta_undecided(&findings, &sites, &changed, &[]);
         let order: Vec<&str> = batch.iter().map(|s| s.file_line.as_str()).collect();
         // Lines sort as numbers: 3 before 20.
         assert_eq!(order, vec!["b.go:1", "a.go:3", "a.go:20"]);
@@ -1281,12 +1306,15 @@ scanner:
     fn batch_order_is_stable_across_runs_and_input_order() {
         let (findings, sites) = mixed_scope_input(3);
         let changed = mixed_scope_changed();
-        let first = delta_undecided(&findings, &sites, &changed);
-        let second = delta_undecided(&findings, &sites, &changed);
+        let first = delta_undecided(&findings, &sites, &changed, &[]);
+        let second = delta_undecided(&findings, &sites, &changed, &[]);
         assert_eq!(first, second);
         let rev_sites: Vec<_> = sites.iter().rev().cloned().collect();
         let rev_findings: Vec<_> = findings.iter().rev().cloned().collect();
-        assert_eq!(delta_undecided(&rev_findings, &rev_sites, &changed), first);
+        assert_eq!(
+            delta_undecided(&rev_findings, &rev_sites, &changed, &[]),
+            first
+        );
     }
 
     #[test]
@@ -1499,6 +1527,58 @@ scanner:
     }
 
     #[test]
+    fn gate_rows_carry_the_control_and_a_row_with_none_is_advisory() {
+        let mut bare = site("k2", "b.B", "Go");
+        bare.control = String::new();
+        let sites = vec![site("k1", "a.A", "Do"), bare];
+        let out = outcome_with(
+            ["k1", "k2"]
+                .iter()
+                .map(|k| SiteVerdict {
+                    site_key: k.to_string(),
+                    verdict: AgentVerdict::Violates,
+                    reason: "no bound".into(),
+                })
+                .collect(),
+        );
+        let adj = apply_verdicts(&sites, &out);
+        let rows = gate_findings(&adj, &sites, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].control, "RC-019");
+        assert_eq!(render::classify(&rows[0]), render::Section::Blocking);
+        assert_eq!(rows[1].control, "");
+        assert_eq!(
+            render::classify(&rows[1]),
+            render::Section::Advisory,
+            "a row with no control cannot block"
+        );
+        assert_eq!(no_control_count(&rows), 1);
+    }
+
+    #[test]
+    fn the_batch_takes_the_control_from_the_class_judgment() {
+        let findings = vec![
+            abstain_finding("no spec for a.A.Do"),
+            abstain_finding("no spec for b.B.Go"),
+        ];
+        let sites = vec![
+            core_site("f.go", 1, "a.A", "Do"),
+            core_site("f.go", 2, "b.B", "Go"),
+        ];
+        let judgments = vec![rvl_triage::ClassJudgment {
+            api: "a.A.Do".into(),
+            scope: "runtime".into(),
+            verdict: "surface".into(),
+            severity: "high".into(),
+            fix: String::new(),
+            control: "RC-019".into(),
+        }];
+        let (batch, _) = delta_undecided(&findings, &sites, &["f.go".to_string()], &judgments);
+        assert_eq!(batch[0].control, "RC-019");
+        assert_eq!(batch[1].control, "", "no judgment names b.B.Go");
+    }
+
+    #[test]
     fn gate_mode_satisfies_never_becomes_a_row() {
         // Asymmetry holds in gate mode too: only violations gate; a satisfies
         // clears in the block, it never turns into a ladder row.
@@ -1521,7 +1601,7 @@ scanner:
         let findings = vec![abstain_finding("no spec for a.A.Do")];
         let before = findings.clone();
         let sites = vec![core_site("f.go", 1, "a.A", "Do")];
-        let (batch, _) = delta_undecided(&findings, &sites, &["f.go".to_string()]);
+        let (batch, _) = delta_undecided(&findings, &sites, &["f.go".to_string()], &[]);
         let out = outcome_with(vec![SiteVerdict {
             site_key: batch[0].site_key.clone(),
             verdict: AgentVerdict::Satisfies,

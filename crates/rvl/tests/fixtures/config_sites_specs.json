@@ -1,0 +1,10 @@
+{
+  "apis": [],
+  "configs": [],
+  "config_keys": [
+    {"format": "github-actions", "key": "job.timeout-minutes", "expect": {"kind": "present"}, "confidence": 0.9, "control": "RC-013", "severity": "medium", "fix": "set jobs.<id>.timeout-minutes", "rationale": "a job with no timeout runs under the 360-minute default"},
+    {"format": "github-actions", "key": "step.uses.ref", "expect": {"kind": "pattern", "name": "sha40"}, "confidence": 0.9, "control": "RC-045", "severity": "low", "fix": "pin the action to a commit SHA", "rationale": "a tag can be moved"},
+    {"format": "kubernetes", "key": "workload.replicas", "expect": {"kind": "at_least", "value": 2}, "confidence": 0.9, "control": "RC-001", "severity": "medium", "fix": "run at least two replicas", "rationale": "one replica is a single point of failure"},
+    {"format": "dep-manifests", "key": "dockerfile.final_stage_user", "expect": {"kind": "one_of", "values": ["non-root"]}, "confidence": 0.9, "control": "RC-044", "severity": "medium", "fix": "add a USER instruction with an unprivileged user", "rationale": "a root process widens a container escape"}
+  ]
+}
