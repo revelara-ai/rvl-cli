@@ -90,20 +90,14 @@ fn path_with_rvl(dir: &Path) -> (std::ffi::OsString, std::path::PathBuf) {
     let specs = dir.join("specs.json");
     std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
     let wrapper = bin.join("rvl");
-    std::fs::write(
+    rvl_testgate::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nexec {} \"$@\" --specs-file {}\n",
             env!("CARGO_BIN_EXE_rvl"),
             specs.display()
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     let path = match std::env::var_os("PATH") {
         Some(p) => {
             let mut dirs = vec![bin.clone()];
@@ -146,12 +140,7 @@ impl Fixture {
         let hooks = self.root.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let p = hooks.join(name);
-        std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        rvl_testgate::write_executable(&p, body);
     }
 
     /// `git` in the repo, with the upgraded binary on PATH and an isolated

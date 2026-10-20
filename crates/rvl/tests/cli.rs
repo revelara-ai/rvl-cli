@@ -4375,8 +4375,6 @@ fn copy_fixture_to(dst: &std::path::Path) {
 #[cfg(unix)]
 #[test]
 fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = tempfile::tempdir().unwrap();
     let Some(goindex_bin) = build_goindex(dir.path()) else {
         return;
@@ -4400,8 +4398,7 @@ fn hook_scan_with_consent_runs_the_stub_agent_and_records_telemetry() {
 
     // The stub approved agent: proof of invocation + a valid empty verdict set.
     let stub = dir.path().join("agent-stub.sh");
-    std::fs::write(&stub, "#!/bin/sh\necho '[]'\n").unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rvl_testgate::write_executable(&stub, "#!/bin/sh\necho '[]'\n");
 
     // Empty specs: every fixture site abstains (no spec), i.e. is undecided.
     let specs = dir.path().join("specs.json");
@@ -5178,12 +5175,13 @@ fn run_bounded(
         // Kill the whole group before reaping the leader, so its pid (the
         // group id) cannot have been reused by an unrelated process.
         #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
-            .stderr(std::process::Stdio::null())
-            .status();
+        let group_killed = kill_process_group(child.id());
         let _ = child.kill();
         let _ = child.wait();
+        #[cfg(unix)]
+        if let Err(e) = group_killed {
+            panic!("{tag} timed out and its process group could not be killed: {e}");
+        }
         return Ok(None);
     };
     let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -5191,6 +5189,100 @@ fn run_bounded(
         status,
         format!("{}{}", read(&out_path), read(&err_path)),
     )))
+}
+
+/// SIGKILL every process in group `pgid` with killpg(2). Not by running
+/// `kill`: a slim image has no kill binary, and a group kill that silently
+/// did nothing left the build's children running with the cause hidden.
+/// ESRCH (no such group, so nothing left to kill) is success; any other
+/// failure is an error.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) -> std::io::Result<()> {
+    let pgid = libc::pid_t::try_from(pgid).map_err(std::io::Error::other)?;
+    // SAFETY: killpg takes two integers and touches no memory of ours.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        err.kind(),
+        format!("killpg({pgid}, SIGKILL): {err}"),
+    ))
+}
+
+/// Set in the child run of the test below, which is the one that holds the
+/// assertions; the parent run only clears PATH for it.
+const NO_KILL_ON_PATH_CHILD: &str = "RVL_TEST_NO_KILL_ON_PATH_CHILD";
+
+/// run_bounded's group kill must not depend on a `kill` binary. The test
+/// binary runs itself again with PATH empty, so no `kill` can be found; in
+/// that run a bounded command times out with a grandchild sleeping in its
+/// group, and the grandchild must be gone afterwards.
+#[cfg(unix)]
+#[test]
+fn run_bounded_kills_the_group_with_no_kill_binary_on_path() {
+    const NAME: &str = "run_bounded_kills_the_group_with_no_kill_binary_on_path";
+    let Some(sleep) = std::env::var_os(NO_KILL_ON_PATH_CHILD) else {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let sleep = std::env::split_paths(&path)
+            .map(|d| d.join("sleep"))
+            .find(|p| p.is_file())
+            .expect("this test machine has no `sleep` on PATH");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(NO_KILL_ON_PATH_CHILD, &sleep)
+            .env("PATH", "")
+            .output()
+            .expect("rerun the test binary");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the PATH-less run failed:\n{all}");
+        assert!(
+            all.contains("1 passed"),
+            "the PATH-less run ran no test:\n{all}"
+        );
+        return;
+    };
+    assert_eq!(std::env::var_os("PATH").as_deref(), Some("".as_ref()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleeper.pid");
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", r#""$0" 600 & echo $! > "$1"; wait"#])
+        .arg(&sleep)
+        .arg(&pid_file);
+    let ran = run_bounded(
+        &mut cmd,
+        dir.path(),
+        "sleeper",
+        std::time::Duration::from_secs(1),
+    )
+    .expect("the bounded command must start");
+    assert!(ran.is_none(), "a command that sleeps 600s must time out");
+
+    let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let gone = loop {
+        // SAFETY: signal 0 only checks that the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            break std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        if std::time::Instant::now() >= gone_by {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(gone, "the grandchild {pid} must be killed with its group");
 }
 
 /// A dotnet build that never ends must fail the test within the bound, name
@@ -5201,13 +5293,12 @@ fn run_bounded(
 #[cfg(unix)]
 #[test]
 fn csindex_build_that_never_ends_fails_within_the_bound() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("sleeper.pid");
     let fake = dir.path().join("dotnet");
-    std::fs::write(
+    rvl_testgate::write_executable(
         &fake,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              if [ \"$1\" = --version ]; then echo 8.0.0; exit 0; fi\n\
              sleep 600 &\n\
@@ -5215,9 +5306,7 @@ fn csindex_build_that_never_ends_fails_within_the_bound() {
              wait\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let bound = std::time::Duration::from_secs(3);
     let start = std::time::Instant::now();
@@ -7304,12 +7393,7 @@ fn detect_sweep(home: &std::path::Path, path: &std::path::Path, cache: &std::pat
 fn put_executable(dir: &std::path::Path, name: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(name);
-    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    rvl_testgate::write_executable(&path, "#!/bin/sh\nexit 0\n");
 }
 
 /// END TO END, BOTH HALVES OF THE INVERSION (po-av01j.193). rvl-cli detects

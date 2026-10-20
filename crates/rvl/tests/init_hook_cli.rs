@@ -738,9 +738,7 @@ fn hook_install_prints_lefthook_snippet_instead_of_writing() {
 
 #[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rvl_testgate::write_executable(path, body);
 }
 
 /// A PATH whose only entries are a fake `rvl` (optional) and the real

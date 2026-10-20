@@ -8623,19 +8623,16 @@ mod tests {
     /// repo-scoped record, so the lane reads as scanned with zero sites.
     #[cfg(unix)]
     fn recording_helper(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let ran = dir.join(format!("{name}.ran"));
         let script = dir.join(name);
-        std::fs::write(
+        rvl_testgate::write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\ntouch '{}'\necho '{}'\n",
                 ran.display(),
                 r#"{"packet_schema":2,"kind":"repo_config","snapshot_id":"x","constructions":[]}"#
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (script, ran)
     }
 
