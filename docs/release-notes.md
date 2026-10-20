@@ -7,7 +7,7 @@ The full list of changes in a release is on its
 
 To read the installed version, run `rvl --version` or `rvl version`.
 
-## After 1.5.0 (not released yet)
+## After 1.6.0 (not released yet)
 
 ### Named contexts in `~/.revelara/config.yaml`
 
@@ -41,9 +41,13 @@ and exits 2 on an earlier one.
 
 See [Configuration](configuration.md#named-contexts).
 
+## 1.6.0 (2026-10-15)
+
+The first release after `v1.5.0`.
+
 ### `rvl factor lookup`
 
-**Minimum version to probe for: the first release after 1.5.0.** `rvl` 1.5.0
+**Minimum version to probe for: 1.6.0.** `rvl` 1.5.0
 and earlier do not have the subcommand: `rvl factor lookup --help` exits 2
 there and exits 0 on a version that has it.
 
@@ -78,7 +82,7 @@ additive: no command or field changed.
 
 ### The config key `kubernetes container.run-as-user-class`
 
-**Minimum version to probe for: the first release after 1.5.0.**
+**Minimum version to probe for: 1.6.0.**
 
 The config lane reads `runAsUser` and `runAsNonRoot` in a Kubernetes manifest
 and emits one setting for each container: the user that the container is
@@ -109,11 +113,13 @@ Kubernetes workload gets one more row in `coverage.config.by_key` and a
 `coverage.config.total` that is higher by one for each container. No finding
 changes.
 
-## After 1.4.0 (not released yet)
+## 1.5.0 (2026-10-11)
+
+The first release after `v1.4.0`.
 
 ### `rvl report --queue`, and `routing` on `rvl cache keys --json`
 
-**Minimum version to probe for: the first release after 1.4.0.**
+**Minimum version to probe for: 1.5.0.**
 
 `rvl report --queue` lists every finding with no spec, with a computed
 `routing`: the two gates `deterministic` and `transferable`, the `quadrant`
@@ -127,7 +133,7 @@ text output shows the route at the end of each key that awaits a spec.
 
 ### `rvl report` leaves out repo-internal surfaces, and `--combine` ranks across repositories
 
-**Minimum version to probe for: the first release after 1.4.0.**
+**Minimum version to probe for: 1.5.0.**
 
 The `rvl report` payload has two new fields, `repo_internal_surfaces` and
 `repo_internal_sites`. A surface that the scanned repository declares itself
@@ -144,7 +150,7 @@ list. Each row has `client_type`, `method`, `lang`, `repo_count` and
 
 ### `scope` on each `sites` row of the `rvl scan --out` document
 
-**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+**Minimum version to probe for: 1.5.0.** `rvl` 1.4.0
 and earlier do not write the field, so a consumer must treat a row without it
 as "not classified", not as `runtime`.
 
@@ -159,7 +165,7 @@ the schema stays `rvl-scan/v1`.
 
 ### `coverage.config.by_key` in the `rvl scan --out` document
 
-**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+**Minimum version to probe for: 1.5.0.** `rvl` 1.4.0
 and earlier do not write the field, so a consumer must treat a document
 without it as "not measured", not as zero.
 
@@ -174,7 +180,7 @@ the schema stays `rvl-scan/v1`.
 
 ### The config key `dep-manifests dockerfile.final_stage_user`
 
-**Minimum version to probe for: the first release after 1.4.0.**
+**Minimum version to probe for: 1.5.0.**
 
 The config lane reads the `USER` instructions of a Dockerfile and emits one
 setting for each file: the user that the built image starts as. The value is
@@ -204,7 +210,7 @@ continuation line that started with `FROM` was read as a build stage.
 
 ### `rvl factor list` and `rvl factor show`
 
-**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+**Minimum version to probe for: 1.5.0.** `rvl` 1.4.0
 and earlier do not have the command: `rvl factor --help` exits 2 there and
 exits 0 on a version that has it.
 
@@ -232,7 +238,7 @@ addition is additive: no command or field changed.
 
 ### `--factor` on `rvl risk list`
 
-**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+**Minimum version to probe for: 1.5.0.** `rvl` 1.4.0
 and earlier do not have the flag: the output of `rvl risk list --help` has
 the text `--factor` only on a version that has it.
 
@@ -254,7 +260,7 @@ addition is additive: no command or field changed.
 
 ### Related causal factors in `rvl risk context` and `rvl control show`
 
-**Minimum version to probe for: the first release after 1.4.0.** `rvl` 1.4.0
+**Minimum version to probe for: 1.5.0.** `rvl` 1.4.0
 and earlier do not print the section. To probe, run `rvl control show <CODE>`
 or `rvl risk context <CODE>` and look for the heading
 `Related Causal Factors:`. The heading is absent on an older `rvl`. It is also

@@ -5,6 +5,14 @@ Releases are cut by pushing a v-prefixed semver tag (e.g. `v1.0.0`).
 archives, a CycloneDX SBOM and SLSA provenance, and publishes the Homebrew
 cask to `revelara-ai/homebrew-tap`.
 
+The release commit (the one that sets the new version in `Cargo.toml`, and
+that the tag points at) also renames the heading
+`## After <previous> (not released yet)` in
+[release-notes.md](release-notes.md) to `## <version> (<release date>)`, and
+changes each "the first release after <previous>" in that section's
+"Minimum version to probe for" lines to the version. A change merged after the
+tag starts a new `## After <version> (not released yet)` section at the top.
+
 A change reaches `main` through a pull request. A maintainer's approval sends
 it to a merge queue, which runs CI on the change merged with the current
 `main` and merges it when that run is green.
