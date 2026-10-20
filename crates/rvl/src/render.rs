@@ -147,6 +147,11 @@ pub struct Coverage {
     /// alone, and presenting it as the blend is the po-av01j.199 bug at a new
     /// seam. `None` when no blend ran or it completed.
     pub blend_incomplete: Option<String>,
+    /// Agent gate rows whose site's class maps to no control. They stay
+    /// advisory, and the coverage block says why: a row with no control
+    /// cannot be waived by control, tracked on the coverage page, or tied to
+    /// a causal factor.
+    pub agent_no_control: usize,
     /// Distinct machine-generated files whose packets were dropped before
     /// evaluation (po-av01j.133.7). Reported, never silent: excluding files
     /// without saying so reads as having scanned them, and it moves every
@@ -905,6 +910,16 @@ pub fn render_ladder(
             "  0 API specs in the commercial spec cache \u{2014} every API surface abstained as \
              no_spec; run `{BIN} sync`, and if it persists the published artifact is empty \
              (report it)"
+        );
+        let _ = writeln!(o, "{}", paint(&line, "33", color));
+    }
+    if cov.agent_no_control > 0 {
+        let n = cov.agent_no_control;
+        let line = format!(
+            "  {n} agent violation{} advisory, not blocking \u{2014} no control maps to the \
+             site's API class, so the row cannot be waived by control, tracked on the coverage \
+             page, or tied to a causal factor",
+            if n == 1 { "" } else { "s" }
         );
         let _ = writeln!(o, "{}", paint(&line, "33", color));
     }

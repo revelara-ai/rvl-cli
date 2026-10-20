@@ -9,6 +9,17 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Agent gate rows carry a control
+
+Under `scanner.agent_verdicts: gate`, a ladder row from an agent `violates`
+verdict (`agent.<type>.<method>`) now has the `control` of the site's class
+judgment in `--out` and in `rvl explain`. Before, the field was empty.
+
+- Changed: a gate row whose class maps to no control is advisory, and
+  `COVERAGE` prints
+  `<n> agent violation(s) advisory, not blocking — no control maps to the site's API class, ...`.
+  Before, every gate row blocked.
+
 ### Named contexts in `~/.revelara/config.yaml`
 
 **Minimum version to probe for: the first release after 1.6.0.**
