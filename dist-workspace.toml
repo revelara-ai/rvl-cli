@@ -39,13 +39,23 @@ cargo-cyclonedx = true
 # dist's `github-attestations`, which stores an attestation in GitHub's API
 # and publishes no file with the release.
 post-announce-jobs = ["./slsa-provenance"]
+# A smoke test of every archive before anything is published:
+# .github/workflows/smoke.yml unpacks each target's archive on that target's
+# own runner, runs `rvl --version` and scans a fixture repository with seed
+# specs (ci/smoke-archive.sh). A global-artifacts job, because that is the one
+# custom slot that runs after the per-target builds and that `host` waits for:
+# `host` runs only when it succeeded, so an archive that does not start or does
+# not scan is never uploaded.
+global-artifacts-jobs = ["./smoke"]
 # Publish jobs default to id-token+packages write and NOTHING else, which means
 # `contents: none` and a failing `actions/checkout` of this repo. The cask job
 # needs to read this repo (for ci/render-cask.sh) and nothing more; it reaches
 # the tap with a PAT, not GITHUB_TOKEN. The provenance job needs exactly what
 # slsa-github-generator documents: read the run, an OIDC token to sign with,
-# and write access to upload the provenance to the release.
-github-custom-job-permissions = { "publish-cask" = { contents = "read" }, "slsa-provenance" = { actions = "read", id-token = "write", contents = "write" } }
+# and write access to upload the provenance to the release. The smoke job reads
+# this repo for its script and fixture; the archives it tests are artifacts of
+# the same run, which need no permission.
+github-custom-job-permissions = { "publish-cask" = { contents = "read" }, "slsa-provenance" = { actions = "read", id-token = "write", contents = "write" }, "smoke" = { contents = "read" } }
 # No source.tar.gz on the release. The cask installs only the per-target
 # archives and nothing reads the tarball; ci/check-release-plan.sh fails the
 # build if the plan lists one again.
