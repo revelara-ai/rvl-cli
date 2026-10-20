@@ -349,11 +349,15 @@ fn inline_allow(line: &str) -> bool {
 }
 
 /// Shannon entropy of `s` in bits per character.
+///
+/// The terms are summed in character order. Float addition is not
+/// associative, so a `HashMap`, whose order is seeded per process, could put a
+/// value one rounding step either side of a threshold on two runs of one tree.
 pub fn shannon_entropy(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
-    let mut counts = std::collections::HashMap::new();
+    let mut counts = std::collections::BTreeMap::new();
     for c in s.chars() {
         *counts.entry(c).or_insert(0usize) += 1;
     }

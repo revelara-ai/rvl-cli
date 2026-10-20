@@ -762,7 +762,7 @@ fn paint(s: &str, code: &str, color: bool) -> String {
 }
 
 /// Render the severity-ladder hook output. `elapsed` is a caller-formatted
-/// timing string (e.g. "0.4s (warm)"). `config` is the G6 config lane's
+/// timing string (e.g. "scan complete in 0.42s"). `config` is the G6 config lane's
 /// coverage (None or empty renders nothing extra); config FINDINGS themselves
 /// ride in `findings` like any other finding, only the coverage lines differ.
 pub fn render_ladder(
