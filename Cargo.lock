@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "cindex"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "clang-sys",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "rustindex"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "rvl"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-bounds"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "rvl-core",
  "rvl-spec",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-cache"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-config"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "ignore",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-content"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "ignore",
  "regex",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-core"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-data"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -988,11 +988,12 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "ureq",
+ "webpki-roots",
 ]
 
 [[package]]
 name = "rvl-emission"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "rvl-core",
  "rvl-spec",
@@ -1000,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-index"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1014,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-misuse"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "rvl-core",
  "rvl-spec",
@@ -1022,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-propagate"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1033,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-skills"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -1052,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-spec"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1062,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "rvl-structure"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1074,14 +1075,14 @@ dependencies = [
 
 [[package]]
 name = "rvl-testgate"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "serde_yaml",
 ]
 
 [[package]]
 name = "rvl-triage"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "rvl-core",
@@ -1443,9 +1444,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
