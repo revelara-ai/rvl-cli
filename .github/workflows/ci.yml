@@ -165,6 +165,10 @@ jobs:
   # stay in `check` alone. Always GitHub-hosted: CI_RUNNER selects a Linux
   # fleet.
   check-macos:
+    # Names every trigger, so it is always true. The queue's workflow guard
+    # counts a gate need as a test job only when the queue config lists it or
+    # its `if:` names workflow_dispatch.
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -299,7 +303,7 @@ jobs:
           # A dispatched or push run must see success from every job. Only a
           # pull_request may also pass on skipped, which the merge queue's
           # workflow guard requires of every gate; no test job has an `if:`
-          # today, so on a pull_request they are never skipped.
+          # that can be false, so on a pull_request they are never skipped.
           for r in "${{ needs.check.result }}" "${{ needs.check-macos.result }}" "${{ needs.helpers.result }}"; do
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               case "$r" in success|skipped) ;; *) echo "ci-gate: a test job was $r" >&2; exit 1 ;; esac
