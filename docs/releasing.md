@@ -71,6 +71,32 @@ so a fresh install scans with no setup:
   `rvl-csindex` cask should install into that same directory so the two routes
   compose.
 
+## Smoke test of every archive
+
+Before `host` uploads anything, each per-target archive is run on the runner
+that built it. `global-artifacts-jobs = ["./smoke"]` in `dist-workspace.toml`
+makes the generated workflow call `.github/workflows/smoke.yml` once the
+builds succeed, with one job for each entry of the plan's build matrix. `host`
+does not run unless every one of those jobs passed. Each job runs
+`ci/smoke-archive.sh`, which unpacks the archive and checks two things:
+
+- `rvl --version` names the release version.
+- A scan of `ci/smoke/repo` with the seed specs in `ci/smoke/specs.json`
+  reaches a verdict under `--strict`. The fixture has one unbounded call each
+  in Go, C and Python. Each of those lanes must be `scanned` and decide a
+  `violates` site, with goindex and cindex served from the archive and pyindex
+  from the copy embedded in `rvl`. The scan runs with a scratch `HOME` and
+  with every helper override unset, so nothing on the runner can stand in for
+  a helper the archive should carry.
+
+On a pull request the builds are skipped, so the smoke jobs are too. To see
+them run before a real release, push a version tag to a fork.
+`crates/rvl/tests/release_smoke.rs` holds the wiring to its contract and runs
+the script against a fake archive.
+
+The macOS binaries are not notarized. The cask clears the quarantine flag
+instead (`ci/render-cask.sh`).
+
 ## SBOM and provenance
 
 Each release publishes two supply-chain assets beside the archives:

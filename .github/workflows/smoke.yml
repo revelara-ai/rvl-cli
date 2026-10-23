@@ -1,0 +1,73 @@
+name: Release smoke
+
+# Unpacks each release archive on its own platform and runs it: `rvl --version`,
+# then a scan of ci/smoke/repo with the seed specs in ci/smoke/specs.json. See
+# ci/smoke-archive.sh for what the scan must show.
+#
+# This is a cargo-dist CUSTOM GLOBAL-ARTIFACTS JOB: it is declared in
+# dist-workspace.toml as `global-artifacts-jobs = ["./smoke"]` and called by
+# the generated release.yml once `build-local-artifacts` has succeeded, with
+# the plan manifest passed in. `host` needs it, and `host` runs only when it
+# succeeded, so an archive that does not start or does not scan is never
+# uploaded to a release. On a pull request `build-local-artifacts` is skipped,
+# and so is this.
+#
+# One job per entry of the plan's build matrix, on the runner that entry was
+# built on: every target dist builds is smoked natively, and a new target is
+# covered with no edit here. Its permissions are granted by the caller, in
+# `github-custom-job-permissions` in dist-workspace.toml.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "cargo-dist plan manifest: the build matrix and the release version"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    name: smoke (${{ join(matrix.targets, ', ') }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.plan).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repo (for ci/smoke-archive.sh and its fixture)
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch this target's archive
+        uses: actions/download-artifact@v8
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: dist-artifacts
+
+      # goindex drives the `go` tool at scan time, so the Go lane needs a
+      # toolchain on the machine; the archive carries goindex and not Go.
+      # python3 for the embedded pyindex is already on every runner image.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache: false
+
+      - name: Unpack, run and scan
+        shell: bash
+        env:
+          PLAN: ${{ inputs.plan }}
+          TARGETS: ${{ join(matrix.targets, ' ') }}
+        run: |
+          set -euo pipefail
+          read -r -a targets <<<"$TARGETS"
+          # The archive is named for one target; a job building two would
+          # leave the second unsmoked.
+          if [ "${#targets[@]}" -ne 1 ]; then
+            echo "smoke assumes one target per build job, got: ${targets[*]}" >&2
+            exit 1
+          fi
+          version=$(jq -r '[ .releases[] | select(.app_name == "rvl") | .app_version ] | unique
+            | if length == 1 then .[0] else "" end' <<<"$PLAN")
+          [ -n "$version" ] || { echo "the plan names no single rvl version" >&2; exit 1; }
+          ci/smoke-archive.sh "dist-artifacts/rvl-${targets[0]}.tar.xz" "$version"

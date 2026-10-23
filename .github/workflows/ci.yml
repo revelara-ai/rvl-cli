@@ -25,8 +25,9 @@ env:
   # A live test that cannot reach its engine (libclang, node and `typescript`,
   # a JDK, rust-analyzer, Go, python3, the .NET SDK) prints SKIP and passes on
   # a workstation. With this set it fails instead (crates/rvl-testgate), so a
-  # green run here means every language lane executed. The `check` job
-  # provisions each engine below; a runner that lacks one is red, not quiet.
+  # green run here means every language lane executed. The `check` and
+  # `check-macos` jobs provision each engine below; a runner that lacks one is
+  # red, not quiet.
   RVLSCAN_REQUIRE_ENGINES: "1"
 
 # Runner selection follows the org convention: the `CI_RUNNER` variable selects
@@ -158,6 +159,68 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # check-macos: the workspace tests on macOS arm64, which the cask installs
+  # and no other job ran, with the same engines `check` provisions. fmt,
+  # clippy and the release-plan guard read the source, not the platform, and
+  # stay in `check` alone. Always GitHub-hosted: CI_RUNNER selects a Linux
+  # fleet.
+  check-macos:
+    # Names every trigger, so it is always true. The queue's workflow guard
+    # counts a gate need as a test job only when the queue config lists it or
+    # its `if:` names workflow_dispatch.
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rust-analyzer,rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the in-workspace helpers
+        run: cargo build -p rvl --bin cindex --bin rustindex
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: helpers/tsindex/package.json
+
+      - name: Install the tsindex dependencies
+        working-directory: helpers/tsindex
+        run: npm ci
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The aarch64-apple-darwin engine a release ships, from the same pin.
+      - name: Fetch the pinned libclang
+        run: |
+          ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
+
+      - name: Every engine is available
+        run: |
+          target/debug/cindex --engine-check
+          (cd helpers/tsindex && node -e "require('typescript')")
+          go version
+          javac -version
+          rust-analyzer --version
+          python3 --version
+          dotnet --version
+
+      - name: Test
+        run: cargo test --workspace
+
   # helpers: go vet and go test for goindex, plus pyindex and tsindex.
   helpers:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -223,6 +286,7 @@ jobs:
 
   # The one check run the merge queue reads, and the one a ruleset can require.
   # `check` and `helpers` are named in the queue config: do not rename them.
+  # `check-macos` gates through this job alone.
   # always() makes this job run when a need failed or was cancelled, so that
   # case reports a failure instead of a skipped (and so passing) check. The
   # event list is every trigger this workflow has, so the condition is always()
@@ -230,7 +294,7 @@ jobs:
   # by name in it.
   ci-gate:
     name: ci-gate
-    needs: [check, helpers]
+    needs: [check, check-macos, helpers]
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -238,9 +302,9 @@ jobs:
         run: |
           # A dispatched or push run must see success from every job. Only a
           # pull_request may also pass on skipped, which the merge queue's
-          # workflow guard requires of every gate; neither job has an `if:`
-          # today, so on a pull_request they are never skipped.
-          for r in "${{ needs.check.result }}" "${{ needs.helpers.result }}"; do
+          # workflow guard requires of every gate; no test job has an `if:`
+          # that can be false, so on a pull_request they are never skipped.
+          for r in "${{ needs.check.result }}" "${{ needs.check-macos.result }}" "${{ needs.helpers.result }}"; do
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               case "$r" in success|skipped) ;; *) echo "ci-gate: a test job was $r" >&2; exit 1 ;; esac
             else

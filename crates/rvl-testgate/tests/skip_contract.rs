@@ -160,29 +160,32 @@ fn ci_exports_the_require_engines_switch_to_every_job() {
 }
 
 /// The switch only reports a missing engine. These are the steps that make
-/// the engines present in the job that runs `cargo test --workspace`; drop
-/// one and the suite fails there, which is the point, but this names the
-/// cause before a runner has to.
+/// the engines present in each job that runs `cargo test --workspace` (Linux
+/// and macOS); drop one and the suite fails there, which is the point, but
+/// this names the cause before a runner has to.
 #[test]
-fn the_check_job_provisions_every_engine_before_it_tests() {
-    let check = job(&ci_workflow(), "check");
-    let test_at = check
-        .find("run: cargo test --workspace")
-        .expect("the check job runs the workspace tests");
-    let before_tests = &check[..test_at];
-    for (engine, step) in [
-        ("libclang (C/C++)", "ci/fetch-libclang.sh"),
-        ("libclang loads", "cindex --engine-check"),
-        ("typescript (tsindex)", "npm ci"),
-        ("node", "actions/setup-node@"),
-        ("the Go toolchain", "actions/setup-go@"),
-        ("a JDK", "actions/setup-java@"),
-        ("rust-analyzer", "rust-analyzer"),
-        (".NET SDK", "actions/setup-dotnet@"),
-    ] {
-        assert!(
-            before_tests.contains(step),
-            "the check job must provision {engine} (`{step}`) before `cargo test --workspace`"
-        );
+fn every_test_job_provisions_every_engine_before_it_tests() {
+    let workflow = ci_workflow();
+    for id in ["check", "check-macos"] {
+        let check = job(&workflow, id);
+        let test_at = check
+            .find("run: cargo test --workspace")
+            .unwrap_or_else(|| panic!("the {id} job runs the workspace tests"));
+        let before_tests = &check[..test_at];
+        for (engine, step) in [
+            ("libclang (C/C++)", "ci/fetch-libclang.sh"),
+            ("libclang loads", "cindex --engine-check"),
+            ("typescript (tsindex)", "npm ci"),
+            ("node", "actions/setup-node@"),
+            ("the Go toolchain", "actions/setup-go@"),
+            ("a JDK", "actions/setup-java@"),
+            ("rust-analyzer", "rust-analyzer"),
+            (".NET SDK", "actions/setup-dotnet@"),
+        ] {
+            assert!(
+                before_tests.contains(step),
+                "the {id} job must provision {engine} (`{step}`) before `cargo test --workspace`"
+            );
+        }
     }
 }

@@ -1,0 +1,50 @@
+{
+  "_comment": "Seed specs for the release smoke scan (ci/smoke-archive.sh): one blocking identity per lane of ci/smoke/repo, each with no bound in the fixture, so every lane must decide a `violates` site. Test-grade, not the production corpus.",
+  "apis": [
+    {
+      "type": "net/http.Client",
+      "method": "Do",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["client_config", "context"],
+      "confidence": 0.95,
+      "rationale": "Do blocks until the response headers arrive; a client Timeout or a request context deadline bounds it"
+    },
+    {
+      "type": "requests",
+      "method": "get",
+      "site_count": 1,
+      "blocking": "yes",
+      "bounded_by": ["call_arg"],
+      "confidence": 0.9,
+      "rationale": "requests.get blocks until the response completes; the bound is the per-call timeout= argument",
+      "unbounded_sentinels": ["None"]
+    },
+    {
+      "type": "libcurl.CURL",
+      "method": "curl_easy_perform",
+      "blocking": "yes",
+      "bounded_by": ["client_config"],
+      "confidence": 0.9,
+      "rationale": "curl_easy_perform blocks until the transfer completes and is unbounded unless CURLOPT_TIMEOUT(_MS) was set on the handle"
+    },
+    {
+      "type": "libcurl.CURL",
+      "method": "curl_easy_setopt",
+      "blocking": "no",
+      "bounded_by": [],
+      "confidence": 0.9,
+      "rationale": "setopt configures the handle and performs no I/O"
+    }
+  ],
+  "configs": [
+    {
+      "type": "net/http.Client",
+      "bounds": "whole_call",
+      "scope": "this_client",
+      "confidence": 1,
+      "fields": ["Timeout"],
+      "rationale": "net/http.Client is bounded end to end only when Timeout is set"
+    }
+  ]
+}
