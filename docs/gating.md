@@ -59,7 +59,7 @@ with `git stash --keep-index` and restore them with `git stash pop`.
 | Code | Meaning |
 | ---- | ------- |
 | `0` | Scan completed; nothing blocking remains after waivers (`commit clean`). |
-| `1` | Scan could not complete: no verifiable spec cache, a retriever error under `--strict`, an IO failure. The scanner broke; your code was never judged. |
+| `1` | Scan could not complete: no verifiable spec cache, a retriever error or a helper past its time limit under `--strict`, an IO failure. The scanner broke; your code was never judged. |
 | `2` | Usage error: unknown or invalid flag/argument. |
 | `3` | Scan completed and BLOCKING findings remain (`✗ blocked`). Fix them, or waive them in `.revelara.yaml`. |
 
@@ -172,6 +172,21 @@ claimed. The guard lives at the one place every helper's output passes
 through, so it does not depend on any individual helper's exit-code hygiene.
 A degraded lane renders `NOT CLEAN — nothing was scanned (see COVERAGE)`
 under the default fail-open policy and turns into exit `1` under `--strict`.
+
+A helper that hangs is a third way. Every helper and agent process runs
+under a time limit: `--scan-budget` (default `30m`, or `scanner.timeout` in
+`.revelara.yaml`) for the scan's helpers and agent calls together, and
+`--helper-timeout` (default `20m`, or `scanner.helper_timeout`) for any one
+helper. When a limit runs out, the helper's process group is killed, the
+language is reported degraded in COVERAGE, and the scan fails open; under
+`--strict` it exits `1`, never `3`, so the `|| [ "$?" -eq 3 ]` recipe above
+still fails the job. Set a budget shorter than the job's own timeout, so a
+hung helper ends the job with an error naming it, instead of the runner
+killing the job with nothing said:
+
+```sh
+rvl scan . --strict --scan-budget 15m --out findings.json || [ "$?" -eq 3 ]
+```
 
 A CI job that wants belt and braces can still assert on coverage as well as
 on the exit code. `--out` writes a `coverage.lang_status` array (`state`, and
