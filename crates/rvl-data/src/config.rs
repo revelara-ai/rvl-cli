@@ -291,22 +291,64 @@ pub fn save(cfg: &DataConfig) -> Result<(), String> {
 }
 
 /// Write the config file with rvl-cli's permission contract: directory
-/// 0700, file 0600.
+/// 0700, file 0600. The text goes to a temp file in the same directory,
+/// created 0600 and synced, then renamed over the config: the API key is
+/// never readable by another user, and a crash or a full disk leaves the
+/// old file whole.
 fn write_config_text(path: &Path, data: &str) -> Result<(), String> {
     let dir = path.parent().ok_or("invalid config path")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
     }
-    std::fs::write(path, data).map_err(|e| e.to_string())?;
+    replace_file(path, data.as_bytes())
+}
+
+/// Replace `path` with `bytes` through a 0600 temp file beside it and a
+/// rename. On error the temp file is removed and `path` is untouched.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    // A temp file left by a crashed run of this pid is stale.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove {}: {e}", tmp.display()))
+        }
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(())
+    let mut file = opts
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let written = (|| {
+        // The umask can only narrow the creation mode; set it exactly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        }
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| format!("write {}: {e}", path.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 // --- `config` subcommand (show, set) — ported from rvl-cli
@@ -1086,5 +1128,70 @@ contexts:
                 ..DataConfig::default()
             }
         );
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_config_is_written_0600_whole_and_without_a_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".revelara");
+        let path = dir.join("config.yaml");
+        write_config_text(&path, "api_key: pk_first\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "api_key: pk_first\n"
+        );
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        // A file another writer left world-readable is replaced by a 0600 one.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_text(&path, "api_key: pk_second\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "api_key: pk_second\n"
+        );
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(names(&dir), ["config.yaml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_the_old_config_byte_identical() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".revelara");
+        let path = dir.join("config.yaml");
+        write_config_text(&path, "api_key: pk_old\n").unwrap();
+        let old = std::fs::read(&path).unwrap();
+        // replace_file, not write_config_text: the latter chmods the
+        // directory back to 0700 first.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            eprintln!("skipped: this user writes to a read-only directory (root)");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let err = replace_file(&path, b"api_key: pk_new\n");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.is_err(), "{err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(names(&dir), ["config.yaml"]);
     }
 }
