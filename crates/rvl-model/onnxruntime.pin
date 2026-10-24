@@ -1,0 +1,36 @@
+# The ONNX Runtime every RELEASE archive vendors beside `rvl`.
+#
+# Release scan results must not depend on the scanning machine, so a release
+# does not use whatever ONNX Runtime the machine has: it ships this one.
+# ci/fetch-onnxruntime.sh reads this file in release CI and in the CI test
+# jobs, verifies every download against the sha256 below and fails on any
+# mismatch. tests/onnxruntime_pin.rs holds the `lib` triples to the `targets`
+# in dist-workspace.toml, so a new release target cannot ship unpinned.
+#
+# LIBRARY: Microsoft's CPU release archives on GitHub
+# (github.com/microsoft/onnxruntime/releases/tag/v1.31.0). Each holds one
+# self-contained libonnxruntime (it links only libc, libm, libdl, libpthread,
+# librt, libstdc++ and libgcc_s on Linux). The checksums are the sha256
+# digests GitHub publishes for each release asset, read from the releases API
+# on 2026-10-24. No osx-x86_64 archive exists after 1.23.2, which is why
+# x86_64-apple-darwin is not a release target.
+#
+# The library member is the unversioned name in the archive's lib/, which is a
+# symlink to the versioned file there; the fetch dereferences it. The license
+# member is ONNX Runtime's MIT license, and the ThirdPartyNotices.txt beside it
+# ships too.
+#
+# To bump: change every line together (one ONNX Runtime version for all
+# targets), take each sha256 from the publisher, keep the `ort` crate in
+# crates/rvl-model/Cargo.toml on the matching API version, and re-run
+# `cargo test -p rvl-model`.
+#
+# Format, whitespace-separated, `#` starts a comment:
+#   version <onnxruntime-version>
+#   lib <rust-target-triple> <url> <sha256> <library-member> <license-member>
+
+version 1.31.0
+
+lib x86_64-unknown-linux-gnu https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so onnxruntime-linux-x64-1.31.0/LICENSE
+lib aarch64-unknown-linux-gnu https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-aarch64-1.31.0.tgz c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab onnxruntime-linux-aarch64-1.31.0/lib/libonnxruntime.so onnxruntime-linux-aarch64-1.31.0/LICENSE
+lib aarch64-apple-darwin https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-osx-arm64-1.31.0.tgz 1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc onnxruntime-osx-arm64-1.31.0/lib/libonnxruntime.dylib onnxruntime-osx-arm64-1.31.0/LICENSE

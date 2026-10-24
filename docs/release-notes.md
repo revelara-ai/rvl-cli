@@ -9,6 +9,25 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### No more releases for Intel macOS
+
+Releases no longer include an `x86_64-apple-darwin` archive. Intel Macs
+get no new `rvl` releases. 1.7.1 is the last release that runs there, and its
+archive stays downloadable from its
+[GitHub release](https://github.com/revelara-ai/rvl-cli/releases/tag/v1.7.1).
+The Homebrew cask now requires an Apple silicon Mac.
+
+The reason: local model inference needs ONNX Runtime, and ONNX Runtime
+publishes no Intel macOS build after 1.23.2. A release carries a pinned ONNX
+Runtime so that a scan gives the same results on every machine, and that
+runtime does not exist for Intel macOS.
+
+- New: each release archive carries the pinned ONNX Runtime (1.31.0) in
+  `onnxruntime/` beside `rvl`. `RVL_ONNXRUNTIME` overrides it with another
+  library file or a directory holding one.
+- New: `scanner.model_threads` in `.revelara.yaml` sets the CPU threads for
+  local model inference (default 4). See [Configuration](configuration.md).
+
 ### Agent gate rows carry a control
 
 Under `scanner.agent_verdicts: gate`, a ladder row from an agent `violates`
