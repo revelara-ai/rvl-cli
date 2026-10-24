@@ -285,6 +285,23 @@ fn release_plan_guard_fails_on_a_source_tarball() {
 }
 
 #[test]
+fn release_plan_guard_fails_on_an_intel_macos_archive() {
+    let mut p: serde_json::Value = serde_json::from_str(&plan(&["rvl"], false)).unwrap();
+    let name = "rvl-x86_64-apple-darwin.tar.xz";
+    p["artifacts"][name] = serde_json::json!({
+        "name": name,
+        "kind": "executable-zip",
+        "target_triples": ["x86_64-apple-darwin"],
+    });
+    let out = check_plan(&p.to_string());
+    assert!(
+        !out.status.success(),
+        "an Intel macOS archive must fail the guard"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(name));
+}
+
+#[test]
 fn dist_config_builds_no_source_tarball() {
     assert!(
         live_lines(&read("dist-workspace.toml")).contains(&"source-tarball = false"),

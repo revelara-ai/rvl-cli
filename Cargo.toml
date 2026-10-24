@@ -19,6 +19,7 @@ members = [
     "crates/cindex",
     "crates/rustindex",
     "crates/rvl-testgate",
+    "crates/rvl-model",
 ]
 
 # The rustindex fixture is its own cargo workspace (stub crates named like the

@@ -63,6 +63,17 @@ so a fresh install scans with no setup:
   Adding a release target means pinning a library for it first:
   `cargo test -p cindex` fails until `libclang.pin` and the `targets` in
   `dist-workspace.toml` agree.
+- **`onnxruntime/`**, the engine of local model inference (`rvl-model`), is
+  vendored the same way: `crates/rvl-model/onnxruntime.pin` names the ONNX
+  Runtime version and, per target triple, Microsoft's release archive and its
+  sha256. `ci/fetch-onnxruntime.sh` verifies the download, fails the build on
+  a mismatch, and writes `crates/rvl/dist-extras/onnxruntime/` (the library,
+  ONNX Runtime's license and its third-party notices), which `include` packs
+  beside `rvl`. The step sets `RVL_REQUIRE_VENDORED_ONNXRUNTIME`, so a release
+  `rvl` whose bundle is missing fails closed rather than loading a system
+  runtime. `cargo test -p rvl-model` fails until `onnxruntime.pin` and the
+  `targets` in `dist-workspace.toml` agree, and the smoke test fails an archive
+  without the bundle.
 - **`csindex`** is deliberately not shipped: the assembly is ~39 KB but pulls
   ~9 MB of `Microsoft.CodeAnalysis` behind it, more than the rest of the
   archive combined. Scanning a C# repo without it fails closed with the one
@@ -70,6 +81,16 @@ so a fresh install scans with no setup:
   where resolution finds it — no environment variable at any point. A future
   `rvl-csindex` cask should install into that same directory so the two routes
   compose.
+
+## Release targets
+
+A release builds `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` (`targets` in `dist-workspace.toml`).
+`x86_64-apple-darwin` (Intel macOS) was dropped after 1.7.1: ONNX Runtime
+publishes no Intel macOS build after 1.23.2, so an archive for it could not
+carry the pinned runtime, and a scan there would differ from the same scan on
+any other machine. `ci/check-release-plan.sh` fails a plan that lists it
+again, and the cask's macOS block requires arm64.
 
 ## Smoke test of every archive
 
@@ -105,8 +126,9 @@ Each release publishes two supply-chain assets beside the archives:
   dependency tree.
   `cargo-cyclonedx = true` in `dist-workspace.toml` makes the generated
   workflow build it in the global-artifacts job. It lists crates only. The Go
-  modules of `goindex` (see `helpers/goindex/go.mod`) and the vendored
-  `libclang` are in the archive and not in the SBOM.
+  modules of `goindex` (see `helpers/goindex/go.mod`), the vendored
+  `libclang` and the vendored ONNX Runtime are in the archive and not in the
+  SBOM.
 - **`rvl.intoto.jsonl`**, SLSA Build Level 3 provenance for every asset of the
   release, the SBOM included. `.github/workflows/slsa-provenance.yml` runs
   after `announce`, hashes the artifacts of the release run with
