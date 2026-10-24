@@ -302,6 +302,36 @@ all, and `--strict` turns a degraded lane into exit 1. Details, and the CI
 assertion that closes the remaining gap, are in
 [Gating commits and CI](gating.md).
 
+### Time limits
+
+A helper that hangs cannot hang the scan. Two wall-clock limits bound every
+helper and agent process a scan starts:
+
+| Limit | Flag | `.revelara.yaml` | Default |
+|---|---|---|---|
+| The whole scan's helpers and agent calls | `--scan-budget` | `scanner.timeout` | `30m` |
+| Any one helper run | `--helper-timeout` | `scanner.helper_timeout` | `20m` |
+
+Values are seconds (`90`) or one unit (`90s`, `15m`, `1h`); `0` turns a limit
+off. The flag beats the config, which beats the default.
+
+Each helper and agent runs in its own process group. When a limit runs out,
+the whole group (the helper and anything it started) is killed and reaped,
+and the language is reported degraded in COVERAGE:
+
+```
+  Go: retriever failed — timed out: …/goindex was still running when the scan budget of 30m (--scan-budget) ran out, so its process group was killed and this language is degraded
+```
+
+A helper not yet started when the budget runs out is not started, and is
+reported the same way. The scan fails open, like every other degraded lane;
+`--strict` turns it into exit `1`. An incremental scan keeps its own 10s
+retrieval budget, and these limits apply inside it. The in-process lanes
+(config, secrets, structure) read files and are not bounded.
+
+The flag is not `--timeout`: on `rvl scan` that is the submission-mode HTTP
+timeout.
+
 ## Exit codes
 
 | Code | Meaning |

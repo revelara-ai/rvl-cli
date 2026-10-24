@@ -3,7 +3,9 @@ mod agent;
 mod autosync;
 mod base_ref;
 mod blend;
+mod budget;
 mod changed;
+mod child;
 mod compat;
 mod config_lane;
 mod context_files;
@@ -38,7 +40,8 @@ use std::process::ExitCode;
 /// * `0` — the scan completed and nothing blocking remains after waivers
 ///   ("commit clean").
 /// * `1` — the scan could not complete: no verifiable spec cache, a retriever
-///   error under `--strict`, an IO failure. The SCANNER broke; the code was
+///   error (a helper past its time limit included) under `--strict`, an IO
+///   failure. The SCANNER broke; the code was
 ///   never judged. (`ExitCode::FAILURE`, and `rvl_data::Failure::runtime`.)
 /// * `2` — usage error: an unknown or invalid flag/argument. (clap's default,
 ///   and `rvl_data::Failure::usage`.)
@@ -139,10 +142,22 @@ enum Cmd {
         #[arg(long)]
         incremental: bool,
         /// Fail CLOSED when the incremental wall budget is exhausted or a
-        /// retriever errors (CI). Default is fail-open: degrade to the reused
+        /// retriever errors or times out (CI), with exit 1. Default is fail-open: degrade to the reused
         /// portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
+        /// Wall-clock budget for the scan's helpers and agent calls together
+        /// (e.g. 90, 90s, 15m, 1h; 0 for none). A helper still running when
+        /// it runs out is killed with its process group and its language is
+        /// reported degraded; `--strict` makes that exit 1. Default 30m, or
+        /// `scanner.timeout` in `.revelara.yaml`. Not `--timeout`, which is
+        /// the submission-mode HTTP timeout.
+        #[arg(long, value_name = "DURATION", value_parser = budget::parse_limit)]
+        scan_budget: Option<budget::Limit>,
+        /// Timeout for any one helper run (same format; 0 for none). Default
+        /// 20m, or `scanner.helper_timeout` in `.revelara.yaml`.
+        #[arg(long, value_name = "DURATION", value_parser = budget::parse_limit)]
+        helper_timeout: Option<budget::Limit>,
         /// Also scan test code for API surfaces. By default the
         /// Python and TypeScript retrievers skip test paths (`tests/`,
         /// `e2e/`, `*.test.ts`, `conftest.py`, the Playwright/Jest/Vitest
@@ -2289,6 +2304,7 @@ fn run_helper(
     name: &str,
     files: &[String],
     include_tests: bool,
+    limits: &budget::Limits,
 ) -> anyhow::Result<Result<String, (DegradeKind, String)>> {
     // Only the helpers that implement the skip are told to lift it; the rest
     // would reject the flag (see `Lang::helper_skips_tests`).
@@ -2318,6 +2334,19 @@ fn run_helper(
         .flatten();
     let mut merged = String::new();
     for batch in &batches {
+        // A spent budget starts nothing: the language degrades like any
+        // other that could not be read, and the scan goes on to the lanes
+        // that need no helper.
+        if let Some(cause) = limits.spent() {
+            return Ok(Err((
+                DegradeKind::Failed,
+                format!(
+                    "not run: {cause} was spent before {} could start, so this language is \
+                     degraded",
+                    helper.path.display()
+                ),
+            )));
+        }
         let argv = helper_argv(helper, root, name, batch, include_tests);
         let (program, args) = argv.split_first().expect("argv always has a program");
         let mut cmd = std::process::Command::new(program);
@@ -2330,8 +2359,23 @@ fn run_helper(
         if helper.kind == HelperKind::NodeScript {
             cmd.env("NODE_PATH", node_path_for(root));
         }
-        let output = match cmd.output() {
-            Ok(o) => o,
+        let deadline = limits.child_deadline();
+        let output = match child::run(&mut cmd, deadline.map(|(at, _)| at)) {
+            Ok(child::Ran::Exited(o)) => o,
+            // Killed with its whole process group at the deadline. Degraded,
+            // never fatal by itself: `retrieval_verdict` decides that, and
+            // `--strict` makes it exit 1 like every other degraded lane.
+            Ok(child::Ran::TimedOut) => {
+                let cause = deadline.map(|(_, c)| c).expect("only a deadline times out");
+                return Ok(Err((
+                    DegradeKind::Failed,
+                    format!(
+                        "timed out: {} was still running when {cause} ran out, so its process \
+                         group was killed and this language is degraded",
+                        helper.path.display()
+                    ),
+                )));
+            }
             // The INTERPRETER is missing, not the helper: `dotnet`, `java`,
             // `node` or `python3` is absent even though the helper file itself
             // resolved. That is the same "not set up yet" state a helper's own
@@ -2988,6 +3032,7 @@ fn resolve_packet_stream(
     path: &Path,
     strict: bool,
     include_tests: bool,
+    limits: &budget::Limits,
 ) -> anyhow::Result<RetrievedStream> {
     if let Some(p) = retrieved {
         let text = std::fs::read_to_string(p)
@@ -3157,7 +3202,7 @@ fn resolve_packet_stream(
             source: helper.source.clone(),
             drift: helper_drift(lang, &helper),
         });
-        match run_helper(lang, &helper, path, &name, &[], include_tests)? {
+        match run_helper(lang, &helper, path, &name, &[], include_tests, limits)? {
             Ok(out) => {
                 // Drop machine-generated files BEFORE counting. Filtering after
                 // the roll-call was built left "Java 33744 sites" printed above
@@ -3896,6 +3941,7 @@ fn run_scan(
     strict: bool,
     include_tests: bool,
     blend: bool,
+    limits: budget::Limits,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     // The full path treats "no language detected" as a clean pass too
@@ -3990,7 +4036,7 @@ fn run_scan(
             render::GatedOperation::Commit,
         );
     }
-    let stream = resolve_packet_stream(retrieved, path, strict, include_tests)?;
+    let stream = resolve_packet_stream(retrieved, path, strict, include_tests, &limits)?;
     let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
         resolve_findings(
             store,
@@ -4020,6 +4066,7 @@ fn run_scan(
             &sites,
             &judgments,
             stdout_color(color),
+            &limits,
         )
     });
     render_scan_output(
@@ -4402,6 +4449,10 @@ struct HelperRetriever {
     /// path does: the merged `RepoConfig` no longer knows whose count it is.
     dependencies_uninstalled:
         std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>>,
+    /// The scan's limits, capped at the retrieval wall budget, so a helper
+    /// still running when that budget runs out is killed rather than left
+    /// behind by the abandoned worker thread.
+    limits: budget::Limits,
 }
 
 impl HelperRetriever {
@@ -4452,7 +4503,15 @@ impl HelperRetriever {
             // combination); an index half built each way would make the
             // reused portion and the re-parsed portion answer different
             // questions.
-            let stream = match run_helper(lang, &helper, &self.root, &self.name, &files, false)? {
+            let stream = match run_helper(
+                lang,
+                &helper,
+                &self.root,
+                &self.name,
+                &files,
+                false,
+                &self.limits,
+            )? {
                 Ok(s) => s,
                 Err((kind, reason)) => {
                     self.push_degradation(LangDegradation { lang, kind, reason });
@@ -4861,6 +4920,7 @@ fn incremental_scan_pass(
     index_dir: &std::path::Path,
     path: &std::path::Path,
     strict: bool,
+    limits: &budget::Limits,
 ) -> anyhow::Result<IncrementalScan> {
     // PREFLIGHT THE ROOT BEFORE READING THE EMPTY SET AS BENIGN
     // (po-av01j.198). `walk_source_files` swallows every `read_dir` error by
@@ -4895,6 +4955,7 @@ fn incremental_scan_pass(
     let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
     let name = snapshot_name(path);
     let root = path.to_path_buf();
+    let limits = *limits;
 
     // Shared with the retriever so degradations survive its move into the
     // budget thread.
@@ -4922,6 +4983,10 @@ fn incremental_scan_pass(
             dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
             root: root.clone(),
             name: name.clone(),
+            limits: limits.within(
+                INCREMENTAL_WALL_BUDGET,
+                budget::Cause::IncrementalBudget(INCREMENTAL_WALL_BUDGET),
+            ),
         };
         let changed_owned = changed.to_vec();
         let changed_len = changed_owned.len();
@@ -5230,6 +5295,9 @@ fn run_index_build(
         dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
         root: root.clone(),
         name,
+        // Not under the commit path's wall budget, but a hung helper must
+        // still not outlive the warm: the default limits apply.
+        limits: budget::Limits::resolve(&root, None, None),
     };
     let scan = incremental_sites(&idx, &root, &candidates, |changed| {
         let (sites, repo_cfg) = retriever.retrieve_full(changed)?;
@@ -5374,6 +5442,7 @@ fn run_scan_incremental(
     hook: Option<&str>,
     base_chain: &base_ref::Chain,
     blend: bool,
+    limits: budget::Limits,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
 
@@ -5422,7 +5491,7 @@ fn run_scan_incremental(
         }
     }
 
-    let scan = incremental_scan_pass(index_dir, path, strict)?;
+    let scan = incremental_scan_pass(index_dir, path, strict, &limits)?;
 
     // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
     // empty report looks as broken as one that errors, so the no-source case
@@ -5585,6 +5654,7 @@ fn run_scan_incremental(
             &sites,
             &judgments,
             stdout_color(color),
+            &limits,
         )
     });
     render_scan_output(
@@ -5664,7 +5734,13 @@ fn run_explain(
     // `explain` is lenient on purpose: it exists to resolve one finding id, so
     // a degraded language must not stop it printing the finding the user asked
     // about. Strictness belongs to `scan`, which is what gates.
-    let stream = resolve_packet_stream(retrieved, path, false, false)?;
+    let stream = resolve_packet_stream(
+        retrieved,
+        path,
+        false,
+        false,
+        &budget::Limits::resolve(path, None, None),
+    )?;
     let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
         resolve_findings(
             store,
@@ -5733,7 +5809,13 @@ fn run_suppress(
             }
             None => {
                 let scan_path = path.unwrap_or(&cwd);
-                let stream = resolve_packet_stream(retrieved, scan_path, false, false)?;
+                let stream = resolve_packet_stream(
+                    retrieved,
+                    scan_path,
+                    false,
+                    false,
+                    &budget::Limits::resolve(scan_path, None, None),
+                )?;
                 let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
                     resolve_findings(
                         store,
@@ -5822,7 +5904,12 @@ fn run_report(
     // Same resolve->scan pipeline scan uses, via the shared building blocks.
     let (findings, sites) = if incremental && retrieved.is_none() {
         // report is read-only and never blocks a workflow: fail-open (strict=false).
-        let scan = incremental_scan_pass(index_dir, path, false)?;
+        let scan = incremental_scan_pass(
+            index_dir,
+            path,
+            false,
+            &budget::Limits::resolve(path, None, None),
+        )?;
         eprintln!(
             "incremental: reused {} files from index, retrieved {} changed",
             scan.reused_files, scan.retrieved_files
@@ -5848,7 +5935,13 @@ fn run_report(
             )?;
         (findings, sites)
     } else {
-        let stream = resolve_packet_stream(retrieved, path, false, false)?;
+        let stream = resolve_packet_stream(
+            retrieved,
+            path,
+            false,
+            false,
+            &budget::Limits::resolve(path, None, None),
+        )?;
         let (findings, _items, sites, _specs, _server, _empty_api_corpus, _judgments) =
             resolve_findings(
                 store,
@@ -7483,6 +7576,8 @@ fn run() -> anyhow::Result<ExitCode> {
             color,
             incremental,
             strict,
+            scan_budget,
+            helper_timeout,
             include_tests,
             changed_only,
             base,
@@ -7497,6 +7592,13 @@ fn run() -> anyhow::Result<ExitCode> {
         } => {
             autosync::set_pin(autosync::resolve_pin(spec_version));
             let path = path.unwrap_or_else(|| PathBuf::from("."));
+            // The clock starts here, before any lane runs. A replayed stream
+            // runs no helper, so it has nothing to bound.
+            let limits = if retrieved.is_some() {
+                budget::Limits::none()
+            } else {
+                budget::Limits::resolve(&path, scan_budget, helper_timeout)
+            };
             let tiers = tier_filter(oss_only);
             // The base-ref chain (po-av01j.194), resolved once and used twice:
             // to pick the changed-set question below, and HERE to decide what
@@ -7586,6 +7688,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     hook.as_deref(),
                     &base_chain,
                     blend,
+                    limits,
                 )
             } else {
                 // Hook adjudication is delta-scoped by definition; without
@@ -7611,6 +7714,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     strict,
                     include_tests,
                     blend,
+                    limits,
                 )
             };
             // After the scan, never before: the check it starts can install
@@ -8463,7 +8567,14 @@ mod tests {
             r#"{"kind":"repo_config","snapshot_id":"x","constructions":[],"retrieval":[{"lang":"go","calls_resolved":900,"candidates":40,"unretrieved":{"io.ReadAll":3}}]}"#,
         )
         .unwrap();
-        let stream = resolve_packet_stream(Some(p.as_path()), dir.path(), false, false).unwrap();
+        let stream = resolve_packet_stream(
+            Some(p.as_path()),
+            dir.path(),
+            false,
+            false,
+            &budget::Limits::none(),
+        )
+        .unwrap();
         assert_eq!(stream.retrieval.len(), 1);
         assert_eq!(stream.retrieval[0].candidates, 40);
         assert_eq!(stream.retrieval[0].unretrieved.get("io.ReadAll"), Some(&3));
@@ -8649,9 +8760,11 @@ mod tests {
         std::env::set_var("RVL_GOINDEX", &go);
         std::env::set_var("RVL_RUSTINDEX", &rs);
         std::env::set_var("RVL_CSINDEX", &cs);
-        let default = resolve_packet_stream(None, tmp.path(), false, false);
+        let default =
+            resolve_packet_stream(None, tmp.path(), false, false, &budget::Limits::none());
         let default_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
-        let with_tests = resolve_packet_stream(None, tmp.path(), false, true);
+        let with_tests =
+            resolve_packet_stream(None, tmp.path(), false, true, &budget::Limits::none());
         let with_tests_ran = (go_ran.exists(), rs_ran.exists(), cs_ran.exists());
         for v in ["RVL_GOINDEX", "RVL_RUSTINDEX", "RVL_CSINDEX"] {
             std::env::remove_var(v);
@@ -10258,7 +10371,7 @@ mod tests {
             detect_languages(dir.path()).is_empty(),
             "the fixture must genuinely have no source"
         );
-        let stream = resolve_packet_stream(None, dir.path(), false, false)
+        let stream = resolve_packet_stream(None, dir.path(), false, false, &budget::Limits::none())
             .expect("no language is not an error: nothing was needed");
         assert!(stream.text.is_empty());
         assert!(
@@ -10282,8 +10395,13 @@ mod tests {
             "the fixture must genuinely have no candidate source"
         );
 
-        let scan = incremental_scan_pass(&dir.path().join("index"), &repo, false)
-            .expect("no supported source is not an error: nothing was needed");
+        let scan = incremental_scan_pass(
+            &dir.path().join("index"),
+            &repo,
+            false,
+            &budget::Limits::none(),
+        )
+        .expect("no supported source is not an error: nothing was needed");
         assert!(scan.sites.is_empty());
         assert!(
             scan.no_supported_sources,

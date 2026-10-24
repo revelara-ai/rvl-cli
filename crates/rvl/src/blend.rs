@@ -404,6 +404,7 @@ pub fn run(
     sites: &[rvl_core::Site],
     judgments: &[rvl_triage::ClassJudgment],
     color: bool,
+    limits: &crate::budget::Limits,
 ) -> BlendOutput {
     let sel = select_undecided(findings, sites, changed, judgments);
     let gate = agent::RepoAgentConfig::load(repo_root).gate_verdicts;
@@ -429,7 +430,11 @@ pub fn run(
             color,
         );
     };
-    blend_with(Arc::new(adapter), &sel, DEFAULT_BLEND_BUDGET, gate, color)
+    // What is left of the scan budget caps the agent's own.
+    let budget = limits
+        .remaining()
+        .map_or(DEFAULT_BLEND_BUDGET, |left| left.min(DEFAULT_BLEND_BUDGET));
+    blend_with(Arc::new(adapter), &sel, budget, gate, color)
 }
 
 #[cfg(test)]
@@ -491,7 +496,7 @@ mod tests {
         fn name(&self) -> &str {
             "fake"
         }
-        fn invoke(&self, prompt: &str) -> anyhow::Result<String> {
+        fn invoke(&self, prompt: &str, _deadline: Instant) -> anyhow::Result<String> {
             *self.calls.lock().unwrap() += 1;
             std::thread::sleep(self.delay);
             match &self.reply {
