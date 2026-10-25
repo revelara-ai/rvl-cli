@@ -3,9 +3,18 @@
 //! Determinism (the same input gives the same bytes): the session runs on a
 //! fixed intra-op thread count with ONNX Runtime's deterministic kernels, one
 //! inter-op thread and sequential execution; every input is padded to the
-//! bundle's `max_length`, so a record does not depend on which inputs shared
-//! its batch; and argmax and softmax are computed here, in f64, with ties
-//! going to the lower label index.
+//! bundle's `max_length` and runs alone, as a `[1, max_length]` tensor, so a
+//! record does not depend on which inputs shared its batch; and argmax and
+//! softmax are computed here, in f64, with ties going to the lower label
+//! index.
+//!
+//! Running an input alone is what makes the record independent of its batch
+//! on every platform: ONNX Runtime picks kernels and summation orders by
+//! tensor shape, per CPU architecture, so the same row in a `[4, n]` and a
+//! `[1, n]` tensor can differ in the last bit of a logit. A transformer
+//! encoder at a fixed `max_length` already gives its matrix products
+//! `max_length` rows per input, so batching inputs together buys little on
+//! CPU.
 //!
 //! The budget is checked before each batch. A batch that has started runs to
 //! its end, and every input after the first batch the budget did not allow
@@ -27,7 +36,8 @@ use crate::runtime::Runtime;
 pub struct Options {
     /// Intra-op threads (`scanner.model_threads`).
     pub threads: usize,
-    /// Inputs per session run. The budget is checked between runs.
+    /// Inputs per batch. The budget is checked between batches; each input
+    /// in a batch is its own session run.
     pub batch_size: usize,
 }
 
@@ -223,7 +233,9 @@ impl Classifier {
             if expired() {
                 break;
             }
-            records.extend(self.run_batch(batch)?);
+            for text in batch {
+                records.push(self.run_one(text)?);
+            }
         }
         let inferred = records.len();
         while records.len() < texts.len() {
@@ -246,33 +258,27 @@ impl Classifier {
         })
     }
 
-    fn run_batch(&mut self, batch: &[&str]) -> Result<Vec<Record>> {
+    /// Run one input as a `[1, max_length]` batch and make its record.
+    fn run_one(&mut self, text: &str) -> Result<Record> {
         let len = self.max_length;
-        let mut ids = Vec::with_capacity(batch.len() * len);
-        let mut mask = Vec::with_capacity(batch.len() * len);
-        let mut types = Vec::with_capacity(batch.len() * len);
-        for text in batch {
-            let enc = self
-                .tokenizer
-                .encode(*text, true)
-                .map_err(|e| anyhow!("tokenize: {e}"))?;
-            if enc.get_ids().len() != len {
-                bail!(
-                    "the tokenizer gave {} tokens, not the fixed {len}",
-                    enc.get_ids().len()
-                );
-            }
-            ids.extend(enc.get_ids().iter().map(|&v| i64::from(v)));
-            mask.extend(enc.get_attention_mask().iter().map(|&v| i64::from(v)));
-            types.extend(enc.get_type_ids().iter().map(|&v| i64::from(v)));
+        let enc = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow!("tokenize: {e}"))?;
+        if enc.get_ids().len() != len {
+            bail!(
+                "the tokenizer gave {} tokens, not the fixed {len}",
+                enc.get_ids().len()
+            );
         }
-        let shape = vec![batch.len() as i64, len as i64];
+        let widen = |v: &[u32]| v.iter().map(|&x| i64::from(x)).collect::<Vec<_>>();
+        let shape = vec![1, len as i64];
         let mut feed = Vec::with_capacity(self.inputs.len());
         for (name, which) in &self.inputs {
             let data = match which {
-                Input::Ids => ids.clone(),
-                Input::Mask => mask.clone(),
-                Input::TypeIds => types.clone(),
+                Input::Ids => widen(enc.get_ids()),
+                Input::Mask => widen(enc.get_attention_mask()),
+                Input::TypeIds => widen(enc.get_type_ids()),
             };
             let t = Tensor::from_array((shape.clone(), data)).map_err(|e| anyhow!("{e}"))?;
             feed.push((name.clone(), t));
@@ -285,29 +291,20 @@ impl Classifier {
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("model output: {e}"))?;
         let width = self.labels.len();
-        if out_shape.len() != 2
-            || out_shape[0] != batch.len() as i64
-            || out_shape[1] != width as i64
-        {
+        if out_shape.len() != 2 || out_shape[0] != 1 || out_shape[1] != width as i64 {
             bail!(
-                "the model's logits are {:?}, expected [{}, {width}] (one per label)",
-                &out_shape[..],
-                batch.len()
+                "the model's logits are {:?}, expected [1, {width}] (one per label)",
+                &out_shape[..]
             );
         }
-        Ok(logits
-            .chunks(width)
-            .map(|row| {
-                let (best, p) = calibrate(row, self.temperature);
-                Record {
-                    verdict: Verdict::Label(self.labels[best].clone()),
-                    confidence: Some(p),
-                    logits: row.to_vec(),
-                    model_id: self.model_id.clone(),
-                    weights_digest: self.weights_digest.clone(),
-                }
-            })
-            .collect())
+        let (best, p) = calibrate(logits, self.temperature);
+        Ok(Record {
+            verdict: Verdict::Label(self.labels[best].clone()),
+            confidence: Some(p),
+            logits: logits.to_vec(),
+            model_id: self.model_id.clone(),
+            weights_digest: self.weights_digest.clone(),
+        })
     }
 }
 
