@@ -71,6 +71,7 @@ const TEXTS: &[&str] = &[
     "CANCEL the context",
     "sleep sleep hang infinite",
     "unknown words only here",
+    "a mock client in a test fixture",
 ];
 
 #[test]
@@ -143,10 +144,12 @@ fn records_carry_the_label_the_fixture_was_built_to_give() {
         Verdict::Label(l) => l.clone(),
         other => panic!("{other:?}"),
     };
-    assert_eq!(label(0), "bounded");
-    assert_eq!(label(1), "unbounded");
-    assert_eq!(label(6), "bounded", "the tokenizer lowercases");
-    assert_eq!(label(7), "unbounded");
+    assert_eq!(label(0), "satisfies");
+    assert_eq!(label(1), "violates");
+    assert_eq!(label(6), "satisfies", "the tokenizer lowercases");
+    assert_eq!(label(7), "violates");
+    assert_eq!(label(8), "abstain", "no signal word");
+    assert_eq!(label(9), "not_applicable");
 
     let model = std::fs::read(fixture_dir().join("model.onnx")).unwrap();
     let digest = {
@@ -156,16 +159,40 @@ fn records_carry_the_label_the_fixture_was_built_to_give() {
     for r in &got.records {
         assert_eq!(r.model_id, "rvl-fixture/tiny-classifier");
         assert_eq!(r.weights_digest, digest);
-        assert_eq!(r.logits.len(), 2);
+        assert_eq!(r.logits.len(), 4);
+        assert_eq!(r.cell_logits.len(), 4, "the fixture has a cell head");
         let (_, p) = rvl_model::classify::calibrate(&r.logits, 1.5);
         assert_eq!(
             r.confidence,
             Some(p),
             "confidence is calibrated at temperature 1.5"
         );
-        assert!((0.5..=1.0).contains(&p), "{p}");
+        assert!((0.25..=1.0).contains(&p), "{p}");
     }
     assert_eq!(got.coverage.line(), None);
+}
+
+#[test]
+fn the_cell_head_names_the_cell_of_the_verdict() {
+    let Some(rt) = runtime("the_cell_head_names_the_cell_of_the_verdict") else {
+        return;
+    };
+    let mut c = classifier(rt, 4, 8);
+    let ids = c.cells().expect("the fixture has a cell head").to_vec();
+    assert_eq!(ids, ["M1", "M2", "S1", "C1"]);
+    let got = c.classify(TEXTS, Duration::from_secs(600)).unwrap();
+    let top = |i: usize, allowed: &[&str]| {
+        rvl_model::classify::top_cell(&ids, &got.records[i].cell_logits, allowed)
+            .map(|at| ids[at].as_str())
+    };
+    assert_eq!(top(1, &["M1", "M2", "S1", "C1"]), Some("M1"));
+    assert_eq!(
+        top(1, &["M2", "S1"]),
+        Some("M2"),
+        "masked to the frame's cells"
+    );
+    assert_eq!(top(0, &["M1", "M2", "S1", "C1"]), Some("S1"));
+    assert_eq!(top(9, &["M1", "M2", "S1", "C1"]), Some("C1"));
 }
 
 #[test]
@@ -205,7 +232,7 @@ fn the_time_budget_marks_the_remainder_abstain() {
         .coverage
         .line()
         .unwrap()
-        .starts_with("5 of 9 model input(s) abstain"));
+        .starts_with("6 of 10 model input(s) abstain"));
 
     // A spent budget reaches nothing, and the line names it.
     let none = c.classify(TEXTS, Duration::ZERO).unwrap();
@@ -237,7 +264,7 @@ fn the_committed_fixture_is_what_its_script_writes() {
             return;
         }
     }
-    for name in ["model.onnx", "tokenizer.json", "bundle.json"] {
+    for name in ["model.onnx", "tokenizer.json", "bundle.json", "cells.json"] {
         assert_eq!(
             std::fs::read(tmp.path().join(name)).unwrap(),
             std::fs::read(fixture_dir().join(name)).unwrap(),

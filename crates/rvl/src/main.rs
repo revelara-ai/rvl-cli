@@ -9,6 +9,7 @@ mod child;
 mod compat;
 mod config_lane;
 mod context_files;
+mod decision;
 mod devscope;
 mod doctor;
 mod embedded_helpers;
@@ -431,6 +432,16 @@ enum Cmd {
         /// The check a scan hands off: silent, always exit 0.
         #[arg(long, hide = true)]
         background: bool,
+        /// With --background: also sync the decision model bundle, for a
+        /// repository that turned the lane on.
+        #[arg(long, hide = true, requires = "background")]
+        model: bool,
+    },
+    /// The decision model the scan's model lane runs
+    /// (`scanner.decision_model: on` in .revelara.yaml).
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
     },
     /// Spec-cache maintenance.
     Cache {
@@ -795,6 +806,14 @@ enum IndexCmd {
     },
     /// Show how many files are indexed.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Download the published model bundle, verify its signature and every
+    /// file's sha256, and cache it (needs an API key; RVL_OFFLINE=1 keeps the
+    /// cached bundle).
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -3926,6 +3945,32 @@ fn stdout_color(mode: Option<&str>) -> bool {
     )
 }
 
+/// The decision-model lane, when `.revelara.yaml` turns it on: after the
+/// deterministic lanes, inside what is left of the scan budget.
+fn decision_lane(
+    store: &CacheStore,
+    keyset: &Keyset,
+    path: &Path,
+    findings: &[rvl_propagate::Finding],
+    sites: &[rvl_core::Site],
+    specs: &rvl_spec::SpecCache,
+    limits: &budget::Limits,
+) -> Option<decision::LaneOutput> {
+    let cfg = decision::enabled(path)?;
+    let budget = limits
+        .remaining()
+        .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
+    Some(decision::run(
+        &cfg,
+        store.root(),
+        keyset,
+        findings,
+        sites,
+        specs,
+        budget,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan(
     store: &CacheStore,
@@ -4016,7 +4061,8 @@ fn run_scan(
             &structure.rows,
             lane.as_ref(),
             None,
-            // No language, so no call site the blend could be asked about.
+            // No call site for the decision model or the blend.
+            None,
             None,
             out,
             color,
@@ -4058,6 +4104,7 @@ fn run_scan(
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
+    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
     let blended = blend.then(|| {
         blend::run(
             path,
@@ -4080,6 +4127,7 @@ fn run_scan(
         &structure_rows,
         Some(&lane),
         None,
+        model.as_ref(),
         blended.as_ref(),
         out,
         color,
@@ -4204,6 +4252,8 @@ fn render_scan_output(
     structure_rows: &[out_doc::OutSite],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
+    // The decision-model lane; None when the repo did not turn it on.
+    model: Option<&decision::LaneOutput>,
     // `scan --blend` (po-av01j.205); None when not requested.
     blended: Option<&blend::BlendOutput>,
     out: Option<&std::path::Path>,
@@ -4272,6 +4322,9 @@ fn render_scan_output(
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
     coverage.by_lang = lang_coverage(findings, sites);
     coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
+    coverage.decision_model = model
+        .map(|m| m.summary.coverage.clone())
+        .unwrap_or_default();
     coverage.agent_no_control = hook_agent
         .map(|a| a.gate_findings.as_slice())
         .into_iter()
@@ -4311,6 +4364,10 @@ fn render_scan_output(
     // built from `findings`, which agent verdicts never touch.
     if let Some(a) = hook_agent {
         ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
+    // Decision-model violations: advisory rows, waivable as `model.<control>`.
+    if let Some(m) = model {
+        ladder_findings.extend(m.findings.iter().cloned());
     }
     // `--blend` follows the same rule: rows only in gate mode, agent-tagged.
     if let Some(b) = blended {
@@ -4360,6 +4417,7 @@ fn render_scan_output(
             blended.map(|b| &b.summary),
             blocked,
         )
+        .with_decision_model(model.map(|m| m.summary.clone()))
     });
 
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
@@ -5643,6 +5701,7 @@ fn run_scan_incremental(
             stdout_color(color),
         )
     });
+    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
     // `--blend` (po-av01j.205): the same residue, whole repo, or the
     // changed set under --changed-only so the agent never sees files the
     // report is not about.
@@ -5668,6 +5727,7 @@ fn run_scan_incremental(
         &structure_rows,
         Some(&lane),
         hook_agent.as_ref(),
+        model.as_ref(),
         blended.as_ref(),
         out,
         color,
@@ -7719,7 +7779,8 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             // After the scan, never before: the check it starts can install
             // a new cache, and that must apply to the NEXT run only.
-            autosync::after_scan(&cfg, specs_file.is_none());
+            let model_lane = rvl_model::ModelConfig::load(&path).is_ok_and(|c| c.decision_model);
+            autosync::after_scan(&cfg, specs_file.is_none(), model_lane);
             result
         }
         Cmd::Report {
@@ -7786,8 +7847,32 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
         ),
-        Cmd::Sync { background: true } => Ok(autosync::background(&cfg, &store, &keyset)),
-        Cmd::Sync { background: false } => {
+        Cmd::Sync {
+            background: true,
+            model,
+        } => Ok(autosync::background(&cfg, &store, &keyset, model)),
+        Cmd::Model {
+            cmd: ModelCmd::Sync,
+        } => {
+            if cfg.org_key.is_empty() && !cfg.offline {
+                eprintln!(
+                    "the decision model needs an API key: set RVL_API_KEY (or `api_key` in \
+                     ~/.revelara/config.yaml)"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            let outcome = autosync::sync_model(&cfg, &keyset)?;
+            if outcome.is_current() || outcome == rvl_cache::model::ModelSyncOutcome::Offline {
+                println!("{}", outcome.message());
+                Ok(ExitCode::SUCCESS)
+            } else {
+                eprintln!("{}", outcome.message());
+                Ok(ExitCode::FAILURE)
+            }
+        }
+        Cmd::Sync {
+            background: false, ..
+        } => {
             // Tiered sync (po-scnmv.13). The OSS vocabulary tier syncs with
             // NO credentials — the public binary works out of the box; the
             // commercial tier still requires the org key. No-key is no longer

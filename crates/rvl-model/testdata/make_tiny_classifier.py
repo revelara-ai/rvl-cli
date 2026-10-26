@@ -3,18 +3,26 @@
 
     python3 -I crates/rvl-model/testdata/make_tiny_classifier.py [outdir]
 
-outdir defaults to tiny-classifier/ beside this script. It holds the three
-files a model bundle has (see crates/rvl-model/src/bundle.rs):
+outdir defaults to tiny-classifier/ beside this script. It holds the files
+a model bundle has (see crates/rvl-model/src/bundle.rs):
 
     model.onnx      the classifier graph, below
     tokenizer.json  a word-level tokenizer in the Hugging Face format
     bundle.json     model id, labels, temperature, max length
+    cells.json      the cell id of each cell-head output
 
-The graph is the shape of an encoder classifier at toy size: token embedding,
-mean pooling over the attention mask, one tanh layer, and a linear head.
+The graph is the shape of the decision model at toy size: token embedding,
+mean pooling over the attention mask, one tanh layer, a linear verdict head
+and a linear cell head.
 
     input_ids, attention_mask: int64 [batch, seq]
-    logits:                    float [batch, 2]
+    logits:                    float [batch, 4]  violates, satisfies,
+                                                 not_applicable, abstain
+    cell_logits:               float [batch, 4]  M1, M2, S1, C1
+
+Embedding dimension 0 carries the violation signal (+) and its opposite (-),
+dimension 1 the not-applicable signal; every other word is zero on both, so
+a long input full of unknown words still reads its few signal words.
 
 The weights come from a fixed linear congruential generator, so the output is
 byte-identical on every run and on every machine: rerun the script and `git
@@ -29,17 +37,20 @@ import sys
 
 VOCAB = [
     "[PAD]", "[UNK]",
-    # Words that read as a bounded call ...
+    # Words that read as a bounded call (satisfies) ...
     "timeout", "deadline", "context", "cancel", "limit", "retry", "budget",
-    # ... and as an unbounded one.
+    # ... as an unbounded one (violates) ...
     "forever", "block", "wait", "loop", "sleep", "infinite", "hang",
+    # ... and as code no rule applies to (not_applicable).
+    "test", "mock", "fixture",
     # Filler.
     "client", "call", "the", "a", "with", "no", "http", "get",
 ]
-LABELS = ["bounded", "unbounded"]
+LABELS = ["violates", "satisfies", "not_applicable", "abstain"]
+CELLS = ["M1", "M2", "S1", "C1"]
 DIM = 8
 HIDDEN = 8
-MAX_LENGTH = 16
+MAX_LENGTH = 64
 TEMPERATURE = 1.5
 MODEL_ID = "rvl-fixture/tiny-classifier"
 
@@ -138,32 +149,50 @@ def weights():
     rng = Lcg(20261019)
     bounded = set(VOCAB[2:9])
     unbounded = set(VOCAB[9:16])
+    inapplicable = set(VOCAB[16:19])
     emb = []
     for word in VOCAB:
         row = [rng.next() for _ in range(DIM)]
-        # Dimension 0 carries the signal the head reads; the rest is noise.
-        if word in bounded:
-            row[0] += 2.0
-        elif word in unbounded:
-            row[0] -= 2.0
+        # Dimensions 0 and 1 carry the signals the heads read; the rest is
+        # noise.
+        row[0] = row[1] = 0.0
+        if word in unbounded:
+            row[0] = 2.0
+        elif word in bounded:
+            row[0] = -2.0
+        elif word in inapplicable:
+            row[1] = 2.0
         emb.extend(row)
-    w1 = [rng.next() for _ in range(DIM * HIDDEN)]
-    w1[0 * HIDDEN + 0] = 1.5  # pooled[0] -> hidden[0]
+    w1 = [rng.next() * 0.1 for _ in range(DIM * HIDDEN)]
+    for i in range(DIM):
+        w1[i * HIDDEN + 0] = w1[i * HIDDEN + 1] = 0.0
+    w1[0 * HIDDEN + 0] = 20.0  # pooled[0] -> hidden[0], the violation signal
+    w1[1 * HIDDEN + 1] = 20.0  # pooled[1] -> hidden[1], the not-applicable one
     b1 = [rng.next() * 0.1 for _ in range(HIDDEN)]
-    w2 = [rng.next() * 0.2 for _ in range(HIDDEN * len(LABELS))]
-    w2[0 * len(LABELS) + 0] = 2.0  # hidden[0] -> bounded
-    w2[0 * len(LABELS) + 1] = -2.0  # hidden[0] -> unbounded
-    b2 = [0.0, 0.0]
+    b1[0] = b1[1] = 0.0
+
+    def head(width, signals, bias):
+        w = [rng.next() * 0.05 for _ in range(HIDDEN * width)]
+        for (h, out), v in signals.items():
+            w[h * width + out] = v
+        return w, bias
+
+    # hidden[0] -> violates (+) or satisfies (-), hidden[1] -> not_applicable;
+    # abstain wins only when no signal word is read.
+    w2, b2 = head(len(LABELS), {(0, 0): 4.0, (0, 1): -4.0, (1, 2): 6.0}, [0.0, 0.0, 0.0, 0.5])
+    # The cell head: M1 and M2 follow violation (M1 the stronger), S1 its
+    # opposite, C1 the not-applicable signal.
+    wc, bc = head(len(CELLS), {(0, 0): 4.0, (0, 1): 3.0, (0, 2): -4.0, (1, 3): 6.0}, [0.0] * 4)
     # Round-trip through float32 so the bytes are what the values say.
     as_f32 = lambda xs: list(struct.unpack("<%df" % len(xs), struct.pack("<%df" % len(xs), *xs)))
-    return as_f32(emb), as_f32(w1), as_f32(b1), as_f32(w2), b2
+    return [as_f32(x) for x in (emb, w1, b1, w2, b2, wc, bc)]
 
 
 # --- the graph ------------------------------------------------------------
 
 
 def model():
-    emb, w1, b1, w2, b2 = weights()
+    emb, w1, b1, w2, b2, wc, bc = weights()
     nodes = [
         node("Gather", ["embedding", "input_ids"], ["tokens"]),
         node("Cast", ["attention_mask"], ["mask"], attr_int("to", FLOAT)),
@@ -178,6 +207,8 @@ def model():
         node("Tanh", ["h1"], ["hidden"]),
         node("MatMul", ["hidden", "w2"], ["l0"]),
         node("Add", ["l0", "b2"], ["logits"]),
+        node("MatMul", ["hidden", "wc"], ["c0"]),
+        node("Add", ["c0", "bc"], ["cell_logits"]),
     ]
     inits = [
         floats("embedding", [len(VOCAB), DIM], emb),
@@ -185,6 +216,8 @@ def model():
         floats("b1", [HIDDEN], b1),
         floats("w2", [HIDDEN, len(LABELS)], w2),
         floats("b2", [len(LABELS)], b2),
+        floats("wc", [HIDDEN, len(CELLS)], wc),
+        floats("bc", [len(CELLS)], bc),
         floats("one", [], [1.0]),
         int64s("seq_axis", [1], [1]),
         int64s("last_axis", [1], [-1]),
@@ -197,6 +230,7 @@ def model():
             f_bytes(11, value_info("input_ids", INT64, ["batch", "seq"])),
             f_bytes(11, value_info("attention_mask", INT64, ["batch", "seq"])),
             f_bytes(12, value_info("logits", FLOAT, ["batch", len(LABELS)])),
+            f_bytes(12, value_info("cell_logits", FLOAT, ["batch", len(CELLS)])),
         ]
     )
     opset = f_bytes(1, "") + f_int(2, OPSET)
@@ -246,7 +280,8 @@ def main():
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "model.onnx"), "wb") as f:
         f.write(model())
-    for name, doc in [("tokenizer.json", tokenizer()), ("bundle.json", bundle())]:
+    cells = {"verdict_outputs": len(LABELS), "cells": CELLS}
+    for name, doc in [("tokenizer.json", tokenizer()), ("bundle.json", bundle()), ("cells.json", cells)]:
         with open(os.path.join(out, name), "w") as f:
             json.dump(doc, f, indent=2, sort_keys=True)
             f.write("\n")
