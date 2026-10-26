@@ -1485,6 +1485,8 @@ dependencies = [
  "anyhow",
  "hex",
  "ort",
+ "regex",
+ "rvl-core",
  "rvl-testgate",
  "serde",
  "serde_json",

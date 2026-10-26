@@ -10,15 +10,20 @@
 //!
 //! ONNX Runtime is a native library loaded at run time, never linked: a
 //! release vendors a pinned build beside `rvl` ([`runtime`]).
+//!
+//! The model's input text is written by [`render`], byte for byte as the
+//! model's training renderer writes it.
 
 pub mod bundle;
 pub mod classify;
+pub mod render;
 pub mod runtime;
 
 use serde::Deserialize;
 
 pub use bundle::{Bundle, Manifest};
 pub use classify::{AbstainReason, Classification, Classifier, Coverage, Options, Record, Verdict};
+pub use render::{render_input, Layout, Question};
 pub use runtime::{Runtime, Source};
 
 /// Intra-op threads when `scanner.model_threads` is absent.
