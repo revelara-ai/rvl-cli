@@ -195,5 +195,12 @@ fn an_unscoped_incremental_scan_still_retrieves_every_stale_file() {
         co.retrieved().iter().any(|f| f.starts_with("pkg")),
         "an unscoped pass asks for the stale baseline:\n{all}"
     );
-    assert!(all.contains("retrieval capped"), "{all}");
+    // Two clocks enforce the same 10 s cap and either may fire first: the
+    // pass's wall budget ("retrieval capped") or the helper's own deadline,
+    // which kills the stub and degrades Go. Both fail open on the cap.
+    assert!(
+        all.contains("retrieval capped at 10s")
+            || all.contains("the incremental retrieval budget of 10s ran out"),
+        "the cap fails open:\n{all}"
+    );
 }
