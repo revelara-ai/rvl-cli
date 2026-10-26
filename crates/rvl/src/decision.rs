@@ -242,10 +242,7 @@ fn infer(
             ..Default::default()
         },
     )?;
-    let texts: Vec<String> = asks
-        .iter()
-        .map(|a| render::render_input(&site_of(a), &question_of(a.frame), layout))
-        .collect();
+    let texts: Vec<String> = asks.iter().map(|a| input_of(a, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let c = classifier.classify(&refs, budget)?;
     let cells = classifier.cells();
@@ -255,6 +252,11 @@ fn infer(
         .map(|(a, r)| decide(a, r, cells))
         .collect();
     Ok((digest, decisions, c.coverage.line()))
+}
+
+/// The model's input for one question.
+fn input_of(a: &Ask, layout: Layout) -> String {
+    render::render_input(&site_of(a), &question_of(a.frame), layout)
 }
 
 /// The model's input site, from what rvl retrieved.
@@ -273,11 +275,12 @@ fn site_of(a: &Ask) -> render::Site {
 }
 
 /// A frame's question, with its cells in the training text's form,
-/// `M1  [violates] <definition>`. The frames carry no control name.
+/// `M1  [violates] <definition>`. A frame from a cache written before
+/// control names were published renders `Control: RC-022` alone.
 fn question_of(f: &Frame) -> Question {
     Question::Frame(render::Frame {
         control: f.control.clone(),
-        control_name: String::new(),
+        control_name: f.control_name.clone(),
         question: f.question.clone(),
         cells: f
             .cells
@@ -496,6 +499,53 @@ mod tests {
 
         let d = decide(&ask(&site, &f), &record("violates", vec![]), None);
         assert_eq!(d.reason, "RC-022 violates, reason: not in this model");
+    }
+
+    #[test]
+    fn a_frame_with_its_control_name_renders_the_golden_byte_for_byte() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rvl-model/testdata/render-goldens/render-goldens.jsonl"
+        );
+        let goldens = std::fs::read_to_string(path).unwrap();
+        let mut checked = 0;
+        for line in goldens.lines().filter(|l| !l.trim().is_empty()) {
+            let g: serde_json::Value = serde_json::from_str(line).unwrap();
+            let row = &g["input"]["row"];
+            if row["id"] != "g24" {
+                continue;
+            }
+            // The frame as the spec cache serves it, its name included.
+            let f: Frame = serde_json::from_value(serde_json::json!({
+                "control": "RC-022", "control_name": "Retry, Backoff and Request Coalescing",
+                "version": "v1", "habitat": "call_site",
+                "question": "Is the call at this site retried on a transient failure?",
+                "cells": [
+                    {"id": "M1", "kind": "manifestation", "verdict": "violates", "definition": "No retry at any layer"},
+                    {"id": "S1", "kind": "satisfying", "verdict": "satisfies", "definition": "A library-configured retry"},
+                    {"id": "C1", "kind": "context", "verdict": "not_applicable", "definition": "Test, fixture or mock code"},
+                ],
+            }))
+            .unwrap();
+            let mut site: rvl_core::Site =
+                serde_json::from_value(g["input"]["site_packet"].clone()).unwrap();
+            site.snippet = row["packet"]["snippet"].as_str().unwrap().into();
+            site.lang = row["language"].as_str().unwrap().into();
+            let a = Ask {
+                site: &site,
+                class: row["class"].as_str().unwrap().into(),
+                frame: &f,
+            };
+            let layout = match g["layout"].as_str().unwrap() {
+                "full" => Layout::Full,
+                _ => Layout::Compact,
+            };
+            let text = input_of(&a, layout);
+            assert_eq!(text, g["text"].as_str().unwrap(), "{layout:?}");
+            assert!(text.contains("\nControl: RC-022 Retry, Backoff and Request Coalescing\n"));
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "the golden under both layouts");
     }
 
     #[test]
