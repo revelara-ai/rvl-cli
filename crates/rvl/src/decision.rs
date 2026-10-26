@@ -13,6 +13,9 @@
 //!   decided: `violates` becomes an advisory finding, `satisfies` and
 //!   `not_applicable` a decided site, each with the model's record (model
 //!   id, weights digest, confidence) in `--out`;
+//! * a served control whose manifest entry lists `served_classes` is asked
+//!   only for a site whose class family is listed; any other site abstains,
+//!   counted as out of distribution on the coverage line;
 //! * any other control abstains, and the coverage line names it.
 //!
 //! Each decision's reason is the frame cell the model's cell head ranks top,
@@ -51,6 +54,9 @@ pub struct Summary {
     pub sites: Vec<Decision>,
     /// The site questions of controls the model does not serve, per control.
     pub unserved: Vec<Unserved>,
+    /// The site questions of served controls whose class family the manifest
+    /// does not serve for that control, per control.
+    pub out_of_distribution: Vec<Unserved>,
     /// The lines the COVERAGE block prints.
     pub coverage: Vec<String>,
 }
@@ -122,7 +128,11 @@ pub fn run(
         Err(e) => return not_run(format!("{e:#}; run `{} model sync`", rvl_core::BIN)),
     };
     let m = &cached.manifest;
-    let (asks, unserved) = select(findings, sites, specs.frames(), m);
+    let Selected {
+        asks,
+        unserved,
+        out_of_distribution,
+    } = select(findings, sites, specs.frames(), m);
     let mut summary = Summary {
         model_id: m.model_id.clone(),
         served_controls: m
@@ -136,6 +146,7 @@ pub fn run(
             .map(|c| c.control.clone())
             .collect(),
         unserved,
+        out_of_distribution,
         ..Summary::default()
     };
     let mut budget_line = None;
@@ -168,16 +179,27 @@ fn not_run(why: String) -> LaneOutput {
     }
 }
 
-/// The site questions to ask, in site order then frame order, and the
-/// unserved controls with how many site questions each left unanswered.
+/// What [`select`] found.
+struct Selected<'a> {
+    /// The site questions to ask, in site order then frame order.
+    asks: Vec<Ask<'a>>,
+    /// The unserved controls with how many site questions each left
+    /// unanswered.
+    unserved: Vec<Unserved>,
+    /// The served controls with how many site questions each left
+    /// unanswered because the site's class family is not served.
+    out_of_distribution: Vec<Unserved>,
+}
+
 fn select<'a>(
     findings: &[rvl_propagate::Finding],
     sites: &'a [rvl_core::Site],
     frames: &'a [Frame],
     manifest: &ModelManifest,
-) -> (Vec<Ask<'a>>, Vec<Unserved>) {
+) -> Selected<'a> {
     let mut asks = Vec::new();
     let mut unserved: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut ood: std::collections::BTreeMap<&str, usize> = Default::default();
     for (f, site) in findings.iter().zip(sites) {
         if f.verdict.is_resolved() {
             continue;
@@ -187,25 +209,33 @@ fn select<'a>(
             .iter()
             .filter(|fr| fr.habitat == CALL_SITE && fr.covers_class(&class))
         {
-            if manifest.serves(&frame.control) {
+            if !manifest.serves(&frame.control) {
+                *unserved.entry(frame.control.as_str()).or_default() += 1;
+            } else if !manifest.serves_class(&frame.control, &class) {
+                *ood.entry(frame.control.as_str()).or_default() += 1;
+            } else {
                 asks.push(Ask {
                     site,
                     class: class.clone(),
                     frame,
                 });
-            } else {
-                *unserved.entry(frame.control.as_str()).or_default() += 1;
             }
         }
     }
-    let unserved = unserved
-        .into_iter()
-        .map(|(control, sites)| Unserved {
-            control: control.to_string(),
-            sites,
-        })
-        .collect();
-    (asks, unserved)
+    let rows = |counts: std::collections::BTreeMap<&str, usize>| {
+        counts
+            .into_iter()
+            .map(|(control, sites)| Unserved {
+                control: control.to_string(),
+                sites,
+            })
+            .collect()
+    };
+    Selected {
+        asks,
+        unserved: rows(unserved),
+        out_of_distribution: rows(ood),
+    }
 }
 
 /// Load the runtime and the bundle, and ask every question.
@@ -419,15 +449,23 @@ fn coverage_lines(s: &Summary, budget_line: Option<String>, frames_rejected: usi
     if let Some(line) = budget_line {
         out.push(line);
     }
-    if !s.unserved.is_empty() {
-        let named: Vec<String> = s
-            .unserved
-            .iter()
+    let named = |rows: &[Unserved]| {
+        rows.iter()
             .map(|u| format!("{} ({})", u.control, u.sites))
-            .collect();
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ")
+    };
+    if !s.out_of_distribution.is_empty() {
+        out.push(format!(
+            "decision model abstains out of distribution, on class families it does not \
+             serve: {}",
+            named(&s.out_of_distribution)
+        ));
+    }
+    if !s.unserved.is_empty() {
         out.push(format!(
             "decision model abstains on controls it does not serve: {}",
-            named.join(" \u{00b7} ")
+            named(&s.unserved)
         ));
     }
     if !s.withheld_controls.is_empty() {
@@ -560,6 +598,62 @@ mod tests {
         assert_eq!(ladder::classify(&row), ladder::Section::Advisory);
     }
 
+    fn manifest(served_classes: &str) -> ModelManifest {
+        let sha = "0".repeat(64);
+        ModelManifest::parse(
+            format!(
+                r#"{{"schema_version":1,"model_id":"m","layout":"compact","max_len":8,
+                "temperature":1.0,"bundle_url":"/b/",
+                "served_controls":[{{"control":"RC-022"{served_classes}}}],
+                "files":[{{"name":"m.onnx","sha256":"{sha}"}},
+                         {{"name":"tokenizer.json","sha256":"{sha}"}}]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn undecided(client_type: &str, method: &str) -> (rvl_propagate::Finding, rvl_core::Site) {
+        let site = rvl_core::Site {
+            client_type: client_type.into(),
+            method: method.into(),
+            ..rvl_core::Site::default()
+        };
+        let f = rvl_propagate::Finding {
+            site_id: String::new(),
+            verdict: rvl_core::Verdict::Abstain,
+            reason: String::new(),
+        };
+        (f, site)
+    }
+
+    #[test]
+    fn a_site_whose_class_family_is_not_served_abstains_out_of_distribution() {
+        let (f1, redis) = undecided("github.com/redis/go-redis/v9.Client", "Get");
+        let (f2, http) = undecided("net/http.Client", "Do");
+        let (findings, sites) = (vec![f1, f2], vec![redis, http]);
+        let frames = vec![frame(&[])];
+
+        let listed = manifest(r#","served_classes":["net/http"]"#);
+        let sel = select(&findings, &sites, &frames, &listed);
+        let asked: Vec<&str> = sel.asks.iter().map(|a| a.class.as_str()).collect();
+        assert_eq!(asked, ["net/http.Client.Do"], "the listed class is asked");
+        assert_eq!(
+            sel.out_of_distribution,
+            [Unserved {
+                control: "RC-022".into(),
+                sites: 1,
+            }],
+            "the go-redis Client.Get site abstains"
+        );
+        assert!(sel.unserved.is_empty());
+
+        let unlisted = manifest("");
+        let sel = select(&findings, &sites, &frames, &unlisted);
+        assert_eq!(sel.asks.len(), 2, "no served_classes asks every class");
+        assert!(sel.out_of_distribution.is_empty());
+    }
+
     #[test]
     fn unserved_and_withheld_controls_are_named_on_the_coverage_line() {
         let s = Summary {
@@ -569,11 +663,19 @@ mod tests {
                 control: "RC-022".into(),
                 sites: 2,
             }],
+            out_of_distribution: vec![Unserved {
+                control: "RC-019".into(),
+                sites: 3,
+            }],
             ..Summary::default()
         };
         let lines = coverage_lines(&s, None, 1);
-        assert!(lines[1].contains("RC-022 (2)"), "{lines:?}");
-        assert!(lines[2].contains("withholds RC-022"), "{lines:?}");
-        assert!(lines[3].contains("1 frame(s)"), "{lines:?}");
+        assert!(
+            lines[1].contains("out of distribution") && lines[1].contains("RC-019 (3)"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("RC-022 (2)"), "{lines:?}");
+        assert!(lines[3].contains("withholds RC-022"), "{lines:?}");
+        assert!(lines[4].contains("1 frame(s)"), "{lines:?}");
     }
 }

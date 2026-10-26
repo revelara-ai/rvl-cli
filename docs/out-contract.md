@@ -300,7 +300,11 @@ The orchestrator uses it to:
   given as the reason, null when the model has no cell head or its top cell
   is not of the verdict's kind), `reason`, `model_id` and `weights_digest`.
   `unserved` counts the site questions of controls the model does not
-  serve, per control (`{"control", "sites"}`); they abstain. `coverage` is
+  serve, per control (`{"control", "sites"}`); they abstain.
+  `out_of_distribution` counts, in the same shape, the site questions of a
+  served control whose manifest entry lists `served_classes` and whose
+  class family (its package: `net/http` for `net/http.Client.Do`) is not
+  listed; they abstain too. `coverage` is
   the lane's COVERAGE lines. A `violates` row is also an advisory row in
   `findings`, class `model.<control>`. Nothing in `sites` or `undecided`
   changes because of it.
