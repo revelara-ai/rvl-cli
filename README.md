@@ -24,6 +24,10 @@ Or download a release archive for your platform from the
 [releases page](https://github.com/revelara-ai/rvl-cli/releases) and put its
 contents on your `PATH`.
 
+Releases are built for macOS on Apple silicon and for Linux on x86_64 and
+arm64. Intel Macs get no release after 1.7.1, which stays installable from its
+release page.
+
 ## Quick start
 
 ```sh
@@ -117,7 +121,7 @@ retriever.
 
 ### Workspace layout
 
-Sixteen crates under `crates/`, plus a `helpers/` tree of retrievers that are
+The crates under `crates/`, plus a `helpers/` tree of retrievers that are
 not Rust.
 
 | Crate | What it is |
@@ -137,6 +141,7 @@ not Rust.
 | `rvl-data` | The platform commands (`risk`, `control`, `evidence`, `knowledge`, …), held to byte-identical JSON parity with the Go CLI via golden tests. |
 | `rvl-skills` | Skill and lens distribution into coding-agent harnesses. Download-only by construction. |
 | `cindex`, `rustindex` | The C/C++ (libclang) and Rust (rust-analyzer SCIP) retrievers, as libraries; their executables are bins of the `rvl` package. |
+| `rvl-model` | Local classifier inference on CPU: loads an ONNX model bundle and runs it through a runtime-loaded ONNX Runtime, deterministically and inside a time budget. A release carries the pinned runtime (`onnxruntime.pin`) beside `rvl`. |
 
 `helpers/` holds the out-of-process retrievers, one directory per language,
 each with its own README: `goindex` (a Go module, with its own `go test`

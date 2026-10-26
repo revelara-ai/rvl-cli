@@ -30,8 +30,9 @@ installers = []
 publish-jobs = ["./publish-cask"]
 # Supply chain (po-fao1r). Each release carries a CycloneDX SBOM of the Rust
 # dependency tree as a release asset (rvl.cdx.xml), built by cargo-cyclonedx in
-# the global-artifacts job. It lists crates only: goindex's Go modules and the
-# vendored libclang are in the archive and not in the SBOM.
+# the global-artifacts job. It lists crates only: goindex's Go modules, the
+# vendored libclang and the vendored ONNX Runtime are in the archive and not in
+# the SBOM.
 cargo-cyclonedx = true
 # SLSA Build Level 3 provenance for every release asset, published on the
 # release as rvl.intoto.jsonl by .github/workflows/slsa-provenance.yml (see
@@ -60,8 +61,13 @@ github-custom-job-permissions = { "publish-cask" = { contents = "read" }, "slsa-
 # archives and nothing reads the tarball; ci/check-release-plan.sh fails the
 # build if the plan lists one again.
 source-tarball = false
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Target platforms to build apps for (Rust target-triple syntax).
+#
+# No x86_64-apple-darwin: ONNX Runtime publishes no Intel macOS build after
+# 1.23.2, so a release cannot vendor the pinned runtime the model lane loads
+# there (crates/rvl-model/onnxruntime.pin). Intel macOS got its last release in
+# 1.7.1. ci/check-release-plan.sh fails the build if the plan lists it again.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # Extra steps spliced into each per-target build job before `dist build`.

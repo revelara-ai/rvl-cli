@@ -103,6 +103,11 @@ rvl-testgate = { path = "../rvl-testgate" }
 # build-setup step list. cindex finds it beside its own resolved path, so it
 # must stay a sibling directory of the executables, never a `binary`.
 #
+# `include` carries `onnxruntime/` the same way: the pinned ONNX Runtime the
+# model lane (crates/rvl-model) loads, verified by ci/fetch-onnxruntime.sh
+# against crates/rvl-model/onnxruntime.pin. rvl-model finds it beside the
+# resolved `rvl`, so it too stays a sibling directory of the executables.
+#
 # `include` carries goindex, which cargo cannot build: release CI cross-builds
 # it per target into `dist-extras/` before `dist build` runs. It is not a cargo
 # bin target, so Homebrew files it under `<prefix>/share/rvl` rather than
@@ -111,4 +116,4 @@ rvl-testgate = { path = "../rvl-testgate" }
 # of the archive combined.
 [package.metadata.dist]
 binaries = { "*" = ["rvl", "cindex", "rustindex"] }
-include = ["dist-extras/goindex", "dist-extras/libclang"]
+include = ["dist-extras/goindex", "dist-extras/libclang", "dist-extras/onnxruntime"]

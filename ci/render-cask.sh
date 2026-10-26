@@ -64,10 +64,13 @@ CASK_NAME="rvl"
 CASK_DESC="Revelara CLI — scan your codebase for reliability risks"
 CASK_HOMEPAGE="https://revelara.ai"
 
-# Rust target triple -> the cask's (os block, arch block) pair.
+# Rust target triple -> the cask's (os block, arch block) pair. macOS is
+# arm64 only: there is no x86_64-apple-darwin release target (see
+# dist-workspace.toml), so the macOS block carries one archive and a
+# `depends_on arch: :arm64` that makes brew refuse an Intel Mac with a reason
+# instead of installing nothing.
 triple_blocks() {
   case "$1" in
-    x86_64-apple-darwin)       echo "on_macos on_intel" ;;
     aarch64-apple-darwin)      echo "on_macos on_arm" ;;
     x86_64-unknown-linux-gnu)  echo "on_linux on_intel" ;;
     aarch64-unknown-linux-gnu) echo "on_linux on_arm" ;;
@@ -75,7 +78,7 @@ triple_blocks() {
   esac
 }
 # Emission order, so the file's shape is stable across releases.
-TRIPLES="x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
+TRIPLES="aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
 
 # ---------------------------------------------------------------------------
 # Collect the manifests
@@ -223,7 +226,11 @@ cask "$CASK_TOKEN" do
   version "$version"
 
 EOF
-emit_os_block on_macos x86_64-apple-darwin aarch64-apple-darwin
+printf '  on_macos do\n'
+printf '    depends_on arch: :arm64\n'
+printf '\n'
+emit_target aarch64-apple-darwin "    "
+printf '  end\n'
 printf '\n'
 emit_os_block on_linux x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 cat <<EOF

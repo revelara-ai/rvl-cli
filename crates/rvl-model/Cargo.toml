@@ -1,0 +1,25 @@
+[package]
+name = "rvl-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Local ONNX classifier inference for rvl (ONNX Runtime, runtime-loaded)"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "api-31"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = "3"
+# The one place a live test may skip; fatal under RVLSCAN_REQUIRE_ENGINES.
+rvl-testgate = { path = "../rvl-testgate" }
