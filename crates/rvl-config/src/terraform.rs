@@ -39,8 +39,16 @@
 //!     `resource.aws_db_instance.backup_retention_period` (`0`),
 //!     `resource.aws_rds_cluster.backup_retention_period` (`1`), and
 //!     `resource.google_sql_database_instance.backup_configuration.enabled` /
-//!     `.point_in_time_recovery_enabled` (`false`). No other resource
-//!     attribute is read. A `dynamic` block on the path is Unresolvable.
+//!     `.point_in_time_recovery_enabled` (`false`). The zone-spread facts
+//!     (RC-017): `resource.aws_db_instance.multi_az` (`false`),
+//!     `resource.google_sql_database_instance.settings.availability_type`
+//!     (`ZONAL`), `resource.google_container_cluster.location-shape`
+//!     (`region` | `zone`, from the `location` name) and
+//!     `resource.google_container_node_pool.node_locations-count` (the
+//!     length of a literal list). The last two have no default an absent
+//!     attribute can take: the provider block or the parent cluster supplies
+//!     it, so they are Unresolvable. No other resource attribute is read. A
+//!     `dynamic` block on the path is Unresolvable.
 //!   * `terraform.module-kind` (`root` | `reusable` | `indeterminate`) and,
 //!     for roots only, `terraform.root-backend` — the same fact as
 //!     `terraform.backend`, emitted where a missing backend is a finding and
@@ -310,6 +318,8 @@ enum Value {
     VarRef(String),
     /// An object literal `{ k = v, ... }` (a `required_providers` entry).
     Object(Vec<(String, Value)>),
+    /// A list literal `[a, b, ...]` whose items are all literal scalars.
+    List(Vec<String>),
     /// Anything needing evaluation: templates, functions, other references,
     /// lists, heredocs, operators. Never resolved, never guessed.
     Expr,
@@ -457,6 +467,10 @@ impl Parser {
                 self.bump();
                 return self.parse_object();
             }
+            Some(Tok::Punct('[')) => {
+                self.bump();
+                self.parse_list()
+            }
             _ => Value::Expr,
         };
         if matches!(candidate, Value::Expr) || !self.at_value_end() {
@@ -497,6 +511,67 @@ impl Parser {
                     self.skip_balanced_brace();
                     return Value::Expr;
                 }
+            }
+        }
+    }
+
+    /// A list literal after its `[`. Only literal scalar items count: any
+    /// other item (a reference, a call, a nested list) degrades the whole
+    /// list to [`Value::Expr`], and the rest is consumed as an expression.
+    fn parse_list(&mut self) -> Value {
+        let mut items = Vec::new();
+        loop {
+            while matches!(self.peek(), Some(Tok::Newline)) {
+                self.bump();
+            }
+            if matches!(self.peek(), Some(Tok::Punct(']'))) {
+                self.bump();
+                return Value::List(items);
+            }
+            let lit = match self.peek() {
+                Some(Tok::Str {
+                    template: false, ..
+                })
+                | Some(Tok::Num(_)) => match self.bump() {
+                    Some(Tok::Str { value, .. }) | Some(Tok::Num(value)) => value,
+                    _ => unreachable!(),
+                },
+                _ => {
+                    self.consume_list();
+                    return Value::Expr;
+                }
+            };
+            items.push(lit);
+            while matches!(self.peek(), Some(Tok::Newline)) {
+                self.bump();
+            }
+            match self.peek() {
+                Some(Tok::Punct(',')) => {
+                    self.bump();
+                }
+                Some(Tok::Punct(']')) => {}
+                _ => {
+                    self.consume_list();
+                    return Value::Expr;
+                }
+            }
+        }
+    }
+
+    /// Skip to just past the `]` closing the CURRENT list (depth already
+    /// inside it).
+    fn consume_list(&mut self) {
+        let mut depth = 1usize;
+        while let Some(t) = self.bump() {
+            match t {
+                Tok::Punct('(') | Tok::Punct('[') | Tok::Punct('{') => depth += 1,
+                Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -734,10 +809,32 @@ struct ResourceAttr {
     /// Nested blocks from the resource body down to the attribute.
     blocks: &'static [&'static str],
     attr: &'static str,
-    default: &'static str,
+    absent: Absent,
+    shape: Shape,
     /// An attribute whose presence means this fact does not describe the
     /// resource, so no packet is emitted.
     unless_attr: Option<&'static str>,
+}
+
+/// What an absent attribute means.
+enum Absent {
+    /// The default the provider documents.
+    Default(&'static str),
+    /// The value comes from somewhere this resource body does not say (the
+    /// provider configuration, a parent resource): the packet abstains, and
+    /// the provenance names where the value lives.
+    Elsewhere(&'static str),
+}
+
+/// What the packet value is, given the attribute's resolved value.
+enum Shape {
+    /// The attribute's value itself.
+    AsWritten,
+    /// `region` or `zone`, from a GCP location name ([`location_shape`]).
+    Location,
+    /// How many items a literal list holds; a non-empty list only, since an
+    /// empty one means "not set" to the provider.
+    ListCount,
 }
 
 const RESOURCE_ATTRS: &[ResourceAttr] = &[
@@ -749,7 +846,8 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         packet_key: "resource.aws_db_instance.backup_retention_period",
         blocks: &[],
         attr: "backup_retention_period",
-        default: "0",
+        absent: Absent::Default("0"),
+        shape: Shape::AsWritten,
         unless_attr: Some("replicate_source_db"),
     },
     ResourceAttr {
@@ -757,7 +855,8 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         packet_key: "resource.aws_rds_cluster.backup_retention_period",
         blocks: &[],
         attr: "backup_retention_period",
-        default: "1",
+        absent: Absent::Default("1"),
+        shape: Shape::AsWritten,
         unless_attr: None,
     },
     ResourceAttr {
@@ -765,7 +864,8 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         packet_key: "resource.google_sql_database_instance.backup_configuration.enabled",
         blocks: &["settings", "backup_configuration"],
         attr: "enabled",
-        default: "false",
+        absent: Absent::Default("false"),
+        shape: Shape::AsWritten,
         unless_attr: None,
     },
     ResourceAttr {
@@ -773,10 +873,141 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         packet_key: "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
         blocks: &["settings", "backup_configuration"],
         attr: "point_in_time_recovery_enabled",
-        default: "false",
+        absent: Absent::Default("false"),
+        shape: Shape::AsWritten,
+        unless_attr: None,
+    },
+    // RC-017: a single-AZ instance has no standby in another zone.
+    ResourceAttr {
+        resource_type: "aws_db_instance",
+        packet_key: "resource.aws_db_instance.multi_az",
+        blocks: &[],
+        attr: "multi_az",
+        absent: Absent::Default("false"),
+        shape: Shape::AsWritten,
+        unless_attr: None,
+    },
+    // RC-017: ZONAL has no failover replica in a second zone.
+    ResourceAttr {
+        resource_type: "google_sql_database_instance",
+        packet_key: "resource.google_sql_database_instance.settings.availability_type",
+        blocks: &["settings"],
+        attr: "availability_type",
+        absent: Absent::Default("ZONAL"),
+        shape: Shape::AsWritten,
+        unless_attr: None,
+    },
+    // RC-017: a zone location is a zonal cluster (one control-plane zone); a
+    // region location is a regional one. An absent location falls back to
+    // the provider block's, which this lane does not read.
+    ResourceAttr {
+        resource_type: "google_container_cluster",
+        packet_key: "resource.google_container_cluster.location-shape",
+        blocks: &[],
+        attr: "location",
+        absent: Absent::Elsewhere("provider-setting"),
+        shape: Shape::Location,
+        unless_attr: None,
+    },
+    // RC-017: how many zones the pool's nodes spread over. An absent list
+    // inherits the cluster's zones, which the pool body does not name.
+    ResourceAttr {
+        resource_type: "google_container_node_pool",
+        packet_key: "resource.google_container_node_pool.node_locations-count",
+        blocks: &[],
+        attr: "node_locations",
+        absent: Absent::Elsewhere("inherited"),
+        shape: Shape::ListCount,
         unless_attr: None,
     },
 ];
+
+/// The shape of a GCP location name: `region` (`us-central1`) or `zone`
+/// (`us-central1-a`). Anything else is `None`, never a guess.
+fn location_shape(location: &str) -> Option<&'static str> {
+    let is_region = |area: &str, place: &str| {
+        !area.is_empty()
+            && area.bytes().all(|c| c.is_ascii_lowercase())
+            && place.bytes().take_while(|c| c.is_ascii_lowercase()).count() > 0
+            && place
+                .trim_start_matches(|c: char| c.is_ascii_lowercase())
+                .bytes()
+                .all(|c| c.is_ascii_digit())
+            && place.ends_with(|c: char| c.is_ascii_digit())
+    };
+    match location.split('-').collect::<Vec<_>>()[..] {
+        [area, place] if is_region(area, place) => Some("region"),
+        [area, place, zone]
+            if is_region(area, place)
+                && zone.len() == 1
+                && zone.bytes().all(|c| c.is_ascii_lowercase()) =>
+        {
+            Some("zone")
+        }
+        _ => None,
+    }
+}
+
+/// Turn one attribute lookup into a packet's (value, resolution, provenance)
+/// for `row`.
+fn resolve_row(
+    row: &ResourceAttr,
+    rel: &str,
+    key_path: &str,
+    found: AttrLookup<'_>,
+    vars: &VarTable,
+) -> (Option<String>, Resolution, Vec<ProvenanceStep>) {
+    let unresolvable = |mut chain: Vec<ProvenanceStep>, role: &str| {
+        chain.push(ProvenanceStep::new(rel, key_path, role));
+        (None, Resolution::Unresolvable, chain)
+    };
+    let v = match found {
+        AttrLookup::Found(v) => v,
+        AttrLookup::Absent => {
+            let absent = ProvenanceStep::new(rel, key_path, "absent");
+            return match row.absent {
+                Absent::Default(d) => (
+                    Some(d.to_string()),
+                    Resolution::PlatformDefault,
+                    vec![
+                        absent,
+                        ProvenanceStep::new("", row.attr, "platform-default"),
+                    ],
+                ),
+                Absent::Elsewhere(role) => (
+                    None,
+                    Resolution::Unresolvable,
+                    vec![absent, ProvenanceStep::new("", row.attr, role)],
+                ),
+            };
+        }
+        AttrLookup::Dynamic => return unresolvable(Vec::new(), "expression"),
+    };
+    match row.shape {
+        Shape::AsWritten => resolve_value(rel, key_path, v, vars),
+        Shape::Location => match resolve_value(rel, key_path, v, vars) {
+            (Some(loc), res, chain) => match location_shape(&loc) {
+                Some(shape) => (Some(shape.to_string()), res, chain),
+                None => unresolvable(chain, "unrecognized"),
+            },
+            unresolved => unresolved,
+        },
+        Shape::ListCount => match v {
+            Value::List(items) if !items.is_empty() => (
+                Some(items.len().to_string()),
+                Resolution::AsAuthored,
+                vec![ProvenanceStep::new(rel, key_path, "explicit")],
+            ),
+            Value::List(_) => unresolvable(Vec::new(), "empty"),
+            // A list from a variable never resolves: one-hop resolution
+            // carries scalar literals only.
+            _ => match resolve_value(rel, key_path, v, vars) {
+                (_, Resolution::Unresolvable, chain) => (None, Resolution::Unresolvable, chain),
+                (_, _, chain) => unresolvable(chain, "not-a-list"),
+            },
+        },
+    }
+}
 
 /// What a walk down a resource body for one [`ResourceAttr`] found.
 enum AttrLookup<'a> {
@@ -1314,22 +1545,8 @@ fn retrieve_dir(
                     .chain(std::iter::once(row.attr.to_string()))
                     .collect::<Vec<_>>()
                     .join(".");
-                let (value, resolution, prov) = match lookup_attr(&b.body, row.blocks, row.attr) {
-                    AttrLookup::Found(v) => resolve_value(rel, &key_path, v, &vars),
-                    AttrLookup::Absent => (
-                        Some(row.default.to_string()),
-                        Resolution::PlatformDefault,
-                        vec![
-                            ProvenanceStep::new(rel, &key_path, "absent"),
-                            ProvenanceStep::new("", row.attr, "platform-default"),
-                        ],
-                    ),
-                    AttrLookup::Dynamic => (
-                        None,
-                        Resolution::Unresolvable,
-                        vec![ProvenanceStep::new(rel, &key_path, "expression")],
-                    ),
-                };
+                let found = lookup_attr(&b.body, row.blocks, row.attr);
+                let (value, resolution, prov) = resolve_row(row, rel, &key_path, found, &vars);
                 out.packets
                     .push(packet(rel, &unit, row.packet_key, value, resolution, prov));
             }
@@ -1737,6 +1954,240 @@ module "local" {
             .map(|p| p.key.as_str())
             .collect();
         assert_eq!(keys, vec!["resource.lifecycle.prevent_destroy"]);
+    }
+
+    // --- the zone-spread facts (RC-017) ---
+
+    /// The zone-spread fixture module, read as one directory.
+    fn zone_spread() -> Retrieved {
+        let got = one(&[
+            (
+                "rds.tf",
+                include_str!("../testdata/terraform/zone_spread/rds.tf"),
+            ),
+            (
+                "cloud_sql.tf",
+                include_str!("../testdata/terraform/zone_spread/cloud_sql.tf"),
+            ),
+            (
+                "gke.tf",
+                include_str!("../testdata/terraform/zone_spread/gke.tf"),
+            ),
+            (
+                "variables.tf",
+                include_str!("../testdata/terraform/zone_spread/variables.tf"),
+            ),
+        ]);
+        assert_eq!(got.unparseable, 0, "the fixture module must parse");
+        got
+    }
+
+    /// (value, resolution, last provenance role) of one packet.
+    fn fact(got: &Retrieved, unit: &str, key: &str) -> (Option<String>, Resolution, String) {
+        let p = find(got, unit, key);
+        (
+            p.resolved_value.clone(),
+            p.resolution,
+            p.provenance.last().unwrap().role.clone(),
+        )
+    }
+
+    fn some(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn rds_multi_az_is_authored_defaulted_or_unresolved() {
+        let got = zone_spread();
+        let key = "resource.aws_db_instance.multi_az";
+        let at = |name: &str| fact(&got, &format!("resource:aws_db_instance.{name}"), key);
+        assert_eq!(
+            at("spread"),
+            (some("true"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("single"),
+            (some("false"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("bare"),
+            (
+                some("false"),
+                Resolution::PlatformDefault,
+                "platform-default".into()
+            ),
+            "the provider documents false: a single-AZ instance"
+        );
+        assert_eq!(
+            at("from_var"),
+            (None, Resolution::Unresolvable, "project-setting".into())
+        );
+        assert_eq!(
+            at("from_expr"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+    }
+
+    #[test]
+    fn cloud_sql_availability_type_is_authored_defaulted_or_unresolved() {
+        let got = zone_spread();
+        let key = "resource.google_sql_database_instance.settings.availability_type";
+        let at = |name: &str| {
+            fact(
+                &got,
+                &format!("resource:google_sql_database_instance.{name}"),
+                key,
+            )
+        };
+        assert_eq!(
+            at("regional"),
+            (some("REGIONAL"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("zonal"),
+            (some("ZONAL"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("bare"),
+            (
+                some("ZONAL"),
+                Resolution::PlatformDefault,
+                "platform-default".into()
+            ),
+            "the provider documents ZONAL"
+        );
+        assert_eq!(
+            at("from_var"),
+            (None, Resolution::Unresolvable, "project-setting".into())
+        );
+        assert_eq!(
+            at("from_expr"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+        assert_eq!(
+            find(&got, "resource:google_sql_database_instance.regional", key).provenance[0]
+                .key_path,
+            "resource.google_sql_database_instance.regional.settings.availability_type"
+        );
+    }
+
+    #[test]
+    fn gke_cluster_location_shape_is_region_or_zone_or_unresolved() {
+        let got = zone_spread();
+        let key = "resource.google_container_cluster.location-shape";
+        let at = |name: &str| {
+            fact(
+                &got,
+                &format!("resource:google_container_cluster.{name}"),
+                key,
+            )
+        };
+        assert_eq!(
+            at("regional"),
+            (some("region"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("zonal"),
+            (some("zone"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("bare"),
+            (None, Resolution::Unresolvable, "provider-setting".into()),
+            "an absent location is the provider block's, never a default"
+        );
+        assert_eq!(
+            at("from_var"),
+            (None, Resolution::Unresolvable, "project-setting".into())
+        );
+        assert_eq!(
+            at("from_expr"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+    }
+
+    #[test]
+    fn gke_location_names_classify_by_their_documented_shape() {
+        for (loc, want) in [
+            ("us-central1", Some("region")),
+            ("northamerica-northeast2", Some("region")),
+            ("us-central1-f", Some("zone")),
+            ("europe-west4-b", Some("zone")),
+            ("us", None),
+            ("us-central", None),
+            ("us-central1-ab", None),
+            ("US-CENTRAL1", None),
+            ("", None),
+        ] {
+            assert_eq!(location_shape(loc), want, "{loc}");
+        }
+        let got = one(&[(
+            "gke.tf",
+            "resource \"google_container_cluster\" \"odd\" {\n  location = \"us\"\n}\n",
+        )]);
+        assert_eq!(
+            fact(
+                &got,
+                "resource:google_container_cluster.odd",
+                "resource.google_container_cluster.location-shape"
+            ),
+            (None, Resolution::Unresolvable, "unrecognized".into())
+        );
+    }
+
+    #[test]
+    fn gke_node_pool_node_locations_count_is_a_literal_list_length_or_unresolved() {
+        let got = zone_spread();
+        let key = "resource.google_container_node_pool.node_locations-count";
+        let at = |name: &str| {
+            fact(
+                &got,
+                &format!("resource:google_container_node_pool.{name}"),
+                key,
+            )
+        };
+        assert_eq!(
+            at("three_zones"),
+            (some("3"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("one_zone"),
+            (some("1"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("bare"),
+            (None, Resolution::Unresolvable, "inherited".into()),
+            "an absent list inherits the cluster's zones, never a default"
+        );
+        assert_eq!(
+            at("from_var"),
+            (None, Resolution::Unresolvable, "non-literal".into()),
+            "a list default is not a one-hop literal"
+        );
+        assert_eq!(
+            at("from_expr"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+        assert_eq!(
+            at("mixed"),
+            (None, Resolution::Unresolvable, "expression".into()),
+            "one non-literal item makes the whole count a guess"
+        );
+    }
+
+    #[test]
+    fn an_empty_node_locations_list_is_unset_not_zero() {
+        let got = one(&[(
+            "gke.tf",
+            "resource \"google_container_node_pool\" \"p\" {\n  node_locations = []\n}\n",
+        )]);
+        assert_eq!(
+            fact(
+                &got,
+                "resource:google_container_node_pool.p",
+                "resource.google_container_node_pool.node_locations-count"
+            ),
+            (None, Resolution::Unresolvable, "empty".into())
+        );
     }
 
     // --- root vs reusable modules (po-pk3fp.13, RC-016) ---
