@@ -276,6 +276,18 @@ impl GoRepo {
             .env("RVL_CACHE_DIR", self.dir.path().join("cache"))
             .env("RVL_INDEX_DIR", self.dir.path().join("index"))
             .env("RVL_OFFLINE", "1");
+        // CI'S OWN BASE REF MUST NOT REACH THE SCAN. A GitHub `pull_request`
+        // run exports `GITHUB_BASE_REF`, which turns a `--changed-only` scan
+        // here into `main...HEAD` of the fixture: an empty range, so nothing
+        // is retrieved and the broken lane these tests pin is never asked.
+        // Hooks inherit the git process's environment, so `git` gets it too.
+        for k in [
+            "RVL_BASE_REF",
+            "GITHUB_BASE_REF",
+            "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
+        ] {
+            c.env_remove(k);
+        }
         // A real goindex is found by env override rather than by PATH, so the
         // ONLY variable these tests change is whether the `go` TOOLCHAIN
         // resolves — not whether the retriever itself does.

@@ -11,6 +11,7 @@
 //! not a trust failure.
 
 pub mod auto;
+pub mod model;
 
 use base64::Engine;
 use ed25519_dalek::Verifier;
@@ -565,7 +566,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// `proxy(None)` because ureq 3 reads the proxy variables from the
 /// environment by default, and `max_redirects(5)`, the ureq 2 limit.
 /// A 4xx/5xx stays an error (`ureq::Error::StatusCode`).
-fn http_agent() -> ureq::Agent {
+pub(crate) fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .proxy(None)

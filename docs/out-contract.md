@@ -108,7 +108,8 @@ The orchestrator uses it to:
   ],
   "config_sites_overflow": 0,
   "hook_agent": null,
-  "blend": null
+  "blend": null,
+  "decision_model": null
 }
 ```
 
@@ -287,6 +288,22 @@ The orchestrator uses it to:
   `out_of_scope`, and `block`, the BLEND section as rendered text.
   `complete: false` means the report is the deterministic half alone.
   Nothing in `findings`, `sites` or `undecided` changes because of it.
+- `decision_model` is present when the repository turns the decision-model
+  lane on (`scanner.decision_model: on`), null otherwise. `model_id` and
+  `weights_digest` (`sha256:<hex>` of the model file) name the model;
+  `not_run` says why the lane did not run (no verified bundle cached, no
+  ONNX Runtime), else null. `served_controls` and `withheld_controls` are
+  the manifest's lists. `sites` has one row per undecided call site and
+  served frame the model was asked: `site_id`, `class`, `control`,
+  `frame_version`, `verdict` (`violates` | `satisfies` | `not_applicable` |
+  `abstain`), `confidence` (null on an abstain), `cell` (the frame cell
+  given as the reason, null when the model has no cell head or its top cell
+  is not of the verdict's kind), `reason`, `model_id` and `weights_digest`.
+  `unserved` counts the site questions of controls the model does not
+  serve, per control (`{"control", "sites"}`); they abstain. `coverage` is
+  the lane's COVERAGE lines. A `violates` row is also an advisory row in
+  `findings`, class `model.<control>`. Nothing in `sites` or `undecided`
+  changes because of it.
 - `exit` duplicates the process exit code so a consumer holding only the file
   knows whether the gate fired (`0` clean, `3` blocking).
 
@@ -301,7 +318,7 @@ The orchestrator uses it to:
   spec-lane findings it is the producing spec's identity
   (`client_type.method`, the waiver key, e.g. `net/http.Client.Do`); for
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
-  `emission.`, `unsized.`, `repo_structure.`, `config.`). The server's precision arm
+  `emission.`, `unsized.`, `repo_structure.`, `config.`, `model.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
   The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
 - `findings[].factors` is the list of causal factor codes (`CF-0007`) of

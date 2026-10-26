@@ -1355,6 +1355,7 @@ dependencies = [
  "rvl-emission",
  "rvl-index",
  "rvl-misuse",
+ "rvl-model",
  "rvl-propagate",
  "rvl-skills",
  "rvl-spec",
