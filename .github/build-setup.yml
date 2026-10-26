@@ -38,7 +38,6 @@
       exit 1
     fi
     case "${targets[0]}" in
-      x86_64-apple-darwin)     export GOOS=darwin GOARCH=amd64 ;;
       aarch64-apple-darwin)    export GOOS=darwin GOARCH=arm64 ;;
       x86_64-unknown-linux-*)  export GOOS=linux  GOARCH=amd64 ;;
       aarch64-unknown-linux-*) export GOOS=linux  GOARCH=arm64 ;;
@@ -72,3 +71,24 @@
     fi
     ci/fetch-libclang.sh "${targets[0]}" "$GITHUB_WORKSPACE/crates/rvl/dist-extras"
     echo "CINDEX_REQUIRE_VENDORED_LIBCLANG=1" >> "$GITHUB_ENV"
+# The pinned ONNX Runtime the model lane (crates/rvl-model) loads in a
+# release. Release scan results must not depend on the scanning machine, so
+# the archive carries one. ci/fetch-onnxruntime.sh reads
+# crates/rvl-model/onnxruntime.pin, verifies the download's sha256 and FAILS
+# this job on a mismatch; it writes crates/rvl/dist-extras/onnxruntime/,
+# which `include` packs beside rvl.
+#
+# RVL_REQUIRE_VENDORED_ONNXRUNTIME reaches `dist build`'s cargo through
+# GITHUB_ENV and is read at COMPILE time: a release rvl whose bundle is missing
+# fails closed instead of loading whatever ONNX Runtime the system has.
+- name: Fetch the pinned ONNX Runtime for this target
+  shell: bash
+  run: |
+    set -euo pipefail
+    targets=(${{ join(matrix.targets, ' ') }})
+    if [ "${#targets[@]}" -ne 1 ]; then
+      echo "ONNX Runtime packaging assumes one target per job, got: ${targets[*]}" >&2
+      exit 1
+    fi
+    ci/fetch-onnxruntime.sh "${targets[0]}" "$GITHUB_WORKSPACE/crates/rvl/dist-extras"
+    echo "RVL_REQUIRE_VENDORED_ONNXRUNTIME=1" >> "$GITHUB_ENV"

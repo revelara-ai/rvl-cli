@@ -22,8 +22,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # A live test that cannot reach its engine (libclang, node and `typescript`,
-  # a JDK, rust-analyzer, Go, python3, the .NET SDK) prints SKIP and passes on
+  # A live test that cannot reach its engine (libclang, ONNX Runtime, node and
+  # `typescript`, a JDK, rust-analyzer, Go, python3, the .NET SDK) prints SKIP and passes on
   # a workstation. With this set it fails instead (crates/rvl-testgate), so a
   # green run here means every language lane executed. The `check` and
   # `check-macos` jobs provision each engine below; a runner that lacks one is
@@ -144,11 +144,19 @@ jobs:
         run: |
           ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
 
+      # The model lane's engine, the ONNX Runtime a release ships, pinned and
+      # checksummed in crates/rvl-model/onnxruntime.pin. The rvl-model tests
+      # load it from target/debug/onnxruntime/, beside the test binaries.
+      - name: Fetch the pinned ONNX Runtime
+        run: |
+          ci/fetch-onnxruntime.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
+
       # Assert the engine, not the build. The tests fail on a missing engine
       # too (RVLSCAN_REQUIRE_ENGINES), but this says which one in one line.
       - name: Every engine is available
         run: |
           target/debug/cindex --engine-check
+          ls target/debug/onnxruntime/libonnxruntime.*
           (cd helpers/tsindex && node -e "require('typescript')")
           go version
           javac -version
@@ -203,14 +211,19 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # The aarch64-apple-darwin engine a release ships, from the same pin.
+      # The aarch64-apple-darwin engines a release ships, from the same pins.
       - name: Fetch the pinned libclang
         run: |
           ci/fetch-libclang.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
 
+      - name: Fetch the pinned ONNX Runtime
+        run: |
+          ci/fetch-onnxruntime.sh "$(rustc -vV | sed -n 's/^host: //p')" target/debug
+
       - name: Every engine is available
         run: |
           target/debug/cindex --engine-check
+          ls target/debug/onnxruntime/libonnxruntime.*
           (cd helpers/tsindex && node -e "require('typescript')")
           go version
           javac -version
