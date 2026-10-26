@@ -550,7 +550,8 @@ pub fn prune_claude_cache_versions(home: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// Claude Code: the tarball is a marketplace plugin (`.claude-plugin/
-/// plugin.json` + `commands/` + `agents/`). It is staged into the SAME local
+/// plugin.json` + `commands/` + `agents/`), to which rvl adds the prompt
+/// reminder hook (`hooks/hooks.json`, see [`crate::prompt_hook`]). It is staged into the SAME local
 /// marketplace rvl-cli uses (`~/.revelara/marketplace`), the marketplace
 /// manifest is (re)written with the installed version, and the returned
 /// [`Registration`] carries the `claude plugin` commands that activate it.
@@ -639,7 +640,18 @@ impl Harness for ClaudeHarness {
             std::fs::remove_dir_all(&marketplace)?;
         }
         std::fs::create_dir_all(&plugin_dir)?;
-        let files_written = write_files(&plugin_dir, files)?;
+        let mut files_written = write_files(&plugin_dir, files)?;
+        // The prompt reminder to run `rvl factor lookup`, merged into the
+        // plugin's own hooks file when the download ships one.
+        let hooks = crate::prompt_hook::hooks_json(
+            files.get(crate::prompt_hook::HOOKS_JSON).map(Vec::as_slice),
+        )?;
+        let hooks_path = plugin_dir.join(crate::prompt_hook::HOOKS_JSON);
+        if !hooks_path.exists() {
+            files_written += 1;
+        }
+        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        std::fs::write(hooks_path, hooks)?;
 
         let manifest_dir = marketplace.join(".claude-plugin");
         std::fs::create_dir_all(&manifest_dir)?;
@@ -1328,6 +1340,55 @@ mod tests {
         assert_eq!(reg.binary, "claude");
         assert_eq!(reg.commands.len(), 3);
         assert!(reg.commands[2].contains(&"revelara@revelara-local".to_string()));
+    }
+
+    #[test]
+    fn claude_install_writes_the_prompt_reminder_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let receipt = ClaudeHarness
+            .install(
+                home.path(),
+                &files(&[("commands/scan.md", b"scan".as_slice())]),
+                "0.2.0",
+            )
+            .unwrap();
+        assert_eq!(receipt.files_written, 2, "the download's file and the hook");
+
+        let installed = std::fs::read(receipt.location.join("hooks/hooks.json")).unwrap();
+        let hooks: serde_json::Value = serde_json::from_slice(&installed).unwrap();
+        let events = hooks["hooks"].as_object().unwrap();
+        assert_eq!(
+            events.keys().collect::<Vec<_>>(),
+            ["UserPromptSubmit"],
+            "reminds only: no PreToolUse hook"
+        );
+        let hook = &hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(hook["type"], "command");
+        let command = hook["command"].as_str().unwrap();
+        assert!(
+            command.starts_with("echo '"),
+            "runs no rvl process: {command}"
+        );
+
+        // The command's output is Claude Code hook JSON carrying the
+        // AGENTS.md reminder, and it exits 0 (never blocks).
+        #[cfg(unix)]
+        {
+            let run = std::process::Command::new("sh")
+                .args(["-c", command])
+                .output()
+                .unwrap();
+            assert!(run.status.success());
+            let out: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+            assert_eq!(
+                out["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit"
+            );
+            assert_eq!(
+                out["hookSpecificOutput"]["additionalContext"],
+                crate::prompt_hook::reminder()
+            );
+        }
     }
 
     #[test]
