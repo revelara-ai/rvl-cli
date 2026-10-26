@@ -21,6 +21,10 @@ pub const CALL_SITE: &str = "call_site";
 pub struct Frame {
     /// `RC-022`.
     pub control: String,
+    /// The control's name, `Retry, Backoff and Request Coalescing`. Absent
+    /// in a cache written before it was published, and then empty.
+    #[serde(default)]
+    pub control_name: String,
     /// `v2`.
     #[serde(default)]
     pub version: String,
@@ -91,7 +95,7 @@ mod tests {
     use super::*;
 
     const SPECS: &str = r#"{"apis":[],"frames":[
-        {"control":"RC-022","version":"v2","habitat":"call_site","question":"Retried?",
+        {"control":"RC-022","control_name":"Retries","version":"v2","habitat":"call_site","question":"Retried?",
          "cells":[{"id":"M1","kind":"manifestation","verdict":"violates","definition":"No retry"}],
          "class_markers":["http"],"later_field":1},
         {"control":"RC-019","version":"v1","habitat":"call_site","question":"Bounded?","cells":[]},
@@ -104,6 +108,8 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(rejected, 1);
         assert_eq!(frames[0].cell("M1").unwrap().definition, "No retry");
+        assert_eq!(frames[0].control_name, "Retries");
+        assert_eq!(frames[1].control_name, "", "a frame without a name parses");
         assert_eq!(parse(r#"{"apis":[]}"#), (vec![], 0));
     }
 
