@@ -6,7 +6,9 @@
 #
 # Unpacks the archive into a scratch directory, checks that `rvl --version`
 # names <version>, and scans a copy of ci/smoke/repo with the seed specs in
-# ci/smoke/specs.json. The fixture has one unbounded call per lane the archive
+# ci/smoke/specs.json. It also checks that the archive carries the pinned ONNX
+# Runtime and its license in onnxruntime/. The fixture has one unbounded call
+# per lane the archive
 # carries a helper for (Go: goindex, C: cindex and its vendored libclang,
 # Python: the embedded pyindex), and the scan must:
 #
@@ -57,6 +59,17 @@ rvl=$bindir/rvl
 got=$("$rvl" --version)
 [ "$got" = "rvl $version" ] || die "\`rvl --version\` printed '$got', expected 'rvl $version'"
 echo "ok: $got"
+
+# --- model runtime -----------------------------------------------------------
+# The pinned ONNX Runtime the model lane loads, beside rvl
+# (ci/fetch-onnxruntime.sh). Checked as files: no lane of the smoke scan
+# loads it yet.
+runtime_libs=$( { find "$bindir/onnxruntime" -maxdepth 1 -type f -name 'libonnxruntime.*' -size +0 2>/dev/null || true; } | wc -l)
+[ "$runtime_libs" -eq 1 ] ||
+  die "$(basename "$archive") does not carry one ONNX Runtime library in $top/onnxruntime/"
+[ -s "$bindir/onnxruntime/LICENSE" ] ||
+  die "$(basename "$archive") carries ONNX Runtime without its LICENSE"
+echo "ok: $top/onnxruntime/ carries the ONNX Runtime library and its license"
 
 # --- scan --------------------------------------------------------------------
 cp -R "$fixture" "$work/repo"

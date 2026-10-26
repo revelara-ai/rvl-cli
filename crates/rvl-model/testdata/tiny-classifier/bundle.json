@@ -1,0 +1,10 @@
+{
+  "labels": [
+    "bounded",
+    "unbounded"
+  ],
+  "max_length": 16,
+  "model_id": "rvl-fixture/tiny-classifier",
+  "pad_id": 0,
+  "temperature": 1.5
+}

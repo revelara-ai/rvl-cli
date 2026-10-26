@@ -157,10 +157,17 @@ J
 exit "${FAKE_EXIT:-3}"
 "#;
 
-/// A `rvl-<triple>.tar.xz` laid out as dist packs one, holding [`FAKE_RVL`].
-fn fake_archive(dir: &Path) -> PathBuf {
+/// A `rvl-<triple>.tar.xz` laid out as dist packs one, holding [`FAKE_RVL`]
+/// and, when `runtime`, an `onnxruntime/` bundle.
+fn fake_archive(dir: &Path, runtime: bool) -> PathBuf {
     let staged = dir.join(TOP);
     std::fs::create_dir_all(&staged).unwrap();
+    if runtime {
+        let bundle = staged.join("onnxruntime");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("libonnxruntime.so"), "ELF-ish").unwrap();
+        std::fs::write(bundle.join("LICENSE"), "MIT License\n").unwrap();
+    }
     let rvl = staged.join("rvl");
     std::fs::write(&rvl, FAKE_RVL).unwrap();
     #[cfg(unix)]
@@ -186,8 +193,12 @@ fn fake_archive(dir: &Path) -> PathBuf {
 }
 
 fn smoke(version: &str, env: &[(&str, &str)]) -> std::process::Output {
+    smoke_archive(version, env, true)
+}
+
+fn smoke_archive(version: &str, env: &[(&str, &str)], runtime: bool) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
-    let archive = fake_archive(dir.path());
+    let archive = fake_archive(dir.path(), runtime);
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("ci/smoke-archive.sh"))
         .arg(&archive)
@@ -227,6 +238,14 @@ fn smoke_passes_a_clean_scan() {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn smoke_fails_on_an_archive_without_the_onnx_runtime() {
+    assert_fails(
+        &smoke_archive("1.6.0", &[], false),
+        "does not carry one ONNX Runtime library",
     );
 }
 

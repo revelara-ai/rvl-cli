@@ -18,6 +18,7 @@ The keys this binary reads are:
 | `scanner.use_agent` | `allow` opts the repo into hook-mode agent adjudication. Absent means deny; opting in requires committing this key. |
 | `scanner.agent_hooks.<hook>.enabled` | Per-hook opt-in for that lane. |
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
+| `scanner.model_threads` | CPU threads for local model inference (default 4, at least 1). Verdicts do not depend on it; it trades scan time for CPU. |
 
 Unknown keys are tolerated everywhere, so the same file can carry settings for
 other consumers.
@@ -96,6 +97,7 @@ headless and CI use work with no config file at all.
 | `RVL_GOINDEX`, `RVL_PYINDEX`, `RVL_TSINDEX`, `RVL_JAVAINDEX`, `RVL_CINDEX`, `RVL_RUSTINDEX`, `RVL_CSINDEX` | Point a lane at a specific helper (slot 1) |
 | `RVL_NODE_MAX_OLD_SPACE_MB` | V8 heap limit, in MB, for the `node` that runs the TypeScript helper. Default: half of physical memory, at most 16384. `0` leaves node's own default (about 4 GB). A `NODE_OPTIONS` that sets `--max-old-space-size` is respected when this is unset |
 | `RVL_RUST_ANALYZER` | Path to the `rust-analyzer` binary the Rust lane drives (`RVL_RUST_ANALYZER_SHA256` optionally pins its checksum) |
+| `RVL_ONNXRUNTIME` | The ONNX Runtime library local model inference loads (the file, or a directory holding it), instead of the pinned one a release carries in `onnxruntime/` beside `rvl` |
 | `RVL_RUSTINDEX_MAX_CRATES` | Largest cargo workspace (crates, dependencies included) the Rust lane hands to `rust-analyzer`; a bigger one is not indexed and the lane is reported partial. Default 600, which keeps `rust-analyzer` under about 8 GB |
 | `RVL_CACHE_DIR`, `RVL_INDEX_DIR`, `RVL_SKILLS_CACHE_DIR` | Relocate the spec cache, packet index, skills cache |
 | `RVL_ALLOW_UNSIGNED_PLUGIN=1` | Accept plugin content from a server with no signing key |
