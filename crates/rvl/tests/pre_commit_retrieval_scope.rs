@@ -180,21 +180,17 @@ fn a_three_file_commit_over_a_stale_index_retrieves_only_the_staged_files() {
     );
 }
 
-/// An unscoped incremental scan still re-parses everything stale: scoping is a
-/// property of `--changed-only`, not a new limit on the warm pass. The stub
-/// stalls on the large request, so this also pins that fail-open on the cap is
-/// unchanged.
+/// An unscoped incremental scan over the same stale baseline asks for more
+/// than the commit, so the stub stalls past the cap: the pass fails open,
+/// unchanged by scoping. That the unscoped request IS the stale baseline is
+/// pinned by a unit test of the request (`an_unscoped_pass_asks_for_every_
+/// stale_file_and_a_scoped_one_for_the_change`), not here: how many lines the
+/// stub logs before the 10 s cap depends on how fast the machine is.
 #[test]
-fn an_unscoped_incremental_scan_still_retrieves_every_stale_file() {
+fn an_unscoped_incremental_scan_that_hits_the_cap_still_fails_open() {
     let co = Checkout::new();
     let (out, all) = co.scan(&[]);
     assert!(out.status.success(), "the cap still fails open:\n{all}");
-    // The stalled batch is killed at the cap, so later batches may never be
-    // asked for; the baseline showing up at all is the point.
-    assert!(
-        co.retrieved().iter().any(|f| f.starts_with("pkg")),
-        "an unscoped pass asks for the stale baseline:\n{all}"
-    );
     // Two clocks enforce the same 10 s cap and either may fire first: the
     // pass's wall budget ("retrieval capped") or the helper's own deadline,
     // which kills the stub and degrades Go. Both fail open on the cap.
