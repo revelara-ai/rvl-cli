@@ -26,6 +26,9 @@ pub use classify::{AbstainReason, Classification, Classifier, Coverage, Options,
 pub use render::{render_input, Layout, Question};
 pub use runtime::{Runtime, Source};
 
+/// The verdict outputs of a published decision model, in logit order.
+pub const VERDICTS: [&str; 4] = ["violates", "satisfies", "not_applicable", "abstain"];
+
 /// Intra-op threads when `scanner.model_threads` is absent.
 pub const DEFAULT_THREADS: usize = 4;
 
@@ -35,12 +38,16 @@ pub const DEFAULT_THREADS: usize = 4;
 pub struct ModelConfig {
     /// `scanner.model_threads`.
     pub threads: usize,
+    /// `scanner.decision_model: on`: the scan decides served frame questions
+    /// with the decision model. Off by default.
+    pub decision_model: bool,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         ModelConfig {
             threads: DEFAULT_THREADS,
+            decision_model: false,
         }
     }
 }
@@ -55,6 +62,7 @@ struct RepoFile {
 #[serde(default)]
 struct ScannerModelSection {
     model_threads: Option<usize>,
+    decision_model: Option<serde_yaml::Value>,
 }
 
 impl ModelConfig {
@@ -67,7 +75,19 @@ impl ModelConfig {
         if threads == 0 {
             anyhow::bail!("scanner.model_threads must be at least 1");
         }
-        Ok(ModelConfig { threads })
+        let decision_model = match f.scanner.decision_model {
+            None => false,
+            Some(serde_yaml::Value::Bool(b)) => b,
+            Some(serde_yaml::Value::String(s)) if s == "on" || s == "off" => s == "on",
+            Some(other) => anyhow::bail!(
+                "scanner.decision_model must be `on` or `off`, not {}",
+                serde_yaml::to_string(&other).unwrap_or_default().trim()
+            ),
+        };
+        Ok(ModelConfig {
+            threads,
+            decision_model,
+        })
     }
 
     /// Load from `<repo_root>/.revelara.yaml`. A missing file is the default.
@@ -99,6 +119,16 @@ mod tests {
     fn model_threads_is_read_from_the_scanner_section() {
         let cfg = ModelConfig::from_yaml_str("scanner:\n  model_threads: 1\n  waivers: []\n");
         assert_eq!(cfg.unwrap().threads, 1);
+    }
+
+    #[test]
+    fn the_decision_model_is_off_unless_turned_on() {
+        let on = |yaml: &str| ModelConfig::from_yaml_str(yaml).map(|c| c.decision_model);
+        assert!(!on("").unwrap());
+        assert!(on("scanner:\n  decision_model: on\n").unwrap());
+        assert!(!on("scanner:\n  decision_model: off\n").unwrap());
+        assert!(on("scanner:\n  decision_model: true\n").unwrap());
+        assert!(on("scanner:\n  decision_model: maybe\n").is_err());
     }
 
     #[test]

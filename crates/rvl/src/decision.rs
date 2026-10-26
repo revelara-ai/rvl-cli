@@ -1,0 +1,529 @@
+//! The decision-model lane: the sites the deterministic lanes left undecided,
+//! asked a served frame's question by the local decision model.
+//!
+//! It runs after the deterministic lanes and before the agent lane, only when
+//! the repository turns it on (`scanner.decision_model: on` in
+//! `.revelara.yaml`), and only on the bundle `rvl model sync` cached and
+//! verified. Inference runs on this machine: no code leaves it.
+//!
+//! For each undecided call site and each `call_site` frame of the spec cache
+//! whose class markers cover the site's class:
+//!
+//! * a control the bundle's manifest SERVES is rendered, inferred and
+//!   decided: `violates` becomes an advisory finding, `satisfies` and
+//!   `not_applicable` a decided site, each with the model's record (model
+//!   id, weights digest, confidence) in `--out`;
+//! * any other control abstains, and the coverage line names it.
+//!
+//! Each decision's reason is the frame cell the model's cell head ranks top,
+//! masked to the frame's cells, with that cell's definition: "RC-022
+//! violates, M2: <definition>". A top cell of another kind than the verdict
+//! (an S cell under `violates`) is not shown: the reason is unknown. A model
+//! without a cell head says the reason is not in this model.
+//!
+//! Model findings are advisory: their severity is not graded.
+
+use serde::Serialize;
+use std::path::Path;
+use std::time::Duration;
+
+use rvl_cache::model::{ModelManifest, ModelStore, MODEL_DIR};
+use rvl_model::render::{self, Layout, Question};
+use rvl_spec::frames::{Frame, CALL_SITE};
+
+use crate::render as ladder;
+
+/// The longest the model may run in one scan, inside the scan budget.
+pub const MODEL_BUDGET: Duration = Duration::from_secs(60);
+
+/// The lane's part of the `--out` document.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Summary {
+    /// Empty when the lane did not run.
+    pub model_id: String,
+    /// `sha256:<hex>` of the model file.
+    pub weights_digest: String,
+    /// Why the lane did not run; null when it ran.
+    pub not_run: Option<String>,
+    pub served_controls: Vec<String>,
+    pub withheld_controls: Vec<String>,
+    /// One row per (site, served frame) the model was asked.
+    pub sites: Vec<Decision>,
+    /// The site questions of controls the model does not serve, per control.
+    pub unserved: Vec<Unserved>,
+    /// The lines the COVERAGE block prints.
+    pub coverage: Vec<String>,
+}
+
+/// The model's answer for one site and one frame, with its record.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Decision {
+    pub site_id: String,
+    pub class: String,
+    pub control: String,
+    pub frame_version: String,
+    /// `violates` | `satisfies` | `not_applicable` | `abstain`.
+    pub verdict: String,
+    pub confidence: Option<f64>,
+    /// The frame cell given as the reason, when there is one.
+    pub cell: Option<String>,
+    pub reason: String,
+    pub model_id: String,
+    pub weights_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unserved {
+    pub control: String,
+    pub sites: usize,
+}
+
+/// What the lane hands the scan.
+#[derive(Debug, Default)]
+pub struct LaneOutput {
+    /// Advisory ladder rows, one per `violates` decision.
+    pub findings: Vec<ladder::Finding>,
+    pub summary: Summary,
+}
+
+/// One question for the model: a site and a served frame.
+struct Ask<'a> {
+    site: &'a rvl_core::Site,
+    class: String,
+    frame: &'a Frame,
+}
+
+/// Whether the repository turned the lane on. A `.revelara.yaml` that does
+/// not parse leaves it off, said on stderr.
+pub fn enabled(repo_root: &Path) -> Option<rvl_model::ModelConfig> {
+    match rvl_model::ModelConfig::load(repo_root) {
+        Ok(c) if c.decision_model => Some(c),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("warning: the decision model lane is off: .revelara.yaml: {e:#}");
+            None
+        }
+    }
+}
+
+/// Run the lane over the deterministic lanes' verdicts.
+pub fn run(
+    cfg: &rvl_model::ModelConfig,
+    cache_root: &Path,
+    keyset: &rvl_cache::Keyset,
+    findings: &[rvl_propagate::Finding],
+    sites: &[rvl_core::Site],
+    specs: &rvl_spec::SpecCache,
+    budget: Duration,
+) -> LaneOutput {
+    let loaded = ModelStore::open(&cache_root.join(MODEL_DIR)).and_then(|s| s.load(keyset));
+    let cached = match loaded {
+        Ok(c) => c,
+        Err(e) => return not_run(format!("{e:#}; run `{} model sync`", rvl_core::BIN)),
+    };
+    let m = &cached.manifest;
+    let (asks, unserved) = select(findings, sites, specs.frames(), m);
+    let mut summary = Summary {
+        model_id: m.model_id.clone(),
+        served_controls: m
+            .served_controls
+            .iter()
+            .map(|c| c.control.clone())
+            .collect(),
+        withheld_controls: m
+            .withheld_controls
+            .iter()
+            .map(|c| c.control.clone())
+            .collect(),
+        unserved,
+        ..Summary::default()
+    };
+    let mut budget_line = None;
+    if !asks.is_empty() {
+        match infer(cfg, &cached.dir, m, &asks, budget) {
+            Ok((digest, decisions, line)) => {
+                summary.weights_digest = digest;
+                summary.sites = decisions;
+                budget_line = line;
+            }
+            Err(e) => summary.not_run = Some(format!("{e:#}")),
+        }
+    }
+    summary.coverage = coverage_lines(&summary, budget_line, specs.frames_rejected());
+    LaneOutput {
+        findings: summary.sites.iter().filter_map(finding_of).collect(),
+        summary,
+    }
+}
+
+fn not_run(why: String) -> LaneOutput {
+    let mut summary = Summary {
+        not_run: Some(why),
+        ..Summary::default()
+    };
+    summary.coverage = coverage_lines(&summary, None, 0);
+    LaneOutput {
+        findings: Vec::new(),
+        summary,
+    }
+}
+
+/// The site questions to ask, in site order then frame order, and the
+/// unserved controls with how many site questions each left unanswered.
+fn select<'a>(
+    findings: &[rvl_propagate::Finding],
+    sites: &'a [rvl_core::Site],
+    frames: &'a [Frame],
+    manifest: &ModelManifest,
+) -> (Vec<Ask<'a>>, Vec<Unserved>) {
+    let mut asks = Vec::new();
+    let mut unserved: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (f, site) in findings.iter().zip(sites) {
+        if f.verdict.is_resolved() {
+            continue;
+        }
+        let class = rvl_triage::class_key_string(site);
+        for frame in frames
+            .iter()
+            .filter(|fr| fr.habitat == CALL_SITE && fr.covers_class(&class))
+        {
+            if manifest.serves(&frame.control) {
+                asks.push(Ask {
+                    site,
+                    class: class.clone(),
+                    frame,
+                });
+            } else {
+                *unserved.entry(frame.control.as_str()).or_default() += 1;
+            }
+        }
+    }
+    let unserved = unserved
+        .into_iter()
+        .map(|(control, sites)| Unserved {
+            control: control.to_string(),
+            sites,
+        })
+        .collect();
+    (asks, unserved)
+}
+
+/// Load the runtime and the bundle, and ask every question.
+fn infer(
+    cfg: &rvl_model::ModelConfig,
+    dir: &Path,
+    m: &ModelManifest,
+    asks: &[Ask],
+    budget: Duration,
+) -> anyhow::Result<(String, Vec<Decision>, Option<String>)> {
+    let layout = match m.layout.as_str() {
+        "compact" => Layout::Compact,
+        "full" => Layout::Full,
+        other => anyhow::bail!("the model's layout {other:?} is not one rvl renders"),
+    };
+    let runtime = rvl_model::runtime::load(&rvl_model::runtime::resolve_from_env()?)?;
+    let bundle = rvl_model::Bundle::from_parts(
+        dir,
+        rvl_model::Manifest {
+            model_id: m.model_id.clone(),
+            labels: rvl_model::VERDICTS.map(String::from).to_vec(),
+            temperature: m.temperature,
+            max_length: m.max_len,
+            pad_id: None,
+        },
+        &m.model_file().name,
+    )?;
+    let digest = bundle.weights_digest.clone();
+    let mut classifier = rvl_model::Classifier::new(
+        runtime,
+        bundle,
+        rvl_model::Options {
+            threads: cfg.threads,
+            ..Default::default()
+        },
+    )?;
+    let texts: Vec<String> = asks
+        .iter()
+        .map(|a| render::render_input(&site_of(a), &question_of(a.frame), layout))
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let c = classifier.classify(&refs, budget)?;
+    let cells = classifier.cells();
+    let decisions = asks
+        .iter()
+        .zip(&c.records)
+        .map(|(a, r)| decide(a, r, cells))
+        .collect();
+    Ok((digest, decisions, c.coverage.line()))
+}
+
+/// The model's input site, from what rvl retrieved.
+fn site_of(a: &Ask) -> render::Site {
+    let s = a.site;
+    render::Site {
+        class: a.class.clone(),
+        scope: s.scope().as_str().to_string(),
+        language: s.lang.clone(),
+        file: s.file_path.clone(),
+        site: format!("{}:{}", s.file_path, s.line_number),
+        snippet: s.snippet.clone(),
+        packet: render::SitePacket::from(s),
+        ..render::Site::default()
+    }
+}
+
+/// A frame's question, with its cells in the training text's form,
+/// `M1  [violates] <definition>`. The frames carry no control name.
+fn question_of(f: &Frame) -> Question {
+    Question::Frame(render::Frame {
+        control: f.control.clone(),
+        control_name: String::new(),
+        question: f.question.clone(),
+        cells: f
+            .cells
+            .iter()
+            .map(|c| format!("{}  [{}] {}", c.id, c.verdict, c.definition))
+            .collect(),
+    })
+}
+
+/// The cell kind a verdict's reason must be.
+fn kind_of(verdict: &str) -> Option<&'static str> {
+    match verdict {
+        "violates" => Some("manifestation"),
+        "satisfies" => Some("satisfying"),
+        "not_applicable" => Some("context"),
+        _ => None,
+    }
+}
+
+/// One record as a decision with its reason.
+fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision {
+    let control = &a.frame.control;
+    let verdict = match &r.verdict {
+        rvl_model::Verdict::Label(l) => l.clone(),
+        rvl_model::Verdict::Abstain(_) => "abstain".to_string(),
+    };
+    let (cell, reason) = match (kind_of(&verdict), cells) {
+        (None, _) if r.confidence.is_none() => (
+            None,
+            format!("{control} abstains: the model time budget ran out"),
+        ),
+        (None, _) => (None, format!("{control} abstains: the model abstained")),
+        (Some(_), None) => (
+            None,
+            format!("{control} {verdict}, reason: not in this model"),
+        ),
+        (Some(kind), Some(ids)) => {
+            let allowed: Vec<&str> = a.frame.cells.iter().map(|c| c.id.as_str()).collect();
+            let top = rvl_model::classify::top_cell(ids, &r.cell_logits, &allowed)
+                .and_then(|i| a.frame.cell(&ids[i]));
+            match top {
+                Some(c) if c.kind == kind => (
+                    Some(c.id.clone()),
+                    format!("{control} {verdict}, {}: {}", c.id, c.definition),
+                ),
+                Some(c) => (
+                    None,
+                    format!(
+                        "{control} {verdict}, reason unknown: the model's top cell {} is not \
+                         a {kind} cell",
+                        c.id
+                    ),
+                ),
+                None => (
+                    None,
+                    format!("{control} {verdict}, reason unknown: no cell of the frame ranked"),
+                ),
+            }
+        }
+    };
+    Decision {
+        site_id: format!("{}:{}", a.site.file_path, a.site.line_number),
+        class: a.class.clone(),
+        control: control.clone(),
+        frame_version: a.frame.version.clone(),
+        verdict,
+        confidence: r.confidence,
+        cell,
+        reason,
+        model_id: r.model_id.clone(),
+        weights_digest: r.weights_digest.clone(),
+    }
+}
+
+/// An advisory ladder row for a `violates` decision. The waiver key is
+/// `model.<control>`.
+fn finding_of(d: &Decision) -> Option<ladder::Finding> {
+    if d.verdict != "violates" {
+        return None;
+    }
+    let class_rule = format!("model.{}", d.control);
+    Some(ladder::Finding {
+        id: ladder::finding_id(&format!("{class_rule}@{}", d.site_id)),
+        site: d.site_id.clone(),
+        description: format!(
+            "{} (decision model {}, confidence {:.2})",
+            d.reason,
+            d.model_id,
+            d.confidence.unwrap_or_default()
+        ),
+        disposition: "surface".into(),
+        // Not graded: advisory until a severity is set for the control.
+        severity: String::new(),
+        incident_count: 0,
+        critical_count: 0,
+        control: d.control.clone(),
+        fix: String::new(),
+        site_count: 1,
+        example_sites: vec![d.site_id.clone()],
+        class_rule,
+        suppressed: false,
+        gate_exempt: false,
+        factors: Vec::new(),
+    })
+}
+
+fn coverage_lines(s: &Summary, budget_line: Option<String>, frames_rejected: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(why) = &s.not_run {
+        out.push(format!("decision model: not run \u{2014} {why}"));
+    } else if s.sites.is_empty() {
+        out.push(format!(
+            "decision model {}: no undecided site has a frame of a served control",
+            s.model_id
+        ));
+    } else {
+        let count = |v: &str| s.sites.iter().filter(|d| d.verdict == v).count();
+        let parts: Vec<String> = [
+            ("violates", "violates"),
+            ("satisfies", "satisfies"),
+            ("not_applicable", "not applicable"),
+            ("abstain", "abstain"),
+        ]
+        .iter()
+        .map(|(v, label)| (count(v), label))
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+        out.push(format!(
+            "decision model {}: {} site question(s) asked \u{2014} {} (advisory)",
+            s.model_id,
+            s.sites.len(),
+            parts.join(" \u{00b7} ")
+        ));
+    }
+    if let Some(line) = budget_line {
+        out.push(line);
+    }
+    if !s.unserved.is_empty() {
+        let named: Vec<String> = s
+            .unserved
+            .iter()
+            .map(|u| format!("{} ({})", u.control, u.sites))
+            .collect();
+        out.push(format!(
+            "decision model abstains on controls it does not serve: {}",
+            named.join(" \u{00b7} ")
+        ));
+    }
+    if !s.withheld_controls.is_empty() {
+        out.push(format!(
+            "decision model withholds {} (below its publication gate)",
+            s.withheld_controls.join(", ")
+        ));
+    }
+    if frames_rejected > 0 {
+        out.push(format!(
+            "{frames_rejected} frame(s) in the spec cache did not parse and were skipped"
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(cells: &[(&str, &str)]) -> Frame {
+        serde_json::from_value(serde_json::json!({
+            "control": "RC-022", "version": "v2", "habitat": "call_site", "question": "q",
+            "cells": cells.iter().map(|(id, kind)| serde_json::json!({
+                "id": id, "kind": kind, "verdict": "violates", "definition": format!("def {id}")
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn record(verdict: &str, cell_logits: Vec<f32>) -> rvl_model::Record {
+        rvl_model::Record {
+            verdict: rvl_model::Verdict::Label(verdict.into()),
+            confidence: Some(0.9),
+            logits: vec![0.0; 4],
+            cell_logits,
+            model_id: "m".into(),
+            weights_digest: "sha256:x".into(),
+        }
+    }
+
+    fn ask<'a>(site: &'a rvl_core::Site, frame: &'a Frame) -> Ask<'a> {
+        Ask {
+            site,
+            class: "a.B.C".into(),
+            frame,
+        }
+    }
+
+    #[test]
+    fn the_reason_is_the_top_cell_of_the_frame_masked_and_of_the_verdicts_kind() {
+        let site = rvl_core::Site::default();
+        let ids: Vec<String> = ["M1", "M2", "S1", "C1"].map(String::from).to_vec();
+        let f = frame(&[
+            ("M1", "manifestation"),
+            ("M2", "manifestation"),
+            ("S1", "satisfying"),
+        ]);
+        // C1 ranks top over all cells, but it is not one of the frame's.
+        let r = record("violates", vec![1.0, 2.0, 0.0, 9.0]);
+        let d = decide(&ask(&site, &f), &r, Some(&ids));
+        assert_eq!(d.cell.as_deref(), Some("M2"));
+        assert_eq!(d.reason, "RC-022 violates, M2: def M2");
+
+        let r = record("violates", vec![1.0, 0.0, 5.0, 0.0]);
+        let d = decide(&ask(&site, &f), &r, Some(&ids));
+        assert_eq!(d.cell, None, "an S cell is not a reason to violate");
+        assert!(d.reason.contains("reason unknown"), "{}", d.reason);
+
+        let d = decide(&ask(&site, &f), &record("violates", vec![]), None);
+        assert_eq!(d.reason, "RC-022 violates, reason: not in this model");
+    }
+
+    #[test]
+    fn only_a_violation_is_a_ladder_row_and_it_is_advisory() {
+        let site = rvl_core::Site::default();
+        let f = frame(&[]);
+        let d = decide(&ask(&site, &f), &record("satisfies", vec![]), None);
+        assert!(finding_of(&d).is_none());
+        let d = decide(&ask(&site, &f), &record("violates", vec![]), None);
+        let row = finding_of(&d).unwrap();
+        assert_eq!(row.class_rule, "model.RC-022");
+        assert_eq!(ladder::classify(&row), ladder::Section::Advisory);
+    }
+
+    #[test]
+    fn unserved_and_withheld_controls_are_named_on_the_coverage_line() {
+        let s = Summary {
+            model_id: "m".into(),
+            withheld_controls: vec!["RC-022".into()],
+            unserved: vec![Unserved {
+                control: "RC-022".into(),
+                sites: 2,
+            }],
+            ..Summary::default()
+        };
+        let lines = coverage_lines(&s, None, 1);
+        assert!(lines[1].contains("RC-022 (2)"), "{lines:?}");
+        assert!(lines[2].contains("withholds RC-022"), "{lines:?}");
+        assert!(lines[3].contains("1 frame(s)"), "{lines:?}");
+    }
+}

@@ -9,6 +9,7 @@ mod child;
 mod compat;
 mod config_lane;
 mod context_files;
+mod decision;
 mod devscope;
 mod doctor;
 mod embedded_helpers;
@@ -431,6 +432,16 @@ enum Cmd {
         /// The check a scan hands off: silent, always exit 0.
         #[arg(long, hide = true)]
         background: bool,
+        /// With --background: also sync the decision model bundle, for a
+        /// repository that turned the lane on.
+        #[arg(long, hide = true, requires = "background")]
+        model: bool,
+    },
+    /// The decision model the scan's model lane runs
+    /// (`scanner.decision_model: on` in .revelara.yaml).
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
     },
     /// Spec-cache maintenance.
     Cache {
@@ -795,6 +806,14 @@ enum IndexCmd {
     },
     /// Show how many files are indexed.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Download the published model bundle, verify its signature and every
+    /// file's sha256, and cache it (needs an API key; RVL_OFFLINE=1 keeps the
+    /// cached bundle).
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -3926,6 +3945,32 @@ fn stdout_color(mode: Option<&str>) -> bool {
     )
 }
 
+/// The decision-model lane, when `.revelara.yaml` turns it on: after the
+/// deterministic lanes, inside what is left of the scan budget.
+fn decision_lane(
+    store: &CacheStore,
+    keyset: &Keyset,
+    path: &Path,
+    findings: &[rvl_propagate::Finding],
+    sites: &[rvl_core::Site],
+    specs: &rvl_spec::SpecCache,
+    limits: &budget::Limits,
+) -> Option<decision::LaneOutput> {
+    let cfg = decision::enabled(path)?;
+    let budget = limits
+        .remaining()
+        .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
+    Some(decision::run(
+        &cfg,
+        store.root(),
+        keyset,
+        findings,
+        sites,
+        specs,
+        budget,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan(
     store: &CacheStore,
@@ -4016,7 +4061,8 @@ fn run_scan(
             &structure.rows,
             lane.as_ref(),
             None,
-            // No language, so no call site the blend could be asked about.
+            // No call site for the decision model or the blend.
+            None,
             None,
             out,
             color,
@@ -4058,6 +4104,7 @@ fn run_scan(
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
+    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
     let blended = blend.then(|| {
         blend::run(
             path,
@@ -4080,6 +4127,7 @@ fn run_scan(
         &structure_rows,
         Some(&lane),
         None,
+        model.as_ref(),
         blended.as_ref(),
         out,
         color,
@@ -4204,6 +4252,8 @@ fn render_scan_output(
     structure_rows: &[out_doc::OutSite],
     config: Option<&config_lane::LaneOutput>,
     hook_agent: Option<&agent::HookOutput>,
+    // The decision-model lane; None when the repo did not turn it on.
+    model: Option<&decision::LaneOutput>,
     // `scan --blend` (po-av01j.205); None when not requested.
     blended: Option<&blend::BlendOutput>,
     out: Option<&std::path::Path>,
@@ -4272,6 +4322,9 @@ fn render_scan_output(
     (coverage.by_design, coverage.by_design_classes) = by_design_coverage(findings);
     coverage.by_lang = lang_coverage(findings, sites);
     coverage.blend_incomplete = blended.and_then(|b| b.incomplete.clone());
+    coverage.decision_model = model
+        .map(|m| m.summary.coverage.clone())
+        .unwrap_or_default();
     coverage.agent_no_control = hook_agent
         .map(|a| a.gate_findings.as_slice())
         .into_iter()
@@ -4311,6 +4364,10 @@ fn render_scan_output(
     // built from `findings`, which agent verdicts never touch.
     if let Some(a) = hook_agent {
         ladder_findings.extend(a.gate_findings.iter().cloned());
+    }
+    // Decision-model violations: advisory rows, waivable as `model.<control>`.
+    if let Some(m) = model {
+        ladder_findings.extend(m.findings.iter().cloned());
     }
     // `--blend` follows the same rule: rows only in gate mode, agent-tagged.
     if let Some(b) = blended {
@@ -4360,6 +4417,7 @@ fn render_scan_output(
             blended.map(|b| &b.summary),
             blocked,
         )
+        .with_decision_model(model.map(|m| m.summary.clone()))
     });
 
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
@@ -4916,11 +4974,16 @@ where
 /// Run one warm incremental pass: hash-gate the candidate sources, reuse indexed
 /// packets, and budget-retrieve the changed files. Shared by `scan --incremental`
 /// and `report --incremental` so both assemble sites the same way.
+///
+/// `scope`, when given, is the gate's changed set (repo-relative): only those
+/// files, plus the C/C++ TUs that include a header in it, are hash-gated and
+/// retrieved. See [`scoped_candidates`].
 fn incremental_scan_pass(
     index_dir: &std::path::Path,
     path: &std::path::Path,
     strict: bool,
     limits: &budget::Limits,
+    scope: Option<&std::collections::BTreeSet<String>>,
 ) -> anyhow::Result<IncrementalScan> {
     // PREFLIGHT THE ROOT BEFORE READING THE EMPTY SET AS BENIGN
     // (po-av01j.198). `walk_source_files` swallows every `read_dir` error by
@@ -4953,6 +5016,10 @@ fn incremental_scan_pass(
     }
 
     let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
+    let candidates = match scope {
+        Some(scope) => scoped_candidates(&index, path, candidates, scope)?,
+        None => candidates,
+    };
     let name = snapshot_name(path);
     let root = path.to_path_buf();
     let limits = *limits;
@@ -5015,6 +5082,57 @@ fn incremental_scan_pass(
         strict,
     )?;
     Ok(scan)
+}
+
+/// The candidates a change-scoped pass hash-gates: the walked sources in
+/// `scope`, plus every TU the index knows to include a header in `scope`.
+///
+/// THE INDEX'S STALENESS IS NOT THE CHANGE. Without this, a `--changed-only`
+/// pass re-parsed every file whose hash differed from the index and filtered
+/// to the changed set only afterwards. In a long-lived checkout whose index
+/// was last warmed thousands of files ago, a 3-file commit asked the helpers
+/// for all of them, hit the retrieval cap, and the gate failed open having
+/// scanned nothing. Every site outside the changed set is dropped by the gate
+/// anyway, so retrieving it bought nothing; the files left stale are re-parsed
+/// by the next unscoped pass or background warm.
+fn scoped_candidates(
+    index: &rvl_index::PacketIndex,
+    root: &Path,
+    walked: Vec<PathBuf>,
+    scope: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    // Headers are not walked (no helper reads one), so the changed set names
+    // them directly; they only serve to pull in the TUs that include them.
+    let mut unknown_header = false;
+    let mut dependents = Vec::new();
+    for rel in scope {
+        let header = root.join(rel);
+        if is_c_header(&header) {
+            let tus = index.dependents(&header)?;
+            unknown_header |= tus.is_empty();
+            dependents.extend(tus);
+        }
+    }
+    let mut out: Vec<PathBuf> = walked
+        .into_iter()
+        // A header no indexed TU includes may still be included by a TU the
+        // index has not seen, so every C/C++ TU stays a candidate: fresh ones
+        // are reused, which is what a warm index makes cheap.
+        .filter(|p| {
+            scope.contains(&repo_relative(root, p))
+                || (unknown_header && lang_of_path(p) == Some(Lang::CCpp))
+        })
+        .collect();
+    // The index keys its entries by canonical path; dedupe on that spelling so
+    // a TU both changed and included is retrieved once.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut listed: std::collections::HashSet<PathBuf> = out.iter().map(|p| canon(p)).collect();
+    for tu in dependents {
+        if listed.insert(canon(&tu)) {
+            out.push(tu);
+        }
+    }
+    Ok(out)
 }
 
 /// The distinct languages a set of files would be retrieved as. The
@@ -5491,7 +5609,15 @@ fn run_scan_incremental(
         }
     }
 
-    let scan = incremental_scan_pass(index_dir, path, strict, &limits)?;
+    // RETRIEVE ONLY THE CHANGE. Under --changed-only the gate keeps nothing
+    // outside the changed set, so the pass must not spend its retrieval cap
+    // re-parsing the rest of the repository's index drift (see
+    // `scoped_candidates`).
+    let scope = match &resolved {
+        Ok(cs) if changed_only => Some(changed_set(&cs.files)),
+        _ => None,
+    };
+    let scan = incremental_scan_pass(index_dir, path, strict, &limits, scope.as_ref())?;
 
     // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
     // empty report looks as broken as one that errors, so the no-source case
@@ -5643,6 +5769,7 @@ fn run_scan_incremental(
             stdout_color(color),
         )
     });
+    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
     // `--blend` (po-av01j.205): the same residue, whole repo, or the
     // changed set under --changed-only so the agent never sees files the
     // report is not about.
@@ -5668,6 +5795,7 @@ fn run_scan_incremental(
         &structure_rows,
         Some(&lane),
         hook_agent.as_ref(),
+        model.as_ref(),
         blended.as_ref(),
         out,
         color,
@@ -5909,6 +6037,7 @@ fn run_report(
             path,
             false,
             &budget::Limits::resolve(path, None, None),
+            None,
         )?;
         eprintln!(
             "incremental: reused {} files from index, retrieved {} changed",
@@ -7719,7 +7848,8 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             // After the scan, never before: the check it starts can install
             // a new cache, and that must apply to the NEXT run only.
-            autosync::after_scan(&cfg, specs_file.is_none());
+            let model_lane = rvl_model::ModelConfig::load(&path).is_ok_and(|c| c.decision_model);
+            autosync::after_scan(&cfg, specs_file.is_none(), model_lane);
             result
         }
         Cmd::Report {
@@ -7786,8 +7916,32 @@ fn run() -> anyhow::Result<ExitCode> {
             specs_file.as_deref(),
             judgments.as_deref(),
         ),
-        Cmd::Sync { background: true } => Ok(autosync::background(&cfg, &store, &keyset)),
-        Cmd::Sync { background: false } => {
+        Cmd::Sync {
+            background: true,
+            model,
+        } => Ok(autosync::background(&cfg, &store, &keyset, model)),
+        Cmd::Model {
+            cmd: ModelCmd::Sync,
+        } => {
+            if cfg.org_key.is_empty() && !cfg.offline {
+                eprintln!(
+                    "the decision model needs an API key: set RVL_API_KEY (or `api_key` in \
+                     ~/.revelara/config.yaml)"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            let outcome = autosync::sync_model(&cfg, &keyset)?;
+            if outcome.is_current() || outcome == rvl_cache::model::ModelSyncOutcome::Offline {
+                println!("{}", outcome.message());
+                Ok(ExitCode::SUCCESS)
+            } else {
+                eprintln!("{}", outcome.message());
+                Ok(ExitCode::FAILURE)
+            }
+        }
+        Cmd::Sync {
+            background: false, ..
+        } => {
             // Tiered sync (po-scnmv.13). The OSS vocabulary tier syncs with
             // NO credentials — the public binary works out of the box; the
             // commercial tier still requires the org key. No-key is no longer
@@ -10228,6 +10382,50 @@ mod tests {
         );
     }
 
+    /// A change-scoped pass hash-gates only the change: the walked sources in
+    /// the changed set, and for a changed header the TUs that include it, or
+    /// every TU when the index knows no includer yet.
+    #[test]
+    fn a_scoped_pass_gates_only_the_changed_files_and_a_headers_tus() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let idx = rvl_index::PacketIndex::open(&root.join("packets.redb")).unwrap();
+        let (a, b, go) = (root.join("a.c"), root.join("b.c"), root.join("m.go"));
+        let (known, unknown) = (root.join("api.h"), root.join("new.h"));
+        for f in [&a, &b, &go, &known, &unknown] {
+            std::fs::write(f, "x\n").unwrap();
+        }
+        idx.put_with_deps(
+            &a,
+            &rvl_index::hash_file(&a).unwrap(),
+            &[],
+            std::slice::from_ref(&known),
+        )
+        .unwrap();
+        let walked = walk_source_files(&root);
+        let scope =
+            |files: &[&str]| changed_set(&files.iter().map(|f| f.to_string()).collect::<Vec<_>>());
+
+        let got = scoped_candidates(&idx, &root, walked.clone(), &scope(&["m.go"])).unwrap();
+        assert_eq!(
+            got,
+            vec![go.clone()],
+            "the stale C files are not the change"
+        );
+        let got = scoped_candidates(&idx, &root, walked.clone(), &scope(&["api.h"])).unwrap();
+        assert_eq!(
+            got,
+            vec![a.clone()],
+            "a known header brings in its TUs only"
+        );
+        let got = scoped_candidates(&idx, &root, walked, &scope(&["new.h"])).unwrap();
+        assert_eq!(
+            got,
+            vec![a, b],
+            "an unknown header keeps every TU a candidate"
+        );
+    }
+
     /// One language's record becomes one line, named for the lane, and a
     /// fully installed tree becomes none (po-pk3fp.15). Batches restating the
     /// same workspaces are counted once.
@@ -10400,6 +10598,7 @@ mod tests {
             &repo,
             false,
             &budget::Limits::none(),
+            None,
         )
         .expect("no supported source is not an error: nothing was needed");
         assert!(scan.sites.is_empty());
