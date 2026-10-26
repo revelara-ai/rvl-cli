@@ -78,6 +78,19 @@ pub struct OutDoc {
     /// and the BLEND block verbatim. Null when `--blend` was not given. A
     /// status report, not findings: engine rows above are never rewritten.
     pub blend: Option<crate::blend::BlendSummary>,
+    /// The decision-model lane (`scanner.decision_model: on`): the model's
+    /// id and weights digest, each site question it answered with its
+    /// verdict, confidence and reason cell, and the controls it does not
+    /// serve. Null when the lane is off. Its `violates` decisions are also
+    /// advisory rows in `findings`, class `model.<control>`. Additive.
+    pub decision_model: Option<crate::decision::Summary>,
+}
+
+impl OutDoc {
+    pub fn with_decision_model(mut self, summary: Option<crate::decision::Summary>) -> OutDoc {
+        self.decision_model = summary;
+        self
+    }
 }
 
 /// One per-site eval row. Field names match the old top-level array exactly,
@@ -477,6 +490,7 @@ pub fn build(
         config_sites_overflow: config_sites.map_or(0, |c| c.overflow),
         hook_agent: hook_agent_block.map(|b| b.to_string()),
         blend: blend.cloned(),
+        decision_model: None,
     }
 }
 

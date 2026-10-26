@@ -237,6 +237,10 @@ pub struct Coverage {
     /// The repo-structure lane's verdict counts (po-av01j.28). `None` when
     /// the lane did not run, which renders no line at all.
     pub structure: Option<StructureCoverage>,
+    /// The decision-model lane's lines: what it decided, the controls it
+    /// abstained on because it does not serve them, and why it did not run
+    /// when it did not. Empty when the lane is off.
+    pub decision_model: Vec<String>,
 }
 
 /// One language's share of the resolved line (po-5csvg). The language is the
@@ -943,6 +947,9 @@ pub fn render_ladder(
             parts.join(" \u{00b7} ")
         );
         let _ = writeln!(o, "{}", paint(&sline, "2", color));
+    }
+    for line in &cov.decision_model {
+        let _ = writeln!(o, "{}", paint(&format!("  {line}"), "2", color));
     }
     if let Some(cc) = config.filter(|cc| !cc.is_empty()) {
         if cc.total > 0 {
