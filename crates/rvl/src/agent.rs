@@ -43,7 +43,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::render;
 
@@ -262,10 +262,11 @@ pub fn consent(
 
 /// A headless invocation of the user's approved coding agent: one prompt in,
 /// raw text out. Implementations must be cheap to construct; the budget wraps
-/// `invoke` from outside.
+/// `invoke` from outside, and `deadline` is that budget's end, by which a
+/// process the adapter started must be gone.
 pub trait Adapter: Send {
     fn name(&self) -> &str;
-    fn invoke(&self, prompt: &str) -> anyhow::Result<String>;
+    fn invoke(&self, prompt: &str, deadline: Instant) -> anyhow::Result<String>;
 }
 
 /// A shared adapter is still an adapter: the manual blend (`blend.rs`) sends
@@ -275,8 +276,8 @@ impl<A: Adapter + Sync + ?Sized> Adapter for std::sync::Arc<A> {
     fn name(&self) -> &str {
         (**self).name()
     }
-    fn invoke(&self, prompt: &str) -> anyhow::Result<String> {
-        (**self).invoke(prompt)
+    fn invoke(&self, prompt: &str, deadline: Instant) -> anyhow::Result<String> {
+        (**self).invoke(prompt, deadline)
     }
 }
 
@@ -293,12 +294,15 @@ impl Adapter for CliAdapter {
         &self.name
     }
 
-    fn invoke(&self, prompt: &str) -> anyhow::Result<String> {
-        let out = std::process::Command::new(&self.argv[0])
-            .args(&self.argv[1..])
-            .arg(prompt)
-            .stdin(std::process::Stdio::null())
-            .output()?;
+    fn invoke(&self, prompt: &str, deadline: Instant) -> anyhow::Result<String> {
+        let mut cmd = std::process::Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..]).arg(prompt);
+        let out = match crate::child::run(&mut cmd, Some(deadline))? {
+            crate::child::Ran::Exited(out) => out,
+            // Killed with its process group; the budget around this call
+            // reports the timeout.
+            crate::child::Ran::TimedOut => anyhow::bail!("agent '{}' timed out", self.name),
+        };
         anyhow::ensure!(
             out.status.success(),
             "agent '{}' exited {}: {}",
@@ -545,8 +549,9 @@ pub struct Outcome {
 /// Run the ONE batched invocation under the agent budget. The budget is
 /// separate from (on top of) the deterministic scan's 10s cap: by the time
 /// this runs, the deterministic ladder is already assembled. On timeout the
-/// worker thread (and any spawned agent process) is abandoned, same policy as
-/// the deterministic `run_with_budget`; the hook process is short-lived.
+/// worker thread is abandoned, same policy as the deterministic
+/// `run_with_budget`, and the agent process it started is killed with its
+/// process group at the same deadline (`crate::child`).
 pub fn adjudicate<A: Adapter + 'static>(
     adapter: A,
     sites: &[UndecidedSite],
@@ -555,7 +560,8 @@ pub fn adjudicate<A: Adapter + 'static>(
     let prompt = build_prompt(sites);
     let name = adapter.name().to_string();
     let start = std::time::Instant::now();
-    let outcome = crate::run_with_budget(budget, move || adapter.invoke(&prompt));
+    let deadline = start + budget;
+    let outcome = crate::run_with_budget(budget, move || adapter.invoke(&prompt, deadline));
     let latency = start.elapsed();
     let mut out = Outcome {
         agent: name,
@@ -1378,7 +1384,7 @@ scanner:
         fn name(&self) -> &str {
             "fake"
         }
-        fn invoke(&self, _prompt: &str) -> anyhow::Result<String> {
+        fn invoke(&self, _prompt: &str, _deadline: Instant) -> anyhow::Result<String> {
             std::thread::sleep(self.delay);
             match &self.reply {
                 Ok(s) => Ok(s.clone()),

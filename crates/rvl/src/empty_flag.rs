@@ -68,6 +68,10 @@ pub const SEMANTICS: &[(&str, &str, Empty)] = &[
     ("scan", "specs-file", Empty::Error),
     ("scan", "judgments", Empty::Error),
     ("scan", "out", Empty::Error),
+    // rvl-native time limits: `budget::parse_limit` refuses an empty value
+    // (exit 2). "No limit" is spelled `0`, never the empty string.
+    ("scan", "scan-budget", Empty::Error),
+    ("scan", "helper-timeout", Empty::Error),
     // rvl-native (po-av01j.171). A CI pin is an optional string: empty ==
     // not given, so RVL_SPEC_VERSION still applies and nothing is pinned.
     ("scan", "spec-version", Empty::Absent),
