@@ -19,6 +19,7 @@ The keys this binary reads are:
 | `scanner.agent_hooks.<hook>.enabled` | Per-hook opt-in for that lane. |
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
 | `scanner.model_threads` | CPU threads for local model inference (default 4, at least 1). Verdicts do not depend on it; it trades scan time for CPU. |
+| `scanner.decision_model` | `on` runs the decision-model lane: after the deterministic lanes, each undecided call site is asked the question of every frame (from the spec cache) whose control the cached model serves, on this machine. `violates` decisions are advisory findings (`model.<control>`); other controls abstain and are named on the COVERAGE line. Off by default. Needs the bundle `rvl model sync` caches (an API key; `RVL_OFFLINE=1` uses the cached bundle). |
 
 Unknown keys are tolerated everywhere, so the same file can carry settings for
 other consumers.

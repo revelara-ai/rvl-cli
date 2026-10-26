@@ -25,6 +25,7 @@ rvl-core = { path = "../rvl-core" }
 rvl-data = { path = "../rvl-data" }
 rvl-skills = { path = "../rvl-skills" }
 rvl-spec = { path = "../rvl-spec" }
+rvl-model = { path = "../rvl-model" }
 rvl-propagate = { path = "../rvl-propagate" }
 rvl-triage = { path = "../rvl-triage" }
 rvl-index = { path = "../rvl-index" }

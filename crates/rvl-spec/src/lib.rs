@@ -20,6 +20,9 @@ use rvl_core::{RepoConfig, Site, Verdict};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod frames;
+pub use frames::Frame;
+
 /// A spec below this confidence does not decide anything; the site abstains.
 /// Set by the multiplier, not by ordinary caution.
 pub const MIN_CONFIDENCE: f64 = 0.6;
@@ -1016,12 +1019,26 @@ pub struct SpecCache {
     decorators: Vec<DecoratorSpec>,
     misuse_shapes: Vec<MisuseSpec>,
     control_factors: HashMap<String, Vec<String>>,
+    frames: Vec<Frame>,
+    frames_rejected: usize,
 }
 
 impl SpecCache {
     pub fn load(text: &str) -> anyhow::Result<Self> {
         let f: SpecFile = serde_json::from_str(text)?;
-        Ok(Self::from_file(f))
+        let mut c = Self::from_file(f);
+        (c.frames, c.frames_rejected) = frames::parse(text);
+        Ok(c)
+    }
+
+    /// The decision frames the cache serves, in publication order.
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
+    /// Frames the cache carried that did not parse.
+    pub fn frames_rejected(&self) -> usize {
+        self.frames_rejected
     }
 
     pub fn from_file(f: SpecFile) -> Self {
@@ -1302,6 +1319,18 @@ impl SpecCache {
         // No confidence to compare: the overlay's entry for a control
         // replaces the baseline's.
         self.control_factors.extend(other.control_factors);
+        // An overlay frame replaces the baseline's for its control and habitat.
+        for f in other.frames {
+            match self
+                .frames
+                .iter_mut()
+                .find(|e| e.control == f.control && e.habitat == f.habitat)
+            {
+                Some(existing) => *existing = f,
+                None => self.frames.push(f),
+            }
+        }
+        self.frames_rejected += other.frames_rejected;
     }
 
     /// What the repo's own construction sites impose on served requests.

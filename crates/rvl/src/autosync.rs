@@ -12,6 +12,7 @@
 
 use crate::Config;
 use rvl_cache::auto;
+use rvl_cache::model::{HttpModelFetcher, ModelStore, ModelSyncOutcome, MODEL_DIR};
 use rvl_cache::{CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TieredLoaded};
 use rvl_core::BIN;
 use std::path::Path;
@@ -79,8 +80,10 @@ fn attribution(previous: &str, current: &str) -> String {
 }
 
 /// After a scan: start the background check when one is due. Everything here
-/// is best-effort and silent, and nothing waits on the child.
-pub fn after_scan(cfg: &Config, used_signed_cache: bool) {
+/// is best-effort and silent, and nothing waits on the child. `model`: the
+/// repository runs the decision-model lane, so the check syncs its bundle
+/// too.
+pub fn after_scan(cfg: &Config, used_signed_cache: bool, model: bool) {
     if !used_signed_cache {
         return;
     }
@@ -99,8 +102,11 @@ pub fn after_scan(cfg: &Config, used_signed_cache: bool) {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["sync", "--background"])
-        .stdin(std::process::Stdio::null())
+    cmd.args(["sync", "--background"]);
+    if model {
+        cmd.arg("--model");
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Its own process group, so a Ctrl-C aimed at the hook that ran this scan
@@ -164,9 +170,27 @@ pub fn note_if_current<'a>(
 /// `sync --background`: the check a scan handed off. Silent and always exit
 /// 0; the outcome is visible to the next scan as a new cache (with the
 /// attribution line), or as nothing at all.
-pub fn background(cfg: &Config, store: &CacheStore, keyset: &Keyset) -> ExitCode {
+pub fn background(cfg: &Config, store: &CacheStore, keyset: &Keyset, model: bool) -> ExitCode {
     let _ = sync_tiers(cfg, store, keyset);
+    if model && !cfg.org_key.is_empty() {
+        let _ = sync_model(cfg, keyset);
+    }
     ExitCode::SUCCESS
+}
+
+/// Sync the decision model's bundle into `<cache>/model/`.
+pub fn sync_model(cfg: &Config, keyset: &Keyset) -> anyhow::Result<ModelSyncOutcome> {
+    let store = ModelStore::open(&cfg.cache_dir.join(MODEL_DIR))?;
+    let fetcher = HttpModelFetcher {
+        base_url: cfg.base_url.clone(),
+        org_key: cfg.org_key.clone(),
+    };
+    Ok(rvl_cache::model::sync(
+        &store,
+        &fetcher,
+        keyset,
+        cfg.offline,
+    ))
 }
 
 /// `init`'s synchronous sync, as the text after "Spec cache: ". It never fails

@@ -76,6 +76,10 @@ pub struct Record {
     pub confidence: Option<f64>,
     /// The raw model output; empty on an abstain.
     pub logits: Vec<f32>,
+    /// The raw cell-head output, one per [`Classifier::cells`] id; empty on
+    /// an abstain and for a model without a cell head.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cell_logits: Vec<f32>,
     pub model_id: String,
     /// `sha256:<hex>` of the bundle's `model.onnx`.
     pub weights_digest: String,
@@ -130,6 +134,10 @@ pub struct Classifier {
     tokenizer: Tokenizer,
     inputs: Vec<(String, Input)>,
     labels: Vec<String>,
+    /// The output index of the verdict logits.
+    logits_at: usize,
+    /// The cell ids and the output index of the cell head, when it has one.
+    cells: Option<(Vec<String>, usize)>,
     temperature: f64,
     max_length: usize,
     batch_size: usize,
@@ -156,9 +164,13 @@ impl Classifier {
             }))
             .map_err(|e| anyhow!("{e}"))
             .context("set the tokenizer's truncation")?;
+        let pad_id = m
+            .pad_id
+            .or_else(|| tokenizer.token_to_id("[PAD]"))
+            .unwrap_or(0);
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::Fixed(m.max_length),
-            pad_id: m.pad_id,
+            pad_id,
             ..Default::default()
         }));
 
@@ -199,18 +211,37 @@ impl Classifier {
         if session.outputs().is_empty() {
             bail!("{}: the model has no output", bundle.dir.display());
         }
+        let output = |name: &str| session.outputs().iter().position(|o| o.name() == name);
+        let logits_at = output("logits").unwrap_or(0);
+        let cells = match bundle.cells.clone() {
+            None => None,
+            Some(ids) => match output("cell_logits") {
+                Some(at) => Some((ids, at)),
+                None => bail!(
+                    "{}: the bundle lists cells, and the model has no `cell_logits` output",
+                    bundle.dir.display()
+                ),
+            },
+        };
 
         Ok(Classifier {
             session,
             tokenizer,
             inputs,
             labels: m.labels.clone(),
+            logits_at,
+            cells,
             temperature: m.temperature,
             max_length: m.max_length,
             batch_size: opts.batch_size,
             model_id: m.model_id.clone(),
             weights_digest: bundle.weights_digest.clone(),
         })
+    }
+
+    /// The cell ids of the model's cell head; `None` without one.
+    pub fn cells(&self) -> Option<&[String]> {
+        self.cells.as_ref().map(|(ids, _)| ids.as_slice())
     }
 
     /// Classify `texts` within `budget`, measured from this call.
@@ -243,6 +274,7 @@ impl Classifier {
                 verdict: Verdict::Abstain(AbstainReason::TimeBudget),
                 confidence: None,
                 logits: Vec::new(),
+                cell_logits: Vec::new(),
                 model_id: self.model_id.clone(),
                 weights_digest: self.weights_digest.clone(),
             });
@@ -287,7 +319,7 @@ impl Classifier {
             .session
             .run(feed)
             .map_err(|e| anyhow!("model inference: {e}"))?;
-        let (out_shape, logits) = outputs[0]
+        let (out_shape, logits) = outputs[self.logits_at]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("model output: {e}"))?;
         let width = self.labels.len();
@@ -297,11 +329,28 @@ impl Classifier {
                 &out_shape[..]
             );
         }
+        let cell_logits = match &self.cells {
+            None => Vec::new(),
+            Some((ids, at)) => {
+                let (shape, v) = outputs[*at]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("model cell output: {e}"))?;
+                if shape.len() != 2 || shape[0] != 1 || shape[1] != ids.len() as i64 {
+                    bail!(
+                        "the model's cell_logits are {:?}, expected [1, {}] (one per cell)",
+                        &shape[..],
+                        ids.len()
+                    );
+                }
+                v.to_vec()
+            }
+        };
         let (best, p) = calibrate(logits, self.temperature);
         Ok(Record {
             verdict: Verdict::Label(self.labels[best].clone()),
             confidence: Some(p),
             logits: logits.to_vec(),
+            cell_logits,
             model_id: self.model_id.clone(),
             weights_digest: self.weights_digest.clone(),
         })
@@ -323,6 +372,22 @@ fn open_session(runtime: &Runtime, model: &[u8], threads: usize) -> Result<Sessi
         .with_deterministic_compute(true)
         .map_err(e)?;
     b.commit_from_memory(model).map_err(|e| anyhow!("{e}"))
+}
+
+/// The top cell among `allowed`: the index into `ids` of the highest
+/// `cell_logits` entry whose id is in `allowed`, ties to the lower index.
+/// `None` when no id is allowed or the logits do not match the ids.
+pub fn top_cell(ids: &[String], cell_logits: &[f32], allowed: &[&str]) -> Option<usize> {
+    if ids.len() != cell_logits.len() {
+        return None;
+    }
+    let mut best: Option<usize> = None;
+    for (i, id) in ids.iter().enumerate() {
+        if allowed.contains(&id.as_str()) && best.is_none_or(|b| cell_logits[i] > cell_logits[b]) {
+            best = Some(i);
+        }
+    }
+    best
 }
 
 /// The argmax index (ties to the lower index) and its probability under
@@ -360,6 +425,16 @@ mod tests {
         assert!((p1 - 1.0 / (1.0 + (-2.0f64).exp())).abs() < 1e-12, "{p1}");
         assert!((p2 - 1.0 / (1.0 + (-1.0f64).exp())).abs() < 1e-12, "{p2}");
         assert!(p2 < p1);
+    }
+
+    #[test]
+    fn the_top_cell_is_masked_to_the_frame() {
+        let ids: Vec<String> = ["M1", "M2", "S1", "C1"].map(String::from).to_vec();
+        let logits = [0.5, 3.0, 2.0, 2.0];
+        assert_eq!(top_cell(&ids, &logits, &["M1", "M2", "S1"]), Some(1));
+        assert_eq!(top_cell(&ids, &logits, &["M1", "S1", "C1"]), Some(2));
+        assert_eq!(top_cell(&ids, &logits, &["X9"]), None);
+        assert_eq!(top_cell(&ids, &logits[..2], &["M1"]), None);
     }
 
     #[test]
