@@ -5016,10 +5016,7 @@ fn incremental_scan_pass(
     }
 
     let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
-    let candidates = match scope {
-        Some(scope) => scoped_candidates(&index, path, candidates, scope)?,
-        None => candidates,
-    };
+    let candidates = pass_candidates(&index, path, candidates, scope)?;
     let name = snapshot_name(path);
     let root = path.to_path_buf();
     let limits = *limits;
@@ -5082,6 +5079,33 @@ fn incremental_scan_pass(
         strict,
     )?;
     Ok(scan)
+}
+
+/// The candidates a pass hash-gates: every walked source when unscoped, the
+/// change and its dependents when scoped (see [`scoped_candidates`]).
+fn pass_candidates(
+    index: &rvl_index::PacketIndex,
+    root: &Path,
+    walked: Vec<PathBuf>,
+    scope: Option<&std::collections::BTreeSet<String>>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    match scope {
+        Some(scope) => scoped_candidates(index, root, walked, scope),
+        None => Ok(walked),
+    }
+}
+
+/// The scope a warm pass retrieves under: the git changed set under
+/// `--changed-only`, and none otherwise. Scoping is a property of
+/// `--changed-only`; an unscoped pass still re-parses everything stale.
+fn retrieval_scope(
+    resolved: &anyhow::Result<changed::ChangedSet>,
+    changed_only: bool,
+) -> Option<std::collections::BTreeSet<String>> {
+    match resolved {
+        Ok(cs) if changed_only => Some(changed_set(&cs.files)),
+        _ => None,
+    }
 }
 
 /// The candidates a change-scoped pass hash-gates: the walked sources in
@@ -5613,10 +5637,7 @@ fn run_scan_incremental(
     // outside the changed set, so the pass must not spend its retrieval cap
     // re-parsing the rest of the repository's index drift (see
     // `scoped_candidates`).
-    let scope = match &resolved {
-        Ok(cs) if changed_only => Some(changed_set(&cs.files)),
-        _ => None,
-    };
+    let scope = retrieval_scope(&resolved, changed_only);
     let scan = incremental_scan_pass(index_dir, path, strict, &limits, scope.as_ref())?;
 
     // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
@@ -10423,6 +10444,58 @@ mod tests {
             got,
             vec![a, b],
             "an unknown header keeps every TU a candidate"
+        );
+    }
+
+    /// An unscoped warm pass asks the retriever for every stale file; only
+    /// `--changed-only` narrows the request to the change. Pinned on the
+    /// request itself, so no wall clock decides whether it holds.
+    #[test]
+    fn an_unscoped_pass_asks_for_every_stale_file_and_a_scoped_one_for_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        for i in 0..5 {
+            let pkg = root.join(format!("pkg{i}"));
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("f.go"), format!("package pkg{i}\n")).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let walked = walk_source_files(&root);
+        let resolved: anyhow::Result<changed::ChangedSet> = Ok(changed::ChangedSet {
+            files: vec!["pkg0/f.go".to_string()],
+            source: "test".to_string(),
+            dirty: Vec::new(),
+        });
+        // A fresh index per pass, so every walked file is stale in each.
+        let requested = |changed_only: bool| {
+            let idx =
+                rvl_index::PacketIndex::open(&dir.path().join(format!("{changed_only}.redb")))
+                    .unwrap();
+            let scope = retrieval_scope(&resolved, changed_only);
+            let candidates = pass_candidates(&idx, &root, walked.clone(), scope.as_ref()).unwrap();
+            let asked = std::cell::RefCell::new(Vec::new());
+            incremental_sites(&idx, &root, &candidates, |changed| {
+                asked
+                    .borrow_mut()
+                    .extend(changed.iter().map(|c| repo_relative(&root, c)));
+                Ok(RetrieveResult::default())
+            })
+            .unwrap();
+            let mut asked = asked.into_inner();
+            asked.sort();
+            asked
+        };
+
+        let all: Vec<String> = (0..5).map(|i| format!("pkg{i}/f.go")).collect();
+        assert_eq!(
+            requested(false),
+            all,
+            "an unscoped pass asks for the stale baseline"
+        );
+        assert_eq!(
+            requested(true),
+            vec!["pkg0/f.go".to_string()],
+            "--changed-only asks for the change"
         );
     }
 
