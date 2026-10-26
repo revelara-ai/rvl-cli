@@ -204,9 +204,18 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "terraform",
         "resource.aws_db_instance.backup_retention_period",
     ),
+    judged("terraform", "resource.aws_db_instance.multi_az"),
     judged(
         "terraform",
         "resource.aws_rds_cluster.backup_retention_period",
+    ),
+    judged(
+        "terraform",
+        "resource.google_container_cluster.location-shape",
+    ),
+    judged(
+        "terraform",
+        "resource.google_container_node_pool.node_locations-count",
     ),
     judged(
         "terraform",
@@ -215,6 +224,10 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged(
         "terraform",
         "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
+    ),
+    judged(
+        "terraform",
+        "resource.google_sql_database_instance.settings.availability_type",
     ),
     judged("terraform", "resource.lifecycle.prevent_destroy"),
     judged("terraform", "terraform.backend"),
