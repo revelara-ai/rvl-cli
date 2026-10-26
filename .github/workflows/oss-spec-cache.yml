@@ -1,0 +1,79 @@
+name: OSS spec cache
+
+# Scans the helper fixtures with the OSS spec cache production serves, the
+# artifact a no-key install syncs. Every other test scans with seed specs, so
+# without this a publisher change could break scanning with CI green. The
+# check is `the_served_oss_spec_cache` in crates/rvl/tests/oss_spec_cache.rs:
+# the signature verifies against the pinned keyset, every section the free
+# tier must carry is present and non-empty, and each lane it feeds decides a
+# site in its fixtures.
+#
+# Its own workflow, not a job of ci.yml: it reads production, so a publisher
+# fault turns it red on every pull request at once. It reports on pull
+# requests and does not gate the merge queue, which reads ci.yml alone. The
+# daily run catches a publish that lands between pull requests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A missing engine fails the check instead of skipping it (crates/rvl-testgate).
+  RVLSCAN_REQUIRE_ENGINES: "1"
+
+jobs:
+  oss-spec-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The engines of the lanes the fixtures exercise: goindex builds with
+      # Go, tsindex runs under node with its own `typescript`, and python3
+      # for pyindex is on the runner image.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: helpers/tsindex/package.json
+
+      - name: Install the tsindex dependencies
+        working-directory: helpers/tsindex
+        run: npm ci
+
+      # The same two GETs `rvl sync` makes on a no-key install, no auth.
+      - name: Fetch the served OSS spec cache
+        run: |
+          set -euo pipefail
+          url=https://api.revelara.ai/api/v1/scanner/spec-cache/oss
+          mkdir -p "$RUNNER_TEMP/oss"
+          curl -fsS --retry 3 -o "$RUNNER_TEMP/oss/specs.json" "$url"
+          curl -fsS --retry 3 -o "$RUNNER_TEMP/oss/specs.json.sig" "$url.sig"
+          jq -r '"content_version \(.content_version); sections \(.specs | keys | join(", "))"' \
+            "$RUNNER_TEMP/oss/specs.json"
+
+      - name: Scan the fixtures with it
+        env:
+          RVL_OSS_SPEC_CACHE: ${{ runner.temp }}/oss/specs.json
+        run: cargo test -p rvl --test oss_spec_cache -- --include-ignored --nocapture
