@@ -37,6 +37,12 @@
 //!     when the set or a selector cannot be resolved, see [`RenderedSet`])
 //!   * `pod.anti-affinity` / `pod.topology-spread-constraints`
 //!     (Deployment/StatefulSet; default none)
+//!   * `pod.spread.zone` (Deployment/StatefulSet; derived: `zone` | `node` |
+//!     `none`, the widest failure domain a HARD placement rule spreads the
+//!     replicas over; see [`spread_domain`])
+//!   * `pod.zone-pin.count` (Deployment/StatefulSet; derived: the number of
+//!     zones a required node selection allows, or `unpinned`; see
+//!     [`zone_pin`])
 //!
 //! Absence resolves to the DOCUMENTED Kubernetes default. Cluster-side
 //! mutators (LimitRange, globalDefault PriorityClass, admission webhooks)
@@ -487,6 +493,143 @@ fn run_as_user_class(
     })
 }
 
+/// The node labels that name a zone: the GA label and its deprecated beta
+/// form, which the kubelet still sets.
+const ZONE_LABELS: [&str; 2] = [
+    "topology.kubernetes.io/zone",
+    "failure-domain.beta.kubernetes.io/zone",
+];
+
+/// The node label that names a node.
+const NODE_LABEL: &str = "kubernetes.io/hostname";
+
+/// The widest failure domain a hard placement rule spreads a pod template's
+/// replicas over, with the field that states it: `zone` before `node`, and
+/// `None` when no hard rule names either.
+///
+/// Hard means the scheduler refuses to break it: a spread constraint whose
+/// `whenUnsatisfiable` is `DoNotSchedule` (the API default) and a required
+/// anti-affinity term. `ScheduleAnyway` and preferred terms are a wish, and
+/// a wish does not keep two replicas out of one zone.
+fn spread_domain(doc: &Value, prefix: &str) -> Option<(&'static str, String)> {
+    let tsc_path = format!("{prefix}.topologySpreadConstraints");
+    let anti_path = format!("{prefix}.affinity.podAntiAffinity");
+    let required = format!("{anti_path}.requiredDuringSchedulingIgnoredDuringExecution");
+    let spreads = lookup(doc, &tsc_path)
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter(|c| {
+            dig(c, &["whenUnsatisfiable"])
+                .and_then(Value::as_str)
+                .unwrap_or("DoNotSchedule")
+                == "DoNotSchedule"
+        })
+        .map(|c| (c, &tsc_path));
+    let terms = lookup(doc, &required)
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .map(|t| (t, &anti_path));
+    let keyed: Vec<(&str, &String)> = spreads
+        .chain(terms)
+        .filter_map(|(v, path)| Some((dig(v, &["topologyKey"])?.as_str()?, path)))
+        .collect();
+    let find = |domain: &'static str, wanted: &dyn Fn(&str) -> bool| {
+        keyed
+            .iter()
+            .find(|(k, _)| wanted(k))
+            .map(|(_, path)| (domain, path.to_string()))
+    };
+    find("zone", &|k| ZONE_LABELS.contains(&k)).or_else(|| find("node", &|k| k == NODE_LABEL))
+}
+
+/// The zones one required node-selector term allows: the intersection of its
+/// `In` expressions on a zone label, `None` when it does not restrict the
+/// zone. `Err` is an expression this reader cannot count (a non-scalar
+/// value, a `NotIn` on a zone label): the set of zones is the cluster's.
+fn term_zones(term: &Value) -> Result<Option<Vec<String>>, ()> {
+    let mut zones: Option<Vec<String>> = None;
+    let exprs = dig(term, &["matchExpressions"]).and_then(Value::as_sequence);
+    for expr in exprs.into_iter().flatten() {
+        let Some(key) = dig(expr, &["key"]).and_then(Value::as_str) else {
+            return Err(());
+        };
+        if !ZONE_LABELS.contains(&key) {
+            continue;
+        }
+        let values = match dig(expr, &["operator"]).and_then(Value::as_str) {
+            Some("In") => dig(expr, &["values"])
+                .and_then(Value::as_sequence)
+                .and_then(|s| s.iter().map(label_str).collect::<Option<Vec<_>>>())
+                .ok_or(())?,
+            // Exists asks for some zone, which every zoned node has.
+            Some("Exists") => continue,
+            _ => return Err(()),
+        };
+        zones = Some(match zones {
+            Some(prev) => prev.into_iter().filter(|z| values.contains(z)).collect(),
+            None => values,
+        });
+    }
+    Ok(zones.map(|mut z| {
+        z.sort();
+        z.dedup();
+        z
+    }))
+}
+
+/// The zones a pod template's required node selection allows, with the field
+/// that pins them: `Ok(None)` when no required selection names a zone.
+///
+/// `nodeSelector` and the required `nodeAffinity` terms are ANDed; the terms
+/// among themselves are ORed, so the affinity pins only when every term
+/// does, and then to the union of their zones. Preferred terms pin nothing.
+fn zone_pin(doc: &Value, prefix: &str) -> Result<Option<(usize, String)>, ()> {
+    let selector_path = format!("{prefix}.nodeSelector");
+    let selected = match lookup(doc, &selector_path).and_then(Value::as_mapping) {
+        Some(m) => match ZONE_LABELS.iter().find_map(|l| get(m, l)) {
+            Some(v) => Some(vec![label_str(v).ok_or(())?]),
+            None => None,
+        },
+        None => None,
+    };
+    let affinity_path = format!("{prefix}.affinity.nodeAffinity");
+    let terms = lookup(
+        doc,
+        &format!(
+            "{affinity_path}.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms"
+        ),
+    )
+    .and_then(Value::as_sequence)
+    .filter(|t| !t.is_empty());
+    let mut affined: Option<Vec<String>> = None;
+    if let Some(terms) = terms {
+        let mut union = Vec::new();
+        let mut every = true;
+        for term in terms {
+            match term_zones(term)? {
+                Some(z) => union.extend(z),
+                None => every = false,
+            }
+        }
+        if every {
+            union.sort();
+            union.dedup();
+            affined = Some(union);
+        }
+    }
+    Ok(match (selected, affined) {
+        (Some(s), Some(a)) => Some((
+            s.iter().filter(|z| a.contains(z)).count(),
+            format!("{selector_path} + {affinity_path}"),
+        )),
+        (Some(s), None) => Some((s.len(), selector_path)),
+        (None, Some(a)) => Some((a.len(), affinity_path)),
+        (None, None) => None,
+    })
+}
+
 /// Kinds that run replicas a disruption budget and a placement rule protect.
 fn replicated(kind: &str) -> bool {
     matches!(kind, "Deployment" | "StatefulSet")
@@ -754,6 +897,38 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             &format!("{prefix}.topologySpreadConstraints"),
             "topologySpreadConstraints",
         );
+        let rules =
+            format!("{prefix}.topologySpreadConstraints, {prefix}.affinity.podAntiAffinity");
+        match spread_domain(doc, &prefix) {
+            Some((domain, path)) => em.derived(&unit, "pod.spread.zone", &path, &path, domain),
+            None => em.absent(
+                &unit,
+                "pod.spread.zone",
+                &format!("{rules} (no hard zone or node rule)"),
+                "scheduler spreading (best effort, not a guarantee)",
+                "none",
+            ),
+        }
+        match zone_pin(doc, &prefix) {
+            Ok(Some((count, path))) => {
+                em.derived(
+                    &unit,
+                    "pod.zone-pin.count",
+                    &path,
+                    &path,
+                    &count.to_string(),
+                );
+            }
+            Ok(None) => em.absent(
+                &unit,
+                "pod.zone-pin.count",
+                &format!("{prefix}.nodeSelector, {prefix}.affinity.nodeAffinity (no zone label)"),
+                "node selection (every zone)",
+                "unpinned",
+            ),
+            // A selection the reader cannot count is no evidence either way.
+            Err(()) => {}
+        }
     }
 
     let containers = lookup(doc, &format!("{prefix}.containers")).and_then(Value::as_sequence);
@@ -1701,6 +1876,186 @@ spec:
         }
     }
 
+    // --- pod.spread.zone, pod.zone-pin.count ---
+
+    /// The zone-spread check's passing fixture: three replicas that a hard
+    /// spread constraint keeps in different zones.
+    const ZONE_SPREAD_PASS: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: app
+          image: registry.example.com/web:v1.2.3
+";
+
+    /// The zone-spread check's failing fixture: one replica, pinned to one
+    /// zone by its node selector.
+    const ZONE_SPREAD_FAIL: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/zone: us-east-1a
+      containers:
+        - name: app
+          image: registry.example.com/web:v1.2.3
+";
+
+    fn value<'a>(got: &'a Retrieved, key: &str) -> Option<&'a str> {
+        got.packets
+            .iter()
+            .find(|p| p.unit == "deployment:web" && p.key == key)
+            .and_then(|p| p.resolved_value.as_deref())
+    }
+
+    /// `LABELED` with `spec` lines put at the head of its pod spec.
+    fn placed(spec: &str) -> Retrieved {
+        packets(&LABELED.replace(
+            "    spec:\n      containers:",
+            &format!("    spec:\n{spec}      containers:"),
+        ))
+    }
+
+    #[test]
+    fn the_passing_fixture_spreads_three_replicas_over_zones_and_pins_none() {
+        let got = packets(ZONE_SPREAD_PASS);
+        assert_eq!(value(&got, "workload.replicas"), Some("3"));
+        let spread = find(&got, "deployment:web", "pod.spread.zone");
+        assert_eq!(spread.resolved_value.as_deref(), Some("zone"));
+        assert_eq!(spread.resolution, Resolution::AsAuthored);
+        assert_eq!(
+            spread.provenance[0].key_path,
+            "spec.template.spec.topologySpreadConstraints"
+        );
+        let pin = find(&got, "deployment:web", "pod.zone-pin.count");
+        assert_eq!(pin.resolved_value.as_deref(), Some("unpinned"));
+        assert_eq!(pin.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn the_failing_fixture_is_one_replica_unspread_and_pinned_to_one_zone() {
+        let got = packets(ZONE_SPREAD_FAIL);
+        assert_eq!(value(&got, "workload.replicas"), Some("1"));
+        let spread = find(&got, "deployment:web", "pod.spread.zone");
+        assert_eq!(spread.resolved_value.as_deref(), Some("none"));
+        assert_eq!(spread.resolution, Resolution::PlatformDefault);
+        let pin = find(&got, "deployment:web", "pod.zone-pin.count");
+        assert_eq!(pin.resolved_value.as_deref(), Some("1"));
+        assert_eq!(pin.resolution, Resolution::AsAuthored);
+        assert_eq!(
+            pin.provenance[0].key_path,
+            "spec.template.spec.nodeSelector"
+        );
+    }
+
+    #[test]
+    fn only_a_hard_rule_spreads_and_zone_wins_over_node() {
+        let tsc = |key: &str, when: &str| {
+            format!("      topologySpreadConstraints:\n        - maxSkew: 1\n          topologyKey: {key}\n{when}")
+        };
+        let anti = |kind: &str, key: &str| {
+            format!("      affinity:\n        podAntiAffinity:\n          {kind}:\n            - topologyKey: {key}\n")
+        };
+        let soft = "          whenUnsatisfiable: ScheduleAnyway\n";
+        let hard = "          whenUnsatisfiable: DoNotSchedule\n";
+        let required = "requiredDuringSchedulingIgnoredDuringExecution";
+        for (spec, want) in [
+            (tsc("topology.kubernetes.io/zone", ""), "zone"),
+            (tsc("topology.kubernetes.io/zone", soft), "none"),
+            (tsc("failure-domain.beta.kubernetes.io/zone", hard), "zone"),
+            (tsc("kubernetes.io/hostname", hard), "node"),
+            (anti(required, "topology.kubernetes.io/zone"), "zone"),
+            (anti(required, "kubernetes.io/hostname"), "node"),
+            (
+                anti(
+                    "preferredDuringSchedulingIgnoredDuringExecution",
+                    "kubernetes.io/hostname",
+                ),
+                "none",
+            ),
+            (tsc("topology.kubernetes.io/region", hard), "none"),
+            (
+                format!(
+                    "{}{}",
+                    anti(required, "kubernetes.io/hostname"),
+                    tsc("topology.kubernetes.io/zone", hard)
+                ),
+                "zone",
+            ),
+        ] {
+            let got = placed(&spec);
+            assert_eq!(value(&got, "pod.spread.zone"), Some(want), "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_required_node_affinity_pins_the_zones_every_term_allows() {
+        let affinity = |terms: &str| {
+            format!("      affinity:\n        nodeAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n            nodeSelectorTerms:\n{terms}")
+        };
+        let term =
+            |expr: &str| format!("              - matchExpressions:\n                  - {expr}\n");
+        let zone_in = |zones: &str| {
+            term(&format!(
+                "{{key: topology.kubernetes.io/zone, operator: In, values: [{zones}]}}"
+            ))
+        };
+        let other = term("{key: node-type, operator: In, values: [large]}");
+        for (spec, want) in [
+            (affinity(&zone_in("a, b")), Some("2")),
+            (affinity(&format!("{}{}", zone_in("a"), zone_in("b, a"))), Some("2")),
+            // One term that leaves the zone open leaves it open.
+            (affinity(&format!("{}{other}", zone_in("a"))), Some("unpinned")),
+            (affinity(&other), Some("unpinned")),
+            (
+                affinity(&term("{key: topology.kubernetes.io/zone, operator: Exists}")),
+                Some("unpinned"),
+            ),
+            // nodeSelector and affinity are ANDed.
+            (
+                format!("      nodeSelector:\n        topology.kubernetes.io/zone: a\n{}", affinity(&zone_in("a, b"))),
+                Some("1"),
+            ),
+            // A preferred term pins nothing.
+            (
+                "      affinity:\n        nodeAffinity:\n          preferredDuringSchedulingIgnoredDuringExecution:\n            - weight: 1\n              preference:\n                matchExpressions:\n                  - {key: topology.kubernetes.io/zone, operator: In, values: [a]}\n".to_string(),
+                Some("unpinned"),
+            ),
+            // A NotIn leaves the count to the cluster's zones: no packet.
+            (
+                affinity(&term("{key: topology.kubernetes.io/zone, operator: NotIn, values: [a]}")),
+                None,
+            ),
+        ] {
+            let got = placed(&spec);
+            assert_eq!(value(&got, "pod.zone-pin.count"), want, "{spec}");
+        }
+    }
+
     #[test]
     fn only_replicated_workloads_carry_the_disruption_and_placement_keys() {
         let daemon = LABELED
@@ -1712,6 +2067,8 @@ spec:
             "workload.pdb-coverage",
             "pod.anti-affinity",
             "pod.topology-spread-constraints",
+            "pod.spread.zone",
+            "pod.zone-pin.count",
         ] {
             assert!(!got.packets.iter().any(|p| p.key == key), "{key}");
         }
