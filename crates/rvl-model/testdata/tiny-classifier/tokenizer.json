@@ -1,0 +1,63 @@
+{
+  "added_tokens": [
+    {
+      "content": "[PAD]",
+      "id": 0,
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    {
+      "content": "[UNK]",
+      "id": 1,
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    }
+  ],
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 1,
+      "a": 19,
+      "block": 10,
+      "budget": 8,
+      "call": 17,
+      "cancel": 5,
+      "client": 16,
+      "context": 4,
+      "deadline": 3,
+      "forever": 9,
+      "get": 23,
+      "hang": 15,
+      "http": 22,
+      "infinite": 14,
+      "limit": 6,
+      "loop": 12,
+      "no": 21,
+      "retry": 7,
+      "sleep": 13,
+      "the": 18,
+      "timeout": 2,
+      "wait": 11,
+      "with": 20
+    }
+  },
+  "normalizer": {
+    "type": "Lowercase"
+  },
+  "padding": null,
+  "post_processor": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "truncation": null,
+  "version": "1.0"
+}
