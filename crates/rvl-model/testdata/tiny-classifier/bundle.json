@@ -1,9 +1,11 @@
 {
   "labels": [
-    "bounded",
-    "unbounded"
+    "violates",
+    "satisfies",
+    "not_applicable",
+    "abstain"
   ],
-  "max_length": 16,
+  "max_length": 64,
   "model_id": "rvl-fixture/tiny-classifier",
   "pad_id": 0,
   "temperature": 1.5
