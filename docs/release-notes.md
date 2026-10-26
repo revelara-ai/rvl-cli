@@ -9,6 +9,23 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Claude Code reminds the agent to look up causal factors
+
+The Claude Code plugin that `rvl plugin install claude` (and
+`rvl skills install claude`) writes now has a `hooks/hooks.json` with a
+`UserPromptSubmit` hook. On each prompt it adds one sentence to the agent's
+context: the first line of the "Causal factors" block in the managed
+`AGENTS.md` block, which tells the agent to run
+`rvl factor lookup "<what the change does>"` before it changes a file.
+
+- New: the hook only reminds. It never blocks a prompt or an edit, makes no
+  network call and runs no `rvl` process: it echoes a fixed JSON line
+  (`hookSpecificOutput.additionalContext`).
+- Only Claude Code gets the hook. The other harnesses keep the instruction
+  in the `AGENTS.md` context block.
+- When the downloaded plugin ships its own `hooks/hooks.json`, the reminder
+  is added to it; its other hooks stay.
+
 ### No more releases for Intel macOS
 
 Releases no longer include an `x86_64-apple-darwin` archive. Intel Macs
