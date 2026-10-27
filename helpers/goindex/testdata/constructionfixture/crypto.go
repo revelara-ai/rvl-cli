@@ -1,6 +1,7 @@
 package constructionfixture
 
 import (
+	"crypto/cipher"
 	"crypto/des"
 	"crypto/md5"
 	"crypto/tls"
@@ -21,14 +22,9 @@ func Verify(cfg *tls.Config, skip bool) {
 	cfg.ServerName = "example.com"
 }
 
-func Encrypt(key, block []byte) ([]byte, error) {
-	c, err := des.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, len(block))
-	c.Encrypt(out, block)
-	return out, nil
+// The cipher is the site; nothing here encrypts with it.
+func Block(key []byte) (cipher.Block, error) {
+	return des.NewCipher(key)
 }
 
 func Digest(b []byte) [16]byte {

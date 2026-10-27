@@ -29,7 +29,7 @@ func constructionSites(t *testing.T) map[string]RetrievedSite {
 func TestCryptoAndDatabaseConstructorsAreCallSitesOfTheirPackage(t *testing.T) {
 	got := constructionSites(t)
 	for _, key := range []string{
-		"Encrypt crypto/des.NewCipher",
+		"Block crypto/des.NewCipher",
 		"Digest crypto/md5.Sum",
 		"Open database/sql.Open",
 	} {
@@ -53,7 +53,7 @@ func TestTLSConfigFieldSettingsAreCallSites(t *testing.T) {
 	if !ok {
 		t.Fatalf("the package-level literal's InsecureSkipVerify is not a site: %v", keys(got))
 	}
-	if skip.Line != 13 || skip.CallSite == "" ||
+	if skip.Line != 14 || skip.CallSite == "" ||
 		len(skip.ConstArgs) != 1 || skip.ConstArgs[0].Name != "InsecureSkipVerify" || skip.ConstArgs[0].Value != "true" {
 		t.Fatalf("literal site = %+v", skip)
 	}

@@ -1591,5 +1591,7 @@ test('TLS and database settings carry the value as const_args', () => {
   assert.ok(client.const_args.some((a) => a.name === 'password' && a.value === "'hunter2'"));
   const pool = one('pg.Pool.constructor');
   assert.ok(pool.const_args.some((a) => a.name === 'connectionString'));
-  assert.strictEqual(one('process.env.NODE_TLS_REJECT_UNAUTHORIZED').const_args[0].value, "'0'");
+  assert.deepStrictEqual(one('process.env.NODE_TLS_REJECT_UNAUTHORIZED').const_args, [
+    { index: 0, name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: 'reject', how: 'name' },
+  ]);
 });

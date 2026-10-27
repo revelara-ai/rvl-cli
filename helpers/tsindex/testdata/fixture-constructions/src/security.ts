@@ -21,9 +21,8 @@ export function desCipher(key: Buffer) {
   return nodeCrypto.createCipheriv('des-ede3-cbc', key, null);
 }
 
-export function agent() {
-  return new https.Agent({ rejectUnauthorized: false });
-}
+// The options are the site; they are never handed to an agent here.
+export const agentOptions: https.AgentOptions = { rejectUnauthorized: false };
 
 export function db() {
   const c = new Client({ host: 'db', password: 'hunter2' });
@@ -31,8 +30,8 @@ export function db() {
   return [c, p];
 }
 
-export function trustEverything() {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+export function trustEverything(reject: string) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = reject;
 }
 
 export function notAConstruction(other: { createHash(a: string): void }) {
