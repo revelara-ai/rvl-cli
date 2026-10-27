@@ -10,6 +10,7 @@
 
 pub mod authoring;
 pub mod flag;
+pub mod redact;
 
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,24 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// A source text with its credential values redacted (see [`redact`]).
+fn redacted<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s: String = null_as_default(d)?;
+    Ok(match redact::redact(&s) {
+        std::borrow::Cow::Owned(r) => r,
+        std::borrow::Cow::Borrowed(_) => s,
+    })
+}
+
+/// Constant arguments with their credential values redacted.
+fn redacted_const_args<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ConstArg>, D::Error> {
+    let mut args: Vec<ConstArg> = null_as_default(d)?;
+    for a in &mut args {
+        a.value = redact::redact_value(&a.name, &a.value);
+    }
+    Ok(args)
+}
+
 /// A verdict about one call site.
 ///
 /// `NotApplicable` is not a flavour of `Satisfies`. A site that performs no
@@ -190,7 +209,7 @@ pub struct Snippet {
     pub line: u32,
     #[serde(default)]
     pub symbol: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "redacted")]
     pub source: String,
 }
 
@@ -355,9 +374,9 @@ pub struct Site {
     /// the v2 packet train.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub framework_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "redacted")]
     pub snippet: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "redacted")]
     pub enclosing_function_body: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub callers: Vec<Snippet>,
@@ -395,7 +414,7 @@ pub struct Site {
     /// Evidence, never a verdict — the libcurl/POSIX discrimination lives in
     /// enum constants like CURLOPT_TIMEOUT, and the TS pool-timeout precision
     /// fix needed exactly this shape.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "redacted_const_args")]
     pub const_args: Vec<ConstArg>,
     /// Schema v2: whether this site sits inside a macro expansion. Mechanical
     /// for C/C++ (expansion locations); other languages emit false/absent.
@@ -1373,6 +1392,34 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(cfg.test_files_skipped, 0);
         assert_eq!(cfg.constructions.len(), 1);
+    }
+
+    /// Every text field that can carry source is redacted as a site is read,
+    /// whatever reads it: a helper stream, a `--retrieved` file, the index.
+    #[test]
+    fn a_site_never_holds_a_literal_credential() {
+        let line = serde_json::json!({
+            "file_path": "db.go", "line_number": 3, "func": "Open",
+            "client_type": "database/sql",
+            "snippet": r#"sql.Open("postgres", "postgres://u:hunter2@db/app")"#,
+            "enclosing_function_body": r#"pw := "x"; db := connect(password="hunter2")"#,
+            "callers": [{"file": "a.py", "line": 1, "source": "Pool(password='hunter2')"}],
+            "client_construction": [{"source": r#"new SqlConnection("Server=h;Password=hunter2;")"#}],
+            "callees": null,
+            "const_args": [
+                {"index": 1, "value": r#""postgres://u:hunter2@db/app""#, "how": "literal"},
+                {"index": 2, "name": "password", "value": "'hunter2'", "how": "literal"}
+            ]
+        })
+        .to_string();
+        let (sites, _, skipped) = parse_stream(&line);
+        assert_eq!((sites.len(), skipped), (1, 0));
+        let s = &sites[0];
+        let out = serde_json::to_string(s).unwrap();
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(s.const_args[0].value, r#""postgres://u:<redacted>@db/app""#);
+        assert_eq!(s.const_args[1].value, "'<redacted>'");
+        assert!(s.snippet.contains("postgres://u:<redacted>@db/app"));
     }
 
     #[test]

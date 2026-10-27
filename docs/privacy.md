@@ -115,6 +115,28 @@ fails and names the file.
 The "code never leaves" claim above is scoped to the deterministic scan and
 this report preview. The one surface that deliberately sends more is below.
 
+## Credential values
+
+A retriever reports constant arguments and source text, so a database or
+crypto construction can carry a literal credential: a DSN with a password, a
+`password`, `passwd`, `pwd`, `secret` or `token` argument or field, a
+connection string with `Password=`. The value is not needed to judge the
+site, and its shape is kept, so `rvl` replaces the value with `<redacted>`:
+`postgres://u:<redacted>@host`, `password='<redacted>'`,
+`Server=h;Password=<redacted>;`.
+
+The redaction is in `rvl-core` (`redact`), and it runs in these places:
+
+- When a site is read, from a helper stream, a `--retrieved` file or the
+  packet index. Every lane, the decision model's input, the agent prompt and
+  each output then hold only the redacted text.
+- When a `config_sites` row of the `--out` document is built. A setting
+  whose key names a credential has the value `<redacted>`.
+- When submission mode posts findings: every string in a finding is
+  redacted, and a string under a credential-named key is redacted whole.
+
+A value that is not a literal, such as `password=os.environ['PW']`, is kept.
+
 ## Submission mode
 
 `rvl scan --service <name>` (with `--scan-dir`, `--file`, or `--stdin`) is

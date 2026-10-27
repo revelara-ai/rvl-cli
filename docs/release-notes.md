@@ -9,6 +9,24 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Credential values are redacted as sites are read
+
+A site's `const_args`, snippet, enclosing body, callers, callees and client
+construction can quote a literal credential, such as a DSN password or a
+`password='...'` argument. `rvl` now replaces the value with `<redacted>`
+when it reads a site, and keeps what is around it:
+`postgres://u:<redacted>@host`, `password='<redacted>'`,
+`Server=h;Password=<redacted>;`.
+
+- Changed: a `--retrieved` stream and the packet index give the redacted
+  text to every lane, so the decision model, the agent prompt and the
+  rendered output never hold the value.
+- Changed: `--out` `config_sites` rows redact `value` and `rule` the same
+  way, and a setting whose key names a credential has `value` `<redacted>`.
+- Changed: submission mode (`rvl scan --service`) redacts every string in
+  the findings before it posts them, so the idempotency key is computed from
+  the redacted findings.
+
 ### Crypto, TLS and database constructions are call sites
 
 The Go, Python and TypeScript retrievers report constructions whose
