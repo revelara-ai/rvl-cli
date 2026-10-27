@@ -20,15 +20,20 @@
 //!
 //! Each decision's reason is the frame cell the model's cell head ranks top,
 //! masked to the frame's cells, with that cell's definition: "RC-022
-//! violates, M2: <definition>". A top cell of another kind than the verdict
-//! (an S cell under `violates`) is not shown: the reason is unknown. A model
-//! without a cell head says the reason is not in this model.
+//! violates, M2: <definition>". A `violates` whose top cell is not a
+//! manifestation cell of the frame abstains, counted on the coverage line:
+//! the model's two heads disagree, and its measured precision is of flags
+//! with a manifestation cell. Under the other verdicts, a top cell of
+//! another kind is not shown: the reason is unknown. A model without a cell
+//! head says the reason is not in this model.
 //!
 //! Model findings are advisory: their severity is not graded.
 
 use serde::Serialize;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use indicatif::ProgressBar;
 
 use rvl_cache::model::{ModelManifest, ModelStore, MODEL_DIR};
 use rvl_model::render::{self, Layout, Question};
@@ -76,6 +81,10 @@ pub struct Decision {
     pub reason: String,
     pub model_id: String,
     pub weights_digest: String,
+    /// The model said `violates` and this abstain replaced it, because its
+    /// top cell is not a manifestation cell of the frame.
+    #[serde(skip)]
+    pub off_cell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -113,6 +122,7 @@ pub fn enabled(repo_root: &Path) -> Option<rvl_model::ModelConfig> {
 }
 
 /// Run the lane over the deterministic lanes' verdicts.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cfg: &rvl_model::ModelConfig,
     cache_root: &Path,
@@ -121,7 +131,9 @@ pub fn run(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     budget: Duration,
+    progress: &ProgressBar,
 ) -> LaneOutput {
+    crate::progress::step(progress, "Loading the decision model");
     let loaded = ModelStore::open(&cache_root.join(MODEL_DIR)).and_then(|s| s.load(keyset));
     let cached = match loaded {
         Ok(c) => c,
@@ -151,7 +163,7 @@ pub fn run(
     };
     let mut budget_line = None;
     if !asks.is_empty() {
-        match infer(cfg, &cached.dir, m, &asks, budget) {
+        match infer(cfg, &cached.dir, m, &asks, budget, progress) {
             Ok((digest, decisions, line)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
@@ -238,13 +250,15 @@ fn select<'a>(
     }
 }
 
-/// Load the runtime and the bundle, and ask every question.
+/// Load the runtime and the bundle, and ask every question, the status line
+/// counting them.
 fn infer(
     cfg: &rvl_model::ModelConfig,
     dir: &Path,
     m: &ModelManifest,
     asks: &[Ask],
     budget: Duration,
+    progress: &ProgressBar,
 ) -> anyhow::Result<(String, Vec<Decision>, Option<String>)> {
     let layout = match m.layout.as_str() {
         "compact" => Layout::Compact,
@@ -264,17 +278,24 @@ fn infer(
         &m.model_file().name,
     )?;
     let digest = bundle.weights_digest.clone();
-    let mut classifier = rvl_model::Classifier::new(
-        runtime,
-        bundle,
-        rvl_model::Options {
-            threads: cfg.threads,
-            ..Default::default()
-        },
-    )?;
+    let opts = rvl_model::Options {
+        threads: cfg.threads,
+        ..Default::default()
+    };
+    let mut classifier = rvl_model::Classifier::new(runtime, bundle, opts)?;
     let texts: Vec<String> = asks.iter().map(|a| input_of(a, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let c = classifier.classify(&refs, budget)?;
+    progress.set_message("Running the decision model");
+    progress.set_position(0);
+    progress.set_length(refs.len() as u64);
+    // `classify`'s budget, measured from this call, with the count moved on
+    // between batches.
+    let start = Instant::now();
+    let mut c = classifier.classify_until(
+        &refs,
+        batch_hook(progress, opts.batch_size, || start.elapsed() >= budget),
+    )?;
+    c.coverage.budget_ms = Some(budget.as_millis());
     let cells = classifier.cells();
     let decisions = asks
         .iter()
@@ -282,6 +303,24 @@ fn infer(
         .map(|(a, r)| decide(a, r, cells))
         .collect();
     Ok((digest, decisions, c.coverage.line()))
+}
+
+/// The hook `classify_until` asks before each batch of `batch` questions:
+/// when the budget is not spent, the count moves on by the batch about to be
+/// asked. A spent budget leaves the count where it is: the rest abstain.
+fn batch_hook<'a>(
+    progress: &'a ProgressBar,
+    batch: usize,
+    mut expired: impl FnMut() -> bool + 'a,
+) -> impl FnMut() -> bool + 'a {
+    move || {
+        if expired() {
+            return true;
+        }
+        let next = progress.position() + batch as u64;
+        progress.set_position(progress.length().map_or(next, |len| next.min(len)));
+        false
+    }
 }
 
 /// The model's input for one question.
@@ -333,10 +372,11 @@ fn kind_of(verdict: &str) -> Option<&'static str> {
 /// One record as a decision with its reason.
 fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision {
     let control = &a.frame.control;
-    let verdict = match &r.verdict {
+    let mut verdict = match &r.verdict {
         rvl_model::Verdict::Label(l) => l.clone(),
         rvl_model::Verdict::Abstain(_) => "abstain".to_string(),
     };
+    let mut off_cell = false;
     let (cell, reason) = match (kind_of(&verdict), cells) {
         (None, _) if r.confidence.is_none() => (
             None,
@@ -356,6 +396,16 @@ fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision 
                     Some(c.id.clone()),
                     format!("{control} {verdict}, {}: {}", c.id, c.definition),
                 ),
+                _ if verdict == "violates" => {
+                    off_cell = true;
+                    let top = top.map_or("no cell of the frame ranked".to_string(), |c| {
+                        format!("its top cell {} is not a manifestation cell", c.id)
+                    });
+                    (
+                        None,
+                        format!("{control} abstains: the model says violates, but {top}"),
+                    )
+                }
                 Some(c) => (
                     None,
                     format!(
@@ -371,17 +421,22 @@ fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision 
             }
         }
     };
+    if off_cell {
+        verdict = "abstain".to_string();
+    }
     Decision {
         site_id: format!("{}:{}", a.site.file_path, a.site.line_number),
         class: a.class.clone(),
         control: control.clone(),
         frame_version: a.frame.version.clone(),
         verdict,
-        confidence: r.confidence,
+        // An abstain has no confidence.
+        confidence: r.confidence.filter(|_| !off_cell),
         cell,
         reason,
         model_id: r.model_id.clone(),
         weights_digest: r.weights_digest.clone(),
+        off_cell,
     }
 }
 
@@ -455,6 +510,21 @@ fn coverage_lines(s: &Summary, budget_line: Option<String>, frames_rejected: usi
             .collect::<Vec<_>>()
             .join(" \u{00b7} ")
     };
+    let mut off_cell: std::collections::BTreeMap<&str, usize> = Default::default();
+    for d in s.sites.iter().filter(|d| d.off_cell) {
+        *off_cell.entry(d.control.as_str()).or_default() += 1;
+    }
+    if !off_cell.is_empty() {
+        let rows: Vec<String> = off_cell
+            .iter()
+            .map(|(control, n)| format!("{control} ({n})"))
+            .collect();
+        out.push(format!(
+            "decision model abstains where it says violates but its top cell is not a \
+             manifestation cell: {}",
+            rows.join(" \u{00b7} ")
+        ));
+    }
     if !s.out_of_distribution.is_empty() {
         out.push(format!(
             "decision model abstains out of distribution, on class families it does not \
@@ -530,13 +600,66 @@ mod tests {
         assert_eq!(d.cell.as_deref(), Some("M2"));
         assert_eq!(d.reason, "RC-022 violates, M2: def M2");
 
-        let r = record("violates", vec![1.0, 0.0, 5.0, 0.0]);
+        let r = record("satisfies", vec![9.0, 0.0, 5.0, 0.0]);
         let d = decide(&ask(&site, &f), &r, Some(&ids));
-        assert_eq!(d.cell, None, "an S cell is not a reason to violate");
+        assert_eq!(d.cell, None, "an M cell is not a reason to satisfy");
         assert!(d.reason.contains("reason unknown"), "{}", d.reason);
 
         let d = decide(&ask(&site, &f), &record("violates", vec![]), None);
         assert_eq!(d.reason, "RC-022 violates, reason: not in this model");
+    }
+
+    #[test]
+    fn a_violation_whose_top_cell_is_not_a_manifestation_cell_abstains() {
+        let site = rvl_core::Site::default();
+        let ids: Vec<String> = ["M1", "S1", "C3"].map(String::from).to_vec();
+        let f = frame(&[
+            ("M1", "manifestation"),
+            ("S1", "satisfying"),
+            ("C3", "context"),
+        ]);
+        let off = decide(
+            &ask(&site, &f),
+            &record("violates", vec![1.0, 0.0, 5.0]),
+            Some(&ids),
+        );
+        assert_eq!(off.verdict, "abstain");
+        assert_eq!((off.cell.as_ref(), off.confidence), (None, None));
+        assert_eq!(
+            off.reason,
+            "RC-022 abstains: the model says violates, but its top cell C3 is not a \
+             manifestation cell"
+        );
+        assert!(finding_of(&off).is_none(), "an abstain is not a finding");
+        let none = decide(
+            &ask(&site, &frame(&[])),
+            &record("violates", vec![]),
+            Some(&[]),
+        );
+        assert_eq!(none.verdict, "abstain", "{}", none.reason);
+
+        let on = decide(
+            &ask(&site, &f),
+            &record("violates", vec![5.0, 0.0, 1.0]),
+            Some(&ids),
+        );
+        assert_eq!(on.verdict, "violates");
+        let s = Summary {
+            model_id: "m".into(),
+            sites: vec![off, none, on],
+            ..Summary::default()
+        };
+        let lines = coverage_lines(&s, None, 0);
+        assert!(
+            lines[0].contains("3 site question(s) asked")
+                && lines[0].contains("1 violates")
+                && lines[0].contains("2 abstain"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("top cell is not a manifestation cell: RC-022 (2)"),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -652,6 +775,36 @@ mod tests {
         let sel = select(&findings, &sites, &frames, &unlisted);
         assert_eq!(sel.asks.len(), 2, "no served_classes asks every class");
         assert!(sel.out_of_distribution.is_empty());
+    }
+
+    /// `classify_until`'s loop over 20 questions in batches of 8, the hook
+    /// asked before each batch; the budget is spent after `budget_batches`.
+    fn ask_twenty(budget_batches: usize) -> (u64, usize) {
+        let progress = indicatif::ProgressBar::hidden();
+        progress.set_length(20);
+        let mut checks = 0;
+        let mut hook = batch_hook(&progress, 8, || {
+            checks += 1;
+            checks > budget_batches
+        });
+        let mut inferred = 0;
+        for batch in [(); 20].chunks(8) {
+            if hook() {
+                break;
+            }
+            inferred += batch.len();
+        }
+        (progress.position(), 20 - inferred)
+    }
+
+    #[test]
+    fn the_question_count_moves_one_batch_at_a_time_and_the_budget_still_stops_it() {
+        assert_eq!(ask_twenty(usize::MAX), (20, 0), "every question asked");
+        assert_eq!(
+            ask_twenty(1),
+            (8, 12),
+            "the budget stop abstains the rest, and the count does not pass it"
+        );
     }
 
     #[test]

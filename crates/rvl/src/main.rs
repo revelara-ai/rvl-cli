@@ -21,6 +21,7 @@ mod hook;
 mod init;
 mod keyset;
 mod out_doc;
+mod progress;
 mod render;
 mod report;
 mod service_check;
@@ -3375,10 +3376,12 @@ fn resolve_findings(
     tiers: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
+    progress: &indicatif::ProgressBar,
 ) -> anyhow::Result<ResolvedScan> {
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
         store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, tiers, repo_root, verbose,
+        progress,
     )
 }
 
@@ -3479,6 +3482,9 @@ fn findings_from_sites(
     tier_filter: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
+    // What this prints goes through it, so a scan's status line does not
+    // garble it.
+    progress: &indicatif::ProgressBar,
 ) -> anyhow::Result<ResolvedScan> {
     // The signed artifact carries BOTH halves of the answer: the specs that
     // decide whether a call is bounded, and the judgments that decide what an
@@ -3488,11 +3494,13 @@ fn findings_from_sites(
         Some(p) => {
             // Dev override. Announced on stderr every time: an unverified
             // spec cache must never load quietly.
-            eprintln!(
-                "WARNING: loading UNVERIFIED specs from {} (--specs-file is a dev override; \
-                 production scans use the signed cache)",
-                p.display()
-            );
+            progress.suspend(|| {
+                eprintln!(
+                    "WARNING: loading UNVERIFIED specs from {} (--specs-file is a dev override; \
+                     production scans use the signed cache)",
+                    p.display()
+                )
+            });
             // No envelope was opened, so there are no cache judgments to carry.
             // A dev spec file plus `--judgments` is the full offline pairing.
             // No tier loaded either, so an empty dev file is the author's
@@ -3517,35 +3525,39 @@ fn findings_from_sites(
             // every run, for the same reason `--specs-file` is: a scan whose
             // inputs were reduced must not look like the ordinary one.
             if tier_filter == TierFilter::OssOnly {
-                eprintln!(
-                    "note: --oss-only: the commercial tier was not loaded; this scan uses \
-                     the OSS vocabulary tier alone, so API surfaces are unjudged and \
-                     findings are advisory"
-                );
+                progress.suspend(|| {
+                    eprintln!(
+                        "note: --oss-only: the commercial tier was not loaded; this scan uses \
+                         the OSS vocabulary tier alone, so API surfaces are unjudged and \
+                         findings are advisory"
+                    )
+                });
             }
             for (tier, loaded) in [
                 (rvl_cache::Tier::Commercial, &tiers.commercial),
                 (rvl_cache::Tier::Oss, &tiers.oss),
             ] {
                 let Some(loaded) = loaded else { continue };
-                if let Some(hint) = &loaded.upgrade_hint {
-                    eprintln!("{hint}");
-                }
-                // Labeled by tier (po-7ocbd): both tiers load, and a note
-                // about the stale one must not read as the other's.
-                if let Some(note) = loaded.staleness_line(tier) {
-                    eprintln!("{note}");
-                }
-                // Gated by `verbose` (like the sites|specs line below) so
-                // quiet callers such as `explain` and `report --json` keep
-                // stdout clean. Staleness/upgrade hints stay on stderr.
-                if verbose {
-                    println!("{}", loaded.summary_line(tier));
-                }
+                progress.suspend(|| {
+                    if let Some(hint) = &loaded.upgrade_hint {
+                        eprintln!("{hint}");
+                    }
+                    // Labeled by tier (po-7ocbd): both tiers load, and a note
+                    // about the stale one must not read as the other's.
+                    if let Some(note) = loaded.staleness_line(tier) {
+                        eprintln!("{note}");
+                    }
+                    // Gated by `verbose` (like the sites|specs line below) so
+                    // quiet callers such as `explain` and `report --json` keep
+                    // stdout clean. Staleness/upgrade hints stay on stderr.
+                    if verbose {
+                        println!("{}", loaded.summary_line(tier));
+                    }
+                });
             }
             // Before the no-tier bail, so a CI pin over an empty cache says
             // what it wanted rather than only that nothing loaded.
-            autosync::cache_header(&tiers, store.root(), repo_root)?;
+            progress.suspend(|| autosync::cache_header(&tiers, store.root(), repo_root))?;
             let judgments = tiers.judgments();
             let commercial_loaded = tiers.commercial.is_some();
             match tiers.spec_texts()? {
@@ -3592,10 +3604,12 @@ fn findings_from_sites(
         let dev = devscope::DevScope::detect(root);
         dev.annotate(&mut sites);
         if verbose && !dev.is_empty() {
-            println!(
-                "dev scope {} file(s) (declared build hooks / unreferenced root scripts)",
-                dev.len()
-            );
+            progress.suspend(|| {
+                println!(
+                    "dev scope {} file(s) (declared build hooks / unreferenced root scripts)",
+                    dev.len()
+                )
+            });
         }
     }
     // G2 (po-av01j.3): server-entry records ride the same stream but are
@@ -3645,7 +3659,7 @@ fn findings_from_sites(
     // and COVERAGE names it below.
     let empty_api_corpus = empty_api_corpus(commercial_loaded, cache.api_count(), sites.len());
     if empty_api_corpus {
-        eprintln!("{}", empty_api_corpus_warning());
+        progress.suspend(|| eprintln!("{}", empty_api_corpus_warning()));
     }
     // Out-of-code bound declarations (po-3t3oj.30): repo policy in
     // `.revelara.yaml` asserting a bound no retrieval can see (a prod
@@ -3656,10 +3670,12 @@ fn findings_from_sites(
         let declared =
             waiver::load_declared_bounds(&root.join(".revelara.yaml"), &rvl_cache::today_utc());
         if !declared.is_empty() {
-            eprintln!(
-                "applying {} declared bound(s) from .revelara.yaml",
-                declared.len()
-            );
+            progress.suspend(|| {
+                eprintln!(
+                    "applying {} declared bound(s) from .revelara.yaml",
+                    declared.len()
+                )
+            });
             let overlay = rvl_spec::SpecFile {
                 apis: vec![],
                 scopes: vec![],
@@ -3703,16 +3719,19 @@ fn findings_from_sites(
         } else {
             format!(" | server-entry {}", server_sites.len())
         };
-        println!(
-            "sites {}{server_note} | specs {} | unparseable lines {skipped}",
-            sites.len(),
-            cache.len()
-        );
+        progress.suspend(|| {
+            println!(
+                "sites {}{server_note} | specs {} | unparseable lines {skipped}",
+                sites.len(),
+                cache.len()
+            )
+        });
     }
 
     // Triage: collapse violations into reader-facing classes. Unjudged classes
     // still surface; they are never dropped.
-    let judgments = resolve_judgments(cache_judgments.as_ref(), judgments, verbose)?;
+    let judgments =
+        progress.suspend(|| resolve_judgments(cache_judgments.as_ref(), judgments, verbose))?;
     // Key each verdict on the site's UNIQUE site_key (not the finding's
     // file:line site_id, which collides on chained calls), so triage rematches
     // it to the right call and labels the finding correctly (po-3t3oj.35).
@@ -3947,6 +3966,7 @@ fn stdout_color(mode: Option<&str>) -> bool {
 
 /// The decision-model lane, when `.revelara.yaml` turns it on: after the
 /// deterministic lanes, inside what is left of the scan budget.
+#[allow(clippy::too_many_arguments)]
 fn decision_lane(
     store: &CacheStore,
     keyset: &Keyset,
@@ -3955,8 +3975,9 @@ fn decision_lane(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     limits: &budget::Limits,
+    progress: &indicatif::ProgressBar,
 ) -> Option<decision::LaneOutput> {
-    let cfg = decision::enabled(path)?;
+    let cfg = progress.suspend(|| decision::enabled(path))?;
     let budget = limits
         .remaining()
         .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
@@ -3968,6 +3989,7 @@ fn decision_lane(
         sites,
         specs,
         budget,
+        progress,
     ))
 }
 
@@ -3989,6 +4011,7 @@ fn run_scan(
     limits: budget::Limits,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+    let progress = progress::scan();
     // The full path treats "no language detected" as a clean pass too
     // (po-av01j.148), so it wants the same root guarantee as the incremental
     // one: an unreadable tree must not render as "commit clean". Overlaps
@@ -4027,6 +4050,7 @@ fn run_scan(
         // degrades to the content and structure lanes alone and names the
         // lane that did not run. An explicit `--specs-file` that fails to
         // load stays an error; the user asked for those specs.
+        progress::step(&progress, "Resolving findings");
         let specs = match resolve_findings(
             store,
             keyset,
@@ -4036,20 +4060,25 @@ fn run_scan(
             tiers,
             Some(path),
             true,
+            &progress,
         ) {
             Ok((_, _, _, specs, _, _, _)) => Some(specs),
             Err(e) if specs_file.is_none() => {
-                eprintln!(
-                    "warning: the config lane did not run ({e:#}); \
-                     only the content and structure lanes are reported"
-                );
+                progress.suspend(|| {
+                    eprintln!(
+                        "warning: the config lane did not run ({e:#}); \
+                         only the content and structure lanes are reported"
+                    )
+                });
                 None
             }
             Err(e) => return Err(e),
         };
+        progress::step(&progress, "Running structure and config lanes");
         let lane = specs
             .as_ref()
             .map(|s| config_lane::run(path, s, &snapshot_name(path)));
+        progress.finish_and_clear();
         return render_scan_output(
             state_path,
             path,
@@ -4082,7 +4111,9 @@ fn run_scan(
             render::GatedOperation::Commit,
         );
     }
+    progress::step(&progress, "Retrieving call sites");
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests, &limits)?;
+    progress::step(&progress, "Resolving findings");
     let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
         resolve_findings(
             store,
@@ -4093,8 +4124,10 @@ fn run_scan(
             tiers,
             Some(path),
             true,
+            &progress,
         )?;
     items.extend(citems);
+    progress::step(&progress, "Running structure and config lanes");
     // Structure + server-entry lanes join the ladder at the same seam: both
     // are control-mapped advisory findings outside the per-class triage.
     let StructureLane {
@@ -4104,8 +4137,11 @@ fn run_scan(
     // The G6 config lane: same repo, same specs, per-format retrievers.
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
-    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
+    let model = decision_lane(
+        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+    );
     let blended = blend.then(|| {
+        progress::step(&progress, "Blending");
         blend::run(
             path,
             None,
@@ -4116,6 +4152,7 @@ fn run_scan(
             &limits,
         )
     });
+    progress.finish_and_clear();
     render_scan_output(
         state_path,
         path,
@@ -4984,6 +5021,7 @@ fn incremental_scan_pass(
     strict: bool,
     limits: &budget::Limits,
     scope: Option<&std::collections::BTreeSet<String>>,
+    progress: &indicatif::ProgressBar,
 ) -> anyhow::Result<IncrementalScan> {
     // PREFLIGHT THE ROOT BEFORE READING THE EMPTY SET AS BENIGN
     // (po-av01j.198). `walk_source_files` swallows every `read_dir` error by
@@ -5015,7 +5053,8 @@ fn incremental_scan_pass(
         return Ok(IncrementalScan::no_source());
     }
 
-    let index = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
+    let index =
+        progress.suspend(|| open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT))?;
     let candidates = pass_candidates(&index, path, candidates, scope)?;
     let name = snapshot_name(path);
     let root = path.to_path_buf();
@@ -5587,6 +5626,7 @@ fn run_scan_incremental(
     limits: budget::Limits,
 ) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
+    let progress = progress::scan();
 
     // THE CHANGED SET IS A GIT QUESTION (po-sg7jb). Resolved BEFORE the scan
     // so an unanswerable one costs nothing, and never from the packet index:
@@ -5638,7 +5678,8 @@ fn run_scan_incremental(
     // re-parsing the rest of the repository's index drift (see
     // `scoped_candidates`).
     let scope = retrieval_scope(&resolved, changed_only);
-    let scan = incremental_scan_pass(index_dir, path, strict, &limits, scope.as_ref())?;
+    progress::step(&progress, "Retrieving call sites");
+    let scan = incremental_scan_pass(index_dir, path, strict, &limits, scope.as_ref(), &progress)?;
 
     // SAY WHY THE LANGUAGE LANE IS EMPTY (po-av01j.198). A gate that prints an
     // empty report looks as broken as one that errors, so the no-source case
@@ -5648,11 +5689,13 @@ fn run_scan_incremental(
     // scan" from "nothing got scanned" -- the distinction render_scan_output's
     // own degraded_note comment calls out.
     let lang_status: Vec<render::LangStatus> = if scan.no_supported_sources {
-        eprintln!(
-            "incremental: no supported source files under {} -- no retriever was needed; \
-             the content, config and structure lanes still ran over the tree",
-            path.display()
-        );
+        progress.suspend(|| {
+            eprintln!(
+                "incremental: no supported source files under {} -- no retriever was needed; \
+                 the content, config and structure lanes still ran over the tree",
+                path.display()
+            )
+        });
         detect_unsupported(path)
             .into_iter()
             .map(|(name, count)| render::LangStatus {
@@ -5669,18 +5712,20 @@ fn run_scan_incremental(
     // One-line reuse summary to stderr; the ladder itself goes to stdout.
     // "re-parsed" is the honest word: it counts what the INDEX had to reload,
     // which is independent of what the change touched.
-    eprintln!(
-        "incremental: reused {} files from index, re-parsed {} stale",
-        scan.reused_files, scan.retrieved_files
-    );
-    if let Some(note) = &scan.degraded_note {
-        eprintln!("incremental: degraded (fail-open): {note}");
-    }
+    progress.suspend(|| {
+        eprintln!(
+            "incremental: reused {} files from index, re-parsed {} stale",
+            scan.reused_files, scan.retrieved_files
+        );
+        if let Some(note) = &scan.degraded_note {
+            eprintln!("incremental: degraded (fail-open): {note}");
+        }
+    });
 
     // The delta the gate and the agent lane are scoped to. Git when we have
     // it; the index's re-parse list only as an advisory fallback outside a git
     // work tree, which `changed_only` has already refused above.
-    let changed_files = match &resolved {
+    let changed_files = progress.suspend(|| match &resolved {
         Ok(cs) => {
             eprintln!("changed set: {} file(s) from {}", cs.files.len(), cs.source);
             cs.files.clone()
@@ -5692,7 +5737,7 @@ fn run_scan_incremental(
             );
             scan.reparsed_files.clone()
         }
-    };
+    });
 
     // SCOPE TO THE CHANGE, at the SITE level and before triage
     // (po-av01j.127). Filtering the rendered ladder instead would leave
@@ -5708,6 +5753,7 @@ fn run_scan_incremental(
     } else {
         scan.sites
     };
+    progress::step(&progress, "Resolving findings");
     let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
         findings_from_sites(
             store,
@@ -5720,6 +5766,7 @@ fn run_scan_incremental(
             tiers,
             Some(path),
             true,
+            &progress,
         )?;
     // The content lane is cheap (one regex pass over the tree) and its rules
     // change with the binary, not the sources, so it runs FULL on every warm
@@ -5735,6 +5782,7 @@ fn run_scan_incremental(
         });
     }
     items.extend(content);
+    progress::step(&progress, "Running structure and config lanes");
     // Incremental scans own the live tree, so the structure lane inventories
     // it directly (one bounded walk; there is no packet stream to ride). The
     // server-entry lane rode the packet index like every other site.
@@ -5777,24 +5825,30 @@ fn run_scan_incremental(
     // pipeline is fully assembled, under its own consent + budget, over the
     // delta-scoped undecided sites only. Every failure path fails open; the
     // deterministic result above is never at risk.
+    // It prints as it goes, so the status line stands aside while it runs.
     let hook_agent = hook.and_then(|h| {
-        agent::run_hook_adjudication(
-            h,
-            path,
-            &changed_files,
-            &findings,
-            &sites,
-            &judgments,
-            &agent::telemetry_path_from_state(state_path),
-            env!("CARGO_PKG_VERSION"),
-            stdout_color(color),
-        )
+        progress.suspend(|| {
+            agent::run_hook_adjudication(
+                h,
+                path,
+                &changed_files,
+                &findings,
+                &sites,
+                &judgments,
+                &agent::telemetry_path_from_state(state_path),
+                env!("CARGO_PKG_VERSION"),
+                stdout_color(color),
+            )
+        })
     });
-    let model = decision_lane(store, keyset, path, &findings, &sites, &specs, &limits);
+    let model = decision_lane(
+        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+    );
     // `--blend` (po-av01j.205): the same residue, whole repo, or the
     // changed set under --changed-only so the agent never sees files the
     // report is not about.
     let blended = blend.then(|| {
+        progress::step(&progress, "Blending");
         blend::run(
             path,
             changed_only.then_some(changed_files.as_slice()),
@@ -5805,6 +5859,7 @@ fn run_scan_incremental(
             &limits,
         )
     });
+    progress.finish_and_clear();
     render_scan_output(
         state_path,
         path,
@@ -5900,6 +5955,7 @@ fn run_explain(
             TierFilter::Both,
             Some(path),
             false,
+            &indicatif::ProgressBar::hidden(),
         )?;
     // Mirror the scan's content lane so a `secret.*` finding id resolves in
     // the live fallback too (skipped for --retrieved, same as scan).
@@ -5975,6 +6031,7 @@ fn run_suppress(
                         TierFilter::Both,
                         Some(scan_path),
                         false,
+                        &indicatif::ProgressBar::hidden(),
                     )?;
                 // Same content-lane mirror as explain's live fallback.
                 if retrieved.is_none() {
@@ -6059,6 +6116,7 @@ fn run_report(
             false,
             &budget::Limits::resolve(path, None, None),
             None,
+            &indicatif::ProgressBar::hidden(),
         )?;
         eprintln!(
             "incremental: reused {} files from index, retrieved {} changed",
@@ -6082,6 +6140,7 @@ fn run_report(
                 tiers,
                 Some(path),
                 false,
+                &indicatif::ProgressBar::hidden(),
             )?;
         (findings, sites)
     } else {
@@ -6102,6 +6161,7 @@ fn run_report(
                 tiers,
                 Some(path),
                 false,
+                &indicatif::ProgressBar::hidden(),
             )?;
         (findings, sites)
     };
@@ -10672,6 +10732,7 @@ mod tests {
             false,
             &budget::Limits::none(),
             None,
+            &indicatif::ProgressBar::hidden(),
         )
         .expect("no supported source is not an error: nothing was needed");
         assert!(scan.sites.is_empty());

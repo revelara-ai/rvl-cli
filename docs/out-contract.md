@@ -299,6 +299,9 @@ The orchestrator uses it to:
   `abstain`), `confidence` (null on an abstain), `cell` (the frame cell
   given as the reason, null when the model has no cell head or its top cell
   is not of the verdict's kind), `reason`, `model_id` and `weights_digest`.
+  When the model says `violates` but its top cell is not a manifestation
+  cell of the frame, the row is an `abstain` (no `cell`, no `confidence`,
+  and the `reason` says so), and a COVERAGE line counts these per control.
   `unserved` counts the site questions of controls the model does not
   serve, per control (`{"control", "sites"}`); they abstain.
   `out_of_distribution` counts, in the same shape, the site questions of a
