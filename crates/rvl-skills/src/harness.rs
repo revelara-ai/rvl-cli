@@ -229,6 +229,10 @@ pub trait Harness {
 /// when it actually changed something.
 pub type PostInstallHook = fn(&Path) -> anyhow::Result<Option<String>>;
 
+/// Rewrites one lens agent (`agents/<id>.md` in the download) into the
+/// harness's own agent format, given the lens id and its content.
+pub type AgentExport = fn(&str, &[u8]) -> Vec<u8>;
+
 /// Universal adapter: tarball content extracted under `home/<install_dir>`,
 /// detected by its binary on PATH or `home/<config_dir>` existing. Mirrors
 /// rvl-cli's editor registry entries for the same names.
@@ -254,6 +258,11 @@ pub struct DirHarness {
     pub local_dir: Option<&'static str>,
     /// Post-install hook for global installs (rvl-cli Registry.PostInstall).
     pub post_install: Option<PostInstallHook>,
+    /// For a harness whose download keeps the lens agents away from its
+    /// agents directory (OpenCode): each `agents/<id>.md` is ALSO written,
+    /// rewritten by this function, to `agents_dir/<id>.md`, so the harness
+    /// registers it as an agent.
+    pub export_agents: Option<AgentExport>,
     pub note: &'static str,
 }
 
@@ -282,6 +291,7 @@ const fn dir(
         agents_dir: None,
         local_dir: None,
         post_install: None,
+        export_agents: None,
         note,
     }
 }
@@ -355,15 +365,49 @@ impl Harness for DirHarness {
         files: &BTreeMap<String, Vec<u8>>,
         _version: &str,
     ) -> anyhow::Result<InstallReceipt> {
-        install_files_at(&home.join(self.install_dir), files, self.note)
+        let mut receipt = install_files_at(&home.join(self.install_dir), files, self.note)?;
+        if let Some((export, dir)) = self.agent_export(home) {
+            let agents = lens_agents(files)
+                .map(|(id, content)| (format!("{id}.md"), export(id, content)))
+                .collect();
+            receipt.files_written += write_files(&dir, &agents)?;
+        }
+        Ok(receipt)
     }
     fn remove(
         &self,
         home: &Path,
         files: Option<&BTreeMap<String, Vec<u8>>>,
     ) -> anyhow::Result<RemoveReceipt> {
-        remove_files_at(&home.join(self.install_dir), files, self.name)
+        let mut receipt = remove_files_at(&home.join(self.install_dir), files, self.name)?;
+        if let (Some((_, dir)), Some(files)) = (self.agent_export(home), files) {
+            for (id, _) in lens_agents(files) {
+                match std::fs::remove_file(dir.join(format!("{id}.md"))) {
+                    Ok(()) => *receipt.files_removed.get_or_insert(0) += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(receipt)
     }
+}
+
+impl DirHarness {
+    /// The agent rewrite and the absolute directory it writes into, when
+    /// this harness exports lens agents.
+    fn agent_export(&self, home: &Path) -> Option<(AgentExport, PathBuf)> {
+        Some((self.export_agents?, home.join(self.agents_dir?)))
+    }
+}
+
+/// The lens agents in a download: `agents/<id>.md` at the top level, as
+/// (id, content).
+fn lens_agents(files: &BTreeMap<String, Vec<u8>>) -> impl Iterator<Item = (&str, &[u8])> {
+    files.iter().filter_map(|(name, content)| {
+        let id = name.strip_prefix("agents/")?.strip_suffix(".md")?;
+        (!id.is_empty() && !id.contains('/')).then_some((id, content.as_slice()))
+    })
 }
 
 /// Place `files` under `root`. Shared by the global install and the
@@ -874,12 +918,19 @@ pub fn registry() -> Vec<Box<dyn Harness>> {
         }),
         Box::new(DirHarness {
             local_dir: Some(".agents/skills"),
+            // The skills download carries the lenses as Claude Code agent
+            // files; OpenCode registers agents only from its own agents
+            // directory and format, so /rvl:scan could not fan out there.
+            agents_dir: Some(".config/opencode/agents"),
+            export_agents: Some(crate::opencode::subagent),
             ..dir(
                 "opencode",
                 "OpenCode",
                 ".config/opencode",
                 ".config/opencode/skills",
-                AUTO_NOTE,
+                "Skills are auto-discovered and the scan lenses are registered as \
+                 OpenCode subagents (needs OpenCode 1.18.33 or later); try: \
+                 \"scan this codebase for reliability risks\"",
             )
         }),
         Box::new(DirHarness {

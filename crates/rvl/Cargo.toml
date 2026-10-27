@@ -48,6 +48,8 @@ serde_yaml = { workspace = true }
 # a truncated or hand-edited helper heals instead of silently scanning wrong.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The scan's live status line on stderr; it hides itself off a terminal.
+indicatif = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
