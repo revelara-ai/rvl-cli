@@ -12,6 +12,7 @@ pub mod agents;
 pub mod fetch;
 pub mod flow;
 pub mod harness;
+pub mod opencode;
 pub mod prompt_hook;
 /// Re-export: the comparison moved to `rvl-core` when the `status` update
 /// nag (po-av01j.185 item 5) needed the same rule without this crate's

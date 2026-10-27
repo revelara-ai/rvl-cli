@@ -18,6 +18,11 @@ the interview-driven `/rvl:assess-*` process assessments. Harnesses without
 slash commands discover the same content through the managed context block
 below.
 
+For OpenCode (1.18.33 or later), the install also registers each scan lens as
+an OpenCode subagent in `~/.config/opencode/agents/`, so `/rvl:scan` fans out
+to the lenses there as it does in Claude Code. A lens's tool allow-list
+becomes `deny` permissions for the tools it does not grant.
+
 Content is served by the Revelara plugin system, verified (transport checksum
 + signed integrity manifest), and cached under `~/.revelara/cache/skills` so
 installs keep working offline (`RVL_OFFLINE=1` or a network failure fall back
