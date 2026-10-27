@@ -1,0 +1,9 @@
+{
+  "name": "tsindex-fixture-constructions",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Crypto, TLS and database constructions that tsindex retrieves as call sites.",
+  "devDependencies": {
+    "pg": "8.11.3"
+  }
+}

@@ -223,6 +223,43 @@ for an `io.Reader` parameter, the field is absent and only a spec keyed on
 (see below): that packet is about the size of the read, and this one is
 about how long it can block.
 
+## Constructions that are call sites
+
+Some violations are in the line that builds a value, not in the call that
+later uses it: a DES cipher, an MD5 hash used for integrity, a TLS config with
+`InsecureSkipVerify: true`, a database opened with a password in its DSN. The
+`Client.Do` or `db.Query` that uses the value shows none of it. So the
+retrievers report these constructions as classic call sites, with no
+`site_kind`. Each one is a row in `--out` `.sites` and is counted in
+COVERAGE. Until a spec names its class, it abstains as `no spec`.
+
+The retriever selects what to report. It does not judge it: the arguments go
+in `const_args`, and whether an MD5 guards integrity or keys a cache is decided
+downstream.
+
+| Retriever | Class (`client_type.func`) |
+| --- | --- |
+| `goindex` | Package functions, with the package as `client_type`: `crypto/des.NewCipher`, `crypto/des.NewTripleDESCipher`, `crypto/rc4.NewCipher`, `crypto/md5.New`, `crypto/md5.Sum`, `crypto/sha1.New`, `crypto/sha1.Sum`, `database/sql.Open`, `github.com/jackc/pgx/v4.Connect`, `github.com/jackc/pgx/v5.Connect`, `github.com/jackc/pgx/v4/pgxpool.Connect`, `github.com/jackc/pgx/v5/pgxpool.New` (`construction_calls`). A struct field set in a composite literal or an assignment, with the struct as `client_type` and the field as `func`: `crypto/tls.Config.InsecureSkipVerify`, `crypto/tls.Config.MinVersion` (`construction_fields`). Both tables are in `helpers/goindex/extractor_corpus.json`. |
+| `pyindex` | Calls, resolved through the imports: `ssl._create_unverified_context`, `hashlib.md5`, `hashlib.sha1`, `cryptography.hazmat.primitives.ciphers.modes.ECB`, `Crypto.Cipher.DES.new`, `Crypto.Cipher.DES3.new` (and `Cryptodome`), `httpx.Client`, `httpx.AsyncClient`, `psycopg.connect`, `psycopg2.connect`, `sqlalchemy.create_engine`. A reference to `ssl.CERT_NONE`. An assignment to `<x>.check_hostname`, as `ssl.SSLContext.check_hostname`. |
+| `tsindex` | `crypto.createHash` with `md5` or `sha1`, and `crypto.createCipheriv` and `crypto.createDecipheriv` with a DES, RC4 or ECB algorithm (an algorithm that is not a literal is reported too), however the builtin is imported. `new` of `pg.Pool` and `pg.Client`, as `pg.Pool.constructor`. A `rejectUnauthorized` property, as `tls.ConnectionOptions.rejectUnauthorized`. An assignment to `process.env.NODE_TLS_REJECT_UNAUTHORIZED`. |
+| The other retrievers | Nothing yet. |
+
+A field, property or attribute site has the value in one `const_args` entry
+named for the field, with `how` `literal`, `named_constant` or `name` as for
+an unsized construction. A call has its arguments as any call site does; an
+options object of a `pg` constructor has one entry per property. When the
+type of a field site is the table's and not one the retriever proved (a
+Python attribute, a TypeScript options property),
+`provenance.client_type_resolved` is `false`.
+
+`requests.get(url, verify=False)` needed nothing new: it was already a call
+site, and `verify` is in its `const_args`.
+
+`database/sql.Open`, `sqlalchemy.create_engine` and `pg.Pool` are also
+unsized constructions (below). The two packets have different site keys:
+the call site asks how the database is reached, the unsized packet how big
+the pool can grow.
+
 ## Unsized constructions
 
 Some objects take a bound when they are built: a connection pool has a

@@ -9,6 +9,20 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Crypto, TLS and database constructions are call sites
+
+The Go, Python and TypeScript retrievers report constructions whose
+arguments are the security setting as classic call sites: `des.NewCipher`,
+`md5.Sum`, a `tls.Config` literal's `InsecureSkipVerify`, `sql.Open`,
+`hashlib.md5`, `ssl.CERT_NONE`, `ctx.check_hostname = ...`,
+`crypto.createHash('md5')`, `rejectUnauthorized`, `new pg.Pool(...)`, and
+others. The list is in "Constructions that are call sites" in
+`docs/retrievers.md`.
+
+- Changed: `--out` `.sites` has rows of these classes (`crypto/md5.Sum`,
+  `ssl.CERT_NONE`, `pg.Pool.constructor`), and COVERAGE counts them. Until a
+  spec names a class, its sites abstain as `no spec`.
+
 ### Claude Code reminds the agent to look up causal factors
 
 The Claude Code plugin that `rvl plugin install claude` (and

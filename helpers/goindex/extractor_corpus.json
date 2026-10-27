@@ -19,7 +19,13 @@
     "bound is: the packet lists the setters and options seen, and a",
     "construction-bound spec judges them. io.ReadAll is in reader_calls too, on",
     "purpose: the call site asks how long the read can block, and the unsized",
-    "read asks how much it can hold."
+    "read asks how much it can hold.",
+    "construction_calls and construction_fields select the constructions retrieved",
+    "as call sites: a cipher, a hash, a database opened from a DSN (package",
+    "functions, the package is the client type) and a TLS setting (a struct field",
+    "in a literal or an assignment, the struct is the client type and the field the",
+    "method). The violating line is the construction: the call that later uses the",
+    "value does not show it. Whether a hash guards integrity is judged downstream."
   ],
   "io_methods": [
     "Query", "QueryRow", "Exec",
@@ -52,5 +58,23 @@
     {"class": "cache", "package": "github.com/patrickmn/go-cache", "func": "New"},
     {"class": "read", "package": "io", "func": "ReadAll"},
     {"class": "read", "package": "io/ioutil", "func": "ReadAll"}
+  ],
+  "construction_calls": [
+    {"package": "crypto/des", "func": "NewCipher"},
+    {"package": "crypto/des", "func": "NewTripleDESCipher"},
+    {"package": "crypto/rc4", "func": "NewCipher"},
+    {"package": "crypto/md5", "func": "New"},
+    {"package": "crypto/md5", "func": "Sum"},
+    {"package": "crypto/sha1", "func": "New"},
+    {"package": "crypto/sha1", "func": "Sum"},
+    {"package": "database/sql", "func": "Open"},
+    {"package": "github.com/jackc/pgx/v4", "func": "Connect"},
+    {"package": "github.com/jackc/pgx/v5", "func": "Connect"},
+    {"package": "github.com/jackc/pgx/v4/pgxpool", "func": "Connect"},
+    {"package": "github.com/jackc/pgx/v5/pgxpool", "func": "New"}
+  ],
+  "construction_fields": [
+    {"type": "crypto/tls.Config", "field": "InsecureSkipVerify"},
+    {"type": "crypto/tls.Config", "field": "MinVersion"}
   ]
 }

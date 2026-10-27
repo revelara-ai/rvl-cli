@@ -169,16 +169,17 @@ func TestUnbufferedChannelIsNotAnUnsizedConstruction(t *testing.T) {
 
 func TestUnsizedPacketsCarryASiteKeyAndStayOutOfTheCensus(t *testing.T) {
 	sites, scan := runRetrieveAll("testdata/boundsfixture", "bounds")
-	// The five io.ReadAll calls are call sites too. The unsized packets for
-	// the same calls are not candidates.
+	// The five io.ReadAll calls and the seven sql.Open calls are call sites
+	// too (sql.Open is in construction_calls). The unsized packets for the
+	// same calls are not candidates.
 	calls := 0
 	for _, s := range sites {
 		if s.SiteKind == "" {
 			calls++
 		}
 	}
-	if calls != 5 || scan.Census.Candidates != calls {
-		t.Fatalf("want the 5 ReadAll call sites as the only candidates, got %d sites and %d candidates",
+	if calls != 12 || scan.Census.Candidates != calls {
+		t.Fatalf("want the 5 ReadAll and 7 sql.Open call sites as the only candidates, got %d sites and %d candidates",
 			calls, scan.Census.Candidates)
 	}
 	var sb strings.Builder

@@ -959,11 +959,12 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 					if callee == nil {
 						return true
 					}
-					// A background-job registration surface (G3) or a classic
-					// I/O call (G1); anything else is not a site.
+					// A background-job registration surface (G3), a classic
+					// I/O call (G1) or a construction whose arguments are the
+					// security setting; anything else is not a site.
 					jobType := jobFrameworkType(callee)
 					isReader := jobType == "" && len(c.Args) > 0 && isReaderCall(callee)
-					if jobType == "" && !isReader && !ioMethods[callee.Name()] {
+					if jobType == "" && !isReader && !ioMethods[callee.Name()] && !isConstructionCall(callee) {
 						if surface, known := knownUnretrieved(callee); known {
 							census.Unretrieved[surface]++
 						}
@@ -1147,6 +1148,11 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 			}
 		}
 	}
+	// TLS settings in struct literals and assignments are call sites too
+	// (construction.go).
+	fields := collectConstructionFields(pkgs, src, root, name)
+	census.Candidates += len(fields)
+	out = append(out, fields...)
 	// G4 emission inventory (po-av01j.5): aggregate emission-point packets
 	// ride the same stream, stamped site_kind: "emission_point".
 	out = append(out, collectEmissions(pkgs, src, root, name)...)

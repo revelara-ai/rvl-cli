@@ -68,6 +68,14 @@ not cover a file read. `client_construction` holds the values that reach the
 variable the reader comes from, such as the call that returned the response.
 `framework_type` is not part of `site_key`.
 
+`construction_calls` and `construction_fields` in the same file select the
+constructions emitted as call sites: a cipher, a hash or a database opened
+from a DSN (a package function; the package is the `client_type`), and a
+`crypto/tls.Config` field set in a composite literal or an assignment (the
+struct is the `client_type`, the field is `func`, and its value is the one
+`const_args` entry). See "Constructions that are call sites" in
+`docs/retrievers.md`.
+
 The same file holds `bound_constructors`: the functions whose calls are
 emitted as `site_kind: "unsized_construction"` packets (a connection pool, a
 cache, a read of a whole body). The packet lists the setters and options seen

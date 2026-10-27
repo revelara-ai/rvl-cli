@@ -160,7 +160,7 @@ test('two calls on one line with different client types get distinct keys', () =
   for (const r of records) {
     (byLine[r.line_number] = byLine[r.line_number] || []).push(r);
   }
-  const shared = Object.values(byLine).find((rs) => rs.length >= 2);
+  const shared = Object.values(byLine).find((rs) => new Set(rs.map((r) => r.client_type)).size >= 2);
   assert.ok(shared, 'fixture must have two client calls sharing a line');
   const clientTypes = new Set(shared.map((r) => r.client_type));
   assert.ok(
@@ -1189,7 +1189,7 @@ test('path aliases beside real imports do not poison the run', () => {
     const { sites, cfg } = callSitesFrom(tmp);
     assert.deepStrictEqual(
       sites.map((r) => `${r.client_type}.${r.func}`).sort(),
-      ['axios.get', 'pg.Pool.query'],
+      ['axios.get', 'pg.Pool.constructor', 'pg.Pool.query'],
       JSON.stringify(sites.map((r) => [r.client_type, r.func, r.receiver])),
     );
     assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
@@ -1267,7 +1267,7 @@ test('a wildcard re-export of a package is named, never guessed', (t) => {
   const { sites, cfg } = callSitesFrom(dir);
   assert.deepStrictEqual(
     sites.map((r) => `${r.client_type}.${r.func}`),
-    ['pg.Pool.query'],
+    ['pg.Pool.constructor', 'pg.Pool.query'],
     JSON.stringify(sites.map((r) => [r.client_type, r.func])),
   );
   assert.deepStrictEqual(cfg.unmappable_specifiers, ["export * from 'ioredis'"]);
@@ -1331,7 +1331,7 @@ test('a path alias from an extended tsconfig is honored', (t) => {
       "export async function go() { return [await pool.query('x'), await helper.query('y')]; }\n",
   });
   const { sites, cfg } = callSitesFrom(dir);
-  assert.deepStrictEqual(sites.map((r) => `${r.client_type}.${r.func}`), ['pg.Pool.query']);
+  assert.deepStrictEqual(sites.map((r) => `${r.client_type}.${r.func}`), ['pg.Pool.constructor', 'pg.Pool.query']);
   assert.deepStrictEqual(cfg.unmappable_specifiers, ['@app/db']);
 });
 
@@ -1351,7 +1351,7 @@ test('a path alias onto in-repo source resolves through it', (t) => {
   const { sites, cfg } = callSitesFrom(dir);
   assert.deepStrictEqual(
     sites.map((r) => `${r.file_path}:${r.client_type}.${r.func}`),
-    ['src/use.ts:pg.Pool.query'],
+    ['packages/db/src/index.ts:pg.Pool.constructor', 'src/use.ts:pg.Pool.query'],
     JSON.stringify(sites.map((r) => [r.file_path, r.client_type, r.func])),
   );
   assert.deepStrictEqual(cfg.unmappable_specifiers, []);
@@ -1544,4 +1544,54 @@ test('an uninstalled tree reports the same floating promises of in-repo function
     got.map((r) => `${r.symbol}:${r.client_type}:${constByName(r, 'misuse_count')}`).sort(),
     ['close:promise:1', 'floats:promise:4', 'floats:thenable:1', 'generic:promise:1'],
   );
+});
+
+// A construction whose arguments are the security setting is a classic call
+// site (no site_kind): a weak hash or cipher, a TLS option that skips
+// verification, a database client built with a credential. The request or
+// query that later uses the value does not show it.
+const CONSTRUCTIONS_ROOT = path.join(HERE, '..', 'testdata', 'fixture-constructions');
+
+function constructionSites() {
+  const out = run('--retrieve', '--root', CONSTRUCTIONS_ROOT);
+  return out
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l))
+    .filter((r) => r.kind !== 'repo_config' && r.site_kind === '');
+}
+
+test('weak crypto constructions are call sites of their builtin module, however imported', () => {
+  const got = constructionSites().map((r) => `${r.symbol} ${r.client_type}.${r.func}`);
+  for (const want of [
+    'weakDigest crypto.createHash',
+    'namedDigest crypto.createHash',
+    'desCipher crypto.createCipheriv',
+  ]) {
+    assert.ok(got.includes(want), `${want} missing from ${got}`);
+  }
+  assert.ok(!got.some((g) => g.startsWith('strongDigest')), 'sha256 is not selected');
+  assert.ok(!got.some((g) => g.startsWith('notAConstruction')), 'a lookalike is never guessed');
+});
+
+test('TLS and database settings carry the value as const_args', () => {
+  const sites = constructionSites();
+  const one = (cls) => {
+    const recs = sites.filter((r) => `${r.client_type}.${r.func}` === cls);
+    assert.strictEqual(recs.length, 1, `${cls}: ${JSON.stringify(recs)}`);
+    return recs[0];
+  };
+  const tls = one('tls.ConnectionOptions.rejectUnauthorized');
+  assert.deepStrictEqual(tls.const_args, [
+    { index: 0, name: 'rejectUnauthorized', value: 'false', how: 'literal' },
+  ]);
+  assert.strictEqual(tls.provenance.client_type_resolved, false);
+  assert.strictEqual(tls.site_key, `${tls.file_path}:${tls.line_number}:tls.ConnectionOptions:rejectUnauthorized`);
+  const client = one('pg.Client.constructor');
+  assert.ok(client.const_args.some((a) => a.name === 'password' && a.value === "'hunter2'"));
+  const pool = one('pg.Pool.constructor');
+  assert.ok(pool.const_args.some((a) => a.name === 'connectionString'));
+  assert.deepStrictEqual(one('process.env.NODE_TLS_REJECT_UNAUTHORIZED').const_args, [
+    { index: 0, name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: 'reject', how: 'name' },
+  ]);
 });

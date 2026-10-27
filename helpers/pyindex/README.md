@@ -77,6 +77,16 @@ Every record carries:
   and decorator-registration records.
 - `lang` — `"python"`.
 
+## Constructions that are call sites
+
+A crypto, TLS or database construction whose arguments are the security
+setting is a call site too, with no `site_kind`: `hashlib.md5(...)`,
+`modes.ECB()`, `ssl._create_unverified_context()`, `httpx.Client(verify=False)`,
+`psycopg2.connect(...)`, `create_engine(url)`, a reference to `ssl.CERT_NONE`
+and an assignment to `<x>.check_hostname`. The tables are `_CONSTRUCTION_*`
+in `pyindex.py`; the list and the record shape are in "Constructions that
+are call sites" in `docs/retrievers.md`.
+
 ## The `retrieval_stats` record (one per run)
 
 After the site packets, pyindex writes exactly one repo-scoped line,
