@@ -3983,6 +3983,7 @@ fn decision_lane(
         .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
     Some(decision::run(
         &cfg,
+        path,
         store.root(),
         keyset,
         findings,
