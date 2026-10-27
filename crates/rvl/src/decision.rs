@@ -28,7 +28,9 @@
 
 use serde::Serialize;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use indicatif::ProgressBar;
 
 use rvl_cache::model::{ModelManifest, ModelStore, MODEL_DIR};
 use rvl_model::render::{self, Layout, Question};
@@ -113,6 +115,7 @@ pub fn enabled(repo_root: &Path) -> Option<rvl_model::ModelConfig> {
 }
 
 /// Run the lane over the deterministic lanes' verdicts.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cfg: &rvl_model::ModelConfig,
     cache_root: &Path,
@@ -121,7 +124,9 @@ pub fn run(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     budget: Duration,
+    progress: &ProgressBar,
 ) -> LaneOutput {
+    crate::progress::step(progress, "Loading the decision model");
     let loaded = ModelStore::open(&cache_root.join(MODEL_DIR)).and_then(|s| s.load(keyset));
     let cached = match loaded {
         Ok(c) => c,
@@ -151,7 +156,7 @@ pub fn run(
     };
     let mut budget_line = None;
     if !asks.is_empty() {
-        match infer(cfg, &cached.dir, m, &asks, budget) {
+        match infer(cfg, &cached.dir, m, &asks, budget, progress) {
             Ok((digest, decisions, line)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
@@ -238,13 +243,15 @@ fn select<'a>(
     }
 }
 
-/// Load the runtime and the bundle, and ask every question.
+/// Load the runtime and the bundle, and ask every question, the status line
+/// counting them.
 fn infer(
     cfg: &rvl_model::ModelConfig,
     dir: &Path,
     m: &ModelManifest,
     asks: &[Ask],
     budget: Duration,
+    progress: &ProgressBar,
 ) -> anyhow::Result<(String, Vec<Decision>, Option<String>)> {
     let layout = match m.layout.as_str() {
         "compact" => Layout::Compact,
@@ -264,17 +271,24 @@ fn infer(
         &m.model_file().name,
     )?;
     let digest = bundle.weights_digest.clone();
-    let mut classifier = rvl_model::Classifier::new(
-        runtime,
-        bundle,
-        rvl_model::Options {
-            threads: cfg.threads,
-            ..Default::default()
-        },
-    )?;
+    let opts = rvl_model::Options {
+        threads: cfg.threads,
+        ..Default::default()
+    };
+    let mut classifier = rvl_model::Classifier::new(runtime, bundle, opts)?;
     let texts: Vec<String> = asks.iter().map(|a| input_of(a, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let c = classifier.classify(&refs, budget)?;
+    progress.set_message("Running the decision model");
+    progress.set_position(0);
+    progress.set_length(refs.len() as u64);
+    // `classify`'s budget, measured from this call, with the count moved on
+    // between batches.
+    let start = Instant::now();
+    let mut c = classifier.classify_until(
+        &refs,
+        batch_hook(progress, opts.batch_size, || start.elapsed() >= budget),
+    )?;
+    c.coverage.budget_ms = Some(budget.as_millis());
     let cells = classifier.cells();
     let decisions = asks
         .iter()
@@ -282,6 +296,24 @@ fn infer(
         .map(|(a, r)| decide(a, r, cells))
         .collect();
     Ok((digest, decisions, c.coverage.line()))
+}
+
+/// The hook `classify_until` asks before each batch of `batch` questions:
+/// when the budget is not spent, the count moves on by the batch about to be
+/// asked. A spent budget leaves the count where it is: the rest abstain.
+fn batch_hook<'a>(
+    progress: &'a ProgressBar,
+    batch: usize,
+    mut expired: impl FnMut() -> bool + 'a,
+) -> impl FnMut() -> bool + 'a {
+    move || {
+        if expired() {
+            return true;
+        }
+        let next = progress.position() + batch as u64;
+        progress.set_position(progress.length().map_or(next, |len| next.min(len)));
+        false
+    }
 }
 
 /// The model's input for one question.
@@ -652,6 +684,36 @@ mod tests {
         let sel = select(&findings, &sites, &frames, &unlisted);
         assert_eq!(sel.asks.len(), 2, "no served_classes asks every class");
         assert!(sel.out_of_distribution.is_empty());
+    }
+
+    /// `classify_until`'s loop over 20 questions in batches of 8, the hook
+    /// asked before each batch; the budget is spent after `budget_batches`.
+    fn ask_twenty(budget_batches: usize) -> (u64, usize) {
+        let progress = indicatif::ProgressBar::hidden();
+        progress.set_length(20);
+        let mut checks = 0;
+        let mut hook = batch_hook(&progress, 8, || {
+            checks += 1;
+            checks > budget_batches
+        });
+        let mut inferred = 0;
+        for batch in [(); 20].chunks(8) {
+            if hook() {
+                break;
+            }
+            inferred += batch.len();
+        }
+        (progress.position(), 20 - inferred)
+    }
+
+    #[test]
+    fn the_question_count_moves_one_batch_at_a_time_and_the_budget_still_stops_it() {
+        assert_eq!(ask_twenty(usize::MAX), (20, 0), "every question asked");
+        assert_eq!(
+            ask_twenty(1),
+            (8, 12),
+            "the budget stop abstains the rest, and the count does not pass it"
+        );
     }
 
     #[test]
