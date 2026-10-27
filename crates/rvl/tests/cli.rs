@@ -9626,3 +9626,65 @@ fn factor_lookup_with_an_empty_description_exits_2() {
         assert!(out.stdout.is_empty());
     }
 }
+
+/// A site that carries a literal credential (PR 245 made database and crypto
+/// constructions sites, with the DSN or password in `const_args`) leaves no
+/// trace of it in anything a scan writes or prints: the `--out` document, the
+/// terminal, the `--json` ladder, the unknown-surface report and the
+/// spec-authoring queue.
+#[test]
+fn no_scan_output_carries_a_literal_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = "hunter2s3cr3t";
+    let db = dir.path().join("app/db.py");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let source = format!(
+        "import psycopg2\n\ndef f():\n    psycopg2.connect(\"postgresql://u:{secret}@db/app\", password='{secret}')\n"
+    );
+    std::fs::write(&db, &source).unwrap();
+    let packet = serde_json::json!({
+        "snapshot_id": "fixture",
+        "file_path": db.to_str().unwrap(),
+        "line_number": 4,
+        "func": "connect",
+        "client_type": "psycopg2",
+        "lang": "python",
+        "snippet": source.lines().nth(3).unwrap().trim(),
+        "enclosing_function_body": source,
+        "const_args": [
+            {"index": 0, "value": format!("\"postgresql://u:{secret}@db/app\""), "how": "literal"},
+            {"index": 1, "name": "password", "value": format!("'{secret}'"), "how": "literal"}
+        ]
+    });
+    let packets = dir.path().join("retrieved.jsonl");
+    std::fs::write(&packets, format!("{packet}\n")).unwrap();
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    let out_path = dir.path().join("scan.json");
+    let run = |args: &[&str]| {
+        let out = bin()
+            .args(args)
+            .arg("--retrieved")
+            .arg(&packets)
+            .arg("--specs-file")
+            .arg(&specs)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .expect("failed to run rvl");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let printed = [
+        run(&["scan", "--out", out_path.to_str().unwrap()]),
+        run(&["scan", "--format", "json"]),
+        run(&["report", "--json"]),
+        run(&["report", "--queue", "--json"]),
+    ];
+    let doc = std::fs::read_to_string(&out_path).unwrap();
+    for text in printed.iter().chain([&doc]) {
+        assert!(!text.contains(secret), "a credential was written: {text}");
+    }
+}

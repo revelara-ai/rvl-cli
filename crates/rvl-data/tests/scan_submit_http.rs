@@ -196,6 +196,28 @@ fn happy_path_posts_scan_and_parses_response() {
     );
 }
 
+/// A finding that quotes a literal credential is sent without it.
+#[test]
+fn a_finding_never_sends_a_literal_credential() {
+    let server = MockServer::start(vec![(200, vec![], HAPPY_RESPONSE)]);
+    let mut req = request_fixture();
+    req.findings = Some(vec![json!({
+        "title": "Database pool has no timeout",
+        "evidence": [{"file": "db.go", "line": 3,
+                      "snippet": "sql.Open(\"postgres\", \"postgres://u:hunter2@db/app\")"}],
+        "description": "connect(host='h', password='hunter2')",
+        "context": {"password": "hunter2", "dsn": "Server=h;Password=hunter2;"}
+    })]);
+    submit_scan(&server.client(), &mut req, Duration::from_secs(5)).expect("2xx");
+    let body = String::from_utf8(server.recorded()[0].body.clone()).unwrap();
+    assert!(!body.contains("hunter2"), "{body}");
+    let sent: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        sent["findings"][0]["evidence"][0]["snippet"],
+        r#"sql.Open("postgres", "postgres://u:<redacted>@db/app")"#
+    );
+}
+
 #[test]
 fn rate_limit_retries_once_honoring_retry_after() {
     let server = MockServer::start(vec![

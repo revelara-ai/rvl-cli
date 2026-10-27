@@ -1500,6 +1500,7 @@ name = "rvl-core"
 version = "1.8.0"
 dependencies = [
  "anyhow",
+ "regex",
  "serde",
  "serde_json",
 ]

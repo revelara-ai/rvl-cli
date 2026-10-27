@@ -1035,7 +1035,30 @@ fn decode_server_error(body: &[u8]) -> (String, String) {
     (String::from_utf8_lossy(body).into_owned(), String::new())
 }
 
+/// Redact the credential values in a finding before it is sent: a finding
+/// quotes code (a snippet, a DSN, a `password=` argument), and the risk
+/// register stores what it is sent. A string under a credential-named key is
+/// redacted whole.
+fn redact_credentials(key: Option<&str>, v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            *s = match key {
+                Some(k) => rvl_core::redact::redact_setting(k, s),
+                None => rvl_core::redact::redact(s).into_owned(),
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|v| redact_credentials(None, v)),
+        Value::Object(o) => o
+            .iter_mut()
+            .for_each(|(k, v)| redact_credentials(Some(k), v)),
+        _ => {}
+    }
+}
+
 /// POST the scan request to `{api_url}/api/v1/risks/scan`.
+///
+/// Credential values in the findings are redacted first (see
+/// [`redact_credentials`]).
 ///
 /// Honors Retry-After on a 429 by retrying once after the declared delay
 /// (capped at 120s, default 60s). 401/403 get a distinct actionable
@@ -1058,6 +1081,9 @@ pub fn submit_scan(
         timeout
     };
 
+    for f in req.findings.iter_mut().flatten() {
+        redact_credentials(None, f);
+    }
     if req.idempotency_key.is_empty() {
         req.idempotency_key = derive_idempotency_key(req);
     }

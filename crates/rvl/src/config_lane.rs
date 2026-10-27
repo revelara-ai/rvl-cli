@@ -150,10 +150,13 @@ fn run_capped(
             line: p.line,
             resource: p.unit.clone(),
             key: p.key.clone(),
-            value: p.resolved_value.as_deref().map(bounded_value),
+            value: p
+                .resolved_value
+                .as_deref()
+                .map(|v| bounded_value(&rvl_core::redact::redact_setting(&p.key, v))),
             verdict: f.verdict.as_str(),
             control: f.control.clone(),
-            rule: bounded_value(rule_phrase(&f.reason)),
+            rule: bounded_value(&rvl_core::redact::redact(rule_phrase(&f.reason))),
         });
         let counts = coverage
             .by_key
@@ -673,6 +676,31 @@ mod tests {
         let cut = bounded_value(&long);
         assert_eq!(cut.chars().count(), CONFIG_VALUE_MAX_CHARS + 1);
         assert!(cut.ends_with('\u{2026}'), "{cut}");
+    }
+
+    /// A `config_sites` row rides the `--out` document, which is uploaded: a
+    /// credential in a setting's value must not ride with it.
+    #[test]
+    fn a_config_site_row_never_carries_a_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.tf"),
+            "module \"vpc\" {\n  source  = \"git::https://u:hunter2@example.com/vpc.git\"\n}\n",
+        )
+        .unwrap();
+        let out = run(dir.path(), &specs("high"), "snap");
+        let row = out
+            .sites
+            .rows
+            .iter()
+            .find(|r| r.key == "module.source")
+            .expect("a module.source row");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("git::https://u:<redacted>@example.com/vpc.git")
+        );
+        let json = serde_json::to_string(&out.sites.rows).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
     }
 
     #[test]
