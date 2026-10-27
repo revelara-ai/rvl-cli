@@ -77,6 +77,9 @@ pub struct ControlEntry {
     pub control: String,
     pub precision: Option<f64>,
     pub ece: Option<f64>,
+    /// The class families the model decides this control for, when the
+    /// manifest lists them; `None` serves every class.
+    pub served_classes: Option<Vec<String>>,
 }
 
 /// A listed control: an object, or the bare control code.
@@ -90,6 +93,8 @@ enum RawControl {
         precision: Option<f64>,
         #[serde(default)]
         ece: Option<f64>,
+        #[serde(default)]
+        served_classes: Option<Vec<String>>,
     },
 }
 
@@ -100,15 +105,18 @@ impl From<RawControl> for ControlEntry {
                 control,
                 precision: None,
                 ece: None,
+                served_classes: None,
             },
             RawControl::Entry {
                 control,
                 precision,
                 ece,
+                served_classes,
             } => ControlEntry {
                 control,
                 precision,
                 ece,
+                served_classes,
             },
         }
     }
@@ -159,6 +167,21 @@ impl ModelManifest {
         self.served_controls.iter().any(|c| c.control == control)
     }
 
+    /// Whether the model decides `control` for a site of `class`: the control
+    /// is served, and its `served_classes`, when listed, hold the class's
+    /// family. A listed entry may be a family or a class of it.
+    pub fn serves_class(&self, control: &str, class: &str) -> bool {
+        self.served_controls
+            .iter()
+            .filter(|c| c.control == control)
+            .any(|c| match &c.served_classes {
+                None => true,
+                Some(listed) => listed
+                    .iter()
+                    .any(|l| class_family(l) == class_family(class)),
+            })
+    }
+
     fn check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.model_id.trim().is_empty(), "model_id is empty");
         anyhow::ensure!(
@@ -199,6 +222,18 @@ impl ModelManifest {
             "the bundle lists no {TOKENIZER_FILE}"
         );
         Ok(())
+    }
+}
+
+/// The family of a class, as the model's training groups it: its package.
+/// `net/http.Client.Do` is `net/http`; a Go import path keeps its dots
+/// before the last slash, so `github.com/redis/go-redis/v9.Client.Get` is
+/// `github.com/redis/go-redis/v9`.
+pub fn class_family(class: &str) -> &str {
+    let tail_at = class.rfind('/').map_or(0, |i| i + 1);
+    match class[tail_at..].find('.') {
+        Some(dot) => &class[..tail_at + dot],
+        None => class,
     }
 }
 
@@ -521,6 +556,30 @@ mod tests {
         assert!(m.serves("RC-019") && !m.serves("RC-022"));
         assert_eq!(m.withheld_controls[0].control, "RC-022");
         assert_eq!(m.model_file().name, "model.int8.onnx");
+    }
+
+    #[test]
+    fn a_control_with_served_classes_serves_only_their_families() {
+        let files = format!(
+            r#"[{{"name":"m.onnx","sha256":"{SHA}"}},{{"name":"tokenizer.json","sha256":"{SHA}"}}]"#
+        );
+        let served = r#"[{"control":"RC-019"},
+            {"control":"RC-022","served_classes":["net/http","requests.get"]}]"#;
+        let text = manifest(&files, "").replace(
+            r#"[{"control":"RC-019","precision":0.9,"ece":0.01}]"#,
+            served,
+        );
+        let m = ModelManifest::parse(text.as_bytes()).unwrap();
+        let redis = "github.com/redis/go-redis/v9.Client.Get";
+        assert_eq!(class_family(redis), "github.com/redis/go-redis/v9");
+        assert!(!m.serves_class("RC-022", redis), "a class not listed");
+        assert!(m.serves_class("RC-022", "net/http.Client.Do"));
+        assert!(m.serves_class("RC-022", "requests.post"), "same family");
+        assert!(
+            m.serves_class("RC-019", redis),
+            "no list serves every class"
+        );
+        assert!(!m.serves_class("RC-030", "net/http.Client.Do"));
     }
 
     #[test]
