@@ -1435,6 +1435,119 @@ def collect_unsized(tree, source, idx, enclosing, file_path, snapshot):
 
 
 # ---------------------------------------------------------------------------
+# Constructions that are call sites.
+#
+# A broken cipher mode, a hash used for integrity, a TLS context that skips
+# verification and a database opened with a credential violate at the line
+# that builds them; the request or query that later uses the value shows none
+# of it. These are classic call sites (no site_kind). Like STRONG_IO_METHODS
+# the tables select what to surface, never what it means: whether md5 here
+# guards integrity is judged downstream.
+# ---------------------------------------------------------------------------
+
+# Dotted callee, resolved through the imports. The client type is the module
+# and the method the last name: `hashlib.md5` is client type `hashlib`.
+_CONSTRUCTION_CALLS = frozenset({
+    "ssl._create_unverified_context",
+    "hashlib.md5",
+    "hashlib.sha1",
+    "cryptography.hazmat.primitives.ciphers.modes.ECB",
+    "Crypto.Cipher.DES.new",
+    "Crypto.Cipher.DES3.new",
+    "Cryptodome.Cipher.DES.new",
+    "Cryptodome.Cipher.DES3.new",
+    "httpx.Client",
+    "httpx.AsyncClient",
+    "psycopg.connect",
+    "psycopg2.connect",
+    "sqlalchemy.create_engine",
+})
+
+# Dotted names whose mere reference is the setting: `cert_reqs=ssl.CERT_NONE`,
+# `ctx.verify_mode = ssl.CERT_NONE`.
+_CONSTRUCTION_REFERENCES = frozenset({"ssl.CERT_NONE"})
+
+# Attribute assignments that are the setting, with the type the attribute
+# belongs to: `ctx.check_hostname = False`.
+_CONSTRUCTION_ATTRIBUTES = {"check_hostname": "ssl.SSLContext"}
+
+
+def collect_constructions(tree, source, idx, enclosing, file_path, snapshot,
+                          emitted):
+    """Return (record, enclosing function node) for each construction site in
+    the file. `emitted` holds the ids of the call nodes the I/O walk already
+    made sites of (`psycopg2.connect` on a resolved module), so no call is a
+    site twice."""
+    found = []  # (node, dotted client type.method, call or None, receiver, value)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if id(node) in emitted:
+                continue
+            dotted = idx.resolve_ctor(node.func)
+            if dotted in _CONSTRUCTION_CALLS:
+                found.append((node, dotted, node, "", None))
+        elif isinstance(node, (ast.Attribute, ast.Name)) and \
+                isinstance(node.ctx, ast.Load):
+            dotted = idx.resolve_ctor(node)
+            if dotted in _CONSTRUCTION_REFERENCES:
+                found.append((node, dotted, None, "", None))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and \
+                        target.attr in _CONSTRUCTION_ATTRIBUTES:
+                    dotted = _CONSTRUCTION_ATTRIBUTES[target.attr] + "." + \
+                        target.attr
+                    found.append((node, dotted, None,
+                                  expr_to_str(target.value), node.value))
+
+    out = []
+    for node, dotted, call, receiver, value in found:
+        client_type, method = dotted.rsplit(".", 1)
+        func_name, func_node = enclosing.get(id(node), ("", None))
+        if call is not None:
+            const_args = _const_args(call, idx)
+        elif value is not None:
+            const_args = [_bound_observation(0, method, value, source, idx)]
+        else:
+            const_args = []
+        out.append(({
+            "packet_schema": PACKET_SCHEMA,
+            "site_key": "",
+            "snapshot_id": snapshot,
+            "file_path": file_path,
+            "line_number": node.lineno,
+            "symbol": func_name,
+            "func": method,
+            "receiver": receiver,
+            "client_type": client_type,
+            "snippet": _segment(source, node),
+            "enclosing_function_body":
+                _segment(source, func_node) if func_node is not None else "",
+            "callers": [],
+            "callees": [],
+            "client_construction": [],
+            "const_args": const_args,
+            "macro_expansion": False,
+            "site_kind": "",
+            "provenance": {
+                # The type is the table's: an attribute assignment names no
+                # receiver type the imports prove.
+                "client_type_resolved": not receiver,
+                "callers_total": 0,
+                "callers_included": 0,
+                "callees_total": 0,
+                "callees_included": 0,
+                "ancestry_depth_searched": 0,
+                "chain_roots": [],
+                "hit_depth_cap": False,
+                "hit_caller_budget": False,
+            },
+            "lang": "python",
+        }, func_node))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Call graph (po-cafdn.3): callers, callees and chain roots.
 #
 # goindex resolves a call through the type checker. Python has none, so an
@@ -2136,6 +2249,7 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
     enclosing = _enclosing_functions(tree)
 
     out = []
+    sites_at = []  # the call nodes the I/O walk makes sites of
     # G2 pre-pass: decorator registrations. @app.route("/x") / @api.get("/y")
     # attach the route to the DECORATED handler, so the record's symbol is the
     # handler and its enclosing body is the handler's source. Registered
@@ -2200,6 +2314,7 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
         constructions = idx.constructions_for(
             recv, recv_str, client_type, func_node)
 
+        sites_at.append(node)
         record = {
             "packet_schema": PACKET_SCHEMA,
             # site_key stamped below in emit(); kept identical to goindex's siteKey
@@ -2247,6 +2362,14 @@ def retrieve_file(abs_path, file_path, snapshot, graph):
         owner = _framework_owner(recv)
         if summary is not None and owner is not None:
             graph.wants_framework(record, summary, owner, recv.attr, fn)
+    emitted = {id(n) for n in sites_at}
+    for record, func_node in collect_constructions(
+            tree, source, idx, enclosing, file_path, snapshot, emitted):
+        out.append(record)
+        if summary is not None and func_node is not None:
+            fn = summary.by_pos.get((func_node.lineno, func_node.col_offset))
+            if fn is not None:
+                graph.wants(record, fn)
     out.extend(_job_decorator_records(tree, idx, source, file_path, snapshot))
     # G4 emission inventory rides the same stream (po-av01j.5).
     swallowed = set()

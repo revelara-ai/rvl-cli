@@ -779,6 +779,67 @@ class TestUnsizedConstructionPackets(unittest.TestCase):
         self.assertNotIn("not_a_construction", self._by_symbol())
 
 
+class TestConstructionSites(unittest.TestCase):
+    """A construction whose arguments are the security setting is a classic
+    call site (no site_kind): a cipher mode, a hash, a TLS context setting, a
+    database opened with a credential. The request or query that later uses
+    the value does not show it."""
+
+    ROOT = os.path.join(HERE, "testdata", "fixture_constructions")
+
+    def _by_symbol(self):
+        code, out, err = _run("--retrieve", "--root", self.ROOT)
+        self.assertEqual(code, 0, err)
+        sites, _ = _parse_stream(out)
+        out = {}
+        for r in sites:
+            if r.get("site_kind") == "":
+                out.setdefault(r["symbol"], []).append(
+                    (r["client_type"] + "." + r["func"], r))
+        return out
+
+    def _classes(self, symbol):
+        return sorted(c for c, _ in self._by_symbol().get(symbol, []))
+
+    def test_tls_settings_are_sites(self):
+        sites = dict(self._by_symbol()["insecure_context"])
+        self.assertEqual(sorted(sites),
+                         ["ssl.CERT_NONE", "ssl.SSLContext.check_hostname"])
+        check = sites["ssl.SSLContext.check_hostname"]
+        self.assertEqual(check["receiver"], "ctx")
+        self.assertEqual(check["const_args"], [
+            {"index": 0, "name": "check_hostname", "value": "False",
+             "how": "literal"}])
+        self.assertFalse(check["provenance"]["client_type_resolved"],
+                         "the receiver's type is the table's, not proven")
+        self.assertEqual(check["site_key"], "{}:{}:ssl.SSLContext:check_hostname"
+                         .format(check["file_path"], check["line_number"]))
+        self.assertEqual(self._classes("unverified"),
+                         ["ssl._create_unverified_context"])
+
+    def test_crypto_constructions_are_sites_of_their_module(self):
+        self.assertEqual(self._classes("digest"), ["hashlib.md5"])
+        self.assertEqual(self._classes("ecb"),
+                         ["cryptography.hazmat.primitives.ciphers.modes.ECB"])
+
+    def test_client_and_database_constructions_carry_their_arguments(self):
+        (cls, rec), = self._by_symbol()["client"]
+        self.assertEqual(cls, "httpx.Client")
+        self.assertIn({"index": 0, "name": "verify", "value": "False",
+                       "how": "literal"}, rec["const_args"])
+        (cls, rec), = self._by_symbol()["engine"]
+        self.assertEqual(cls, "sqlalchemy.create_engine")
+        self.assertEqual(rec["const_args"][0]["value"],
+                         "'postgresql://app:hunter2@db/app'")
+
+    def test_a_connect_is_one_site_however_it_is_imported(self):
+        self.assertEqual(self._classes("module_connect"), ["psycopg2.connect"])
+        self.assertEqual(self._classes("imported_connect"), ["psycopg2.connect"])
+
+    def test_an_unresolved_lookalike_is_never_guessed(self):
+        self.assertNotIn("not_a_construction", self._by_symbol())
+
+
 TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")
 
 # Every test-convention file in the fixture; each carries one requests.get

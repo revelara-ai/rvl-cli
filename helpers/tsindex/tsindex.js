@@ -1788,6 +1788,11 @@ function runRetrieve(root, snapshot, filesArg, includeTests) {
 
     const visit = (node) => {
       if (ts.isCatchClause(node)) catchClauses.push(node);
+      // A construction is checked on every node: it is a call, a `new`, an
+      // options property or an assignment, and none of them is otherwise a
+      // site (a builtin receiver never resolves for the I/O walk).
+      const construction = constructionSite(node, sf, relPath, snapshot, checker, program);
+      if (construction) records.push(construction);
       if (ts.isExpressionStatement(node)) {
         const fl = floatingCall(node, program, checker);
         if (fl) noteMisuse(fl.call, 'missing_await', fl.identity, fl.method);
@@ -2237,6 +2242,163 @@ function unsizedSiteFromNew(node, sf, relPath, snapshot, checker, program) {
     provenance: {
       client_type_resolved: true,
       confidence_tier: res.tier,
+      callers_total: 0,
+      callers_included: 0,
+      callees_total: 0,
+      callees_included: 0,
+    },
+    lang: 'typescript',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Constructions that are call sites.
+//
+// A weak hash or cipher, a TLS option that skips verification and a database
+// client built with a credential violate at the line that builds them; the
+// request or query that later uses the value shows none of it. These are
+// classic call sites (no site_kind). Like the I/O-method allowlists the tables
+// select what to surface, never what it means.
+// ---------------------------------------------------------------------------
+
+// Node builtin module -> function -> the algorithms (first argument) selected.
+// A non-literal algorithm is selected too: what it names is unknown.
+const CONSTRUCTION_BUILTIN_CALLS = new Map([
+  ['crypto', new Map([
+    ['createHash', (alg) => /^(md5|sha1)$/i.test(alg)],
+    ['createCipheriv', (alg) => /^(des|rc4)|-ecb$/i.test(alg)],
+    ['createDecipheriv', (alg) => /^(des|rc4)|-ecb$/i.test(alg)],
+  ])],
+]);
+
+// Constructed `<pkg>.<Type>` whose options carry the credential.
+const CONSTRUCTION_NEW_TYPES = new Set(['pg.Pool', 'pg.Client']);
+
+// An options property that is the setting, with the type it belongs to.
+const CONSTRUCTION_PROPERTIES = new Map([['rejectUnauthorized', 'tls.ConnectionOptions']]);
+
+// builtinBinding names the Node builtin an identifier is imported from, and
+// under what name: `crypto` in `import * as crypto from 'node:crypto'` or
+// `const crypto = require('crypto')` is {mod: 'crypto', name: ''};
+// `createHash` in `import { createHash } from 'crypto'` is
+// {mod: 'crypto', name: 'createHash'}. Builtins are never attributed as a
+// package (externalPackageOf), so this table is the only place they resolve.
+function builtinBinding(id, checker) {
+  const sym = symbolAt(id, checker);
+  for (const decl of (sym && sym.declarations) || []) {
+    let spec = null;
+    let name = '';
+    if (ts.isVariableDeclaration(decl) && decl.initializer && ts.isCallExpression(decl.initializer)) {
+      const call = decl.initializer;
+      if (ts.isIdentifier(call.expression) && call.expression.text === 'require' &&
+          call.arguments.length === 1 && ts.isStringLiteral(call.arguments[0])) {
+        spec = call.arguments[0].text;
+      }
+    } else if (ts.isImportSpecifier(decl)) {
+      spec = moduleSpecifierOf(decl.parent.parent.parent);
+      spec = spec && spec.text;
+      name = (decl.propertyName || decl.name).text;
+    } else if (ts.isImportClause(decl) || ts.isNamespaceImport(decl)) {
+      const imp = ts.isImportClause(decl) ? decl.parent : decl.parent.parent;
+      spec = imp.moduleSpecifier && ts.isStringLiteral(imp.moduleSpecifier) ? imp.moduleSpecifier.text : null;
+    }
+    if (!spec) continue;
+    const mod = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
+    if (CONSTRUCTION_BUILTIN_CALLS.has(mod)) return { mod, name };
+  }
+  return null;
+}
+
+// builtinConstruction returns [module, function] when a call is in
+// CONSTRUCTION_BUILTIN_CALLS and its algorithm is selected, else null.
+function builtinConstruction(node, checker) {
+  const callee = node.expression;
+  let bind = null;
+  let fn = '';
+  if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
+    bind = builtinBinding(callee.expression, checker);
+    fn = callee.name.text;
+  } else if (ts.isIdentifier(callee)) {
+    bind = builtinBinding(callee, checker);
+    fn = bind ? bind.name : '';
+  }
+  if (!bind || (bind.name && bind.name !== fn)) return null;
+  const select = CONSTRUCTION_BUILTIN_CALLS.get(bind.mod).get(fn);
+  if (!select) return null;
+  const alg = node.arguments[0];
+  if (alg && ts.isStringLiteralLike(alg) && !select(alg.text)) return null;
+  return [bind.mod, fn];
+}
+
+// constructionSite returns the call-site record for a node that is a
+// construction (a selected builtin call, a `new` of a selected type, a
+// selected options property, an assignment to NODE_TLS_REJECT_UNAUTHORIZED),
+// or null.
+function constructionSite(node, sf, relPath, snapshot, checker, program) {
+  let clientType = '';
+  let method = '';
+  let receiver = '';
+  let constArgs = [];
+  let resolved = true;
+  let tier = 'medium';
+  let version = '';
+  if (ts.isCallExpression(node)) {
+    const hit = builtinConstruction(node, checker);
+    if (!hit) return null;
+    [clientType, method] = hit;
+    constArgs = constArgsOf(node, checker);
+  } else if (ts.isNewExpression(node)) {
+    const res = resolveClientType(node, checker, program);
+    if (!res.resolved || !CONSTRUCTION_NEW_TYPES.has(res.clientType)) return null;
+    ({ clientType, tier, version } = res);
+    method = 'constructor';
+    constArgs = boundConstArgs('', node, checker).slice(1);
+  } else if (ts.isPropertyAssignment(node)) {
+    method = propertyName(node);
+    if (!CONSTRUCTION_PROPERTIES.has(method)) return null;
+    clientType = CONSTRUCTION_PROPERTIES.get(method);
+    constArgs = [boundObservation(0, method, node.initializer, checker)];
+    // The type is the table's: an options literal names no type syntax proves.
+    resolved = false;
+    tier = 'low';
+  } else if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isPropertyAccessExpression(node.left) &&
+    node.left.name.text === 'NODE_TLS_REJECT_UNAUTHORIZED' &&
+    node.left.expression.getText() === 'process.env'
+  ) {
+    clientType = 'process.env';
+    method = 'NODE_TLS_REJECT_UNAUTHORIZED';
+    receiver = 'process.env';
+    constArgs = [boundObservation(0, method, node.right, checker)];
+  } else {
+    return null;
+  }
+  const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+  const enc = enclosingFunction(node);
+  return {
+    packet_schema: PACKET_SCHEMA,
+    site_key: '', // stamped in emit()
+    snapshot_id: snapshot,
+    file_path: relPath,
+    line_number: line + 1,
+    symbol: enc.name,
+    func: method,
+    receiver,
+    client_type: clientType,
+    client_version: version,
+    snippet: cap(node.getText()),
+    enclosing_function_body: enc.node ? cap(enc.node.getText()) : '',
+    callers: [],
+    callees: [],
+    const_args: constArgs,
+    macro_expansion: false,
+    site_kind: '',
+    client_construction: [],
+    provenance: {
+      client_type_resolved: resolved,
+      confidence_tier: tier,
       callers_total: 0,
       callers_included: 0,
       callees_total: 0,

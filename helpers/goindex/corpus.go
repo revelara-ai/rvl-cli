@@ -7,6 +7,8 @@
 // extractor_corpus.json beside a known_unretrieved list, and the retrieval
 // census counts what the tables leave out. reader_calls is the third
 // retrieval table: package functions that read from a reader (io.ReadAll).
+// construction_calls and construction_fields select the crypto, TLS and
+// database constructions retrieved as call sites (construction.go).
 package main
 
 import (
@@ -40,11 +42,13 @@ type readerCall struct {
 }
 
 type extractorCorpus struct {
-	IOMethods          []string           `json:"io_methods"`
-	ReaderCalls        []readerCall       `json:"reader_calls"`
-	EmissionFrameworks []frameworkEntry   `json:"emission_frameworks"`
-	KnownUnretrieved   []unretrievedEntry `json:"known_unretrieved"`
-	BoundConstructors  []boundConstructor `json:"bound_constructors"`
+	IOMethods          []string            `json:"io_methods"`
+	ReaderCalls        []readerCall        `json:"reader_calls"`
+	EmissionFrameworks []frameworkEntry    `json:"emission_frameworks"`
+	KnownUnretrieved   []unretrievedEntry  `json:"known_unretrieved"`
+	BoundConstructors  []boundConstructor  `json:"bound_constructors"`
+	ConstructionCalls  []constructionCall  `json:"construction_calls"`
+	ConstructionFields []constructionField `json:"construction_fields"`
 }
 
 // parseExtractorCorpus is strict: a malformed table would change what is
@@ -74,12 +78,24 @@ func parseExtractorCorpus(raw []byte) (extractorCorpus, error) {
 		}
 		readers[r] = true
 	}
+	constructions := map[constructionCall]bool{}
+	for _, k := range c.ConstructionCalls {
+		if k.Package == "" || k.Func == "" {
+			return c, fmt.Errorf("extractor corpus: bad construction_calls entry %+v", k)
+		}
+		constructions[k] = true
+	}
+	for _, k := range c.ConstructionFields {
+		if k.Type == "" || k.Field == "" {
+			return c, fmt.Errorf("extractor corpus: bad construction_fields entry %+v", k)
+		}
+	}
 	for _, u := range c.KnownUnretrieved {
 		if u.Package == "" || u.Func == "" {
 			return c, fmt.Errorf("extractor corpus: bad known_unretrieved entry %+v", u)
 		}
-		if readers[readerCall{u.Package, u.Func}] {
-			return c, fmt.Errorf("extractor corpus: %s.%s is in reader_calls and known_unretrieved",
+		if readers[readerCall{u.Package, u.Func}] || constructions[constructionCall{u.Package, u.Func}] {
+			return c, fmt.Errorf("extractor corpus: %s.%s is retrieved and in known_unretrieved",
 				u.Package, u.Func)
 		}
 		// A surface cannot be both retrieved and counted as missed.

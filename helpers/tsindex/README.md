@@ -178,6 +178,18 @@ traced back to that variable, so its fields are missed. (In twenty, the
 for this reason, but the same `query_timeout` fact is still retrieved from the
 inline-literal `new GlobalWorkspaceDataSource({... extra: { query_timeout }})`.)
 
+## Constructions that are call sites
+
+A crypto, TLS or database construction whose arguments are the security
+setting is a call site too, with no `site_kind`: `crypto.createHash('md5')`,
+`crypto.createCipheriv('des-ede3-cbc', ...)`, `new Pool({...})` and
+`new Client({...})` of `pg` (`func` `constructor`), a `rejectUnauthorized`
+property and an assignment to `process.env.NODE_TLS_REJECT_UNAUTHORIZED`.
+Node builtins resolve for this table only (`builtinBinding`); everywhere else
+they are not attributed to a package. The tables are `CONSTRUCTION_*` in
+`tsindex.js`; the list and the record shape are in "Constructions that are
+call sites" in `docs/retrievers.md`.
+
 ## Unsized constructions
 
 A `new` of a class that takes a bound when it is built is one packet with
