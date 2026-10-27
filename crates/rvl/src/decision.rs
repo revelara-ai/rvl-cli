@@ -125,6 +125,7 @@ pub fn enabled(repo_root: &Path) -> Option<rvl_model::ModelConfig> {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     cfg: &rvl_model::ModelConfig,
+    repo_root: &Path,
     cache_root: &Path,
     keyset: &rvl_cache::Keyset,
     findings: &[rvl_propagate::Finding],
@@ -163,7 +164,8 @@ pub fn run(
     };
     let mut budget_line = None;
     if !asks.is_empty() {
-        match infer(cfg, &cached.dir, m, &asks, budget, progress) {
+        let imports = imports_of(repo_root, &asks);
+        match infer(cfg, &cached.dir, m, &asks, &imports, budget, progress) {
             Ok((digest, decisions, line)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
@@ -257,6 +259,7 @@ fn infer(
     dir: &Path,
     m: &ModelManifest,
     asks: &[Ask],
+    imports: &Imports,
     budget: Duration,
     progress: &ProgressBar,
 ) -> anyhow::Result<(String, Vec<Decision>, Option<String>)> {
@@ -283,7 +286,7 @@ fn infer(
         ..Default::default()
     };
     let mut classifier = rvl_model::Classifier::new(runtime, bundle, opts)?;
-    let texts: Vec<String> = asks.iter().map(|a| input_of(a, layout)).collect();
+    let texts: Vec<String> = asks.iter().map(|a| input_of(a, imports, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     progress.set_message("Running the decision model");
     progress.set_position(0);
@@ -323,14 +326,34 @@ fn batch_hook<'a>(
     }
 }
 
-/// The model's input for one question.
-fn input_of(a: &Ask, layout: Layout) -> String {
-    render::render_input(&site_of(a), &question_of(a.frame), layout)
+/// The import block of each file asked about, by its path in the site.
+type Imports = std::collections::HashMap<String, String>;
+
+/// Each file is read once, however many questions its sites are asked. A
+/// file that cannot be read has no import block.
+fn imports_of(repo_root: &Path, asks: &[Ask]) -> Imports {
+    let mut out = Imports::new();
+    for a in asks {
+        let file = &a.site.file_path;
+        if !out.contains_key(file) {
+            let source = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
+            out.insert(file.clone(), render::imports_block(file, &source));
+        }
+    }
+    out
 }
 
-/// The model's input site, from what rvl retrieved.
-fn site_of(a: &Ask) -> render::Site {
+/// The model's input for one question.
+fn input_of(a: &Ask, imports: &Imports, layout: Layout) -> String {
+    render::render_input(&site_of(a, imports), &question_of(a.frame), layout)
+}
+
+/// The model's input site, from what rvl retrieved: the file's import
+/// block, and the retriever's first callee as the definition called at the
+/// site.
+fn site_of(a: &Ask, imports: &Imports) -> render::Site {
     let s = a.site;
+    let callee = s.callees.first();
     render::Site {
         class: a.class.clone(),
         scope: s.scope().as_str().to_string(),
@@ -338,6 +361,9 @@ fn site_of(a: &Ask) -> render::Site {
         file: s.file_path.clone(),
         site: format!("{}:{}", s.file_path, s.line_number),
         snippet: s.snippet.clone(),
+        imports: imports.get(&s.file_path).cloned().unwrap_or_default(),
+        callee_name: callee.map(|c| c.symbol.clone()).unwrap_or_default(),
+        callee_definition: callee.map(|c| c.source.clone()).unwrap_or_default(),
         packet: render::SitePacket::from(s),
         ..render::Site::default()
     }
@@ -701,12 +727,125 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let text = input_of(&a, layout);
+            let text = input_of(&a, &Imports::new(), layout);
             assert_eq!(text, g["text"].as_str().unwrap(), "{layout:?}");
             assert!(text.contains("\nControl: RC-022 Retry, Backoff and Request Coalescing\n"));
             checked += 1;
         }
         assert_eq!(checked, 2, "the golden under both layouts");
+    }
+
+    /// The served frame a golden's question text describes, read as the
+    /// training renderer reads it.
+    fn frame_of_text(control: &str, text: &str) -> Frame {
+        let after = |prefix: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap_or("")
+                .to_string()
+        };
+        let (version, question) = after(&format!("Question ({control}, "))
+            .split_once("): ")
+            .map(|(v, q)| (v.to_string(), q.to_string()))
+            .unwrap();
+        let cells: Vec<serde_json::Value> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("Cells of the "))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .map(|l| {
+                let (id, rest) = l.trim().split_once("  [").unwrap();
+                let (verdict, definition) = rest.split_once("] ").unwrap();
+                serde_json::json!({"id": id, "kind": "manifestation", "verdict": verdict, "definition": definition})
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "control": control, "version": version, "habitat": "call_site", "question": question,
+            "control_name": after(&format!("Control meaning: {control} - ")), "cells": cells,
+        }))
+        .unwrap()
+    }
+
+    /// A file whose import lines are the block's, each on its line, the
+    /// other lines code that imports nothing.
+    fn file_of_imports(block: &str) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for l in block.lines() {
+            let (n, text) = l.split_once(" | ").unwrap();
+            let n: usize = n.trim().parse().unwrap();
+            lines.resize(n - 1, "x = 1".into());
+            lines.push(text.into());
+        }
+        lines.push("x = 1".into());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn imports_and_the_callee_render_the_training_goldens_byte_for_byte() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rvl-model/testdata/render-goldens/render-goldens.jsonl"
+        );
+        let goldens = std::fs::read_to_string(path).unwrap();
+        let mut checked = [0usize; 3];
+        for line in goldens.lines().filter(|l| !l.trim().is_empty()) {
+            let g: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (row, sp) = (&g["input"]["row"], &g["input"]["site_packet"]);
+            let packet = &row["packet"];
+            let str_of = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+            // A frame row of a runtime site whose retriever packet is rvl's:
+            // what the lane asks.
+            if row["kind"] != "frame_question"
+                || row["scope"] != "runtime"
+                || sp["file_path"] != row["file"]
+                || !row["question"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Cells of the ")
+            {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let file = str_of(&row["file"]);
+            std::fs::create_dir_all(root.path().join(&file).parent().unwrap()).unwrap();
+            std::fs::write(
+                root.path().join(&file),
+                file_of_imports(&str_of(&packet["imports"])),
+            )
+            .unwrap();
+            let mut site: rvl_core::Site = serde_json::from_value(sp.clone()).unwrap();
+            site.snippet = str_of(&packet["snippet"]);
+            site.lang = str_of(&row["language"]);
+            if !str_of(&packet["callee_definition"]).is_empty() {
+                site.callees = vec![rvl_core::Snippet {
+                    file: file.clone(),
+                    line: 1,
+                    symbol: str_of(&packet["callee_name"]),
+                    source: str_of(&packet["callee_definition"]),
+                }];
+            }
+            let f = frame_of_text(&str_of(&row["control"]), &str_of(&row["question"]["text"]));
+            let a = Ask {
+                site: &site,
+                class: str_of(&row["class"]),
+                frame: &f,
+            };
+            let layout = match g["layout"].as_str().unwrap() {
+                "full" => Layout::Full,
+                _ => Layout::Compact,
+            };
+            let imports = imports_of(root.path(), std::slice::from_ref(&a));
+            let text = input_of(&a, &imports, layout);
+            assert_eq!(text, str_of(&g["text"]), "{} {layout:?}", row["id"]);
+            checked[0] += 1;
+            checked[1] += !str_of(&packet["imports"]).is_empty() as usize;
+            checked[2] += !site.callees.is_empty() as usize;
+        }
+        assert_eq!(
+            checked,
+            [54, 30, 26],
+            "goldens checked: all, with an import block, with a callee definition"
+        );
     }
 
     #[test]

@@ -128,6 +128,137 @@ impl From<&rvl_core::Site> for SitePacket {
     }
 }
 
+/// The import block of a file, in the training packets' form: each import
+/// line under its 1-based line number, `   3 | import (`, with the lines a
+/// statement continues onto (a Go `import (` block, a parenthesized Python
+/// import, a multi-line JavaScript `import {` or Rust `use`). Which lines
+/// import is read from the file name's suffix; a file of another language,
+/// or one with no import, gives the empty block, which renders
+/// `(none found)`. Uncapped, as the training renderer leaves it.
+pub fn imports_block(file: &str, source: &str) -> String {
+    let Some(syntax) = ImportSyntax::of(file) else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    let mut open: Option<&str> = None;
+    for (i, line) in source.lines().enumerate() {
+        let t = line.trim_start();
+        let closes = match open {
+            Some(close) => t.contains(close) || (close == "\\" && !t.ends_with('\\')),
+            None => match syntax.opens(t) {
+                None => continue,
+                Some(close) => {
+                    open = Some(close);
+                    close == "\\" && !t.ends_with('\\')
+                }
+            },
+        };
+        out.push(format!("{:>4} | {line}", i + 1));
+        if closes || open == Some("") {
+            open = None;
+        }
+    }
+    out.join("\n")
+}
+
+/// How a language writes an import statement.
+#[derive(Clone, Copy)]
+enum ImportSyntax {
+    Go,
+    Python,
+    JavaScript,
+    Jvm,
+    Rust,
+    CSharp,
+    Ruby,
+    Php,
+    C,
+}
+
+impl ImportSyntax {
+    fn of(file: &str) -> Option<ImportSyntax> {
+        let suffix = file.rfind('.').map(|d| file[d + 1..].to_lowercase())?;
+        Some(match suffix.as_str() {
+            "go" => ImportSyntax::Go,
+            "py" => ImportSyntax::Python,
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => ImportSyntax::JavaScript,
+            "java" | "kt" | "scala" => ImportSyntax::Jvm,
+            "rs" => ImportSyntax::Rust,
+            "cs" => ImportSyntax::CSharp,
+            "rb" => ImportSyntax::Ruby,
+            "php" => ImportSyntax::Php,
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => ImportSyntax::C,
+            _ => return None,
+        })
+    }
+
+    /// When `t`, a line without its indent, starts an import: what closes
+    /// the statement, `""` when the line itself does, `"\\"` when a line
+    /// that does not end in a backslash does.
+    fn opens(self, t: &str) -> Option<&'static str> {
+        let word = |w: &str| t.strip_prefix(w).filter(|r| r.starts_with([' ', '\t']));
+        let until = |close: &'static str, done: bool| Some(if done { "" } else { close });
+        match self {
+            ImportSyntax::Go => {
+                let rest = word("import")?.trim_start();
+                until(")", !rest.starts_with('('))
+            }
+            ImportSyntax::Python => {
+                let rest =
+                    word("import").or_else(|| word("from").filter(|r| r.contains(" import")))?;
+                if rest.ends_with('\\') {
+                    Some("\\")
+                } else {
+                    until(")", !rest.contains('(') || rest.contains(')'))
+                }
+            }
+            ImportSyntax::JavaScript => {
+                if let Some(rest) =
+                    word("import").or_else(|| word("export").filter(|r| r.contains("from")))
+                {
+                    until("from", rest.contains("from") || rest.contains(['\'', '"']))
+                } else if t.contains("require(") {
+                    until("", true)
+                } else {
+                    None
+                }
+            }
+            ImportSyntax::Jvm => word("import").and(until("", true)),
+            ImportSyntax::Rust => {
+                let rest = word("use")
+                    .or_else(|| word("pub").and_then(|r| r.trim_start().strip_prefix("use ")))
+                    .or_else(|| word("extern").filter(|r| r.trim_start().starts_with("crate ")))?;
+                until(";", rest.contains(';'))
+            }
+            ImportSyntax::CSharp => {
+                let rest = word("global").map_or(t, str::trim_start);
+                let rest = rest.strip_prefix("using").filter(|r| r.starts_with(' '))?;
+                (!rest.contains('(') && rest.trim_end().ends_with(';')).then_some("")
+            }
+            ImportSyntax::Ruby => ["require", "require_relative", "load"]
+                .into_iter()
+                .any(|w| word(w).is_some() || t.starts_with(&format!("{w}(")))
+                .then_some(""),
+            ImportSyntax::Php => {
+                if let Some(rest) = word("use") {
+                    until(";", rest.contains(';'))
+                } else {
+                    ["require", "require_once", "include", "include_once"]
+                        .into_iter()
+                        .any(|w| word(w).is_some() || t.starts_with(&format!("{w}(")))
+                        .then_some("")
+                }
+            }
+            ImportSyntax::C => t
+                .strip_prefix('#')
+                .is_some_and(|r| {
+                    r.trim_start().starts_with("include") || r.trim_start().starts_with("import")
+                })
+                .then_some(""),
+        }
+    }
+}
+
 /// The model's input for `site` asked `question`, laid out as `layout`.
 pub fn render_input(site: &Site, question: &Question, layout: Layout) -> String {
     let sp = &site.packet;
@@ -373,6 +504,57 @@ mod tests {
                 "Constant arguments: 1=5, timeout=3, =x".into()
             ]
         );
+    }
+
+    #[test]
+    fn an_import_block_is_each_import_line_under_its_number() {
+        let go = "package svc\n\nimport (\n\t\"context\"\n\t\"net/http\"\n)\n\nimport \"os\"\n\nfunc f() {}\n";
+        assert_eq!(
+            imports_block("svc/a.go", go),
+            "   3 | import (\n   4 | \t\"context\"\n   5 | \t\"net/http\"\n   6 | )\n   8 | import \"os\""
+        );
+        let py = "import requests\nfrom app import (\n    a,\n    b,\n)\nfrom x import \\\n    y\nx = 1\n    import json\n# from the start\n";
+        assert_eq!(
+            imports_block("app/c.py", py),
+            "   1 | import requests\n   2 | from app import (\n   3 |     a,\n   4 |     b,\n   5 | )\n\
+             \x20  6 | from x import \\\n   7 |     y\n   9 |     import json"
+        );
+        let ts = "import {\n  a,\n} from \"x\";\nimport \"y\";\nconst z = require('z');\nexport { q } from './q';\nconst n = 1;\n";
+        assert_eq!(
+            imports_block("web/a.ts", ts),
+            "   1 | import {\n   2 |   a,\n   3 | } from \"x\";\n   4 | import \"y\";\n\
+             \x20  5 | const z = require('z');\n   6 | export { q } from './q';"
+        );
+        let rs = "use std::{\n    fs,\n};\npub use a::b;\nfn main() { let used = 1; }\n";
+        assert_eq!(
+            imports_block("src/main.rs", rs),
+            "   1 | use std::{\n   2 |     fs,\n   3 | };\n   4 | pub use a::b;"
+        );
+        let cs = "using System.Net.Http;\nglobal using Foo;\nusing (var c = new HttpClient()) {}\n";
+        assert_eq!(
+            imports_block("A.cs", cs),
+            "   1 | using System.Net.Http;\n   2 | global using Foo;"
+        );
+        assert_eq!(
+            imports_block(
+                "A.java",
+                "package a;\nimport java.net.http.HttpClient;\nclass A {}\n"
+            ),
+            "   2 | import java.net.http.HttpClient;"
+        );
+        assert_eq!(
+            imports_block(
+                "a.c",
+                "#include <curl/curl.h>\n# include \"x.h\"\nint main() {}\n"
+            ),
+            "   1 | #include <curl/curl.h>\n   2 | # include \"x.h\""
+        );
+        assert_eq!(
+            imports_block("a.rb", "require 'net/http'\nputs 1\n"),
+            "   1 | require 'net/http'"
+        );
+        assert_eq!(imports_block("Makefile", "import x\n"), "");
+        assert_eq!(imports_block("a.go", "package a\n"), "");
     }
 
     #[test]
