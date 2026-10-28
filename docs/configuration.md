@@ -20,6 +20,7 @@ The keys this binary reads are:
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
 | `scanner.model_threads` | CPU threads for local model inference (default 4, at least 1). Verdicts do not depend on it; it trades scan time for CPU. |
 | `scanner.decision_model` | `on` runs the decision-model lane: after the deterministic lanes, each undecided call site is asked the question of every frame (from the spec cache) whose control the cached model serves, on this machine. `violates` decisions are advisory findings (`model.<control>`); other controls abstain and are named on the COVERAGE line. Off by default. Needs the bundle `rvl model sync` caches (an API key; `RVL_OFFLINE=1` uses the cached bundle). |
+| `scanner.decision_model_budget` | The longest the decision model may run in one scan (default `60s`; `90`, `150s`, `5m`, `1h`). Questions are asked site by site in scan order; the ones the budget does not reach abstain, and the COVERAGE line counts them and names the first file cut. Under a hook and `--changed-only` the budget is at most `60s`, whatever this says. A full scan of a large repository may need more: a scan that runs out says so. |
 
 Unknown keys are tolerated everywhere, so the same file can carry settings for
 other consumers.
