@@ -298,14 +298,49 @@ fn infer(
     )?;
     c.coverage.budget_ms = Some(budget.as_millis());
     let cells = classifier.cells();
-    let decisions = asks
+    let decisions: Vec<Decision> = asks
         .iter()
         .zip(&c.records)
         .map(|(a, r)| decide(a, r, cells))
         .collect();
+    if let Some(path) = std::env::var_os(INPUTS_ENV) {
+        if let Err(e) = write_inputs(Path::new(&path), &texts, &decisions) {
+            eprintln!("warning: {INPUTS_ENV}: {}: {e}", Path::new(&path).display());
+        }
+    }
     let mut lines: Vec<String> = c.coverage.line().into_iter().collect();
     lines.extend(cut_line(&asks[c.coverage.inferred..]));
     Ok((digest, decisions, lines))
+}
+
+/// The file the lane writes each question's input text to, when set: one
+/// JSON line per question, the text beside the decision it got (`off_cell`
+/// included), to diff against the training renderer's text for the same
+/// site. The file stays on this machine.
+pub const INPUTS_ENV: &str = "RVL_DECISION_MODEL_INPUTS";
+
+#[derive(Serialize)]
+struct InputRow<'a> {
+    #[serde(flatten)]
+    decision: &'a Decision,
+    off_cell: bool,
+    text: &'a str,
+}
+
+/// Write the [`INPUTS_ENV`] file.
+fn write_inputs(path: &Path, texts: &[String], decisions: &[Decision]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for (text, d) in texts.iter().zip(decisions) {
+        let row = InputRow {
+            decision: d,
+            off_cell: d.off_cell,
+            text,
+        };
+        serde_json::to_writer(&mut out, &row)?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
 }
 
 /// What a budget cut dropped: the questions are asked site by site in scan
@@ -650,6 +685,31 @@ mod tests {
 
         let d = decide(&ask(&site, &f), &record("violates", vec![]), None);
         assert_eq!(d.reason, "RC-022 violates, reason: not in this model");
+    }
+
+    #[test]
+    fn the_inputs_file_has_each_text_beside_its_decision() {
+        let site = rvl_core::Site {
+            file_path: "a.go".into(),
+            line_number: 7,
+            ..Default::default()
+        };
+        let f = frame(&[("M1", "manifestation"), ("S1", "satisfying")]);
+        let ids: Vec<String> = ["M1", "S1"].map(String::from).to_vec();
+        let off = decide(
+            &ask(&site, &f),
+            &record("violates", vec![0.0, 3.0]),
+            Some(&ids),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.jsonl");
+        write_inputs(&path, &["Class: a.B.C".into()], &[off]).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["site_id"], "a.go:7");
+        assert_eq!(row["verdict"], "abstain");
+        assert_eq!(row["off_cell"], true);
+        assert_eq!(row["text"], "Class: a.B.C");
     }
 
     #[test]
