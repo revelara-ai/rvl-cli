@@ -9,6 +9,24 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### Construction rules judge crypto, TLS and database call sites
+
+A `config_keys` spec with the format `construction` judges a construction
+call site against its control, without the decision model: a TLS config
+that skips verification, TLS below 1.2, a DES, RC4 or ECB cipher,
+`ssl.CERT_NONE`, `verify=False`, `rejectUnauthorized: false` (RC-059), and a
+literal password in a DSN or a password argument (RC-056). See
+"Construction rules" in `docs/retrievers.md`.
+
+- New: findings with the class `construction.<key>`, such as
+  `construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)`.
+  A rule with a severity of `high` blocks.
+- New: the config-key expectation `absent`, and the patterns
+  `no_literal_credential` and `no_weak_cipher`. An older `rvl` abstains on
+  a spec that uses them.
+- The rules arrive in the spec cache. Until it carries them, nothing
+  changes.
+
 ### The decision model runs each input at its own length, under a budget you set
 
 The decision model ran every input padded to the model's maximum length.

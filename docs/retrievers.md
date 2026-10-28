@@ -231,7 +231,8 @@ later uses it: a DES cipher, an MD5 hash used for integrity, a TLS config with
 `Client.Do` or `db.Query` that uses the value shows none of it. So the
 retrievers report these constructions as classic call sites, with no
 `site_kind`. Each one is a row in `--out` `.sites` and is counted in
-COVERAGE. Until a spec names its class, it abstains as `no spec`.
+COVERAGE. Until an `apis` spec names its class, it abstains as `no spec`
+there. A construction rule (below) judges the control.
 
 The retriever selects what to report. It does not judge it: the arguments go
 in `const_args`, and whether an MD5 guards integrity or keys a cache is decided
@@ -259,6 +260,38 @@ site, and `verify` is in its `const_args`.
 unsized constructions (below). The two packets have different site keys:
 the call site asks how the database is reached, the unsized packet how big
 the pool can grow.
+
+### Construction rules
+
+The deadline lane asks such a site only whether it blocks. Whether it
+violates a control is asked by a construction rule: a `config_keys` spec
+with the format `construction`, judged by the config lane's evaluator. Its
+key names what it judges:
+
+| Key | Judges | Example |
+| --- | --- | --- |
+| `<class>` | The construction itself, whatever its arguments | `crypto/des.NewCipher`, expect `absent` |
+| `<class>(<arg>)` | One argument, by its keyword or property name, else by position (`arg0`, `arg1`) | `requests.get(verify)`, expect `not_equals "False"`; `database/sql.Open(arg1)`, expect `pattern no_literal_credential` |
+
+A string argument is compared without its quotes. The `absent` expectation
+is violated by any occurrence. Two patterns are for these rules:
+`no_literal_credential` (no password in the value: values reach the rule
+redacted, so a literal credential is `<redacted>`) and `no_weak_cipher` (no
+DES, 3DES, RC4 or ECB cipher name).
+
+- A site or argument that no rule names is not judged. md5 and sha1 have no
+  rule: a hash can key a cache or guard integrity, which only its use shows.
+- An argument whose value is not a constant (`how` `name`) abstains.
+- Only runtime sites are judged. A test that skips verification against a
+  local server is the common case.
+
+A violation is a finding with the class `construction.<key>`
+(`construction.database/sql.Open(arg1)`) and the control and severity of the
+rule. A rule with a severity of `high` blocks. A rule with no severity is
+unjudged and never blocks. The site keeps its deadline verdict and its
+`.sites` row. The rules the spec producer is asked to publish, with a
+violating and an allowed case for each, are in
+`crates/rvl-config/testdata/construction_rules.json`.
 
 ## Unsized constructions
 

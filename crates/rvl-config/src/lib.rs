@@ -34,6 +34,7 @@ use std::path::Path;
 
 pub mod alertmanager;
 pub mod argo_flux;
+pub mod construction;
 pub mod dep_manifests;
 pub mod eval;
 pub mod github_actions;

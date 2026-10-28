@@ -2713,6 +2713,99 @@ fn scan_surfaces_misuse_shapes_and_keeps_them_out_of_g1_coverage() {
     assert_eq!(rows.len(), 1, "only G1 findings belong in --out: {rows:?}");
 }
 
+// --- construction rules (crypto, TLS and database constructions) ---
+
+/// A spec cache with the construction rules the spec producer is asked to
+/// publish, plus the deadline facts of the Go construction classes: each one
+/// is in-memory work (`sql.Open` dials nothing), so the deadline lane does
+/// not ask about it.
+fn construction_specs(dir: &std::path::Path) -> std::path::PathBuf {
+    let rules = manifest_dir().join("../rvl-config/testdata/construction_rules.json");
+    let mut specs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rules).unwrap()).unwrap();
+    let no = |t: &str, m: &str| {
+        serde_json::json!({"type": t, "method": m, "blocking": "no", "confidence": 0.95,
+                           "rationale": "builds a value in memory"})
+    };
+    specs["apis"] = serde_json::json!([
+        no("crypto/tls.Config", "InsecureSkipVerify"),
+        no("crypto/tls.Config", "MinVersion"),
+        no("crypto/des", "NewCipher"),
+        no("crypto/md5", "Sum"),
+        no("database/sql", "Open"),
+    ]);
+    let path = dir.join("specs.json");
+    std::fs::write(&path, specs.to_string()).unwrap();
+    path
+}
+
+/// Go, live end to end: goindex reports the construction fixture's TLS,
+/// cipher, hash and database constructions as call sites, and the
+/// construction rules judge them. Each violated rule is one blocking
+/// `construction.<key>` row under its control; the hash and the TLS field
+/// set from a variable are not findings; no output carries the password.
+#[test]
+fn live_go_scan_judges_construction_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(goindex_fixture().with_file_name("constructionfixture"))
+        .arg("--specs-file")
+        .arg(construction_specs(dir.path()))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_GOINDEX", &goindex_bin)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let doc = std::fs::read_to_string(&out_path).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a high rule blocks: {stdout}\n{stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+    let mut classes: Vec<(String, String)> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["class"].as_str().unwrap().starts_with("construction."))
+        .map(|f| {
+            (
+                f["class"].as_str().unwrap().to_string(),
+                f["control"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    classes.sort();
+    let want = [
+        ("construction.crypto/des.NewCipher", "RC-059"),
+        (
+            "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)",
+            "RC-059",
+        ),
+        (
+            "construction.crypto/tls.Config.MinVersion(MinVersion)",
+            "RC-059",
+        ),
+        ("construction.database/sql.Open(arg1)", "RC-056"),
+    ]
+    .map(|(c, r)| (c.to_string(), r.to_string()));
+    assert_eq!(classes, want, "{stdout}");
+    for text in [&stdout, &stderr, &doc] {
+        assert!(
+            !text.contains("hunter2"),
+            "a password reached the output: {text}"
+        );
+    }
+}
+
 /// The hand-authored SEED misuse-shape corpus (test-grade).
 fn misuse_seed_specs() -> std::path::PathBuf {
     manifest_dir()

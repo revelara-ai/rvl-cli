@@ -333,7 +333,9 @@ The orchestrator uses it to:
   vocabulary/structure lanes it keeps a fixed prefix (`server_entry.`,
   `emission.`, `unsized.`, `repo_structure.`, `config.`, `model.`). The server's precision arm
   (fleet FP evidence) attributes findings to specs through this field.
-  The misuse lane has the prefix `misuse.` (`misuse.discarded_error`).
+  The misuse lane has the prefix `misuse.` (`misuse.discarded_error`), and
+  the construction rules the prefix `construction.`
+  (`construction.database/sql.Open(arg1)`).
 - `findings[].factors` is the list of causal factor codes (`CF-0007`) of
   the row's `control`, read from the spec cache's `control_factors`
   section. It is `[]` when the row has no control, when the cache names

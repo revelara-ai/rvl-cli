@@ -102,7 +102,7 @@ fn class_rule(format: &str, key: &str) -> String {
 /// The rule phrase of a reason: the fixed vocabulary before any `:` detail,
 /// same convention as `rvl_triage::class_of` so detail never fragments a
 /// class.
-fn rule_phrase(reason: &str) -> &str {
+pub(crate) fn rule_phrase(reason: &str) -> &str {
     reason.split(':').next().unwrap_or(reason).trim()
 }
 
