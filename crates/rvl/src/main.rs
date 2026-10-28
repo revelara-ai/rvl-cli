@@ -1990,7 +1990,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
 /// Linux caps a SINGLE argv entry at MAX_ARG_STRLEN = 32 pages = 128 KiB,
 /// independently of ARG_MAX (2 MiB on a typical box). `--files` joins the whole
 /// changed set into one entry, so the binding limit is the per-argument one and
-/// ARG_MAX is a red herring: on apache/airflow the list is 7690 paths totalling
+/// ARG_MAX is a red herring: on example-org/example-repo the list is 7690 paths totalling
 /// ~1.46 MB, which fits ARG_MAX with room to spare and exceeds the real limit
 /// eleven times over. The spawn then fails before the helper runs, and because
 /// the incremental path is fail-open the scan reported a degraded result rather
@@ -10122,7 +10122,7 @@ mod tests {
 
     // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
     // independently of ARG_MAX. `--files` joins the whole changed set into one
-    // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
+    // entry, so on example-org/example-repo (7690 paths, ~1.46 MB) the spawn failed
     // before pyindex ran -- and because the incremental path is fail-open, the
     // scan reported a degraded result rather than an error anyone would chase.
     #[test]
