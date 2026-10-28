@@ -49,16 +49,18 @@ fn runtime(test: &str) -> Option<&'static Runtime> {
 }
 
 fn classifier(rt: &Runtime, threads: usize, batch_size: usize) -> Classifier {
-    let bundle = Bundle::load(&fixture_dir()).unwrap();
-    Classifier::new(
+    with_options(
         rt,
-        bundle,
         Options {
             threads,
             batch_size,
+            ..Options::default()
         },
     )
-    .unwrap()
+}
+
+fn with_options(rt: &Runtime, opts: Options) -> Classifier {
+    Classifier::new(rt, Bundle::load(&fixture_dir()).unwrap(), opts).unwrap()
 }
 
 const TEXTS: &[&str] = &[
@@ -130,6 +132,39 @@ fn a_record_does_not_depend_on_its_batch() {
         serde_json::to_string(&alone).unwrap(),
         serde_json::to_string(&batched.records).unwrap()
     );
+}
+
+#[test]
+fn own_length_and_fixed_padding_give_the_same_verdicts() {
+    let Some(rt) = runtime("own_length_and_fixed_padding_give_the_same_verdicts") else {
+        return;
+    };
+    // Past the fixture's 64 tokens, so truncation is exercised too.
+    let long = "the client call ".repeat(40) + "forever";
+    let mut texts = TEXTS.to_vec();
+    texts.push(&long);
+    let run = |fixed_padding| {
+        let opts = Options {
+            fixed_padding,
+            ..Options::default()
+        };
+        with_options(rt, opts)
+            .classify(&texts, Duration::from_secs(600))
+            .unwrap()
+    };
+    let (own, fixed) = (run(false), run(true));
+    assert_eq!(own.coverage.abstained, 0);
+    for (i, (a, b)) in own.records.iter().zip(&fixed.records).enumerate() {
+        assert_eq!(a.verdict, b.verdict, "{i}: {:?}", texts[i]);
+        for (x, y) in a.logits.iter().zip(&b.logits) {
+            assert!(
+                (x - y).abs() < 1e-4,
+                "{i}: {:?} vs {:?}",
+                a.logits,
+                b.logits
+            );
+        }
+    }
 }
 
 #[test]

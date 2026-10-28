@@ -1,7 +1,8 @@
 //! OpenCode lens-agent registration. OpenCode's tier-3 download is a skills
-//! directory, so the `/rvl:scan` lenses (`agents/<id>.md`, Claude Code
-//! agent files) never became OpenCode agents and the scan could not fan
-//! out. OpenCode reads agents from `~/.config/opencode/agents/<id>.md`
+//! directory, so the `/rvl:scan` lenses (Claude Code agent files, either
+//! `agents/<id>.md` or, in the skills-plus-agent-fallback layout, the agent
+//! skills `rvl-<id>/SKILL.md`) never became OpenCode agents and the scan
+//! could not fan out. OpenCode reads agents from `~/.config/opencode/agents/<id>.md`
 //! (OpenCode 1.18.33 or later is the supported floor), but its frontmatter
 //! is not Claude Code's: `tools:` is a map there, not a comma list, and
 //! `model:` must name a provider. A lens copied verbatim would fail
@@ -164,6 +165,76 @@ mod tests {
         let removed = h.remove(&home, Some(&content)).unwrap();
         assert_eq!(removed.files_removed, Some(5));
         assert!(!agents_dir.join("rvl-rust-pro.md").exists());
+    }
+
+    /// The skills-plus-agent-fallback layout the server gives OpenCode has
+    /// no `agents/` directory: skills are `<name>/SKILL.md` and each agent
+    /// is the skill `rvl-<id>/SKILL.md`. Those agent skills are the lenses,
+    /// so `rvl plugin agents opencode` lists each `rvl-<id>`.
+    #[test]
+    fn opencode_registers_the_lenses_of_a_fallback_layout_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let content: BTreeMap<String, Vec<u8>> = [
+            ("scan/SKILL.md", "scan skill"),
+            ("scan/reference.md", "scan reference"),
+            ("rvl-rust-pro/SKILL.md", RUST_LENS),
+            ("rvl-golang-pro/SKILL.md", GO_LENS),
+        ]
+        .into_iter()
+        .map(|(n, c)| (n.to_string(), c.as_bytes().to_vec()))
+        .collect();
+
+        let h = crate::harness::by_name("opencode").unwrap();
+        let receipt = h.install(&home, &content, "1.0.0").unwrap();
+        assert_eq!(receipt.files_written, 6, "4 download files + 2 agents");
+        let store = crate::store::SkillsStore::open(&dir.path().join("cache")).unwrap();
+        store
+            .record_installed(
+                "opencode",
+                crate::store::InstalledInfo {
+                    version: "1.0.0".into(),
+                    location: receipt.location.display().to_string(),
+                    installed_at: "2026-10-28".into(),
+                },
+            )
+            .unwrap();
+        let (agents_dir, _) =
+            crate::agents::installed_agents_dir(&store, &home, "opencode").unwrap();
+        let listed = crate::agents::list_agents(&agents_dir).unwrap();
+        assert_eq!(
+            listed.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["rvl-golang-pro", "rvl-rust-pro"]
+        );
+        assert_eq!(listed[1].description, "Rust reliability: panics");
+        let rust = std::fs::read_to_string(agents_dir.join("rvl-rust-pro.md")).unwrap();
+        assert!(rust.contains("\nmode: subagent\n"), "{rust}");
+
+        let removed = h.remove(&home, Some(&content)).unwrap();
+        assert_eq!(removed.files_removed, Some(6));
+        assert!(!agents_dir.join("rvl-rust-pro.md").exists());
+    }
+
+    /// A download that has `agents/<id>.md` takes its lenses from there
+    /// only: an `rvl-` skill beside them is not also a lens.
+    #[test]
+    fn top_level_agents_win_over_rvl_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let content: BTreeMap<String, Vec<u8>> = [
+            ("rvl-scan/SKILL.md", "scan skill"),
+            ("agents/rvl-rust-pro.md", RUST_LENS),
+        ]
+        .into_iter()
+        .map(|(n, c)| (n.to_string(), c.as_bytes().to_vec()))
+        .collect();
+        let h = crate::harness::by_name("opencode").unwrap();
+        h.install(home.path(), &content, "1.0.0").unwrap();
+        let agents_dir = home.path().join(".config/opencode/agents");
+        let listed = crate::agents::list_agents(&agents_dir).unwrap();
+        assert_eq!(
+            listed.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["rvl-rust-pro"]
+        );
     }
 
     #[test]

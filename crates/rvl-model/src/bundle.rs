@@ -38,11 +38,11 @@ pub struct Manifest {
     pub labels: Vec<String>,
     /// Calibration temperature: confidence is `softmax(logits / temperature)`.
     pub temperature: f64,
-    /// Every input is truncated and padded to this many tokens, so a record
-    /// never depends on which other inputs shared its batch.
+    /// Every input is truncated to this many tokens. It is not padded: each
+    /// input runs alone at its own length (`classify`).
     pub max_length: usize,
-    /// The token id padding is filled with; absent, the tokenizer's `[PAD]`
-    /// token, else 0.
+    /// The token id padding is filled with under `Options::fixed_padding`;
+    /// absent, the tokenizer's `[PAD]` token, else 0.
     #[serde(default)]
     pub pad_id: Option<u32>,
 }
