@@ -1,17 +1,17 @@
 //! The decision model's input text.
 //!
-//! The model was trained on text written by a reference renderer
-//! (`testdata/render-goldens/prepare.py`, `render_input`), and it must see
-//! the same text at scan time, byte for byte: an input it was not trained on
-//! is a silent drift in its decisions. [`render_input`] writes that text from
-//! what rvl has at a site: the export fields of the site ([`Site`]), the
-//! retriever's site packet ([`SitePacket`]) and the question asked of it
-//! ([`Question`]: the bound question, or a served frame's).
+//! The model was trained on text written by the decision model's private
+//! training renderer, and it must see the same text at scan time, byte for
+//! byte: an input it was not trained on is a silent drift in its decisions.
+//! [`render_input`] writes that text from what rvl has at a site: the export
+//! fields of the site ([`Site`]), the retriever's site packet
+//! ([`SitePacket`]) and the question asked of it ([`Question`]: the bound
+//! question, or a served frame's).
 //!
-//! The reference counts length caps in Unicode code points and collapses and
-//! strips whitespace by Python's definition of it; so does this module.
-//! The goldens test (`tests/render_goldens.rs`) holds the two to the same
-//! bytes and the same token ids.
+//! The training renderer counts length caps in Unicode code points and
+//! collapses and strips whitespace by Python's definition of it; so does this
+//! module. The goldens test (`tests/render_goldens.rs`) holds the two to the
+//! same bytes and the same token ids.
 //!
 //! The token ids are the model's input as they are: truncated to the
 //! bundle's `max_length`, never padded (`classify`). A model is to be

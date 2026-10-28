@@ -840,7 +840,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
     );
 }
 
-// po-av01j.139, second half. Found on apache/airflow: the incremental pass
+// po-av01j.139, second half. Found on example-org/example-repo: the incremental pass
 // degraded (pyindex failed on a 7690-file Python repo) and the coverage line
 // still read "no API call sites in scope -- nothing to resolve". There WERE
 // call sites; the retriever never got to them. Printing the two alike is the

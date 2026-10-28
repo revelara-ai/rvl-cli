@@ -1,15 +1,15 @@
 //! The renderer against the training renderer's goldens.
 //!
 //! `testdata/render-goldens/render-goldens.jsonl` holds inputs of the
-//! training renderer (`prepare.py`, `render_input`) with the text it wrote
-//! and the ids the shipped model's tokenizer gives that text, under both
-//! layouts (`SOURCE.md` names the commit they were copied from). Each golden
+//! decision model's private training renderer with the text it wrote and
+//! the ids the shipped model's tokenizer gives that text, under both
+//! layouts (`SOURCE.md` says where they come from). Each golden
 //! is rendered here and tokenized with the vendored tokenizer, and must
 //! match both exactly.
 //!
 //! A golden input is a label-export row, whose question is the judges' text;
 //! [`question_of`] reads the expectation and the frame out of that text as
-//! `prepare.py` does. rvl gets them structured, from the spec cache.
+//! the training renderer does. rvl gets them structured, from the spec cache.
 
 use std::path::PathBuf;
 
@@ -70,9 +70,8 @@ fn site_packet_of(sp: &Value) -> SitePacket {
     }
 }
 
-/// The question of an export row, read out of its text by `prepare.py`'s
-/// expressions (`_EXPECTATION`, `_FRAME_QUESTION`, `_FRAME_CELLS`,
-/// `_CONTROL_NAME`).
+/// The question of an export row, read out of its text by the same
+/// expressions the training renderer uses.
 fn question_of(row: &Value) -> Question {
     let text = row["question"]["text"].as_str().unwrap_or("");
     let group = |re: &str, i: usize| {
