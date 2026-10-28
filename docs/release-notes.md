@@ -24,6 +24,8 @@ so more of a medium repository's questions fit in the default budget.
 - Added: when the budget cuts the lane short, a COVERAGE line (also in
   `--out` `decision_model.coverage`) says how many questions it cut, in how
   many files, from which file on, and names the setting.
+- Fixed: on macOS the decision model ran on Core ML, which ONNX Runtime
+  chose by default; it now runs on the CPU, as on Linux and Windows.
 
 ### Credential values are redacted as sites are read
 

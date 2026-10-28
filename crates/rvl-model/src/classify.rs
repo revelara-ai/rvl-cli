@@ -29,6 +29,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use ort::session::builder::AutoDevicePolicy;
 use ort::session::Session;
 use ort::value::{Tensor, TensorElementType, ValueType};
 use serde::Serialize;
@@ -371,6 +372,12 @@ impl Classifier {
 
 /// A CPU session on `threads` intra-op threads, deterministic kernels and
 /// sequential execution of the graph.
+///
+/// The session asks for the CPU device explicitly. Without that, `ort`'s
+/// session builder picks the most power-efficient device, which on macOS
+/// registers the CoreML execution provider: its kernels are not the CPU
+/// kernels the other platforms run, and it rejects an input of zero tokens,
+/// which an own-length run gives for a tokenizer that adds no special tokens.
 fn open_session(runtime: &Runtime, model: &[u8], threads: usize) -> Result<Session> {
     let e = |e: ort::Error<_>| anyhow!("{e}");
     let mut b = Session::builder(&runtime.env)
@@ -382,6 +389,8 @@ fn open_session(runtime: &Runtime, model: &[u8], threads: usize) -> Result<Sessi
         .with_parallel_execution(false)
         .map_err(e)?
         .with_deterministic_compute(true)
+        .map_err(e)?
+        .with_auto_device(AutoDevicePolicy::PreferCPU)
         .map_err(e)?;
     b.commit_from_memory(model).map_err(|e| anyhow!("{e}"))
 }
