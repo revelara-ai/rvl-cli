@@ -1,20 +1,26 @@
 //! Batch inference: a record per input, inside a time budget.
 //!
-//! Determinism (the same input gives the same bytes): the session runs on a
-//! fixed intra-op thread count with ONNX Runtime's deterministic kernels, one
-//! inter-op thread and sequential execution; every input is padded to the
-//! bundle's `max_length` and runs alone, as a `[1, max_length]` tensor, so a
-//! record does not depend on which inputs shared its batch; and argmax and
-//! softmax are computed here, in f64, with ties going to the lower label
-//! index.
+//! Determinism is per input (the same input gives the same bytes): the
+//! session runs on a fixed intra-op thread count with ONNX Runtime's
+//! deterministic kernels, one inter-op thread and sequential execution;
+//! every input is truncated to the bundle's `max_length` and runs alone, as
+//! a `[1, n]` tensor of its own `n` tokens, with no padding, so the tensor's
+//! shape depends on the input and nothing else, and a record does not depend
+//! on which inputs shared its batch; and argmax and softmax are computed
+//! here, in f64, with ties going to the lower label index.
 //!
 //! Running an input alone is what makes the record independent of its batch
 //! on every platform: ONNX Runtime picks kernels and summation orders by
 //! tensor shape, per CPU architecture, so the same row in a `[4, n]` and a
-//! `[1, n]` tensor can differ in the last bit of a logit. A transformer
-//! encoder at a fixed `max_length` already gives its matrix products
-//! `max_length` rows per input, so batching inputs together buys little on
-//! CPU.
+//! `[1, n]` tensor can differ in the last bit of a logit. A record of an
+//! input run at its own length can differ from one padded to `max_length`
+//! ([`Options::fixed_padding`]) by more than that: a dynamically quantized
+//! model scales each activation tensor by its range, and the padding rows
+//! are in that range. `examples/padding.rs` measures the difference on a
+//! model's answer key. Not padding is what makes inference fast: an
+//! encoder's cost grows with the tokens it reads, and most inputs are a
+//! fraction of `max_length`. Batching inputs together, which would need
+//! padding again, measured slower than single runs on CPU.
 //!
 //! The budget is checked before each batch. A batch that has started runs to
 //! its end, and every input after the first batch the budget did not allow
@@ -39,6 +45,10 @@ pub struct Options {
     /// Inputs per batch. The budget is checked between batches; each input
     /// in a batch is its own session run.
     pub batch_size: usize,
+    /// Pad every input to the bundle's `max_length`, as rvl did before it
+    /// ran each input at its own length. Slower, and its logits differ in
+    /// the last bits; kept to compare the two on a model's answer key.
+    pub fixed_padding: bool,
 }
 
 impl Default for Options {
@@ -46,6 +56,7 @@ impl Default for Options {
         Options {
             threads: crate::DEFAULT_THREADS,
             batch_size: 8,
+            fixed_padding: false,
         }
     }
 }
@@ -168,7 +179,7 @@ impl Classifier {
             .pad_id
             .or_else(|| tokenizer.token_to_id("[PAD]"))
             .unwrap_or(0);
-        tokenizer.with_padding(Some(PaddingParams {
+        tokenizer.with_padding(opts.fixed_padding.then(|| PaddingParams {
             strategy: PaddingStrategy::Fixed(m.max_length),
             pad_id,
             ..Default::default()
@@ -290,17 +301,18 @@ impl Classifier {
         })
     }
 
-    /// Run one input as a `[1, max_length]` batch and make its record.
+    /// Run one input as a `[1, n]` batch of its `n` tokens and make its
+    /// record.
     fn run_one(&mut self, text: &str) -> Result<Record> {
-        let len = self.max_length;
         let enc = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow!("tokenize: {e}"))?;
-        if enc.get_ids().len() != len {
+        let len = enc.get_ids().len();
+        if len > self.max_length {
             bail!(
-                "the tokenizer gave {} tokens, not the fixed {len}",
-                enc.get_ids().len()
+                "the tokenizer gave {len} tokens, more than the bundle's {}",
+                self.max_length
             );
         }
         let widen = |v: &[u32]| v.iter().map(|&x| i64::from(x)).collect::<Vec<_>>();

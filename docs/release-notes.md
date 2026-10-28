@@ -9,6 +9,22 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### The decision model runs each input at its own length, under a budget you set
+
+The decision model ran every input padded to the model's maximum length.
+It now runs each input at its own token length: about 2.5 times as many
+inputs a second for typical inputs, measured on a model of the same shape,
+so more of a medium repository's questions fit in the default budget.
+
+- Changed: `--out` `decision_model.sites` `confidence` values and the model
+  records change for every input, once; the same input still gives the
+  same bytes on the same machine.
+- Added: `scanner.decision_model_budget` in `.revelara.yaml` (default
+  `60s`). A hook and `--changed-only` hold it to at most `60s`.
+- Added: when the budget cuts the lane short, a COVERAGE line (also in
+  `--out` `decision_model.coverage`) says how many questions it cut, in how
+  many files, from which file on, and names the setting.
+
 ### Credential values are redacted as sites are read
 
 A site's `const_args`, snippet, enclosing body, callers, callees and client

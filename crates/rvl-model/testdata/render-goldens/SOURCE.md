@@ -18,5 +18,10 @@ renderer with no network:
   `9fd55248d51d33976b324fc11592e28071da7d41e0e9401dfb7082e30574b7b1`. A test
   that reads it checks this sha256 first.
 
+At scan time the token ids are truncated to the bundle's `max_length` and
+not padded: each input runs at its own length (`src/classify.rs`). The
+model's precision and calibration are to be measured the same way;
+`examples/padding.rs` compares the two paddings on an answer key.
+
 When the training renderer changes, copy all three again from the commit that
 changed it, and update the commit above.
