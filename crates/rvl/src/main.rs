@@ -22,6 +22,7 @@ mod init;
 mod keyset;
 mod out_doc;
 mod progress;
+mod proto_builders;
 mod render;
 mod report;
 mod service_check;
@@ -3009,6 +3010,9 @@ struct RetrievedStream {
     /// Distinct machine-generated files whose packets were dropped. Reported in
     /// COVERAGE: excluding them silently would read as having scanned them.
     generated_skipped: usize,
+    /// `newBuilder*` sites on protobuf message classes the repository's
+    /// `.proto` files declare, dropped by the same rule.
+    proto_builders_skipped: usize,
     /// Test files each helper declined to read, per language. The
     /// same rule as `generated_skipped`: reported, never silent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
@@ -3076,6 +3080,7 @@ fn resolve_packet_stream(
             // A prebuilt stream is scanned as given: PATH is ignored on this
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped,
             parse_incomplete,
             dependencies_uninstalled,
@@ -3118,6 +3123,7 @@ fn resolve_packet_stream(
         return Ok(RetrievedStream {
             text: String::new(),
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -3185,6 +3191,7 @@ fn resolve_packet_stream(
     let detected = langs.len();
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
+    let mut proto_builders_skipped = 0usize;
     let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
     let mut parse_incomplete: Vec<render::ParseIncomplete> = Vec::new();
     let mut dependencies_uninstalled: Vec<render::DependenciesUninstalled> = Vec::new();
@@ -3230,6 +3237,8 @@ fn resolve_packet_stream(
                 // which is the same defect shape as the RC-057 false negative.
                 let (out, gen) = strip_generated_packets(&out, path);
                 generated_skipped += gen;
+                let (out, builders) = proto_builders::strip_proto_builder_packets(&out, path);
+                proto_builders_skipped += builders;
                 // The helper says how many test files it declined to read, on
                 // its repo-scoped record. Read per language HERE,
                 // where the stream is still one language's, so COVERAGE can
@@ -3306,6 +3315,7 @@ fn resolve_packet_stream(
     Ok(RetrievedStream {
         text: combined,
         generated_skipped,
+        proto_builders_skipped,
         test_files_skipped,
         parse_incomplete,
         dependencies_uninstalled,
@@ -4103,6 +4113,7 @@ fn run_scan(
             Vec::new(),
             None,
             0,
+            0,
             false,
             Vec::new(),
             Vec::new(),
@@ -4178,6 +4189,7 @@ fn run_scan(
         // below still report.
         stream.total_failure.clone(),
         stream.generated_skipped,
+        stream.proto_builders_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
         stream.parse_incomplete.clone(),
@@ -4310,6 +4322,8 @@ fn render_scan_output(
     degraded_note: Option<String>,
     // Machine-generated files dropped before evaluation (po-av01j.133.7).
     generated_skipped: usize,
+    // Generated protobuf builder sites dropped before evaluation.
+    proto_builders_skipped: usize,
     // The commercial tier loaded with zero API specs over real call sites
     // is threaded into COVERAGE beside the stderr warning.
     empty_api_corpus: bool,
@@ -4335,6 +4349,7 @@ fn render_scan_output(
         resolved,
         total: sites.len(),
         generated_skipped,
+        proto_builders_skipped,
         empty_api_corpus,
         test_files_skipped,
         parse_incomplete,
@@ -4614,6 +4629,9 @@ impl HelperRetriever {
                     continue;
                 }
             };
+            // An incremental pass drops the same builder sites as the full
+            // one, or a changed file would bring them back.
+            let (stream, _) = proto_builders::strip_proto_builder_packets(&stream, &self.root);
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
             // Same tolerance as `push_degradation`: a poisoned lock loses a
@@ -5883,6 +5901,7 @@ fn run_scan_incremental(
         scan.degraded_note.clone(),
         // The incremental path reuses indexed packets, which were already
         // filtered when they were first retrieved.
+        0,
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
