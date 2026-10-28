@@ -711,6 +711,12 @@ pub enum ConfigExpect {
     /// governing the key does not count: the control asks for an authored
     /// bound, and "the platform picked one for you" is the finding.
     Present,
+    /// The key must NOT be set: any authored occurrence is the finding, and a
+    /// platform default governing it satisfies. The complement of `Present`,
+    /// for a setting or a construction that is wrong whatever its value: a DES
+    /// cipher, `ssl.CERT_NONE`. Value-bearing variants cannot say it, since
+    /// what is wrong is that the key appears at all.
+    Absent,
     /// The resolved value must equal `value` (string-compared on the packet's
     /// canonical rendering).
     Equals { value: String },
@@ -2960,6 +2966,7 @@ mod tests {
         // that cannot round-trip would corrupt the signed cache silently.
         let variants = vec![
             ConfigExpect::Present,
+            ConfigExpect::Absent,
             ConfigExpect::Equals {
                 value: "false".into(),
             },
@@ -3011,6 +3018,7 @@ mod tests {
                 r#"{"kind":"duration_at_least","value":"1m"}"#,
                 ConfigExpect::DurationAtLeast { value: "1m".into() },
             ),
+            (r#"{"kind":"absent"}"#, ConfigExpect::Absent),
         ] {
             assert_eq!(serde_json::from_str::<ConfigExpect>(json).unwrap(), want);
         }

@@ -3765,6 +3765,11 @@ fn findings_from_sites(
         &unsized_sites,
         cache.construction_bound_specs(),
     ));
+    // Construction rules: a call site that is wrong for what it builds (a TLS
+    // config that skips verification, a DES cipher, a literal password in a
+    // DSN), judged by config-key specs. Violations only, keyed
+    // `construction.<rule key>`. The site keeps its deadline verdict too.
+    items.extend(construction_items(&sites, &cache));
     Ok((
         findings,
         items,
@@ -3830,6 +3835,50 @@ fn unsized_items(
             site_count: f.evidence.len().max(1),
             example_sites: f.evidence.into_iter().take(3).collect(),
             control: f.control,
+        })
+        .collect()
+}
+
+/// Map construction-rule violations into triage items, one per (rule key,
+/// rule phrase), as the config lane groups its classes. The class key is
+/// (`construction`, rule key), so the ladder renders
+/// `construction.database/sql.Open(arg1) — does not match
+/// no_literal_credential` and a waiver matches on `construction.<key>`. Like a
+/// config class, a rule with no judged severity is unjudged and never blocks.
+fn construction_items(
+    sites: &[rvl_core::Site],
+    specs: &rvl_spec::SpecCache,
+) -> Vec<rvl_triage::TriagedItem> {
+    let mut classes: std::collections::BTreeMap<(String, String), Vec<_>> = Default::default();
+    for f in rvl_config::construction::evaluate(sites, specs) {
+        if f.verdict == rvl_core::Verdict::Violates {
+            let rule = config_lane::rule_phrase(&f.reason).to_string();
+            classes.entry((f.key.clone(), rule)).or_default().push(f);
+        }
+    }
+    classes
+        .into_iter()
+        .map(|((key, rule), found)| {
+            let first = &found[0];
+            rvl_triage::TriagedItem {
+                class: rvl_triage::ClassKey {
+                    client_type: rvl_config::construction::FORMAT.into(),
+                    framework_type: String::new(),
+                    method: key,
+                    reason: rule,
+                    scope: "runtime".into(),
+                },
+                disposition: if first.severity.is_empty() {
+                    "unjudged".into()
+                } else {
+                    "surface".into()
+                },
+                severity: first.severity.clone(),
+                fix: first.fix.clone(),
+                control: first.control.clone(),
+                site_count: found.len(),
+                example_sites: found.iter().take(3).map(|f| f.site.clone()).collect(),
+            }
         })
         .collect()
 }

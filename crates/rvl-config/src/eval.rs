@@ -17,7 +17,7 @@
 //!     state the fact a conditional spec asks about.
 
 use crate::{ConfigPacket, ConfigPredicate, Resolution};
-use rvl_core::Verdict;
+use rvl_core::{redact, Verdict};
 use rvl_spec::{ConfigExpect, SpecCache, MIN_CONFIDENCE};
 
 /// A verdict about one config packet. `control`/`severity`/`fix` are carried
@@ -51,6 +51,20 @@ pub fn pattern_matches(name: &str, value: &str) -> Option<bool> {
         // retry). An empty value — an authored absence, e.g. an unpinned
         // `uses:` ref — is not configured either.
         "configured" => Some(!value.is_empty() && value != crate::ABSENT_RENDERING),
+        // No credential written into the value: a DSN with a password, or a
+        // password argument given as a literal. A call site's values arrive
+        // already redacted, so there the credential is the marker; a config
+        // value is raw, so it is redacted here first.
+        "no_literal_credential" => {
+            Some(!value.contains(redact::MARKER) && redact::redact_setting("", value) == value)
+        }
+        // Not a broken cipher: DES, 3DES and RC4 by name, or any cipher in
+        // ECB mode, in the OpenSSL naming Node's `createCipheriv` takes
+        // (`des-ede3-cbc`, `rc4`, `aes-128-ecb`).
+        "no_weak_cipher" => {
+            let v = value.to_ascii_lowercase();
+            Some(!(v.starts_with("des") || v.starts_with("rc4") || v.ends_with("-ecb")))
+        }
         _ => None,
     }
 }
@@ -233,6 +247,27 @@ pub fn evaluate(
             ),
             Resolution::PlatformDefault => decided(
                 Verdict::Violates,
+                format!("not explicitly set: platform default {value} governs"),
+            ),
+            Resolution::Unresolvable => unreachable!("handled above"),
+        },
+        ConfigExpect::Absent => match p.resolution {
+            Resolution::AsAuthored | Resolution::Rendered => {
+                let shown = if value.is_empty() {
+                    p.key.clone()
+                } else {
+                    format!("{} = {value}", p.key)
+                };
+                decided(
+                    Verdict::Violates,
+                    format!(
+                        "present where the spec forbids it: {shown}; {}",
+                        provenance_note(p)
+                    ),
+                )
+            }
+            Resolution::PlatformDefault => decided(
+                Verdict::Satisfies,
                 format!("not explicitly set: platform default {value} governs"),
             ),
             Resolution::Unresolvable => unreachable!("handled above"),
@@ -746,6 +781,80 @@ mod tests {
         // An empty value (an authored absence, e.g. an unpinned `uses:` ref)
         // is not configured either.
         assert_eq!(pattern_matches("configured", ""), Some(false));
+    }
+
+    #[test]
+    fn absent_violates_any_authored_occurrence_and_passes_a_default() {
+        let c = cache("tls.insecure", ConfigExpect::Absent, 0.9);
+        for res in [Resolution::AsAuthored, Resolution::Rendered] {
+            let set = evaluate(&packet("tls.insecure", Some("true"), res), &c);
+            assert_eq!(set.verdict, Verdict::Violates, "{}", set.reason);
+            assert!(
+                set.reason
+                    .starts_with("present where the spec forbids it: tls.insecure = true"),
+                "{}",
+                set.reason
+            );
+        }
+        let bare = evaluate(
+            &packet("tls.insecure", Some(""), Resolution::AsAuthored),
+            &c,
+        );
+        assert!(
+            bare.reason
+                .starts_with("present where the spec forbids it: tls.insecure;"),
+            "an empty value is not rendered: {}",
+            bare.reason
+        );
+        let unset = evaluate(
+            &packet("tls.insecure", Some("false"), Resolution::PlatformDefault),
+            &c,
+        );
+        assert_eq!(unset.verdict, Verdict::Satisfies, "{}", unset.reason);
+        let outside = evaluate(&packet("tls.insecure", None, Resolution::Unresolvable), &c);
+        assert_eq!(outside.verdict, Verdict::Abstain, "{}", outside.reason);
+    }
+
+    #[test]
+    fn no_literal_credential_reads_redacted_and_raw_values() {
+        for (value, clean) in [
+            ("postgres://app:<redacted>@db/app", false),
+            ("dbname=app password=<redacted>", false),
+            ("<redacted>", false),
+            // A raw config value is redacted before it is judged.
+            ("postgres://app:hunter2@db/app", false),
+            ("Server=h;Password=hunter2;", false),
+            ("postgres://app@db/app", true),
+            ("dbname=app host=db", true),
+            ("", true),
+        ] {
+            assert_eq!(
+                pattern_matches("no_literal_credential", value),
+                Some(clean),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_weak_cipher_flags_des_rc4_and_ecb_by_name() {
+        for (value, strong) in [
+            ("des-ede3-cbc", false),
+            ("DES-CBC", false),
+            ("des3", false),
+            ("rc4", false),
+            ("aes-128-ecb", false),
+            ("bf-ecb", false),
+            ("aes-256-gcm", true),
+            ("chacha20-poly1305", true),
+            ("aes-128-cbc", true),
+        ] {
+            assert_eq!(
+                pattern_matches("no_weak_cipher", value),
+                Some(strong),
+                "{value}"
+            );
+        }
     }
 
     /// A cache built from the artifact's JSON, the way a served spec arrives.
