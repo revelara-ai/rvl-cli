@@ -13,6 +13,14 @@
 //! module reads them, derives the Java class name protoc gives each message,
 //! and drops a `newBuilder*` site whose receiver is one of those classes.
 //!
+//! THE CHAIN GOES WITH ITS ROOT. Without the generated classes on the
+//! classpath the retriever cannot type `Ad.newBuilder()`, so each link of the
+//! fluent chain on it (`.setText(..)`, `.build()`) is a site of its own whose
+//! receiver is the chain's text attributed through the import,
+//! `hipstershop.Demo.Ad.newBuilder.setText`. With the classes present the
+//! receiver is protoc's `Ad.Builder`. Both are dropped with the root; the
+//! count is of builder chains, one per `newBuilder*` call.
+//!
 //! EVIDENCE, NOT NAME GUESSING. A `newBuilder` on a type no `.proto` here
 //! declares is kept: it may be a client's builder, and the retriever's
 //! builder rules own that case.
@@ -21,19 +29,23 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Drop the `newBuilder*` sites on protobuf message classes declared by the
-/// repository's `.proto` files, returning the filtered stream and the number
-/// of sites dropped. The `.proto` files are read only when the stream holds a
-/// candidate, so a repository without one pays nothing.
+/// repository's `.proto` files, and the links of the fluent chain on each,
+/// returning the filtered stream and the number of builder chains dropped.
+/// The `.proto` files are read only when the stream holds a candidate, so a
+/// repository without one pays nothing.
 pub fn strip_proto_builder_packets(text: &str, root: &Path) -> (String, usize) {
     let mut messages: Option<HashSet<String>> = None;
     let mut kept = String::with_capacity(text.len());
     let mut dropped = 0usize;
     for line in text.lines() {
-        if line.contains("\"newBuilder") {
-            if let Some(client_type) = builder_site_type(line) {
+        if line.contains("newBuilder") || line.contains(".Builder\"") {
+            if let Some((client_type, func)) = java_call_site(line) {
                 let messages = messages.get_or_insert_with(|| proto_message_classes(root));
-                if messages.contains(&client_type) {
+                if func.starts_with("newBuilder") && messages.contains(&client_type) {
                     dropped += 1;
+                    continue;
+                }
+                if builder_chain_message(&client_type).is_some_and(|m| messages.contains(m)) {
                     continue;
                 }
             }
@@ -44,12 +56,24 @@ pub fn strip_proto_builder_packets(text: &str, root: &Path) -> (String, usize) {
     (kept, dropped)
 }
 
-/// The receiver class of a Java call site whose method is `newBuilder*`.
-fn builder_site_type(line: &str) -> Option<String> {
+/// The receiver class and method of a Java call site.
+fn java_call_site(line: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
     let call_site = s("site_kind").is_empty() && s("lang") == "java";
-    (call_site && s("func").starts_with("newBuilder")).then(|| s("client_type").to_string())
+    call_site.then(|| (s("client_type").to_string(), s("func").to_string()))
+}
+
+/// The message class a chain link's receiver builds: `M` for protoc's
+/// `M.Builder`, or for the untyped chain text `M.newBuilder[.link]*`.
+fn builder_chain_message(client_type: &str) -> Option<&str> {
+    if let Some(m) = client_type.strip_suffix(".Builder") {
+        return Some(m);
+    }
+    let (m, rest) = client_type.split_once(".newBuilder")?;
+    // `newBuilder` or a `newBuilder*` overload, then the end or a link.
+    let factory = rest.split('.').next().unwrap_or_default();
+    factory.chars().all(char::is_alphanumeric).then_some(m)
 }
 
 /// The Java class of every message declared by a `.proto` file under `root`.
@@ -315,6 +339,33 @@ mod tests {
         assert!(kept.contains("com.acme.vendor.Widget"), "{kept}");
         assert!(kept.contains("getText"), "{kept}");
         assert!(kept.contains("repo_config"), "{kept}");
+    }
+
+    /// Untyped, each link of `Ad.newBuilder().setText(..).build()` is a site
+    /// on the chain text; typed, on protoc's `Ad.Builder`. Both go with the
+    /// root and are not counted again; the vendor builder's chain stays.
+    #[test]
+    fn the_links_of_a_message_builder_chain_go_with_it() {
+        let stream = [
+            site("hipstershop.Demo.Ad", "newBuilder"),
+            site("hipstershop.Demo.Ad.newBuilder", "setRedirectUrl"),
+            site("hipstershop.Demo.Ad.newBuilder.setRedirectUrl", "setText"),
+            site(
+                "hipstershop.Demo.Ad.newBuilder.setRedirectUrl.setText",
+                "build",
+            ),
+            site("hipstershop.Demo.AdResponse.Builder", "build"),
+            site("com.acme.vendor.Widget.newBuilder", "build"),
+            site("com.acme.vendor.Widget.Builder", "build"),
+            site("hipstershop.Demo.Adx.newBuilder", "build"),
+        ]
+        .join("\n");
+        let (kept, dropped) = strip_proto_builder_packets(&stream, &fixture());
+        assert_eq!(dropped, 1, "{kept}");
+        assert!(!kept.contains("hipstershop.Demo.Ad."), "{kept}");
+        assert!(!kept.contains("hipstershop.Demo.AdResponse"), "{kept}");
+        assert_eq!(kept.matches("com.acme.vendor.Widget").count(), 2, "{kept}");
+        assert!(kept.contains("hipstershop.Demo.Adx.newBuilder"), "{kept}");
     }
 
     #[test]

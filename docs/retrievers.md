@@ -426,8 +426,10 @@ that was scanned:
   the repository's `.proto` files, derives each message's Java class
   (`java_package` or `package`, then `java_outer_classname` or the file name
   in camel case unless `java_multiple_files`), and drops a `newBuilder*`
-  site on one of those classes. A `newBuilder` on a class no `.proto`
-  declares stays a site. It prints `N generated protobuf builder sites
+  site on one of those classes, with each link of the fluent chain on it
+  (a site on `Ad.Builder`, or on the untyped chain text
+  `hipstershop.Demo.Ad.newBuilder.setText`). A `newBuilder` on a class no
+  `.proto` declares stays a site. It prints `N generated protobuf builder sites
   excluded`; `--out` carries `coverage.proto_builders_skipped`.
 - **Test files**, decided by path convention inside the helper. `goindex`
   has always skipped `_test.go` and `vendor/`. `pyindex` and `tsindex` skip

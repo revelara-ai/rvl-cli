@@ -183,8 +183,9 @@ The orchestrator uses it to:
     makes the second zero by scanning them.
   - `proto_builders_skipped`: `newBuilder*` call sites on a protobuf
     message class that a `.proto` file in the repository declares, dropped
-    after retrieval. Building a message is not a client call. Counted on
-    the full scan; a warm scan reports 0.
+    after retrieval. Building a message is not a client call. One per
+    builder chain: the chain's links are dropped with it, not counted.
+    Counted on the full scan; a warm scan reports 0.
   - `retrieval[]`: the retrieval denominator, one row per language whose
     helper measures it (Go today). `resolved`/`total` is resolution over the
     sites the extractor RETRIEVED, and the extractor's tables decide what is
