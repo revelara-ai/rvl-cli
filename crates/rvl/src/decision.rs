@@ -403,11 +403,10 @@ fn input_of(a: &Ask, imports: &Imports, layout: Layout) -> String {
 }
 
 /// The model's input site, from what rvl retrieved: the file's import
-/// block, and the retriever's first callee as the definition called at the
-/// site.
+/// block, and the definition called at the site ([`callee_at`]).
 fn site_of(a: &Ask, imports: &Imports) -> render::Site {
     let s = a.site;
-    let callee = s.callees.first();
+    let callee = callee_at(s);
     render::Site {
         class: a.class.clone(),
         scope: s.scope().as_str().to_string(),
@@ -421,6 +420,17 @@ fn site_of(a: &Ask, imports: &Imports) -> render::Site {
         packet: render::SitePacket::from(s),
         ..render::Site::default()
     }
+}
+
+/// The function called at the site: the retriever's callee whose name is
+/// the site's method, or none. The retrievers' callees are every in-repo
+/// function the enclosing function calls, so the first of them is often
+/// another call. A Python callee is qualified (`Client.publish`), so only its
+/// last segment is compared.
+fn callee_at(s: &rvl_core::Site) -> Option<&rvl_core::Snippet> {
+    s.callees
+        .iter()
+        .find(|c| !s.method.is_empty() && c.symbol.rsplit(['.', ':']).next() == Some(&s.method))
 }
 
 /// A frame's question, with its cells in the training text's form,
@@ -913,6 +923,13 @@ mod tests {
             site.snippet = str_of(&packet["snippet"]);
             site.lang = str_of(&row["language"]);
             if !str_of(&packet["callee_definition"]).is_empty() {
+                // The goldens' site packets name no method: the callee is
+                // the one called at the site.
+                site.method = str_of(&packet["callee_name"])
+                    .rsplit('.')
+                    .next()
+                    .unwrap()
+                    .to_string();
                 site.callees = vec![rvl_core::Snippet {
                     file: file.clone(),
                     line: 1,
@@ -942,6 +959,36 @@ mod tests {
             [54, 30, 26],
             "goldens checked: all, with an import block, with a callee definition"
         );
+    }
+
+    #[test]
+    fn the_callee_block_is_the_function_called_at_the_site_or_none() {
+        let snippet = |symbol: &str| rvl_core::Snippet {
+            symbol: symbol.into(),
+            source: format!("def {symbol}(): ..."),
+            ..rvl_core::Snippet::default()
+        };
+        let mut site = rvl_core::Site {
+            method: "publish".into(),
+            callees: vec![snippet("_token"), snippet("QueueClient.publish")],
+            ..rvl_core::Site::default()
+        };
+        let f = frame(&[]);
+        let imports = Imports::new();
+        let s = site_of(&ask(&site, &f), &imports);
+        assert_eq!(s.callee_name, "QueueClient.publish");
+        assert_eq!(s.callee_definition, "def QueueClient.publish(): ...");
+        // The enclosing function calls in-repo code, but not at the site.
+        site.method = "get".into();
+        let s = site_of(&ask(&site, &f), &imports);
+        assert_eq!(
+            (s.callee_name, s.callee_definition),
+            (String::new(), String::new())
+        );
+        // A site that names no method has no callee.
+        site.method.clear();
+        site.callees = vec![snippet("")];
+        assert!(callee_at(&site).is_none());
     }
 
     #[test]
