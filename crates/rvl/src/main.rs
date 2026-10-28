@@ -22,6 +22,7 @@ mod init;
 mod keyset;
 mod out_doc;
 mod progress;
+mod proto_builders;
 mod render;
 mod report;
 mod service_check;
@@ -1989,7 +1990,7 @@ fn resolve_helper(lang: Lang) -> anyhow::Result<ResolvedHelper> {
 /// Linux caps a SINGLE argv entry at MAX_ARG_STRLEN = 32 pages = 128 KiB,
 /// independently of ARG_MAX (2 MiB on a typical box). `--files` joins the whole
 /// changed set into one entry, so the binding limit is the per-argument one and
-/// ARG_MAX is a red herring: on apache/airflow the list is 7690 paths totalling
+/// ARG_MAX is a red herring: on example-org/example-repo the list is 7690 paths totalling
 /// ~1.46 MB, which fits ARG_MAX with room to spare and exceeds the real limit
 /// eleven times over. The spawn then fails before the helper runs, and because
 /// the incremental path is fail-open the scan reported a degraded result rather
@@ -3009,6 +3010,9 @@ struct RetrievedStream {
     /// Distinct machine-generated files whose packets were dropped. Reported in
     /// COVERAGE: excluding them silently would read as having scanned them.
     generated_skipped: usize,
+    /// `newBuilder*` sites on protobuf message classes the repository's
+    /// `.proto` files declare, dropped by the same rule.
+    proto_builders_skipped: usize,
     /// Test files each helper declined to read, per language. The
     /// same rule as `generated_skipped`: reported, never silent.
     test_files_skipped: Vec<render::TestFilesSkipped>,
@@ -3076,6 +3080,7 @@ fn resolve_packet_stream(
             // A prebuilt stream is scanned as given: PATH is ignored on this
             // branch, so there is no root to resolve its files against.
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped,
             parse_incomplete,
             dependencies_uninstalled,
@@ -3118,6 +3123,7 @@ fn resolve_packet_stream(
         return Ok(RetrievedStream {
             text: String::new(),
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -3185,6 +3191,7 @@ fn resolve_packet_stream(
     let detected = langs.len();
     let mut combined = String::new();
     let mut generated_skipped = 0usize;
+    let mut proto_builders_skipped = 0usize;
     let mut test_files_skipped: Vec<render::TestFilesSkipped> = Vec::new();
     let mut parse_incomplete: Vec<render::ParseIncomplete> = Vec::new();
     let mut dependencies_uninstalled: Vec<render::DependenciesUninstalled> = Vec::new();
@@ -3230,6 +3237,8 @@ fn resolve_packet_stream(
                 // which is the same defect shape as the RC-057 false negative.
                 let (out, gen) = strip_generated_packets(&out, path);
                 generated_skipped += gen;
+                let (out, builders) = proto_builders::strip_proto_builder_packets(&out, path);
+                proto_builders_skipped += builders;
                 // The helper says how many test files it declined to read, on
                 // its repo-scoped record. Read per language HERE,
                 // where the stream is still one language's, so COVERAGE can
@@ -3306,6 +3315,7 @@ fn resolve_packet_stream(
     Ok(RetrievedStream {
         text: combined,
         generated_skipped,
+        proto_builders_skipped,
         test_files_skipped,
         parse_incomplete,
         dependencies_uninstalled,
@@ -4014,7 +4024,10 @@ fn stdout_color(mode: Option<&str>) -> bool {
 }
 
 /// The decision-model lane, when `.revelara.yaml` turns it on: after the
-/// deterministic lanes, inside what is left of the scan budget.
+/// deterministic lanes, inside what is left of the scan budget and
+/// `scanner.decision_model_budget`. A `held` scan (a hook, `--changed-only`)
+/// holds the model to the default budget whatever the setting says: those
+/// run on every commit or push.
 #[allow(clippy::too_many_arguments)]
 fn decision_lane(
     store: &CacheStore,
@@ -4024,12 +4037,11 @@ fn decision_lane(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     limits: &budget::Limits,
+    held: bool,
     progress: &indicatif::ProgressBar,
 ) -> Option<decision::LaneOutput> {
     let cfg = progress.suspend(|| decision::enabled(path))?;
-    let budget = limits
-        .remaining()
-        .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
+    let budget = model_budget(&cfg, held, limits.remaining());
     Some(decision::run(
         &cfg,
         path,
@@ -4041,6 +4053,22 @@ fn decision_lane(
         budget,
         progress,
     ))
+}
+
+/// The decision model's budget: `scanner.decision_model_budget`, held to the
+/// default under a hook or `--changed-only`, inside what is left of the scan
+/// budget.
+fn model_budget(
+    cfg: &rvl_model::ModelConfig,
+    held: bool,
+    remaining: Option<std::time::Duration>,
+) -> std::time::Duration {
+    let own = if held {
+        cfg.budget.min(rvl_model::DEFAULT_BUDGET)
+    } else {
+        cfg.budget
+    };
+    remaining.map_or(own, |r| r.min(own))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4152,6 +4180,7 @@ fn run_scan(
             Vec::new(),
             None,
             0,
+            0,
             false,
             Vec::new(),
             Vec::new(),
@@ -4188,7 +4217,7 @@ fn run_scan(
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
     let model = decision_lane(
-        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+        store, keyset, path, &findings, &sites, &specs, &limits, false, &progress,
     );
     let blended = blend.then(|| {
         progress::step(&progress, "Blending");
@@ -4227,6 +4256,7 @@ fn run_scan(
         // below still report.
         stream.total_failure.clone(),
         stream.generated_skipped,
+        stream.proto_builders_skipped,
         empty_api_corpus,
         stream.test_files_skipped.clone(),
         stream.parse_incomplete.clone(),
@@ -4359,6 +4389,8 @@ fn render_scan_output(
     degraded_note: Option<String>,
     // Machine-generated files dropped before evaluation (po-av01j.133.7).
     generated_skipped: usize,
+    // Generated protobuf builder sites dropped before evaluation.
+    proto_builders_skipped: usize,
     // The commercial tier loaded with zero API specs over real call sites
     // is threaded into COVERAGE beside the stderr warning.
     empty_api_corpus: bool,
@@ -4384,6 +4416,7 @@ fn render_scan_output(
         resolved,
         total: sites.len(),
         generated_skipped,
+        proto_builders_skipped,
         empty_api_corpus,
         test_files_skipped,
         parse_incomplete,
@@ -4663,6 +4696,9 @@ impl HelperRetriever {
                     continue;
                 }
             };
+            // An incremental pass drops the same builder sites as the full
+            // one, or a changed file would bring them back.
+            let (stream, _) = proto_builders::strip_proto_builder_packets(&stream, &self.root);
             let (mut got, cfg, _skipped) = rvl_core::parse_stream(&stream);
             sites.append(&mut got);
             // Same tolerance as `push_degradation`: a poisoned lock loses a
@@ -5892,7 +5928,15 @@ fn run_scan_incremental(
         })
     });
     let model = decision_lane(
-        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+        store,
+        keyset,
+        path,
+        &findings,
+        &sites,
+        &specs,
+        &limits,
+        hook.is_some() || changed_only,
+        &progress,
     );
     // `--blend` (po-av01j.205): the same residue, whole repo, or the
     // changed set under --changed-only so the agent never sees files the
@@ -5932,6 +5976,7 @@ fn run_scan_incremental(
         scan.degraded_note.clone(),
         // The incremental path reuses indexed packets, which were already
         // filtered when they were first retrieved.
+        0,
         0,
         empty_api_corpus,
         scan.test_files_skipped.clone(),
@@ -8403,6 +8448,25 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_model_budget_is_the_setting_held_under_a_hook_and_inside_the_scan_budget() {
+        use std::time::Duration;
+        let cfg = rvl_model::ModelConfig {
+            budget: Duration::from_secs(150),
+            ..Default::default()
+        };
+        let secs = Duration::from_secs;
+        assert_eq!(model_budget(&cfg, false, None), secs(150));
+        assert_eq!(model_budget(&cfg, true, None), secs(60), "a hook holds it");
+        assert_eq!(model_budget(&cfg, false, Some(secs(90))), secs(90));
+        assert_eq!(model_budget(&cfg, true, Some(secs(30))), secs(30));
+        let short = rvl_model::ModelConfig {
+            budget: secs(20),
+            ..Default::default()
+        };
+        assert_eq!(model_budget(&short, true, None), secs(20), "lower is kept");
+    }
+
     // --- the detached reindex log stays bounded (po-gvzpc) ---
 
     /// A log under the cap is left alone: rotating on every spawn would throw
@@ -10107,7 +10171,7 @@ mod tests {
 
     // po-av01j.141. Linux caps ONE argv entry at MAX_ARG_STRLEN = 128 KiB,
     // independently of ARG_MAX. `--files` joins the whole changed set into one
-    // entry, so on apache/airflow (7690 paths, ~1.46 MB) the spawn failed
+    // entry, so on example-org/example-repo (7690 paths, ~1.46 MB) the spawn failed
     // before pyindex ran -- and because the incremental path is fail-open, the
     // scan reported a degraded result rather than an error anyone would chase.
     #[test]

@@ -41,9 +41,6 @@ use rvl_spec::frames::{Frame, CALL_SITE};
 
 use crate::render as ladder;
 
-/// The longest the model may run in one scan, inside the scan budget.
-pub const MODEL_BUDGET: Duration = Duration::from_secs(60);
-
 /// The lane's part of the `--out` document.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Summary {
@@ -162,19 +159,19 @@ pub fn run(
         out_of_distribution,
         ..Summary::default()
     };
-    let mut budget_line = None;
+    let mut budget_lines = Vec::new();
     if !asks.is_empty() {
         let imports = imports_of(repo_root, &asks);
         match infer(cfg, &cached.dir, m, &asks, &imports, budget, progress) {
-            Ok((digest, decisions, line)) => {
+            Ok((digest, decisions, lines)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
-                budget_line = line;
+                budget_lines = lines;
             }
             Err(e) => summary.not_run = Some(format!("{e:#}")),
         }
     }
-    summary.coverage = coverage_lines(&summary, budget_line, specs.frames_rejected());
+    summary.coverage = coverage_lines(&summary, budget_lines, specs.frames_rejected());
     LaneOutput {
         findings: summary.sites.iter().filter_map(finding_of).collect(),
         summary,
@@ -186,7 +183,7 @@ fn not_run(why: String) -> LaneOutput {
         not_run: Some(why),
         ..Summary::default()
     };
-    summary.coverage = coverage_lines(&summary, None, 0);
+    summary.coverage = coverage_lines(&summary, Vec::new(), 0);
     LaneOutput {
         findings: Vec::new(),
         summary,
@@ -253,7 +250,8 @@ fn select<'a>(
 }
 
 /// Load the runtime and the bundle, and ask every question, the status line
-/// counting them.
+/// counting them. Returns the weights digest, the decisions and, when the
+/// budget cut inference short, the coverage lines that say so.
 fn infer(
     cfg: &rvl_model::ModelConfig,
     dir: &Path,
@@ -262,7 +260,7 @@ fn infer(
     imports: &Imports,
     budget: Duration,
     progress: &ProgressBar,
-) -> anyhow::Result<(String, Vec<Decision>, Option<String>)> {
+) -> anyhow::Result<(String, Vec<Decision>, Vec<String>)> {
     let layout = match m.layout.as_str() {
         "compact" => Layout::Compact,
         "full" => Layout::Full,
@@ -300,12 +298,68 @@ fn infer(
     )?;
     c.coverage.budget_ms = Some(budget.as_millis());
     let cells = classifier.cells();
-    let decisions = asks
+    let decisions: Vec<Decision> = asks
         .iter()
         .zip(&c.records)
         .map(|(a, r)| decide(a, r, cells))
         .collect();
-    Ok((digest, decisions, c.coverage.line()))
+    if let Some(path) = std::env::var_os(INPUTS_ENV) {
+        if let Err(e) = write_inputs(Path::new(&path), &texts, &decisions) {
+            eprintln!("warning: {INPUTS_ENV}: {}: {e}", Path::new(&path).display());
+        }
+    }
+    let mut lines: Vec<String> = c.coverage.line().into_iter().collect();
+    lines.extend(cut_line(&asks[c.coverage.inferred..]));
+    Ok((digest, decisions, lines))
+}
+
+/// The file the lane writes each question's input text to, when set: one
+/// JSON line per question, the text beside the decision it got (`off_cell`
+/// included), to diff against the training renderer's text for the same
+/// site. The file stays on this machine.
+pub const INPUTS_ENV: &str = "RVL_DECISION_MODEL_INPUTS";
+
+#[derive(Serialize)]
+struct InputRow<'a> {
+    #[serde(flatten)]
+    decision: &'a Decision,
+    off_cell: bool,
+    text: &'a str,
+}
+
+/// Write the [`INPUTS_ENV`] file.
+fn write_inputs(path: &Path, texts: &[String], decisions: &[Decision]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for (text, d) in texts.iter().zip(decisions) {
+        let row = InputRow {
+            decision: d,
+            off_cell: d.off_cell,
+            text,
+        };
+        serde_json::to_writer(&mut out, &row)?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
+}
+
+/// What a budget cut dropped: the questions are asked site by site in scan
+/// order, each site's frames in turn, so the cut is the tail of that order.
+/// `None` when nothing was cut.
+fn cut_line(cut: &[Ask]) -> Option<String> {
+    let first = cut.first()?;
+    let files: std::collections::BTreeSet<&str> =
+        cut.iter().map(|a| a.site.file_path.as_str()).collect();
+    Some(format!(
+        "decision model: questions are asked site by site in scan order, so the budget cut \
+         the last {} question(s), in {} file(s) from {} on; \
+         `scanner.decision_model_budget` raises the budget (a hook and --changed-only hold \
+         it to {}s)",
+        cut.len(),
+        files.len(),
+        first.site.file_path,
+        rvl_model::DEFAULT_BUDGET.as_secs()
+    ))
 }
 
 /// The hook `classify_until` asks before each batch of `batch` questions:
@@ -498,7 +552,7 @@ fn finding_of(d: &Decision) -> Option<ladder::Finding> {
     })
 }
 
-fn coverage_lines(s: &Summary, budget_line: Option<String>, frames_rejected: usize) -> Vec<String> {
+fn coverage_lines(s: &Summary, budget_lines: Vec<String>, frames_rejected: usize) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(why) = &s.not_run {
         out.push(format!("decision model: not run \u{2014} {why}"));
@@ -527,9 +581,7 @@ fn coverage_lines(s: &Summary, budget_line: Option<String>, frames_rejected: usi
             parts.join(" \u{00b7} ")
         ));
     }
-    if let Some(line) = budget_line {
-        out.push(line);
-    }
+    out.extend(budget_lines);
     let named = |rows: &[Unserved]| {
         rows.iter()
             .map(|u| format!("{} ({})", u.control, u.sites))
@@ -636,6 +688,50 @@ mod tests {
     }
 
     #[test]
+    fn the_inputs_file_has_each_text_beside_its_decision() {
+        let site = rvl_core::Site {
+            file_path: "a.go".into(),
+            line_number: 7,
+            ..Default::default()
+        };
+        let f = frame(&[("M1", "manifestation"), ("S1", "satisfying")]);
+        let ids: Vec<String> = ["M1", "S1"].map(String::from).to_vec();
+        let off = decide(
+            &ask(&site, &f),
+            &record("violates", vec![0.0, 3.0]),
+            Some(&ids),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.jsonl");
+        write_inputs(&path, &["Class: a.B.C".into()], &[off]).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["site_id"], "a.go:7");
+        assert_eq!(row["verdict"], "abstain");
+        assert_eq!(row["off_cell"], true);
+        assert_eq!(row["text"], "Class: a.B.C");
+    }
+
+    #[test]
+    fn a_budget_cut_names_what_it_dropped() {
+        let site = |file: &str| rvl_core::Site {
+            file_path: file.into(),
+            ..rvl_core::Site::default()
+        };
+        let (a, b, c) = (site("a.go"), site("b.go"), site("c.go"));
+        let f = frame(&[]);
+        let asks = [ask(&a, &f), ask(&b, &f), ask(&b, &f), ask(&c, &f)];
+        assert_eq!(cut_line(&asks[4..]), None, "nothing cut");
+        assert_eq!(
+            cut_line(&asks[1..]).unwrap(),
+            "decision model: questions are asked site by site in scan order, so the budget \
+             cut the last 3 question(s), in 2 file(s) from b.go on; \
+             `scanner.decision_model_budget` raises the budget (a hook and --changed-only \
+             hold it to 60s)"
+        );
+    }
+
+    #[test]
     fn a_violation_whose_top_cell_is_not_a_manifestation_cell_abstains() {
         let site = rvl_core::Site::default();
         let ids: Vec<String> = ["M1", "S1", "C3"].map(String::from).to_vec();
@@ -675,7 +771,7 @@ mod tests {
             sites: vec![off, none, on],
             ..Summary::default()
         };
-        let lines = coverage_lines(&s, None, 0);
+        let lines = coverage_lines(&s, Vec::new(), 0);
         assert!(
             lines[0].contains("3 site question(s) asked")
                 && lines[0].contains("1 violates")
@@ -961,7 +1057,7 @@ mod tests {
             }],
             ..Summary::default()
         };
-        let lines = coverage_lines(&s, None, 1);
+        let lines = coverage_lines(&s, Vec::new(), 1);
         assert!(
             lines[1].contains("out of distribution") && lines[1].contains("RC-019 (3)"),
             "{lines:?}"

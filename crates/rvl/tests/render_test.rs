@@ -110,6 +110,7 @@ fn cov() -> Coverage {
         total: 1,
         abstain_no_spec: 0,
         generated_skipped: 0,
+        proto_builders_skipped: 0,
         test_files_skipped: Vec::new(),
         parse_incomplete: Vec::new(),
         dependencies_uninstalled: Vec::new(),
@@ -173,6 +174,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         total: 59,
         abstain_no_spec: 1,
         generated_skipped: 0,
+        proto_builders_skipped: 0,
         test_files_skipped: Vec::new(),
         parse_incomplete: Vec::new(),
         dependencies_uninstalled: Vec::new(),
@@ -241,6 +243,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             total: 5,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -292,6 +295,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -334,6 +338,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             total: 10,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -372,6 +377,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -409,6 +415,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -451,6 +458,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -593,6 +601,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             total: 1,
             abstain_no_spec: 0,
             generated_skipped: 0,
+            proto_builders_skipped: 0,
             test_files_skipped: Vec::new(),
             parse_incomplete: Vec::new(),
             dependencies_uninstalled: Vec::new(),
@@ -641,6 +650,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 total: 1,
                 abstain_no_spec: 0,
                 generated_skipped: 0,
+                proto_builders_skipped: 0,
                 test_files_skipped: Vec::new(),
                 parse_incomplete: Vec::new(),
                 dependencies_uninstalled: Vec::new(),
@@ -830,7 +840,7 @@ fn config_and_degradation_still_render_when_there_are_no_call_sites() {
     );
 }
 
-// po-av01j.139, second half. Found on apache/airflow: the incremental pass
+// po-av01j.139, second half. Found on example-org/example-repo: the incremental pass
 // degraded (pyindex failed on a 7690-file Python repo) and the coverage line
 // still read "no API call sites in scope -- nothing to resolve". There WERE
 // call sites; the retriever never got to them. Printing the two alike is the

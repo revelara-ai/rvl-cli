@@ -368,6 +368,7 @@ impl Harness for DirHarness {
         let mut receipt = install_files_at(&home.join(self.install_dir), files, self.note)?;
         if let Some((export, dir)) = self.agent_export(home) {
             let agents = lens_agents(files)
+                .into_iter()
                 .map(|(id, content)| (format!("{id}.md"), export(id, content)))
                 .collect();
             receipt.files_written += write_files(&dir, &agents)?;
@@ -401,12 +402,27 @@ impl DirHarness {
     }
 }
 
-/// The lens agents in a download: `agents/<id>.md` at the top level, as
-/// (id, content).
-fn lens_agents(files: &BTreeMap<String, Vec<u8>>) -> impl Iterator<Item = (&str, &[u8])> {
-    files.iter().filter_map(|(name, content)| {
-        let id = name.strip_prefix("agents/")?.strip_suffix(".md")?;
-        (!id.is_empty() && !id.contains('/')).then_some((id, content.as_slice()))
+/// The lens agents in a download, as (id, content): `agents/<id>.md` at
+/// the top level. A download with none is the skills-plus-agent-fallback
+/// layout, which carries each agent as the skill `rvl-<id>/SKILL.md`; its
+/// lenses are those entries, under the id `rvl-<id>`.
+fn lens_agents(files: &BTreeMap<String, Vec<u8>>) -> Vec<(&str, &[u8])> {
+    let lenses = |strip: fn(&str) -> Option<&str>| -> Vec<(&str, &[u8])> {
+        files
+            .iter()
+            .filter_map(|(name, content)| {
+                let id = strip(name)?;
+                (!id.is_empty() && !id.contains('/')).then_some((id, content.as_slice()))
+            })
+            .collect()
+    };
+    let agents = lenses(|name| name.strip_prefix("agents/")?.strip_suffix(".md"));
+    if !agents.is_empty() {
+        return agents;
+    }
+    lenses(|name| {
+        let id = name.strip_suffix("/SKILL.md")?;
+        (id.len() > "rvl-".len() && id.starts_with("rvl-")).then_some(id)
     })
 }
 

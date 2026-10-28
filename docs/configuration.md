@@ -20,6 +20,7 @@ The keys this binary reads are:
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
 | `scanner.model_threads` | CPU threads for local model inference (default 4, at least 1). Verdicts do not depend on it; it trades scan time for CPU. |
 | `scanner.decision_model` | `on` runs the decision-model lane: after the deterministic lanes, each undecided call site is asked the question of every frame (from the spec cache) whose control the cached model serves, on this machine. `violates` decisions are advisory findings (`model.<control>`); other controls abstain and are named on the COVERAGE line. Off by default. Needs the bundle `rvl model sync` caches (an API key; `RVL_OFFLINE=1` uses the cached bundle). |
+| `scanner.decision_model_budget` | The longest the decision model may run in one scan (default `60s`; `90`, `150s`, `5m`, `1h`). Questions are asked site by site in scan order; the ones the budget does not reach abstain, and the COVERAGE line counts them and names the first file cut. Under a hook and `--changed-only` the budget is at most `60s`, whatever this says. A full scan of a large repository may need more: a scan that runs out says so. |
 
 Unknown keys are tolerated everywhere, so the same file can carry settings for
 other consumers.
@@ -99,6 +100,7 @@ headless and CI use work with no config file at all.
 | `RVL_NODE_MAX_OLD_SPACE_MB` | V8 heap limit, in MB, for the `node` that runs the TypeScript helper. Default: half of physical memory, at most 16384. `0` leaves node's own default (about 4 GB). A `NODE_OPTIONS` that sets `--max-old-space-size` is respected when this is unset |
 | `RVL_RUST_ANALYZER` | Path to the `rust-analyzer` binary the Rust lane drives (`RVL_RUST_ANALYZER_SHA256` optionally pins its checksum) |
 | `RVL_ONNXRUNTIME` | The ONNX Runtime library local model inference loads (the file, or a directory holding it), instead of the pinned one a release carries in `onnxruntime/` beside `rvl` |
+| `RVL_DECISION_MODEL_INPUTS` | A file the decision-model lane writes each question's input text to, one JSON line per question beside the decision it got (`off_cell` says a `violates` abstained because its top cell is not a manifestation cell). For comparing what the model reads at scan time with what it was trained on. The file stays on this machine |
 | `RVL_RUSTINDEX_MAX_CRATES` | Largest cargo workspace (crates, dependencies included) the Rust lane hands to `rust-analyzer`; a bigger one is not indexed and the lane is reported partial. Default 600, which keeps `rust-analyzer` under about 8 GB |
 | `RVL_CACHE_DIR`, `RVL_INDEX_DIR`, `RVL_SKILLS_CACHE_DIR` | Relocate the spec cache, packet index, skills cache |
 | `RVL_ALLOW_UNSIGNED_PLUGIN=1` | Accept plugin content from a server with no signing key |
