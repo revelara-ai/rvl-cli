@@ -157,6 +157,10 @@ pub struct Coverage {
     /// without saying so reads as having scanned them, and it moves every
     /// number above it.
     pub generated_skipped: usize,
+    /// `newBuilder*` sites on protobuf message classes the repository's
+    /// `.proto` files declare, dropped before evaluation. Same rule as
+    /// `generated_skipped`: reported, never silent.
+    pub proto_builders_skipped: usize,
     /// Test files each helper declined to read, per language.
     /// Same rule as `generated_skipped`: reported, never silent. Only
     /// languages with a non-zero count are listed.
@@ -396,6 +400,7 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
     if cov.lang_status.is_empty()
         && cov.retrievers.is_empty()
         && cov.generated_skipped == 0
+        && cov.proto_builders_skipped == 0
         && cov.test_files_skipped.is_empty()
         && cov.parse_incomplete.is_empty()
         && cov.dependencies_uninstalled.is_empty()
@@ -468,6 +473,14 @@ pub fn render_lang_status(cov: &Coverage, color: bool) -> String {
             "  {} machine-generated file{} excluded (banner-declared; not editable, not counted)",
             cov.generated_skipped,
             if cov.generated_skipped == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(o, "{}", paint(&g, "2", color));
+    }
+    if cov.proto_builders_skipped > 0 {
+        let g = format!(
+            "  {} generated protobuf builder site{} excluded (message construction, not a client call)",
+            cov.proto_builders_skipped,
+            if cov.proto_builders_skipped == 1 { "" } else { "s" }
         );
         let _ = writeln!(o, "{}", paint(&g, "2", color));
     }

@@ -411,14 +411,26 @@ To waive the finding, use the class `server_entry.liveness-probe-handler-io`.
 
 ## What a retriever skips
 
-A retriever reads production code. Two kinds of file are left out, and
-both are counted in COVERAGE rather than dropped in silence, because a file
-excluded without saying so reads as a file that was scanned:
+A retriever reads production code. Two kinds of file and one kind of
+call site are left out, and each is counted in COVERAGE rather than dropped
+in silence, because something excluded without saying so reads as something
+that was scanned:
 
 - **Machine-generated files**, decided by the banner in the file (`Code
   generated ... DO NOT EDIT`), never by the path. `rvl` drops their packets
   after retrieval and prints `N machine-generated files excluded`; `--out`
   carries `coverage.generated_skipped`.
+- **Generated protobuf builder sites**: `Ad.newBuilder()...build()` in
+  hand-written Java, where `Ad` is a message class protoc generates at build
+  time and so is not in the tree for the banner rule to read. `rvl` reads
+  the repository's `.proto` files, derives each message's Java class
+  (`java_package` or `package`, then `java_outer_classname` or the file name
+  in camel case unless `java_multiple_files`), and drops a `newBuilder*`
+  site on one of those classes, with each link of the fluent chain on it
+  (a site on `Ad.Builder`, or on the untyped chain text
+  `hipstershop.Demo.Ad.newBuilder.setText`). A `newBuilder` on a class no
+  `.proto` declares stays a site. It prints `N generated protobuf builder sites
+  excluded`; `--out` carries `coverage.proto_builders_skipped`.
 - **Test files**, decided by path convention inside the helper. `goindex`
   has always skipped `_test.go` and `vendor/`. `pyindex` and `tsindex` skip
   the conventions below, count what they skipped, and report the count on

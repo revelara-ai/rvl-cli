@@ -54,6 +54,7 @@ The orchestrator uses it to:
     "total": 1780,
     "abstain": { "no_spec": 90, "bounds": 40, "judge": 30, "other": 6 },
     "generated_skipped": 3,
+    "proto_builders_skipped": 0,
     "test_files_skipped": 12,
     "parse_incomplete_files": 0,
     "dependency_trees_uninstalled": 0,
@@ -180,6 +181,11 @@ The orchestrator uses it to:
     test files its packet index flagged when they were first retrieved as
     well as the ones it re-parsed this pass. `rvl scan --include-tests`
     makes the second zero by scanning them.
+  - `proto_builders_skipped`: `newBuilder*` call sites on a protobuf
+    message class that a `.proto` file in the repository declares, dropped
+    after retrieval. Building a message is not a client call. One per
+    builder chain: the chain's links are dropped with it, not counted.
+    Counted on the full scan; a warm scan reports 0.
   - `retrieval[]`: the retrieval denominator, one row per language whose
     helper measures it (Go today). `resolved`/`total` is resolution over the
     sites the extractor RETRIEVED, and the extractor's tables decide what is

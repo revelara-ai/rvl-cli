@@ -4083,6 +4083,62 @@ fn live_java_scan_surfaces_unsized_constructions() {
     );
 }
 
+/// Java, live end to end: the protobuf fixture's AdService.java builds `Ad`
+/// and `AdResponse` messages with `newBuilder()...build()`. The classes are
+/// generated from demo.proto and are not in the tree; the sites are dropped
+/// as out of scope and COVERAGE counts them, while the vendor `Widget`
+/// builder, which no `.proto` declares, stays a site.
+#[test]
+fn live_java_scan_drops_generated_protobuf_builder_sites() {
+    let Some(javaindex) = javaindex_ready() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("findings.json");
+    let out = bin()
+        .arg("scan")
+        .arg(
+            helpers_dir()
+                .join("javaindex")
+                .join("testdata")
+                .join("fixture_proto"),
+        )
+        .arg("--specs-file")
+        .arg(java_seed_specs())
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_JAVAINDEX", &javaindex)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() || out.status.code() == Some(1),
+        "scan errored: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let classes: Vec<&str> = doc["sites"]
+        .as_array()
+        .expect("sites must be an array")
+        .iter()
+        .filter_map(|r| r["class"].as_str())
+        .collect();
+    assert!(
+        !classes.iter().any(|c| c.starts_with("hipstershop.")),
+        "a generated message builder is not a call site: {classes:?}"
+    );
+    assert!(
+        classes.contains(&"com.acme.vendor.Widget.newBuilder"),
+        "a builder no .proto declares stays a site: {classes:?}"
+    );
+    assert!(
+        stdout.contains("2 generated protobuf builder sites excluded"),
+        "the exclusion is counted in COVERAGE: {stdout}"
+    );
+}
+
 /// Java, live end to end: javaindex inventories the fixture's emissions (the
 /// slf4j aggregates, the swallowing catch), and the seed specs surface the
 /// RC-027 swallow gap in the ladder.

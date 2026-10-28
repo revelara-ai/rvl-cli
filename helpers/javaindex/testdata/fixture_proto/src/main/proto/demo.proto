@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package hipstershop;
+
+message AdRequest {
+  repeated string context_keys = 1;
+}
+
+message AdResponse {
+  repeated Ad ads = 1;
+}
+
+message Ad {
+  string redirect_url = 1;
+  string text = 2;
+}
