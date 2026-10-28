@@ -3965,7 +3965,10 @@ fn stdout_color(mode: Option<&str>) -> bool {
 }
 
 /// The decision-model lane, when `.revelara.yaml` turns it on: after the
-/// deterministic lanes, inside what is left of the scan budget.
+/// deterministic lanes, inside what is left of the scan budget and
+/// `scanner.decision_model_budget`. A `held` scan (a hook, `--changed-only`)
+/// holds the model to the default budget whatever the setting says: those
+/// run on every commit or push.
 #[allow(clippy::too_many_arguments)]
 fn decision_lane(
     store: &CacheStore,
@@ -3975,12 +3978,11 @@ fn decision_lane(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     limits: &budget::Limits,
+    held: bool,
     progress: &indicatif::ProgressBar,
 ) -> Option<decision::LaneOutput> {
     let cfg = progress.suspend(|| decision::enabled(path))?;
-    let budget = limits
-        .remaining()
-        .map_or(decision::MODEL_BUDGET, |r| r.min(decision::MODEL_BUDGET));
+    let budget = model_budget(&cfg, held, limits.remaining());
     Some(decision::run(
         &cfg,
         path,
@@ -3992,6 +3994,22 @@ fn decision_lane(
         budget,
         progress,
     ))
+}
+
+/// The decision model's budget: `scanner.decision_model_budget`, held to the
+/// default under a hook or `--changed-only`, inside what is left of the scan
+/// budget.
+fn model_budget(
+    cfg: &rvl_model::ModelConfig,
+    held: bool,
+    remaining: Option<std::time::Duration>,
+) -> std::time::Duration {
+    let own = if held {
+        cfg.budget.min(rvl_model::DEFAULT_BUDGET)
+    } else {
+        cfg.budget
+    };
+    remaining.map_or(own, |r| r.min(own))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4139,7 +4157,7 @@ fn run_scan(
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
     let model = decision_lane(
-        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+        store, keyset, path, &findings, &sites, &specs, &limits, false, &progress,
     );
     let blended = blend.then(|| {
         progress::step(&progress, "Blending");
@@ -5843,7 +5861,15 @@ fn run_scan_incremental(
         })
     });
     let model = decision_lane(
-        store, keyset, path, &findings, &sites, &specs, &limits, &progress,
+        store,
+        keyset,
+        path,
+        &findings,
+        &sites,
+        &specs,
+        &limits,
+        hook.is_some() || changed_only,
+        &progress,
     );
     // `--blend` (po-av01j.205): the same residue, whole repo, or the
     // changed set under --changed-only so the agent never sees files the
@@ -8353,6 +8379,25 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_budget_is_the_setting_held_under_a_hook_and_inside_the_scan_budget() {
+        use std::time::Duration;
+        let cfg = rvl_model::ModelConfig {
+            budget: Duration::from_secs(150),
+            ..Default::default()
+        };
+        let secs = Duration::from_secs;
+        assert_eq!(model_budget(&cfg, false, None), secs(150));
+        assert_eq!(model_budget(&cfg, true, None), secs(60), "a hook holds it");
+        assert_eq!(model_budget(&cfg, false, Some(secs(90))), secs(90));
+        assert_eq!(model_budget(&cfg, true, Some(secs(30))), secs(30));
+        let short = rvl_model::ModelConfig {
+            budget: secs(20),
+            ..Default::default()
+        };
+        assert_eq!(model_budget(&short, true, None), secs(20), "lower is kept");
+    }
 
     // --- the detached reindex log stays bounded (po-gvzpc) ---
 

@@ -12,6 +12,10 @@
 //! strips whitespace by Python's definition of it; so does this module.
 //! The goldens test (`tests/render_goldens.rs`) holds the two to the same
 //! bytes and the same token ids.
+//!
+//! The token ids are the model's input as they are: truncated to the
+//! bundle's `max_length`, never padded (`classify`). A model is to be
+//! measured the same way, each input at its own length.
 
 use rvl_core::Snippet;
 

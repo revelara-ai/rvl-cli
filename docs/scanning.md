@@ -329,6 +329,12 @@ reported the same way. The scan fails open, like every other degraded lane;
 retrieval budget, and these limits apply inside it. The in-process lanes
 (config, secrets, structure) read files and are not bounded.
 
+The decision-model lane has its own limit, inside the scan budget:
+`scanner.decision_model_budget` (default `60s`, at most `60s` under a hook
+and `--changed-only`). Its questions are asked site by site in scan order;
+the ones it does not reach abstain, and COVERAGE says how many, in how many
+files, from which file on.
+
 The flag is not `--timeout`: on `rvl scan` that is the submission-mode HTTP
 timeout.
 
