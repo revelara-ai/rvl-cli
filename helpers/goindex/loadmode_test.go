@@ -15,8 +15,9 @@ import (
 // type-check every transitive dependency -- the standard library and every
 // imported module -- from source, keeping every function body's AST and type
 // facts. goindex only reads the ROOT packages' bodies, so all of that was dead
-// weight: 2.26 GB on a 28 MB prometheus checkout, 3.8 GB on a 57 MB temporal
-// one. A pre-commit hook that can OOM the machine it protects gets uninstalled.
+// weight: 2.26 GB on a 28 MB prometheus checkout, 3.8 GB on a 57 MB checkout
+// of a large open-source monorepo. A pre-commit hook that can OOM the machine
+// it protects gets uninstalled.
 //
 // Dependencies are still type-checked from source (export data would need a
 // compile, which on a cold build cache blows the hook's 10s cap), but their
