@@ -381,25 +381,25 @@ fn batch_hook<'a>(
 }
 
 /// What the lane reads of a file asked about: its import block and its
-/// text, which the callee definition is found in.
-#[derive(Default)]
+/// text, which the site window and the callee definition are taken from.
 struct File {
     imports: String,
-    source: String,
+    /// The file, when it could be read.
+    source: Option<String>,
 }
 
 /// Each file asked about, by its path in the site.
 type Files = std::collections::HashMap<String, File>;
 
 /// Each file is read once, however many questions its sites are asked. A
-/// file that cannot be read has no import block and no callee definition.
+/// file that cannot be read has no import block and no source.
 fn files_of(repo_root: &Path, asks: &[Ask]) -> Files {
     let mut out = Files::new();
     for a in asks {
         let file = &a.site.file_path;
         if !out.contains_key(file) {
-            let source = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-            let imports = render::imports_block(file, &source);
+            let source = std::fs::read_to_string(repo_root.join(file)).ok();
+            let imports = render::imports_block(file, source.as_deref().unwrap_or_default());
             out.insert(file.clone(), File { imports, source });
         }
     }
@@ -412,22 +412,28 @@ fn input_of(a: &Ask, files: &Files, layout: Layout) -> String {
 }
 
 /// The model's input site, from what rvl retrieved and the site's file: the
-/// file's import block, and the definition in that file of a name called on
-/// the site line ([`render::callee_definition`]), as the training packets
-/// have them.
+/// window around the site and the file's import block, and the definition in
+/// that file of a name called on the site line ([`render::callee_definition`]),
+/// as the training packets have them. A file that cannot be read keeps the
+/// retriever's snippet and has no callee block.
 fn site_of(a: &Ask, files: &Files) -> render::Site {
     let s = a.site;
     let file = files.get(&s.file_path);
-    let (callee_name, callee_definition) = file
-        .and_then(|f| render::callee_definition(&f.source, s.line_number as usize))
+    let source = file.and_then(|f| f.source.as_deref());
+    let (callee_name, callee_definition) = source
+        .and_then(|t| render::callee_definition(t, s.line_number as usize))
         .unwrap_or_default();
+    let snippet = match source {
+        Some(t) => render::snippet_window(t, s.line_number as usize),
+        None => s.snippet.clone(),
+    };
     render::Site {
         class: a.class.clone(),
         scope: s.scope().as_str().to_string(),
         language: s.lang.clone(),
         file: s.file_path.clone(),
         site: format!("{}:{}", s.file_path, s.line_number),
-        snippet: s.snippet.clone(),
+        snippet,
         imports: file.map(|f| f.imports.clone()).unwrap_or_default(),
         callee_name,
         callee_definition,
@@ -935,7 +941,10 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let files = files_of(root.path(), std::slice::from_ref(&a));
+            let mut files = files_of(root.path(), std::slice::from_ref(&a));
+            // The goldens' snippets are opaque strings, not windows of this
+            // file: the retriever's snippet stands in.
+            files.values_mut().for_each(|f| f.source = None);
             let mut s = site_of(&a, &files);
             // The goldens' callee definitions are bare bodies, not the
             // numbered block found in the file: they are the golden's own
@@ -993,6 +1002,35 @@ mod tests {
         site.file_path = "gone.py".into();
         let s = site_of(&ask(&site, &f), &files);
         assert_eq!((s.callee_name, s.callee_definition), Default::default());
+    }
+
+    #[test]
+    fn the_site_snippet_is_the_files_window_and_the_retrievers_without_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("svc")).unwrap();
+        let go = "package svc\n\nimport \"net/http\"\n\nfunc f(c *http.Client) {\n\tc.Do(nil)\n}\n";
+        std::fs::write(root.path().join("svc/a.go"), go).unwrap();
+        let f = frame(&[]);
+        let mut site = rvl_core::Site {
+            file_path: "svc/a.go".into(),
+            line_number: 6,
+            snippet: "c.Do(nil)".into(),
+            ..rvl_core::Site::default()
+        };
+        let files = files_of(root.path(), std::slice::from_ref(&ask(&site, &f)));
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!(s.snippet, render::snippet_window(go, 6));
+        assert!(s
+            .snippet
+            .contains("\n   5 | func f(c *http.Client) {\n>  6 | \tc.Do(nil)\n"));
+        assert_eq!(s.imports, "   3 | import \"net/http\"");
+        let text = input_of(&ask(&site, &f), &files, Layout::Compact);
+        assert!(text.contains("Site svc/a.go:6:\n   1 | package svc\n"));
+
+        site.file_path = "svc/gone.go".into();
+        let files = files_of(root.path(), std::slice::from_ref(&ask(&site, &f)));
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!((s.snippet.as_str(), s.imports.as_str()), ("c.Do(nil)", ""));
     }
 
     #[test]
