@@ -1,0 +1,13 @@
+def crlf(x):
+    return x
+y = crlf(1)
+ def nbsp(x):
+z = nbsp(2)
+w = vtab (3)
+Ünit unicode(int a) {
+q = unicode(4)
+def vt(x):
+r = vt(5)
+def again(x): return again(x - 1)
+fn tupled<T>(t: T) {}
+s = tupled(t) + tupled(u)

@@ -161,8 +161,8 @@ pub fn run(
     };
     let mut budget_lines = Vec::new();
     if !asks.is_empty() {
-        let imports = imports_of(repo_root, &asks);
-        match infer(cfg, &cached.dir, m, &asks, &imports, budget, progress) {
+        let files = files_of(repo_root, &asks);
+        match infer(cfg, &cached.dir, m, &asks, &files, budget, progress) {
             Ok((digest, decisions, lines)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
@@ -257,7 +257,7 @@ fn infer(
     dir: &Path,
     m: &ModelManifest,
     asks: &[Ask],
-    imports: &Imports,
+    files: &Files,
     budget: Duration,
     progress: &ProgressBar,
 ) -> anyhow::Result<(String, Vec<Decision>, Vec<String>)> {
@@ -284,7 +284,7 @@ fn infer(
         ..Default::default()
     };
     let mut classifier = rvl_model::Classifier::new(runtime, bundle, opts)?;
-    let texts: Vec<String> = asks.iter().map(|a| input_of(a, imports, layout)).collect();
+    let texts: Vec<String> = asks.iter().map(|a| input_of(a, files, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     progress.set_message("Running the decision model");
     progress.set_position(0);
@@ -380,33 +380,47 @@ fn batch_hook<'a>(
     }
 }
 
-/// The import block of each file asked about, by its path in the site.
-type Imports = std::collections::HashMap<String, String>;
+/// What the lane reads of a file asked about: its import block and its
+/// text, which the callee definition is found in.
+#[derive(Default)]
+struct File {
+    imports: String,
+    source: String,
+}
+
+/// Each file asked about, by its path in the site.
+type Files = std::collections::HashMap<String, File>;
 
 /// Each file is read once, however many questions its sites are asked. A
-/// file that cannot be read has no import block.
-fn imports_of(repo_root: &Path, asks: &[Ask]) -> Imports {
-    let mut out = Imports::new();
+/// file that cannot be read has no import block and no callee definition.
+fn files_of(repo_root: &Path, asks: &[Ask]) -> Files {
+    let mut out = Files::new();
     for a in asks {
         let file = &a.site.file_path;
         if !out.contains_key(file) {
             let source = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-            out.insert(file.clone(), render::imports_block(file, &source));
+            let imports = render::imports_block(file, &source);
+            out.insert(file.clone(), File { imports, source });
         }
     }
     out
 }
 
 /// The model's input for one question.
-fn input_of(a: &Ask, imports: &Imports, layout: Layout) -> String {
-    render::render_input(&site_of(a, imports), &question_of(a.frame), layout)
+fn input_of(a: &Ask, files: &Files, layout: Layout) -> String {
+    render::render_input(&site_of(a, files), &question_of(a.frame), layout)
 }
 
-/// The model's input site, from what rvl retrieved: the file's import
-/// block, and the definition called at the site ([`callee_at`]).
-fn site_of(a: &Ask, imports: &Imports) -> render::Site {
+/// The model's input site, from what rvl retrieved and the site's file: the
+/// file's import block, and the definition in that file of a name called on
+/// the site line ([`render::callee_definition`]), as the training packets
+/// have them.
+fn site_of(a: &Ask, files: &Files) -> render::Site {
     let s = a.site;
-    let callee = callee_at(s);
+    let file = files.get(&s.file_path);
+    let (callee_name, callee_definition) = file
+        .and_then(|f| render::callee_definition(&f.source, s.line_number as usize))
+        .unwrap_or_default();
     render::Site {
         class: a.class.clone(),
         scope: s.scope().as_str().to_string(),
@@ -414,23 +428,12 @@ fn site_of(a: &Ask, imports: &Imports) -> render::Site {
         file: s.file_path.clone(),
         site: format!("{}:{}", s.file_path, s.line_number),
         snippet: s.snippet.clone(),
-        imports: imports.get(&s.file_path).cloned().unwrap_or_default(),
-        callee_name: callee.map(|c| c.symbol.clone()).unwrap_or_default(),
-        callee_definition: callee.map(|c| c.source.clone()).unwrap_or_default(),
+        imports: file.map(|f| f.imports.clone()).unwrap_or_default(),
+        callee_name,
+        callee_definition,
         packet: render::SitePacket::from(s),
         ..render::Site::default()
     }
-}
-
-/// The function called at the site: the retriever's callee whose name is
-/// the site's method, or none. The retrievers' callees are every in-repo
-/// function the enclosing function calls, so the first of them is often
-/// another call. A Python callee is qualified (`Client.publish`), so only its
-/// last segment is compared.
-fn callee_at(s: &rvl_core::Site) -> Option<&rvl_core::Snippet> {
-    s.callees
-        .iter()
-        .find(|c| !s.method.is_empty() && c.symbol.rsplit(['.', ':']).next() == Some(&s.method))
 }
 
 /// A frame's question, with its cells in the training text's form,
@@ -833,7 +836,7 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let text = input_of(&a, &Imports::new(), layout);
+            let text = input_of(&a, &Files::new(), layout);
             assert_eq!(text, g["text"].as_str().unwrap(), "{layout:?}");
             assert!(text.contains("\nControl: RC-022 Retry, Backoff and Request Coalescing\n"));
             checked += 1;
@@ -922,21 +925,6 @@ mod tests {
             let mut site: rvl_core::Site = serde_json::from_value(sp.clone()).unwrap();
             site.snippet = str_of(&packet["snippet"]);
             site.lang = str_of(&row["language"]);
-            if !str_of(&packet["callee_definition"]).is_empty() {
-                // The goldens' site packets name no method: the callee is
-                // the one called at the site.
-                site.method = str_of(&packet["callee_name"])
-                    .rsplit('.')
-                    .next()
-                    .unwrap()
-                    .to_string();
-                site.callees = vec![rvl_core::Snippet {
-                    file: file.clone(),
-                    line: 1,
-                    symbol: str_of(&packet["callee_name"]),
-                    source: str_of(&packet["callee_definition"]),
-                }];
-            }
             let f = frame_of_text(&str_of(&row["control"]), &str_of(&row["question"]["text"]));
             let a = Ask {
                 site: &site,
@@ -947,12 +935,18 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let imports = imports_of(root.path(), std::slice::from_ref(&a));
-            let text = input_of(&a, &imports, layout);
+            let files = files_of(root.path(), std::slice::from_ref(&a));
+            let mut s = site_of(&a, &files);
+            // The goldens' callee definitions are bare bodies, not the
+            // numbered block found in the file: they are the golden's own
+            // (the callee goldens of rvl-model check the block).
+            s.callee_name = str_of(&packet["callee_name"]);
+            s.callee_definition = str_of(&packet["callee_definition"]);
+            let text = render::render_input(&s, &question_of(a.frame), layout);
             assert_eq!(text, str_of(&g["text"]), "{} {layout:?}", row["id"]);
             checked[0] += 1;
             checked[1] += !str_of(&packet["imports"]).is_empty() as usize;
-            checked[2] += !site.callees.is_empty() as usize;
+            checked[2] += !s.callee_definition.is_empty() as usize;
         }
         assert_eq!(
             checked,
@@ -962,33 +956,43 @@ mod tests {
     }
 
     #[test]
-    fn the_callee_block_is_the_function_called_at_the_site_or_none() {
-        let snippet = |symbol: &str| rvl_core::Snippet {
-            symbol: symbol.into(),
-            source: format!("def {symbol}(): ..."),
-            ..rvl_core::Snippet::default()
-        };
+    fn the_callee_block_is_the_definition_in_the_sites_file_of_a_name_called_on_its_line() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("q.py"),
+            "import requests\n\ndef send(body):\n    return requests.post(URL, data=body)\n\n\
+             def publish(body):\n    send(body)\n",
+        )
+        .unwrap();
         let mut site = rvl_core::Site {
-            method: "publish".into(),
-            callees: vec![snippet("_token"), snippet("QueueClient.publish")],
+            file_path: "q.py".into(),
+            line_number: 7,
+            // The retriever's callees are not read.
+            callees: vec![rvl_core::Snippet {
+                symbol: "send".into(),
+                source: "def send(body): ...".into(),
+                ..rvl_core::Snippet::default()
+            }],
             ..rvl_core::Site::default()
         };
         let f = frame(&[]);
-        let imports = Imports::new();
-        let s = site_of(&ask(&site, &f), &imports);
-        assert_eq!(s.callee_name, "QueueClient.publish");
-        assert_eq!(s.callee_definition, "def QueueClient.publish(): ...");
-        // The enclosing function calls in-repo code, but not at the site.
-        site.method = "get".into();
-        let s = site_of(&ask(&site, &f), &imports);
+        let files = files_of(root.path(), &[ask(&site, &f)]);
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!(s.callee_name, "send");
         assert_eq!(
-            (s.callee_name, s.callee_definition),
-            (String::new(), String::new())
+            s.callee_definition,
+            "   3 | def send(body):\n   4 |     return requests.post(URL, data=body)\n   5 | \n\
+             \x20  6 | def publish(body):\n   7 |     send(body)\n   8 | "
         );
-        // A site that names no method has no callee.
-        site.method.clear();
-        site.callees = vec![snippet("")];
-        assert!(callee_at(&site).is_none());
+        assert_eq!(s.imports, "   1 | import requests");
+        // A call into another file has no callee block.
+        site.line_number = 4;
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!((s.callee_name, s.callee_definition), Default::default());
+        // Nor has a site whose file was not read.
+        site.file_path = "gone.py".into();
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!((s.callee_name, s.callee_definition), Default::default());
     }
 
     #[test]
