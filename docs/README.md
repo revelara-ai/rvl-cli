@@ -26,6 +26,7 @@ end.
 | [Releasing](releasing.md) | Cutting a release, and how each retriever helper is packaged. |
 | [Test packets](test-packets.md) | Why hand-authored `--retrieved` test packets must be bound to a live helper run, and the per-lane audit. |
 | [The top-20 lens candidates, reconciled](lens-reconciliation.md) | Which of the ranked lens classes the scanner already ships, which need only a corpus entry, and which need a retriever. Read it before you port a lens class. |
+| [Waiver scope](waiver-scope.md) | Design, not built: value-fingerprint and site waivers alongside today's file and class waivers, what `rvl suppress` should write by default, and inline allow-comments. |
 
 The repository's top-level [README](../README.md) covers building, testing,
 workspace layout, and where a change goes.
