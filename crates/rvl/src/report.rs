@@ -538,6 +538,48 @@ mod tests {
         );
     }
 
+    /// AUDIT: judgment provenance is display text from the signed cache and
+    /// never reaches the shape-only payload. A sentinel planted in
+    /// `source_note` (and the refs) rides the same scan's triage, proving it
+    /// was in reach, and is absent from the report and the queue.
+    #[test]
+    fn judgment_provenance_never_reaches_the_report_payload() {
+        const SENTINEL_NOTE: &str = "PROVENANCE_NOTE_SECRET_q7w8e9";
+        const SENTINEL_REF: &str = "PROVENANCE_REF_SECRET_r4t5y6";
+        let judged = unknown_site("db.Pool", "Exec");
+        let sites = vec![judged.clone(), unknown_site("db.Pool", "Query")];
+        let findings = vec![
+            Finding {
+                site_id: judged.site_key(),
+                verdict: rvl_core::Verdict::Violates,
+                reason: "no bound anywhere".into(),
+            },
+            finding("no spec for db.Pool.Query"),
+        ];
+        let judgments: Vec<rvl_triage::ClassJudgment> =
+            serde_json::from_value(serde_json::json!([{
+                "api": "db.Pool.Exec", "scope": "runtime", "verdict": "surface",
+                "severity": "high", "control": "RC-019", "source_kind": "incident",
+                "source_refs": [SENTINEL_REF], "source_note": SENTINEL_NOTE,
+            }]))
+            .unwrap();
+        let verdicts: Vec<_> = findings
+            .iter()
+            .map(|f| (f.site_id.clone(), f.verdict, f.reason.clone()))
+            .collect();
+        let items = rvl_triage::triage(&sites, &verdicts, &judgments);
+        assert_eq!(items[0].provenance.source_note, SENTINEL_NOTE);
+
+        let report = serde_json::to_string(&build_report(&sites, &findings, "9.9.9")).unwrap();
+        assert!(report.contains("db.Pool"), "{report}");
+        let queue = serde_json::to_string(&build_queue(&sites, &findings)).unwrap();
+        for json in [report, queue] {
+            for leaked in [SENTINEL_NOTE, SENTINEL_REF, "source_note", "source_refs"] {
+                assert!(!json.contains(leaked), "{leaked} leaked: {json}");
+            }
+        }
+    }
+
     #[test]
     fn lang_is_normalized_so_a_snippet_cannot_ride() {
         // `lang` is free-form on the wire INTO rvl. Everything that is not
