@@ -97,3 +97,85 @@ defect. See "Misuse shapes" in `docs/retrievers.md`.
 
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.
+
+## Retrieval budgets
+
+Five flags bound how much of the search reaches a packet. Each is a sweep
+axis, and the defaults stay where they are until the precision of a raise is
+measured:
+
+| Flag | Default | What it caps |
+| --- | --- | --- |
+| `-max-callers` | 4 | ancestors emitted per site (`provenance.hit_caller_budget`) |
+| `-max-callees` | 4 | in-repo callees emitted per site |
+| `-max-snippet` | 2400 | bytes per snippet (`// ... truncated`) |
+| `-max-depth` | 12 | levels of the upward walk (`provenance.hit_depth_cap`) |
+| `-max-ctors` | 2 | constructions emitted per site |
+
+The walk itself and its counts (`ancestors_traced`, `ancestors_with_deadline`,
+`direct_callers`, `direct_callers_passing_bounded_ctx`) do not depend on
+`-max-callers`: that flag decides how many ancestors are shown, and whether
+the search counts as complete. rvl reasons from "no bound found" only on a
+complete search, so a raise that makes a site complete turns an `unresolved
+bounds` abstain into a decision. Which way the decision goes is the
+precision question. Raising the budgets on a corpus the rulesets were
+authored against closed most of its `unresolved bounds` abstains, and it also
+removed 6 advisory findings. Nothing measured whether those 6 were false
+positives.
+
+Measured on 2026-10-29: goindex built from this repository at `a8a1893` (Go
+1.27.3), with `-retrieve` on two public comparator repositories. Each flag was
+raised alone, then together. A site is a call-site packet (no `site_kind`).
+"Incomplete" means `hit_caller_budget` or `hit_depth_cap`.
+
+| authelia/authelia `e5b644b` (211 sites) | incomplete | callee cut | snippet cut | stream |
+| --- | --- | --- | --- | --- |
+| defaults 4/4/2400/12 | 47 | 42 | 44 | 2.3 MB |
+| `-max-callers 8` | 28 | 42 | 49 | 2.5 MB |
+| `-max-callers 16` | 14 | 42 | 50 | 2.8 MB |
+| `-max-callers 24` | 10 | 42 | 50 | 2.9 MB |
+| `-max-callees 16` | 47 | 39 | 44 | 2.4 MB |
+| `-max-snippet 12000` | 47 | 42 | 3 | 2.6 MB |
+| `-max-depth 32` | 47 | 42 | 44 | 2.3 MB |
+| 24/16/12000/32 | 10 | 39 | 7 | 3.5 MB |
+
+| argoproj/argo-cd `e1a6522` (1967 sites) | incomplete | callee cut | snippet cut | stream |
+| --- | --- | --- | --- | --- |
+| defaults 4/4/2400/12 | 124 (4 at the depth cap) | 163 | 223 | 11.7 MB |
+| `-max-callers 8` | 83 | 163 | 235 | 12.5 MB |
+| `-max-callers 16` | 67 | 163 | 241 | 13.4 MB |
+| `-max-callers 24` | 59 | 163 | 242 | 14.5 MB |
+| `-max-callees 16` | 124 | 153 | 223 | 12.2 MB |
+| `-max-snippet 12000` | 124 | 163 | 57 | 14.0 MB |
+| `-max-depth 32` | 124 (0 at the depth cap) | 163 | 223 | 11.7 MB |
+| 24/16/12000/32 | 59 | 153 | 82 | 19.3 MB |
+
+What this shows:
+
+- Only `-max-callers` changes whether a search is complete. Callees, snippet
+  bytes and depth change what the packet shows but complete no site. On
+  argo-cd, the 4 sites at the depth cap were also over the caller budget, so
+  `-max-depth 32` alone completes none of them.
+- The knee is the caller budget. An incomplete site needs `-max-callers` at
+  least equal to its `ancestors_traced`. At `-max-callers 24`, authelia keeps
+  10 incomplete sites (25 to 78 ancestors). argo-cd keeps 59: 10 with 26 to 95
+  ancestors and 49 with 121 to 392, which is fan-in to shared server code that
+  no emitted-caller budget reaches.
+- At the defaults, every site that the raise completes has a
+  `none_bounded` dataflow verdict, except 1 `all_bounded` and 3 `mixed` sites
+  on argo-cd. Where the API's spec needs a bound, a complete search over
+  `none_bounded` evidence is a finding. On these two repositories, the raise
+  therefore moves toward more findings, not fewer. That is the opposite of
+  the earlier 6 advisory findings removed. If a drop appears here, the
+  structural evidence did not cause it. The cause is what the decision model
+  read in the extra caller text, and only adjudication can say whether that
+  reading is right.
+- The full raise costs +52% (authelia) and +65% (argo-cd) of packet stream.
+  `-max-callers 24` alone costs +26% and +24%, and makes as many sites
+  complete.
+
+This is a retrieval measurement, not a coverage one. It counts which sites a
+raise would let rvl decide, not which of those sites have a spec that would
+decide them. Choosing values needs the per-site precision of the decisions
+that flip, adjudicated on a development repository and then confirmed once
+on a held-out gate set. Re-run the sweep for each language.

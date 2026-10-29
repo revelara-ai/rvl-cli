@@ -22,6 +22,18 @@ judged in its context. See "Construction rules" in `docs/retrievers.md`.
 - New: `guard` on a Go construction field site in `--retrieved` and the
   site records, the condition of the `if` that holds the setting.
 
+### `rvl explain` says what a judgment was authored from
+
+A judgment in the spec cache may name what it was authored from: a pattern,
+an incident or documentation, the refs to it, and a note. `rvl explain`
+prints them in an `authored from:` block after the fix, and prints nothing
+when the judgment names none.
+
+- Added: `--out` `findings[].source_kind`, `source_refs` and `source_note`,
+  each absent when empty. They never change `severity`, the gate or `exit`.
+- The refs are printed as the cache gives them; `rvl` looks nothing up.
+- An older `rvl` reads a cache with these fields and ignores them.
+
 ### Construction rules judge crypto, TLS and database call sites
 
 A `config_keys` spec with the format `construction` judges a construction

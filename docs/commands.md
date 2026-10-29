@@ -12,7 +12,7 @@ Every command takes `--help`, and most of the platform commands take
 | `rvl scan digest <ENGINE_DOC>` | Print the residual-scoping digest of a scan document (`scan --out`). See [Orchestrated scans](#orchestrated-scans). |
 | `rvl scan finalize <SCAN_DIR>` | Rebuild the findings files of a submit directory from the lens outputs. See [Orchestrated scans](#orchestrated-scans). |
 | `rvl scan report <ENGINE_DOC>` | Print the sections of the scan report that are pure data, as Markdown. See [Orchestrated scans](#orchestrated-scans). |
-| `rvl explain <ID> [PATH]` | Explain one finding as an evidence block: the sites it covers, the control, and the fix. |
+| `rvl explain <ID> [PATH]` | Explain one finding as an evidence block: the sites it covers, the control, the fix, and what its judgment was authored from. |
 | `rvl suppress <ID> [PATH] [--reason …] [--expires YYYY-MM-DD]` | Waive a finding: append a rule waiver to `./.revelara.yaml` under `scanner.waivers`. |
 | `rvl report [PATH]` | Show exactly what a scan would report about unknown API surfaces (shape only). See [Privacy](privacy.md). |
 | `rvl report --combine <FILE>...` | Read report payloads written by `rvl report --out`, one per repository, and rank the surfaces by how many repositories have each one. See [Privacy](privacy.md#combine-the-reports-of-several-repositories). |

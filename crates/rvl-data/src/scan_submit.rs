@@ -243,9 +243,10 @@ pub struct EffectiveTolerance {
 
 // --- typed finding (dedup round-trip; rvl-cli internal/scanner/wire.go) ---
 
-/// The typed finding the `--scan-dir` dedup pass round-trips through.
-/// Carries the STPA and graph-evidence fields so the round-trip cannot
-/// strip them from the request (po-gli2z).
+/// The typed finding the dedup pass keys and ranks on. The `--scan-dir`
+/// path emits each winner's raw row (`dedup_scan_dir_findings`), so a
+/// field missing here is not lost there; the STPA and graph-evidence
+/// fields are still carried for `deduplicate_findings` callers.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanFinding {
@@ -340,10 +341,15 @@ pub struct ScanProvenance {
 /// the highest risk_score (first-seen wins ties by lexical order) and
 /// merging corroboration. Port of rvl-cli scanner.DeduplicateFindings.
 pub fn deduplicate_findings(findings: Vec<ScanFinding>) -> Vec<ScanFinding> {
-    if findings.is_empty() {
-        return findings;
-    }
+    dedup_winners(findings)
+        .into_iter()
+        .map(|(_, f)| f)
+        .collect()
+}
 
+/// The dedup pass itself: each surviving finding, with its corroboration
+/// merged, beside the index it had in the input.
+fn dedup_winners(findings: Vec<ScanFinding>) -> Vec<(usize, ScanFinding)> {
     fn evidence_path(f: &ScanFinding) -> &str {
         f.evidence.first().map(|e| e.path.as_str()).unwrap_or("")
     }
@@ -384,12 +390,14 @@ pub fn deduplicate_findings(findings: Vec<ScanFinding>) -> Vec<ScanFinding> {
     let mut winners: std::collections::HashMap<(String, String, i64), usize> =
         std::collections::HashMap::with_capacity(findings.len());
     let mut result: Vec<ScanFinding> = Vec::with_capacity(findings.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(findings.len());
 
-    for f in findings {
+    for (i, f) in findings.into_iter().enumerate() {
         let k = key_for(&f);
         let Some(&idx) = winners.get(&k) else {
             winners.insert(k, result.len());
             result.push(f);
+            origin.push(i);
             continue;
         };
 
@@ -411,6 +419,7 @@ pub fn deduplicate_findings(findings: Vec<ScanFinding>) -> Vec<ScanFinding> {
             let mut new_winner = f;
             new_winner.corroborated_by_agents = corroboration;
             result[idx] = new_winner;
+            origin[idx] = i;
         } else {
             let loser_component = f.component.clone();
             let mut corroboration = merge_strings(
@@ -423,7 +432,50 @@ pub fn deduplicate_findings(findings: Vec<ScanFinding>) -> Vec<ScanFinding> {
             result[idx].corroborated_by_agents = corroboration;
         }
     }
-    result
+    origin.into_iter().zip(result).collect()
+}
+
+/// Deduplicate merged `--scan-dir` findings on their raw values: the
+/// typed pass picks the winners, and each winner is emitted as its own
+/// input row with only `corroborated_by_agents` rewritten, so a field
+/// `ScanFinding` does not model (corroboration, substantiation,
+/// graph_evidence, ...) survives. A string `provenance` is the skill's
+/// lens attribution ("agent:golang-pro", "engine"), not a
+/// `ScanProvenance`: the typed view drops it, the raw row keeps it.
+/// Returns how many rows were removed, or the error of the first row
+/// the typed view cannot parse (and leaves `findings` untouched).
+fn dedup_scan_dir_findings(findings: &mut Vec<Value>) -> Result<usize, String> {
+    let mut typed = Vec::with_capacity(findings.len());
+    for (i, raw) in findings.iter().enumerate() {
+        let mut view = raw.clone();
+        if let Value::Object(m) = &mut view {
+            if m.get("provenance").is_some_and(|p| !p.is_object()) {
+                m.remove("provenance");
+            }
+        }
+        match serde_json::from_value::<ScanFinding>(view) {
+            Ok(f) => typed.push(f),
+            Err(e) => return Err(format!("finding {i}: {e}")),
+        }
+    }
+    let original = typed.len();
+    let winners = dedup_winners(typed);
+    if winners.len() == original {
+        return Ok(0);
+    }
+    let mut out = Vec::with_capacity(winners.len());
+    for (i, f) in winners {
+        let mut raw = std::mem::take(&mut findings[i]);
+        if let (Value::Object(m), false) = (&mut raw, f.corroborated_by_agents.is_empty()) {
+            m.insert(
+                "corroborated_by_agents".into(),
+                Value::from(f.corroborated_by_agents),
+            );
+        }
+        out.push(raw);
+    }
+    *findings = out;
+    Ok(original - findings.len())
 }
 
 // --- request emission (Go struct-marshal parity) ---
@@ -1497,27 +1549,14 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     };
     print_normalization_issues(&norm_report);
 
-    // Deduplicate cross-agent findings after a scan-dir merge, via the
-    // typed round-trip (which is exactly why ScanFinding carries the STPA
-    // fields). A round-trip that cannot parse leaves findings untouched.
+    // Deduplicate cross-agent findings after a scan-dir merge. A row the
+    // typed view cannot parse leaves findings untouched, and says so.
     if scan_dir.is_some() {
-        if let Some(findings) = &req.findings {
-            if !findings.is_empty() {
-                if let Ok(typed) =
-                    serde_json::from_value::<Vec<ScanFinding>>(Value::Array(findings.clone()))
-                {
-                    let original = typed.len();
-                    let deduped = deduplicate_findings(typed);
-                    if deduped.len() < original {
-                        eprintln!(
-                            "scanner: deduplicated {} cross-agent duplicate(s)",
-                            original - deduped.len()
-                        );
-                        if let Ok(Value::Array(vals)) = serde_json::to_value(&deduped) {
-                            req.findings = Some(vals);
-                        }
-                    }
-                }
+        if let Some(findings) = req.findings.as_mut() {
+            match dedup_scan_dir_findings(findings) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("scanner: deduplicated {n} cross-agent duplicate(s)"),
+                Err(e) => eprintln!("scanner: cross-agent dedup skipped: {e}"),
             }
         }
     }
@@ -2332,6 +2371,53 @@ mod tests {
             vec!["api".to_string()],
             "loser component recorded as corroboration"
         );
+    }
+
+    /// Two lens files of one scan dir report the same finding, each with
+    /// the skill's string provenance and fields `ScanFinding` does not
+    /// model: the dedup must run, keep one row, and keep those fields.
+    #[test]
+    fn scan_dir_dedup_runs_on_string_provenance_and_keeps_unmodeled_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let row = |agent: &str, score: i64| {
+            serde_json::json!({
+                "title": "Missing timeout",
+                "category": "resilience",
+                "likelihood": "high",
+                "impact": "high",
+                "slug": "missing-timeout",
+                "component": agent,
+                "risk_score": score,
+                "provenance": format!("agent:{agent}"),
+                "evidence": [{"type": "code", "path": "a.go", "line_number": 10}],
+                "graph_evidence": {"paths": [["a", "b"]], "lens": agent},
+                "substantiation": {"verdict": "substantiated"},
+                "practice_class": "timeouts"
+            })
+        };
+        for (name, agent, score) in [
+            ("03-findings-golang-pro.json", "golang-pro", 70),
+            ("03-findings-sre.json", "sre", 40),
+        ] {
+            let doc = serde_json::json!({"findings": [row(agent, score)]});
+            write(dir, name, &doc.to_string());
+        }
+
+        let mut req = ScanRequest::default();
+        merge_scan_dir(dir, &mut req).unwrap();
+        let findings = req.findings.as_mut().unwrap();
+        normalize_findings(findings);
+        assert_eq!(dedup_scan_dir_findings(findings), Ok(1));
+
+        assert_eq!(findings.len(), 1, "the shared finding dedups to one row");
+        let f = &findings[0];
+        assert_eq!(f["risk_score"], 70, "highest score wins");
+        assert_eq!(f["graph_evidence"]["lens"], "golang-pro");
+        assert_eq!(f["substantiation"]["verdict"], "substantiated");
+        assert_eq!(f["practice_class"], "timeouts");
+        assert_eq!(f["provenance"], "agent:golang-pro");
+        assert_eq!(f["corroborated_by_agents"], serde_json::json!(["sre"]));
     }
 
     // --- misc helpers ---

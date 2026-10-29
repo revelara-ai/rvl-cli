@@ -342,6 +342,13 @@ The orchestrator uses it to:
   no factor for the control, and when the cache predates the section. A
   document from a release that does not write the field has no `factors`
   key: read that as "not reported", not as "no factors".
+- `findings[].source_kind`, `findings[].source_refs` and
+  `findings[].source_note` say what the row's judgment was authored from:
+  the kind (`pattern` | `incident` | `documentation`), the public pattern
+  UUIDs or incident short names, and a note, as the spec cache's judgment
+  gives them. Each is absent when empty, which includes every row with no
+  judgment. They are display only: `severity`, the gate and `exit` never
+  read them.
 - `findings[].subject` is what the row is about, in the shape the server's
   scan submission reads (`{"kind", "value"}`). An orchestrator that submits
   an engine row copies it to the finding unchanged, so that the identity of
