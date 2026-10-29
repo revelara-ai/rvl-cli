@@ -161,8 +161,8 @@ pub fn run(
     };
     let mut budget_lines = Vec::new();
     if !asks.is_empty() {
-        let imports = imports_of(repo_root, &asks);
-        match infer(cfg, &cached.dir, m, &asks, &imports, budget, progress) {
+        let files = files_of(repo_root, &asks);
+        match infer(cfg, &cached.dir, m, &asks, &files, budget, progress) {
             Ok((digest, decisions, lines)) => {
                 summary.weights_digest = digest;
                 summary.sites = decisions;
@@ -257,7 +257,7 @@ fn infer(
     dir: &Path,
     m: &ModelManifest,
     asks: &[Ask],
-    imports: &Imports,
+    files: &Files,
     budget: Duration,
     progress: &ProgressBar,
 ) -> anyhow::Result<(String, Vec<Decision>, Vec<String>)> {
@@ -284,7 +284,7 @@ fn infer(
         ..Default::default()
     };
     let mut classifier = rvl_model::Classifier::new(runtime, bundle, opts)?;
-    let texts: Vec<String> = asks.iter().map(|a| input_of(a, imports, layout)).collect();
+    let texts: Vec<String> = asks.iter().map(|a| input_of(a, files, layout)).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     progress.set_message("Running the decision model");
     progress.set_position(0);
@@ -380,41 +380,57 @@ fn batch_hook<'a>(
     }
 }
 
-/// The import block of each file asked about, by its path in the site.
-type Imports = std::collections::HashMap<String, String>;
+/// What the lane reads of a file asked about.
+struct FileText {
+    /// The file's import block.
+    imports: String,
+    /// The file, when it could be read.
+    source: Option<String>,
+}
+
+/// Each file asked about, by its path in the site.
+type Files = std::collections::HashMap<String, FileText>;
 
 /// Each file is read once, however many questions its sites are asked. A
-/// file that cannot be read has no import block.
-fn imports_of(repo_root: &Path, asks: &[Ask]) -> Imports {
-    let mut out = Imports::new();
+/// file that cannot be read has no import block and no source.
+fn files_of(repo_root: &Path, asks: &[Ask]) -> Files {
+    let mut out = Files::new();
     for a in asks {
         let file = &a.site.file_path;
         if !out.contains_key(file) {
-            let source = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-            out.insert(file.clone(), render::imports_block(file, &source));
+            let source = std::fs::read_to_string(repo_root.join(file)).ok();
+            let imports = render::imports_block(file, source.as_deref().unwrap_or_default());
+            out.insert(file.clone(), FileText { imports, source });
         }
     }
     out
 }
 
 /// The model's input for one question.
-fn input_of(a: &Ask, imports: &Imports, layout: Layout) -> String {
-    render::render_input(&site_of(a, imports), &question_of(a.frame), layout)
+fn input_of(a: &Ask, files: &Files, layout: Layout) -> String {
+    render::render_input(&site_of(a, files), &question_of(a.frame), layout)
 }
 
-/// The model's input site, from what rvl retrieved: the file's import
-/// block, and the definition called at the site ([`callee_at`]).
-fn site_of(a: &Ask, imports: &Imports) -> render::Site {
+/// The model's input site, from what rvl retrieved: the site's window and
+/// the import block of its file, and the definition called at the site
+/// ([`callee_at`]). A file that cannot be read keeps the retriever's
+/// snippet.
+fn site_of(a: &Ask, files: &Files) -> render::Site {
     let s = a.site;
     let callee = callee_at(s);
+    let file = files.get(&s.file_path);
+    let snippet = match file.and_then(|f| f.source.as_deref()) {
+        Some(source) => render::snippet_window(source, s.line_number as usize),
+        None => s.snippet.clone(),
+    };
     render::Site {
         class: a.class.clone(),
         scope: s.scope().as_str().to_string(),
         language: s.lang.clone(),
         file: s.file_path.clone(),
         site: format!("{}:{}", s.file_path, s.line_number),
-        snippet: s.snippet.clone(),
-        imports: imports.get(&s.file_path).cloned().unwrap_or_default(),
+        snippet,
+        imports: file.map(|f| f.imports.clone()).unwrap_or_default(),
         callee_name: callee.map(|c| c.symbol.clone()).unwrap_or_default(),
         callee_definition: callee.map(|c| c.source.clone()).unwrap_or_default(),
         packet: render::SitePacket::from(s),
@@ -833,7 +849,7 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let text = input_of(&a, &Imports::new(), layout);
+            let text = input_of(&a, &Files::new(), layout);
             assert_eq!(text, g["text"].as_str().unwrap(), "{layout:?}");
             assert!(text.contains("\nControl: RC-022 Retry, Backoff and Request Coalescing\n"));
             checked += 1;
@@ -947,8 +963,11 @@ mod tests {
                 "full" => Layout::Full,
                 _ => Layout::Compact,
             };
-            let imports = imports_of(root.path(), std::slice::from_ref(&a));
-            let text = input_of(&a, &imports, layout);
+            let mut files = files_of(root.path(), std::slice::from_ref(&a));
+            // The goldens' snippets are opaque strings, not windows of this
+            // file: the retriever's snippet stands in.
+            files.values_mut().for_each(|f| f.source = None);
+            let text = input_of(&a, &files, layout);
             assert_eq!(text, str_of(&g["text"]), "{} {layout:?}", row["id"]);
             checked[0] += 1;
             checked[1] += !str_of(&packet["imports"]).is_empty() as usize;
@@ -974,13 +993,13 @@ mod tests {
             ..rvl_core::Site::default()
         };
         let f = frame(&[]);
-        let imports = Imports::new();
-        let s = site_of(&ask(&site, &f), &imports);
+        let files = Files::new();
+        let s = site_of(&ask(&site, &f), &files);
         assert_eq!(s.callee_name, "QueueClient.publish");
         assert_eq!(s.callee_definition, "def QueueClient.publish(): ...");
         // The enclosing function calls in-repo code, but not at the site.
         site.method = "get".into();
-        let s = site_of(&ask(&site, &f), &imports);
+        let s = site_of(&ask(&site, &f), &files);
         assert_eq!(
             (s.callee_name, s.callee_definition),
             (String::new(), String::new())
@@ -989,6 +1008,35 @@ mod tests {
         site.method.clear();
         site.callees = vec![snippet("")];
         assert!(callee_at(&site).is_none());
+    }
+
+    #[test]
+    fn the_site_snippet_is_the_files_window_and_the_retrievers_without_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("svc")).unwrap();
+        let go = "package svc\n\nimport \"net/http\"\n\nfunc f(c *http.Client) {\n\tc.Do(nil)\n}\n";
+        std::fs::write(root.path().join("svc/a.go"), go).unwrap();
+        let f = frame(&[]);
+        let mut site = rvl_core::Site {
+            file_path: "svc/a.go".into(),
+            line_number: 6,
+            snippet: "c.Do(nil)".into(),
+            ..rvl_core::Site::default()
+        };
+        let files = files_of(root.path(), std::slice::from_ref(&ask(&site, &f)));
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!(s.snippet, render::snippet_window(go, 6));
+        assert!(s
+            .snippet
+            .contains("\n   5 | func f(c *http.Client) {\n>  6 | \tc.Do(nil)\n"));
+        assert_eq!(s.imports, "   3 | import \"net/http\"");
+        let text = input_of(&ask(&site, &f), &files, Layout::Compact);
+        assert!(text.contains("Site svc/a.go:6:\n   1 | package svc\n"));
+
+        site.file_path = "svc/gone.go".into();
+        let files = files_of(root.path(), std::slice::from_ref(&ask(&site, &f)));
+        let s = site_of(&ask(&site, &f), &files);
+        assert_eq!((s.snippet.as_str(), s.imports.as_str()), ("c.Do(nil)", ""));
     }
 
     #[test]
