@@ -562,6 +562,7 @@ fn finding_of(d: &Decision) -> Option<ladder::Finding> {
         suppressed: false,
         gate_exempt: false,
         factors: Vec::new(),
+        provenance: Default::default(),
     })
 }
 

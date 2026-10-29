@@ -88,6 +88,34 @@ pub struct ClassJudgment {
     /// the mapping and triage only carries it through.
     #[serde(default)]
     pub control: String,
+    /// What the judgment was authored from, flattened so the three keys sit
+    /// beside `control` on the wire as the factory publishes them.
+    #[serde(flatten)]
+    pub provenance: Provenance,
+}
+
+/// What a judgment was authored from: a pattern, an incident or
+/// documentation, the refs to it, and a note. Display only: it never decides
+/// severity, elevation, gating or exit. Every field is optional on the wire,
+/// so a judgment published without it, or before it existed, reads as empty.
+///
+/// The refs are public corpus identities (pattern UUIDs, incident short
+/// names) and are carried as given, never resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// `pattern` | `incident` | `documentation`, as the factory wrote it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_note: String,
+}
+
+impl Provenance {
+    pub fn is_empty(&self) -> bool {
+        self.source_kind.is_empty() && self.source_refs.is_empty() && self.source_note.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +126,8 @@ pub struct TriagedItem {
     pub fix: String,
     /// Control reference carried from the class judgment (e.g. "RC-043").
     pub control: String,
+    /// Provenance carried from the class judgment, the way `control` is.
+    pub provenance: Provenance,
     pub site_count: usize,
     pub example_sites: Vec<String>,
 }
@@ -221,6 +251,7 @@ pub fn triage(
                 severity: j.map(|j| j.severity.clone()).unwrap_or_default(),
                 fix: j.map(|j| j.fix.clone()).unwrap_or_default(),
                 control: j.map(|j| j.control.clone()).unwrap_or_default(),
+                provenance: j.map(|j| j.provenance.clone()).unwrap_or_default(),
                 site_count: ids.len(),
                 example_sites: ids.into_iter().take(3).collect(),
                 class: k,
@@ -332,6 +363,7 @@ mod tests {
                 severity: "low".into(),
                 fix: String::new(),
                 control: String::new(),
+                provenance: Provenance::default(),
             }]
         };
 
@@ -374,6 +406,7 @@ mod tests {
             severity: "high".into(),
             fix: "rotate and move to a secret manager".into(),
             control: "RC-043".into(),
+            provenance: Provenance::default(),
         }];
         let items = triage(&s, &v, &j);
         assert_eq!(items.len(), 1);
@@ -382,6 +415,81 @@ mod tests {
         // An unjudged class carries no control.
         let bare = triage(&s, &v, &[]);
         assert_eq!(bare[0].control, "");
+    }
+
+    // --- Provenance rides like control, and only as display ---
+
+    const WITH_PROVENANCE: &str = r#"[{"api":"db.Pool.Query","scope":"runtime","verdict":"surface",
+        "severity":"high","fix":"bound it","control":"RC-019","source_kind":"incident",
+        "source_refs":["s3-us-east-1-2017"],"source_note":"a slow dependency held every worker"}]"#;
+
+    #[test]
+    fn provenance_rides_from_the_judgment_onto_the_item() {
+        let j: Vec<ClassJudgment> = serde_json::from_str(WITH_PROVENANCE).unwrap();
+        let s = vec![site("a/f.go", 1, "db.Pool", "Query")];
+        let v = vec![(s[0].site_key(), Verdict::Violates, "no bound".to_string())];
+        let items = triage(&s, &v, &j);
+        assert_eq!(
+            items[0].provenance,
+            Provenance {
+                source_kind: "incident".into(),
+                source_refs: vec!["s3-us-east-1-2017".into()],
+                source_note: "a slow dependency held every worker".into(),
+            }
+        );
+        // An unjudged class has none.
+        assert!(triage(&s, &v, &[])[0].provenance.is_empty());
+    }
+
+    #[test]
+    fn a_judgment_without_provenance_reads_as_empty() {
+        let j: Vec<ClassJudgment> = serde_json::from_str(
+            r#"[{"api":"db.Pool.Query","scope":"runtime","severity":"high","control":"RC-019"}]"#,
+        )
+        .unwrap();
+        assert!(j[0].provenance.is_empty());
+        assert_eq!(j[0].control, "RC-019");
+    }
+
+    /// The pre-change binary read judgments into this shape, with no
+    /// `deny_unknown_fields`. An artifact that carries provenance must still
+    /// grade the same way there: same severity, same control, same fix.
+    #[test]
+    fn an_artifact_with_provenance_loads_on_the_pre_change_shape() {
+        #[derive(Deserialize)]
+        struct PreChange {
+            api: String,
+            scope: String,
+            #[serde(default)]
+            verdict: String,
+            #[serde(default)]
+            severity: String,
+            #[serde(default)]
+            fix: String,
+            #[serde(default)]
+            control: String,
+        }
+        let old: Vec<PreChange> = serde_json::from_str(WITH_PROVENANCE).unwrap();
+        let new: Vec<ClassJudgment> = serde_json::from_str(WITH_PROVENANCE).unwrap();
+        let (o, n) = (&old[0], &new[0]);
+        assert_eq!(
+            (
+                &o.api,
+                &o.scope,
+                &o.verdict,
+                &o.severity,
+                &o.fix,
+                &o.control
+            ),
+            (
+                &n.api,
+                &n.scope,
+                &n.verdict,
+                &n.severity,
+                &n.fix,
+                &n.control
+            )
+        );
     }
 
     // --- Judgment matching is EXACT, never substring (po-av01j.96) ---
@@ -394,6 +502,7 @@ mod tests {
             severity: "low".into(),
             fix: String::new(),
             control: String::new(),
+            provenance: Provenance::default(),
         }
     }
 
@@ -513,6 +622,7 @@ mod tests {
             severity: "high".into(),
             fix: "bound it".into(),
             control: "RC-019".into(),
+            provenance: Provenance::default(),
         };
         let general = judgment("v9.Client.Get", "rollup");
         for corpus in [

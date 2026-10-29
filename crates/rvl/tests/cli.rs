@@ -9459,6 +9459,16 @@ const TEST_KEYSET_ENV: &str = "RVL_TEST_KEYSET_HEX";
 /// install it as the cache under `<root>/cache`. Returns the public half, hex
 /// encoded, which is the only thing a scan needs to trust the result.
 fn install_signed_commercial_tier(root: &std::path::Path, apis: &str) -> String {
+    install_signed_tier_with_judgments(root, apis, None)
+}
+
+/// [`install_signed_commercial_tier`], with a `judgments` section in the same
+/// signed envelope when `judgments` is set.
+fn install_signed_tier_with_judgments(
+    root: &std::path::Path,
+    apis: &str,
+    judgments: Option<&str>,
+) -> String {
     use base64::Engine;
     use ed25519_dalek::Signer;
 
@@ -9466,8 +9476,9 @@ fn install_signed_commercial_tier(root: &std::path::Path, apis: &str) -> String 
     let key_hex = hex::encode(signing.verifying_key().to_bytes());
     let keyset = rvl_cache::Keyset::from_hex(&[key_hex.as_str()]).unwrap();
     let bytes = format!(
-        r#"{{"schema":1,"content_version":"{}.1","specs":{{"apis":{apis},"configs":[]}}}}"#,
-        rvl_cache::today_utc()
+        r#"{{"schema":1,"content_version":"{}.1","specs":{{"apis":{apis},"configs":[]}}{}}}"#,
+        rvl_cache::today_utc(),
+        judgments.map_or(String::new(), |j| format!(r#","judgments":{j}"#)),
     )
     .into_bytes();
     let sig = base64::engine::general_purpose::STANDARD.encode(signing.sign(&bytes).to_bytes());
@@ -9553,6 +9564,96 @@ fn a_signed_populated_commercial_tier_does_not_warn() {
     assert!(!stderr.contains("0 API specs"), "{stderr}");
     assert!(!stdout.contains("0 API specs"), "{stdout}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The `requests.get` spec, for a signed tier on which the fixture violates.
+const REQUESTS_GET_API: &str = r#"[{"type":"requests","method":"get","site_count":1,"blocking":"yes","bounded_by":["call_arg"],"confidence":0.95,"rationale":"requests defaults to no timeout"}]"#;
+
+/// Scan the runtime fixture on a signed tier whose one judgment is
+/// `judgment`, then explain the finding. Returns the exit code, the `--out`
+/// finding and the explain text.
+fn scan_and_explain_signed_judgment(
+    tag: &str,
+    judgment: serde_json::Value,
+) -> (Option<i32>, serde_json::Value, String) {
+    let (root, packets, _) = write_runtime_python_fixture(tag);
+    let judgments = serde_json::json!([judgment]).to_string();
+    let key_hex = install_signed_tier_with_judgments(&root, REQUESTS_GET_API, Some(&judgments));
+    let out_path = root.join("findings.json");
+    let env = |c: &mut Command| {
+        c.env("RVL_CACHE_DIR", root.join("cache"))
+            .env("HOME", root.join("home"))
+            .env(TEST_KEYSET_ENV, &key_hex);
+    };
+    let mut scan = bin();
+    scan.args(["scan", "--retrieved"])
+        .arg(&packets)
+        .arg("--out")
+        .arg(&out_path);
+    env(&mut scan);
+    let out = scan.output().expect("failed to run rvl");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let finding = out_finding(&doc, "RC-019").clone();
+
+    let mut explain = bin();
+    explain.args(["explain", finding["id"].as_str().unwrap()]);
+    env(&mut explain);
+    let ex = explain.output().expect("failed to run rvl");
+    let explained = String::from_utf8_lossy(&ex.stdout).into_owned();
+    assert!(ex.status.success(), "explain failed: {explained}");
+    let _ = std::fs::remove_dir_all(&root);
+    (out.status.code(), finding, explained)
+}
+
+fn requests_get_judgment() -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(RELIABILITY_SEED).unwrap()[0].clone()
+}
+
+/// Judgment provenance rides from the signed artifact through triage to
+/// `explain` and the `--out` row, and changes nothing that grades: the same
+/// judgment without it gives the same exit, severity and base severity.
+#[cfg(debug_assertions)]
+#[test]
+fn judgment_provenance_rides_from_the_signed_artifact_to_explain() {
+    let mut with = requests_get_judgment();
+    with["source_kind"] = "incident".into();
+    with["source_refs"] = serde_json::json!(["s3-us-east-1-2017", "gh-2018-10-21"]);
+    with["source_note"] = "a hung dependency call held every worker".into();
+    let (code, row, explained) = scan_and_explain_signed_judgment("provenance-with", with);
+
+    assert!(
+        explained.contains(
+            "  authored from: incident s3-us-east-1-2017, gh-2018-10-21\n    \
+             a hung dependency call held every worker\n"
+        ),
+        "{explained}"
+    );
+    assert_eq!(row["source_kind"], "incident", "{row}");
+    assert_eq!(
+        row["source_refs"],
+        serde_json::json!(["s3-us-east-1-2017", "gh-2018-10-21"])
+    );
+    assert_eq!(
+        row["source_note"],
+        "a hung dependency call held every worker"
+    );
+
+    let (bare_code, bare_row, bare_explained) =
+        scan_and_explain_signed_judgment("provenance-without", requests_get_judgment());
+    assert!(
+        !bare_explained.contains("authored from"),
+        "{bare_explained}"
+    );
+    for key in ["source_kind", "source_refs", "source_note"] {
+        assert!(bare_row.get(key).is_none(), "{key} absent: {bare_row}");
+    }
+
+    assert_eq!(code, Some(EXIT_BLOCKED));
+    assert_eq!(code, bare_code, "provenance never decides the exit");
+    for key in ["severity", "base_severity", "control", "fix", "class"] {
+        assert_eq!(row[key], bare_row[key], "{key}");
+    }
 }
 
 /// A key outside the keyset is still refused: the seam adds named keys, it
