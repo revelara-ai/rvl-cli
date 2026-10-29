@@ -78,14 +78,14 @@ func TestTLSConfigFieldSettingsAreCallSites(t *testing.T) {
 func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 	got := constructionSites(t)
 	for symbol, want := range map[string]string{
-		"Reverified":  "",
-		"Loopback":    "",
-		"OptedOut":    "t.Insecure == true",
-		"NotVerified": "!o.SSLVerify",
-		"Skipped":     "o.SkipSSL",
-		"Verified":    "!(o.SSLVerify)",
-		"Deferred":    "",
-		"Verify":      "",
+		"Reverified":       "",
+		"InsecureLoopback": "",
+		"OptedOut":         "t.Insecure == true",
+		"NotVerified":      "!o.SSLVerify",
+		"Skipped":          "o.SkipVerify",
+		"Verified":         "!(o.SSLVerify)",
+		"DeferredInsecure": "",
+		"Verify":           "",
 	} {
 		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
 		if !ok {

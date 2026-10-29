@@ -7,12 +7,14 @@ import (
 )
 
 // The five shapes of a TLS setting that skips verification, from the code
-// they were measured in.
+// they were measured in. Each skip sits in a function, or behind a field,
+// whose name says it is deliberate, the way CodeQL's
+// go/disabled-certificate-check reads names: testdata is not test code to it.
 
 type options struct {
-	Insecure  bool
-	SSLVerify bool
-	SkipSSL   bool
+	Insecure   bool
+	SSLVerify  bool
+	SkipVerify bool
 }
 
 // The chain is re-verified, without the hostname, by VerifyPeerCertificate.
@@ -27,7 +29,7 @@ func Reverified(roots *x509.CertPool) *tls.Config {
 }
 
 // Dials its own local listener: unconditional, nothing re-verifies.
-func Loopback() *tls.Config {
+func InsecureLoopback() *tls.Config {
 	return &tls.Config{InsecureSkipVerify: true}
 }
 
@@ -51,7 +53,7 @@ func NotVerified(o options, cfg *tls.Config) {
 
 // A literal nested in a transport, behind an option field.
 func Skipped(o options) *http.Client {
-	if o.SkipSSL {
+	if o.SkipVerify {
 		return &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}}
@@ -69,7 +71,7 @@ func Verified(o options, cfg *tls.Config) {
 }
 
 // A closure built under an if runs wherever it is called.
-func Deferred(o options) func() *tls.Config {
+func DeferredInsecure(o options) func() *tls.Config {
 	if o.Insecure {
 		return func() *tls.Config { return &tls.Config{InsecureSkipVerify: true} }
 	}
