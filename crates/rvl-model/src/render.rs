@@ -165,6 +165,74 @@ pub fn imports_block(file: &str, source: &str) -> String {
     out.join("\n")
 }
 
+/// Lines of a callee definition shown.
+pub const DEFINITION_MAX_LINES: usize = 40;
+
+/// Names that appear with parentheses on almost every line and never name a
+/// callee worth showing.
+const CALL_NOISE: [&str; 34] = [
+    "if", "for", "while", "switch", "return", "range", "catch", "max", "min", "len", "print",
+    "str", "int", "float", "list", "dict", "set", "tuple", "bool", "make", "new", "append", "fmt",
+    "log", "await", "defer", "go", "func", "function", "def", "assert", "super", "self", "this",
+];
+
+/// A pattern of the training exporter, which is Go's RE2 syntax, compiled
+/// with Go's meaning: there `\s` is `[\t\n\f\r ]` and `\w` is
+/// `[0-9A-Za-z_]`, where the regex crate's are Unicode (and its ASCII `\s`
+/// has `\v`). A `\w` inside a class becomes a nested class, which is the
+/// same union.
+fn re2(pattern: &str) -> regex::Regex {
+    let pattern = pattern
+        .replace(r"\s", r"[\t\n\f\r ]")
+        .replace(r"\w", "[0-9A-Za-z_]");
+    regex::Regex::new(&pattern).expect("a valid pattern")
+}
+
+/// The definition of the callee at a site, in the training packets' form:
+/// in the same file, the definition of a name called on the site line
+/// (1-based), and the `DEFINITION_MAX_LINES` lines from its first line,
+/// each under its number, `  12 | def fetch(url):`. The rightmost call on
+/// the line is tried first: in `out = self._call_once(prompt)` that is
+/// `_call_once`. Definitions are found by their first line: a Python `def`,
+/// a Go `func` (with or without a receiver), a JavaScript/TypeScript
+/// `function` or `const`/`let`/`var` binding, a Rust `fn`, and a
+/// Java/C#-style method header; the site line itself is not one. A name
+/// defined in another file, or a line out of the file, gives `None`.
+///
+/// A port of the training exporter's, byte for byte, its patterns included:
+/// the file is split on `\n` alone, so a CRLF line keeps its `\r`.
+pub fn callee_definition(source: &str, line: usize) -> Option<(String, String)> {
+    static CALL_NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let call_name = CALL_NAME.get_or_init(|| re2(r"([A-Za-z_][A-Za-z0-9_]*)\s*\("));
+    let all: Vec<&str> = source.split('\n').collect();
+    if line < 1 || line > all.len() {
+        return None;
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for m in call_name.captures_iter(all[line - 1]) {
+        let name = m.get(1).expect("the name group").as_str();
+        if !CALL_NOISE.contains(&name) && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    for name in names.into_iter().rev() {
+        let name_re = regex::escape(name);
+        let def = re2(&format!(
+            r"^\s*(async\s+)?(def|fn|pub\s+fn|pub\(crate\)\s+fn|function\*?|func(\s*\([^)]*\))?)\s+{name_re}\s*[(<\[]|^\s*(export\s+)?(const|let|var)\s+{name_re}\s*(:\s*[^=]+)?=|^\s*((public|private|protected|internal|static|final|async|override|virtual|abstract)\s+)*[\w<>\[\],.?]+\s+{name_re}\s*\([^;]*$"
+        ));
+        let Some(at) = (0..all.len()).find(|&at| at != line - 1 && def.is_match(all[at])) else {
+            continue;
+        };
+        let end = (at + DEFINITION_MAX_LINES).min(all.len());
+        let mut block = String::new();
+        for (n, text) in all.iter().enumerate().take(end).skip(at) {
+            block.push_str(&format!("{:>4} | {text}\n", n + 1));
+        }
+        return Some((name.to_string(), block.trim_end_matches('\n').to_string()));
+    }
+    None
+}
+
 /// How a language writes an import statement.
 #[derive(Clone, Copy)]
 enum ImportSyntax {
