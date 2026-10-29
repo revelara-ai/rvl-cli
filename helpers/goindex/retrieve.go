@@ -554,9 +554,10 @@ const loadMode = packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 // standard library and every imported module -- from source, and kept every
 // function body's AST and type facts, so peak RSS tracked the dependency graph
 // rather than the repo: 2.26 GB on a 28 MB prometheus checkout, 3.8 GB on a
-// 57 MB temporal one. goindex reads bodies only in the module it is loading;
-// for everything else the declarations carry all the type information it
-// uses. This is how gopls type-checks dependencies. Measured on prometheus:
+// 57 MB checkout of a large open-source monorepo. goindex reads bodies only in
+// the module it is loading; for everything else the declarations carry all the
+// type information it uses. This is how gopls type-checks dependencies.
+// Measured on prometheus:
 // byte-identical output, 2.26 GB -> 0.93 GB, 76s -> 15s.
 //
 // The failure to avoid is the inverse: a module file mistaken for a dependency
