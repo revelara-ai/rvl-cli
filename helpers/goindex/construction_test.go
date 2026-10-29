@@ -73,6 +73,30 @@ func TestTLSConfigFieldSettingsAreCallSites(t *testing.T) {
 	}
 }
 
+// A setting made under an if carries the condition, so a user's opt-out can
+// be told from the code's default. The walk stops at a closure.
+func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
+	got := constructionSites(t)
+	for symbol, want := range map[string]string{
+		"Reverified":       "",
+		"InsecureLoopback": "",
+		"OptedOut":         "t.Insecure == true",
+		"NotVerified":      "!o.SSLVerify",
+		"Skipped":          "o.SkipVerify",
+		"Verified":         "!(o.SSLVerify)",
+		"DeferredInsecure": "",
+		"Verify":           "",
+	} {
+		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
+		if !ok {
+			t.Fatalf("%s: no InsecureSkipVerify site in %v", symbol, keys(got))
+		}
+		if s.Guard != want {
+			t.Errorf("%s: guard %q, want %q", symbol, s.Guard, want)
+		}
+	}
+}
+
 func TestConstructionTablesAreValidated(t *testing.T) {
 	for _, table := range []string{
 		`"construction_calls":[{"package":"crypto/md5","func":""}]`,

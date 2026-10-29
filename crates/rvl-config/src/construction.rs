@@ -21,6 +21,14 @@
 //!
 //! Only runtime sites are judged, as in the other construction lanes: a test
 //! that skips verification against a local server is the common case there.
+//!
+//! A setting that turns verification off is judged in its context too
+//! ([`REVERIFIED_BY`]). A `tls.Config` that also sets `VerifyPeerCertificate`
+//! or `VerifyConnection` skips only Go's default verification and checks the
+//! peer itself, so it satisfies. One made under an `if` on an option field
+//! (`if opts.Insecure`) is the user's opt-out: it still violates, under the
+//! reason "disabled behind an option" and with severity `medium`, so it stays
+//! advisory while the unconditional form, at the rule's own severity, blocks.
 
 use crate::{eval, ConfigPacket, ProvenanceStep, Resolution};
 use rvl_core::{ConstArg, ScopeClass, Site, Verdict};
@@ -62,6 +70,75 @@ fn unquoted(value: &str) -> &str {
         }
     }
     value
+}
+
+/// A setting that turns peer verification off, and the fields that verify
+/// the peer in its place when the same value sets them.
+const REVERIFIED_BY: &[(&str, &[&str])] = &[(
+    "crypto/tls.Config.InsecureSkipVerify",
+    &["VerifyPeerCertificate", "VerifyConnection"],
+)];
+
+/// The severity of a verification opt-out: below `high`, so it never blocks.
+const OPT_OUT_SEVERITY: &str = "medium";
+
+/// The field that re-verifies the peer for this setting, if the same value
+/// sets one: a key of the literal, which is the site's snippet, or an
+/// assignment to the same receiver in the enclosing function.
+fn reverified_by(site: &Site, class: &str) -> Option<&'static str> {
+    let (_, fields) = REVERIFIED_BY.iter().find(|(c, _)| *c == class)?;
+    fields.iter().copied().find(|field| {
+        if site.receiver.is_empty() {
+            site.snippet.contains(&format!("{field}:"))
+        } else {
+            site.enclosing_function_body
+                .contains(&format!("{}.{field} =", site.receiver))
+        }
+    })
+}
+
+/// The option field a guard tests, if it tests one alone: `t.Insecure` in
+/// `t.Insecure == true`, `connOption.SSLVerify` in `!connOption.SSLVerify`.
+/// A call, a comparison with anything but a boolean, or a bare variable is
+/// not an option field.
+fn option_field(guard: &str) -> Option<&str> {
+    let mut g = guard.trim();
+    loop {
+        let before = g;
+        g = g.strip_prefix('!').unwrap_or(g).trim_start();
+        if let Some(inner) = g.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+            g = inner.trim();
+        }
+        for op in ["== true", "== false", "!= true", "!= false"] {
+            g = g.strip_suffix(op).unwrap_or(g).trim_end();
+        }
+        if g == before {
+            break;
+        }
+    }
+    let ident = |p: &str| {
+        p.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && p.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    (g.contains('.') && g.split('.').all(ident)).then_some(g)
+}
+
+/// Judge a violation of a verification setting again in its context: re-
+/// verified, it satisfies; behind an option, it is an advisory opt-out.
+fn in_context(site: &Site, class: &str, mut f: SiteFinding) -> SiteFinding {
+    if f.verdict != Verdict::Violates || !REVERIFIED_BY.iter().any(|(c, _)| *c == class) {
+        return f;
+    }
+    if let Some(field) = reverified_by(site, class) {
+        f.verdict = Verdict::Satisfies;
+        f.reason = format!(
+            "re-verified by {field}: the default verification is skipped and {field} checks the peer in its place"
+        );
+    } else if let Some(option) = option_field(&site.guard) {
+        f.reason = format!("disabled behind an option: {option}; {}", f.reason);
+        f.severity = OPT_OUT_SEVERITY.to_string();
+    }
+    f
 }
 
 fn judge(site: &Site, key: &str, value: &str, specs: &SpecCache) -> SiteFinding {
@@ -120,7 +197,8 @@ pub fn evaluate(sites: &[Site], specs: &SpecCache) -> Vec<SiteFinding> {
                 });
                 continue;
             }
-            out.push(judge(site, &key, unquoted(&arg.value), specs));
+            let f = judge(site, &key, unquoted(&arg.value), specs);
+            out.push(in_context(site, &class, f));
         }
     }
     out
@@ -310,6 +388,163 @@ mod tests {
             "{}",
             f.reason
         );
+    }
+
+    /// An `InsecureSkipVerify = true` site as goindex reports it: the
+    /// literal or the assignment as its snippet, the receiver of an
+    /// assignment, the function and the `if` that holds it.
+    fn skip_verify(snippet: &str, receiver: &str, enclosing: &str, guard: &str) -> Site {
+        let mut s = site(
+            "tls.go",
+            ("crypto/tls.Config", "InsecureSkipVerify"),
+            &[(0, "InsecureSkipVerify", "true", "literal")],
+        );
+        s.snippet = snippet.into();
+        s.receiver = receiver.into();
+        s.enclosing_function_body = enclosing.into();
+        s.guard = guard.into();
+        s
+    }
+
+    // The five measured shapes, as written in the code they were found in.
+
+    /// A Redis operator dials pods by IP: Go's verification is off and
+    /// VerifyPeerCertificate checks the chain without the hostname.
+    const REVERIFIED: &str = "&tls.Config{
+		RootCAs:            rootCAs,
+		InsecureSkipVerify: true, // chain re-verified without hostname below
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			_, _, err := cryptutil.VerifyCertificateExceptServerName(rawCerts, &tls.Config{RootCAs: rootCAs})
+			return err
+		},
+	}";
+
+    /// A node dials its own local listener. Nothing in the literal says so,
+    /// so it stays a violation the decision model or a waiver must settle.
+    const LOOPBACK: &str = "&tls.Config{InsecureSkipVerify: true}";
+
+    #[test]
+    fn a_config_that_re_verifies_the_peer_satisfies() {
+        let f = one(skip_verify(REVERIFIED, "", "", ""));
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        assert!(
+            f.reason
+                .starts_with("re-verified by VerifyPeerCertificate:"),
+            "{}",
+            f.reason
+        );
+        // An assignment, with the callback assigned to the same receiver.
+        let body = "func dial(cfg *tls.Config) {
+	cfg.InsecureSkipVerify = true
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error { return check(cs) }
+}";
+        let f = one(skip_verify(
+            "cfg.InsecureSkipVerify = true",
+            "cfg",
+            body,
+            "",
+        ));
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        // Another value's callback does not re-verify this one.
+        let f = one(skip_verify(
+            "cfg.InsecureSkipVerify = true",
+            "cfg",
+            &body.replace("cfg.VerifyConnection", "other.VerifyConnection"),
+            "",
+        ));
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+    }
+
+    #[test]
+    fn an_unconditional_skip_violates_at_the_rules_severity() {
+        let f = one(skip_verify(LOOPBACK, "", "", ""));
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert!(f.reason.starts_with("equal to true"), "{}", f.reason);
+        assert_eq!(f.severity, "high");
+    }
+
+    #[test]
+    fn a_skip_behind_an_option_field_is_an_advisory_opt_out() {
+        for (guard, option, snippet, receiver) in [
+            // A health prober's TLS options, with no CA given.
+            ("t.Insecure == true", "t.Insecure", LOOPBACK, ""),
+            // An Oracle driver's connection string turns verification off.
+            (
+                "!connOption.SSLVerify",
+                "connOption.SSLVerify",
+                "config.InsecureSkipVerify = true",
+                "config",
+            ),
+            // A linter's AI autofix client, behind its skip-SSL setting.
+            (
+                "config.SkipSSL",
+                "config.SkipSSL",
+                "&tls.Config{\n\tInsecureSkipVerify: true, // #nosec G402\n}",
+                "",
+            ),
+            // The else branch of `if o.Verify`.
+            ("!(o.Verify)", "o.Verify", LOOPBACK, ""),
+        ] {
+            let f = one(skip_verify(snippet, receiver, "", guard));
+            assert_eq!(f.verdict, Verdict::Violates, "{guard}: {}", f.reason);
+            assert!(
+                f.reason.starts_with(&format!(
+                    "disabled behind an option: {option}; equal to true"
+                )),
+                "{guard}: {}",
+                f.reason
+            );
+            assert_eq!(f.severity, "medium", "{guard}");
+            assert_eq!(f.control, "RC-059", "{guard}");
+        }
+    }
+
+    #[test]
+    fn a_guard_that_is_not_an_option_field_changes_nothing() {
+        for guard in [
+            "err != nil",
+            "len(ca) == 0",
+            "insecure",
+            "cfg.Insecure && debug",
+            "opts.Insecure()",
+        ] {
+            let f = one(skip_verify(LOOPBACK, "", "", guard));
+            assert_eq!(f.severity, "high", "{guard}: {}", f.reason);
+            assert!(
+                f.reason.starts_with("equal to true"),
+                "{guard}: {}",
+                f.reason
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_verification_setting_is_judged_in_context() {
+        // MinVersion has no re-verifying field and no opt-out.
+        let mut s = site(
+            "tls.go",
+            ("crypto/tls.Config", "MinVersion"),
+            &[(0, "MinVersion", "769", "named_constant")],
+        );
+        s.snippet = "&tls.Config{MinVersion: tls.VersionTLS10, VerifyConnection: v}".into();
+        s.guard = "o.Legacy".into();
+        let f = one(s);
+        assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        assert_eq!(f.severity, "medium");
+        assert!(!f.reason.contains("option"), "{}", f.reason);
+        // A satisfying setting stays one, guard or not.
+        let mut s = skip_verify(LOOPBACK, "", "", "o.Insecure");
+        s.const_args[0].value = "false".into();
+        assert_eq!(one(s).verdict, Verdict::Satisfies);
+    }
+
+    #[test]
+    fn option_fields_are_read_through_negation_parens_and_boolean_compares() {
+        assert_eq!(option_field("!(!(a.b == false))"), Some("a.b"));
+        assert_eq!(option_field("a.b.c != true"), Some("a.b.c"));
+        assert_eq!(option_field("(a.b) && (c.d)"), None);
+        assert_eq!(option_field("a.b == \"x\""), None);
+        assert_eq!(option_field(""), None);
     }
 
     #[test]

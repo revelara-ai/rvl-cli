@@ -14,6 +14,7 @@ import (
 	"go/ast"
 	"go/types"
 
+	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -67,6 +68,32 @@ func structName(t types.Type) string {
 	return t.String()
 }
 
+// guard is the condition under which the code at n runs: that of the
+// innermost if statement whose branch holds n, as written, negated in its else
+// branch. "" when no if holds it; the walk stops at a function, since a
+// closure built under an if can run anywhere.
+func guard(p *packages.Package, src *srcIndex, f *ast.File, n ast.Node) string {
+	path, _ := astutil.PathEnclosingInterval(f, n.Pos(), n.End())
+	for i, up := range path {
+		switch up := up.(type) {
+		case *ast.FuncLit, *ast.FuncDecl:
+			return ""
+		case *ast.IfStmt:
+			if i == 0 {
+				continue
+			}
+			cond := src.text(p, up.Cond, up.Cond)
+			switch path[i-1] {
+			case up.Body:
+				return cond
+			case up.Else:
+				return "!(" + cond + ")"
+			}
+		}
+	}
+	return ""
+}
+
 // collectConstructionFields returns one call site per construction_fields
 // setting in scanned code, package-level declarations included: a TLS config
 // is often a package variable.
@@ -96,6 +123,7 @@ func collectConstructionFields(pkgs []*packages.Package, src *srcIndex, root, sn
 						Callees:    []Snippet{},
 						ConstArgs:  []ConstArg{valueObservation(p, src, field, 0, value)},
 						Prov:       Provenance{ClientTypeKnown: true},
+						Guard:      guard(p, src, f, at),
 					}
 					if fd != nil {
 						s.Symbol = fd.Name.Name

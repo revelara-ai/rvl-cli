@@ -237,6 +237,12 @@ type RetrievedSite struct {
 	// or whole-body read built here (bounds.go). Additive default-carrying
 	// field within the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
+	// Guard is the condition of the innermost if statement whose branch
+	// holds the site, as written, and `!(cond)` in its else branch. Set on a
+	// construction_fields site only (construction.go): a TLS setting made
+	// under `if opts.Insecure` is the user's opt-out, not the code's default.
+	// Absent when no if in the function holds it.
+	Guard string `json:"guard,omitempty"`
 }
 
 // --- G3 background-job registration surfaces (po-av01j.4) ---
