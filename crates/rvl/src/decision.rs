@@ -216,9 +216,12 @@ fn select<'a>(
             continue;
         }
         let class = rvl_triage::class_key_string(site);
+        // Main frames only: the manifest gates a control, and the model was
+        // trained and gated on its main frame's question, not on a second
+        // frame the control holds.
         for frame in frames
             .iter()
-            .filter(|fr| fr.habitat == CALL_SITE && fr.covers_class(&class))
+            .filter(|fr| fr.is_main() && fr.habitat == CALL_SITE && fr.covers_class(&class))
         {
             if !manifest.serves(&frame.control) {
                 *unserved.entry(frame.control.as_str()).or_default() += 1;
@@ -1100,6 +1103,21 @@ mod tests {
         let sel = select(&findings, &sites, &frames, &unlisted);
         assert_eq!(sel.asks.len(), 2, "no served_classes asks every class");
         assert!(sel.out_of_distribution.is_empty());
+    }
+
+    #[test]
+    fn a_controls_second_frame_is_not_asked() {
+        let (f, site) = undecided("net/http.Client", "Do");
+        let (findings, sites) = (vec![f], vec![site]);
+        let named = Frame {
+            frame: "jitter".into(),
+            ..frame(&[])
+        };
+        let frames = vec![frame(&[]), named];
+        let sel = select(&findings, &sites, &frames, &manifest(""));
+        let asked: Vec<&str> = sel.asks.iter().map(|a| a.frame.frame.as_str()).collect();
+        assert_eq!(asked, [""], "only the main frame is asked");
+        assert!(sel.unserved.is_empty() && sel.out_of_distribution.is_empty());
     }
 
     /// `classify_until`'s loop over 20 questions in batches of 8, the hook

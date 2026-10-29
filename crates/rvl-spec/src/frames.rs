@@ -7,6 +7,10 @@
 //! (`manifestation`) violates, an `S` cell (`satisfying`) satisfies, a `C`
 //! cell (`context`) is not applicable.
 //!
+//! A control may hold more than one frame. Its main frame carries no `frame`
+//! key; each other frame names itself there (`runbook-currency`). A frame is
+//! known by its control and that name, never by its control alone.
+//!
 //! A frame that does not parse is dropped and counted, never fatal: frames
 //! come from their own producer, and a malformed one must not cost a scan
 //! its specs.
@@ -21,6 +25,10 @@ pub const CALL_SITE: &str = "call_site";
 pub struct Frame {
     /// `RC-022`.
     pub control: String,
+    /// The frame's name within its control, `runbook-currency`. Empty for
+    /// the control's main frame, which publishes no `frame` key.
+    #[serde(default)]
+    pub frame: String,
     /// The control's name, `Retry, Backoff and Request Coalescing`. Absent
     /// in a cache written before it was published, and then empty.
     #[serde(default)]
@@ -52,6 +60,16 @@ pub struct Cell {
 }
 
 impl Frame {
+    /// Whether this is its control's main frame.
+    pub fn is_main(&self) -> bool {
+        self.frame.is_empty()
+    }
+
+    /// Whether `other` is the same frame: same control, same frame name.
+    pub fn same_frame(&self, other: &Frame) -> bool {
+        self.control == other.control && self.frame == other.frame
+    }
+
     /// Whether the frame applies to a site of spec class `class`
     /// (`net/http.Client.Do`).
     pub fn covers_class(&self, class: &str) -> bool {
@@ -99,18 +117,33 @@ mod tests {
          "cells":[{"id":"M1","kind":"manifestation","verdict":"violates","definition":"No retry"}],
          "class_markers":["http"],"later_field":1},
         {"control":"RC-019","version":"v1","habitat":"call_site","question":"Bounded?","cells":[]},
-        {"control":"RC-001"}
+        {"control":"RC-001"},
+        {"control":"RC-022","frame":"jitter","habitat":"call_site","question":"Jittered?","cells":[]}
     ]}"#;
 
     #[test]
     fn frames_parse_and_a_malformed_one_is_counted_not_fatal() {
         let (frames, rejected) = parse(SPECS);
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert_eq!(rejected, 1);
         assert_eq!(frames[0].cell("M1").unwrap().definition, "No retry");
         assert_eq!(frames[0].control_name, "Retries");
         assert_eq!(frames[1].control_name, "", "a frame without a name parses");
         assert_eq!(parse(r#"{"apis":[]}"#), (vec![], 0));
+    }
+
+    #[test]
+    fn a_frame_is_known_by_its_control_and_frame_name() {
+        let (frames, _) = parse(SPECS);
+        let (main, named) = (&frames[0], &frames[2]);
+        assert!(main.is_main(), "no `frame` key is the main frame");
+        assert_eq!(named.frame, "jitter");
+        assert!(!named.is_main());
+        assert!(!main.same_frame(named), "one control, two frames");
+        assert!(main.same_frame(&Frame {
+            question: "Retried, v3?".into(),
+            ..main.clone()
+        }));
     }
 
     #[test]

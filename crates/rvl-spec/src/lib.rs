@@ -1325,13 +1325,10 @@ impl SpecCache {
         // No confidence to compare: the overlay's entry for a control
         // replaces the baseline's.
         self.control_factors.extend(other.control_factors);
-        // An overlay frame replaces the baseline's for its control and habitat.
+        // An overlay frame replaces the baseline's frame of its control and
+        // frame name: a control's second frame sits beside its main frame.
         for f in other.frames {
-            match self
-                .frames
-                .iter_mut()
-                .find(|e| e.control == f.control && e.habitat == f.habitat)
-            {
+            match self.frames.iter_mut().find(|e| e.same_frame(&f)) {
                 Some(existing) => *existing = f,
                 None => self.frames.push(f),
             }
@@ -2136,6 +2133,25 @@ mod tests {
             base.config("net/http.Client").unwrap().declared,
             "a served spec must not displace a declaration"
         );
+    }
+
+    #[test]
+    fn an_overlay_frame_replaces_its_own_frame_and_a_named_frame_sits_beside_the_main() {
+        let frames = |body: &str| {
+            SpecCache::load(&format!(r#"{{"apis":[],"configs":[],"frames":[{body}]}}"#)).unwrap()
+        };
+        let mut base =
+            frames(r#"{"control":"RC-006","habitat":"repository","question":"Main?","cells":[]}"#);
+        base.merge(frames(
+            r#"{"control":"RC-006","frame":"runbook-currency","habitat":"repository","question":"Current?","cells":[]},
+               {"control":"RC-006","habitat":"repository","question":"Main, v2?","cells":[]}"#,
+        ));
+        let got: Vec<(&str, &str)> = base
+            .frames()
+            .iter()
+            .map(|f| (f.frame.as_str(), f.question.as_str()))
+            .collect();
+        assert_eq!(got, [("", "Main, v2?"), ("runbook-currency", "Current?")]);
     }
 
     #[test]
