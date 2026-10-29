@@ -445,6 +445,14 @@ pub struct Site {
     /// the same answer, and half of them only hold a `Site` (po-av01j.173).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_override: Option<ScopeClass>,
+    /// The condition under which the site runs: that of the innermost `if`
+    /// whose branch holds it, as written, and `!(<cond>)` in its else branch.
+    /// Empty when no `if` holds it or the retriever does not say; goindex
+    /// sets it on a construction field site, so a TLS setting made under
+    /// `if opts.Insecure` reads as the user's opt-out. Additive within the v2
+    /// packet train.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guard: String,
 }
 
 /// The `site_kind` a G2 server-entry record carries: an HTTP handler, route,

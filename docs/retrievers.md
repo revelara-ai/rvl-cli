@@ -253,6 +253,12 @@ type of a field site is the table's and not one the retriever proved (a
 Python attribute, a TypeScript options property),
 `provenance.client_type_resolved` is `false`.
 
+A `goindex` field site also has `guard`: the condition of the innermost `if`
+whose branch holds the setting, as written (`t.Insecure == true`), and
+`!(<cond>)` in its else branch. It is absent when no `if` in the function
+holds the setting. The walk stops at a function literal, since a closure built
+under an `if` can run anywhere.
+
 `requests.get(url, verify=False)` needed nothing new: it was already a call
 site, and `verify` is in its `const_args`.
 
@@ -284,6 +290,16 @@ DES, 3DES, RC4 or ECB cipher name).
 - An argument whose value is not a constant (`how` `name`) abstains.
 - Only runtime sites are judged. A test that skips verification against a
   local server is the common case.
+- A setting that turns verification off is judged in its context.
+  `InsecureSkipVerify: true` satisfies when the same `tls.Config` sets
+  `VerifyPeerCertificate` or `VerifyConnection`: in the literal, or by an
+  assignment to the same receiver in the function. Then only Go's default
+  verification is skipped, and the callback checks the peer in its place.
+  When the site's `guard` tests an option field alone (`opts.Insecure`,
+  `!conn.SSLVerify`, `cfg.Skip == true`), the setting is the user's opt-out:
+  it still violates, with the reason `disabled behind an option` and severity
+  `medium`, so it is its own advisory row. The unconditional form keeps the
+  rule's severity and blocks.
 
 A violation is a finding with the class `construction.<key>`
 (`construction.database/sql.Open(arg1)`) and the control and severity of the

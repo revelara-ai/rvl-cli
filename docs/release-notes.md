@@ -9,6 +9,19 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### An opt-out of TLS verification is advisory; a re-verifying config passes
+
+`construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)` is
+judged in its context. See "Construction rules" in `docs/retrievers.md`.
+
+- A `tls.Config` that also sets `VerifyPeerCertificate` or
+  `VerifyConnection` is no longer a finding.
+- A setting under an `if` on an option field is reported with the reason
+  `disabled behind an option` and severity `medium`, as an advisory row of
+  its own. The unconditional form still blocks.
+- New: `guard` on a Go construction field site in `--retrieved` and the
+  site records, the condition of the `if` that holds the setting.
+
 ### Construction rules judge crypto, TLS and database call sites
 
 A `config_keys` spec with the format `construction` judges a construction

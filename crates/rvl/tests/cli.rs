@@ -2742,8 +2742,10 @@ fn construction_specs(dir: &std::path::Path) -> std::path::PathBuf {
 /// Go, live end to end: goindex reports the construction fixture's TLS,
 /// cipher, hash and database constructions as call sites, and the
 /// construction rules judge them. Each violated rule is one blocking
-/// `construction.<key>` row under its control; the hash and the TLS field
-/// set from a variable are not findings; no output carries the password.
+/// `construction.<key>` row under its control; the hash, the TLS field set
+/// from a variable and the config that re-verifies the peer are not
+/// findings; the skips behind an option field are one advisory row of their
+/// own; no output carries the password.
 #[test]
 fn live_go_scan_judges_construction_rules() {
     let dir = tempfile::tempdir().unwrap();
@@ -2771,7 +2773,7 @@ fn live_go_scan_judges_construction_rules() {
         "a high rule blocks: {stdout}\n{stderr}"
     );
     let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
-    let mut classes: Vec<(String, String)> = parsed["findings"]
+    let mut classes: Vec<(String, String, String, u64)> = parsed["findings"]
         .as_array()
         .unwrap()
         .iter()
@@ -2780,23 +2782,29 @@ fn live_go_scan_judges_construction_rules() {
             (
                 f["class"].as_str().unwrap().to_string(),
                 f["control"].as_str().unwrap().to_string(),
+                f["base_severity"].as_str().unwrap().to_string(),
+                f["site_count"].as_u64().unwrap(),
             )
         })
         .collect();
     classes.sort();
+    let skip = "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
+    // Unconditional: the package variable, the loopback dial and the closure
+    // built under an if. Behind an option: OptedOut, NotVerified, Skipped and
+    // Verified's else branch.
     let want = [
-        ("construction.crypto/des.NewCipher", "RC-059"),
-        (
-            "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)",
-            "RC-059",
-        ),
+        ("construction.crypto/des.NewCipher", "RC-059", "high", 1),
+        (skip, "RC-059", "high", 3),
+        (skip, "RC-059", "medium", 4),
         (
             "construction.crypto/tls.Config.MinVersion(MinVersion)",
             "RC-059",
+            "medium",
+            1,
         ),
-        ("construction.database/sql.Open(arg1)", "RC-056"),
+        ("construction.database/sql.Open(arg1)", "RC-056", "high", 1),
     ]
-    .map(|(c, r)| (c.to_string(), r.to_string()));
+    .map(|(c, r, s, n)| (c.to_string(), r.to_string(), s.to_string(), n));
     assert_eq!(classes, want, "{stdout}");
     for text in [&stdout, &stderr, &doc] {
         assert!(
