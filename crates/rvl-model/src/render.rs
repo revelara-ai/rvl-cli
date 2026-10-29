@@ -21,6 +21,8 @@ use rvl_core::Snippet;
 
 /// The cap on the site snippet, a callee definition and an enclosing function.
 pub const SNIPPET_MAX_CHARS: usize = 6000;
+/// The lines either side of the site line in its snippet window.
+pub const SNIPPET_RADIUS: usize = 10;
 /// The cap on each client construction.
 pub const CONSTRUCTION_MAX_CHARS: usize = 1500;
 /// The cap on each caller.
@@ -130,6 +132,32 @@ impl From<&rvl_core::Site> for SitePacket {
                 .collect(),
         }
     }
+}
+
+/// The site snippet of a file, in the training packets' form: the lines
+/// [`SNIPPET_RADIUS`] either side of the 1-based `line`, clamped to the
+/// file, each under its number, the site line marked: ` 40 | ...`,
+/// `> 41 | ...`, a number wider than 3 digits widening its line,
+/// `>1234 | ...`. The file is split on `\n` alone, so a CRLF line keeps its
+/// `\r`, and a final newline gives an empty last line. A line outside the
+/// file centers the window on line 1 and marks nothing. Trailing newlines
+/// are trimmed; the window itself is uncapped, as the training export leaves
+/// it (the renderer caps the block).
+pub fn snippet_window(source: &str, line: usize) -> String {
+    let all: Vec<&str> = source.split('\n').collect();
+    let center = if line < 1 || line > all.len() {
+        1
+    } else {
+        line
+    };
+    let start = center.saturating_sub(SNIPPET_RADIUS).max(1);
+    let end = (center + SNIPPET_RADIUS).min(all.len());
+    let mut out = String::new();
+    for n in start..=end {
+        let marker = if n == line { '>' } else { ' ' };
+        out.push_str(&format!("{marker}{n:>3} | {}\n", all[n - 1]));
+    }
+    out.trim_end_matches('\n').to_string()
 }
 
 /// The import block of a file, in the training packets' form: each import
@@ -576,6 +604,96 @@ mod tests {
                 "Constant arguments: 1=5, timeout=3, =x".into()
             ]
         );
+    }
+
+    /// A file of `n` lines, `l1` to `ln`, with a final newline.
+    fn numbered_file(n: usize) -> String {
+        (1..=n).map(|i| format!("l{i}\n")).collect()
+    }
+
+    /// The window of lines `start..=end` of [`numbered_file`], `site` marked.
+    fn numbered_window(start: usize, end: usize, site: usize) -> String {
+        (start..=end)
+            .map(|i| {
+                let marker = if i == site { '>' } else { ' ' };
+                format!("{marker}{i:>3} | l{i}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_site_snippet_is_the_training_export_window() {
+        let file = numbered_file(40);
+        // Mid-file: ten lines either side, the site line marked.
+        let mid = snippet_window(&file, 20);
+        assert_eq!(mid, numbered_window(10, 30, 20));
+        assert!(mid.starts_with("  10 | l10\n"));
+        assert!(mid.contains("\n> 20 | l20\n"));
+        // Line 1: the window clamps to the start of the file.
+        assert_eq!(snippet_window(&file, 1), numbered_window(1, 11, 1));
+        // The last line, and the empty line its final newline gives.
+        assert_eq!(
+            snippet_window(&file, 40),
+            numbered_window(30, 40, 40) + "\n  41 | "
+        );
+        assert_eq!(
+            snippet_window(&file, 41),
+            numbered_window(31, 40, 0) + "\n> 41 | "
+        );
+        // Past the end: centered on line 1, nothing marked.
+        assert_eq!(snippet_window(&file, 42), numbered_window(1, 11, 0));
+        assert_eq!(snippet_window(&file, 0), numbered_window(1, 11, 0));
+        // A 4-digit line widens its own line only.
+        let long = numbered_file(1005);
+        let w = snippet_window(&long, 1000);
+        assert_eq!(
+            w,
+            numbered_window(990, 1006, 1000).replace(" 1006 | l1006", " 1006 | ")
+        );
+        assert!(w.starts_with(" 990 | l990\n"));
+        assert!(w.contains("\n 999 | l999\n>1000 | l1000\n 1001 | l1001\n"));
+        // CRLF: each line keeps its \r.
+        let crlf = "a\r\nb\r\nc\r\n";
+        assert_eq!(
+            snippet_window(crlf, 2),
+            "   1 | a\r\n>  2 | b\r\n   3 | c\r\n   4 | "
+        );
+    }
+
+    #[test]
+    fn a_site_snippet_renders_as_the_real_training_row() {
+        // The shape of a real export row: a Go method, its site line marked.
+        let mut lines: Vec<String> = (1..=556).map(|i| format!("// {i}")).collect();
+        lines.extend(
+            [
+                "\t\t},",
+                "\t}",
+                "}",
+                "",
+                "func (p *Plugin) a() {}",
+                "",
+                "func (p *Plugin) b() {}",
+                "",
+                "// checkPendingHosts reconnects.",
+                "func (p *Plugin) checkPendingHosts() {",
+                "\tticker := time.NewTicker(p.config.ReconnectInterval_)",
+                "\tdefer ticker.Stop()",
+            ]
+            .map(String::from),
+        );
+        lines.extend((569..=600).map(|i| format!("\t\t\t// {i}")));
+        let w = snippet_window(&lines.join("\n"), 567);
+        let rows: Vec<&str> = w.lines().collect();
+        assert_eq!(rows.len(), 21);
+        assert_eq!(rows[0], " 557 | \t\t},");
+        assert_eq!(rows[9], " 566 | func (p *Plugin) checkPendingHosts() {");
+        assert_eq!(
+            rows[10],
+            ">567 | \tticker := time.NewTicker(p.config.ReconnectInterval_)"
+        );
+        assert_eq!(rows[11], " 568 | \tdefer ticker.Stop()");
+        assert_eq!(rows[20], " 577 | \t\t\t// 577");
     }
 
     #[test]
