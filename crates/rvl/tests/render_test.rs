@@ -25,6 +25,7 @@ fn f(id_seed: &str, sev: &str, disp: &str, crit: u32) -> Finding {
         suppressed: false,
         gate_exempt: false,
         factors: Vec::new(),
+        provenance: Default::default(),
     }
 }
 
@@ -1614,4 +1615,59 @@ fn explain_lists_the_control_factor_codes() {
     assert!(out.contains("  factors: CF-0007, CF-0021\n"), "{out}");
     let out = render_explain(&f("cf4", "medium", "surface", 0), &[], false);
     assert!(!out.contains("factors"), "{out}");
+}
+
+// --- judgment provenance: explain only, display only ---
+
+fn with_provenance(seed: &str) -> Finding {
+    let mut f = f(seed, "high", "surface", 0);
+    f.provenance = rvl_triage::Provenance {
+        source_kind: "pattern".into(),
+        source_refs: vec![
+            "0b5e1c2a-7d4f-4e8a-9c1b-2f3a4b5c6d7e".into(),
+            "1c6f2d3b-8e5a-4f9b-8d2c-3a4b5c6d7e8f".into(),
+        ],
+        source_note: "unbounded client calls stall the worker pool".into(),
+    };
+    f
+}
+
+#[test]
+fn explain_prints_the_authored_from_block_after_the_fix() {
+    let out = render_explain(&with_provenance("pv1"), &[], false);
+    let block = "  fix: set a Timeout or thread a ctx deadline\n  \
+         authored from: pattern 0b5e1c2a-7d4f-4e8a-9c1b-2f3a4b5c6d7e, \
+         1c6f2d3b-8e5a-4f9b-8d2c-3a4b5c6d7e8f\n    \
+         unbounded client calls stall the worker pool\n  suppress:";
+    assert!(out.contains(block), "{out}");
+}
+
+#[test]
+fn absent_provenance_renders_nothing() {
+    let out = render_explain(&f("pv2", "high", "surface", 0), &[], false);
+    assert!(!out.contains("authored from"), "{out}");
+    assert!(!out.contains("unknown"), "{out}");
+    assert!(
+        out.contains("  fix: set a Timeout or thread a ctx deadline\n  suppress:"),
+        "the fix is followed by what always followed it: {out}"
+    );
+}
+
+#[test]
+fn provenance_changes_neither_the_section_nor_the_ladder() {
+    let bare = f("pv3", "high", "surface", 0);
+    let with = with_provenance("pv3");
+    assert_eq!(classify(&bare), classify(&with));
+    let ladder = |x: &Finding| render_ladder(std::slice::from_ref(x), cov(), None, "0.1s", false);
+    assert_eq!(ladder(&bare), ladder(&with));
+}
+
+#[test]
+fn a_last_scan_state_without_provenance_still_loads() {
+    let mut v = serde_json::to_value(with_provenance("pv4")).unwrap();
+    v.as_object_mut().unwrap().remove("provenance");
+    let back: Finding = serde_json::from_value(v).unwrap();
+    assert!(back.provenance.is_empty());
+    let empty = serde_json::to_value(f("pv5", "high", "surface", 0)).unwrap();
+    assert!(empty.get("provenance").is_none(), "{empty}");
 }

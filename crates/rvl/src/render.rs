@@ -92,6 +92,12 @@ pub struct Finding {
     /// still loads.
     #[serde(default)]
     pub factors: Vec<String>,
+    /// What the class judgment was authored from, for the explain view.
+    /// Empty when the judgment carries none or the finding has no judgment;
+    /// defaulted so an older last-scan state still loads. Display only:
+    /// `classify` never reads it.
+    #[serde(default, skip_serializing_if = "rvl_triage::Provenance::is_empty")]
+    pub provenance: rvl_triage::Provenance,
 }
 
 /// The git operation a blocking verdict stops (po-av01j.207). The verdict line
@@ -1252,6 +1258,7 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
     if !f.fix.is_empty() {
         let _ = writeln!(o, "  {}: {}", paint("fix", "1", color), f.fix);
     }
+    write_provenance(&mut o, &f.provenance, color);
     let _ = writeln!(
         o,
         "  {}",
@@ -1279,6 +1286,30 @@ pub fn render_explain(f: &Finding, incidents: &[(String, bool, String)], color: 
         }
     }
     o
+}
+
+/// The "authored from" block of the explain view: the kind, the refs as
+/// given (never looked up), and the note on its own line. Writes nothing for
+/// an absent provenance, so a judgment without one reads as it always did.
+fn write_provenance(o: &mut String, p: &rvl_triage::Provenance, color: bool) {
+    if p.is_empty() {
+        return;
+    }
+    let mut from = p.source_kind.clone();
+    if !p.source_refs.is_empty() {
+        if !from.is_empty() {
+            from.push(' ');
+        }
+        from.push_str(&p.source_refs.join(", "));
+    }
+    let _ = write!(o, "  {}:", paint("authored from", "1", color));
+    if !from.is_empty() {
+        let _ = write!(o, " {from}");
+    }
+    let _ = writeln!(o);
+    if !p.source_note.is_empty() {
+        let _ = writeln!(o, "    {}", p.source_note);
+    }
 }
 
 /// Render a default-bound duration the way a human writes it: `600s`, `1.5s`,

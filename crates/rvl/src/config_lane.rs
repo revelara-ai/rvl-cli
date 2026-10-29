@@ -235,6 +235,7 @@ fn run_capped(
                 suppressed: false,
                 gate_exempt: false,
                 factors: Vec::new(),
+                provenance: Default::default(),
             }
         })
         .collect();

@@ -671,6 +671,7 @@ pub fn gate_findings(
                 suppressed: false,
                 gate_exempt: false,
                 factors: Vec::new(),
+                provenance: Default::default(),
             })
         })
         .collect()
@@ -1578,6 +1579,7 @@ scanner:
             severity: "high".into(),
             fix: String::new(),
             control: "RC-019".into(),
+            provenance: Default::default(),
         }];
         let (batch, _) = delta_undecided(&findings, &sites, &["f.go".to_string()], &judgments);
         assert_eq!(batch[0].control, "RC-019");

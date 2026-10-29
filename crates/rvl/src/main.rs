@@ -989,6 +989,7 @@ fn triage_to_findings(
                 suppressed: false,
                 gate_exempt: false,
                 factors: Vec::new(),
+                provenance: it.provenance.clone(),
             }
         })
         .collect()
@@ -1038,6 +1039,7 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
                 suppressed: false,
                 gate_exempt: false,
                 factors: Vec::new(),
+                provenance: Default::default(),
             }
         })
         .collect()
@@ -1137,6 +1139,7 @@ fn server_to_findings(
                 suppressed: false,
                 gate_exempt: false,
                 factors: Vec::new(),
+                provenance: Default::default(),
             }
         })
         .chain(liveness_handler_finding(&server.routes, probes))
@@ -1178,6 +1181,7 @@ fn liveness_handler_finding(
         suppressed: false,
         gate_exempt: false,
         factors: Vec::new(),
+        provenance: Default::default(),
     })
 }
 
@@ -3814,6 +3818,7 @@ fn misuse_items(
             severity: f.severity.to_string(),
             fix: f.fix,
             control: f.control,
+            provenance: Default::default(),
             site_count: f.occurrences,
             example_sites: f.evidence.into_iter().take(3).collect(),
         })
@@ -3845,6 +3850,7 @@ fn unsized_items(
             site_count: f.evidence.len().max(1),
             example_sites: f.evidence.into_iter().take(3).collect(),
             control: f.control,
+            provenance: Default::default(),
         })
         .collect()
 }
@@ -3886,6 +3892,7 @@ fn construction_items(
                 severity: first.severity.clone(),
                 fix: first.fix.clone(),
                 control: first.control.clone(),
+                provenance: Default::default(),
                 site_count: found.len(),
                 example_sites: found.iter().take(3).map(|f| f.site.clone()).collect(),
             }
@@ -3919,6 +3926,7 @@ fn emission_items(
             severity: f.severity.to_string(),
             fix: f.fix,
             control: f.control.to_string(),
+            provenance: Default::default(),
             site_count: f.evidence.len().max(1),
             example_sites: f.evidence.into_iter().take(3).collect(),
         })
@@ -3978,6 +3986,7 @@ fn content_judgments(findings: &[rvl_content::ContentFinding]) -> Vec<rvl_triage
                 severity: severity.to_string(),
                 fix: SECRETS_FIX.to_string(),
                 control: SECRETS_CONTROL.to_string(),
+                provenance: Default::default(),
             });
         }
     }
@@ -11215,6 +11224,7 @@ mod tests {
             suppressed: false,
             gate_exempt: false,
             factors: Vec::new(),
+            provenance: Default::default(),
         }
     }
 

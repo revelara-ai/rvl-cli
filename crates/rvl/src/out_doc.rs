@@ -138,6 +138,11 @@ pub struct OutFinding {
     /// The causal factor codes of `control`. Empty when the spec cache
     /// names none.
     pub factors: Vec<String>,
+    /// What the row's judgment was authored from: `source_kind`,
+    /// `source_refs` and `source_note`, each absent when empty. Additive and
+    /// display only: never read by `severity`, the gate or `exit`.
+    #[serde(flatten)]
+    pub provenance: rvl_triage::Provenance,
 }
 
 /// The subject of a finding, in the wire shape the server reads
@@ -358,6 +363,7 @@ pub fn build(
             suppressed: f.suppressed,
             gate_exempt: f.gate_exempt,
             factors: f.factors.clone(),
+            provenance: f.provenance.clone(),
         })
         .collect();
 
@@ -521,6 +527,7 @@ mod tests {
             suppressed: false,
             gate_exempt: false,
             factors: Vec::new(),
+            provenance: Default::default(),
         };
         let blocked = render::blocking_count(std::slice::from_ref(&f)) > 0;
         let doc = build(
@@ -573,6 +580,7 @@ mod tests {
             suppressed: false,
             gate_exempt: false,
             factors: Vec::new(),
+            provenance: Default::default(),
         };
         let doc = build(
             std::slice::from_ref(&f),
@@ -606,6 +614,7 @@ mod tests {
             suppressed: false,
             gate_exempt: false,
             factors: Vec::new(),
+            provenance: Default::default(),
         }
     }
 
