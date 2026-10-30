@@ -318,7 +318,8 @@ The orchestrator uses it to:
   `findings`, class `model.<control>`. Nothing in `sites` or `undecided`
   changes because of it.
 - `exit` duplicates the process exit code so a consumer holding only the file
-  knows whether the gate fired (`0` clean, `3` blocking).
+  knows whether the gate fired (`0` clean, `3` blocking, `4` an
+  `--incremental` scan that read no code because its code went unread).
 
 ## Compatibility
 

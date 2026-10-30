@@ -71,8 +71,6 @@ pub fn human(d: Duration) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {
     ScanBudget(Duration),
-    /// The incremental path's own retrieval cap (`INCREMENTAL_WALL_BUDGET`).
-    IncrementalBudget(Duration),
     HelperTimeout(Duration),
 }
 
@@ -80,9 +78,6 @@ impl std::fmt::Display for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Cause::ScanBudget(d) => write!(f, "the scan budget of {} (--scan-budget)", human(*d)),
-            Cause::IncrementalBudget(d) => {
-                write!(f, "the incremental retrieval budget of {}", human(*d))
-            }
             Cause::HelperTimeout(d) => {
                 write!(f, "the helper timeout of {} (--helper-timeout)", human(*d))
             }
@@ -122,19 +117,6 @@ impl Limits {
             pick(budget, yaml.budget, DEFAULT_SCAN_BUDGET),
             pick(helper_timeout, yaml.helper_timeout, DEFAULT_HELPER_TIMEOUT),
         )
-    }
-
-    /// The same limits, with the scan deadline brought forward to `cap` from
-    /// now when that is sooner.
-    pub fn within(self, cap: Duration, cause: Cause) -> Limits {
-        let at = Instant::now() + cap;
-        Limits {
-            deadline: match self.deadline {
-                Some((d, c)) if d <= at => Some((d, c)),
-                _ => Some((at, cause)),
-            },
-            ..self
-        }
     }
 
     /// Time left in the scan budget; `None` when there is no budget.
@@ -278,15 +260,7 @@ mod tests {
             Some((_, Cause::ScanBudget(_)))
         ));
         assert!(Limits::none().child_deadline().is_none());
-        let l = Limits::none().within(
-            Duration::from_secs(10),
-            Cause::IncrementalBudget(Duration::from_secs(10)),
-        );
-        assert!(matches!(
-            l.child_deadline(),
-            Some((_, Cause::IncrementalBudget(_)))
-        ));
-        assert!(l.spent().is_none());
+        assert!(Limits::none().spent().is_none());
         assert!(Limits::start(Some(Duration::ZERO), None).spent().is_some());
     }
 

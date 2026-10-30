@@ -30,7 +30,8 @@ jobs:
       # README for the supported channels.
 
       # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
-      # lane that could not read the code. Both fail the job. A pull_request
+      # lane that could not read the code (exit 4 without --strict, when it
+      # read none). All fail the job. A pull_request
       # event exports GITHUB_BASE_REF; a merge_group event does not, so the
       # base is passed in.
       - name: Gate the change

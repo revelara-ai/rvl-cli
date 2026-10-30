@@ -123,6 +123,7 @@ fn cov() -> Coverage {
         by_design_classes: Vec::new(),
         degraded: Vec::new(),
         degraded_note: None,
+        unread_fails: false,
         lang_status: Vec::new(),
         retrieval: Vec::new(),
     }
@@ -187,6 +188,7 @@ fn ladder_groups_by_severity_with_blocked_footer() {
         by_design_classes: Vec::new(),
         degraded: Vec::new(),
         degraded_note: None,
+        unread_fails: false,
         lang_status: Vec::new(),
         retrieval: Vec::new(),
     };
@@ -256,6 +258,7 @@ fn suppressed_finding_is_hidden_and_counted_in_footer() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -308,6 +311,7 @@ fn zero_suppressed_omits_the_suppressed_footer_clause() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -351,6 +355,7 @@ fn ladder_with_no_blocking_says_commit_clean() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -390,6 +395,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -428,6 +434,7 @@ fn no_color_mode_emits_no_ansi_escapes() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -471,6 +478,7 @@ fn hook_ladder_shows_counts_not_named_incidents() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -614,6 +622,7 @@ fn config_coverage_renders_resolution_abstain_levers_and_sightings() {
             by_design_classes: Vec::new(),
             degraded: Vec::new(),
             degraded_note: None,
+            unread_fails: false,
             lang_status: Vec::new(),
             retrieval: Vec::new(),
         },
@@ -663,6 +672,7 @@ fn empty_config_coverage_renders_nothing_extra() {
                 by_design_classes: Vec::new(),
                 degraded: Vec::new(),
                 degraded_note: None,
+                unread_fails: false,
                 lang_status: Vec::new(),
                 retrieval: Vec::new(),
             },
@@ -799,8 +809,8 @@ fn an_empty_g1_lane_says_so_instead_of_rendering_a_meaningless_zero() {
         "a bare 0/0 tells the reader nothing: {out}"
     );
     assert!(
-        out.contains("commit clean"),
-        "nothing to scan is a CLEAN result, never a failure: {out}"
+        out.contains("0 code sites scanned (none in scope)"),
+        "nothing to scan is a passing result, never a failure: {out}"
     );
 }
 
@@ -899,13 +909,52 @@ fn an_empty_lane_after_a_degraded_pass_does_not_render_the_clean_verdict() {
     );
 }
 
-// The genuinely empty scope (po-av01j.198) keeps its clean verdict: "nothing
-// to scan" and "could not scan" are opposite statements and this is the first.
+// The genuinely empty scope (po-av01j.198) is not a failure: "nothing to scan"
+// and "could not scan" are opposite statements and this is the first. It is
+// not "clean" either: zero code sites vouch for nothing, so the line says that
+// none were in scope.
 #[test]
-fn an_empty_lane_with_nothing_to_scan_keeps_the_clean_verdict() {
+fn an_empty_lane_with_nothing_to_scan_says_so_instead_of_clean() {
     let out = render_ladder(&[], Coverage::default(), None, "0.1s", false);
-    assert!(out.contains("commit clean"), "{out}");
-    assert!(!out.contains("NOT CLEAN"), "{out}");
+    assert!(
+        out.contains("0 code sites scanned (none in scope)"),
+        "{out}"
+    );
+    assert!(!out.contains("clean"), "{out}");
+}
+
+// THE DONE-WHEN. A run that resolved no code site never prints "clean",
+// whichever of the three ways it got there: nothing in scope, code unread on
+// a full scan (fails open), code unread on the incremental gate (exits 4). The
+// last names the next step, and the exit predicate agrees with the footer.
+#[test]
+fn a_run_with_zero_code_sites_never_prints_clean() {
+    let unread = |unread_fails| Coverage {
+        degraded_note: Some("retrieval failed (helper `tsindex`)".into()),
+        unread_fails,
+        ..Default::default()
+    };
+    for (cov, exits) in [
+        (Coverage::default(), false),
+        (unread(false), false),
+        (unread(true), true),
+    ] {
+        assert_eq!(cov.total, 0);
+        assert_eq!(cov.unread_exit(), exits);
+        let out = render_ladder(&[], cov, None, "0.1s", false);
+        assert!(!out.contains("clean"), "0 code sites called clean: {out}");
+        assert!(out.contains("nothing was scanned") || out.contains("0 code sites scanned"));
+    }
+    let out = render_ladder(&[], unread(true), None, "0.1s", false);
+    assert!(
+        out.contains("NOT CLEAN") && out.contains("0 code sites scanned"),
+        "{out}"
+    );
+    assert!(
+        out.contains("run `rvl scan .`"),
+        "names the next step: {out}"
+    );
+    assert!(!out.contains("fails open"), "this one does not: {out}");
 }
 
 // A PARTIAL pass is fail-open by design: sites WERE scanned, the skipped
@@ -1086,7 +1135,7 @@ fn a_gate_exempt_finding_is_shown_but_can_never_block() {
         out.contains(&finding_id("cfg1")),
         "an exempt finding must still be reported: {out}"
     );
-    assert!(out.contains("commit clean"), "{out}");
+    assert!(!out.contains("blocked"), "{out}");
 }
 
 // The exemption must not resurrect something a waiver suppressed.

@@ -31,7 +31,7 @@ four lines:
 ```sh
 #!/bin/sh
 # Installed by `rvl hook install`: Revelara deterministic scan gate.
-# Exit 3 means BLOCKING findings remain; 0 is clean. No model calls.
+# Exit 3 means BLOCKING findings remain; 4 that no code was read; 0 passes. No model calls.
 exec rvl scan . --incremental --changed-only --hook pre-commit
 ```
 
@@ -62,6 +62,7 @@ with `git stash --keep-index` and restore them with `git stash pop`.
 | `1` | Scan could not complete: no verifiable spec cache, a retriever error or a helper past its time limit under `--strict`, an IO failure. The scanner broke; your code was never judged. |
 | `2` | Usage error: unknown or invalid flag/argument. |
 | `3` | Scan completed and BLOCKING findings remain (`✗ blocked`). Fix them, or waive them in `.revelara.yaml`. |
+| `4` | An `--incremental` scan (the hooks run one) read no code site because the code it was asked about went unread: a helper failed, was killed, or emitted nothing. The verdict says `0 code sites scanned`; run `rvl scan .` to see which language and why. A change with no code to read exits `0`. |
 
 Blocked has its own code so a hook can tell "your code has a problem" (`3`)
 from "the scanner is broken" (`1`). A broken scanner must not be read as a
@@ -115,7 +116,8 @@ jobs:
       # README for the supported channels.
 
       # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
-      # lane that could not read the code. Both fail the job. A pull_request
+      # lane that could not read the code (exit 4 without --strict, when it
+      # read none). All fail the job. A pull_request
       # event exports GITHUB_BASE_REF; a merge_group event does not, so the
       # base is passed in.
       - name: Gate the change
@@ -154,12 +156,21 @@ chain: `--base`, `RVL_BASE_REF`, `GITHUB_BASE_REF`,
 `GITHUB_BASE_REF`, so a PR job usually needs no flag at all.
 
 `--strict` matters more than it looks. By default a scan fails open: when
-a retriever errors, the scan degrades to whatever it did read, prints
-`NOT CLEAN — nothing was scanned (see COVERAGE)`, and still exits `0` so a
-commit is not held hostage to a broken toolchain. That is the right default on
-a laptop and the wrong one on a build runner, where an image missing a
-language toolchain would otherwise produce a green gate forever. `--strict`
-turns that case into exit `1`.
+a retriever errors, the scan degrades to whatever it did read and exits `0`
+so a commit is not held hostage to a broken toolchain. That is the right
+default on a laptop and the wrong one on a build runner, where an image
+missing a language toolchain would otherwise produce a green gate forever.
+`--strict` turns that case into exit `1`.
+
+One case does not fail open: when the retrievers read no code at all. A full
+scan prints `NOT CLEAN — nothing was scanned (see COVERAGE)` and exits `0`.
+An `--incremental` scan, which is what the hooks run, prints
+`NOT CLEAN — 0 code sites scanned` with the next step and exits `4`, so the
+commit or push is refused rather than passed over code nobody read. A scan
+whose change has no code site to read (docs, config, code with no call
+sites) is not this case: it exits `0` and prints
+`0 code sites scanned (none in scope)`. A scan prints `commit clean` only
+when it read at least one code site.
 
 A retriever that errors is not the only way a lane can read nothing. A
 helper can also exit `0` having emitted no packets at all. The Go lane did
@@ -170,8 +181,9 @@ nothing rvl recognizes (not even the repo-scoped record every helper writes
 on a successful run) is degraded as a failed lane, whatever the exit code
 claimed. The guard lives at the one place every helper's output passes
 through, so it does not depend on any individual helper's exit-code hygiene.
-A degraded lane renders `NOT CLEAN — nothing was scanned (see COVERAGE)`
-under the default fail-open policy and turns into exit `1` under `--strict`.
+A degraded lane that leaves no code read renders `NOT CLEAN` (exit `4` on
+an `--incremental` scan, `0` on a full one) and turns into exit `1` under
+`--strict`.
 
 A helper that hangs is a third way. Every helper and agent process runs
 under a time limit: `--scan-budget` (default `30m`, or `scanner.timeout` in

@@ -100,7 +100,7 @@ fn shim_body(hook: &str) -> String {
     format!(
         "#!/bin/sh\n\
          # Installed by `{BIN} hook install`: Revelara deterministic scan gate.\n\
-         # Exit 3 means BLOCKING findings remain; 0 is clean. No model calls.\n\
+         # Exit 3 means BLOCKING findings remain; 4 that no code was read; 0 passes. No model calls.\n\
          exec {}\n",
         gate_cmd(hook)
     )
