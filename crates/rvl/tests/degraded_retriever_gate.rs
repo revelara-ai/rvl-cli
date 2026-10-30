@@ -11,8 +11,11 @@
 //! fail-OPEN per language, `--strict` fail-closed, and ALL detected languages
 //! degraded as fatal at any strictness ("a clean report over nothing scanned is
 //! the single outcome that must never be quiet"). The incremental path simply
-//! never called it. THE FIX IS THE VERDICT LINE, NOT THE EXIT CODE: our
-//! retriever being broken must not block someone's commit.
+//! never called it. The fix was the verdict line, with the exit code left at
+//! 0 so a broken retriever would not block a commit. That half is since
+//! reversed for a pass that read NO code site: a commit nobody read has no
+//! verdict, so the gate refuses it (exit 4) and names `rvl scan .` as the
+//! step that shows why.
 //!
 //! These tests drive a real `git commit` through the hook the product installs,
 //! with a PATH that genuinely lacks `python3`, because the defect is not "a
@@ -223,23 +226,21 @@ fn a_commit_whose_only_retriever_cannot_run_is_never_called_clean() {
         .unwrap();
     let all = combined(&out);
 
-    // FAIL OPEN (ruled): our retriever being broken is our defect, and it must
-    // not stand between a developer and their commit.
+    // The commit read no code at all, so the gate has no verdict to give it.
     assert!(
-        out.status.success(),
-        "a broken retriever must not block a commit:\n{all}"
+        !out.status.success(),
+        "a commit nobody read must not pass the gate:\n{all}"
     );
-    assert_ne!(f.head(), before, "the commit must actually exist");
-
-    // ...but it must never be sold as a clean one.
+    assert_eq!(f.head(), before, "no commit may be created");
     assert!(
         !all.contains("commit clean"),
         "THE BEAD: a scan that read nothing reported a clean commit:\n{all}"
     );
     assert!(
-        all.contains("NOT CLEAN") && all.contains("nothing was scanned"),
+        all.contains("NOT CLEAN") && all.contains("0 code sites scanned"),
         "the verdict line must state that nothing was scanned:\n{all}"
     );
+    assert!(all.contains("rvl scan ."), "and name the next step:\n{all}");
     // The incremental path must be at least as loud as the full path, which
     // has rendered this since po-av01j.139.
     assert!(
@@ -287,10 +288,11 @@ fn the_same_commit_still_blocks_when_the_retriever_works() {
     );
 }
 
-/// A working retriever over a clean file keeps the clean verdict: the fix must
-/// not make every scan read as degraded.
+/// A working retriever over a file with no call sites passes: the fix must not
+/// make every scan read as degraded. It does not say "clean": no code site
+/// was in scope to be clean.
 #[test]
-fn a_working_retriever_over_a_clean_file_still_says_commit_clean() {
+fn a_working_retriever_over_a_file_with_no_call_sites_still_passes() {
     let f = PyRepo::new().with_python();
     f.install_hook("--pre-commit");
     std::fs::write(f.root.join("safe.py"), "def add(a, b):\n    return a + b\n").unwrap();
@@ -303,7 +305,10 @@ fn a_working_retriever_over_a_clean_file_still_says_commit_clean() {
         .unwrap();
     let all = combined(&out);
     assert!(out.status.success(), "{all}");
-    assert!(all.contains("commit clean"), "{all}");
+    assert!(
+        all.contains("0 code sites scanned (none in scope)"),
+        "{all}"
+    );
     assert!(!all.contains("NOT CLEAN"), "{all}");
 }
 
@@ -338,11 +343,11 @@ fn strict_still_fails_closed_on_the_incremental_path() {
 
 /// po-av01j.198 MUST NOT REGRESS. A repo with no supported source at all is a
 /// different fact from a repo whose retriever is broken: there was nothing to
-/// scan, so "clean" is the honest word. Same fixture family, same hook, only
-/// the presence of source differs -- which is the whole distinction these two
-/// beads exist to draw.
+/// scan, so the commit passes and the line says none was in scope. Same
+/// fixture family, same hook, only the presence of source differs -- which is
+/// the whole distinction these two beads exist to draw.
 #[test]
-fn a_repo_with_no_supported_source_still_reads_clean() {
+fn a_repo_with_no_supported_source_still_commits() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -397,7 +402,7 @@ fn a_repo_with_no_supported_source_still_reads_clean() {
     let all = combined(&out);
     assert!(out.status.success(), "{all}");
     assert!(
-        all.contains("commit clean"),
+        all.contains("0 code sites scanned (none in scope)"),
         "nothing to scan is not the same as could not scan (po-av01j.198):\n{all}"
     );
     assert!(!all.contains("NOT CLEAN"), "{all}");

@@ -12,8 +12,11 @@
 //!
 //! These tests stand up that checkout: thousands of committed Go files and an
 //! index that has never seen them, so every one is stale. The Go helper is a
-//! stub that records the files it was asked for, and stalls past the cap when
+//! stub that records the files it was asked for, and stalls for 30 s when
 //! asked for more than the commit, the way a real helper does on a large set.
+//! The pass no longer has a 10 s cap of its own (a cold index is now read
+//! whole, see `incremental_index_seed.rs`); the scope is what keeps a commit
+//! fast.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,7 +74,7 @@ impl Checkout {
 
         // The stub Go helper: log the requested files, one per line, then
         // answer with the repo-scoped record every real helper writes. Asked
-        // for more than the commit, it stalls past the 10 s cap.
+        // for more than the commit, it stalls for 30 s.
         let helper_log = dir.path().join("helper.log");
         let stub = dir.path().join("goindex-stub");
         rvl_testgate::write_executable(
@@ -138,7 +141,7 @@ impl Checkout {
 }
 
 /// THE REPORT. A 3-file commit over a baseline thousands of files stale
-/// retrieves exactly the staged files, inside the cap, and says so.
+/// retrieves exactly the staged files, quickly, and says so.
 #[test]
 fn a_three_file_commit_over_a_stale_index_retrieves_only_the_staged_files() {
     let co = Checkout::new();
@@ -162,10 +165,6 @@ fn a_three_file_commit_over_a_stale_index_retrieves_only_the_staged_files() {
         "the changed set is the staged files, never the index's drift:\n{all}"
     );
     assert!(
-        !all.contains("retrieval capped"),
-        "three files must fit the cap:\n{all}"
-    );
-    assert!(
         !all.contains("nothing was scanned"),
         "the staged files were scanned:\n{all}"
     );
@@ -176,27 +175,6 @@ fn a_three_file_commit_over_a_stale_index_retrieves_only_the_staged_files() {
     );
     assert!(
         took < std::time::Duration::from_secs(10),
-        "the scan took {took:?}, past the retrieval cap"
-    );
-}
-
-/// An unscoped incremental scan over the same stale baseline asks for more
-/// than the commit, so the stub stalls past the cap: the pass fails open,
-/// unchanged by scoping. That the unscoped request IS the stale baseline is
-/// pinned by a unit test of the request (`an_unscoped_pass_asks_for_every_
-/// stale_file_and_a_scoped_one_for_the_change`), not here: how many lines the
-/// stub logs before the 10 s cap depends on how fast the machine is.
-#[test]
-fn an_unscoped_incremental_scan_that_hits_the_cap_still_fails_open() {
-    let co = Checkout::new();
-    let (out, all) = co.scan(&[]);
-    assert!(out.status.success(), "the cap still fails open:\n{all}");
-    // Two clocks enforce the same 10 s cap and either may fire first: the
-    // pass's wall budget ("retrieval capped") or the helper's own deadline,
-    // which kills the stub and degrades Go. Both fail open on the cap.
-    assert!(
-        all.contains("retrieval capped at 10s")
-            || all.contains("the incremental retrieval budget of 10s ran out"),
-        "the cap fails open:\n{all}"
+        "the scan took {took:?}: it read more than the commit"
     );
 }

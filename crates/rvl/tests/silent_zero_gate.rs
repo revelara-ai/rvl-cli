@@ -24,10 +24,13 @@
 //!      anyone knowing it is broken, and it is tested with a helper stub that
 //!      exits 0 precisely so it cannot be passing for reason (1).
 //!
-//! FAIL OPEN throughout (ruled on .199): our retriever being broken is our
-//! defect and must not stand between a developer and their commit. The verdict
-//! goes NOT CLEAN, the exit code stays 0 on the hook path, and `--strict` is
-//! CI's opt-in to fail closed.
+//! The exit code was FAIL OPEN (ruled on .199): our retriever being broken is
+//! our defect and must not stand between a developer and their commit. That
+//! ruling is reversed for the incremental path the hooks run, for the case
+//! where it read NO code site: the verdict goes NOT CLEAN, says 0 code sites
+//! were scanned, names `rvl scan .` as the next step, and the run exits 4.
+//! A change with nothing to read (no call sites) still exits 0, without the
+//! word "clean". `--strict` still fails closed earlier, with exit 1.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -337,7 +340,7 @@ fn require_goindex() -> bool {
 
 /// THE BEAD, end to end through the hook the product installs. Go is the
 /// repo's only language, the `go` tool is absent so goindex can read nothing,
-/// and the commit used to be sold as clean at exit 0.
+/// and the commit used to be sold as clean at exit 0. Now it is refused.
 #[test]
 fn a_go_repo_without_the_go_toolchain_is_never_called_clean() {
     if !require_goindex() {
@@ -356,23 +359,21 @@ fn a_go_repo_without_the_go_toolchain_is_never_called_clean() {
         .unwrap();
     let all = combined(&out);
 
-    // FAIL OPEN (ruled on .199): a broken toolchain is not the developer's
-    // fault and must not block their commit.
+    // A change nobody read has no verdict: the hook refuses the commit.
     assert!(
-        out.status.success(),
-        "a toolchain we cannot run must not block a commit:\n{all}"
+        !out.status.success(),
+        "a commit whose code went unread must not pass the gate:\n{all}"
     );
-    assert_ne!(f.head(), before, "the commit must actually exist");
-
-    // ...but it must never be sold as a clean one.
+    assert_eq!(f.head(), before, "no commit may be created");
     assert!(
         !all.contains("commit clean"),
         "THE BEAD: a scan that read no Go reported a clean commit:\n{all}"
     );
     assert!(
-        all.contains("NOT CLEAN") && all.contains("nothing was scanned"),
+        all.contains("NOT CLEAN") && all.contains("0 code sites scanned"),
         "the verdict line must state that nothing was scanned:\n{all}"
     );
+    assert!(all.contains("rvl scan ."), "and name the next step:\n{all}");
     assert!(
         all.contains("INCOMPLETE"),
         "the coverage block must say the call-site lane never ran:\n{all}"
@@ -419,9 +420,10 @@ fn the_same_commit_still_blocks_when_the_toolchain_works() {
 /// THE FALSE POSITIVE THE GUARD MUST NOT HAVE. A Go repo that genuinely
 /// contains no client call sites is legitimate and common, and the retriever
 /// answering "I loaded your code and there is nothing here" is a real answer,
-/// not a silence. It must still read clean.
+/// not a silence. It must still commit, and say there was nothing to judge
+/// rather than call the commit clean.
 #[test]
-fn a_go_repo_with_no_call_sites_at_all_still_reads_clean() {
+fn a_go_repo_with_no_call_sites_at_all_still_commits() {
     if !require_goindex() {
         return;
     }
@@ -440,9 +442,10 @@ fn a_go_repo_with_no_call_sites_at_all_still_reads_clean() {
     let all = combined(&out);
     assert!(out.status.success(), "{all}");
     assert!(
-        all.contains("commit clean"),
+        all.contains("0 code sites scanned (none in scope)"),
         "a language with no call sites is scanned, not degraded:\n{all}"
     );
+    assert!(!all.contains("commit clean"), "{all}");
     assert!(!all.contains("NOT CLEAN"), "{all}");
     assert!(!all.contains("INCOMPLETE"), "{all}");
 }
@@ -496,9 +499,10 @@ fn a_helper_that_exits_zero_with_an_empty_stream_is_a_failed_lane() {
         .output()
         .unwrap();
     let all = combined(&out);
-    assert!(
-        out.status.success(),
-        "the guard is fail-open like every other degradation:\n{all}"
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a pass that read no code exits 4:\n{all}"
     );
     assert!(
         !all.contains("commit clean"),
@@ -536,7 +540,7 @@ fn a_zero_valued_repo_record_does_not_count_as_having_scanned() {
         .output()
         .unwrap();
     let all = combined(&out);
-    assert!(out.status.success(), "{all}");
+    assert_eq!(out.status.code(), Some(4), "{all}");
     assert!(
         !all.contains("commit clean") && all.contains("NOT CLEAN"),
         "the exact record the bead reported must not read as a scan:\n{all}"
@@ -566,9 +570,10 @@ fn a_repo_record_with_no_sites_is_a_real_scan() {
     let all = combined(&out);
     assert!(out.status.success(), "{all}");
     assert!(
-        all.contains("commit clean") && !all.contains("NOT CLEAN"),
+        all.contains("0 code sites scanned (none in scope)") && !all.contains("NOT CLEAN"),
         "a helper that ran and found nothing must not be called degraded:\n{all}"
     );
+    assert!(!all.contains("commit clean"), "{all}");
 }
 
 /// A DEGRADED LANGUAGE MUST NOT POISON THE INDEX. Without this, the fix is
@@ -627,9 +632,10 @@ fn a_python_helper_that_exits_zero_with_an_empty_stream_is_a_failed_lane() {
         .output()
         .unwrap();
     let all = combined(&out);
-    assert!(
-        out.status.success(),
-        "the guard is fail-open like every other degradation:\n{all}"
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a pass that read no code exits 4:\n{all}"
     );
     assert!(
         !all.contains("commit clean") && all.contains("NOT CLEAN"),
@@ -646,9 +652,9 @@ fn a_python_helper_that_exits_zero_with_an_empty_stream_is_a_failed_lane() {
 /// embedded pyindex on a closed PATH — the brew-install shape: the helper
 /// extracts from the binary, `python3` is the machine's. A Python repo with
 /// no client calls is legitimate and common; the helper's `retrieval_stats`
-/// record proves it ran, and the repo still reads clean.
+/// record proves it ran, and the repo still passes the gate.
 #[test]
-fn a_python_repo_with_no_call_sites_still_reads_clean() {
+fn a_python_repo_with_no_call_sites_still_passes() {
     let f = GoRepo::new_python().with_python3();
     f.stage("app.py", "def add(a, b):\n    return a + b\n");
 
@@ -662,7 +668,7 @@ fn a_python_repo_with_no_call_sites_still_reads_clean() {
     let all = combined(&out);
     assert!(out.status.success(), "{all}");
     assert!(
-        all.contains("commit clean") && !all.contains("NOT CLEAN"),
+        all.contains("0 code sites scanned (none in scope)") && !all.contains("NOT CLEAN"),
         "a language with no call sites is scanned, not degraded:\n{all}"
     );
     assert!(!all.contains("INCOMPLETE"), "{all}");

@@ -297,8 +297,10 @@ reuses from the index keep the resolution they were retrieved with.
 Check the per-language roll-call: a lane that ran and read nothing is
 different from a lane with nothing to find. A helper that exits cleanly
 having emitted nothing is reported as a failed lane, the report prints
-`NOT CLEAN — nothing was scanned (see COVERAGE)` when no code was read at
-all, and `--strict` turns a degraded lane into exit 1. Details, and the CI
+`NOT CLEAN` when no code was read at all (an `--incremental` scan, which the
+hooks run, also exits 4), and `--strict` turns a degraded lane into exit 1.
+A scan that read no code site because there was none to read prints
+`0 code sites scanned (none in scope)`, never `commit clean`. Details, and the CI
 assertion that closes the remaining gap, are in
 [Gating commits and CI](gating.md).
 
@@ -325,8 +327,8 @@ and the language is reported degraded in COVERAGE:
 
 A helper not yet started when the budget runs out is not started, and is
 reported the same way. The scan fails open, like every other degraded lane;
-`--strict` turns it into exit `1`. An incremental scan keeps its own 10s
-retrieval budget, and these limits apply inside it. The in-process lanes
+`--strict` turns it into exit `1`. An incremental scan reads its changed
+files under the same limits; it has no shorter cap of its own. The in-process lanes
 (config, secrets, structure) read files and are not bounded.
 
 The decision-model lane has its own limit, inside the scan budget:
@@ -363,8 +365,8 @@ The installed shim runs
 `rvl scan . --incremental --changed-only --hook <name>`:
 
 - pre-commit scans exactly your staged changes. It reuses the incremental
-  packet index and re-reads only files whose content hash changed, under a
-  10-second retrieval budget (fail-open; `--strict` makes it fail closed).
+  packet index and re-reads only files whose content hash changed, under
+  the scan's time limits.
 - pre-push scans the pushed range against a base ref. The base resolves
   through a chain (`--base`, `RVL_BASE_REF`, `GITHUB_BASE_REF`,
   `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, then `scanner.base_ref` in
@@ -376,6 +378,13 @@ a required CI check on the merge ref:
 [Gating commits and CI](gating.md) ships the job. For the same reason the
 pre-commit scan refuses, with exit `1`, a staged file that also has unstaged
 edits: it reads the working tree, and that is not what the commit contains.
+
+The index needs no setup step. A full `rvl scan .` seeds it with every file
+it read, and an `--incremental` scan reads whatever the index has not seen
+and records it, so the first hook run on a large repository can take as
+long as a full scan, once. Later runs read only files whose content
+changed. A language helper loads the whole program even for one changed
+file, so a commit that changes code takes at least that load time.
 
 `rvl index init/reindex/status` manages the incremental index directly.
 `rvl index reindex --detach` rebuilds it in the background, which is useful
