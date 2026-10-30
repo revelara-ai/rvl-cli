@@ -50,6 +50,7 @@ use std::process::ExitCode;
 ///   and `rvl_data::Failure::usage`.)
 /// * `3` — the scan completed and BLOCKING findings remain: fix or suppress
 ///   them. This is the gate firing.
+/// * `4` — an `--incremental` scan read no code site: see [`EXIT_UNREAD`].
 ///
 /// "Blocked" gets its own code instead of reusing `1` because a hook must be
 /// able to distinguish "your code has a problem" from "the scanner is broken",
@@ -57,6 +58,15 @@ use std::process::ExitCode;
 /// makes the contract additive: no previously non-zero code changed meaning,
 /// only the previously-and-wrongly-zero blocked case moved.
 const EXIT_BLOCKED: u8 = 3;
+
+/// `4`: an `--incremental` scan read NO code site because the code it was
+/// asked about went unread: a helper failed, was killed, or emitted nothing,
+/// or the scan budget ran out. Not `3`, because nothing was judged, and not
+/// `1`, because the other lanes did run and report. A change with no code to
+/// read (docs, config, code without call sites) is not this case and exits
+/// `0`. A full scan keeps failing open here; `--strict` still turns any
+/// degradation into `1` before a verdict is printed.
+const EXIT_UNREAD: u8 = 4;
 
 #[derive(Parser)]
 #[command(name = rvl_data::BIN, version, about = "Revelara reliability scanner")]
@@ -144,9 +154,9 @@ enum Cmd {
         /// files whose content hash changed. Ignored when `--retrieved` is given.
         #[arg(long)]
         incremental: bool,
-        /// Fail CLOSED when the incremental wall budget is exhausted or a
-        /// retriever errors or times out (CI), with exit 1. Default is fail-open: degrade to the reused
-        /// portion so a scan never blocks.
+        /// Fail CLOSED when the scan budget is exhausted or a retriever errors
+        /// or times out (CI), with exit 1. Default is fail-open: degrade to the
+        /// reused portion so a scan never blocks.
         #[arg(long)]
         strict: bool,
         /// Wall-clock budget for the scan's helpers and agent calls together
@@ -3042,6 +3052,9 @@ struct RetrievedStream {
     /// off its repo-scoped record. Empty for a helper that does not measure
     /// one.
     retrieval: Vec<rvl_core::RetrievalCensus>,
+    /// Languages whose helper read the whole tree, so every walked file of
+    /// theirs can seed the packet index: see [`seed_packet_index`].
+    seedable: Vec<Lang>,
 }
 
 /// Resolve the packet-stream TEXT feeding the pipeline. With `--retrieved`,
@@ -3096,6 +3109,9 @@ fn resolve_packet_stream(
             retrievers: Vec::new(),
             // A captured stream carries its census on the same record.
             retrieval: cfg.retrieval,
+            // A captured stream may describe another tree, or another
+            // revision of this one: it never seeds the index.
+            seedable: Vec::new(),
         });
     }
     let mut langs = detect_languages(path);
@@ -3143,6 +3159,7 @@ fn resolve_packet_stream(
                 })
                 .collect(),
             degraded: Vec::new(),
+            seedable: Vec::new(),
         });
     }
     // DISCOVERY PROBE (po-av01j.148). Resolve every detected language's helper
@@ -3203,6 +3220,7 @@ fn resolve_packet_stream(
     let mut status: Vec<render::LangStatus> = Vec::new();
     let mut retrievers: Vec<render::RetrieverInfo> = Vec::new();
     let mut retrieval: Vec<rvl_core::RetrievalCensus> = Vec::new();
+    let mut seedable: Vec<Lang> = Vec::new();
     for lang in langs {
         // A helper that cannot be FOUND is a degradation of that language too,
         // not a fatal error: an unrelated language's toolchain being absent is
@@ -3268,8 +3286,14 @@ fn resolve_packet_stream(
                 let sites = out.matches("\"site_key\"").count();
                 // ...unless the helper says part of what it parsed was lost
                 // to parse errors: then the count is a floor, not an answer.
-                // Same for a Rust workspace rustindex left out for its size.
-                let note = incomplete_parse_note(&out).or_else(|| rust_too_large_note(&out));
+                // Same for a Rust workspace rustindex left out for its size,
+                // which was not read at all, so its files must not seed the
+                // index as read with no sites.
+                let too_large = rust_too_large_note(&out);
+                if too_large.is_none() {
+                    seedable.push(lang);
+                }
+                let note = incomplete_parse_note(&out).or(too_large);
                 status.push(match note {
                     None => render::LangStatus {
                         lang: lang.to_string(),
@@ -3328,6 +3352,7 @@ fn resolve_packet_stream(
         degraded,
         retrievers,
         retrieval,
+        seedable,
     })
 }
 
@@ -4252,6 +4277,7 @@ fn model_budget(
 fn run_scan(
     store: &CacheStore,
     keyset: &Keyset,
+    index_dir: &std::path::Path,
     state_path: &std::path::Path,
     path: &std::path::Path,
     retrieved: Option<&std::path::Path>,
@@ -4365,10 +4391,17 @@ fn run_scan(
             Vec::new(),
             // The full path takes no `--hook`.
             render::GatedOperation::Commit,
+            false,
         );
     }
     progress::step(&progress, "Retrieving call sites");
     let stream = resolve_packet_stream(retrieved, path, strict, include_tests, &limits)?;
+    // The index is built with the test-path skip in place (see the
+    // `--include-tests` guard in `run`), so a scan that lifted it does not
+    // seed one.
+    if !include_tests {
+        progress.suspend(|| seed_packet_index(index_dir, path, &stream));
+    }
     progress::step(&progress, "Resolving findings");
     let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
         resolve_findings(
@@ -4440,6 +4473,7 @@ fn run_scan(
         stream.retrieval.clone(),
         stream.dependencies_uninstalled.clone(),
         render::GatedOperation::Commit,
+        false,
     )
 }
 
@@ -4582,6 +4616,9 @@ fn render_scan_output(
     // What a blocking verdict stops, so the verdict and the bypass hint say
     // "push" under the pre-push hook (po-av01j.207).
     operation: render::GatedOperation,
+    // An incremental pass: no code read because the code went unread exits
+    // EXIT_UNREAD instead of failing open.
+    unread_fails: bool,
 ) -> anyhow::Result<ExitCode> {
     // Resolved = the scanner reached a conclusion (bounded/unbounded blocking,
     // or non-blocking). The rest abstain; bucket them by the lever that closes
@@ -4599,6 +4636,7 @@ fn render_scan_output(
         parse_incomplete,
         dependencies_uninstalled,
         degraded_note,
+        unread_fails,
         lang_status,
         retrievers,
         retrieval,
@@ -4695,6 +4733,14 @@ fn render_scan_output(
     // field, and the process exit code, so no pair of them can ever disagree
     // (po-av01j.94's invariant, extended to the document).
     let blocked = render::blocking_count(&ladder_findings) > 0;
+    let unread = !blocked && coverage.unread_exit();
+    let exit = if blocked {
+        EXIT_BLOCKED
+    } else if unread {
+        EXIT_UNREAD
+    } else {
+        0
+    };
 
     // Build the structured scan document (rvl-scan/v1) BEFORE the ladder
     // render consumes `coverage`. Deterministic-engine truth only; the agent
@@ -4712,7 +4758,7 @@ fn render_scan_output(
                 .map(|a| a.block.as_str())
                 .filter(|b| !b.is_empty()),
             blended.map(|b| &b.summary),
-            blocked,
+            exit,
         )
         .with_decision_model(model.map(|m| m.summary.clone()))
     });
@@ -4747,7 +4793,7 @@ fn render_scan_output(
     // here, so this is the single place the blocking verdict becomes a process
     // status — derived from the same `classify` the footer used, never a second
     // opinion. See EXIT_BLOCKED for the full contract.
-    if blocked {
+    if blocked || unread {
         // rvl-cli v1's `--mode eval` (po-av01j.191): the user disarmed this
         // gate deliberately, and an upgrade must not re-arm it. Reported, not
         // silent — the ladder above already printed every finding.
@@ -4759,7 +4805,7 @@ fn render_scan_output(
         // only bypass a blocked committer can find is `--no-verify`, which
         // skips every hook and leaves no record; the force-through leaves one.
         println!("{}", force::force_through_hint(operation));
-        return Ok(ExitCode::from(EXIT_BLOCKED));
+        return Ok(ExitCode::from(exit));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -4776,14 +4822,14 @@ fn render_scan_output(
 //   * Reuse and merge key on the full `site_key` (path:line:client_type:method),
 //     never file:line: one location can resolve to several sites with different
 //     verdicts, and a file:line key silently drops one of a colliding pair.
-//   * The retrieval wall budget fails OPEN: when it is exhausted the scan
-//     degrades to the reused portion rather than blocking. `--strict` inverts
-//     that for CI, where a partial answer is worse than a failed job.
+//   * The retrieval runs under the scan's own limits (`--scan-budget`,
+//     `--helper-timeout`), never a shorter cap of its own. When those are
+//     exhausted the scan degrades to the reused portion; `--strict` refuses
+//     the partial answer instead, for CI.
 
-/// Default wall-clock cap on the CHANGED-file retrieval, mirroring
-/// `rvl_index::Budget::hook()`. A warm scan sits on a pre-commit hook; it must
-/// never hang a commit, so it degrades to what it has once this elapses.
-const INCREMENTAL_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many unindexed files a warm pass reads before it says why it is slow:
+/// a cold index on a large repository takes as long as a full scan, once.
+const COLD_READ_NOTE_FILES: usize = 200;
 
 /// A real `rvl_index::Retriever`: shells out to the language helpers for a
 /// specific CHANGED-file list. Files are grouped by extension -> language and
@@ -4804,9 +4850,8 @@ struct HelperRetriever {
     /// path does: the merged `RepoConfig` no longer knows whose count it is.
     dependencies_uninstalled:
         std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>>,
-    /// The scan's limits, capped at the retrieval wall budget, so a helper
-    /// still running when that budget runs out is killed rather than left
-    /// behind by the abandoned worker thread.
+    /// The scan's limits, so a helper still running when they run out is
+    /// killed rather than left behind by the abandoned worker thread.
     limits: budget::Limits,
 }
 
@@ -5338,28 +5383,40 @@ fn incremental_scan_pass(
     // outlives it.
     let dependencies: std::sync::Arc<std::sync::Mutex<Vec<render::DependenciesUninstalled>>> =
         Default::default();
+    let bar = progress.clone();
     let mut scan = incremental_sites(&index, path, &candidates, move |changed| {
         attempted_w.store(
             langs_of_paths(changed).len(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        // Budget only the potentially-slow helper retrieval.
+        // THE CHANGE IS READ WHOLE. This pass used to cap retrieval at 10 s
+        // and fall back to the reused portion. A helper loads the whole
+        // program before it filters to `--files`, so the cap measured helper
+        // start-up, not the change: a cold index was never built, and a
+        // TypeScript or Rust commit of a few files came back with no sites.
+        // Retrieval now runs under the scan's own limits, like a full scan,
+        // and the index it fills makes the next pass read only new content.
         let retriever = HelperRetriever {
             degraded: std::sync::Arc::clone(&collector),
             dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
             root: root.clone(),
             name: name.clone(),
-            limits: limits.within(
-                INCREMENTAL_WALL_BUDGET,
-                budget::Cause::IncrementalBudget(INCREMENTAL_WALL_BUDGET),
-            ),
+            limits,
         };
+        if changed.len() >= COLD_READ_NOTE_FILES {
+            bar.suspend(|| {
+                eprintln!(
+                    "incremental: reading {} file(s) the packet index has not seen; \
+                     later runs reuse them",
+                    changed.len()
+                )
+            });
+        }
         let changed_owned = changed.to_vec();
         let changed_len = changed_owned.len();
-        let outcome = run_with_budget(INCREMENTAL_WALL_BUDGET, move || {
-            retriever.retrieve_full(&changed_owned)
-        });
-        let mut rr = resolve_budgeted(outcome, strict, changed_len, INCREMENTAL_WALL_BUDGET)?;
+        let cap = limits.remaining().unwrap_or(std::time::Duration::MAX);
+        let outcome = run_with_budget(cap, move || retriever.retrieve_full(&changed_owned));
+        let mut rr = resolve_budgeted(outcome, strict, changed_len, cap)?;
         // Carry the per-language degradations into the re-indexing decision
         // (po-av01j.209). Read here rather than inside `retrieve_full` because
         // this is the last point that still owns the collector handle and the
@@ -5578,13 +5635,82 @@ fn open_packet_index(
     Ok(index)
 }
 
+/// Seed the packet index from a full scan's stream, so the next
+/// `--incremental` pass reuses what this scan read instead of reading the
+/// repository again. Before this only an incremental pass or `index init`
+/// wrote the index, and a full scan followed by a warm one read everything
+/// twice.
+///
+/// Only the files of a language whose helper read the whole tree are
+/// recorded (`RetrievedStream::seedable`): a degraded or skipped language's
+/// files stay unindexed, or the next pass would reuse an emptiness nobody
+/// read. Each file is recorded the way `incremental_sites` records a
+/// retrieved one: its shard, a skipped test file as skipped, a partial parse
+/// as incomplete. Best effort: the index is a cache, so a busy or broken one
+/// is a note, never a failed scan.
+fn seed_packet_index(index_dir: &Path, root: &Path, stream: &RetrievedStream) {
+    if stream.seedable.is_empty() {
+        return;
+    }
+    let seed = || -> anyhow::Result<usize> {
+        let idx = open_packet_index(index_dir, rvl_index::DEFAULT_OPEN_TIMEOUT)?;
+        let (sites, cfg, _) = rvl_core::parse_stream(&stream.text);
+        let includes = includes_by_tu(&cfg);
+        let paths = |v: &[String]| -> std::collections::HashSet<String> {
+            v.iter().map(|f| normalize_rel(f)).collect()
+        };
+        let skipped = paths(&cfg.test_files_skipped_paths);
+        let incomplete = paths(&cfg.parse_incomplete_paths);
+        // Grouped once: `shard_of` per file would scan every site per file.
+        let mut by_file: std::collections::HashMap<&str, Vec<rvl_core::Site>> =
+            std::collections::HashMap::new();
+        for s in &sites {
+            by_file
+                .entry(s.file_path.as_str())
+                .or_default()
+                .push(s.clone());
+        }
+        let mut seeded = 0usize;
+        for f in walk_source_files(root) {
+            if !lang_of_path(&f).is_some_and(|l| stream.seedable.contains(&l)) {
+                continue;
+            }
+            let rel = repo_relative(root, &f);
+            let h = rvl_index::hash_file(&f)?;
+            if skipped.contains(&rel) {
+                idx.put_test_skipped(&f, &h)?;
+                seeded += 1;
+                continue;
+            }
+            let headers = includes.get(rel.as_str());
+            let mut shard = by_file.get(rel.as_str()).cloned().unwrap_or_default();
+            let mut deps = Vec::new();
+            for hdr in headers.into_iter().flatten() {
+                shard.extend(by_file.get(hdr).into_iter().flatten().cloned());
+                deps.push(root.join(hdr));
+            }
+            if incomplete.contains(&rel) {
+                idx.put_incomplete_with_deps(&f, &h, &shard, &deps)?;
+            } else {
+                idx.put_with_deps(&f, &h, &shard, &deps)?;
+            }
+            seeded += 1;
+        }
+        Ok(seeded)
+    };
+    match seed() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("packet index: seeded {n} file(s); the next --incremental scan reuses them"),
+        Err(e) => eprintln!("note: the packet index was not seeded ({e:#}); the next --incremental scan reads the files itself"),
+    }
+}
+
 /// `index init` / `index reindex`, both packet-stream and live modes.
 ///
 /// Live mode (no --retrieved) is the background warm a post-commit hook
 /// triggers: hash-gate the sources, re-retrieve ONLY the changed files
-/// through the language helpers, store the fresh packets. Deliberately NOT
-/// under the incremental wall budget — the budget protects the commit path,
-/// and this runs behind it (with --detach, literally in the background).
+/// through the language helpers, store the fresh packets (with --detach, in
+/// the background).
 fn run_index_build(
     cfg: &Config,
     path: Option<PathBuf>,
@@ -5739,8 +5865,7 @@ fn run_index_build(
         dependencies_uninstalled: std::sync::Arc::clone(&dependencies),
         root: root.clone(),
         name,
-        // Not under the commit path's wall budget, but a hung helper must
-        // still not outlive the warm: the default limits apply.
+        // A hung helper must not outlive the warm: the default limits apply.
         limits: budget::Limits::resolve(&root, None, None),
     };
     let scan = incremental_sites(&idx, &root, &candidates, |changed| {
@@ -6183,6 +6308,7 @@ fn run_scan_incremental(
         scan.repo_cfg.retrieval.clone(),
         scan.dependencies_uninstalled.clone(),
         render::GatedOperation::from_hook(hook),
+        true,
     )
 }
 
@@ -8205,6 +8331,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 run_scan(
                     &store,
                     &keyset,
+                    &cfg.index_dir,
                     &state_path,
                     &path,
                     retrieved.as_deref(),

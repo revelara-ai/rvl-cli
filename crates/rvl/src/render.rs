@@ -218,6 +218,11 @@ pub struct Coverage {
     /// first one printed over the second is the exact confusion this bead
     /// exists to remove.
     pub degraded_note: Option<String>,
+    /// A pass that read no code because the code it was asked about went
+    /// unread exits nonzero instead of failing open. Set by the incremental
+    /// path, which the git hooks run: its verdict is about the change, so a
+    /// change nobody read has no verdict. The full scan leaves it off.
+    pub unread_fails: bool,
     /// Languages that contributed no packets at all (po-av01j.102). Distinct
     /// from the abstain buckets above, which count SITES the scanner reached
     /// and could not decide. These are languages it never got to look at, so
@@ -667,6 +672,19 @@ impl Coverage {
     pub fn abstain_total(&self) -> usize {
         self.abstain_no_spec + self.abstain_bounds + self.abstain_judge + self.abstain_other
     }
+
+    /// No code site was scanned because a retriever could not read the code:
+    /// "I could not look", never "I found nothing".
+    pub fn nothing_scanned(&self) -> bool {
+        self.total == 0 && self.degraded_note.is_some()
+    }
+
+    /// [`Coverage::nothing_scanned`] on a pass that refuses to fail open over
+    /// it. The footer and the process exit code both read this, so they
+    /// cannot disagree.
+    pub fn unread_exit(&self) -> bool {
+        self.unread_fails && self.nothing_scanned()
+    }
 }
 
 /// What the config lane concluded for the settings of one (format, key). The
@@ -1092,7 +1110,7 @@ pub fn render_ladder(
     // scanned, the reader is told which language was skipped by the coverage
     // lines above, and calling that "not clean" would train people to ignore
     // the word.
-    let nothing_scanned = cov.total == 0 && cov.degraded_note.is_some();
+    let nothing_scanned = cov.nothing_scanned();
     if blocking.is_empty() {
         let mut foot = format!(
             "{} {} advisory",
@@ -1106,7 +1124,24 @@ pub fn render_ladder(
         if suppressed > 0 {
             let _ = write!(foot, " \u{00b7} {suppressed} suppressed");
         }
-        if nothing_scanned {
+        if cov.unread_exit() {
+            // The incremental gate does not fail open over code it never
+            // read: the run exits nonzero (EXIT_UNREAD) and names the step
+            // that shows which language went unread and why.
+            let _ = writeln!(
+                o,
+                "{foot} \u{00b7} {}",
+                paint(
+                    &format!(
+                        "NOT CLEAN \u{2014} 0 code sites scanned: the changed code went unread \
+                         (see COVERAGE); run `{BIN} scan .` to see why, then {} again",
+                        cov.operation.as_str()
+                    ),
+                    "33",
+                    color
+                )
+            );
+        } else if nothing_scanned {
             // The exit code stays 0: a broken retriever is OUR defect and must
             // not block someone's commit (ruled po-av01j.199, and what
             // `--strict`'s help has always promised). So the verdict line is
@@ -1136,6 +1171,11 @@ pub fn render_ladder(
                     color
                 )
             );
+        } else if cov.total == 0 {
+            // NOT "clean" either: zero code sites is a scan with nothing to
+            // judge (a docs-only change, code with no call sites), and the
+            // line says that rather than vouching for code it never saw.
+            let _ = writeln!(o, "{foot} \u{00b7} 0 code sites scanned (none in scope)");
         } else {
             let _ = writeln!(o, "{foot} \u{00b7} commit clean");
         }

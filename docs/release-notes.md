@@ -24,6 +24,31 @@ in Go and Python. See "Construction rules" in `docs/retrievers.md`.
   (`cfg.Insecure && debug`). A Go skip under such a guard was blocking and is
   now advisory. A local is still not an option.
 
+### A scan that reads no code site no longer prints "commit clean"
+
+What changed:
+
+- An `--incremental` scan, which is what the installed git hooks run, that
+  read no code site because the code it was asked about went unread (a
+  language helper failed, was killed, or emitted nothing) now prints
+  `NOT CLEAN — 0 code sites scanned`, names `rvl scan .` as the step that
+  shows why, and exits `4`. It exited `0` before. Under a hook, a nonzero
+  exit stops the commit or push.
+- A scan with no code site to read (a docs-only change, code with no call
+  sites) still exits `0`. Its verdict now reads
+  `0 code sites scanned (none in scope)` instead of `commit clean`.
+- An `--incremental` scan no longer stops reading after 10 seconds. A cold
+  packet index is now built by the first run instead of never, and a
+  full `rvl scan .` seeds it. The first hook run on a large repository can
+  take as long as a full scan; later runs read only files whose content
+  changed.
+- `--out` `exit` can be `4`.
+
+What to do: run a full scan once (`rvl scan .`). It seeds the index the
+hooks read, and if a language's code is not being read it says which one
+and why. A CI job or a hook wrapper that treats only `3` as the gate firing
+should also treat `4` as a failure.
+
 ### A construction rule can block only what a change introduces
 
 A `config_keys` spec may carry `gate`. See "Construction rules" in

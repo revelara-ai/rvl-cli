@@ -205,7 +205,7 @@ fn a_docs_only_repo_commits_through_the_installed_pre_commit_hook() {
         "the run must state why nothing was retrieved: {all}"
     );
     assert!(
-        all.contains("COVERAGE") && all.contains("commit clean"),
+        all.contains("COVERAGE") && all.contains("0 code sites scanned (none in scope)"),
         "an empty scope still gets the full-scan report: {all}"
     );
 }
@@ -309,7 +309,7 @@ fn a_docs_change_reads_the_same_with_or_without_source_in_the_repo() {
 
     for out in [&no_source, &with_source] {
         assert!(
-            combined(out).contains("commit clean"),
+            combined(out).contains("0 code sites scanned (none in scope)"),
             "both must reach the same verdict: {}",
             combined(out)
         );

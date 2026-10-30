@@ -41,7 +41,7 @@ pub fn lever_of(reason: &str) -> &'static str {
 pub struct OutDoc {
     pub schema: &'static str,
     /// Duplicates the process exit code so a consumer holding only this file
-    /// knows whether the gate fired (0 clean, 3 blocking).
+    /// knows whether the gate fired (0 clean, 3 blocking, 4 code unread).
     pub exit: u8,
     pub findings: Vec<OutFinding>,
     pub coverage: OutCoverage,
@@ -341,7 +341,7 @@ pub fn build(
     config_sites: Option<&crate::config_lane::ConfigSites>,
     hook_agent_block: Option<&str>,
     blend: Option<&crate::blend::BlendSummary>,
-    blocked: bool,
+    exit: u8,
 ) -> OutDoc {
     let findings = ladder
         .iter()
@@ -395,7 +395,7 @@ pub fn build(
 
     OutDoc {
         schema: "rvl-scan/v1",
-        exit: if blocked { 3 } else { 0 },
+        exit,
         findings,
         coverage: OutCoverage {
             resolved: coverage.resolved,
@@ -540,7 +540,7 @@ mod tests {
             None,
             None,
             None,
-            blocked,
+            if blocked { 3 } else { 0 },
         );
         assert_eq!(doc.exit, 3);
         assert_eq!(doc.findings[0].severity, "blocking");
@@ -592,7 +592,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            0,
         );
         assert_eq!(doc.findings[0].class, "github.com/cli/cli/v2/api.Client.Do");
     }
@@ -629,7 +629,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            0,
         );
         let v = serde_json::to_value(&doc.findings).unwrap();
         v.as_array()
@@ -710,7 +710,7 @@ mod tests {
             candidates: 97,
             unretrieved,
         }];
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, 0);
         let v = serde_json::to_value(&doc.coverage).unwrap();
         assert_eq!(v["retrieval"][0]["lang"], "go");
         assert_eq!(v["retrieval"][0]["candidates"], 97);
@@ -762,7 +762,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            0,
         );
         let v = serde_json::to_value(&doc).unwrap();
         let config = &v["coverage"]["config"];
@@ -798,7 +798,7 @@ mod tests {
             by_lang: vec![lc("Go", 900, 1000, 100), lc("Python", 0, 7184, 5173)],
             ..Default::default()
         };
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, 0);
         let v = serde_json::to_value(&doc.coverage.by_language).unwrap();
         assert_eq!(
             v,
@@ -808,7 +808,7 @@ mod tests {
             ])
         );
         cov.empty_api_corpus = true;
-        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, false);
+        let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, 0);
         assert!(!doc.coverage.by_language[1].corpus_gap);
     }
 
@@ -835,18 +835,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let doc = build(
-            &[],
-            &coverage,
-            None,
-            &[],
-            &[],
-            &rows,
-            None,
-            None,
-            None,
-            false,
-        );
+        let doc = build(&[], &coverage, None, &[], &[], &rows, None, None, None, 0);
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["structure"].as_array().unwrap().len(), 3);
         assert_eq!(v["structure"][0]["site_id"], "repo");
@@ -877,7 +866,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            0,
         );
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["structure"], serde_json::json!([]));
@@ -927,7 +916,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            0,
         );
         serde_json::to_value(&doc).unwrap()
     }
