@@ -94,7 +94,7 @@ func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 		"DeferredInsecure": {},
 		"Verify":           {},
 		"DialInsecure":     {guard: `addr != "" && insecure`, params: []string{"addr", "insecure"}},
-		"FromEnv":          {guard: "skip"},
+		"InsecureFromEnv":  {guard: "skip"},
 	} {
 		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
 		if !ok {

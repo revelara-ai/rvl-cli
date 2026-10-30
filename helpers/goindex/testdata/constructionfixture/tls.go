@@ -88,7 +88,7 @@ func DialInsecure(addr string, insecure bool) *tls.Config {
 }
 
 // A local computed in the function is not an option.
-func FromEnv(env func(string) string) *tls.Config {
+func InsecureFromEnv(env func(string) string) *tls.Config {
 	skip := env("TLS_SKIP") != ""
 	if skip {
 		return &tls.Config{InsecureSkipVerify: true}
