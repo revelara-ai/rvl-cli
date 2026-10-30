@@ -130,6 +130,10 @@ pub struct TriagedItem {
     pub provenance: Provenance,
     pub site_count: usize,
     pub example_sites: Vec<String>,
+    /// Shown, never blocking: a construction rule gated on what a change
+    /// introduces, at a site the change did not add.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gate_exempt: bool,
 }
 
 /// A judgment's `api` with the form the corpus authors it in normalised away:
@@ -255,6 +259,7 @@ pub fn triage(
                 site_count: ids.len(),
                 example_sites: ids.into_iter().take(3).collect(),
                 class: k,
+                gate_exempt: false,
             }
         })
         .filter(|t| t.disposition != "low_value")

@@ -29,7 +29,7 @@
 //! the ones being committed.
 
 use anyhow::Context as _;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Which git question answers "what changed" for this invocation.
@@ -89,17 +89,175 @@ pub struct ChangedSet {
     /// edits. The retrievers read the working tree, so for these the content
     /// judged would not be the content committed. The scan refuses them.
     pub dirty: Vec<String>,
+    /// What the change is diffed against, for the lines it adds
+    /// ([`added_lines`]).
+    pub base: Base,
 }
 
 /// The empty set, for callers that need a placeholder.
 impl ChangedSet {
-    fn new(files: Vec<String>, source: impl Into<String>, dirty: Vec<String>) -> Self {
+    fn new(files: Vec<String>, source: impl Into<String>, dirty: Vec<String>, base: Base) -> Self {
         Self {
             files: sorted_unique(files),
             source: source.into(),
             dirty: sorted_unique(dirty),
+            base,
         }
     }
+}
+
+/// What a changed set's lines are diffed against: the base at which a line
+/// the change adds did not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// The index against HEAD: what the commit being created adds.
+    Index,
+    /// A revision range as git diffs it, `base...HEAD` or `upstream..HEAD`.
+    Range(String),
+    /// The working tree against HEAD. An untracked file is added whole.
+    WorkingTree,
+    /// No one commit: the commits being pushed are the ones on no remote,
+    /// and they need not share a base. No line is known to be added.
+    Unknown,
+}
+
+/// The lines a change adds, per file: what was not there at its base.
+#[derive(Debug, Default)]
+pub struct AddedLines {
+    /// Path relative to the scanned root -> `(first line, line count)` hunks.
+    files: BTreeMap<String, Vec<(u32, u32)>>,
+}
+
+impl AddedLines {
+    /// Does the change add line `line` of `file`? `file` as a site carries it,
+    /// relative to the scanned root.
+    pub fn contains(&self, file: &str, line: u32) -> bool {
+        let file = file.trim_start_matches("./").replace('\\', "/");
+        self.files.get(&file).is_some_and(|hunks| {
+            hunks
+                .iter()
+                .any(|&(start, count)| line >= start && line - start < count)
+        })
+    }
+
+    /// The change adds `lines` of `file`, for a test.
+    #[cfg(test)]
+    pub fn of(file: &str, lines: &[u32]) -> Self {
+        let hunks = lines.iter().map(|&l| (l, 1)).collect();
+        Self {
+            files: BTreeMap::from([(file.to_string(), hunks)]),
+        }
+    }
+
+    fn add_whole(&mut self, file: String) {
+        self.files.insert(file, vec![(1, u32::MAX)]);
+    }
+}
+
+/// Read the `+` side of a `-U0 --no-prefix` patch: each file's added hunks.
+/// Header lines are read only before a file's first hunk, so an added line
+/// that itself starts with `++` is never taken for a file name.
+fn parse_added(patch: &str, into: &mut AddedLines) {
+    let mut file: Option<String> = None;
+    let mut header = false;
+    for line in patch.lines() {
+        if line.starts_with("diff ") {
+            header = true;
+            file = None;
+        } else if header && line.starts_with("+++ ") {
+            let path = line["+++ ".len()..].trim_end_matches('\t');
+            file = (path != "/dev/null").then(|| unquote(path));
+        } else if let Some(hunk) = line.strip_prefix("@@ ") {
+            header = false;
+            let Some(f) = &file else { continue };
+            // `@@ -a[,b] +c[,d] @@`: the new side starts at c and runs d lines.
+            let Some(new) = hunk.split(' ').find_map(|w| w.strip_prefix('+')) else {
+                continue;
+            };
+            let (start, count) = match new.split_once(',') {
+                Some((s, n)) => (s.parse().ok(), n.parse().ok()),
+                None => (new.parse().ok(), Some(1)),
+            };
+            if let (Some(start), Some(count)) = (start, count) {
+                if count > 0 {
+                    into.files
+                        .entry(f.clone())
+                        .or_default()
+                        .push((start, count));
+                }
+            }
+        }
+    }
+}
+
+/// A patch header path as git writes it: quoted, with C escapes, when it
+/// holds a quote, a backslash or a control character. Non-ASCII stays as is
+/// because the diff runs with `core.quotePath` off.
+fn unquote(path: &str) -> String {
+    let Some(inner) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_string();
+    };
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The lines `cs` adds against its base. A file the base lacks is added
+/// whole; a renamed file adds only the lines it changed.
+pub fn added_lines(root: &Path, cs: &ChangedSet) -> anyhow::Result<AddedLines> {
+    let mut added = AddedLines::default();
+    let diff = |rev: &[&str]| -> anyhow::Result<String> {
+        let mut args = vec![
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-prefix",
+            "--relative",
+            "-M",
+            "--diff-filter=ACMR",
+        ];
+        args.extend_from_slice(rev);
+        git(root, &args)
+    };
+    match &cs.base {
+        Base::Index => parse_added(&diff(&["--cached"])?, &mut added),
+        Base::Range(range) => {
+            anyhow::ensure!(
+                !range.starts_with('-'),
+                "invalid revision range {range}: leading dash"
+            );
+            parse_added(&diff(&[range, "--"])?, &mut added)
+        }
+        Base::WorkingTree => {
+            // An unborn branch has no HEAD: its staged adds are the change.
+            let rev = if head_exists(root) {
+                "HEAD"
+            } else {
+                "--cached"
+            };
+            parse_added(&diff(&[rev])?, &mut added);
+            for file in untracked(root)? {
+                added.add_whole(file);
+            }
+        }
+        Base::Unknown => {}
+    }
+    Ok(added)
 }
 
 fn sorted_unique(v: Vec<String>) -> Vec<String> {
@@ -267,6 +425,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                 files,
                 "git index (staged paths, `git diff --cached`)",
                 dirty,
+                Base::Index,
             ))
         }
         Mode::BaseRange { base, source } => {
@@ -275,6 +434,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                 files,
                 format!("git range {base}...HEAD (base ref from {source})"),
                 Vec::new(),
+                Base::Range(format!("{base}...HEAD")),
             ))
         }
         Mode::PrePush { fallback_base } => {
@@ -295,6 +455,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                     files,
                     format!("git range {range} (branch upstream)"),
                     Vec::new(),
+                    Base::Range(range),
                 ));
             }
             // No upstream, but a base ref was configured: use it. This is the
@@ -307,6 +468,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                     files,
                     format!("git range {base}...HEAD (base ref; branch has no upstream)"),
                     Vec::new(),
+                    Base::Range(format!("{base}...HEAD")),
                 ));
             }
             // No upstream and no base ref: the commits being pushed are the
@@ -336,6 +498,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                 files,
                 "git commits not present on any remote (no upstream configured)",
                 Vec::new(),
+                Base::Unknown,
             ))
         }
         Mode::WorkingTree => {
@@ -361,6 +524,7 @@ pub fn resolve(root: &Path, mode: Mode) -> anyhow::Result<ChangedSet> {
                 files,
                 "git working tree vs HEAD, plus untracked files",
                 Vec::new(),
+                Base::WorkingTree,
             ))
         }
     }
@@ -876,6 +1040,117 @@ mod tests {
         assert_eq!(
             resolve(&root, Mode::WorkingTree).unwrap().files,
             vec!["first.go".to_string()]
+        );
+    }
+
+    // --- the lines a change adds ---
+
+    /// The index adds the staged line and the staged new file, not the
+    /// committed line beside them, and not an unstaged edit.
+    #[test]
+    fn pre_commit_adds_only_the_staged_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo(&dir);
+        std::fs::write(
+            root.join("legacy.go"),
+            "package main\n// new line\n// old debt\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("fresh.go"), "package main\n\nvar x = 1\n").unwrap();
+        run(&root, &["add", "-A"]);
+        std::fs::write(root.join("unstaged.go"), "package main\n").unwrap();
+        let cs = resolve(&root, Mode::PreCommit).unwrap();
+        let added = added_lines(&root, &cs).unwrap();
+        assert!(added.contains("legacy.go", 2), "{added:?}");
+        assert!(!added.contains("legacy.go", 1), "{added:?}");
+        assert!(
+            !added.contains("legacy.go", 3),
+            "the old line moved down: {added:?}"
+        );
+        assert!(
+            (1..=3).all(|l| added.contains("./fresh.go", l)),
+            "{added:?}"
+        );
+        assert!(!added.contains("fresh.go", 4), "{added:?}");
+        assert!(!added.contains("unstaged.go", 1), "{added:?}");
+    }
+
+    /// A pull request adds its own lines against the merge base: not the
+    /// base's lines, not work landed on main since, not the lines of a file
+    /// it only renamed.
+    #[test]
+    fn a_base_range_adds_the_branchs_lines_against_the_merge_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = pr_checkout(&dir);
+        run(&root, &["mv", "legacy.go", "moved.go"]);
+        std::fs::write(root.join("added.go"), "package main\n\nvar y = 2\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "pr commit 3"]);
+        let cs = resolve(
+            &root,
+            Mode::BaseRange {
+                base: "main".into(),
+                source: "test".into(),
+            },
+        )
+        .unwrap();
+        let added = added_lines(&root, &cs).unwrap();
+        assert!((1..=3).all(|l| added.contains("added.go", l)), "{added:?}");
+        assert!(
+            !added.contains("moved.go", 2),
+            "a rename adds nothing: {added:?}"
+        );
+        assert!(!added.contains("someone_elses.go", 1), "{added:?}");
+    }
+
+    /// At a keyboard an untracked file is added whole; a tracked file adds
+    /// what differs from HEAD.
+    #[test]
+    fn the_working_tree_adds_untracked_files_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo(&dir);
+        std::fs::write(
+            root.join("legacy.go"),
+            "package main\n// old debt\n// more\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("new.go"), "package main\n").unwrap();
+        let cs = resolve(&root, Mode::WorkingTree).unwrap();
+        let added = added_lines(&root, &cs).unwrap();
+        assert!(added.contains("legacy.go", 3), "{added:?}");
+        assert!(!added.contains("legacy.go", 2), "{added:?}");
+        assert!(
+            added.contains("new.go", 1) && added.contains("new.go", 900),
+            "{added:?}"
+        );
+    }
+
+    /// No base, no added line: a gate that blocks on new lines cannot fire
+    /// on lines it cannot place.
+    #[test]
+    fn an_unknown_base_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo(&dir);
+        let cs = ChangedSet::new(vec!["legacy.go".into()], "test", Vec::new(), Base::Unknown);
+        assert!(!added_lines(&root, &cs).unwrap().contains("legacy.go", 1));
+    }
+
+    #[test]
+    fn an_added_line_that_starts_with_plus_signs_is_not_a_file_header() {
+        let patch = "diff --git a.go a.go\n--- a.go\n+++ a.go\n@@ -1,0 +2,2 @@\n\
+                     +++ b.go\n+x\ndiff --git \"q\\\"t.go\" \"q\\\"t.go\"\n\
+                     +++ \"q\\\"t.go\"\n@@ -3 +4 @@\n-a\n+b\n@@ -9,2 +9,0 @@\n";
+        let mut added = AddedLines::default();
+        parse_added(patch, &mut added);
+        assert!(
+            added.contains("a.go", 2) && added.contains("a.go", 3),
+            "{added:?}"
+        );
+        assert!(!added.contains("b.go", 1), "{added:?}");
+        assert!(added.contains("q\"t.go", 4), "{added:?}");
+        assert!(
+            !added.contains("q\"t.go", 9),
+            "a pure deletion adds nothing: {added:?}"
         );
     }
 }
