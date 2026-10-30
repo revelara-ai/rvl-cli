@@ -23,12 +23,14 @@
 //! that skips verification against a local server is the common case there.
 //!
 //! A setting that turns verification off is judged in its context too
-//! ([`REVERIFIED_BY`]). A `tls.Config` that also sets `VerifyPeerCertificate`
-//! or `VerifyConnection` skips only Go's default verification and checks the
-//! peer itself, so it satisfies. One made under an `if` on an option field
-//! (`if opts.Insecure`) is the user's opt-out: it still violates, under the
-//! reason "disabled behind an option" and with severity `medium`, so it stays
-//! advisory while the unconditional form, at the rule's own severity, blocks.
+//! ([`VERIFICATION_OFF`]). A `tls.Config` that also sets
+//! `VerifyPeerCertificate` or `VerifyConnection` skips only Go's default
+//! verification and checks the peer itself, so it satisfies
+//! ([`REVERIFIED_BY`]). One made under an `if` on an option ([`option`]:
+//! `if opts.Insecure`, or `if not verify` on the function's own parameter)
+//! is the user's opt-out: it still violates, under the reason "disabled
+//! behind an option" and with severity `medium`, so it stays advisory while
+//! the unconditional form, at the rule's own severity, blocks.
 //!
 //! A rule may also publish a gate ([`Gate`]). Under `introduced` its
 //! unconditional form blocks only where a change-scoped scan sees the change
@@ -97,6 +99,18 @@ fn unquoted(value: &str) -> &str {
     value
 }
 
+/// The rules whose violation turns peer verification off, so they are judged
+/// in context: a class rule (`ssl.CERT_NONE`) or an argument rule
+/// (`ssl.SSLContext.check_hostname(check_hostname)`).
+const VERIFICATION_OFF: &[&str] = &[
+    "crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)",
+    "ssl.CERT_NONE",
+    "ssl.SSLContext.check_hostname(check_hostname)",
+    "ssl._create_unverified_context",
+    "httpx.Client(verify)",
+    "httpx.AsyncClient(verify)",
+];
+
 /// A setting that turns peer verification off, and the fields that verify
 /// the peer in its place when the same value sets them.
 const REVERIFIED_BY: &[(&str, &[&str])] = &[(
@@ -122,36 +136,119 @@ fn reverified_by(site: &Site, class: &str) -> Option<&'static str> {
     })
 }
 
-/// The option field a guard tests, if it tests one alone: `t.Insecure` in
-/// `t.Insecure == true`, `connOption.SSLVerify` in `!connOption.SSLVerify`.
-/// A call, a comparison with anything but a boolean, or a bare variable is
-/// not an option field.
-fn option_field(guard: &str) -> Option<&str> {
-    let mut g = guard.trim();
-    loop {
-        let before = g;
-        g = g.strip_prefix('!').unwrap_or(g).trim_start();
-        if let Some(inner) = g.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
-            g = inner.trim();
-        }
-        for op in ["== true", "== false", "!= true", "!= false"] {
-            g = g.strip_suffix(op).unwrap_or(g).trim_end();
-        }
-        if g == before {
+/// `e` without parentheses that enclose all of it: `(a)`, not `(a) && (b)`.
+fn unparenthesized(mut e: &str) -> &str {
+    while let Some(inner) = e.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        if split_top(inner, &[]).is_none() {
             break;
         }
+        e = inner.trim();
+    }
+    e
+}
+
+/// `e` split at each of `ops` outside brackets and string literals, or None
+/// when a bracket closes that `e` did not open. A word operator (`and`)
+/// splits only between spaces.
+fn split_top<'a>(e: &'a str, ops: &[&str]) -> Option<Vec<&'a str>> {
+    let (mut parts, mut start, mut depth, mut quote) = (Vec::new(), 0, 0u32, None);
+    for (i, c) in e.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => quote = Some(c),
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => depth = depth.checked_sub(1)?,
+            (None, _) if depth == 0 && i >= start => {
+                let rest = &e[i..];
+                let at = ops.iter().find(|op| {
+                    rest.starts_with(**op)
+                        && (!op.starts_with(char::is_alphabetic)
+                            || (e[..i].ends_with(' ') && rest[op.len()..].starts_with(' ')))
+                });
+                if let Some(op) = at {
+                    parts.push(e[start..i].trim());
+                    start = i + op.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.push(e[start..].trim());
+    Some(parts)
+}
+
+/// `e` without one leading negation, if it has one: `!x`, `not x`.
+fn without_not(e: &str) -> Option<&str> {
+    e.strip_prefix('!')
+        .or_else(|| e.strip_prefix("not").filter(|r| r.starts_with([' ', '('])))
+        .map(str::trim_start)
+}
+
+/// `e` without one trailing comparison with a boolean, and whether it
+/// negates: `x == false`, `x is not True`.
+fn compared(e: &str) -> Option<(&str, bool)> {
+    [
+        ("== true", false),
+        ("!= false", false),
+        ("== True", false),
+        ("is True", false),
+        ("!= True", true),
+        ("is not True", true),
+        ("== false", true),
+        ("!= true", true),
+        ("== False", true),
+        ("is False", true),
+        ("!= False", false),
+        ("is not False", false),
+    ]
+    .into_iter()
+    .find_map(|(op, neg)| e.strip_suffix(op).map(|r| (r.trim_end(), neg)))
+}
+
+/// The option a guard tests, if it tests one: (1) a dotted field or
+/// attribute path tested alone (`t.Insecure == true`, `!conn.SSLVerify`,
+/// `not self.verify`), (2) a parameter of the enclosing function, by bare
+/// name, tested alone (`not verify` in `def send(..., verify=True)`): the
+/// caller's opt-out, or (3) a conjunction one of whose terms is (1) or (2)
+/// (`url.startswith("https://") and not verify`). A call, a local, a
+/// comparison with anything but a boolean, or a disjunction is not an option.
+fn option<'a>(guard: &'a str, params: &[String]) -> Option<&'a str> {
+    term(guard.trim(), params, false)
+}
+
+/// [`option`] for `e` under `negated` negations, counted mod 2: negated,
+/// `!(a && b)` is a disjunction and `!(a || b)` a conjunction.
+fn term<'a>(e: &'a str, params: &[String], negated: bool) -> Option<&'a str> {
+    let e = unparenthesized(e);
+    let (and, or) = (&["&&", "and"][..], &["||", "or"][..]);
+    let (conj, disj) = if negated { (or, and) } else { (and, or) };
+    if split_top(e, disj)?.len() > 1 {
+        return None;
+    }
+    let terms = split_top(e, conj)?;
+    if terms.len() > 1 {
+        return terms.into_iter().find_map(|t| term(t, params, negated));
+    }
+    if let Some(rest) = without_not(e) {
+        return term(rest, params, !negated);
+    }
+    if let Some((rest, neg)) = compared(e) {
+        return term(rest, params, negated ^ neg);
     }
     let ident = |p: &str| {
         p.starts_with(|c: char| c.is_alphabetic() || c == '_')
             && p.chars().all(|c| c.is_alphanumeric() || c == '_')
     };
-    (g.contains('.') && g.split('.').all(ident)).then_some(g)
+    let path = e.contains('.') && e.split('.').all(ident);
+    let param = ident(e) && params.iter().any(|p| p == e);
+    (path || param).then_some(e)
 }
 
 /// Judge a violation of a verification setting again in its context: re-
 /// verified, it satisfies; behind an option, it is an advisory opt-out.
-fn in_context(site: &Site, class: &str, mut f: SiteFinding) -> SiteFinding {
-    if f.verdict != Verdict::Violates || !REVERIFIED_BY.iter().any(|(c, _)| *c == class) {
+fn in_context(site: &Site, class: &str, key: &str, mut f: SiteFinding) -> SiteFinding {
+    if f.verdict != Verdict::Violates || !VERIFICATION_OFF.contains(&key) {
         return f;
     }
     if let Some(field) = reverified_by(site, class) {
@@ -159,7 +256,7 @@ fn in_context(site: &Site, class: &str, mut f: SiteFinding) -> SiteFinding {
         f.reason = format!(
             "re-verified by {field}: the default verification is skipped and {field} checks the peer in its place"
         );
-    } else if let Some(option) = option_field(&site.guard) {
+    } else if let Some(option) = option(&site.guard, &site.guard_params) {
         f.reason = format!("disabled behind an option: {option}; {}", f.reason);
         f.severity = OPT_OUT_SEVERITY.to_string();
     }
@@ -200,7 +297,8 @@ pub fn evaluate(sites: &[Site], specs: &SpecCache) -> Vec<SiteFinding> {
     {
         let class = format!("{}.{}", site.client_type, site.method);
         if specs.config_key(FORMAT, &class).is_some() {
-            out.push(judge(site, &class, "", specs));
+            let f = judge(site, &class, "", specs);
+            out.push(in_context(site, &class, &class, f));
         }
         for arg in &site.const_args {
             let key = format!("{class}({})", selector(arg));
@@ -223,7 +321,7 @@ pub fn evaluate(sites: &[Site], specs: &SpecCache) -> Vec<SiteFinding> {
                 continue;
             }
             let f = judge(site, &key, unquoted(&arg.value), specs);
-            out.push(in_context(site, &class, f));
+            out.push(in_context(site, &class, &key, f));
         }
     }
     out
@@ -489,13 +587,14 @@ mod tests {
     }
 
     #[test]
-    fn a_skip_behind_an_option_field_is_an_advisory_opt_out() {
-        for (guard, option, snippet, receiver) in [
+    fn a_skip_behind_an_option_is_an_advisory_opt_out() {
+        for (guard, params, option, snippet, receiver) in [
             // A health prober's TLS options, with no CA given.
-            ("t.Insecure == true", "t.Insecure", LOOPBACK, ""),
+            ("t.Insecure == true", &[][..], "t.Insecure", LOOPBACK, ""),
             // An Oracle driver's connection string turns verification off.
             (
                 "!connOption.SSLVerify",
+                &[],
                 "connOption.SSLVerify",
                 "config.InsecureSkipVerify = true",
                 "config",
@@ -503,14 +602,28 @@ mod tests {
             // A linter's AI autofix client, behind its skip-SSL setting.
             (
                 "config.SkipSSL",
+                &[],
                 "config.SkipSSL",
                 "&tls.Config{\n\tInsecureSkipVerify: true, // #nosec G402\n}",
                 "",
             ),
             // The else branch of `if o.Verify`.
-            ("!(o.Verify)", "o.Verify", LOOPBACK, ""),
+            ("!(o.Verify)", &[], "o.Verify", LOOPBACK, ""),
+            // The caller's opt-out: a parameter of the function.
+            ("insecure", &["insecure"], "insecure", LOOPBACK, ""),
+            // A conjunction one of whose terms is an option.
+            ("cfg.Insecure && debug", &[], "cfg.Insecure", LOOPBACK, ""),
+            (
+                "addr != \"\" && insecure",
+                &["insecure"],
+                "insecure",
+                LOOPBACK,
+                "",
+            ),
         ] {
-            let f = one(skip_verify(snippet, receiver, "", guard));
+            let mut s = skip_verify(snippet, receiver, "", guard);
+            s.guard_params = params.iter().map(|p| p.to_string()).collect();
+            let f = one(s);
             assert_eq!(f.verdict, Verdict::Violates, "{guard}: {}", f.reason);
             assert!(
                 f.reason.starts_with(&format!(
@@ -525,18 +638,80 @@ mod tests {
     }
 
     #[test]
-    fn a_guard_that_is_not_an_option_field_changes_nothing() {
+    fn a_guard_that_is_not_an_option_changes_nothing() {
         for guard in [
             "err != nil",
             "len(ca) == 0",
+            // A local, not a parameter.
             "insecure",
-            "cfg.Insecure && debug",
+            "debug && err == nil",
+            "cfg.Insecure || debug",
+            "!(cfg.Insecure && debug)",
             "opts.Insecure()",
         ] {
             let f = one(skip_verify(LOOPBACK, "", "", guard));
             assert_eq!(f.severity, "high", "{guard}: {}", f.reason);
             assert!(
                 f.reason.starts_with("equal to true"),
+                "{guard}: {}",
+                f.reason
+            );
+        }
+    }
+
+    /// A Python TLS setting as pyindex reports it: the class, the argument
+    /// (none for a reference to `ssl.CERT_NONE`), the guard and the
+    /// parameters it reads.
+    fn python_tls(class: (&str, &str), arg: &str, guard: &str, params: &[&str]) -> Site {
+        let args: &[(u32, &str, &str, &str)] = match arg {
+            "" => &[],
+            _ => &[(0, "check_hostname", "False", "literal")],
+        };
+        let mut s = site("tls.py", class, args);
+        s.guard = guard.into();
+        s.guard_params = params.iter().map(|p| p.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn a_python_tls_setting_behind_an_option_is_an_advisory_opt_out() {
+        let none = (("ssl", "CERT_NONE"), "");
+        let hostname = (("ssl.SSLContext", "check_hostname"), "check_hostname");
+        // The measured shapes, as pyindex unparses their guards.
+        for ((class, arg), guard, params, want) in [
+            (
+                hostname,
+                "self._insecure_skip_tls_verify",
+                &[][..],
+                "medium",
+            ),
+            (none, "self._insecure_skip_tls_verify", &[], "medium"),
+            (
+                hostname,
+                "self._config.confluence_disable_ssl_validation",
+                &[],
+                "medium",
+            ),
+            (none, "ctx.options.ssl_insecure", &[], "medium"),
+            (none, "not verify", &["verify"], "medium"),
+            (
+                hostname,
+                "url.startswith('https://') and (not verify)",
+                &["verify"],
+                "medium",
+            ),
+            (none, "not (options.ssl_verify)", &[], "medium"),
+            (none, "self.verify is False", &[], "medium"),
+            // A local read from a call is not an option.
+            (none, "verify is False", &[], "high"),
+            (none, "", &[], "high"),
+        ] {
+            let f = one(python_tls(class, arg, guard, params));
+            assert_eq!(f.verdict, Verdict::Violates, "{guard}: {}", f.reason);
+            assert_eq!(f.severity, want, "{guard}: {}", f.reason);
+            assert_eq!(
+                f.reason.starts_with("disabled behind an option"),
+                want == "medium",
                 "{guard}: {}",
                 f.reason
             );
@@ -564,12 +739,28 @@ mod tests {
     }
 
     #[test]
-    fn option_fields_are_read_through_negation_parens_and_boolean_compares() {
-        assert_eq!(option_field("!(!(a.b == false))"), Some("a.b"));
-        assert_eq!(option_field("a.b.c != true"), Some("a.b.c"));
-        assert_eq!(option_field("(a.b) && (c.d)"), None);
-        assert_eq!(option_field("a.b == \"x\""), None);
-        assert_eq!(option_field(""), None);
+    fn options_are_read_through_negation_parens_and_boolean_compares() {
+        let none: &[String] = &[];
+        let verify = &["verify".to_string()];
+        assert_eq!(option("!(!(a.b == false))", none), Some("a.b"));
+        assert_eq!(option("a.b.c != true", none), Some("a.b.c"));
+        assert_eq!(option("not (a.b is not True)", none), Some("a.b"));
+        assert_eq!(option("(a.b) && (c.d)", none), Some("a.b"));
+        assert_eq!(option("(x) && (c.d)", none), Some("c.d"));
+        assert_eq!(option("verify == False", verify), Some("verify"));
+        assert_eq!(option("verify", none), None);
+        assert_eq!(option("notify", &["notify".into()]), Some("notify"));
+        // Negated, a conjunction is a disjunction and the reverse.
+        assert_eq!(option("!(a.b && c)", none), None);
+        assert_eq!(option("not (a.b or c)", none), Some("a.b"));
+        assert_eq!(option("a.b or c", none), None);
+        // An operator inside a string or a call is not one of the guard's.
+        assert_eq!(option("f(a.b and c)", none), None);
+        assert_eq!(option("s == ' and a.b'", none), None);
+        assert_eq!(option("a.b == \"x\"", none), None);
+        assert_eq!(option("a) && (b.c", none), None);
+        assert_eq!(option("é.b && ü", none), Some("é.b"));
+        assert_eq!(option("", none), None);
     }
 
     #[test]

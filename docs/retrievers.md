@@ -253,11 +253,18 @@ type of a field site is the table's and not one the retriever proved (a
 Python attribute, a TypeScript options property),
 `provenance.client_type_resolved` is `false`.
 
-A `goindex` field site also has `guard`: the condition of the innermost `if`
-whose branch holds the setting, as written (`t.Insecure == true`), and
-`!(<cond>)` in its else branch. It is absent when no `if` in the function
-holds the setting. The walk stops at a function literal, since a closure built
-under an `if` can run anywhere.
+A `goindex` field site and a `pyindex` construction site also have `guard`:
+the condition of the innermost `if` whose branch holds the setting, and its
+negation in the else branch. `goindex` writes it as written
+(`t.Insecure == true`, `!(<cond>)`). `pyindex` writes it unparsed
+(`not verify`, `not (<cond>)`), and reads the test of `X if cond else Y` the
+same way. It is absent when no `if` in the function holds the setting. The
+walk stops at a function literal, a `def` or a `lambda`, since a closure built
+under an `if` can run anywhere. `guard_params` lists the parameters of that
+function the condition reads by bare name, sorted: `["verify"]` for
+`not verify` in `def send(self, verify=True)`. A parameter read only as the
+root of a path (the `self` of `self.verify`) is not listed. The field is
+absent when there are none.
 
 `requests.get(url, verify=False)` needed nothing new: it was already a call
 site, and `verify` is in its `const_args`.
@@ -295,11 +302,25 @@ DES, 3DES, RC4 or ECB cipher name).
   `VerifyPeerCertificate` or `VerifyConnection`: in the literal, or by an
   assignment to the same receiver in the function. Then only Go's default
   verification is skipped, and the callback checks the peer in its place.
-  When the site's `guard` tests an option field alone (`opts.Insecure`,
-  `!conn.SSLVerify`, `cfg.Skip == true`), the setting is the user's opt-out:
+  When the site's `guard` tests an option, the setting is the user's opt-out:
   it still violates, with the reason `disabled behind an option` and severity
   `medium`, so it is its own advisory row. The unconditional form keeps the
-  rule's severity and blocks.
+  rule's severity and blocks. An option is one of these:
+  - A field or attribute path tested alone, through negation, parentheses
+    and a comparison with a boolean: `opts.Insecure`, `!conn.SSLVerify`,
+    `cfg.Skip == true`, `not self.verify`, `self.verify is False`.
+  - A parameter of the enclosing function, by bare name and in
+    `guard_params`, tested alone: `if insecure` in `func dial(insecure bool)`,
+    `not verify` in `def send(self, verify=True)`. It is the caller's
+    opt-out, as `requests`' `verify=` is.
+  - A conjunction one of whose terms is one of the above:
+    `url.startswith("https://") and not verify`, `cfg.Insecure && debug`.
+
+  A local, even one read from the environment, a call, a comparison with
+  anything but a boolean, and a disjunction are not options. The settings
+  judged this way are `InsecureSkipVerify: true`, `ssl.CERT_NONE`,
+  `check_hostname = False`, `ssl._create_unverified_context()` and
+  `httpx.Client(verify=False)`.
 
 A violation is a finding with the class `construction.<key>`
 (`construction.database/sql.Open(arg1)`) and the control and severity of the

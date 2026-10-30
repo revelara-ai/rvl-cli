@@ -2789,13 +2789,14 @@ fn live_go_scan_judges_construction_rules() {
         .collect();
     classes.sort();
     let skip = "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
-    // Unconditional: the package variable, the loopback dial and the closure
-    // built under an if. Behind an option: OptedOut, NotVerified, Skipped and
-    // Verified's else branch.
+    // Unconditional: the package variable, the loopback dial, the closure
+    // built under an if and the skip under a local. Behind an option:
+    // OptedOut, NotVerified, Skipped, Verified's else branch and the
+    // parameter DialInsecure is called with.
     let want = [
         ("construction.crypto/des.NewCipher", "RC-059", "high", 1),
-        (skip, "RC-059", "high", 3),
-        (skip, "RC-059", "medium", 4),
+        (skip, "RC-059", "high", 4),
+        (skip, "RC-059", "medium", 5),
         (
             "construction.crypto/tls.Config.MinVersion(MinVersion)",
             "RC-059",
@@ -2812,6 +2813,74 @@ fn live_go_scan_judges_construction_rules() {
             "a password reached the output: {text}"
         );
     }
+}
+
+/// Python, live end to end: pyindex reports the condition that guards each
+/// TLS setting of the construction fixture, and a setting behind an option,
+/// an attribute or the function's own parameter, is an advisory row of its
+/// own. The unguarded settings, the one under a local read from a call and
+/// the one in a closure still block.
+#[test]
+fn live_python_scan_judges_a_tls_opt_out_advisory() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        rvl_testgate::skip(
+            "live_python_scan_judges_a_tls_opt_out_advisory",
+            "no python3",
+        );
+        return;
+    }
+    let pyindex = helpers_dir().join("pyindex");
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(pyindex.join("testdata").join("fixture_constructions"))
+        .arg("--specs-file")
+        .arg(construction_specs(dir.path()))
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_PYINDEX", pyindex.join("pyindex.py"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(3), "{stdout}\n{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let none = "construction.ssl.CERT_NONE";
+    let hostname = "construction.ssl.SSLContext.check_hostname(check_hostname)";
+    let mut got: Vec<(String, String, u64)> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| [none, hostname].contains(&f["class"].as_str().unwrap()))
+        .map(|f| {
+            (
+                f["class"].as_str().unwrap().to_string(),
+                f["base_severity"].as_str().unwrap().to_string(),
+                f["site_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    got.sort();
+    let want = [
+        // app.py's unguarded context, the local read from a call, the closure.
+        (none, "high", 3),
+        // The attribute option, the keyword parameter, the parameter in a
+        // conjunction.
+        (none, "medium", 3),
+        (hostname, "high", 1),
+        // The attribute option, the parameter in a conjunction, the else
+        // branch of an option.
+        (hostname, "medium", 3),
+    ]
+    .map(|(c, s, n)| (c.to_string(), s.to_string(), n));
+    assert_eq!(got, want, "{stdout}");
 }
 
 /// Go, live end to end, on a real repository's pre-commit gate: the

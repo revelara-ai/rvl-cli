@@ -446,13 +446,19 @@ pub struct Site {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_override: Option<ScopeClass>,
     /// The condition under which the site runs: that of the innermost `if`
-    /// whose branch holds it, as written, and `!(<cond>)` in its else branch.
-    /// Empty when no `if` holds it or the retriever does not say; goindex
-    /// sets it on a construction field site, so a TLS setting made under
-    /// `if opts.Insecure` reads as the user's opt-out. Additive within the v2
-    /// packet train.
+    /// whose branch holds it, as written, and `!(<cond>)` in its else branch
+    /// (pyindex: unparsed, `not (<cond>)`, and the test of `X if cond else
+    /// Y` too). Empty when no `if` holds it or the retriever does not say;
+    /// goindex and pyindex set it on a construction site, so a TLS setting
+    /// made under `if opts.Insecure` reads as the user's opt-out. Additive
+    /// within the v2 packet train.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guard: String,
+    /// The parameters of the function holding the site that `guard` reads by
+    /// bare name (`verify` in `not verify`, not the `o` of `o.Verify`), so a
+    /// caller's opt-out can be told from a local's value. Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_params: Vec<String>,
 }
 
 /// The `site_kind` a G2 server-entry record carries: an HTTP handler, route,

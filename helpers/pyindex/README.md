@@ -85,7 +85,9 @@ setting is a call site too, with no `site_kind`: `hashlib.md5(...)`,
 `psycopg2.connect(...)`, `create_engine(url)`, a reference to `ssl.CERT_NONE`
 and an assignment to `<x>.check_hostname`. The tables are `_CONSTRUCTION_*`
 in `pyindex.py`; the list and the record shape are in "Constructions that
-are call sites" in `docs/retrievers.md`.
+are call sites" in `docs/retrievers.md`. A site under an `if`, or in a branch
+of `X if cond else Y`, also has `guard` (the condition, unparsed) and
+`guard_params` (the enclosing function's parameters it reads by bare name).
 
 ## The `retrieval_stats` record (one per run)
 

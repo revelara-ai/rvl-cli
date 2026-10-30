@@ -243,6 +243,11 @@ type RetrievedSite struct {
 	// under `if opts.Insecure` is the user's opt-out, not the code's default.
 	// Absent when no if in the function holds it.
 	Guard string `json:"guard,omitempty"`
+	// GuardParams are the parameters of the function holding the site that
+	// Guard reads by bare name, sorted: `if insecure` on the caller's
+	// argument is an opt-out, on a local it is not. Absent when there are
+	// none.
+	GuardParams []string `json:"guard_params,omitempty"`
 }
 
 // --- G3 background-job registration surfaces (po-av01j.4) ---

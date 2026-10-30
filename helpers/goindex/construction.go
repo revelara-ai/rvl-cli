@@ -13,6 +13,7 @@ package main
 import (
 	"go/ast"
 	"go/types"
+	"sort"
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
@@ -71,27 +72,62 @@ func structName(t types.Type) string {
 // guard is the condition under which the code at n runs: that of the
 // innermost if statement whose branch holds n, as written, negated in its else
 // branch. "" when no if holds it; the walk stops at a function, since a
-// closure built under an if can run anywhere.
-func guard(p *packages.Package, src *srcIndex, f *ast.File, n ast.Node) string {
+// closure built under an if can run anywhere. params are the parameters of
+// that function the condition reads by bare name (`insecure`, not the `o` of
+// `o.Insecure`), so a caller's opt-out can be told from a local's value.
+func guard(p *packages.Package, src *srcIndex, f *ast.File, n ast.Node) (cond string, params []string) {
 	path, _ := astutil.PathEnclosingInterval(f, n.Pos(), n.End())
+	var test ast.Expr
 	for i, up := range path {
 		switch up := up.(type) {
-		case *ast.FuncLit, *ast.FuncDecl:
-			return ""
+		case *ast.FuncLit:
+			return cond, guardParams(p, test, up.Type)
+		case *ast.FuncDecl:
+			return cond, guardParams(p, test, up.Type)
 		case *ast.IfStmt:
-			if i == 0 {
+			if i == 0 || test != nil {
 				continue
 			}
-			cond := src.text(p, up.Cond, up.Cond)
+			text := src.text(p, up.Cond, up.Cond)
 			switch path[i-1] {
 			case up.Body:
-				return cond
+				cond, test = text, up.Cond
 			case up.Else:
-				return "!(" + cond + ")"
+				cond, test = "!("+text+")", up.Cond
 			}
 		}
 	}
-	return ""
+	return cond, nil
+}
+
+// guardParams are the parameters of fn that test reads by bare name, sorted.
+func guardParams(p *packages.Package, test ast.Expr, fn *ast.FuncType) []string {
+	if test == nil || fn.Params == nil {
+		return nil
+	}
+	own := map[types.Object]bool{}
+	for _, field := range fn.Params.List {
+		for _, name := range field.Names {
+			own[p.TypesInfo.Defs[name]] = true
+		}
+	}
+	rooted := map[ast.Expr]bool{}
+	seen := map[string]bool{}
+	var out []string
+	ast.Inspect(test, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			rooted[n.X] = true
+		case *ast.Ident:
+			if obj := p.TypesInfo.Uses[n]; obj != nil && own[obj] && !rooted[n] && !seen[n.Name] {
+				seen[n.Name] = true
+				out = append(out, n.Name)
+			}
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
 }
 
 // collectConstructionFields returns one call site per construction_fields
@@ -123,8 +159,8 @@ func collectConstructionFields(pkgs []*packages.Package, src *srcIndex, root, sn
 						Callees:    []Snippet{},
 						ConstArgs:  []ConstArg{valueObservation(p, src, field, 0, value)},
 						Prov:       Provenance{ClientTypeKnown: true},
-						Guard:      guard(p, src, f, at),
 					}
+					s.Guard, s.GuardParams = guard(p, src, f, at)
 					if fd != nil {
 						s.Symbol = fd.Name.Name
 						s.Enclosing = src.text(p, fd, fd)

@@ -77,3 +77,21 @@ func DeferredInsecure(o options) func() *tls.Config {
 	}
 	return nil
 }
+
+// The caller's own argument turns verification off, alone or with another
+// test.
+func DialInsecure(addr string, insecure bool) *tls.Config {
+	if addr != "" && insecure {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+	return &tls.Config{}
+}
+
+// A local computed in the function is not an option.
+func FromEnv(env func(string) string) *tls.Config {
+	skip := env("TLS_SKIP") != ""
+	if skip {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+	return &tls.Config{}
+}

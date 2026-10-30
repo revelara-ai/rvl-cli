@@ -1472,6 +1472,49 @@ _CONSTRUCTION_REFERENCES = frozenset({"ssl.CERT_NONE"})
 _CONSTRUCTION_ATTRIBUTES = {"check_hostname": "ssl.SSLContext"}
 
 
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _params(fn):
+    """The parameter names of a def or lambda."""
+    a = fn.args
+    names = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]
+    names += [x.arg for x in (a.vararg, a.kwarg) if x is not None]
+    return set(names)
+
+
+def _guard(node, parents):
+    """(condition, parameters) under which the code at `node` runs: the test
+    of the innermost `if` or `X if cond else Y` whose branch holds it,
+    unparsed, as `not (<cond>)` in its else branch; and the parameters of the
+    function holding the site that the test reads by bare name (`verify`,
+    not the `self` of `self.verify`), sorted.
+    ("", []) when none holds it; the walk stops at a def or lambda, since a
+    closure built under an `if` can run anywhere."""
+    child, up = node, parents.get(id(node))
+    cond = None
+    while up is not None and not isinstance(up, _FUNCTIONS):
+        if cond is None and isinstance(up, ast.If):
+            if any(s is child for s in up.body):
+                cond = ast.unparse(up.test), up.test
+            elif any(s is child for s in up.orelse):
+                cond = "not ({})".format(ast.unparse(up.test)), up.test
+        elif cond is None and isinstance(up, ast.IfExp):
+            if up.body is child:
+                cond = ast.unparse(up.test), up.test
+            elif up.orelse is child:
+                cond = "not ({})".format(ast.unparse(up.test)), up.test
+        child, up = up, parents.get(id(up))
+    if cond is None:
+        return "", []
+    params = _params(up) if up is not None else set()
+    rooted = {id(n.value) for n in ast.walk(cond[1])
+              if isinstance(n, ast.Attribute)}
+    names = {n.id for n in ast.walk(cond[1])
+             if isinstance(n, ast.Name) and id(n) not in rooted}
+    return cond[0], sorted(names & params)
+
+
 def collect_constructions(tree, source, idx, enclosing, file_path, snapshot,
                           emitted):
     """Return (record, enclosing function node) for each construction site in
@@ -1500,9 +1543,11 @@ def collect_constructions(tree, source, idx, enclosing, file_path, snapshot,
                     found.append((node, dotted, None,
                                   expr_to_str(target.value), node.value))
 
+    parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
     out = []
     for node, dotted, call, receiver, value in found:
         client_type, method = dotted.rsplit(".", 1)
+        guard, guard_params = _guard(node, parents)
         func_name, func_node = enclosing.get(id(node), ("", None))
         if call is not None:
             const_args = _const_args(call, idx)
@@ -1544,6 +1589,9 @@ def collect_constructions(tree, source, idx, enclosing, file_path, snapshot,
             },
             "lang": "python",
         }, func_node))
+        if guard:
+            out[-1][0]["guard"] = guard
+            out[-1][0]["guard_params"] = guard_params
     return out
 
 
