@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // A construction whose arguments are the security setting is a call site of
 // its own: a later Client.Do or db.Query does not show the cipher, the TLS
@@ -73,26 +76,32 @@ func TestTLSConfigFieldSettingsAreCallSites(t *testing.T) {
 	}
 }
 
-// A setting made under an if carries the condition, so a user's opt-out can
-// be told from the code's default. The walk stops at a closure.
+// A setting made under an if carries the condition, and the parameters it
+// reads by bare name, so a user's opt-out can be told from the code's
+// default. The walk stops at a closure.
 func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 	got := constructionSites(t)
-	for symbol, want := range map[string]string{
-		"Reverified":       "",
-		"InsecureLoopback": "",
-		"OptedOut":         "t.Insecure == true",
-		"NotVerified":      "!o.SSLVerify",
-		"Skipped":          "o.SkipVerify",
-		"Verified":         "!(o.SSLVerify)",
-		"DeferredInsecure": "",
-		"Verify":           "",
+	for symbol, want := range map[string]struct {
+		guard  string
+		params []string
+	}{
+		"Reverified":       {},
+		"InsecureLoopback": {},
+		"OptedOut":         {guard: "t.Insecure == true"},
+		"NotVerified":      {guard: "!o.SSLVerify"},
+		"Skipped":          {guard: "o.SkipVerify"},
+		"Verified":         {guard: "!(o.SSLVerify)"},
+		"DeferredInsecure": {},
+		"Verify":           {},
+		"DialInsecure":     {guard: `addr != "" && insecure`, params: []string{"addr", "insecure"}},
+		"InsecureFromEnv":  {guard: "skip"},
 	} {
 		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
 		if !ok {
 			t.Fatalf("%s: no InsecureSkipVerify site in %v", symbol, keys(got))
 		}
-		if s.Guard != want {
-			t.Errorf("%s: guard %q, want %q", symbol, s.Guard, want)
+		if s.Guard != want.guard || !slices.Equal(s.GuardParams, want.params) {
+			t.Errorf("%s: guard %q %q, want %q %q", symbol, s.Guard, s.GuardParams, want.guard, want.params)
 		}
 	}
 }

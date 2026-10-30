@@ -839,6 +839,33 @@ class TestConstructionSites(unittest.TestCase):
     def test_an_unresolved_lookalike_is_never_guessed(self):
         self.assertNotIn("not_a_construction", self._by_symbol())
 
+    def test_a_tls_setting_carries_the_condition_that_guards_it(self):
+        got = sorted(
+            (symbol, r["line_number"], cls, r.get("guard"),
+             r.get("guard_params"))
+            for symbol, sites in self._by_symbol().items()
+            for cls, r in sites
+            if r["file_path"].endswith("guarded.py"))
+        hostname, none = "ssl.SSLContext.check_hostname", "ssl.CERT_NONE"
+        self.assertEqual(got, [
+            ("context", 20, hostname, "self._insecure_skip_tls_verify", []),
+            ("context", 21, none, "self._insecure_skip_tls_verify", []),
+            # Unparsed, so the precedence is explicit.
+            ("health_ok", 43, hostname,
+             "url.startswith('https://') and (not verify)", ["verify"]),
+            ("health_ok", 44, none,
+             "url.startswith('https://') and (not verify)", ["verify"]),
+            ("send", 36, none, "not verify", ["verify"]),
+            ("stream_options", 30, none, "verify is False", []),
+            ("verified", 53, hostname, "not (options.ssl_verify)", []),
+            # Built under the if, inside a lambda that runs anywhere.
+            ("verified", 55, none, None, None),
+        ])
+        # An unguarded setting has neither field.
+        for _, r in self._by_symbol()["insecure_context"]:
+            self.assertNotIn("guard", r)
+            self.assertNotIn("guard_params", r)
+
 
 TESTS_FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture_tests")
 

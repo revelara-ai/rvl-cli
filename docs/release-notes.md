@@ -9,6 +9,21 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A Python TLS opt-out is advisory; an option may be a parameter
+
+A TLS setting that turns verification off is judged by the same option rule
+in Go and Python. See "Construction rules" in `docs/retrievers.md`.
+
+- New: `guard` and `guard_params` on a `pyindex` construction site, and
+  `guard_params` on a `goindex` field site.
+- `ssl.CERT_NONE`, `check_hostname = False`,
+  `ssl._create_unverified_context()` and `httpx.Client(verify=False)` under
+  an `if` on an option are advisory rows, with severity `medium`.
+- An option now also is a parameter of the enclosing function, by bare name
+  (`if insecure`, `not verify`), and a conjunction with an option term
+  (`cfg.Insecure && debug`). A Go skip under such a guard was blocking and is
+  now advisory. A local is still not an option.
+
 ### A scan that reads no code site no longer prints "commit clean"
 
 What changed:
