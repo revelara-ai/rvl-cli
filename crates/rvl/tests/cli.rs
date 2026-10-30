@@ -2814,6 +2814,154 @@ fn live_go_scan_judges_construction_rules() {
     }
 }
 
+/// Go, live end to end, on a real repository's pre-commit gate: the
+/// TLS-verification rule published with `gate: introduced` blocks the
+/// unconditional skip the commit adds and nothing else. The skip already at
+/// the base, the skip behind an option and the config that re-verifies the
+/// peer do not block; a waiver clears the block; a full scan of the same
+/// tree is advisory.
+#[test]
+fn live_go_pre_commit_blocks_only_the_tls_skip_a_change_introduces() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(goindex_bin) = build_goindex(dir.path()) else {
+        return;
+    };
+    let skip = "crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
+    let specs = construction_specs(dir.path());
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&specs).unwrap()).unwrap();
+    for k in doc["config_keys"].as_array_mut().unwrap() {
+        if k["key"] == skip {
+            k["gate"] = "introduced".into();
+        }
+    }
+    std::fs::write(&specs, doc.to_string()).unwrap();
+
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("go.mod"), "module gatefixture\n\ngo 1.21\n").unwrap();
+    let base = "package gatefixture\n\nimport (\n\t\"crypto/tls\"\n\t\"crypto/x509\"\n)\n\n\
+                // Dials its own loopback listener, since before this change.\n\
+                func Loopback() *tls.Config {\n\treturn &tls.Config{InsecureSkipVerify: true}\n}\n";
+    std::fs::write(root.join("tls.go"), base).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "user.email", "t@example.com"],
+        &["config", "user.name", "Test"],
+        &["add", "-A"],
+        &["commit", "-qm", "seed"],
+    ] {
+        stage(&root, args);
+    }
+    let scan = |extra: &[&str]| {
+        let out_path = dir.path().join("out.json");
+        let out = bin()
+            .arg("scan")
+            .arg(&root)
+            .arg("--incremental")
+            .args(extra)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_GOINDEX", &goindex_bin)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("RVL_INDEX_DIR", dir.path().join("index"))
+            .env("HOME", dir.path().join("home"))
+            .output()
+            .expect("failed to run rvl");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap())
+                .unwrap_or_else(|e| panic!("{e}: {stdout}\n{stderr}"));
+        let mut rows: Vec<(String, String, String, String)> = doc["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["class"] == format!("construction.{skip}"))
+            .map(|f| {
+                let s = |k: &str| f[k].as_str().unwrap().to_string();
+                (
+                    s("site"),
+                    s("severity"),
+                    s("base_severity"),
+                    s("description"),
+                )
+            })
+            .collect();
+        rows.sort();
+        (out.status.code(), rows, format!("{stdout}\n{stderr}"))
+    };
+    let hook = ["--changed-only", "--hook", "pre-commit"];
+
+    // The same line at the base: the commit touches the file elsewhere.
+    std::fs::write(root.join("tls.go"), format!("{base}\n// Reviewed.\n")).unwrap();
+    stage(&root, &["add", "-A"]);
+    let (code, rows, out) = scan(&hook);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(rows.len(), 1, "{rows:?}\n{out}");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[0].2.as_str()),
+        ("advisory", "high")
+    );
+
+    // The commit adds an unconditional skip, an opt-out and a re-verified one.
+    let change = "\ntype options struct{ Insecure bool }\n\n\
+                  func Dial() *tls.Config {\n\treturn &tls.Config{InsecureSkipVerify: true}\n}\n\n\
+                  func OptedOut(o options) *tls.Config {\n\tif o.Insecure {\n\
+                  \t\treturn &tls.Config{InsecureSkipVerify: true}\n\t}\n\treturn &tls.Config{}\n}\n\n\
+                  func Reverified() *tls.Config {\n\treturn &tls.Config{\n\
+                  \t\tInsecureSkipVerify: true,\n\
+                  \t\tVerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error { return nil },\n\
+                  \t}\n}\n";
+    std::fs::write(root.join("tls.go"), format!("{base}{change}")).unwrap();
+    stage(&root, &["add", "-A"]);
+    let (code, rows, out) = scan(&hook);
+    assert_eq!(code, Some(EXIT_BLOCKED), "{out}");
+    let blocking: Vec<_> = rows.iter().filter(|r| r.1 == "blocking").collect();
+    assert_eq!(blocking.len(), 1, "{rows:#?}\n{out}");
+    let (site, _, _, description) = blocking[0];
+    assert_eq!(site, "tls.go:16", "the skip in Dial: {rows:#?}");
+    for part in [
+        "introduced by this change",
+        "fix: verify the peer",
+        &format!("scanner.waivers in .revelara.yaml: {{matcher: \"construction.{skip}\""),
+    ] {
+        assert!(description.contains(part), "{part}: {description}");
+    }
+    let advisory: Vec<_> = rows
+        .iter()
+        .filter(|r| r.1 == "advisory")
+        .map(|r| (r.0.as_str(), r.2.as_str()))
+        .collect();
+    // The skip at the base, and the opt-out at its own severity. The
+    // re-verified config is no finding at all.
+    assert_eq!(
+        advisory,
+        [("tls.go:10", "high"), ("tls.go:21", "medium")],
+        "{out}"
+    );
+
+    // A full scan of the same tree: the gated rule never blocks there.
+    let (code, rows, out) = scan(&[]);
+    assert!(rows.iter().all(|r| r.1 == "advisory"), "{rows:#?}\n{out}");
+    assert_eq!(code, Some(0), "{out}");
+
+    // A waiver on the rule clears the block.
+    std::fs::write(
+        root.join(".revelara.yaml"),
+        format!(
+            "scanner:\n  waivers:\n    - matcher: \"construction.{skip}\"\n      \
+             paths: [\"tls.go\"]\n      reason: \"dials its own listener\"\n"
+        ),
+    )
+    .unwrap();
+    stage(&root, &["add", "-A"]);
+    let (code, _, out) = scan(&hook);
+    assert_eq!(code, Some(0), "{out}");
+}
+
 /// The hand-authored SEED misuse-shape corpus (test-grade).
 fn misuse_seed_specs() -> std::path::PathBuf {
     manifest_dir()

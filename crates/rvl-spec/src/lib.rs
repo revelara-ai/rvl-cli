@@ -826,7 +826,18 @@ pub struct ConfigKeySpec {
     /// Suggested fix for the explain view.
     #[serde(default)]
     pub fix: String,
+    /// When a violation may block: empty, by its severity alone;
+    /// [`GATE_INTRODUCED`], only where a change introduces it. A value this
+    /// binary does not know never blocks, so a gate added by a newer scanner
+    /// degrades to advisory rather than to blocking every finding.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gate: String,
 }
+
+/// The [`ConfigKeySpec::gate`] under which a violation blocks only in a
+/// change-scoped scan, and only at a site the change adds. The same rule's
+/// violations that already exist stay advisory.
+pub const GATE_INTRODUCED: &str = "introduced";
 
 /// The `kind` of a [`ServerSpec`]: route paths that count as a health-check
 /// endpoint (RC-020).
@@ -2264,6 +2275,7 @@ mod tests {
                 control: String::new(),
                 severity: String::new(),
                 fix: String::new(),
+                gate: String::new(),
             }],
             ..Default::default()
         };

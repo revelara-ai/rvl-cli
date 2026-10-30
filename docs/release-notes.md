@@ -9,6 +9,21 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A construction rule can block only what a change introduces
+
+A `config_keys` spec may carry `gate`. See "Construction rules" in
+`docs/retrievers.md`.
+
+- With `gate: introduced`, a construction rule blocks in a `--changed-only`
+  scan only at a line the change adds, at severity `high`, as a row with
+  the reason `introduced by this change` that names the fix and the
+  `scanner.waivers` entry. The rule's other violations, and every one in a
+  full scan, are advisory and carry `gate_exempt` in `--out`.
+- A `gate` value this rvl does not know never blocks. A config-lane rule
+  with any `gate` is advisory.
+- An rvl older than this release ignores `gate` and blocks such a rule by
+  its severity, as before.
+
 ### An opt-out of TLS verification is advisory; a re-verifying config passes
 
 `construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)` is
