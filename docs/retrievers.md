@@ -305,7 +305,24 @@ A violation is a finding with the class `construction.<key>`
 (`construction.database/sql.Open(arg1)`) and the control and severity of the
 rule. A rule with a severity of `high` blocks. A rule with no severity is
 unjudged and never blocks. The site keeps its deadline verdict and its
-`.sites` row. The rules the spec producer is asked to publish, with a
+`.sites` row.
+
+A rule may publish `gate`. With `gate: introduced`, a violation blocks only
+in a change-scoped scan (`--changed-only`, which the pre-commit and pre-push
+hooks and a pull-request CI job run), only at the rule's severity `high`,
+so never an opt-out behind an option, and only when the change adds the
+line the site is on. A line the change adds is one on the `+` side of the
+git diff against the change's base: the index against `HEAD` for
+pre-commit, the pushed range for pre-push, `<base>...HEAD` with a base ref,
+the working tree against `HEAD` otherwise, where an untracked file is added
+whole. Such a violation is its own row, with the reason `introduced by this
+change`, the fix, and the `scanner.waivers` entry that accepts it. Every
+other violation of the rule, the ones already at the base and all of them
+in a full scan, is shown at its severity and does not block. A pre-push from
+a branch with no upstream and no base ref has no single base, so there no
+line is added. A `gate` value rvl does not know never blocks, and in the
+config lane any `gate` makes the rule advisory: no other lane implements
+one. The rules the spec producer is asked to publish, with a
 violating and an allowed case for each, are in
 `crates/rvl-config/testdata/construction_rules.json`.
 

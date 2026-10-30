@@ -997,7 +997,7 @@ fn triage_to_findings(
                 // Matched against `.revelara.yaml` waivers; written by suppress.
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
                 suppressed: false,
-                gate_exempt: false,
+                gate_exempt: it.gate_exempt,
                 factors: Vec::new(),
                 provenance: it.provenance.clone(),
             }
@@ -3420,7 +3420,7 @@ fn resolve_findings(
     let (sites, repo_cfg, skipped) = rvl_core::parse_stream(stream);
     findings_from_sites(
         store, keyset, sites, &repo_cfg, skipped, specs_file, judgments, tiers, repo_root, verbose,
-        progress,
+        None, progress,
     )
 }
 
@@ -3521,6 +3521,9 @@ fn findings_from_sites(
     tier_filter: TierFilter,
     repo_root: Option<&std::path::Path>,
     verbose: bool,
+    // The lines a change-scoped scan's change adds, for the construction
+    // rules gated on what a change introduces. None outside such a scan.
+    added: Option<&changed::AddedLines>,
     // What this prints goes through it, so a scan's status line does not
     // garble it.
     progress: &indicatif::ProgressBar,
@@ -3808,7 +3811,7 @@ fn findings_from_sites(
     // config that skips verification, a DES cipher, a literal password in a
     // DSN), judged by config-key specs. Violations only, keyed
     // `construction.<rule key>`. The site keeps its deadline verdict too.
-    items.extend(construction_items(&sites, &cache));
+    items.extend(construction_items(&sites, &cache, added));
     Ok((
         findings,
         items,
@@ -3846,6 +3849,7 @@ fn misuse_items(
             provenance: Default::default(),
             site_count: f.occurrences,
             example_sites: f.evidence.into_iter().take(3).collect(),
+            gate_exempt: false,
         })
         .collect()
 }
@@ -3876,6 +3880,7 @@ fn unsized_items(
             example_sites: f.evidence.into_iter().take(3).collect(),
             control: f.control,
             provenance: Default::default(),
+            gate_exempt: false,
         })
         .collect()
 }
@@ -3886,20 +3891,45 @@ fn unsized_items(
 /// `construction.database/sql.Open(arg1) — does not match
 /// no_literal_credential` and a waiver matches on `construction.<key>`. Like a
 /// config class, a rule with no judged severity is unjudged and never blocks.
+///
+/// A rule's gate ([`rvl_config::construction::Gate`]) decides what else may
+/// block. Under `introduced`, an unconditional violation at a line `added`
+/// says the change adds is a class of its own, "introduced by this change",
+/// whose row names the fix and the waiver; every other violation of the rule,
+/// and all of them when `added` is None (no change-scoped scan), is shown and
+/// exempt from the gate. An opt-out behind an option is already `medium`.
 fn construction_items(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
+    added: Option<&changed::AddedLines>,
 ) -> Vec<rvl_triage::TriagedItem> {
-    let mut classes: std::collections::BTreeMap<(String, String), Vec<_>> = Default::default();
+    use rvl_config::construction::Gate;
+    let introduced = |f: &rvl_config::construction::SiteFinding| {
+        let Some((file, line)) = f.site.rsplit_once(':') else {
+            return false;
+        };
+        f.severity == "high"
+            && added.is_some_and(|a| line.parse().is_ok_and(|l| a.contains(file, l)))
+    };
+    let mut classes: std::collections::BTreeMap<(String, String), (bool, Vec<_>)> =
+        Default::default();
     for f in rvl_config::construction::evaluate(sites, specs) {
-        if f.verdict == rvl_core::Verdict::Violates {
-            let rule = config_lane::rule_phrase(&f.reason).to_string();
-            classes.entry((f.key.clone(), rule)).or_default().push(f);
+        if f.verdict != rvl_core::Verdict::Violates {
+            continue;
         }
+        let phrase = config_lane::rule_phrase(&f.reason);
+        let (rule, exempt) = match rvl_config::construction::gate(specs, &f.key) {
+            Gate::Severity => (phrase.to_string(), false),
+            Gate::Introduced if introduced(&f) => (introduced_reason(&f, phrase), false),
+            Gate::Introduced | Gate::Advisory => (phrase.to_string(), true),
+        };
+        let class = classes.entry((f.key.clone(), rule)).or_default();
+        class.0 = exempt;
+        class.1.push(f);
     }
     classes
         .into_iter()
-        .map(|((key, rule), found)| {
+        .map(|((key, rule), (gate_exempt, found))| {
             let first = &found[0];
             rvl_triage::TriagedItem {
                 class: rvl_triage::ClassKey {
@@ -3920,9 +3950,146 @@ fn construction_items(
                 provenance: Default::default(),
                 site_count: found.len(),
                 example_sites: found.iter().take(3).map(|f| f.site.clone()).collect(),
+                gate_exempt,
             }
         })
         .collect()
+}
+
+/// The reason of a violation a change introduces, which is its ladder row:
+/// what it is, the fix, and the `.revelara.yaml` waiver that accepts it.
+fn introduced_reason(f: &rvl_config::construction::SiteFinding, phrase: &str) -> String {
+    format!(
+        "introduced by this change ({phrase}); fix: {}; or waive it under scanner.waivers \
+         in .revelara.yaml: {{matcher: \"{}.{}\", paths: [\"<file glob>\"], reason: \"<why>\"}}",
+        f.fix,
+        rvl_config::construction::FORMAT,
+        f.key
+    )
+}
+
+#[cfg(test)]
+mod construction_gate_tests {
+    use super::*;
+    use rvl_spec::{SpecCache, SpecFile};
+
+    const SKIP: &str = "crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
+
+    /// The construction rules, with `gate` on the TLS-verification rule.
+    fn specs(gate: &str) -> SpecCache {
+        let text = include_str!("../../rvl-config/testdata/construction_rules.json");
+        let mut file: SpecFile = serde_json::from_str(text).unwrap();
+        for k in file.config_keys.iter_mut().filter(|k| k.key == SKIP) {
+            k.gate = gate.into();
+        }
+        SpecCache::from_file(file)
+    }
+
+    /// `InsecureSkipVerify: true` at `tls.go:<line>`, in the given literal
+    /// and under the given guard.
+    fn skip(line: u32, snippet: &str, guard: &str) -> rvl_core::Site {
+        serde_json::from_value(serde_json::json!({
+            "file_path": "tls.go", "line_number": line, "client_type": "crypto/tls.Config",
+            "func": "InsecureSkipVerify", "symbol": "dial", "snippet": snippet, "guard": guard,
+            "const_args": [{"index": 0, "name": "InsecureSkipVerify", "value": "true",
+                            "how": "literal"}],
+        }))
+        .unwrap()
+    }
+
+    const BARE: &str = "&tls.Config{InsecureSkipVerify: true}";
+
+    fn ladder(
+        sites: &[rvl_core::Site],
+        gate: &str,
+        added: Option<&changed::AddedLines>,
+    ) -> Vec<render::Finding> {
+        let specs = specs(gate);
+        triage_to_findings(&construction_items(sites, &specs, added), Some(&specs))
+    }
+
+    fn blocking(findings: &[render::Finding]) -> Vec<&render::Finding> {
+        findings
+            .iter()
+            .filter(|f| render::classify(f) == render::Section::Blocking)
+            .collect()
+    }
+
+    #[test]
+    fn an_introduced_unconditional_skip_blocks_and_names_the_fix_and_the_waiver() {
+        let sites = [skip(7, BARE, ""), skip(30, BARE, "")];
+        let added = changed::AddedLines::of("tls.go", &[7]);
+        let found = ladder(&sites, "introduced", Some(&added));
+        let blocks = blocking(&found);
+        assert_eq!(blocks.len(), 1, "{found:#?}");
+        let b = blocks[0];
+        assert_eq!((b.site.as_str(), b.site_count), ("tls.go:7", 1));
+        assert_eq!(b.class_rule, format!("construction.{SKIP}"));
+        for part in [
+            "introduced by this change (equal to true)",
+            "fix: verify the peer",
+            "scanner.waivers",
+            &format!("matcher: \"construction.{SKIP}\""),
+        ] {
+            assert!(b.description.contains(part), "{part}: {}", b.description);
+        }
+        // The skip that was already at the base: shown, at its severity, and
+        // advisory.
+        let old: Vec<_> = found.iter().filter(|f| f.site == "tls.go:30").collect();
+        assert_eq!(old.len(), 1, "{found:#?}");
+        assert_eq!(old[0].severity, "high");
+        assert_eq!(render::classify(old[0]), render::Section::Advisory);
+    }
+
+    #[test]
+    fn a_gated_rule_is_advisory_outside_a_change_scoped_scan_or_at_a_line_it_did_not_add() {
+        let sites = [skip(7, BARE, "")];
+        for added in [None, Some(changed::AddedLines::of("tls.go", &[8]))] {
+            let found = ladder(&sites, "introduced", added.as_ref());
+            assert!(blocking(&found).is_empty(), "{added:?}: {found:#?}");
+            assert_eq!(found.len(), 1, "still shown: {found:#?}");
+        }
+        // A gate this binary does not know never blocks, introduced or not.
+        let added = changed::AddedLines::of("tls.go", &[7]);
+        let found = ladder(&sites, "on-review", Some(&added));
+        assert!(blocking(&found).is_empty(), "{found:#?}");
+        // With no gate the rule blocks by its severity, as before.
+        assert_eq!(blocking(&ladder(&sites, "", None)).len(), 1);
+    }
+
+    #[test]
+    fn an_introduced_opt_out_or_re_verified_skip_does_not_block() {
+        let reverified = "&tls.Config{InsecureSkipVerify: true, VerifyPeerCertificate: verify}";
+        let sites = [skip(7, BARE, "opts.Insecure"), skip(9, reverified, "")];
+        let added = changed::AddedLines::of("tls.go", &[7, 9]);
+        let found = ladder(&sites, "introduced", Some(&added));
+        assert!(blocking(&found).is_empty(), "{found:#?}");
+        // The opt-out is an advisory row; the re-verified config no finding.
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].site, "tls.go:7");
+        assert_eq!(found[0].severity, "medium");
+    }
+
+    #[test]
+    fn a_waiver_clears_an_introduced_skip() {
+        let added = changed::AddedLines::of("tls.go", &[7]);
+        let mut found = ladder(&[skip(7, BARE, "")], "introduced", Some(&added));
+        let waivers = [waiver::Waiver {
+            rule: format!("construction.{SKIP}"),
+            paths: vec!["tls.go".into()],
+            expires: String::new(),
+            reason: "dials its own loopback listener".into(),
+        }];
+        for f in &mut found {
+            f.suppressed = waiver::is_waived(
+                &f.class_rule,
+                waiver::site_path(&f.site),
+                &waivers,
+                "2026-10-30",
+            );
+        }
+        assert!(blocking(&found).is_empty(), "{found:#?}");
+    }
 }
 
 /// Map emission-lane violations into triage items. The class key is
@@ -3954,6 +4121,7 @@ fn emission_items(
             provenance: Default::default(),
             site_count: f.evidence.len().max(1),
             example_sites: f.evidence.into_iter().take(3).collect(),
+            gate_exempt: false,
         })
         .collect()
 }
@@ -5973,6 +6141,24 @@ fn run_scan_incremental(
     } else {
         scan.sites
     };
+    // What the change adds, line by line, for the construction rules that
+    // block only what a change introduces. A diff git cannot give leaves
+    // those rules advisory: it narrows the gate, never widens it.
+    let added = match &resolved {
+        Ok(cs) if changed_only => match changed::added_lines(path, cs) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                progress.suspend(|| {
+                    eprintln!(
+                        "note: the lines this change adds are unavailable from git ({e:#}); \
+                         rules gated on an introduced site stay advisory"
+                    )
+                });
+                None
+            }
+        },
+        _ => None,
+    };
     progress::step(&progress, "Resolving findings");
     let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
         findings_from_sites(
@@ -5986,6 +6172,7 @@ fn run_scan_incremental(
             tiers,
             Some(path),
             true,
+            added.as_ref(),
             &progress,
         )?;
     // The content lane is cheap (one regex pass over the tree) and its rules
@@ -6370,6 +6557,7 @@ fn run_report(
                 tiers,
                 Some(path),
                 false,
+                None,
                 &indicatif::ProgressBar::hidden(),
             )?;
         (findings, sites)
@@ -10775,6 +10963,7 @@ mod tests {
             files: vec!["pkg0/f.go".to_string()],
             source: "test".to_string(),
             dirty: Vec::new(),
+            base: changed::Base::Unknown,
         });
         // A fresh index per pass, so every walked file is stale in each.
         let requested = |changed_only: bool| {

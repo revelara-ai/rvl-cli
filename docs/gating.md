@@ -40,6 +40,21 @@ touched, so a one-file docs commit does not surface the whole repository.
 It requires `--incremental`, and the changed set comes from git, never from
 the packet index.
 
+A construction rule published with `gate: introduced` (see "Construction
+rules" in `docs/retrievers.md`) blocks only a violation on a line the change
+adds. The same rule's violations already in the repository stay advisory, so
+a TLS-verification disable blocks the commit that introduces it and not the
+one that edits the file around an old one. Its row reads `introduced by this
+change`, with the fix and the waiver:
+
+```yaml
+scanner:
+  waivers:
+    - matcher: "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)"
+      paths: ["internal/dial/loopback.go"]
+      reason: "dials its own listener"
+```
+
 The pre-commit scan reads working-tree files, not the staged blobs. When a
 staged file also has unstaged edits (`git add -p`, or an edit after
 `git add`), those two differ, and a verdict on one says nothing about the

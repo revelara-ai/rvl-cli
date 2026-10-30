@@ -387,6 +387,7 @@ mod tests {
                     control: String::new(),
                     severity: String::new(),
                     fix: String::new(),
+                    gate: String::new(),
                 })
                 .collect(),
             ..Default::default()

@@ -29,6 +29,11 @@
 //! (`if opts.Insecure`) is the user's opt-out: it still violates, under the
 //! reason "disabled behind an option" and with severity `medium`, so it stays
 //! advisory while the unconditional form, at the rule's own severity, blocks.
+//!
+//! A rule may also publish a gate ([`Gate`]). Under `introduced` its
+//! unconditional form blocks only where a change-scoped scan sees the change
+//! add the site; the violations already in the repository, and every one in a
+//! full scan, are advisory.
 
 use crate::{eval, ConfigPacket, ProvenanceStep, Resolution};
 use rvl_core::{ConstArg, ScopeClass, Site, Verdict};
@@ -36,6 +41,26 @@ use rvl_spec::SpecCache;
 
 /// The config-key `format` of a construction rule.
 pub const FORMAT: &str = "construction";
+
+/// When a construction rule's violation may block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// By its severity, wherever it is: the rule publishes no gate.
+    Severity,
+    /// At severity `high`, only at a site the change under scan adds.
+    Introduced,
+    /// Never: the rule names a gate this binary does not know.
+    Advisory,
+}
+
+/// The gate of the rule `key`, by [`rvl_spec::ConfigKeySpec::gate`].
+pub fn gate(specs: &SpecCache, key: &str) -> Gate {
+    match specs.config_key(FORMAT, key).map(|s| s.gate.as_str()) {
+        None | Some("") => Gate::Severity,
+        Some(rvl_spec::GATE_INTRODUCED) => Gate::Introduced,
+        Some(_) => Gate::Advisory,
+    }
+}
 
 /// One judged construction or argument.
 #[derive(Debug, Clone, PartialEq)]
@@ -545,6 +570,29 @@ mod tests {
         assert_eq!(option_field("(a.b) && (c.d)"), None);
         assert_eq!(option_field("a.b == \"x\""), None);
         assert_eq!(option_field(""), None);
+    }
+
+    #[test]
+    fn a_rules_gate_is_read_from_its_spec_and_an_unknown_one_is_advisory() {
+        let skip = "crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
+        let with = |gate: &str| {
+            let mut file: SpecFile = serde_json::from_str(RULES).unwrap();
+            for k in &mut file.config_keys {
+                k.gate = gate.into();
+            }
+            SpecCache::from_file(file)
+        };
+        assert_eq!(gate(&specs(), skip), Gate::Severity);
+        assert_eq!(gate(&with("introduced"), skip), Gate::Introduced);
+        assert_eq!(gate(&with("on-review"), skip), Gate::Advisory);
+        assert_eq!(gate(&with("introduced"), "no.such.rule"), Gate::Severity);
+        // The wire form the spec producer publishes.
+        let file: SpecFile = serde_json::from_str(
+            r#"{"config_keys": [{"format": "construction", "key": "k",
+                "expect": {"kind": "absent"}, "severity": "high", "gate": "introduced"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(gate(&SpecCache::from_file(file), "k"), Gate::Introduced);
     }
 
     #[test]

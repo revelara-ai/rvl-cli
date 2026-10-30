@@ -138,6 +138,9 @@ fn run_capped(
         control: String,
         severity: String,
         fix: String,
+        // The spec names a gate. This lane implements none, so the class is
+        // advisory, the way an unknown gate is (`ConfigKeySpec::gate`).
+        gated: bool,
         sites: Vec<String>,
     }
     let mut classes: BTreeMap<(String, String, String), Class> = BTreeMap::new();
@@ -200,6 +203,9 @@ fn run_capped(
             control: f.control.clone(),
             severity: f.severity.clone(),
             fix: f.fix.clone(),
+            gated: specs
+                .config_key(&p.format, &p.key)
+                .is_some_and(|s| !s.gate.is_empty()),
             sites: Vec::new(),
         });
         c.sites.push(format!("{} ({})", p.file_path, p.unit));
@@ -233,7 +239,7 @@ fn run_capped(
                 example_sites: c.sites.into_iter().take(3).collect(),
                 class_rule: class_rule(&format, &key),
                 suppressed: false,
-                gate_exempt: false,
+                gate_exempt: c.gated,
                 factors: Vec::new(),
                 provenance: Default::default(),
             }
@@ -332,7 +338,11 @@ mod tests {
     use rvl_spec::{ConfigExpect, ConfigKeySpec, SpecCache, SpecFile};
 
     fn specs(severity: &str) -> SpecCache {
-        SpecCache::from_file(SpecFile {
+        SpecCache::from_file(spec_file(severity))
+    }
+
+    fn spec_file(severity: &str) -> SpecFile {
+        SpecFile {
             config_keys: vec![
                 ConfigKeySpec {
                     format: "github-actions".into(),
@@ -343,6 +353,7 @@ mod tests {
                     control: "RC-013".into(),
                     severity: severity.into(),
                     fix: "set jobs.<id>.timeout-minutes".into(),
+                    gate: String::new(),
                 },
                 // A specced key whose value lives outside the repo (the
                 // GITHUB_TOKEN default) exercises the outside-repo lever.
@@ -355,10 +366,11 @@ mod tests {
                     control: "RC-044".into(),
                     severity: String::new(),
                     fix: String::new(),
+                    gate: String::new(),
                 },
             ],
             ..Default::default()
-        })
+        }
     }
 
     fn repo_with_workflow(yaml: &str) -> tempfile::TempDir {
@@ -475,6 +487,26 @@ mod tests {
         );
     }
 
+    /// This lane implements no gate, so a spec that names one, known or not,
+    /// is advisory here: shown at its severity, never blocking.
+    #[test]
+    fn a_spec_that_names_a_gate_is_advisory_in_this_lane() {
+        let dir = repo_with_workflow("on: push\njobs:\n  a:\n    runs-on: x\n");
+        for gate in [rvl_spec::GATE_INTRODUCED, "on-tuesdays"] {
+            let mut file = spec_file("high");
+            file.config_keys[0].gate = gate.into();
+            let out = run(dir.path(), &SpecCache::from_file(file), "snap");
+            let f = out
+                .findings
+                .iter()
+                .find(|f| f.class_rule == "github-actions.job.timeout-minutes")
+                .expect("a violating class");
+            assert_eq!(f.severity, "high", "{gate}");
+            assert!(f.gate_exempt, "{gate}");
+            assert_eq!(render::classify(f), render::Section::Advisory, "{gate}");
+        }
+    }
+
     // The outside-repo lever still exists and must still be reachable: a
     // VALUE-BEARING expectation on the same unresolvable packet cannot decide,
     // because it genuinely needs the value `Present` never wanted.
@@ -492,6 +524,7 @@ mod tests {
                 control: "RC-044".into(),
                 severity: "medium".into(),
                 fix: String::new(),
+                gate: String::new(),
             }],
             ..Default::default()
         };

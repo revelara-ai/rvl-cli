@@ -452,6 +452,7 @@ mod tests {
                 control: "RC-013".into(),
                 severity: "medium".into(),
                 fix: "set it".into(),
+                gate: String::new(),
             }],
             ..Default::default()
         })
