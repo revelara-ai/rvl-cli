@@ -1320,6 +1320,8 @@ func discoverModules(root string) []string {
 func modulePaths(moduleDirs []string) []string {
 	var paths []string
 	for _, dir := range moduleDirs {
+		// #nosec G304 -- dir is a module of the repository being scanned, and
+		// reading that repository is what this helper is for.
 		b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 		if err != nil {
 			continue

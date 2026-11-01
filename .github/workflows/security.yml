@@ -1,0 +1,208 @@
+name: Security
+
+# SAST and SCA for this repository, written here rather than called from a
+# shared reusable workflow: this repository is public, and GitHub does not let
+# a public repository call a reusable workflow kept in a private one.
+#
+# SAST: gosec over the Go helper (helpers/goindex, the only Go module; the
+# repository root has no go.mod) and Semgrep over the whole tree, which covers
+# the Rust workspace and the other helpers. SCA: govulncheck for the Go module,
+# cargo-audit for Cargo.lock, npm audit for the tsindex lockfile. No DAST: rvl
+# is a CLI, there is no running service to probe.
+#
+# Each job writes its machine-readable report to $RUNNER_TEMP/reports and
+# uploads it as an artifact even when the scan fails. gosec, govulncheck,
+# cargo-audit and npm audit fail their job on a finding; Semgrep reports only,
+# so its artifact is a baseline to triage before it becomes a gate.
+#
+# Not part of ci-gate: the merge queue reads ci.yml alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Same runner convention as ci.yml: CI_RUNNER selects the self-hosted fleet,
+# an unset variable falls back to GitHub-hosted.
+jobs:
+  sast-go:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+          cache: ${{ vars.CI_RUNNER == '' }}
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+
+      # testdata holds synthetic fixtures, out of scope per SECURITY.md.
+      - name: gosec
+        working-directory: helpers/goindex
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          "$(go env GOPATH)/bin/gosec" -exclude-dir=testdata \
+            -fmt sarif -out "$RUNNER_TEMP/reports/gosec.sarif" -stdout -verbose text ./...
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: sast-gosec
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
+
+  sast-semgrep:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Installed from PyPI, not run in the Semgrep container: the container
+      # runs as root and leaves files a self-hosted runner cannot clean.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: python -m pip install semgrep==1.183.0
+
+      - name: Semgrep
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          semgrep scan --config p/default --exclude testdata \
+            --sarif-output "$RUNNER_TEMP/reports/semgrep.sarif" --text
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: sast-semgrep
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
+
+  sca-go:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+          cache: ${{ vars.CI_RUNNER == '' }}
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+      # govulncheck exits 0 on a finding in its sarif format, so the report is
+      # written first and the text run is the gate.
+      - name: govulncheck
+        working-directory: helpers/goindex
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          govulncheck="$(go env GOPATH)/bin/govulncheck"
+          "$govulncheck" -format sarif ./... > "$RUNNER_TEMP/reports/govulncheck.sarif"
+          "$govulncheck" ./...
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: sca-go
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
+
+  sca-rust:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          # As in ci.yml: the self-hosted fleet may not have rustup.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # Reads Cargo.lock against the RustSec advisory database. An
+      # "unmaintained" warning is reported, not failed on.
+      - name: cargo audit
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          cargo audit --json > "$RUNNER_TEMP/reports/cargo-audit.json" || true
+          cargo audit
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: sca-rust
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
+
+  sca-npm:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Reclaim workspace ownership (self-hosted runner hygiene)
+        if: ${{ vars.CI_RUNNER != '' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_WORKSPACE" 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: helpers/tsindex/package.json
+
+      # Reads package-lock.json alone; nothing is installed.
+      - name: npm audit
+        working-directory: helpers/tsindex
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          npm audit --json > "$RUNNER_TEMP/reports/npm-audit.json" || true
+          npm audit
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: sca-npm
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
