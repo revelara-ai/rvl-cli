@@ -493,10 +493,23 @@ mod tests {
         }
     }
 
+    /// The check is a `debug_assert!`, so only a debug build can panic here.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "not declared in key_ledger::EMITTED_KEYS")]
     fn an_undeclared_key_fails_at_the_point_of_emission() {
         declared("github-actions", "job.not-in-the-ledger");
+    }
+
+    /// The release half: an undeclared key is an authoring bug, never a
+    /// reason to fail a user's scan, so the key is emitted unchanged.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_release_build_emits_an_undeclared_key_unchanged() {
+        assert_eq!(
+            declared("github-actions", "job.not-in-the-ledger"),
+            "job.not-in-the-ledger"
+        );
     }
 
     #[test]
