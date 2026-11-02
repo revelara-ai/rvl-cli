@@ -7,6 +7,9 @@ use rvl_structure::{
 };
 use std::path::Path;
 
+/// The scan date every fixture is judged on.
+const TODAY: &str = "2026-11-02";
+
 fn write(root: &Path, rel: &str, content: &str) {
     let p = root.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -20,7 +23,7 @@ fn finding<'a>(fs: &'a [StructureFinding], control: &str) -> &'a StructureFindin
 }
 
 fn eval_dir(root: &Path) -> Vec<StructureFinding> {
-    evaluate(&inventory(root))
+    evaluate(&inventory(root), TODAY)
 }
 
 /// A Go mini-repo with enough sources to judge and no tests at all.
@@ -102,7 +105,7 @@ fn rc033_truncated_walk_never_licenses_reasoning_from_absence() {
         walk_complete: false,
         ..Default::default()
     };
-    let fs = evaluate(&facts);
+    let fs = evaluate(&facts, TODAY);
     assert_eq!(
         finding(&fs, "RC-033").verdict,
         Verdict::Abstain,
@@ -552,10 +555,10 @@ fn rc070_no_manifests_is_not_applicable() {
 // --- RC-006: runbook-directory presence (weak signal) ---
 
 #[test]
-fn rc006_runbook_dir_satisfies_weakly() {
+fn rc006_runbook_dir_without_runbook_files_satisfies_weakly() {
     let dir = tempfile::tempdir().unwrap();
     go_repo_without_tests(dir.path());
-    write(dir.path(), "docs/runbooks/db-failover.md", "# steps\n");
+    write(dir.path(), "docs/runbooks/README.md", "# index\n");
     let fs = eval_dir(dir.path());
     let f = finding(&fs, "RC-006");
     assert_eq!(f.verdict, Verdict::Satisfies);
@@ -575,6 +578,238 @@ fn rc006_absence_abstains_runbooks_may_live_elsewhere() {
         f.reason
     );
     assert!(f.weak);
+}
+
+// --- RC-006: runbook currency (front matter, CODEOWNERS, committed rulesets) ---
+
+const RUNBOOK_CURRENT: &str =
+    "---\nowner: \"@sre\"\nlast_reviewed: 2026-06-01\n---\n# DB failover\n";
+
+const RULESET_REVIEWED: &str = r#"{
+  "name": "main", "target": "branch", "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+  "rules": [{"type": "pull_request", "parameters": {
+    "required_approving_review_count": 0, "require_code_owner_review": true,
+    "dismiss_stale_reviews_on_push": false, "require_last_push_approval": false,
+    "required_review_thread_resolution": false}}]
+}"#;
+
+/// A repository whose one runbook is current, owned and review-gated.
+fn runbook_repo(root: &Path, runbook: &str) {
+    write(root, "docs/runbooks/db-failover.md", runbook);
+    write(root, "docs/runbooks/README.md", "# index, not a runbook\n");
+    write(
+        root,
+        ".github/CODEOWNERS",
+        "* @org/eng\n/docs/runbooks/ @org/sre\n",
+    );
+}
+
+#[test]
+fn rc006_current_owned_runbook_satisfies_and_scopes_out_forge_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(dir.path(), RUNBOOK_CURRENT);
+    let facts = inventory(dir.path());
+    assert_eq!(
+        facts.runbooks.len(),
+        1,
+        "README indexes, it is not a runbook"
+    );
+    assert_eq!(facts.codeowners.as_deref(), Some(".github/CODEOWNERS"));
+    let f = evaluate(&facts, TODAY)
+        .into_iter()
+        .find(|f| f.control == "RC-006")
+        .unwrap();
+    assert_eq!(f.verdict, Verdict::Satisfies, "reason: {}", f.reason);
+    assert!(!f.weak, "a judged runbook is not a presence-only signal");
+    assert!(
+        f.reason.contains("forge settings is out of scope"),
+        "{}",
+        f.reason
+    );
+    assert!(!f.reason.contains("advisory"), "{}", f.reason);
+}
+
+#[test]
+fn rc006_each_owner_and_date_key_is_read() {
+    for fm in [
+        "owners: [\"@a\", \"@b\"]\nlast_reviewed_on: \"2026-01-02\"",
+        "owner_slack: \"#sre-oncall\"\ntested_on: 2026-03-04",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        runbook_repo(dir.path(), &format!("---\n{fm}\n---\nsteps\n"));
+        let f = eval_dir(dir.path());
+        let f = finding(&f, "RC-006");
+        assert_eq!(f.verdict, Verdict::Satisfies, "{fm}: {}", f.reason);
+    }
+}
+
+#[test]
+fn rc006_missing_owner_or_date_violates() {
+    for (fm, missing) in [
+        ("last_reviewed: 2026-06-01", "no owner"),
+        ("owner: \"@sre\"", "no last_reviewed"),
+        (
+            "owner: \"@sre\"\nlast_reviewed: 2026-02-31",
+            "no last_reviewed",
+        ),
+        ("owner: \"\"\nlast_reviewed: 2026-06-01", "no owner"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        runbook_repo(dir.path(), &format!("---\n{fm}\n---\n"));
+        let fs = eval_dir(dir.path());
+        let f = finding(&fs, "RC-006");
+        assert_eq!(f.verdict, Verdict::Violates, "{fm}: {}", f.reason);
+        assert!(f.reason.contains(missing), "{fm}: {}", f.reason);
+        assert_eq!(f.evidence, vec!["docs/runbooks/db-failover.md".to_string()]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(dir.path(), "# no front matter at all\n");
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-006");
+    assert!(
+        f.reason.contains("no owner") && f.reason.contains("no last_reviewed"),
+        "{}",
+        f.reason
+    );
+}
+
+#[test]
+fn rc006_a_stale_review_is_an_advisory_note_never_a_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(
+        dir.path(),
+        "---\nowner: \"@sre\"\nlast_reviewed: 2025-11-01\n---\n",
+    );
+    let facts = inventory(dir.path());
+    let f = evaluate(&facts, TODAY)
+        .into_iter()
+        .find(|f| f.control == "RC-006")
+        .unwrap();
+    assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    assert!(
+        f.reason.contains("advisory") && f.reason.contains("db-failover.md (2025-11-01)"),
+        "366 days before the scan date: {}",
+        f.reason
+    );
+    // Exactly 365 days is not stale.
+    let f = evaluate(&facts, "2026-11-01")
+        .into_iter()
+        .find(|f| f.control == "RC-006")
+        .unwrap();
+    assert!(!f.reason.contains("advisory"), "{}", f.reason);
+}
+
+#[test]
+fn rc006_the_last_matching_codeowners_pattern_decides() {
+    let cases = [
+        // A later pattern with no owners leaves the path unowned.
+        ("* @org/eng\n/docs/runbooks/\n", false),
+        // A later owned pattern wins over an earlier unowned one.
+        ("/docs/\n**/runbooks/*.md @org/sre # inline comment\n", true),
+        // An unanchored directory name matches at any depth.
+        ("runbooks @org/sre\n", true),
+        // A wildcard last segment matches direct entries only.
+        ("/docs/* @org/docs\n", false),
+        // Paths are case sensitive.
+        ("/Docs/runbooks/ @org/sre\n", false),
+        // A negation line is unsupported syntax: GitHub skips it.
+        ("* @org/eng\n!docs/runbooks/db-failover.md\n", true),
+    ];
+    for (codeowners, owned) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        runbook_repo(dir.path(), RUNBOOK_CURRENT);
+        write(dir.path(), ".github/CODEOWNERS", codeowners);
+        let facts = inventory(dir.path());
+        assert_eq!(facts.runbooks[0].code_owned, owned, "{codeowners:?}");
+        let f = evaluate(&facts, TODAY)
+            .into_iter()
+            .find(|f| f.control == "RC-006")
+            .unwrap();
+        let want = if owned {
+            Verdict::Satisfies
+        } else {
+            Verdict::Violates
+        };
+        assert_eq!(f.verdict, want, "{codeowners:?}: {}", f.reason);
+    }
+}
+
+#[test]
+fn rc006_codeowners_location_precedence_and_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(dir.path(), RUNBOOK_CURRENT);
+    std::fs::remove_file(dir.path().join(".github/CODEOWNERS")).unwrap();
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-006");
+    assert_eq!(f.verdict, Verdict::Violates);
+    assert!(f.reason.contains("no CODEOWNERS file"), "{}", f.reason);
+
+    // The root file is in effect when .github/ has none; docs/ comes last.
+    write(dir.path(), "docs/CODEOWNERS", "* @org/docs\n");
+    write(dir.path(), "CODEOWNERS", "*.go @org/go\n");
+    let facts = inventory(dir.path());
+    assert_eq!(facts.codeowners.as_deref(), Some("CODEOWNERS"));
+    assert!(!facts.runbooks[0].code_owned);
+}
+
+#[test]
+fn rc006_a_committed_ruleset_must_require_review_on_the_default_branch() {
+    let no_review = RULESET_REVIEWED.replace(
+        "\"require_code_owner_review\": true",
+        "\"require_code_owner_review\": false",
+    );
+    let one_approval = no_review.replace(
+        "\"required_approving_review_count\": 0",
+        "\"required_approving_review_count\": 1",
+    );
+    let evaluate_only = RULESET_REVIEWED.replace("\"active\"", "\"evaluate\"");
+    let other_branch = RULESET_REVIEWED.replace("~DEFAULT_BRANCH", "refs/heads/release");
+    let cases = [
+        (RULESET_REVIEWED.to_string(), Verdict::Satisfies),
+        (one_approval, Verdict::Satisfies),
+        (no_review, Verdict::Violates),
+        (evaluate_only, Verdict::Violates),
+        (other_branch, Verdict::Violates),
+    ];
+    for (ruleset, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        runbook_repo(dir.path(), RUNBOOK_CURRENT);
+        write(dir.path(), ".github/rulesets/main.json", &ruleset);
+        let fs = eval_dir(dir.path());
+        let f = finding(&fs, "RC-006");
+        assert_eq!(f.verdict, want, "{ruleset}: {}", f.reason);
+        assert!(
+            f.reason.contains("forge settings is out of scope"),
+            "{}",
+            f.reason
+        );
+        if want == Verdict::Violates {
+            assert!(f
+                .evidence
+                .contains(&".github/rulesets/main.json".to_string()));
+        }
+    }
+
+    // A ruleset that does not parse is not read as one that lacks review.
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(dir.path(), RUNBOOK_CURRENT);
+    write(dir.path(), ".github/rulesets/broken.json", "{ not json");
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-006");
+    assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+    assert!(f.reason.contains("not read as rulesets"), "{}", f.reason);
+}
+
+#[test]
+fn rc006_runbook_facts_ride_the_record_and_old_records_still_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    runbook_repo(dir.path(), RUNBOOK_CURRENT);
+    let facts = inventory(dir.path());
+    let back = parse_record(&facts.to_jsonl()).unwrap();
+    assert_eq!(back, facts);
+    let old = parse_record(r#"{"kind":"repo_structure","runbook_dirs":["runbooks"]}"#).unwrap();
+    assert!(old.runbooks.is_empty() && old.rulesets.is_empty() && old.codeowners.is_none());
 }
 
 // --- CI scanner inventory (Q21/Q22): a repo-level fact, no verdict ---
@@ -801,7 +1036,7 @@ fn record_round_trips_through_a_packet_stream() {
 
 #[test]
 fn evaluate_emits_one_finding_per_control_every_time() {
-    let fs = evaluate(&RepoStructure::default());
+    let fs = evaluate(&RepoStructure::default(), TODAY);
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,

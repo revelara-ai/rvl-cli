@@ -2,8 +2,10 @@
 //! it reports what is present (names, counts, markers), never a verdict.
 //! Contents are read locally to detect markers; no source text is stored.
 
+use crate::runbooks;
 use crate::{
-    CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, ScannerClass, ScannerFacts,
+    CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
+    ScannerFacts,
 };
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -152,6 +154,7 @@ struct Acc {
     contract: BTreeSet<String>,
     manifests: Vec<ManifestFacts>,
     runbooks: BTreeSet<String>,
+    runbook_files: Vec<RunbookFacts>,
     ci_scans: CiScanFacts,
     scanners: BTreeSet<ScannerFacts>,
     walk_complete: bool,
@@ -203,6 +206,17 @@ pub fn inventory(root: &Path) -> RepoStructure {
 
     resolve_lockfiles(root, &mut acc.manifests);
     acc.manifests.sort_by(|a, b| a.path.cmp(&b.path));
+    acc.runbook_files.sort_by(|a, b| a.path.cmp(&b.path));
+    let codeowners = runbooks::CODEOWNERS_PATHS
+        .iter()
+        .find(|p| root.join(p).is_file())
+        .map(|p| p.to_string());
+    if let Some(file) = &codeowners {
+        let rules = runbooks::codeowners_rules(&read_capped(&root.join(file)));
+        for r in &mut acc.runbook_files {
+            r.code_owned = runbooks::code_owned(&rules, &r.path);
+        }
+    }
 
     RepoStructure {
         kind: crate::RECORD_KIND.to_string(),
@@ -221,6 +235,9 @@ pub fn inventory(root: &Path) -> RepoStructure {
         contract_frameworks: acc.contract.into_iter().collect(),
         manifests: acc.manifests,
         runbook_dirs: acc.runbooks.into_iter().collect(),
+        runbooks: acc.runbook_files,
+        codeowners,
+        rulesets: committed_rulesets(root),
         ci_scans: CiScanFacts {
             scanners: acc.scanners.into_iter().collect(),
             ..acc.ci_scans
@@ -518,12 +535,36 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
 
     // --- runbook conventions carried by loose docs (ops/ with markdown) ---
-    if ext == "md" {
-        let d = dirs.join("/");
-        if d == "ops" || d == "docs/ops" {
-            acc.runbooks.insert(d);
-        }
+    let d = dirs.join("/");
+    let ops = d == "ops" || d == "docs/ops";
+    if ext == "md" && ops {
+        acc.runbooks.insert(d);
     }
+    let in_runbook_dir = ops || dir_prefix_matching(&rp, RUNBOOK_DIRS).is_some();
+    if matches!(ext.as_str(), "md" | "markdown") && in_runbook_dir && !runbooks::is_index(name) {
+        let (owner, reviewed_on) = runbooks::front_matter(&read_capped(path));
+        acc.runbook_files.push(RunbookFacts {
+            path: rp,
+            owner,
+            reviewed_on,
+            code_owned: false,
+        });
+    }
+}
+
+/// The committed `.github/rulesets/*.json` files, sorted by path.
+fn committed_rulesets(root: &Path) -> Vec<crate::RulesetFacts> {
+    let Ok(entries) = std::fs::read_dir(root.join(".github/rulesets")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+        .map(|p| runbooks::ruleset(rel(root, &p), &read_capped(&p)))
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 /// Record the known scanners one workflow file runs. A file that is not a

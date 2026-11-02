@@ -15,6 +15,7 @@ pub mod model;
 
 use base64::Engine;
 use ed25519_dalek::Verifier;
+use rvl_core::civil::{civil_from_days, days_from_civil};
 use rvl_core::BIN;
 use serde::Deserialize;
 use sha2::Digest;
@@ -464,41 +465,6 @@ pub fn offline_from_env(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-/// Days since the civil epoch for a "YYYY-MM-DD" prefix; None if malformed.
-/// (Howard Hinnant's days-from-civil; no chrono dependency for one subtraction.)
-fn days_from_civil(date: &str) -> Option<i64> {
-    let mut it = date.splitn(3, '-');
-    let y: i64 = it.next()?.parse().ok()?;
-    let m: i64 = it.next()?.parse().ok()?;
-    let d: i64 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146097 + doe - 719468)
-}
-
-/// Inverse of [`days_from_civil`] (Hinnant's civil-from-days). Both halves
-/// of the calendar math live in this crate so they cannot drift apart.
-fn civil_from_days(z: i64) -> String {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Today as "YYYY-MM-DD" (UTC), for [`CacheStore::load`]'s staleness check.
 pub fn today_utc() -> String {
     let secs = std::time::SystemTime::now()
@@ -763,15 +729,6 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn calendar_halves_round_trip() {
-        for day in [-719468, 0, 11017, 20664, 30000] {
-            let s = civil_from_days(day);
-            assert_eq!(days_from_civil(&s), Some(day), "round trip failed for {s}");
-        }
-        assert_eq!(civil_from_days(20664), "2026-07-30");
     }
 
     #[test]

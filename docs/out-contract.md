@@ -243,6 +243,20 @@ The orchestrator uses it to:
   record). An empty array never means that the repository satisfies the
   controls. To score the lane against a gold set, key each gold case by a
   control code (`RC-033`) or by the full class.
+  The `RC-006` row judges a repository with runbook files (markdown under a
+  `runbooks/`, `runbook/` or `playbooks/` directory, or in `ops/` or
+  `docs/ops/`, index and README files excepted). It violates when a runbook's
+  YAML front matter names no `owner`, `owners` or `owner_slack`, or no
+  `last_reviewed`, `last_reviewed_on` or `tested_on` date (YYYY-MM-DD); when
+  the last matching pattern of the CODEOWNERS file in effect names no owner
+  for its path; or when committed `.github/rulesets/*.json` files exist and
+  none is an active branch ruleset on the default branch with a
+  `pull_request` rule requiring code-owner review or at least one approval.
+  A review date more than 365 days before the scan date is an advisory note
+  on a `satisfies` row, never a violation. Branch protection kept in forge
+  settings is out of scope, and the reason says so. A repository with a
+  runbook directory and no runbook files keeps the weak presence-only
+  `satisfies`.
 - `config_sites` is the config lane, one row per setting it read, whatever
   the verdict: the sites behind the `coverage.config.by_key` counts, so a
   consumer can sample them. The rows are pre-waiver engine truth. When no
