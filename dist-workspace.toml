@@ -74,3 +74,10 @@ pr-run-mode = "plan"
 # Cross-builds goindex, the one retriever cargo cannot produce, into
 # crates/rvl/dist-extras/ so `include` can pack it (po-aml3h).
 github-build-setup = "../build-setup.yml"
+
+# GitHub retires the macOS 14 runner image on 2026-11-02 and browned it out on
+# 2026-11-01, which cancelled the v1.10.0 macOS build
+# (actions/runner-images#13518). cargo-dist 0.32 still defaults
+# aarch64-apple-darwin to macos-14, so name the runner here.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
