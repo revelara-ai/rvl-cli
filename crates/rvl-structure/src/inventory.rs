@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// Directories never worth descending into: vendored deps and build output.
 /// A vendored dependency's tests must not satisfy the repo's own controls.
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "target",
@@ -120,7 +120,7 @@ const PYPROJECT_LOCKS: &[&str] = &["poetry.lock", "uv.lock", "pdm.lock", "pylock
 /// megafile cannot turn the inventory walk into a full-content crawl.
 const MAX_MARKER_READ: u64 = 256 * 1024;
 
-fn read_capped(path: &Path) -> String {
+pub(crate) fn read_capped(path: &Path) -> String {
     let Ok(f) = std::fs::File::open(path) else {
         return String::new();
     };
@@ -130,7 +130,7 @@ fn read_capped(path: &Path) -> String {
 }
 
 /// Repo-relative, forward-slashed spelling of `file` under `root`.
-fn rel(root: &Path, file: &Path) -> String {
+pub(crate) fn rel(root: &Path, file: &Path) -> String {
     let r = file.strip_prefix(root).unwrap_or(file);
     r.components()
         .map(|c| c.as_os_str().to_string_lossy())

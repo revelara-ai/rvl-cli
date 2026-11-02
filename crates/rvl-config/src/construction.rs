@@ -35,7 +35,8 @@
 //! A rule may also publish a gate ([`Gate`]). Under `introduced` its
 //! unconditional form blocks only where a change-scoped scan sees the change
 //! add the site; the violations already in the repository, and every one in a
-//! full scan, are advisory.
+//! full scan, are advisory. Under `service` it blocks there and, in a
+//! repository read as a service, wherever it is.
 
 use crate::{eval, ConfigPacket, ProvenanceStep, Resolution};
 use rvl_core::{ConstArg, ScopeClass, Site, Verdict};
@@ -51,6 +52,9 @@ pub enum Gate {
     Severity,
     /// At severity `high`, only at a site the change under scan adds.
     Introduced,
+    /// At severity `high`, at a site the change under scan adds, and at
+    /// every site of a repository read as a service.
+    Service,
     /// Never: the rule names a gate this binary does not know.
     Advisory,
 }
@@ -60,6 +64,7 @@ pub fn gate(specs: &SpecCache, key: &str) -> Gate {
     match specs.config_key(FORMAT, key).map(|s| s.gate.as_str()) {
         None | Some("") => Gate::Severity,
         Some(rvl_spec::GATE_INTRODUCED) => Gate::Introduced,
+        Some(rvl_spec::GATE_SERVICE) => Gate::Service,
         Some(_) => Gate::Advisory,
     }
 }
@@ -775,6 +780,7 @@ mod tests {
         };
         assert_eq!(gate(&specs(), skip), Gate::Severity);
         assert_eq!(gate(&with("introduced"), skip), Gate::Introduced);
+        assert_eq!(gate(&with("service"), skip), Gate::Service);
         assert_eq!(gate(&with("on-review"), skip), Gate::Advisory);
         assert_eq!(gate(&with("introduced"), "no.such.rule"), Gate::Severity);
         // The wire form the spec producer publishes.
