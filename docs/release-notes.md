@@ -9,6 +9,24 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A TLS opt-out is one the option's name says; a pinned config re-verifies
+
+See "Construction rules" in `docs/retrievers.md`.
+
+- `guard` on a `goindex` field site and a `pyindex` construction site is now
+  the conjunction of every `if` that holds the setting, outermost first:
+  `(o.Insecure) && (ok)`. It was the innermost `if` alone, so a skip under
+  an `if` on a local inside one on an option was blocking. It is now
+  advisory. `guard_params` lists the parameters any of them reads.
+- A guard is an option only when the option's name says it turns
+  verification off (`Insecure`, `Skip...`, `disable_...`) and it is set, or
+  says it turns verification on (`...Verify`, `validate_...`) and it is
+  unset. A skip under `if m.IsHttps` or `if e.RequireTLS`, where the option
+  turns on a TLS that skips verification, was advisory and now blocks.
+- `cfg.InsecureSkipVerify = true` satisfies when `cfg` is built in the same
+  function from a literal that sets `VerifyPeerCertificate` or
+  `VerifyConnection`.
+
 ### A control may hold a named frame beside its main frame
 
 - New: `frame` on a `decision_model.sites` row, the frame's id within its

@@ -855,6 +855,9 @@ class TestConstructionSites(unittest.TestCase):
              "url.startswith('https://') and (not verify)", ["verify"]),
             ("health_ok", 44, none,
              "url.startswith('https://') and (not verify)", ["verify"]),
+            # The conjunction of the ifs that hold it, outermost first.
+            ("nested", 63, hostname,
+             "(options.ssl_insecure) and (ctx is not None)", ["ctx"]),
             ("send", 36, none, "not verify", ["verify"]),
             ("stream_options", 30, none, "verify is False", []),
             ("verified", 53, hostname, "not (options.ssl_verify)", []),
