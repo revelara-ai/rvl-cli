@@ -25,6 +25,7 @@ end.
 | [Release notes](release-notes.md) | What each release adds for a consumer that must know the version it runs against, such as a skill that probes for a minimum `rvl` version. |
 | [Releasing](releasing.md) | Cutting a release, and how each retriever helper is packaged. |
 | [Test packets](test-packets.md) | Why hand-authored `--retrieved` test packets must be bound to a live helper run, and the per-lane audit. |
+| [Pool entry-point reachability (spike)](pool-reachability.md) | What goindex's call graph resolves toward "one pool serves handlers and jobs", measured on three repositories, and a per-site fact versus a per-pool row. |
 | [The top-20 lens candidates, reconciled](lens-reconciliation.md) | Which of the ranked lens classes the scanner already ships, which need only a corpus entry, and which need a retriever. Read it before you port a lens class. |
 
 The repository's top-level [README](../README.md) covers building, testing,

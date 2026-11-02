@@ -208,3 +208,106 @@ fn a_native_helper_that_reports_the_shipped_version_is_not_drift() {
         "a helper reporting the shipped version is the shipped helper:\n{all}"
     );
 }
+
+/// A GOINDEX ON PATH IS COMPARED WITH THE SOURCE RVL WAS BUILT FROM.
+///
+/// goindex is neither embedded nor, on a source build, bundled, so an old
+/// goindex on PATH used to be the only goindex in sight: the scan ran it,
+/// reported 0 Go sites, and said nothing. The stub here is that old helper.
+/// It answers the handshake with a version from another build and emits an
+/// empty Go lane.
+#[cfg(unix)]
+#[test]
+fn an_old_goindex_on_path_is_named_as_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("go.mod"), "module example.com/m\n\ngo 1.21\n").unwrap();
+    std::fs::write(
+        root.join("main.go"),
+        "package main\n\nimport \"crypto/tls\"\n\nvar C = &tls.Config{InsecureSkipVerify: true}\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("specs.json"), r#"{"apis":[],"configs":[]}"#).unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    rvl_testgate::write_executable(
+        &bin.join("goindex"),
+        "#!/bin/sh\n\
+         case \"$*\" in *packet-schema*) printf '2\\ncontent-version 000000000000\\n'; exit 0;; esac\n\
+         echo '{\"packet_schema\":2,\"kind\":\"retrieval_stats\",\"snapshot_id\":\"x\",\
+         \"lang\":\"go\",\"files_total\":1,\"files_parsed\":1,\"files_failed\":0,\"sites\":0}'\n",
+    );
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    // A copy of rvl alone in its directory, so no goindex is bundled beside
+    // it: the source build of the report, where PATH is the only goindex.
+    let rvl = dir.path().join("rvl-alone").join("rvl");
+    std::fs::create_dir_all(rvl.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_rvl"), &rvl).unwrap();
+    let out = Command::new(&rvl)
+        .current_dir(&root)
+        .env("HOME", dir.path().join("home"))
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("RVL_INDEX_DIR", dir.path().join("index"))
+        .env("RVL_OFFLINE", "1")
+        .env_remove("RVL_GOINDEX")
+        .env("PATH", path)
+        .args(["scan", ".", "--specs-file"])
+        .arg(dir.path().join("specs.json"))
+        .output()
+        .unwrap();
+    let all = combined(&out);
+    let goindex = bin.join("goindex").display().to_string();
+    let ran = all
+        .lines()
+        .find(|l| l.contains("retrievers:"))
+        .unwrap_or_else(|| panic!("the scan must have run:\n{all}"));
+    assert!(
+        ran.contains(&format!("{goindex} (PATH)")),
+        "the stub on PATH must be the goindex that ran:\n{all}"
+    );
+    let drift_line = all
+        .lines()
+        .find(|l| l.contains("helper drift"))
+        .unwrap_or_else(|| panic!("an old goindex on PATH must be announced:\n{all}"));
+    assert!(
+        drift_line.contains("Go")
+            && drift_line.contains(&goindex)
+            && drift_line.contains("the goindex source this rvl was built from")
+            && drift_line.contains("content 000000000000"),
+        "the warning must name the language, the file and what it differs from:\n{all}"
+    );
+}
+
+/// build.rs hashes helpers/goindex the way goindex hashes itself. If the two
+/// ever disagree, every goindex, the right one included, is reported as drift;
+/// this pins them together by asking a goindex built from the same source.
+#[test]
+fn the_goindex_version_rvl_compiles_in_is_the_one_goindex_reports() {
+    let out = match Command::new("go")
+        .args(["run", ".", "-packet-schema"])
+        .current_dir(manifest_dir().join("../../helpers/goindex"))
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        other => {
+            rvl_testgate::skip(
+                "the_goindex_version_rvl_compiles_in_is_the_one_goindex_reports",
+                format!("cannot run goindex from source: {other:?}"),
+            );
+            return;
+        }
+    };
+    let reply = String::from_utf8_lossy(&out.stdout);
+    let reported = reply
+        .lines()
+        .nth(1)
+        .and_then(|l| l.strip_prefix("content-version "))
+        .unwrap_or_else(|| panic!("goindex must answer the handshake: {reply:?}"));
+    // The same value the rvl binary compiles in (build.rs sets it for every
+    // target of this package, this test included).
+    assert_eq!(reported, env!("RVL_GOINDEX_CONTENT_VERSION"));
+}

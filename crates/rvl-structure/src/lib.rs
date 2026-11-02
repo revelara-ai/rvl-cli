@@ -13,6 +13,9 @@
 //! seen across all GitHub Actions workflows. [`RepoStructure::scanner_seen`]
 //! says when their absence can be read.
 //!
+//! [`repo_kind`] reads, from the same tree, whether the repository is a
+//! service, a tool or a library, for the rules that block only in a service.
+//!
 //! Privacy: facts are shape-only — file names, counts, and presence booleans.
 //! Content is read locally to detect markers (a `#[cfg(test)]` attribute, a
 //! coverage key in a config) but no source text is ever stored in the facts.
@@ -22,8 +25,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 mod inventory;
+mod repo_kind;
 
 pub use inventory::inventory;
+pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
 
 /// The `kind` tag this record carries in the packet stream.
 pub const RECORD_KIND: &str = "repo_structure";
