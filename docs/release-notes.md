@@ -9,6 +9,22 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A Prometheus runbook link is checked inside the repository
+
+A Prometheus alert rule's `runbook_url` (or `runbook`) annotation is now
+resolved during the scan. The scan reports only a status, never the link.
+
+- New: the config key `prometheus-rules` `rule.annotations.runbook.target`.
+  Its value is `resolved` when the link is a path with no scheme and no host
+  that exists relative to the rule file's directory or the repository root
+  (a `#fragment` is dropped). It is `missing` when the path exists in
+  neither. It is `external` when the link has a scheme or a host; such a
+  link is not fetched. A templated path is unresolvable.
+- New: the pattern `repo_link_resolves`. It is satisfied by `resolved`,
+  violated by `missing`, and abstains on `external`. An older `rvl`
+  abstains on a spec that uses it.
+- The spec arrives in the spec cache. Until it carries one, nothing changes.
+
 ### A construction rule can block in services only
 
 A `config_keys` spec may carry `gate: service`. See "Construction rules" in
