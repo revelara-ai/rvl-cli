@@ -125,7 +125,7 @@ func Pinned(o options, pinned []byte, verify func([][]byte, [][]*x509.Certificat
 
 // The option turns TLS on, and the only TLS it turns on skips verification:
 // the option is the insecure mode, not an opt-out of a verified one.
-func DialTLS(o options) *tls.Config {
+func DialInsecureTLS(o options) *tls.Config {
 	if o.UseTLS {
 		return &tls.Config{InsecureSkipVerify: true}
 	}

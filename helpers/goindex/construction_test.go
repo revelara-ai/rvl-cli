@@ -97,7 +97,7 @@ func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 		"InsecureFromEnv":  {guard: "skip"},
 		"NestedOptOut":     {guard: "(o.Insecure) && (ok)"},
 		"Pinned":           {guard: "o.InsecureIfPinned && pinned != nil", params: []string{"pinned"}},
-		"DialTLS":          {guard: "o.UseTLS"},
+		"DialInsecureTLS":  {guard: "o.UseTLS"},
 	} {
 		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
 		if !ok {
