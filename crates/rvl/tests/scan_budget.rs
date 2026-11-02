@@ -36,7 +36,7 @@ impl Repo {
         rvl_testgate::write_executable(
             &stub,
             &format!(
-                "#!/bin/sh\necho $$ > {d}/leader\nsleep 60 &\necho $! > {d}/grandchild\nwait\n",
+                "#!/bin/sh\ncase \"$*\" in *packet-schema*) echo 2; exit 0;; esac\necho $$ > {d}/leader\nsleep 60 &\necho $! > {d}/grandchild\nwait\n",
                 d = dir.path().display()
             ),
         );

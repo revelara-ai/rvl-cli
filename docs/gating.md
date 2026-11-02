@@ -55,6 +55,14 @@ scanner:
       reason: "dials its own listener"
 ```
 
+A construction rule published with `gate: service` blocks what
+`gate: introduced` blocks and, in a repository rvl reads as a service (a
+server entry point and a deployment manifest, and no README or directory that
+marks it a security or diagnostic tool), every violation of the rule already
+there, in any scan, outside its `cli/`, `tools/`, `scripts/`, tests, examples
+and docs. Its row reads `in a service (...)` and names what the
+repository was read as a service from.
+
 The pre-commit scan reads working-tree files, not the staged blobs. When a
 staged file also has unstaged edits (`git add -p`, or an edit after
 `git add`), those two differ, and a verdict on one says nothing about the
