@@ -180,6 +180,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kyverno", "rule.validate.failureAction"),
     judged("prometheus-rules", "group.interval"),
     judged("prometheus-rules", "rule.annotations.runbook"),
+    judged("prometheus-rules", "rule.annotations.runbook.target"),
     judged("prometheus-rules", "rule.expr"),
     judged("prometheus-rules", "rule.for"),
     judged("prometheus-rules", "rule.labels.severity"),
