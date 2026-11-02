@@ -1484,35 +1484,43 @@ def _params(fn):
 
 
 def _guard(node, parents):
-    """(condition, parameters) under which the code at `node` runs: the test
-    of the innermost `if` or `X if cond else Y` whose branch holds it,
-    unparsed, as `not (<cond>)` in its else branch; and the parameters of the
-    function holding the site that the test reads by bare name (`verify`,
-    not the `self` of `self.verify`), sorted.
+    """(condition, parameters) under which the code at `node` runs: the
+    conjunction of the tests of each `if` or `X if cond else Y` whose branch
+    holds it, outermost first, unparsed, each as `not (<cond>)` in its else
+    branch; and the parameters of the function holding the site that the
+    tests read by bare name (`verify`, not the `self` of `self.verify`),
+    sorted.
     ("", []) when none holds it; the walk stops at a def or lambda, since a
     closure built under an `if` can run anywhere."""
     child, up = node, parents.get(id(node))
-    cond = None
+    conds = []  # (text, test), innermost first
     while up is not None and not isinstance(up, _FUNCTIONS):
-        if cond is None and isinstance(up, ast.If):
+        if isinstance(up, ast.If):
             if any(s is child for s in up.body):
-                cond = ast.unparse(up.test), up.test
+                conds.append((ast.unparse(up.test), up.test))
             elif any(s is child for s in up.orelse):
-                cond = "not ({})".format(ast.unparse(up.test)), up.test
-        elif cond is None and isinstance(up, ast.IfExp):
+                conds.append(("not ({})".format(ast.unparse(up.test)), up.test))
+        elif isinstance(up, ast.IfExp):
             if up.body is child:
-                cond = ast.unparse(up.test), up.test
+                conds.append((ast.unparse(up.test), up.test))
             elif up.orelse is child:
-                cond = "not ({})".format(ast.unparse(up.test)), up.test
+                conds.append(("not ({})".format(ast.unparse(up.test)), up.test))
         child, up = up, parents.get(id(up))
-    if cond is None:
+    if not conds:
         return "", []
+    conds.reverse()
+    if len(conds) == 1:
+        cond = conds[0][0]
+    else:
+        cond = " and ".join("({})".format(text) for text, _ in conds)
     params = _params(up) if up is not None else set()
-    rooted = {id(n.value) for n in ast.walk(cond[1])
-              if isinstance(n, ast.Attribute)}
-    names = {n.id for n in ast.walk(cond[1])
-             if isinstance(n, ast.Name) and id(n) not in rooted}
-    return cond[0], sorted(names & params)
+    names = set()
+    for _, test in conds:
+        rooted = {id(n.value) for n in ast.walk(test)
+                  if isinstance(n, ast.Attribute)}
+        names |= {n.id for n in ast.walk(test)
+                  if isinstance(n, ast.Name) and id(n) not in rooted}
+    return cond, sorted(names & params)
 
 
 def collect_constructions(tree, source, idx, enclosing, file_path, snapshot,

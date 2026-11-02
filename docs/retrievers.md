@@ -257,11 +257,14 @@ Python attribute, a TypeScript options property),
 `provenance.client_type_resolved` is `false`.
 
 A `goindex` field site and a `pyindex` construction site also have `guard`:
-the condition of the innermost `if` whose branch holds the setting, and its
-negation in the else branch. `goindex` writes it as written
-(`t.Insecure == true`, `!(<cond>)`). `pyindex` writes it unparsed
-(`not verify`, `not (<cond>)`), and reads the test of `X if cond else Y` the
-same way. It is absent when no `if` in the function holds the setting. The
+the condition of each `if` whose branch holds the setting, and its negation
+in the else branch. `goindex` writes it as written (`t.Insecure == true`,
+`!(<cond>)`). `pyindex` writes it unparsed (`not verify`, `not (<cond>)`),
+and reads the test of `X if cond else Y` the same way. Under nested `if`s it
+is their conjunction, outermost first, each in parentheses:
+`(o.Insecure) && (ok)` for a setting under `if t, ok := rt.(*http.Transport);
+ok` inside `if o.Insecure`, `(a) and (b)` in Python. It is absent when no
+`if` in the function holds the setting. The
 walk stops at a function literal, a `def` or a `lambda`, since a closure built
 under an `if` can run anywhere. `guard_params` lists the parameters of that
 function the condition reads by bare name, sorted: `["verify"]` for
@@ -302,8 +305,11 @@ DES, 3DES, RC4 or ECB cipher name).
   local server is the common case.
 - A setting that turns verification off is judged in its context.
   `InsecureSkipVerify: true` satisfies when the same `tls.Config` sets
-  `VerifyPeerCertificate` or `VerifyConnection`: in the literal, or by an
-  assignment to the same receiver in the function. Then only Go's default
+  `VerifyPeerCertificate` or `VerifyConnection`: in the literal, or, for an
+  assignment, by an assignment to the same receiver in the function or in
+  the literal the receiver is built from there (`config := &tls.Config{...,
+  VerifyPeerCertificate: c.verifyPeerCert}`, then `config.InsecureSkipVerify
+  = true` when a pinned chain is configured). Then only Go's default
   verification is skipped, and the callback checks the peer in its place.
   When the site's `guard` tests an option, the setting is the user's opt-out:
   it still violates, with the reason `disabled behind an option` and severity
@@ -318,6 +324,16 @@ DES, 3DES, RC4 or ECB cipher name).
     opt-out, as `requests`' `verify=` is.
   - A conjunction one of whose terms is one of the above:
     `url.startswith("https://") and not verify`, `cfg.Insecure && debug`.
+
+  The option's name, the last segment of its path, must also say that it
+  opts out of verification: set, a name with `insecure`, `skip`, `disable`,
+  `noverify`, `unverified`, `unsafe` or `ignore` (`opts.Insecure`,
+  `insecure_skip_tls_verify`, `disable_ssl_validation`); unset, a name with
+  `verif`, `validat` or `check` (`!conn.SSLVerify`, `not validate_certs`),
+  case and underscores aside. An option that turns TLS on (`if m.IsHttps`,
+  `if e.RequireTLS`) when the only TLS it turns on skips verification is the
+  insecure mode itself, not an opt-out of a verified one, so the setting
+  keeps the rule's severity.
 
   A local, even one read from the environment, a call, a comparison with
   anything but a boolean, and a disjunction are not options. The settings

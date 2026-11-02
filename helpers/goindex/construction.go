@@ -69,40 +69,59 @@ func structName(t types.Type) string {
 	return t.String()
 }
 
-// guard is the condition under which the code at n runs: that of the
-// innermost if statement whose branch holds n, as written, negated in its else
-// branch. "" when no if holds it; the walk stops at a function, since a
-// closure built under an if can run anywhere. params are the parameters of
-// that function the condition reads by bare name (`insecure`, not the `o` of
-// `o.Insecure`), so a caller's opt-out can be told from a local's value.
+// guard is the condition under which the code at n runs: the conjunction of
+// the if statements whose branches hold n, outermost first, each as written
+// and negated in its else branch. "" when no if holds it; the walk stops at a
+// function, since a closure built under an if can run anywhere. A setting
+// nested in an if on a local (`if t, ok := x.(T); ok`) inside one on an
+// option keeps the option. params are the parameters of that function the
+// condition reads by bare name (`insecure`, not the `o` of `o.Insecure`), so
+// a caller's opt-out can be told from a local's value.
 func guard(p *packages.Package, src *srcIndex, f *ast.File, n ast.Node) (cond string, params []string) {
 	path, _ := astutil.PathEnclosingInterval(f, n.Pos(), n.End())
-	var test ast.Expr
+	var conds []string
+	var tests []ast.Expr
 	for i, up := range path {
 		switch up := up.(type) {
 		case *ast.FuncLit:
-			return cond, guardParams(p, test, up.Type)
+			return conjunction(conds), guardParams(p, tests, up.Type)
 		case *ast.FuncDecl:
-			return cond, guardParams(p, test, up.Type)
+			return conjunction(conds), guardParams(p, tests, up.Type)
 		case *ast.IfStmt:
-			if i == 0 || test != nil {
+			if i == 0 {
 				continue
 			}
 			text := src.text(p, up.Cond, up.Cond)
 			switch path[i-1] {
 			case up.Body:
-				cond, test = text, up.Cond
+				conds, tests = append(conds, text), append(tests, up.Cond)
 			case up.Else:
-				cond, test = "!("+text+")", up.Cond
+				conds, tests = append(conds, "!("+text+")"), append(tests, up.Cond)
 			}
 		}
 	}
-	return cond, nil
+	return conjunction(conds), nil
 }
 
-// guardParams are the parameters of fn that test reads by bare name, sorted.
-func guardParams(p *packages.Package, test ast.Expr, fn *ast.FuncType) []string {
-	if test == nil || fn.Params == nil {
+// conjunction joins conds, innermost first, as one condition, outermost
+// first: `(a) && (b)`. One condition is as written.
+func conjunction(conds []string) string {
+	if len(conds) == 1 {
+		return conds[0]
+	}
+	out := ""
+	for i := len(conds) - 1; i >= 0; i-- {
+		if out != "" {
+			out += " && "
+		}
+		out += "(" + conds[i] + ")"
+	}
+	return out
+}
+
+// guardParams are the parameters of fn that tests read by bare name, sorted.
+func guardParams(p *packages.Package, tests []ast.Expr, fn *ast.FuncType) []string {
+	if len(tests) == 0 || fn.Params == nil {
 		return nil
 	}
 	own := map[types.Object]bool{}
@@ -114,18 +133,20 @@ func guardParams(p *packages.Package, test ast.Expr, fn *ast.FuncType) []string 
 	rooted := map[ast.Expr]bool{}
 	seen := map[string]bool{}
 	var out []string
-	ast.Inspect(test, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.SelectorExpr:
-			rooted[n.X] = true
-		case *ast.Ident:
-			if obj := p.TypesInfo.Uses[n]; obj != nil && own[obj] && !rooted[n] && !seen[n.Name] {
-				seen[n.Name] = true
-				out = append(out, n.Name)
+	for _, test := range tests {
+		ast.Inspect(test, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.SelectorExpr:
+				rooted[n.X] = true
+			case *ast.Ident:
+				if obj := p.TypesInfo.Uses[n]; obj != nil && own[obj] && !rooted[n] && !seen[n.Name] {
+					seen[n.Name] = true
+					out = append(out, n.Name)
+				}
 			}
-		}
-		return true
-	})
+			return true
+		})
+	}
 	sort.Strings(out)
 	return out
 }

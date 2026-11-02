@@ -76,8 +76,8 @@ func TestTLSConfigFieldSettingsAreCallSites(t *testing.T) {
 	}
 }
 
-// A setting made under an if carries the condition, and the parameters it
-// reads by bare name, so a user's opt-out can be told from the code's
+// A setting made under an if carries the condition of every if that holds it,
+// and the parameters it reads by bare name, so a user's opt-out can be told from the code's
 // default. The walk stops at a closure.
 func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 	got := constructionSites(t)
@@ -87,7 +87,7 @@ func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 	}{
 		"Reverified":       {},
 		"InsecureLoopback": {},
-		"OptedOut":         {guard: "t.Insecure == true"},
+		"OptedOut":         {guard: "(len(ca) <= 0) && (t.Insecure == true)", params: []string{"ca"}},
 		"NotVerified":      {guard: "!o.SSLVerify"},
 		"Skipped":          {guard: "o.SkipVerify"},
 		"Verified":         {guard: "!(o.SSLVerify)"},
@@ -95,6 +95,9 @@ func TestATLSFieldSiteCarriesTheIfThatGuardsIt(t *testing.T) {
 		"Verify":           {},
 		"DialInsecure":     {guard: `addr != "" && insecure`, params: []string{"addr", "insecure"}},
 		"InsecureFromEnv":  {guard: "skip"},
+		"NestedOptOut":     {guard: "(o.Insecure) && (ok)"},
+		"Pinned":           {guard: "o.InsecureIfPinned && pinned != nil", params: []string{"pinned"}},
+		"DialTLS":          {guard: "o.UseTLS"},
 	} {
 		s, ok := got[symbol+" crypto/tls.Config.InsecureSkipVerify"]
 		if !ok {

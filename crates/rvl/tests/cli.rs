@@ -2790,13 +2790,14 @@ fn live_go_scan_judges_construction_rules() {
     classes.sort();
     let skip = "construction.crypto/tls.Config.InsecureSkipVerify(InsecureSkipVerify)";
     // Unconditional: the package variable, the loopback dial, the closure
-    // built under an if and the skip under a local. Behind an option:
-    // OptedOut, NotVerified, Skipped, Verified's else branch and the
-    // parameter DialInsecure is called with.
+    // built under an if, the skip under a local and the one under an option
+    // that turns TLS on. Behind an option: OptedOut, NotVerified, Skipped,
+    // Verified's else branch, the parameter DialInsecure is called with and
+    // the option outside NestedOptOut's type assertion. Pinned re-verifies.
     let want = [
         ("construction.crypto/des.NewCipher", "RC-059", "high", 1),
-        (skip, "RC-059", "high", 4),
-        (skip, "RC-059", "medium", 5),
+        (skip, "RC-059", "high", 5),
+        (skip, "RC-059", "medium", 6),
         (
             "construction.crypto/tls.Config.MinVersion(MinVersion)",
             "RC-059",
@@ -2876,8 +2877,8 @@ fn live_python_scan_judges_a_tls_opt_out_advisory() {
         (none, "medium", 3),
         (hostname, "high", 1),
         // The attribute option, the parameter in a conjunction, the else
-        // branch of an option.
-        (hostname, "medium", 3),
+        // branch of an option, the option outside an if on a parameter.
+        (hostname, "medium", 4),
     ]
     .map(|(c, s, n)| (c.to_string(), s.to_string(), n));
     assert_eq!(got, want, "{stdout}");

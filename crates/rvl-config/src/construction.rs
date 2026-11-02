@@ -27,8 +27,8 @@
 //! `VerifyPeerCertificate` or `VerifyConnection` skips only Go's default
 //! verification and checks the peer itself, so it satisfies
 //! ([`REVERIFIED_BY`]). One made under an `if` on an option ([`option`]:
-//! `if opts.Insecure`, or `if not verify` on the function's own parameter)
-//! is the user's opt-out: it still violates, under the reason "disabled
+//! `if opts.Insecure`, or `if not verify` on the function's own parameter,
+//! whose name says it turns verification off) is the user's opt-out: it still violates, under the reason "disabled
 //! behind an option" and with severity `medium`, so it stays advisory while
 //! the unconditional form, at the rule's own severity, blocks.
 //!
@@ -127,17 +127,60 @@ const REVERIFIED_BY: &[(&str, &[&str])] = &[(
 const OPT_OUT_SEVERITY: &str = "medium";
 
 /// The field that re-verifies the peer for this setting, if the same value
-/// sets one: a key of the literal, which is the site's snippet, or an
-/// assignment to the same receiver in the enclosing function.
+/// sets one: a key of the literal, which is the site's snippet, or, for an
+/// assignment, an assignment to the same receiver in the enclosing function
+/// or a key of the literal the receiver is built from there.
 fn reverified_by(site: &Site, class: &str) -> Option<&'static str> {
     let (_, fields) = REVERIFIED_BY.iter().find(|(c, _)| *c == class)?;
+    let body = &site.enclosing_function_body;
     fields.iter().copied().find(|field| {
         if site.receiver.is_empty() {
             site.snippet.contains(&format!("{field}:"))
         } else {
-            site.enclosing_function_body
-                .contains(&format!("{}.{field} =", site.receiver))
+            body.contains(&format!("{}.{field} =", site.receiver))
+                || built_from(body, &site.receiver)
+                    .any(|literal| literal.contains(&format!("{field}:")))
         }
+    })
+}
+
+/// The composite literals `receiver` is built from in `body`, braces
+/// included: the `{...}` of `receiver := &tls.Config{...}` or
+/// `receiver = tls.Config{...}`.
+fn built_from<'a>(body: &'a str, receiver: &'a str) -> impl Iterator<Item = &'a str> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+    body.match_indices(receiver).filter_map(move |(at, _)| {
+        if body[..at].ends_with(word) {
+            return None;
+        }
+        let rest = body[at + receiver.len()..].trim_start();
+        let rest = rest
+            .strip_prefix(":=")
+            .or_else(|| rest.strip_prefix('=').filter(|r| !r.starts_with('=')))?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix('&').unwrap_or(rest);
+        let open = rest.find(|c: char| !word(c))?;
+        if !rest[open..].starts_with('{') || open == 0 {
+            return None;
+        }
+        let literal = &rest[open..];
+        let (mut depth, mut quote) = (0u32, None);
+        for (i, c) in literal.char_indices() {
+            match (quote, c) {
+                (Some(q), _) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'' | '`') => quote = Some(c),
+                (None, '{') => depth += 1,
+                (None, '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&literal[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     })
 }
 
@@ -218,6 +261,9 @@ fn compared(e: &str) -> Option<(&str, bool)> {
 /// caller's opt-out, or (3) a conjunction one of whose terms is (1) or (2)
 /// (`url.startswith("https://") and not verify`). A call, a local, a
 /// comparison with anything but a boolean, or a disjunction is not an option.
+/// Nor is a path or parameter whose name does not say it opts out of
+/// verification ([`opts_out`]): `if m.IsHttps` turns on a TLS that skips
+/// verification, so the option is the insecure mode itself.
 fn option<'a>(guard: &'a str, params: &[String]) -> Option<&'a str> {
     term(guard.trim(), params, false)
 }
@@ -247,7 +293,45 @@ fn term<'a>(e: &'a str, params: &[String], negated: bool) -> Option<&'a str> {
     };
     let path = e.contains('.') && e.split('.').all(ident);
     let param = ident(e) && params.iter().any(|p| p == e);
-    (path || param).then_some(e)
+    ((path || param) && opts_out(e, negated)).then_some(e)
+}
+
+/// Words in an option's name that say it turns verification off when set:
+/// `Insecure`, `SkipVerify`, `disable_ssl_validation`, `no_verify`.
+const OFF_WORDS: &[&str] = &[
+    "insecure",
+    "skip",
+    "disable",
+    "noverify",
+    "unverified",
+    "unsafe",
+    "ignore",
+];
+
+/// Words in an option's name that say it turns verification on when set:
+/// `SSLVerify`, `check_hostname`, `validate_certs`.
+const ON_WORDS: &[&str] = &["verif", "validat", "check"];
+
+/// Whether testing the option `e`, negated or not, opts out of
+/// verification by its name, the last segment of its path: set when it
+/// names verification off (an [`OFF_WORDS`] word, first, so
+/// `insecure_skip_tls_verify` is one), unset when it names verification on
+/// (an [`ON_WORDS`] word).
+fn opts_out(e: &str, negated: bool) -> bool {
+    let name: String = e
+        .rsplit('.')
+        .next()
+        .unwrap_or(e)
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
+    if has(OFF_WORDS) {
+        !negated
+    } else {
+        has(ON_WORDS) && negated
+    }
 }
 
 /// Judge a violation of a verification setting again in its context: re-
@@ -581,6 +665,44 @@ mod tests {
             "",
         ));
         assert_eq!(f.verdict, Verdict::Violates, "{}", f.reason);
+        // A proxy's TLS config skips Go's verification only when a pinned
+        // chain is configured, on a config built with the callback that
+        // checks the pin.
+        let pinned = "func (c *Config) GetTLSConfig() *tls.Config {
+	config := &tls.Config{
+		RootCAs:               root,
+		NextProtos:            c.NextProtocol,
+		VerifyPeerCertificate: c.verifyPeerCert,
+	}
+	if c.AllowInsecureIfPinnedPeerCertificate && c.PinnedPeerCertificateChainSha256 != nil {
+		config.InsecureSkipVerify = true
+	}
+	return config
+}";
+        let guard =
+            "c.AllowInsecureIfPinnedPeerCertificate && c.PinnedPeerCertificateChainSha256 != nil";
+        let f = one(skip_verify(
+            "config.InsecureSkipVerify = true",
+            "config",
+            pinned,
+            guard,
+        ));
+        assert_eq!(f.verdict, Verdict::Satisfies, "{}", f.reason);
+        // Another value's literal, or a field after the receiver's literal
+        // closed, does not re-verify this one.
+        for body in [
+            pinned.replace("config := &tls.Config{", "other := &tls.Config{"),
+            pinned.replace("config := &tls.Config{", "myconfig := &tls.Config{"),
+            "func f() {\n\tconfig := tls.Config{}\n\tx := T{VerifyPeerCertificate: v}\n}".into(),
+        ] {
+            let f = one(skip_verify(
+                "config.InsecureSkipVerify = true",
+                "config",
+                &body,
+                "",
+            ));
+            assert_eq!(f.verdict, Verdict::Violates, "{body}: {}", f.reason);
+        }
     }
 
     #[test]
@@ -618,6 +740,15 @@ mod tests {
             ("insecure", &["insecure"], "insecure", LOOPBACK, ""),
             // A conjunction one of whose terms is an option.
             ("cfg.Insecure && debug", &[], "cfg.Insecure", LOOPBACK, ""),
+            // An SBOM tool's registry client: the option holds an if on a
+            // type assertion that holds the assignment.
+            (
+                "(registryOpts.InsecureSkipTLSVerify) && (ok)",
+                &[],
+                "registryOpts.InsecureSkipTLSVerify",
+                "transport.TLSClientConfig.InsecureSkipVerify = true",
+                "transport.TLSClientConfig",
+            ),
             (
                 "addr != \"\" && insecure",
                 &["insecure"],
@@ -653,6 +784,10 @@ mod tests {
             "cfg.Insecure || debug",
             "!(cfg.Insecure && debug)",
             "opts.Insecure()",
+            // A database's HTTPS mode and a mailer's TLS mode: the option
+            // turns on a TLS that skips verification.
+            "m.IsHttps",
+            "e.RequireTLS",
         ] {
             let f = one(skip_verify(LOOPBACK, "", "", guard));
             assert_eq!(f.severity, "high", "{guard}: {}", f.reason);
@@ -747,25 +882,55 @@ mod tests {
     fn options_are_read_through_negation_parens_and_boolean_compares() {
         let none: &[String] = &[];
         let verify = &["verify".to_string()];
-        assert_eq!(option("!(!(a.b == false))", none), Some("a.b"));
-        assert_eq!(option("a.b.c != true", none), Some("a.b.c"));
-        assert_eq!(option("not (a.b is not True)", none), Some("a.b"));
-        assert_eq!(option("(a.b) && (c.d)", none), Some("a.b"));
-        assert_eq!(option("(x) && (c.d)", none), Some("c.d"));
+        assert_eq!(option("!(!(a.verify == false))", none), Some("a.verify"));
+        assert_eq!(option("a.b.verify != true", none), Some("a.b.verify"));
+        assert_eq!(
+            option("not (a.insecure is not True)", none),
+            Some("a.insecure")
+        );
+        assert_eq!(option("(a.skip) && (c.d)", none), Some("a.skip"));
+        assert_eq!(option("(x) && (c.insecure)", none), Some("c.insecure"));
         assert_eq!(option("verify == False", verify), Some("verify"));
         assert_eq!(option("verify", none), None);
-        assert_eq!(option("notify", &["notify".into()]), Some("notify"));
+        let notify = &["notify_verify".to_string()];
+        assert_eq!(option("!notify_verify", notify), Some("notify_verify"));
         // Negated, a conjunction is a disjunction and the reverse.
-        assert_eq!(option("!(a.b && c)", none), None);
-        assert_eq!(option("not (a.b or c)", none), Some("a.b"));
-        assert_eq!(option("a.b or c", none), None);
+        assert_eq!(option("!(a.insecure && c)", none), None);
+        assert_eq!(option("not (a.verify or c)", none), Some("a.verify"));
+        assert_eq!(option("a.insecure or c", none), None);
         // An operator inside a string or a call is not one of the guard's.
-        assert_eq!(option("f(a.b and c)", none), None);
-        assert_eq!(option("s == ' and a.b'", none), None);
-        assert_eq!(option("a.b == \"x\"", none), None);
-        assert_eq!(option("a) && (b.c", none), None);
-        assert_eq!(option("é.b && ü", none), Some("é.b"));
+        assert_eq!(option("f(a.insecure and c)", none), None);
+        assert_eq!(option("s == ' and a.insecure'", none), None);
+        assert_eq!(option("a.insecure == \"x\"", none), None);
+        assert_eq!(option("a) && (b.insecure", none), None);
+        assert_eq!(option("é.insecure && ü", none), Some("é.insecure"));
         assert_eq!(option("", none), None);
+    }
+
+    #[test]
+    fn an_option_opts_out_only_when_its_name_says_so() {
+        let none: &[String] = &[];
+        for (guard, want) in [
+            ("o.InsecureSkipVerify", Some("o.InsecureSkipVerify")),
+            (
+                "self._insecure_skip_tls_verify",
+                Some("self._insecure_skip_tls_verify"),
+            ),
+            ("o.NoVerify", Some("o.NoVerify")),
+            ("!o.TLSVerify", Some("o.TLSVerify")),
+            ("not self.validate_certs", Some("self.validate_certs")),
+            ("!o.CheckHostname", Some("o.CheckHostname")),
+            // The option turns TLS on: the insecure mode is the option.
+            ("m.IsHttps", None),
+            ("e.RequireTLS", None),
+            ("o.UseTLS", None),
+            ("insecureOpts.UseTLS", None),
+            // The wrong way round: the skip runs when the name says secure.
+            ("!o.Insecure", None),
+            ("o.SSLVerify", None),
+        ] {
+            assert_eq!(option(guard, none), want, "{guard}");
+        }
     }
 
     #[test]

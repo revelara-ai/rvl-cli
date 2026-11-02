@@ -12,9 +12,11 @@ import (
 // go/disabled-certificate-check reads names: testdata is not test code to it.
 
 type options struct {
-	Insecure   bool
-	SSLVerify  bool
-	SkipVerify bool
+	Insecure         bool
+	SSLVerify        bool
+	SkipVerify       bool
+	UseTLS           bool
+	InsecureIfPinned bool
 }
 
 // The chain is re-verified, without the hostname, by VerifyPeerCertificate.
@@ -94,4 +96,38 @@ func InsecureFromEnv(env func(string) string) *tls.Config {
 		return &tls.Config{InsecureSkipVerify: true}
 	}
 	return &tls.Config{}
+}
+
+// An option outside, an if on a local's type assertion inside: the option
+// still holds the assignment.
+func NestedOptOut(o options, rt http.RoundTripper) http.RoundTripper {
+	if o.Insecure {
+		if t, ok := rt.(*http.Transport); ok {
+			t = t.Clone()
+			t.TLSClientConfig.InsecureSkipVerify = true
+			return t
+		}
+	}
+	return rt
+}
+
+// Set only when a pinned chain is configured, on a config whose
+// VerifyPeerCertificate checks the pin.
+func Pinned(o options, pinned []byte, verify func([][]byte, [][]*x509.Certificate) error) *tls.Config {
+	config := &tls.Config{
+		VerifyPeerCertificate: verify,
+	}
+	if o.InsecureIfPinned && pinned != nil {
+		config.InsecureSkipVerify = true
+	}
+	return config
+}
+
+// The option turns TLS on, and the only TLS it turns on skips verification:
+// the option is the insecure mode, not an opt-out of a verified one.
+func DialTLS(o options) *tls.Config {
+	if o.UseTLS {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+	return nil
 }

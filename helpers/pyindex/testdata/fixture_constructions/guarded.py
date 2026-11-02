@@ -54,3 +54,11 @@ def verified(options, ctx):
     if options.ssl_insecure:
         return lambda: ssl.CERT_NONE
     return None
+
+
+# An option outside, a test of a parameter inside: the option still holds it.
+def nested(options, ctx):
+    if options.ssl_insecure:
+        if ctx is not None:
+            ctx.check_hostname = False
+    return ctx
