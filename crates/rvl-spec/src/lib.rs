@@ -827,7 +827,8 @@ pub struct ConfigKeySpec {
     #[serde(default)]
     pub fix: String,
     /// When a violation may block: empty, by its severity alone;
-    /// [`GATE_INTRODUCED`], only where a change introduces it. A value this
+    /// [`GATE_INTRODUCED`], only where a change introduces it;
+    /// [`GATE_SERVICE`], there and in a service repository. A value this
     /// binary does not know never blocks, so a gate added by a newer scanner
     /// degrades to advisory rather than to blocking every finding.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -838,6 +839,13 @@ pub struct ConfigKeySpec {
 /// change-scoped scan, and only at a site the change adds. The same rule's
 /// violations that already exist stay advisory.
 pub const GATE_INTRODUCED: &str = "introduced";
+
+/// The [`ConfigKeySpec::gate`] that blocks what [`GATE_INTRODUCED`] blocks
+/// and, in a repository rvl reads as a service (a server entry point and a
+/// deployment manifest, no tool marker), every violation at severity `high`,
+/// the ones already there included. In a tool, a library or a repository it
+/// cannot tell, it is [`GATE_INTRODUCED`].
+pub const GATE_SERVICE: &str = "service";
 
 /// The `kind` of a [`ServerSpec`]: route paths that count as a health-check
 /// endpoint (RC-020).
