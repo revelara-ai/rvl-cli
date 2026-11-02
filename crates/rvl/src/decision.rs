@@ -6,7 +6,12 @@
 //! `.revelara.yaml`), and only on the bundle `rvl model sync` cached and
 //! verified. Inference runs on this machine: no code leaves it.
 //!
-//! For each undecided call site and each `call_site` frame of the spec cache
+//! An undecided site outside runtime code (dev_only, test_support, migration
+//! or backfill, by `Site::scope`) is not asked, as no other lane judges one:
+//! the coverage line counts them. The model was trained and checked on
+//! runtime sites.
+//!
+//! For each undecided runtime call site and each `call_site` frame of the spec cache
 //! whose class markers cover the site's class:
 //!
 //! * a control the bundle's manifest SERVES is rendered, inferred and
@@ -59,6 +64,8 @@ pub struct Summary {
     /// The site questions of served controls whose class family the manifest
     /// does not serve for that control, per control.
     pub out_of_distribution: Vec<Unserved>,
+    /// The undecided sites not asked because they are not runtime code.
+    pub not_runtime: usize,
     /// The lines the COVERAGE block prints.
     pub coverage: Vec<String>,
 }
@@ -142,6 +149,7 @@ pub fn run(
         asks,
         unserved,
         out_of_distribution,
+        not_runtime,
     } = select(findings, sites, specs.frames(), m);
     let mut summary = Summary {
         model_id: m.model_id.clone(),
@@ -157,6 +165,7 @@ pub fn run(
             .collect(),
         unserved,
         out_of_distribution,
+        not_runtime,
         ..Summary::default()
     };
     let mut budget_lines = Vec::new();
@@ -200,6 +209,8 @@ struct Selected<'a> {
     /// The served controls with how many site questions each left
     /// unanswered because the site's class family is not served.
     out_of_distribution: Vec<Unserved>,
+    /// The undecided sites skipped because they are not runtime code.
+    not_runtime: usize,
 }
 
 fn select<'a>(
@@ -211,8 +222,13 @@ fn select<'a>(
     let mut asks = Vec::new();
     let mut unserved: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut ood: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut not_runtime = 0;
     for (f, site) in findings.iter().zip(sites) {
         if f.verdict.is_resolved() {
+            continue;
+        }
+        if site.scope() != rvl_core::ScopeClass::Runtime {
+            not_runtime += 1;
             continue;
         }
         let class = rvl_triage::class_key_string(site);
@@ -246,6 +262,7 @@ fn select<'a>(
         asks,
         unserved: rows(unserved),
         out_of_distribution: rows(ood),
+        not_runtime,
     }
 }
 
@@ -628,6 +645,13 @@ fn coverage_lines(s: &Summary, budget_lines: Vec<String>, frames_rejected: usize
             "decision model abstains out of distribution, on class families it does not \
              serve: {}",
             named(&s.out_of_distribution)
+        ));
+    }
+    if s.not_runtime > 0 {
+        out.push(format!(
+            "decision model skips {} undecided site(s) outside runtime code \
+             (dev_only, test_support, migration, backfill)",
+            s.not_runtime
         ));
     }
     if !s.unserved.is_empty() {
@@ -1100,6 +1124,36 @@ mod tests {
         let sel = select(&findings, &sites, &frames, &unlisted);
         assert_eq!(sel.asks.len(), 2, "no served_classes asks every class");
         assert!(sel.out_of_distribution.is_empty());
+    }
+
+    #[test]
+    fn a_site_outside_runtime_code_gets_no_question_and_is_counted() {
+        let (f1, mut probe) = undecided("net/http.Client", "Do");
+        probe.file_path = "scripts/probes/rust/repo/src/report_runner.rs".into();
+        let (f2, mut test) = undecided("net/http.Client", "Do");
+        test.scope_override = Some(rvl_core::ScopeClass::TestSupport);
+        let (f3, mut app) = undecided("net/http.Client", "Do");
+        app.file_path = "src/client.go".into();
+        let (findings, sites) = (vec![f1, f2, f3], vec![probe, test, app]);
+        let frames = vec![frame(&[])];
+
+        let sel = select(&findings, &sites, &frames, &manifest(""));
+        let asked: Vec<&str> = sel.asks.iter().map(|a| a.site.file_path.as_str()).collect();
+        assert_eq!(asked, ["src/client.go"], "only the runtime site is asked");
+        assert_eq!(sel.not_runtime, 2);
+
+        let s = Summary {
+            model_id: "m".into(),
+            not_runtime: sel.not_runtime,
+            ..Summary::default()
+        };
+        let lines = coverage_lines(&s, Vec::new(), 0);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("skips 2 undecided site(s) outside runtime")),
+            "{lines:?}"
+        );
     }
 
     /// `classify_until`'s loop over 20 questions in batches of 8, the hook

@@ -47,6 +47,15 @@ A `config_keys` spec may carry `gate: service`. See "Construction rules" in
 - rvl 1.10.0 and 1.10.1 read `gate: service` as a gate they do not know, so
   the rule never blocks there.
 
+### The decision model asks only about runtime code
+
+The decision-model lane no longer asks about an undecided site outside
+runtime code (dev_only, test_support, migration, backfill), the same scope
+check every other lane makes. Such a site gets no `model.<control>` row.
+
+- New: `decision_model.not_runtime` in `--out`, the count of those sites,
+  and a COVERAGE line that says how many were skipped.
+
 ### A Python TLS opt-out is advisory; an option may be a parameter
 
 A TLS setting that turns verification off is judged by the same option rule
