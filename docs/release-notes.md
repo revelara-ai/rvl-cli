@@ -9,6 +9,13 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A control may hold a named frame beside its main frame
+
+- New: `frame` on a `decision_model.sites` row, the frame's id within its
+  control. A row of a control's main frame has no `frame` key, as before.
+- A spec overlay's frame replaces the baseline's frame of the same control
+  and frame id. It was the frame of the same control and habitat.
+
 ### A Python TLS opt-out is advisory; an option may be a parameter
 
 A TLS setting that turns verification off is judged by the same option rule

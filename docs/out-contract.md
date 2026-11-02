@@ -301,7 +301,8 @@ The orchestrator uses it to:
   ONNX Runtime), else null. `served_controls` and `withheld_controls` are
   the manifest's lists. `sites` has one row per undecided call site and
   served frame the model was asked: `site_id`, `class`, `control`,
-  `frame_version`, `verdict` (`violates` | `satisfies` | `not_applicable` |
+  `frame` (the frame's id within its control, present only for a named
+  frame: a control's main frame has none), `frame_version`, `verdict` (`violates` | `satisfies` | `not_applicable` |
   `abstain`), `confidence` (null on an abstain), `cell` (the frame cell
   given as the reason, null when the model has no cell head or its top cell
   is not of the verdict's kind), `reason`, `model_id` and `weights_digest`.
