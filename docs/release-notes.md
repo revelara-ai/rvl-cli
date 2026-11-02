@@ -27,6 +27,13 @@ See "Construction rules" in `docs/retrievers.md`.
   function from a literal that sets `VerifyPeerCertificate` or
   `VerifyConnection`.
 
+### A control may hold a named frame beside its main frame
+
+- New: `frame` on a `decision_model.sites` row, the frame's id within its
+  control. A row of a control's main frame has no `frame` key, as before.
+- A spec overlay's frame replaces the baseline's frame of the same control
+  and frame id. It was the frame of the same control and habitat.
+
 ### A Prometheus runbook link is checked inside the repository
 
 A Prometheus alert rule's `runbook_url` (or `runbook`) annotation is now
