@@ -64,6 +64,7 @@ impl Repo {
             &stub,
             &format!(
                 "#!/bin/sh\n\
+                 case \"$*\" in *packet-schema*) echo 2; exit 0;; esac\n\
                  root=. files=''\n\
                  while [ $# -gt 0 ]; do\n\
                  \x20 case \"$1\" in --root) root=\"$2\"; shift;; --files) files=\"$2\"; shift;; esac\n\

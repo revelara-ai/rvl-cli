@@ -16,6 +16,28 @@ To read the installed version, run `rvl --version` or `rvl version`.
 - A spec overlay's frame replaces the baseline's frame of the same control
   and frame id. It was the frame of the same control and habitat.
 
+### A construction rule can block in services only
+
+A `config_keys` spec may carry `gate: service`. See "Construction rules" in
+`docs/retrievers.md`.
+
+- With `gate: service`, a construction rule blocks what `gate: introduced`
+  blocks, and in a repository rvl reads as a service it also blocks the
+  rule's violations already there, at severity `high`, as a row with the
+  reason `in a service (...)` that names what the repository was read as a
+  service from, the fix and the `scanner.waivers` entry.
+- A service is a repository with a server entry point and a deployment
+  manifest (a Kubernetes workload, a Helm chart, a Dockerfile with `EXPOSE`,
+  a Procfile `web` process), outside its examples, tests and docs, and no
+  tool marker: a README that calls it a scanner, an exploit or penetration
+  testing tool, an intercepting proxy, a reverse shell, a netcat or a
+  diagnostic tool, or a payload directory such as `pocs/`.
+- A violation in a directory that holds what a person runs (`cli/`, `tools/`,
+  `hack/`, `scripts/`, `diagnostics/`, `debug/`), or in a test, example or
+  docs directory, does not block as a service's, even in a service.
+- rvl 1.10.0 and 1.10.1 read `gate: service` as a gate they do not know, so
+  the rule never blocks there.
+
 ### A Python TLS opt-out is advisory; an option may be a parameter
 
 A TLS setting that turns verification off is judged by the same option rule
