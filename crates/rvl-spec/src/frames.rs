@@ -7,6 +7,10 @@
 //! (`manifestation`) violates, an `S` cell (`satisfying`) satisfies, a `C`
 //! cell (`context`) is not applicable.
 //!
+//! A control holds one main frame and may hold named ones: a named frame
+//! carries its id at `frame` (`runbook-currency`), a main frame carries no
+//! `frame` key. A frame is known by its control and its frame id.
+//!
 //! A frame that does not parse is dropped and counted, never fatal: frames
 //! come from their own producer, and a malformed one must not cost a scan
 //! its specs.
@@ -21,6 +25,10 @@ pub const CALL_SITE: &str = "call_site";
 pub struct Frame {
     /// `RC-022`.
     pub control: String,
+    /// The frame's id within its control, `runbook-currency`. Empty for the
+    /// control's main frame, which publishes no `frame` key.
+    #[serde(default)]
+    pub frame: String,
     /// The control's name, `Retry, Backoff and Request Coalescing`. Absent
     /// in a cache written before it was published, and then empty.
     #[serde(default)]
@@ -66,6 +74,11 @@ impl Frame {
         }
     }
 
+    /// Whether `other` is the same frame: the same control and frame id.
+    pub fn same_frame(&self, other: &Frame) -> bool {
+        self.control == other.control && self.frame == other.frame
+    }
+
     pub fn cell(&self, id: &str) -> Option<&Cell> {
         self.cells.iter().find(|c| c.id == id)
     }
@@ -99,18 +112,29 @@ mod tests {
          "cells":[{"id":"M1","kind":"manifestation","verdict":"violates","definition":"No retry"}],
          "class_markers":["http"],"later_field":1},
         {"control":"RC-019","version":"v1","habitat":"call_site","question":"Bounded?","cells":[]},
-        {"control":"RC-001"}
+        {"control":"RC-001"},
+        {"control":"RC-019","frame":"second","version":"v1","habitat":"repository","question":"Current?"}
     ]}"#;
 
     #[test]
     fn frames_parse_and_a_malformed_one_is_counted_not_fatal() {
         let (frames, rejected) = parse(SPECS);
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert_eq!(rejected, 1);
         assert_eq!(frames[0].cell("M1").unwrap().definition, "No retry");
         assert_eq!(frames[0].control_name, "Retries");
         assert_eq!(frames[1].control_name, "", "a frame without a name parses");
         assert_eq!(parse(r#"{"apis":[]}"#), (vec![], 0));
+    }
+
+    #[test]
+    fn a_frame_is_known_by_its_control_and_frame_id() {
+        let (frames, _) = parse(SPECS);
+        assert_eq!(frames[1].frame, "", "a main frame publishes no frame key");
+        assert_eq!(frames[2].frame, "second");
+        assert!(!frames[1].same_frame(&frames[2]));
+        assert!(frames[2].same_frame(&frames[2].clone()));
+        assert!(!frames[0].same_frame(&frames[1]));
     }
 
     #[test]

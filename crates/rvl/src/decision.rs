@@ -76,6 +76,9 @@ pub struct Decision {
     pub site_id: String,
     pub class: String,
     pub control: String,
+    /// The frame's id within its control; absent for the main frame.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub frame: String,
     pub frame_version: String,
     /// `violates` | `satisfies` | `not_applicable` | `abstain`.
     pub verdict: String,
@@ -544,6 +547,7 @@ fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision 
         site_id: format!("{}:{}", a.site.file_path, a.site.line_number),
         class: a.class.clone(),
         control: control.clone(),
+        frame: a.frame.frame.clone(),
         frame_version: a.frame.version.clone(),
         verdict,
         // An abstain has no confidence.
@@ -557,14 +561,19 @@ fn decide(a: &Ask, r: &rvl_model::Record, cells: Option<&[String]>) -> Decision 
 }
 
 /// An advisory ladder row for a `violates` decision. The waiver key is
-/// `model.<control>`.
+/// `model.<control>`; a named frame's row has an id of its own, so two
+/// frames of one control at one site are two rows.
 fn finding_of(d: &Decision) -> Option<ladder::Finding> {
     if d.verdict != "violates" {
         return None;
     }
     let class_rule = format!("model.{}", d.control);
+    let key = match d.frame.as_str() {
+        "" => format!("{class_rule}@{}", d.site_id),
+        frame => format!("{class_rule}/{frame}@{}", d.site_id),
+    };
     Some(ladder::Finding {
-        id: ladder::finding_id(&format!("{class_rule}@{}", d.site_id)),
+        id: ladder::finding_id(&key),
         site: d.site_id.clone(),
         description: format!(
             "{} (decision model {}, confidence {:.2})",
@@ -1068,6 +1077,26 @@ mod tests {
         let row = finding_of(&d).unwrap();
         assert_eq!(row.class_rule, "model.RC-022");
         assert_eq!(ladder::classify(&row), ladder::Section::Advisory);
+    }
+
+    #[test]
+    fn a_named_frame_is_its_own_row_and_a_main_frame_says_no_frame() {
+        let site = rvl_core::Site::default();
+        let main = frame(&[]);
+        let mut named = main.clone();
+        named.frame = "second".into();
+        let violates = record("violates", vec![]);
+        let m = decide(&ask(&site, &main), &violates, None);
+        let n = decide(&ask(&site, &named), &violates, None);
+        assert!(serde_json::to_value(&m).unwrap().get("frame").is_none());
+        assert_eq!(serde_json::to_value(&n).unwrap()["frame"], "second");
+        let (m, n) = (finding_of(&m).unwrap(), finding_of(&n).unwrap());
+        assert_eq!(m.id, ladder::finding_id("model.RC-022@:0"));
+        assert_ne!(m.id, n.id);
+        assert_eq!(
+            n.class_rule, "model.RC-022",
+            "the waiver key is the control's"
+        );
     }
 
     fn manifest(served_classes: &str) -> ModelManifest {
