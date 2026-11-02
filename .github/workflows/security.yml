@@ -80,7 +80,7 @@ jobs:
 
       # Installed from PyPI, not run in the Semgrep container: the container
       # runs as root and leaves files a self-hosted runner cannot clean.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
