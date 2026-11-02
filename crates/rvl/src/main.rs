@@ -1873,10 +1873,11 @@ fn helper_content_version(helper: &ResolvedHelper) -> Option<String> {
 /// same" or "nothing to compare against" (po-8ozxg).
 ///
 /// The shipped sibling is the bundled helper when one exists, otherwise the
-/// copy embedded in this binary. A helper resolved from one of those slots is
-/// its own reference, with one exception: a BUNDLED script still has an
-/// embedded sibling, and that pair is the one that actually went stale in the
-/// field. `make install` puts pyindex.py beside rvl, a later build of rvl
+/// copy embedded in this binary, otherwise the goindex source this binary was
+/// built from ([`built_from_version`]). A helper resolved from one of the first
+/// two slots is its own reference, with one exception: a BUNDLED helper is
+/// still compared with the embedded copy or the built-from source, and that
+/// pair is the one that actually went stale in the field. `make install` puts pyindex.py beside rvl, a later build of rvl
 /// replaces only the binary, and the adjacent script outranks the newer one
 /// carried inside it.
 ///
@@ -1897,12 +1898,32 @@ fn helper_drift(lang: Lang, ran: &ResolvedHelper) -> Option<String> {
             helper_content_version(&b)?,
             format!("the bundled {}", b.path.display()),
         ),
-        _ => (
-            helper_drift::content_version(embedded_for(lang)?.contents.as_bytes()),
-            format!("the copy embedded in this {BIN}"),
-        ),
+        _ => match embedded_for(lang) {
+            Some(embedded) => (
+                helper_drift::content_version(embedded.contents.as_bytes()),
+                format!("the copy embedded in this {BIN}"),
+            ),
+            None => (
+                built_from_version(lang)?.to_string(),
+                format!(
+                    "the {} source this {BIN} was built from",
+                    lang.helper_base()
+                ),
+            ),
+        },
     };
     helper_drift::describe(helper_content_version(ran).as_deref(), &shipped, &label)
+}
+
+/// The content version of the native helper source this binary was built
+/// beside, hashed by build.rs. goindex is neither embedded nor, on a source
+/// build, bundled, so without this a goindex on PATH had no sibling and an old
+/// one scanned silently: a stale goindex reported 0 Go sites with no warning.
+fn built_from_version(lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::Go => option_env!("RVL_GOINDEX_CONTENT_VERSION"),
+        _ => None,
+    }
 }
 
 /// Locate the retriever helper for `lang`, failing closed with actionable

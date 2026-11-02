@@ -98,7 +98,10 @@ you ran.
 
 When the helper that ran has a shipped sibling (a bundled helper, otherwise
 the embedded copy), the scan compares their content versions and adds one
-line to `COVERAGE` if they do not agree:
+line to `COVERAGE` if they do not agree. `goindex` has no embedded copy, so
+its last reference is the `helpers/goindex` source the `rvl` binary was built
+beside: a source build with only an old `goindex` on `PATH` still gets the
+line, rather than a silent `Go 0 sites`.
 
 ```text
   retrievers: Python /home/u/.local/bin/pyindex.py (bundled)
