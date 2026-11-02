@@ -3811,7 +3811,7 @@ fn findings_from_sites(
     // config that skips verification, a DES cipher, a literal password in a
     // DSN), judged by config-key specs. Violations only, keyed
     // `construction.<rule key>`. The site keeps its deadline verdict too.
-    items.extend(construction_items(&sites, &cache, added));
+    items.extend(construction_items(&sites, &cache, added, repo_root));
     Ok((
         findings,
         items,
@@ -3898,12 +3898,28 @@ fn unsized_items(
 /// whose row names the fix and the waiver; every other violation of the rule,
 /// and all of them when `added` is None (no change-scoped scan), is shown and
 /// exempt from the gate. An opt-out behind an option is already `medium`.
+///
+/// Under `service`, the rule blocks what `introduced` blocks, and when
+/// `repo_root` reads as a service ([`rvl_structure::repo_kind`]) every other
+/// violation at severity `high` too, as a class whose row says what the
+/// repository was read as a service from. The tree is read only when such a
+/// rule has a violation.
 fn construction_items(
     sites: &[rvl_core::Site],
     specs: &rvl_spec::SpecCache,
     added: Option<&changed::AddedLines>,
+    repo_root: Option<&std::path::Path>,
 ) -> Vec<rvl_triage::TriagedItem> {
     use rvl_config::construction::Gate;
+    let kind = std::cell::OnceCell::new();
+    let service = || {
+        kind.get_or_init(|| {
+            repo_root
+                .map(rvl_structure::repo_kind)
+                .filter(|k| k.kind == rvl_structure::RepoKind::Service)
+        })
+        .as_ref()
+    };
     let introduced = |f: &rvl_config::construction::SiteFinding| {
         let Some((file, line)) = f.site.rsplit_once(':') else {
             return false;
@@ -3920,8 +3936,19 @@ fn construction_items(
         let phrase = config_lane::rule_phrase(&f.reason);
         let (rule, exempt) = match rvl_config::construction::gate(specs, &f.key) {
             Gate::Severity => (phrase.to_string(), false),
-            Gate::Introduced if introduced(&f) => (introduced_reason(&f, phrase), false),
-            Gate::Introduced | Gate::Advisory => (phrase.to_string(), true),
+            Gate::Introduced | Gate::Service if introduced(&f) => {
+                (introduced_reason(&f, phrase), false)
+            }
+            Gate::Service
+                if f.severity == "high"
+                    && f.site
+                        .rsplit_once(':')
+                        .is_some_and(|(file, _)| rvl_structure::in_service_code(file))
+                    && service().is_some() =>
+            {
+                (service_reason(&f, phrase, service().unwrap()), false)
+            }
+            Gate::Introduced | Gate::Service | Gate::Advisory => (phrase.to_string(), true),
         };
         let class = classes.entry((f.key.clone(), rule)).or_default();
         class.0 = exempt;
@@ -3968,6 +3995,25 @@ fn introduced_reason(f: &rvl_config::construction::SiteFinding, phrase: &str) ->
     )
 }
 
+/// The reason of a violation that blocks because the repository is a
+/// service: what it is, what the repository was read as a service from, the
+/// fix and the waiver.
+fn service_reason(
+    f: &rvl_config::construction::SiteFinding,
+    phrase: &str,
+    kind: &rvl_structure::RepoKindFacts,
+) -> String {
+    format!(
+        "in a service ({phrase}; read as a service from {}); fix: {}; or waive it under \
+         scanner.waivers in .revelara.yaml: {{matcher: \"{}.{}\", paths: [\"<file glob>\"], \
+         reason: \"<why>\"}}",
+        kind.evidence.join(", "),
+        f.fix,
+        rvl_config::construction::FORMAT,
+        f.key
+    )
+}
+
 #[cfg(test)]
 mod construction_gate_tests {
     use super::*;
@@ -4004,9 +4050,35 @@ mod construction_gate_tests {
         gate: &str,
         added: Option<&changed::AddedLines>,
     ) -> Vec<render::Finding> {
-        let specs = specs(gate);
-        triage_to_findings(&construction_items(sites, &specs, added), Some(&specs))
+        in_repo(sites, gate, added, None)
     }
+
+    fn in_repo(
+        sites: &[rvl_core::Site],
+        gate: &str,
+        added: Option<&changed::AddedLines>,
+        root: Option<&std::path::Path>,
+    ) -> Vec<render::Finding> {
+        let specs = specs(gate);
+        triage_to_findings(
+            &construction_items(sites, &specs, added, root),
+            Some(&specs),
+        )
+    }
+
+    /// A repository with the given files.
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let p = dir.path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        dir
+    }
+
+    const SERVER: &str = "package main\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n";
+    const DEPLOYMENT: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n";
 
     fn blocking(findings: &[render::Finding]) -> Vec<&render::Finding> {
         findings
@@ -4068,6 +4140,70 @@ mod construction_gate_tests {
         assert_eq!(found.len(), 1, "{found:#?}");
         assert_eq!(found[0].site, "tls.go:7");
         assert_eq!(found[0].severity, "medium");
+    }
+
+    #[test]
+    fn under_the_service_gate_an_existing_unconditional_skip_blocks_in_a_service() {
+        let dir = tree(&[("cmd/api/main.go", SERVER), ("deploy/api.yaml", DEPLOYMENT)]);
+        let sites = [skip(7, BARE, ""), skip(9, BARE, "opts.Insecure")];
+        for added in [None, Some(changed::AddedLines::of("tls.go", &[1]))] {
+            let found = in_repo(&sites, "service", added.as_ref(), Some(dir.path()));
+            let blocks = blocking(&found);
+            assert_eq!(blocks.len(), 1, "{added:?}: {found:#?}");
+            assert_eq!(blocks[0].site, "tls.go:7");
+            for part in [
+                "in a service (equal to true; read as a service from \
+                 Kubernetes workload: deploy/api.yaml, server entry point: cmd/api/main.go)",
+                "fix: verify the peer",
+                &format!("matcher: \"construction.{SKIP}\""),
+            ] {
+                assert!(
+                    blocks[0].description.contains(part),
+                    "{part}: {}",
+                    blocks[0].description
+                );
+            }
+            // The opt-out behind an option stays advisory in a service too.
+            let opt: Vec<_> = found.iter().filter(|f| f.site == "tls.go:9").collect();
+            assert_eq!(opt.len(), 1, "{found:#?}");
+            assert_eq!(render::classify(opt[0]), render::Section::Advisory);
+        }
+    }
+
+    /// A service's own CLI inspects a peer on purpose: its skip is not in the
+    /// service.
+    #[test]
+    fn under_the_service_gate_an_existing_skip_in_the_services_cli_does_not_block() {
+        let dir = tree(&[("cmd/api/main.go", SERVER), ("deploy/api.yaml", DEPLOYMENT)]);
+        let mut cli = skip(7, BARE, "");
+        cli.file_path = "cli/cmd/identity.go".into();
+        let found = in_repo(&[cli], "service", None, Some(dir.path()));
+        assert!(blocking(&found).is_empty(), "{found:#?}");
+        assert_eq!(found.len(), 1, "{found:#?}");
+    }
+
+    #[test]
+    fn under_the_service_gate_a_tool_or_an_unread_repo_blocks_only_what_a_change_adds() {
+        let tool = tree(&[
+            ("README.md", "A fast intranet vulnerability scanner."),
+            ("main.go", SERVER),
+            ("deploy/api.yaml", DEPLOYMENT),
+        ]);
+        let library = tree(&[("dial.go", "package dial\n")]);
+        let sites = [skip(7, BARE, ""), skip(30, BARE, "")];
+        let added = changed::AddedLines::of("tls.go", &[7]);
+        for root in [Some(tool.path()), Some(library.path()), None] {
+            let found = in_repo(&sites, "service", None, root);
+            assert!(blocking(&found).is_empty(), "{root:?}: {found:#?}");
+            let found = in_repo(&sites, "service", Some(&added), root);
+            let blocks = blocking(&found);
+            assert_eq!(blocks.len(), 1, "{root:?}: {found:#?}");
+            assert!(
+                blocks[0].description.contains("introduced by this change"),
+                "{found:#?}"
+            );
+            assert_eq!(blocks[0].site, "tls.go:7");
+        }
     }
 
     #[test]

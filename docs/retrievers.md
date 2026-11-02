@@ -341,7 +341,30 @@ change`, the fix, and the `scanner.waivers` entry that accepts it. Every
 other violation of the rule, the ones already at the base and all of them
 in a full scan, is shown at its severity and does not block. A pre-push from
 a branch with no upstream and no base ref has no single base, so there no
-line is added. A `gate` value rvl does not know never blocks, and in the
+line is added.
+
+With `gate: service`, a violation blocks wherever `gate: introduced` blocks
+it, and, in a repository rvl reads as a service, at the rule's severity
+`high` wherever it is, in a full scan too. Such a violation is a row with the
+reason `in a service (...)`, which names the deployment manifest and the
+server entry point the repository was read as a service from, the fix and
+the `scanner.waivers` entry. rvl reads a repository as a service when, outside
+its examples, tests, fixtures and docs, it has both a server entry point (an
+HTTP or gRPC server or a listener in Go, Python, JavaScript or TypeScript,
+Rust, Java or Kotlin, or C#) and a deployment manifest (a Kubernetes
+Deployment, StatefulSet or DaemonSet, a Helm `Chart.yaml`, a Dockerfile with
+`EXPOSE`, or a Procfile `web` process), and no tool marker. A tool marker is a
+root README that calls the repository a penetration testing, red team,
+exploit, vulnerability or port scanning tool, an intercepting proxy, a
+reverse shell, a netcat or a diagnostic tool, or a payload directory such as
+`pocs/` or `exploits/`. A security tool disables verification on purpose, so
+a marker wins over every service signal. A violation in a directory that holds
+what a person runs (`cli/`, `tools/`, `hack/`, `scripts/`, `diagnostics/`,
+`debug/`) or in an example, test or docs directory is not in the service: a
+service's own CLI may skip verification to inspect a peer. In a tool, a
+library or a repository rvl cannot read, the gate is `introduced`.
+
+A `gate` value rvl does not know never blocks, and in the
 config lane any `gate` makes the rule advisory: no other lane implements
 one. The rules the spec producer is asked to publish, with a
 violating and an allowed case for each, are in
