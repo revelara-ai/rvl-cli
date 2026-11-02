@@ -9,6 +9,15 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### The decision model asks only about runtime code
+
+The decision-model lane no longer asks about an undecided site outside
+runtime code (dev_only, test_support, migration, backfill), the same scope
+check every other lane makes. Such a site gets no `model.<control>` row.
+
+- New: `decision_model.not_runtime` in `--out`, the count of those sites,
+  and a COVERAGE line that says how many were skipped.
+
 ### A Python TLS opt-out is advisory; an option may be a parameter
 
 A TLS setting that turns verification off is judged by the same option rule

@@ -313,7 +313,9 @@ The orchestrator uses it to:
   `out_of_distribution` counts, in the same shape, the site questions of a
   served control whose manifest entry lists `served_classes` and whose
   class family (its package: `net/http` for `net/http.Client.Do`) is not
-  listed; they abstain too. `coverage` is
+  listed; they abstain too. `not_runtime` counts the undecided sites not
+  asked at all because they are outside runtime code (dev_only,
+  test_support, migration, backfill). `coverage` is
   the lane's COVERAGE lines. A `violates` row is also an advisory row in
   `findings`, class `model.<control>`. Nothing in `sites` or `undecided`
   changes because of it.
