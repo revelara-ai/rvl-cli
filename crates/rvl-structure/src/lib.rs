@@ -26,6 +26,7 @@ use std::path::Path;
 
 mod inventory;
 mod repo_kind;
+mod runbooks;
 
 pub use inventory::inventory;
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
@@ -120,6 +121,43 @@ pub struct CiScanFacts {
     pub scanners: Vec<ScannerFacts>,
 }
 
+/// One runbook file's review facts (RC-006). Shape only: whether an owner is
+/// named, never who.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunbookFacts {
+    /// Repo-relative path of the runbook.
+    pub path: String,
+    /// The YAML front matter names an owner (`owner`, `owners` or
+    /// `owner_slack`).
+    #[serde(default)]
+    pub owner: bool,
+    /// The latest valid YYYY-MM-DD among the front matter's `last_reviewed`,
+    /// `last_reviewed_on` and `tested_on`.
+    #[serde(default)]
+    pub reviewed_on: Option<String>,
+    /// The last CODEOWNERS pattern matching the path names an owner.
+    #[serde(default)]
+    pub code_owned: bool,
+}
+
+/// One committed `.github/rulesets/*.json` file (RC-006).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RulesetFacts {
+    /// Repo-relative path of the ruleset file.
+    pub path: String,
+    /// The file is a JSON object with a `rules` array.
+    #[serde(default)]
+    pub parsed: bool,
+    /// An active branch ruleset whose `ref_name` condition includes the
+    /// default branch.
+    #[serde(default)]
+    pub default_branch: bool,
+    /// A `pull_request` rule requires code-owner review or at least one
+    /// approval.
+    #[serde(default)]
+    pub requires_review: bool,
+}
+
 /// The repo-scoped structure record. Rides the packet stream as a JSONL line
 /// with `kind: "repo_structure"`, like the `repo_config` record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +179,15 @@ pub struct RepoStructure {
     /// Repo-relative runbook-convention directories present.
     #[serde(default)]
     pub runbook_dirs: Vec<String>,
+    /// Markdown runbooks under those directories, index files excepted.
+    #[serde(default)]
+    pub runbooks: Vec<RunbookFacts>,
+    /// Repo-relative path of the CODEOWNERS file in effect, if any.
+    #[serde(default)]
+    pub codeowners: Option<String>,
+    /// Committed `.github/rulesets/*.json` files.
+    #[serde(default)]
+    pub rulesets: Vec<RulesetFacts>,
     /// Known CI scanners seen across all GitHub Actions workflows.
     #[serde(default)]
     pub ci_scans: CiScanFacts,
@@ -161,6 +208,9 @@ impl Default for RepoStructure {
             contract_frameworks: Vec::new(),
             manifests: Vec::new(),
             runbook_dirs: Vec::new(),
+            runbooks: Vec::new(),
+            codeowners: None,
+            rulesets: Vec::new(),
             ci_scans: CiScanFacts::default(),
             walk_complete: false,
         }
@@ -235,8 +285,9 @@ pub struct StructureFinding {
     pub weak: bool,
 }
 
-/// Map structure facts to per-control verdicts. Deterministic, no model
-/// calls. Always returns one finding per control, in stable order:
+/// Map structure facts to per-control verdicts, `today` the scan date as
+/// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
+/// no model calls. Always returns one finding per control, in stable order:
 /// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
@@ -245,14 +296,14 @@ pub struct StructureFinding {
 /// itself is a judgement (contract tests for a possibly-consumer-less
 /// library, runbooks that may live in a wiki), the evaluator abstains with
 /// the reason rather than guessing.
-pub fn evaluate(facts: &RepoStructure) -> Vec<StructureFinding> {
+pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
     vec![
         eval_unit_tests(facts),
         eval_coverage(facts),
         eval_integration(facts),
         eval_contract(facts),
         eval_manifests(facts),
-        eval_runbooks(facts),
+        eval_runbooks(facts, today),
     ]
 }
 
@@ -595,9 +646,19 @@ fn eval_manifests(facts: &RepoStructure) -> StructureFinding {
     )
 }
 
-fn eval_runbooks(facts: &RepoStructure) -> StructureFinding {
+/// A runbook reviewed more than this many days before the scan date earns an
+/// advisory note on a satisfies finding, never a violation.
+pub const RUNBOOK_REVIEW_DAYS: i64 = 365;
+
+/// Where a runbook's review is enforced that this lane cannot read.
+const FORGE_SCOPE: &str = "branch protection in forge settings is out of scope";
+
+fn eval_runbooks(facts: &RepoStructure, today: &str) -> StructureFinding {
     let control = "RC-006";
     let control_name = "incident runbooks";
+    if !facts.runbooks.is_empty() {
+        return eval_runbook_currency(facts, today);
+    }
     let fix =
         "add runbooks/ with per-alert mitigation procedures and link them from alerts".to_string();
     let mk = |verdict, reason: String, evidence| StructureFinding {
@@ -622,6 +683,130 @@ fn eval_runbooks(facts: &RepoStructure) -> StructureFinding {
         "no runbook directory convention found; runbooks may live outside the repo (weak signal)"
             .into(),
         vec![],
+    )
+}
+
+/// RC-006 for a repository with runbook files: each names an owner and a
+/// review date in its front matter, CODEOWNERS owns each path, and a committed
+/// ruleset, when there is one, requires review on the default branch.
+fn eval_runbook_currency(facts: &RepoStructure, today: &str) -> StructureFinding {
+    let paths = |keep: &dyn Fn(&RunbookFacts) -> bool| -> Vec<&str> {
+        facts
+            .runbooks
+            .iter()
+            .filter(|r| keep(r))
+            .map(|r| r.path.as_str())
+            .collect()
+    };
+    let no_owner = paths(&|r| !r.owner);
+    let no_date = paths(&|r| r.reviewed_on.is_none());
+    let unowned = paths(&|r| !r.code_owned);
+
+    let mut problems = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    let mut flag = |what: String, list: &[&str]| {
+        if !list.is_empty() {
+            problems.push(format!("{what}: {}", list.join(", ")));
+            evidence.extend(list.iter().map(|p| p.to_string()));
+        }
+    };
+    flag(
+        "no owner, owners or owner_slack in front matter".into(),
+        &no_owner,
+    );
+    flag(
+        "no last_reviewed, last_reviewed_on or tested_on date (YYYY-MM-DD) in front matter".into(),
+        &no_date,
+    );
+    flag(
+        match &facts.codeowners {
+            Some(file) => format!("the last matching pattern in {file} names no owner"),
+            None => "no CODEOWNERS file (.github/, root or docs/) names an owner".into(),
+        },
+        &unowned,
+    );
+
+    let readable: Vec<&RulesetFacts> = facts.rulesets.iter().filter(|r| r.parsed).collect();
+    let unread: Vec<&str> = facts
+        .rulesets
+        .iter()
+        .filter(|r| !r.parsed)
+        .map(|r| r.path.as_str())
+        .collect();
+    let reviewed = readable
+        .iter()
+        .any(|r| r.default_branch && r.requires_review);
+    let ruleset_note = if facts.rulesets.is_empty() {
+        format!("no committed .github/rulesets/*.json; {FORGE_SCOPE}")
+    } else if reviewed {
+        format!("a committed ruleset requires review on the default branch; {FORGE_SCOPE}")
+    } else if !unread.is_empty() {
+        format!(
+            "committed ruleset(s) not read as rulesets: {}; {FORGE_SCOPE}",
+            unread.join(", ")
+        )
+    } else {
+        let list: Vec<&str> = readable.iter().map(|r| r.path.as_str()).collect();
+        problems.push(format!(
+            "no committed ruleset is active on the default branch with a pull_request rule \
+             requiring code-owner review or an approval: {}",
+            list.join(", ")
+        ));
+        evidence.extend(list.iter().map(|p| p.to_string()));
+        FORGE_SCOPE.to_string()
+    };
+
+    let mk = |verdict, reason: String, evidence| StructureFinding {
+        control: "RC-006",
+        control_name: "incident runbooks",
+        verdict,
+        reason,
+        evidence,
+        fix: "give each runbook YAML front matter with an owner and a last_reviewed date \
+              (YYYY-MM-DD), own its path in CODEOWNERS, and require code-owner review on the \
+              default branch"
+            .into(),
+        severity: "low",
+        weak: false,
+    };
+    let n = facts.runbooks.len();
+    if !problems.is_empty() {
+        evidence.sort();
+        evidence.dedup();
+        return mk(
+            Verdict::Violates,
+            format!(
+                "{n} runbook file(s): {}; {ruleset_note}",
+                problems.join("; ")
+            ),
+            evidence,
+        );
+    }
+    let mut reason = format!(
+        "{n} runbook file(s) name an owner and a review date, and CODEOWNERS owns each; \
+         {ruleset_note}"
+    );
+    let stale: Vec<String> = facts
+        .runbooks
+        .iter()
+        .filter_map(|r| {
+            let on = r.reviewed_on.as_deref()?;
+            let age = rvl_core::civil::days_from_civil(today.get(..10)?)?
+                - rvl_core::civil::days_from_civil(on)?;
+            (age > RUNBOOK_REVIEW_DAYS).then(|| format!("{} ({on})", r.path))
+        })
+        .collect();
+    if !stale.is_empty() {
+        reason.push_str(&format!(
+            "; advisory: last reviewed more than {RUNBOOK_REVIEW_DAYS} days before {}: {}",
+            &today[..10],
+            stale.join(", ")
+        ));
+    }
+    mk(
+        Verdict::Satisfies,
+        reason,
+        facts.runbooks.iter().map(|r| r.path.clone()).collect(),
     )
 }
 

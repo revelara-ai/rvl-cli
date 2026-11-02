@@ -26,6 +26,14 @@
 //!   * `rule.annotations.runbook` — presence of a `runbook_url` / `runbook`
 //!     annotation. SHAPE-ONLY: the packet carries the marker `nonempty`,
 //!     never the URL (runbook locations are repo-internal content).
+//!   * `rule.annotations.runbook.target` — where that annotation points, as
+//!     a status only: `resolved` (a schemeless, hostless path, `#fragment`
+//!     dropped, that exists relative to the rule file's directory or the
+//!     repository root), `missing` (it exists in neither), or `external`
+//!     (any scheme or host; never fetched). A templated path is
+//!     unresolvable. Emitted only when the walk hands the retriever the
+//!     repository root and the annotation is set; the link itself never
+//!     rides in a packet either.
 //!   * `rule.expr` — non-emptiness of the alert expression. SHAPE-ONLY: the
 //!     marker `nonempty`, never the PromQL (metric names, label values and
 //!     hostnames live in expressions; per the privacy contract they never
@@ -44,6 +52,7 @@
 
 use crate::{render_value, ConfigPacket, ConfigRetriever, ProvenanceStep, Resolution, Retrieved};
 use serde_yaml::Value;
+use std::path::Path;
 
 pub struct PrometheusRules;
 
@@ -107,40 +116,62 @@ impl ConfigRetriever for PrometheusRules {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        let mut out = Retrieved::default();
-        let Ok(doc) = serde_yaml::from_str::<Value>(contents) else {
-            out.unparseable = 1;
-            return out;
-        };
-        let Some(root) = doc.as_mapping() else {
-            out.unparseable = 1;
-            return out;
-        };
-        let em = Emitter {
-            rel_path,
-            snapshot_id,
-        };
-        // Sloth first (native root or CRD `spec:`), then rule files; a
-        // claimed file that is neither degrades to an unparseable count.
-        if get(root, "slos").is_some() {
-            em.sloth(root, "", &mut out);
-        } else if let Some(spec) = get(root, "spec").and_then(Value::as_mapping) {
-            if get(spec, "slos").is_some() {
-                em.sloth(spec, "spec.", &mut out);
-            } else {
-                out.unparseable = 1;
-            }
-        } else if let Some(groups) = get(root, "groups").and_then(Value::as_sequence) {
-            em.rule_groups(groups, &mut out);
+        retrieve_in(None, rel_path, contents, snapshot_id)
+    }
+
+    /// The walk's entry: with the root, a runbook link can be resolved.
+    fn retrieve_with_root(
+        &self,
+        root: &Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        retrieve_in(Some(root), rel_path, contents, snapshot_id)
+    }
+}
+
+fn retrieve_in(
+    repo_root: Option<&Path>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
+    let mut out = Retrieved::default();
+    let Ok(doc) = serde_yaml::from_str::<Value>(contents) else {
+        out.unparseable = 1;
+        return out;
+    };
+    let Some(root) = doc.as_mapping() else {
+        out.unparseable = 1;
+        return out;
+    };
+    let em = Emitter {
+        root: repo_root,
+        rel_path,
+        snapshot_id,
+    };
+    // Sloth first (native root or CRD `spec:`), then rule files; a
+    // claimed file that is neither degrades to an unparseable count.
+    if get(root, "slos").is_some() {
+        em.sloth(root, "", &mut out);
+    } else if let Some(spec) = get(root, "spec").and_then(Value::as_mapping) {
+        if get(spec, "slos").is_some() {
+            em.sloth(spec, "spec.", &mut out);
         } else {
             out.unparseable = 1;
         }
-        out
+    } else if let Some(groups) = get(root, "groups").and_then(Value::as_sequence) {
+        em.rule_groups(groups, &mut out);
+    } else {
+        out.unparseable = 1;
     }
+    out
 }
 
 /// Shared packet plumbing for one file.
 struct Emitter<'a> {
+    root: Option<&'a Path>,
     rel_path: &'a str,
     snapshot_id: &'a str,
 }
@@ -223,6 +254,48 @@ impl Emitter<'_> {
             ),
             _ => self.authored_absent(unit, key, key_path),
         }
+    }
+
+    /// `rule.annotations.runbook.target`: the status of where the runbook
+    /// annotation points. None without a root (nothing can be resolved) or
+    /// without an annotation (the presence key already judges that).
+    fn runbook_target(
+        &self,
+        unit: &str,
+        key_path: &str,
+        v: Option<&Value>,
+    ) -> Option<ConfigPacket> {
+        let root = self.root?;
+        let link = render_value(v?);
+        let link = link.trim();
+        if link.is_empty() {
+            return None;
+        }
+        let key = "rule.annotations.runbook.target";
+        let status = if is_external(link) {
+            "external"
+        } else if link.contains("{{") {
+            // `{{ $externalURL }}/runbooks/x`: nothing is rendered on the
+            // scan path, so where it points is unknowable here.
+            return Some(self.packet(
+                unit,
+                key,
+                None,
+                Resolution::Unresolvable,
+                vec![ProvenanceStep::new(self.rel_path, key_path, "templated")],
+            ));
+        } else if resolves_in_repo(root, self.rel_path, link) {
+            "resolved"
+        } else {
+            "missing"
+        };
+        Some(self.packet(
+            unit,
+            key,
+            Some(status.to_string()),
+            Resolution::AsAuthored,
+            vec![ProvenanceStep::new(self.rel_path, key_path, "explicit")],
+        ))
     }
 
     fn rule_groups(&self, groups: &[Value], out: &mut Retrieved) {
@@ -319,6 +392,10 @@ impl Emitter<'_> {
                     &kp("annotations.runbook_url"),
                     runbook,
                 ));
+                if let Some(p) = self.runbook_target(&unit, &kp("annotations.runbook_url"), runbook)
+                {
+                    out.packets.push(p);
+                }
 
                 // rule.expr: shape-only non-emptiness of the expression.
                 out.packets.push(self.presence_marker(
@@ -425,6 +502,57 @@ impl Emitter<'_> {
             }
         }
     }
+}
+
+/// A link with a scheme (`https:`, `mailto:`, RFC 3986's grammar) or a host
+/// (`//wiki/x`) points outside the repository. It is never fetched.
+fn is_external(link: &str) -> bool {
+    if link.starts_with("//") {
+        return true;
+    }
+    match link.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Whether a repo link, its `#fragment` dropped, names a path that exists
+/// relative to the rule file's directory or the repository root (a leading
+/// `/` means the root only). The path is normalized lexically and a `..`
+/// above the root names nothing, so no check leaves the root.
+fn resolves_in_repo(root: &Path, rule_file: &str, link: &str) -> bool {
+    let path = link.split('#').next().unwrap_or("");
+    // A link naming no path (`#section`) names no runbook.
+    if path.split('/').all(|seg| seg.is_empty() || seg == ".") {
+        return false;
+    }
+    let rule_dir: Vec<&str> = match rule_file.rsplit_once('/') {
+        Some((dir, _)) if !path.starts_with('/') => dir.split('/').collect(),
+        _ => Vec::new(),
+    };
+    let mut bases = vec![rule_dir];
+    if !bases[0].is_empty() {
+        bases.push(Vec::new());
+    }
+    bases.into_iter().any(|mut parts| {
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return false;
+                    }
+                }
+                s => parts.push(s),
+            }
+        }
+        !parts.is_empty() && root.join(parts.join("/")).exists()
+    })
 }
 
 fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
@@ -546,6 +674,130 @@ mod tests {
             let v = p.resolved_value.as_deref().unwrap_or("");
             assert!(!v.contains("runbooks.internal"), "leaked URL: {p:?}");
             assert!(!v.contains("rate(errors"), "leaked PromQL: {p:?}");
+        }
+    }
+
+    // --- rule.annotations.runbook.target: a status, never the link ---
+
+    /// A rule file at `alerts/rules.yml` whose one alert links `link`, retrieved
+    /// with a repository root holding `docs/runbooks/high-errors.md` and
+    /// `alerts/runbooks/disk.md`.
+    fn target(link: &str) -> ConfigPacket {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs/runbooks")).unwrap();
+        std::fs::write(root.join("docs/runbooks/high-errors.md"), "# steps\n").unwrap();
+        std::fs::create_dir_all(root.join("alerts/runbooks")).unwrap();
+        std::fs::write(root.join("alerts/runbooks/disk.md"), "# steps\n").unwrap();
+        let yaml = format!(
+            "groups:\n- name: api\n  rules:\n  - alert: A\n    expr: up == 0\n    annotations:\n      runbook_url: {link:?}\n"
+        );
+        let got = PrometheusRules.retrieve_with_root(root, "alerts/rules.yml", &yaml, "snap");
+        for p in &got.packets {
+            let v = p.resolved_value.as_deref().unwrap_or("");
+            assert!(!v.contains("runbook"), "the link rides in a packet: {p:?}");
+        }
+        find(&got, "rule:api/A", "rule.annotations.runbook.target").clone()
+    }
+
+    #[test]
+    fn runbook_target_resolves_from_the_rule_directory_or_the_root() {
+        for link in [
+            "runbooks/disk.md",
+            "./runbooks/disk.md",
+            "../docs/runbooks/high-errors.md",
+            "docs/runbooks/high-errors.md",
+            "/docs/runbooks/high-errors.md",
+            "docs/runbooks/high-errors.md#mitigation",
+            "docs/runbooks",
+        ] {
+            let p = target(link);
+            assert_eq!(p.resolved_value.as_deref(), Some("resolved"), "{link}");
+            assert_eq!(p.resolution, Resolution::AsAuthored, "{link}");
+            assert_eq!(p.provenance[0].role, "explicit");
+        }
+    }
+
+    #[test]
+    fn runbook_target_is_missing_when_neither_base_has_the_path() {
+        for link in [
+            "docs/runbooks/gone.md",
+            // A leading `/` is the root only, never the rule's directory.
+            "/runbooks/disk.md",
+            // A `..` above the root names nothing.
+            "../../docs/runbooks/high-errors.md",
+            "#mitigation",
+        ] {
+            assert_eq!(
+                target(link).resolved_value.as_deref(),
+                Some("missing"),
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn runbook_target_is_external_for_any_scheme_or_host() {
+        for link in [
+            "https://runbooks.example.com/high-errors",
+            "http://wiki/runbooks/disk.md",
+            "mailto:oncall@example.com",
+            "//wiki.example.com/runbooks",
+            "https://{{ $labels.cluster }}.example.com/runbook",
+        ] {
+            assert_eq!(
+                target(link).resolved_value.as_deref(),
+                Some("external"),
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn runbook_target_with_a_templated_path_is_unresolvable() {
+        let p = target("{{ $externalURL }}/runbooks/disk.md");
+        assert_eq!(p.resolution, Resolution::Unresolvable);
+        assert_eq!(p.resolved_value, None);
+        assert_eq!(p.provenance[0].role, "templated");
+    }
+
+    #[test]
+    fn runbook_target_needs_a_root_and_an_annotation() {
+        // Without the root nothing can be resolved, and without an annotation
+        // the presence key already says so: no target packet either way.
+        let got = packets(LITERAL_RULES);
+        assert!(got
+            .packets
+            .iter()
+            .all(|p| p.key != "rule.annotations.runbook.target"));
+        let dir = tempfile::tempdir().unwrap();
+        let got = PrometheusRules.retrieve_with_root(dir.path(), "rules.yml", BARE_ALERT, "snap");
+        assert!(got
+            .packets
+            .iter()
+            .all(|p| p.key != "rule.annotations.runbook.target"));
+    }
+
+    #[test]
+    fn repo_link_resolves_passes_fails_and_abstains_on_the_three_statuses() {
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"config_keys":[{"format":"prometheus-rules","key":"rule.annotations.runbook.target",
+                "expect":{"kind":"pattern","name":"repo_link_resolves"},"confidence":0.9,
+                "control":"RC-006","severity":"medium","fix":"link a runbook that exists"}]}"#,
+        )
+        .expect("the spec file parses");
+        for (link, verdict) in [
+            ("docs/runbooks/high-errors.md", rvl_core::Verdict::Satisfies),
+            ("docs/runbooks/gone.md", rvl_core::Verdict::Violates),
+            ("https://runbooks.example.com/x", rvl_core::Verdict::Abstain),
+        ] {
+            let f = crate::eval::evaluate(&target(link), &[], &specs);
+            assert_eq!(f.verdict, verdict, "{link}: {}", f.reason);
+            assert!(
+                !f.reason.contains("runbooks"),
+                "the link leaks into a reason: {}",
+                f.reason
+            );
         }
     }
 

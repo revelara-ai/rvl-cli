@@ -33,40 +33,73 @@ pub struct ConfigFinding {
     pub fix: String,
 }
 
+/// What a named pattern says about one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternVerdict {
+    Matches,
+    Fails,
+    /// The pattern does not judge this value; the reason says why.
+    Abstains(&'static str),
+}
+
+impl From<bool> for PatternVerdict {
+    fn from(matches: bool) -> Self {
+        if matches {
+            Self::Matches
+        } else {
+            Self::Fails
+        }
+    }
+}
+
 /// Match a NAMED pattern against a value. Patterns are code-defined so a
 /// signed spec never carries executable pattern syntax; a name this binary
 /// does not know returns `None` and the caller abstains (a spec authored for
 /// a newer scanner must degrade safely, never guess).
-pub fn pattern_matches(name: &str, value: &str) -> Option<bool> {
-    match name {
+pub fn pattern_matches(name: &str, value: &str) -> Option<PatternVerdict> {
+    let verdict = match name {
         // A full 40-hex-char commit SHA: the action-pinning control.
-        "sha40" => Some(value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())),
+        "sha40" => value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()),
         // Any non-empty value: presence-of-a-key controls where absence is
         // an AUTHORED fact with no platform default behind it (e.g. an alert
         // rule with no severity label — the packet's value is "").
-        "nonempty" => Some(!value.is_empty()),
+        "nonempty" => !value.is_empty(),
         // Any real authored value at all: the presence judgment for
         // decidable-absent keys, whose packets render the absence as
         // [`crate::ABSENT_RENDERING`] (an automated Argo Application with no
         // retry). An empty value — an authored absence, e.g. an unpinned
         // `uses:` ref — is not configured either.
-        "configured" => Some(!value.is_empty() && value != crate::ABSENT_RENDERING),
+        "configured" => !value.is_empty() && value != crate::ABSENT_RENDERING,
         // No credential written into the value: a DSN with a password, or a
         // password argument given as a literal. A call site's values arrive
         // already redacted, so there the credential is the marker; a config
         // value is raw, so it is redacted here first.
         "no_literal_credential" => {
-            Some(!value.contains(redact::MARKER) && redact::redact_setting("", value) == value)
+            !value.contains(redact::MARKER) && redact::redact_setting("", value) == value
         }
         // Not a broken cipher: DES, 3DES and RC4 by name, or any cipher in
         // ECB mode, in the OpenSSL naming Node's `createCipheriv` takes
         // (`des-ede3-cbc`, `rc4`, `aes-128-ecb`).
         "no_weak_cipher" => {
             let v = value.to_ascii_lowercase();
-            Some(!(v.starts_with("des") || v.starts_with("rc4") || v.ends_with("-ecb")))
+            !(v.starts_with("des") || v.starts_with("rc4") || v.ends_with("-ecb"))
         }
-        _ => None,
-    }
+        // A link the retriever resolved inside the repository: a status, never
+        // the link (`rule.annotations.runbook.target`). An external link is
+        // not fetched, so whether it resolves is unknown here.
+        "repo_link_resolves" => {
+            return Some(match value {
+                "resolved" => PatternVerdict::Matches,
+                "missing" => PatternVerdict::Fails,
+                "external" => PatternVerdict::Abstains(
+                    "the link points outside the repository, which is not fetched",
+                ),
+                _ => PatternVerdict::Abstains("the value is not a link status"),
+            })
+        }
+        _ => return None,
+    };
+    Some(verdict.into())
 }
 
 /// Seconds in a duration string of the Go / Prometheus grammar: one or more
@@ -386,14 +419,17 @@ pub fn evaluate(
             None => abstain(format!(
                 "unknown pattern '{name}': the spec is newer than this scanner"
             )),
-            Some(true) => decided(
+            Some(PatternVerdict::Matches) => decided(
                 Verdict::Satisfies,
                 format!("{} = {value} matches {name}; {}", p.key, provenance_note(p)),
             ),
-            Some(false) => decided(
+            Some(PatternVerdict::Fails) => decided(
                 Verdict::Violates,
                 format!("does not match {name}: {} = {value}", p.key),
             ),
+            Some(PatternVerdict::Abstains(why)) => {
+                abstain(format!("{name} does not judge {} = {value}: {why}", p.key))
+            }
         },
     }
 }
@@ -781,7 +817,10 @@ mod tests {
         assert_eq!(set.verdict, Verdict::Satisfies, "{}", set.reason);
         // An empty value (an authored absence, e.g. an unpinned `uses:` ref)
         // is not configured either.
-        assert_eq!(pattern_matches("configured", ""), Some(false));
+        assert_eq!(
+            pattern_matches("configured", ""),
+            Some(PatternVerdict::Fails)
+        );
     }
 
     #[test]
@@ -831,7 +870,7 @@ mod tests {
         ] {
             assert_eq!(
                 pattern_matches("no_literal_credential", value),
-                Some(clean),
+                Some(clean.into()),
                 "{value}"
             );
         }
@@ -852,7 +891,7 @@ mod tests {
         ] {
             assert_eq!(
                 pattern_matches("no_weak_cipher", value),
-                Some(strong),
+                Some(strong.into()),
                 "{value}"
             );
         }

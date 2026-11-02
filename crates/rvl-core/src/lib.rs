@@ -9,6 +9,7 @@
 //! its own sanity check.
 
 pub mod authoring;
+pub mod civil;
 pub mod flag;
 pub mod redact;
 
