@@ -1076,7 +1076,7 @@ fn resolve_structure_lane(retrieved: Option<&Path>, stream: &str, path: &Path) -
     let Some(facts) = facts else {
         return StructureLane::default();
     };
-    let verdicts = rvl_structure::evaluate(&facts);
+    let verdicts = rvl_structure::evaluate(&facts, &rvl_cache::today_utc());
     StructureLane {
         ladder: structure_to_findings(&verdicts),
         rows: verdicts
