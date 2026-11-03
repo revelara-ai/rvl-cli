@@ -8525,6 +8525,10 @@ fn run() -> anyhow::Result<ExitCode> {
                  built with test paths skipped, so a warm scan cannot honor it for the whole \
                  repository. Re-run without --incremental to scan test code."
             );
+            // After every flag check, so a usage error fetches nothing.
+            if specs_file.is_none() {
+                autosync::first_sync(&cfg, &store, &keyset, oss_only)?;
+            }
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
             let result = if incremental && retrieved.is_none() {

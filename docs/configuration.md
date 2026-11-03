@@ -140,6 +140,11 @@ You do not need to run `rvl sync` by hand:
 
 - `rvl init` syncs both tiers (the commercial one only with a key) before it
   finishes. A failed fetch does not fail init; it says to run `rvl sync`.
+- A scan that finds no spec cache installed, as on a fresh CI runner, syncs
+  before it scans and says so on stderr. This is not the background check:
+  CI and a pin do not turn it off. With `RVL_OFFLINE=1` it cannot fetch: the
+  scan says to run `rvl sync`, and exits `1` unless the repository holds
+  nothing but content (secrets), which the content lane scans without a cache.
 - A scan on the signed cache starts at most one background check every six
   hours, after the scan has finished. The scan never waits for it, and a
   failed check is silent. The last check time is `auto-sync.stamp` in the

@@ -8,7 +8,8 @@
 //! * While a scan loads its cache it enforces a CI pin and prints the
 //!   attribution line when the corpus changed since this repo's last scan.
 //! * `init` syncs synchronously: it is a setup step, and a first scan with no
-//!   cache cannot run at all.
+//!   cache cannot run at all. For the same reason a scan that finds no cache
+//!   installed syncs before it loads (a CI runner's first scan).
 
 use crate::Config;
 use rvl_cache::auto;
@@ -77,6 +78,41 @@ fn attribution(previous: &str, current: &str) -> String {
         "spec cache updated since this repo's last scan: {previous} -> {current}; \
          findings can change because the corpus changed, not your code"
     )
+}
+
+/// Before a scan on the signed cache: when no tier the scan would load was
+/// ever installed, sync now, in the foreground, because a scan with no cache
+/// cannot judge a call site. This is the first run on a CI runner or a new
+/// machine. Offline there is nothing to fetch: the note names the fix, and
+/// the scan goes on, because the content lane needs no cache and a committed
+/// token must still block. A scan that needs the cache then exits 1 with the
+/// same fix. A cache that is installed but does not verify is left to the
+/// load, which falls back and names its own fix.
+pub fn first_sync(
+    cfg: &Config,
+    store: &CacheStore,
+    keyset: &Keyset,
+    oss_only: bool,
+) -> anyhow::Result<()> {
+    let oss = store.subdir_store(rvl_cache::OSS_DIR)?;
+    if oss.is_installed() || (!oss_only && store.is_installed()) {
+        return Ok(());
+    }
+    if cfg.offline {
+        eprintln!(
+            "note: no spec cache is installed and RVL_OFFLINE is set, so this scan cannot \
+             fetch one: run '{BIN} sync' with network access (or '{BIN} cache import')"
+        );
+        return Ok(());
+    }
+    eprintln!("no spec cache is installed; running '{BIN} sync' before the first scan");
+    let (oss, commercial) = sync_tiers(cfg, store, keyset)?;
+    let mut parts = vec![describe("oss tier", &oss)];
+    if let Some(c) = &commercial {
+        parts.push(describe("commercial tier", c));
+    }
+    eprintln!("{}", parts.join("; "));
+    Ok(())
 }
 
 /// After a scan: start the background check when one is due. Everything here
