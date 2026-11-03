@@ -115,6 +115,18 @@ fails and names the file.
 The "code never leaves" claim above is scoped to the deterministic scan and
 this report preview. The one surface that deliberately sends more is below.
 
+## Hook-agent telemetry
+
+When a hook hands undecided sites to your coding agent, `rvl` appends one
+line to `agent-telemetry.jsonl`, next to `last-scan.json` in its cache
+directory (never inside the scanned repository). The line holds the hook,
+the agent adapter's name, each adjudicated `client_type`, `method` and
+`site_count`, the latency and whether the agent timed out. It holds no
+verdicts, reasons, code or paths (`AgentTelemetry` has no field for them).
+
+The file is local-only: `rvl` never uploads it, and no command sends it.
+Read it to tune the per-hook agent budgets; delete it at any time.
+
 ## Credential values
 
 A retriever reports constant arguments and source text, so a database or

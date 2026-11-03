@@ -32,10 +32,10 @@
 //!   and the shape-only report are built from the deterministic findings
 //!   alone; nothing in this module mutates them (see
 //!   `verdicts_never_mutate_deterministic_findings`).
-//! * Telemetry is identity-only and LOCAL-ONLY today (same posture as the
-//!   shape report): hook name, adapter name, `client_type.method` + count for
-//!   the adjudicated surfaces, latency, timeout flag. NO verdicts, NO reasons,
-//!   NO code, NO paths ever ride in it — see [`AgentTelemetry`].
+//! * Telemetry is identity-only and LOCAL-ONLY: it is never uploaded. Hook
+//!   name, adapter name, `client_type.method` + count for the adjudicated
+//!   surfaces, latency, timeout flag. NO verdicts, NO reasons, NO code, NO
+//!   paths ever ride in it — see [`AgentTelemetry`].
 //!
 //! The signed-overlay TRANSPORT for the org kill switch (how
 //! `org-policy.yaml` gets synced/signed) is follow-up work; this module owns
@@ -831,9 +831,8 @@ pub struct TelemetrySurface {
 
 /// The ENTIRE per-run telemetry payload: run identity, adjudicated surface
 /// identities, latency, timeout flag. NO verdicts (they never leave the
-/// machine), NO reasons, NO code, NO paths. Recording is LOCAL-ONLY today
-/// (same posture as the shape report): the async channel consumes this file
-/// when it lands.
+/// machine), NO reasons, NO code, NO paths. Recording is LOCAL-ONLY: no
+/// channel uploads this file; it stays on the machine for local budget tuning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTelemetry {
     pub scanner_version: String,
