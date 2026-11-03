@@ -34,6 +34,10 @@ type reachingValue struct {
 	alias  types.Object // a plain copy of another object: follow it
 	ctor   string       // the result of this in-repo function: its body is the construction
 	opaque bool         // the result of a call whose construction is not in this repository
+	// result is the declared result of that in-repo function the value is.
+	// Its own values are what the function's return statements hand back
+	// (return flow), so a value can be followed forward out of a constructor.
+	result *types.Var
 }
 
 // traceStatus says what a trace found.
@@ -144,6 +148,9 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 			switch {
 			case fn != nil && fn.Pkg() != nil && ix.repo[fn.Pkg().Path()]:
 				v.ctor = fn.FullName()
+				if res := fn.Origin().Signature().Results(); idx < res.Len() {
+					v.result = res.At(idx)
+				}
 			case fn != nil:
 				// A dependency's constructor of its OWN type is called with
 				// the options that configure it, and the call is the
@@ -169,6 +176,7 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 				for i := 0; i < params.Len(); i++ {
 					ix.paramOwner[params.At(i)] = fn
 				}
+				ix.returns(s.Body, fn.Signature().Results(), valueOf)
 			}
 		case *ast.CallExpr:
 			ix.bindParams(info, s, valueOf, accounted)
@@ -244,6 +252,71 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 		}
 		return true
 	})
+}
+
+// returns records return flow: each value a return statement in body hands
+// back reaches the declared result it is returned as. A function literal's
+// returns are its own, not the declaration's, and are skipped. A bare return
+// needs nothing here: it returns named results, whose assignments are
+// recorded like any variable's.
+func (ix *reachIndex) returns(body *ast.BlockStmt, results *types.Tuple,
+	valueOf func(ast.Expr, int) reachingValue) {
+	if body == nil || results.Len() == 0 {
+		return
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.ReturnStmt:
+			for i := 0; i < results.Len(); i++ {
+				switch {
+				case len(s.Results) == results.Len():
+					ix.values[results.At(i)] = append(ix.values[results.At(i)], valueOf(s.Results[i], 0))
+				case len(s.Results) == 1:
+					// return f(), f yielding every result.
+					ix.values[results.At(i)] = append(ix.values[results.At(i)], valueOf(s.Results[0], i))
+				}
+			}
+		}
+		return true
+	})
+}
+
+// forward returns every variable the values of seeds flow into: the reverse
+// of the edges trace follows. A value moves through plain copies, struct
+// fields (T{f: v}, x.f = v), parameters it is passed as, and the results of
+// the in-repo function that returns it, into the variables a call of that
+// function is assigned to. It is how a pool built inside a constructor
+// reaches the code that uses it. The seeds are included.
+func (ix *reachIndex) forward(seeds []*types.Var) map[*types.Var]bool {
+	next := map[types.Object][]*types.Var{}
+	for to, vals := range ix.values {
+		to, ok := to.(*types.Var)
+		if !ok {
+			continue
+		}
+		for _, rv := range vals {
+			if rv.alias != nil {
+				next[rv.alias] = append(next[rv.alias], to)
+			}
+			if rv.result != nil {
+				next[rv.result] = append(next[rv.result], to)
+			}
+		}
+	}
+	seen := map[*types.Var]bool{}
+	work := append([]*types.Var(nil), seeds...)
+	for len(work) > 0 {
+		v := work[len(work)-1]
+		work = work[:len(work)-1]
+		if v == nil || seen[v] {
+			continue
+		}
+		seen[v] = true
+		work = append(work, next[v]...)
+	}
+	return seen
 }
 
 // calleeFunc resolves the declared function or method a call invokes, or nil
