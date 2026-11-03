@@ -585,11 +585,12 @@ runs as a scanner in their own right are not part of it yet, and the
 
 ## Privacy
 
-The deterministic scan runs entirely locally and your code never leaves the
-machine. The scanner is open source, so you can verify this in the code
-rather than take it on trust. The only thing a scan could ever report to
-Revelara is the shape of unknown API surfaces: exactly four fields per
-surface (client type, method name, language name, and a count of sites).
+The deterministic scan runs entirely locally, and `rvl` never uploads your
+repositories or source files. The scanner is open source, so you can verify
+this in the code rather than take it on trust. The only thing a scan could
+ever report to Revelara is the shape of unknown API surfaces: exactly four
+fields per surface (client type, method name, language name, and a count of
+sites).
 No source snippets, no file paths, no line numbers, nothing that identifies
 your repository. You can see the exact payload any time:
 
@@ -600,6 +601,10 @@ rvl report --json     # the exact JSON the wire would carry
 
 Reporting is local-only today: `rvl report` shows or writes the payload, it
 does not transmit it. `RVL_OFFLINE=1` disables every network fetch.
+Submission mode (`rvl scan --service`, API key required) is the exception:
+it sends findings whose text can quote short excerpts of code or
+configuration; `--dry-run` prints that payload without sending it. See
+[Privacy](privacy.md).
 
 The report leaves out surfaces that your repository declares itself and
 sites whose client type did not resolve. It gives a count for each. See

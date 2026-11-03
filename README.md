@@ -8,7 +8,10 @@ and makes no model calls: it resolves the API surfaces your code actually
 calls, matches them against a signed spec cache, and returns a blocking /
 advisory ladder with an exit code a git hook or CI job can gate on.
 
-Customer code never leaves the machine. See [Privacy](docs/privacy.md).
+`rvl` never uploads your repositories or source files. A local scan sends
+nothing today. Submission mode, which needs an API key and a flag, sends
+findings, and their text can quote short excerpts of code or configuration.
+See [Privacy](docs/privacy.md).
 
 ## Install
 
