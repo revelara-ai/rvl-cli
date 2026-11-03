@@ -105,6 +105,45 @@ forward trace stops at the constructor's `return`. yarr survives only because
 the pool goes into a struct field (`&SQLiteStorage{db: db}`), and that
 field's methods are users.
 
+### With return flow
+
+`reachIndex` now records return flow. Each value a `return` statement hands
+back reaches the function's declared result, and a call's result reaches the
+variable it is assigned to (`trace.go`, `returns` and `forward`). The
+fixture test is `TestForwardTraceLeavesTheConstructorThroughItsReturn`.
+
+The probe was written again for this measurement, and it ran against the same
+heads with Go 1.27.1. It counts distinct handler functions. The first probe
+counted route registrations, so a function registered twice, like crowdsec's
+`FindAlerts` for GET and HEAD, counted twice there. The table gives both
+probes' numbers at the caller's seed so that the two can be compared.
+
+| Seed | Variant | Flow vars | Users | Handler functions | Job entries |
+| --- | --- | --- | --- | --- | --- |
+| nakama `main.go:159` (caller) | base | 185 | 876 | 166 (first probe: 167) | 5 |
+| nakama `server/db.go:122` | base | 2 | 1 | 0 | 1 |
+| | return flow | 190 | 877 | 166 | 6 |
+| crowdsec `pkg/apiserver/apiserver.go:128` (caller) | base | 14 | 54 | 18 (first probe: 24 routes) | 5 |
+| crowdsec `pkg/database/database.go:46` | base | 1 | 1 | 0 | 1 |
+| | return flow | 1 | 1 | 0 | 1 |
+
+- **nakama** now resolves from the construction. The pool leaves
+  `dbConnect` through its return, then leaves `DbConnect` through its return,
+  and reaches `main.go:159`. From there the result is the same as seeding the
+  caller. The 5 extra flow variables are the two returns and the locals
+  along the way. The extra job is `dbConnect` itself: it starts a
+  goroutine with a `time.NewTicker` that rescans the database's DNS, so the
+  ticker rule counts it. That is the precision risk named under Answers, a
+  constructor that starts a ticker.
+- **crowdsec** does not change. `getEntDriver` hands the pool to
+  `entsql.OpenDB(dbdialect, db)`, which is a dependency's function, and
+  returns that function's driver, not the pool. Return flow carries the
+  driver, which does not hold the seed. To reach the caller, the trace needs
+  the pool-wrapping rule (`+wrap`) extended to a dependency's function that
+  takes the pool and returns a value of its own type. The job counted at
+  the construction is `reloadHandler`. It is called from a goroutine, and it
+  is a caller, several levels up, of `getEntDriver`.
+
 ### The site-to-pool join
 
 A per-site fact first has to know which pool the site's receiver is. That is
@@ -120,9 +159,11 @@ the existing backward `reach.trace`:
 
 1. **Construction to users.** It works through struct fields, parameters
    (closed-world, through `bindParams`) and closures (a captured variable is
-   the same object). It does not work through function results, interface
-   values, channels, maps or slices. Return flow is the gap that matters: the
-   pool is almost always built inside a constructor and returned.
+   the same object), and now through function results (return flow). It
+   does not work through interface values, channels, maps or slices, or
+   through a dependency's function that wraps the pool. Return flow was the
+   gap that mattered, because the pool is almost always built inside a
+   constructor and returned.
 2. **Handler or job.** The caller graph can carry the classification. The
    facts needed are not joined today. A `go` call is a plain caller edge, and
    a route registration's handler argument is a reference with no edge. gRPC
@@ -163,7 +204,8 @@ Either option is blocked by the same groundwork. The list is in the order
 measured above:
 
 1. Add return-flow edges to `reachIndex`, so a seed at the construction
-   reaches the caller.
+   reaches the caller. Done: see "With return flow". crowdsec still needs
+   item 4's wrapping rule, extended to a dependency's wrapper.
 2. Link registration arguments to functions, and mark `go` edges.
 3. Add gRPC `Register*Server` and `http.Handler` values as handler entries.
 4. Add interface dispatch (CHA), or the pool-wrapping rule.
