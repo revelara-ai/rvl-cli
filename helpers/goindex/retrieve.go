@@ -267,6 +267,9 @@ var jobFrameworks = []struct {
 	{"github.com/robfig/cron", map[string]bool{"AddFunc": true, "AddJob": true, "Schedule": true}, "github.com/robfig/cron.Cron"},
 	{"github.com/hibiken/asynq", map[string]bool{"HandleFunc": true, "Handle": true}, "github.com/hibiken/asynq.ServeMux"},
 	{"github.com/riverqueue/river", map[string]bool{"AddWorker": true, "AddWorkerSafely": true}, "github.com/riverqueue/river"},
+	// gocron/v2 registers s.NewJob(gocron.DurationJob(d), gocron.NewTask(f)).
+	// NewTask is the row, not NewJob: the job function is its argument.
+	{"github.com/go-co-op/gocron", map[string]bool{"NewTask": true}, "github.com/go-co-op/gocron.Scheduler"},
 	{"time", map[string]bool{"NewTicker": true, "Tick": true}, "time.Ticker"},
 }
 
