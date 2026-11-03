@@ -262,6 +262,15 @@ impl CacheStore {
         CacheStore::open(&self.root.join(name))
     }
 
+    /// Whether nothing was ever installed here: no artifact in `current` or
+    /// in `last-good`. A file check, not a verification, so it costs a scan
+    /// nothing; a slot that is present and fails to verify is not empty.
+    pub fn is_empty(&self) -> bool {
+        ["current", "last-good"]
+            .iter()
+            .all(|slot| !self.dir(slot).join(ARTIFACT).exists())
+    }
+
     /// sha256 hex of the currently installed artifact bytes, if any.
     pub fn current_hash(&self) -> Option<String> {
         std::fs::read(self.dir("current").join(ARTIFACT))

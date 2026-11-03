@@ -70,7 +70,8 @@ note: no API key; the commercial judgment lanes were not synced.
 Everything local works without credentials: `rvl scan`, `rvl doctor`,
 `rvl explain`, `rvl suppress`, `rvl report`, `rvl index`, `rvl hook`. Once
 synced, a scan works offline; `RVL_OFFLINE=1` disables all network fetches
-if you want to guarantee it. After that first sync the cache keeps itself
+if you want to guarantee it. A first scan with no cache syncs before it runs.
+After that first sync the cache keeps itself
 current: `rvl init` syncs, and a scan starts a background check at most every
 six hours that applies from the next scan (see
 [Keeping the cache current](configuration.md#keeping-the-cache-current)).

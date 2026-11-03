@@ -26,8 +26,44 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Put `rvl` on PATH here, pinned to a version. See "Install" in the rvl
-      # README for the supported channels.
+      # rvl, pinned to a release. The archive holds rvl and every helper it
+      # carries (goindex, cindex, rustindex) with the vendored libclang/ and
+      # onnxruntime/ beside them, so putting its directory on PATH is the
+      # whole install. Checked against the release's own sha256 before it is
+      # unpacked. A lane still needs its language's toolchain on the runner:
+      # `go` for Go, python3 for Python (on the image), node for TypeScript.
+      - name: Install rvl
+        env:
+          RVL_VERSION: v1.10.1
+          RVL_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/revelara-ai/rvl-cli/releases/download/$RVL_VERSION"
+          curl -fsSL --retry 3 -O "$base/rvl-$RVL_TARGET.tar.xz"
+          curl -fsSL --retry 3 -O "$base/rvl-$RVL_TARGET.tar.xz.sha256"
+          sha256sum -c "rvl-$RVL_TARGET.tar.xz.sha256"
+          tar -xJf "rvl-$RVL_TARGET.tar.xz"
+          echo "$RUNNER_TEMP/rvl-$RVL_TARGET" >> "$GITHUB_PATH"
+
+      # The signed spec cache, kept between runs so a sync is a conditional
+      # GET that usually answers "up to date". A new key each run saves the
+      # synced cache; the prefix restores the newest one.
+      - name: Restore the spec cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.revelara/cache/specs
+          key: rvl-spec-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: rvl-spec-cache-${{ runner.os }}-
+
+      # Brings the cache up to date: the OSS tier needs no key, and the
+      # commercial tier syncs with RVL_API_KEY. It exits non-zero when it
+      # refreshed nothing, which fails the job before a scan runs on a stale
+      # or missing corpus.
+      - name: Sync the spec cache
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: rvl sync
 
       # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
       # lane that could not read the code (exit 4 without --strict, when it

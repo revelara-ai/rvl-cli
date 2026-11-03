@@ -140,6 +140,11 @@ You do not need to run `rvl sync` by hand:
 
 - `rvl init` syncs both tiers (the commercial one only with a key) before it
   finishes. A failed fetch does not fail init; it says to run `rvl sync`.
+- A scan on a machine with no spec cache installed syncs both tiers before
+  it loads, and waits for it: a cache with nothing in it cannot scan. This
+  happens once, and in CI too, since there is no previous corpus to keep
+  reproducible. A failed fetch leaves the scan to exit `1` naming
+  `rvl sync`; with `RVL_OFFLINE=1` it does not fetch, and says so.
 - A scan on the signed cache starts at most one background check every six
   hours, after the scan has finished. The scan never waits for it, and a
   failed check is silent. The last check time is `auto-sync.stamp` in the

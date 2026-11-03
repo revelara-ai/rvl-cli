@@ -1,0 +1,165 @@
+name: Reference gate job
+
+# Runs the reference CI job users copy, docs/examples/rvl-gate.yml, against a
+# fixture repository (ci/gate-fixture.sh), so the job the docs ship is a job
+# that works. The steps of the `rvl-gate` job below are the example's steps,
+# as written, with steps named `ci-only: ...` added and one `if:` on the
+# install step; the `reference_ci_job` test fails on any other difference.
+#
+# A pull request builds rvl from its own tree and puts that build on PATH in
+# place of the install step, so a change to the scan path is proven through
+# the job users run. The weekly run and the run after each release use the
+# real install step: the pinned release archive, from GitHub.
+#
+# Its own workflow, not a job of ci.yml: it reads the production spec cache,
+# so it reports on pull requests and does not gate the merge queue.
+
+on:
+  pull_request:
+    paths:
+      - docs/examples/rvl-gate.yml
+      - .github/workflows/rvl-gate-reference.yml
+      - ci/gate-fixture.sh
+      - ci/smoke/repo/**
+      - ci/fetch-libclang.sh
+      - ci/fetch-onnxruntime.sh
+      - crates/**
+      - helpers/**
+      - Cargo.toml
+      - Cargo.lock
+  schedule:
+    - cron: "41 5 * * 1"
+  # After a release. A release is published with the run's own token, which
+  # starts no `release` event workflow, so this follows the Release run.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rvl-gate:
+    # Release also runs, plan-only, on pull requests: follow a tag's
+    # successful run only.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The example's steps run in the fixture repository, as they would at the
+    # root of a user's checkout.
+    defaults:
+      run:
+        working-directory: gate-fixture
+    steps:
+      # On pull_request this checks out refs/pull/N/merge: the PR head merged
+      # with the current base, not the PR head alone. Full history, so the
+      # base ref that --changed-only diverges from is reachable.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "ci-only: build the fixture repository"
+        working-directory: .
+        run: ci/gate-fixture.sh gate-fixture
+
+      # The fixture has Go, and the Go lane runs the `go` tool, as a Go
+      # repository's own job sets it up.
+      - name: "ci-only: set up Go for the fixture"
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+
+      - name: "ci-only: cache the build of this pull request"
+        if: github.event_name == 'pull_request'
+        uses: Swatinem/rust-cache@v2
+
+      # The archive's layout from this tree: rvl, cindex and rustindex from
+      # cargo, goindex from Go, and the pinned libclang and ONNX Runtime a
+      # release vendors, all in one directory on PATH.
+      - name: "ci-only: install rvl from this pull request"
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          cargo build -p rvl --bins
+          go build -C helpers/goindex -o "$PWD/target/debug/goindex" .
+          ci/fetch-libclang.sh x86_64-unknown-linux-gnu target/debug
+          ci/fetch-onnxruntime.sh x86_64-unknown-linux-gnu target/debug
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+
+      # rvl, pinned to a release. The archive holds rvl and every helper it
+      # carries (goindex, cindex, rustindex) with the vendored libclang/ and
+      # onnxruntime/ beside them, so putting its directory on PATH is the
+      # whole install. Checked against the release's own sha256 before it is
+      # unpacked. A lane still needs its language's toolchain on the runner:
+      # `go` for Go, python3 for Python (on the image), node for TypeScript.
+      - name: Install rvl
+        if: github.event_name != 'pull_request'
+        env:
+          RVL_VERSION: v1.10.1
+          RVL_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/revelara-ai/rvl-cli/releases/download/$RVL_VERSION"
+          curl -fsSL --retry 3 -O "$base/rvl-$RVL_TARGET.tar.xz"
+          curl -fsSL --retry 3 -O "$base/rvl-$RVL_TARGET.tar.xz.sha256"
+          sha256sum -c "rvl-$RVL_TARGET.tar.xz.sha256"
+          tar -xJf "rvl-$RVL_TARGET.tar.xz"
+          echo "$RUNNER_TEMP/rvl-$RVL_TARGET" >> "$GITHUB_PATH"
+
+      # The signed spec cache, kept between runs so a sync is a conditional
+      # GET that usually answers "up to date". A new key each run saves the
+      # synced cache; the prefix restores the newest one.
+      - name: Restore the spec cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.revelara/cache/specs
+          key: rvl-spec-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: rvl-spec-cache-${{ runner.os }}-
+
+      # Brings the cache up to date: the OSS tier needs no key, and the
+      # commercial tier syncs with RVL_API_KEY. It exits non-zero when it
+      # refreshed nothing, which fails the job before a scan runs on a stale
+      # or missing corpus.
+      - name: Sync the spec cache
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: rvl sync
+
+      # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
+      # lane that could not read the code (exit 4 without --strict, when it
+      # read none). All fail the job. A pull_request
+      # event exports GITHUB_BASE_REF; a merge_group event does not, so the
+      # base is passed in.
+      - name: Gate the change
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+          RVL_BASE_REF: ${{ github.event.merge_group.base_sha }}
+        run: rvl scan . --incremental --changed-only --strict
+
+      # The coverage assertion: every lane rvl claimed to scan read at least
+      # one site. A full scan, because the incremental path has no roll-call.
+      # Exit 3 is tolerated here: this step asks "was the code read", and the
+      # step above already gave the verdict on the change.
+      - name: Assert coverage
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: |
+          rvl scan . --strict --out findings.json || [ "$?" -eq 3 ]
+          jq -e '.coverage.lang_status
+                 | all(.state == "scanned" and ((.detail | tonumber?) // 0) > 0)' \
+            findings.json

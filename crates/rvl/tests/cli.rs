@@ -9072,7 +9072,14 @@ fn gating_docs_ship_the_reference_ci_job_verbatim() {
         gating.contains(job.trim_end()),
         "docs/gating.md must carry docs/examples/rvl-gate.yml verbatim"
     );
-    for needle in ["pull_request", "merge_group", "--strict", "lang_status"] {
+    for needle in [
+        "pull_request",
+        "merge_group",
+        "--strict",
+        "lang_status",
+        "sha256sum -c",
+        "rvl sync",
+    ] {
         assert!(job.contains(needle), "reference job must mention {needle}");
     }
 }

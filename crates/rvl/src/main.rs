@@ -3627,11 +3627,13 @@ fn findings_from_sites(
                 Some((base, overlay)) => (base, overlay, judgments, commercial_loaded),
                 None if tier_filter == TierFilter::OssOnly => anyhow::bail!(
                     "--oss-only needs the OSS tier, and it is not installed or did not \
-                     verify: run '{BIN} sync' (the OSS vocabulary tier needs no API key)"
+                     verify: run '{BIN} sync' (the OSS vocabulary tier needs no API key){}",
+                    autosync::offline_note()
                 ),
                 None => anyhow::bail!(
                     "no spec cache tier loadable: run '{BIN} sync' \
-                     (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
+                     (the OSS vocabulary tier needs no API key), or '{BIN} cache import'{}",
+                    autosync::offline_note()
                 ),
             }
         }
@@ -8454,6 +8456,10 @@ fn run() -> anyhow::Result<ExitCode> {
                  built with test paths skipped, so a warm scan cannot honor it for the whole \
                  repository. Re-run without --incremental to scan test code."
             );
+            // After every flag check, so a usage error never waits on a fetch.
+            if specs_file.is_none() {
+                autosync::sync_if_empty(&cfg, &store, &keyset, tiers)?;
+            }
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
             let result = if incremental && retrieved.is_none() {
