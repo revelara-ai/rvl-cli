@@ -36,6 +36,31 @@ pub fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Whether a `.revelara.yaml` `expires:` value is still in force at `today`
+/// ("YYYY-MM-DD"). An empty or malformed value is open-ended; otherwise in
+/// force through the date itself. Shared by the scanner's waiver engine and
+/// the scan submission's applied-waiver report so the two cannot disagree on
+/// which waivers are live.
+pub fn expiry_active(expires: &str, today: &str) -> bool {
+    let expires = expires.trim();
+    if expires.is_empty() || !is_ymd(expires) {
+        return true;
+    }
+    today.trim() <= expires
+}
+
+/// A `YYYY-MM-DD` shape (digits and dashes at fixed positions). ISO dates
+/// sort lexically, so a string compare is exact once both sides pass this.
+fn is_ymd(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +72,13 @@ mod tests {
             assert_eq!(days_from_civil(&s), Some(day), "round trip failed for {s}");
         }
         assert_eq!(civil_from_days(20664), "2026-07-30");
+    }
+
+    #[test]
+    fn expiry_active_through_the_date_and_open_ended_when_unset_or_malformed() {
+        assert!(expiry_active("2026-12-31", "2026-12-31"));
+        assert!(!expiry_active("2026-12-31", "2027-01-01"));
+        assert!(expiry_active("", "2027-01-01"));
+        assert!(expiry_active("someday", "2027-01-01"));
     }
 }
