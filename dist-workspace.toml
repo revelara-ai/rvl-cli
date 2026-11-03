@@ -7,6 +7,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# .github/workflows/release.yml is kept by hand from the generated copy: the
+# generated one interpolates the tag into `run:` bodies and passes
+# `secrets: inherit`, and this repository's Semgrep gate fails both. Without
+# this, `dist plan` (in ci.yml and in the release) fails on any difference. The
+# header of release.yml lists the edits and how to take a cargo-dist upgrade.
+allow-dirty = ["ci"]
 # The installers to generate for each app.
 #
 # Deliberately EMPTY, and specifically NOT ["homebrew"]. cargo-dist 0.32 can

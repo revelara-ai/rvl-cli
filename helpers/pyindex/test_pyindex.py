@@ -22,7 +22,9 @@ FIXTURE_ROOT = os.path.join(HERE, "testdata", "fixture")
 
 def _run(*args):
     """Invoke the CLI as a subprocess; return (returncode, stdout, stderr)."""
-    proc = subprocess.run(
+    # The argv is this interpreter, the script beside this file and the test's
+    # own arguments, as a list with no shell: nothing outside the test reaches it.
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit
         [sys.executable, PYINDEX, *args],
         capture_output=True, text=True)
     return proc.returncode, proc.stdout, proc.stderr

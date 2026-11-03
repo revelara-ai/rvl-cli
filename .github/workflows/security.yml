@@ -149,6 +149,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
+        # rustup's documented installer, over https with TLS 1.2 or later, run only
+        # on a runner without rustup. Pinning its checksum is a follow-up.
+        # nosemgrep: gha-curl-pipe-shell
         run: |
           # As in ci.yml: the self-hosted fleet may not have rustup.
           if ! command -v rustup >/dev/null 2>&1; then
