@@ -1,11 +1,23 @@
 # Privacy
 
-Code never leaves the machine. `rvl` is open source, so this claim
-can be verified in the code. This page covers the channels that exist
-and what each can carry: the shape-only report attached to the deterministic
-scan, the explicitly separate, flag-gated
-[submission mode](#submission-mode), and the
+`rvl` never uploads your repositories or source files. `rvl` is open
+source, so this can be verified in the code. A local scan sends nothing
+today; the only payload it is designed to report is API shape
+(`client_type`, `method`, `lang`, `site_count`). Submission mode, which
+needs an API key, sends findings, and their text can quote short excerpts
+of code.
+
+This page covers the channels that exist and what each can carry: the
+shape-only report attached to the deterministic scan and the agent
+telemetry, both local-only today; the explicitly separate, flag-gated
+[submission mode](#submission-mode); and the
 [platform queries](#platform-queries), which send only what the caller typed.
+
+When you run `rvl` with an AI coding agent (`--blend`, the `/rvl:scan`
+lenses), the agent reads your code, or `rvl` hands it excerpts, and the
+agent sends them to its model provider. The agent acts for you, under your
+agreement with that provider; it is not a Revelara channel and this page
+does not cover it.
 
 When a scan reports the unknown API surfaces it could not decide (no spec
 exists yet), the payload carries only the API shape (`client_type`,
@@ -112,8 +124,10 @@ API above an API that many repositories share. The combined list also sums
 the three counts above. If a file is not a report payload, the command
 fails and names the file.
 
-The "code never leaves" claim above is scoped to the deterministic scan and
-this report preview. The one surface that deliberately sends more is below.
+"A local scan sends nothing" above covers the deterministic scan, this
+report preview and the agent telemetry, which `rvl` writes to a local file
+(`agent-telemetry.jsonl`) with run identity and API shape only. The one
+surface that deliberately sends more is submission mode, below.
 
 ## Credential values
 
@@ -144,11 +158,16 @@ A value that is not a literal, such as `password=os.environ['PW']`, is kept.
 register at the Revelara API. This is a deliberate, flag-gated operation:
 it never happens as a side effect of a local scan, and it requires an API
 key. Its payload is intentionally richer than the shape-only report: the
-findings themselves (titles, descriptions, severities, file paths),
+findings themselves (titles, descriptions, evidence, severities, file
+paths and line numbers),
 service/team/component attribution, and repo metadata (`git_commit`,
 `git_branch` from the `--target` directory), optionally plus a control
 structure (`--cs-file`). That is the point of the feature: a risk register
-needs to say where the risk lives.
+needs to say where the risk lives. A finding's title, description and
+evidence are written by the agent that found the risk, and they can quote
+a short excerpt of the code or configuration at the site. Credential values
+in them are redacted ([above](#credential-values)). Repositories and source
+files are not uploaded.
 
 Use `--dry-run` to validate and print the exact submit summary without
 sending anything. The shape-only report contract above is unaffected:
