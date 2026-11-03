@@ -70,9 +70,10 @@ note: no API key; the commercial judgment lanes were not synced.
 Everything local works without credentials: `rvl scan`, `rvl doctor`,
 `rvl explain`, `rvl suppress`, `rvl report`, `rvl index`, `rvl hook`. Once
 synced, a scan works offline; `RVL_OFFLINE=1` disables all network fetches
-if you want to guarantee it. After that first sync the cache keeps itself
-current: `rvl init` syncs, and a scan starts a background check at most every
-six hours that applies from the next scan (see
+if you want to guarantee it. A scan that finds no cache installed syncs one
+first. After that first sync the cache keeps itself current: `rvl init`
+syncs, and a scan starts a background check at most every six hours that
+applies from the next scan (see
 [Keeping the cache current](configuration.md#keeping-the-cache-current)).
 
 To set a repo up properly, run `rvl init` once. It writes `.revelara.yaml`
@@ -136,8 +137,9 @@ check the free experience before you publish.
 `--oss-only` is a load filter. `rvl sync` still syncs both tiers and nothing
 is uninstalled, so the next scan without the flag uses both tiers again. Each
 run prints a note on stderr that the commercial tier was not loaded. If the
-OSS tier is not installed the scan fails and tells you to run `rvl sync`; it
-does not fall back to the commercial tier. The flag cannot be combined with
+OSS tier is not installed the scan syncs first, and if it still does not
+load, fails and tells you to run `rvl sync`; it does not fall back to the
+commercial tier. The flag cannot be combined with
 `--specs-file` or `--judgments`, which bypass the tiers.
 
 `rvl explain` and `rvl suppress` resolve an id from the last scan, so they

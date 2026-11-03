@@ -262,6 +262,14 @@ impl CacheStore {
         CacheStore::open(&self.root.join(name))
     }
 
+    /// Whether an artifact sits in either slot, verified or not. False is the
+    /// cache a first run has: nothing was ever synced or imported here.
+    pub fn is_installed(&self) -> bool {
+        ["current", "last-good"]
+            .iter()
+            .any(|slot| self.dir(slot).join(ARTIFACT).is_file())
+    }
+
     /// sha256 hex of the currently installed artifact bytes, if any.
     pub fn current_hash(&self) -> Option<String> {
         std::fs::read(self.dir("current").join(ARTIFACT))

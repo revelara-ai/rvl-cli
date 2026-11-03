@@ -1,0 +1,89 @@
+name: Reference job
+
+# Runs docs/examples/rvl-gate.yml, the CI job users copy, on a fixture
+# repository (a git copy of ci/smoke/repo, with a change on a branch). The
+# runner is crates/rvl/tests/reference_ci_job.rs: it runs the job's `run:`
+# steps in order, the way a runner would, and checks that the sync installed
+# the spec cache where the job's cache step saves it and that every helper
+# came from beside rvl.
+#
+#   * pull_request (one that touches the job, its runner or the fixture): the
+#     pull request's own build stands in for the release archive. It is laid
+#     out as the archive is, rvl with goindex, cindex, rustindex and the
+#     pinned libclang/ beside it, and the job's install step is skipped.
+#   * schedule: the job as written, installing the release it pins, so a
+#     release that went missing or an archive that stopped carrying a helper
+#     is caught.
+#   * after each Release run on a tag: the job installs that release.
+#
+# Every mode needs the network: `rvl sync` fetches the OSS spec cache, which
+# needs no API key. No secret is passed, so the scan runs on the OSS tier.
+
+on:
+  pull_request:
+    paths:
+      - docs/examples/rvl-gate.yml
+      - .github/workflows/reference-job.yml
+      - crates/rvl/tests/reference_ci_job.rs
+      - ci/smoke/repo/**
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  reference-job:
+    # After a Release run: only a tag push that published. A Release run on a
+    # pull request only plans.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # goindex drives the `go` tool at scan time, in every mode; on a pull
+      # request it is also built here.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: helpers/goindex/go.mod
+          cache-dependency-path: helpers/goindex/go.sum
+
+      - name: Lay out this pull request's build as the archive is
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          cargo build -p rvl
+          dir=$RUNNER_TEMP/rvl-build
+          mkdir -p "$dir"
+          cp target/debug/rvl target/debug/cindex target/debug/rustindex "$dir/"
+          CGO_ENABLED=0 go build -C helpers/goindex -trimpath -o "$dir/goindex" .
+          ci/fetch-libclang.sh x86_64-unknown-linux-gnu "$dir"
+          echo "RVL_REFERENCE_JOB_RVL_DIR=$dir" >> "$GITHUB_ENV"
+
+      # A Release run on a tag carries the tag as its head branch.
+      - name: Install the release that just published
+        if: github.event_name == 'workflow_run'
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch }}
+        run: echo "RVL_REFERENCE_JOB_VERSION=$TAG" >> "$GITHUB_ENV"
+
+      - name: Run the reference job on the fixture
+        run: cargo test -p rvl --test reference_ci_job -- --include-ignored --nocapture

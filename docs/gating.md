@@ -127,6 +127,9 @@ permissions:
 jobs:
   rvl-gate:
     runs-on: ubuntu-latest
+    env:
+      # The rvl release this job installs. Bump it to upgrade.
+      RVL_VERSION: v1.10.1
     steps:
       # On pull_request this checks out refs/pull/N/merge: the PR head merged
       # with the current base, not the PR head alone. Full history, so the
@@ -135,8 +138,42 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Put `rvl` on PATH here, pinned to a version. See "Install" in the rvl
-      # README for the supported channels.
+      # The release archive of RVL_VERSION, checked against the .sha256
+      # published beside it. It carries rvl and every helper a lane needs
+      # (goindex, cindex, rustindex, the vendored libclang/), so the
+      # directory it unpacks to goes on PATH as it is.
+      - name: Install rvl
+        id: install
+        run: |
+          set -euo pipefail
+          archive=rvl-x86_64-unknown-linux-gnu.tar.xz
+          base=https://github.com/revelara-ai/rvl-cli/releases/download/$RVL_VERSION
+          cd "$RUNNER_TEMP"
+          curl -fsSLO --retry 3 "$base/$archive"
+          curl -fsSLO --retry 3 "$base/$archive.sha256"
+          echo "$(cut -d ' ' -f 1 "$archive.sha256")  $archive" | sha256sum -c -
+          tar -xJf "$archive"
+          echo "$RUNNER_TEMP/${archive%.tar.xz}" >> "$GITHUB_PATH"
+
+      # The spec cache (rvl's default RVL_CACHE_DIR), kept between runs so
+      # the sync below is a cheap "not modified" most of the time. A new key
+      # each run saves the synced cache; the prefix restores the latest one.
+      - uses: actions/cache@v5
+        with:
+          path: ~/.revelara/cache/specs
+          key: rvl-spec-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: rvl-spec-cache-${{ runner.os }}-
+
+      # Fetch the signed spec cache, or confirm it is current. Without an
+      # API key this is the OSS tier alone, and every finding is advisory.
+      # A failed fetch is a warning: a restored cache still verifies and
+      # scans, and with no cache the scan below tries the sync again and
+      # exits 1 when it cannot.
+      - name: Sync the spec cache
+        id: sync
+        env:
+          RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
+        run: rvl sync || echo "::warning::rvl sync failed; scanning with the cached spec cache"
 
       # The verdict. Exit 3 is blocking findings; exit 1 under --strict is a
       # lane that could not read the code (exit 4 without --strict, when it
@@ -144,6 +181,7 @@ jobs:
       # event exports GITHUB_BASE_REF; a merge_group event does not, so the
       # base is passed in.
       - name: Gate the change
+        id: gate
         env:
           RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
           RVL_BASE_REF: ${{ github.event.merge_group.base_sha }}
@@ -154,6 +192,7 @@ jobs:
       # Exit 3 is tolerated here: this step asks "was the code read", and the
       # step above already gave the verdict on the change.
       - name: Assert coverage
+        id: coverage
         env:
           RVL_API_KEY: ${{ secrets.REVELARA_API_KEY }}
         run: |
@@ -164,6 +203,27 @@ jobs:
 ```
 
 The rest of this section explains each line of it.
+
+The job installs rvl from the release archive of the version in
+`RVL_VERSION`, after checking it against the `.sha256` published beside it.
+The archive carries what every lane needs (`goindex`, `cindex` and its
+vendored `libclang/`, `rustindex`), and nothing is piped to a shell. To
+upgrade, bump `RVL_VERSION`. The job names the Linux x86_64 archive. On an
+arm64 runner, use `rvl-aarch64-unknown-linux-gnu.tar.xz`.
+
+A scan needs a spec cache, and a fresh runner has none. The cache step keeps
+`~/.revelara/cache/specs` between runs, and `rvl sync` then fetches the
+signed cache or confirms it is current. When the cache is restored, the sync
+costs one conditional request. A scan that finds no cache installed also
+syncs before it scans, so a job without the sync step still runs. With
+`RVL_OFFLINE` set it cannot sync, so it exits `1` with a message that names
+`rvl sync` (a repository with nothing but content files still gets the
+content lane's verdict, which needs no cache).
+
+This repository runs the job on a fixture in its own CI
+(`.github/workflows/reference-job.yml`): with each pull request's build when
+the pull request changes the job, and with the pinned release on a schedule
+and after each release.
 
 Credentials come from the environment, so CI needs no `rvl login`:
 
