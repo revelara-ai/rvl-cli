@@ -667,6 +667,7 @@ pub fn gate_findings(
                 fix: String::new(),
                 site_count: 1,
                 example_sites: Vec::new(),
+                sites: vec![s.file_line.clone()],
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,

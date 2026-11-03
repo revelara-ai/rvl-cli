@@ -865,6 +865,164 @@ fn path_scoped_waiver_matches_the_finding_file() {
     );
 }
 
+/// One secret class, two different tokens: one in `a.toml`, one in `b.toml`.
+/// Scans with a `secret.github_token` waiver whose `paths:` line is `paths`
+/// (none when empty) and returns (exit code, stdout, the `--out` document,
+/// the temp dir holding the cache and home, the repo root).
+fn scan_two_secret_files(
+    paths: &str,
+) -> (
+    Option<i32>,
+    String,
+    serde_json::Value,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Fake tokens, assembled so no token-shaped literal sits in this source.
+    for (file, body) in [
+        ("a.toml", "AbCd1234EfGh5678IjKl9012MnOp3456QrSt"),
+        ("b.toml", "ZyXw9876VuTs5432RqPo1098NmLk7654JiHg"),
+    ] {
+        let token = ["ghp", "_", body].concat();
+        std::fs::write(repo.join(file), format!("token = \"{token}\"\n")).unwrap();
+    }
+    let scope = if paths.is_empty() {
+        String::new()
+    } else {
+        format!("    paths: {paths}\n")
+    };
+    std::fs::write(
+        repo.join(".revelara.yaml"),
+        format!(
+            "scanner:\n  waivers:\n  - matcher: secret.github_token\n    reason: fixture\n{scope}"
+        ),
+    )
+    .unwrap();
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    (out.status.code(), stdout, doc, dir, repo)
+}
+
+/// The `--out` rows of class `secret.github_token`.
+fn github_token_rows(doc: &serde_json::Value) -> Vec<&serde_json::Value> {
+    doc["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["class"] == "secret.github_token")
+        .collect()
+}
+
+/// A path waiver is judged for each site of a row, not for its first site:
+/// a waiver for `a.toml` must not hide the token in `b.toml`, which sorts
+/// after it. The ladder, the document's `exit` and the process agree, and
+/// the row keeps its id, so the printed `explain:` hint and `suppress`
+/// resolve it from the last scan.
+#[test]
+fn a_path_waiver_for_the_first_site_keeps_the_later_site_blocking() {
+    let (code, stdout, doc, dir, _repo) = scan_two_secret_files("[\"a.toml\"]");
+    assert_eq!(code, Some(EXIT_BLOCKED), "{stdout}");
+    assert_eq!(doc["exit"], EXIT_BLOCKED, "{doc:#}");
+    assert!(stdout.contains("b.toml:1"), "{stdout}");
+    assert!(!stdout.contains("a.toml"), "{stdout}");
+    let rows = github_token_rows(&doc);
+    let blocking: Vec<_> = rows
+        .iter()
+        .filter(|f| f["severity"] == "blocking")
+        .collect();
+    assert_eq!(blocking.len(), 1, "{rows:#?}");
+    assert_eq!(blocking[0]["site"], "b.toml:1", "{rows:#?}");
+    assert_eq!(blocking[0]["site_count"], 1, "{rows:#?}");
+    let suppressed: Vec<_> = rows
+        .iter()
+        .filter(|f| f["severity"] == "suppressed")
+        .collect();
+    assert_eq!(suppressed.len(), 1, "{rows:#?}");
+    assert_eq!(suppressed[0]["site"], "a.toml:1", "{rows:#?}");
+    assert_ne!(suppressed[0]["id"], blocking[0]["id"], "{rows:#?}");
+
+    let id = blocking[0]["id"].as_str().unwrap();
+    assert!(stdout.contains(&format!("explain {id}")), "{stdout}");
+    let explain = bin()
+        .args(["explain", id])
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let explained = String::from_utf8_lossy(&explain.stdout);
+    assert!(explain.status.success(), "{explained}");
+    assert!(explained.contains("b.toml:1"), "{explained}");
+    assert!(!explained.contains("a.toml"), "{explained}");
+
+    let suppress = bin()
+        .args(["suppress", id, "--reason", "fixture"])
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("failed to run rvl");
+    let suppressed = String::from_utf8_lossy(&suppress.stdout);
+    assert!(suppress.status.success(), "{suppressed}");
+    assert!(
+        suppressed.contains(&format!("waived rule `secret.github_token` (finding {id})")),
+        "{suppressed}"
+    );
+}
+
+/// The mirror case: a waiver for the later site keeps the first one, as it
+/// did before the waiver was judged per site.
+#[test]
+fn a_path_waiver_for_the_later_site_keeps_the_first_site_blocking() {
+    let (code, stdout, doc, _dir, _repo) = scan_two_secret_files("[\"b.toml\"]");
+    assert_eq!(code, Some(EXIT_BLOCKED), "{stdout}");
+    assert_eq!(doc["exit"], EXIT_BLOCKED, "{doc:#}");
+    let rows = github_token_rows(&doc);
+    let blocking: Vec<_> = rows
+        .iter()
+        .filter(|f| f["severity"] == "blocking")
+        .collect();
+    assert_eq!(blocking.len(), 1, "{rows:#?}");
+    assert_eq!(blocking[0]["site"], "a.toml:1", "{rows:#?}");
+    assert_eq!(blocking[0]["site_count"], 1, "{rows:#?}");
+}
+
+/// A path waiver that covers every site of a row suppresses the row whole.
+#[test]
+fn a_path_waiver_covering_every_site_suppresses_the_row() {
+    let (code, stdout, doc, _dir, _repo) = scan_two_secret_files("[\"a.toml\", \"b.toml\"]");
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(doc["exit"], 0, "{doc:#}");
+    let rows = github_token_rows(&doc);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["severity"], "suppressed", "{rows:#?}");
+    assert_eq!(rows[0]["site_count"], 2, "{rows:#?}");
+}
+
+/// A class waiver with no `paths:` suppresses the row whole, as before.
+#[test]
+fn a_class_waiver_without_paths_suppresses_the_row() {
+    let (code, stdout, doc, _dir, _repo) = scan_two_secret_files("");
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(doc["exit"], 0, "{doc:#}");
+    let rows = github_token_rows(&doc);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["severity"], "suppressed", "{rows:#?}");
+    assert_eq!(rows[0]["site_count"], 2, "{rows:#?}");
+}
+
 // --- exit-code contract (po-av01j.94) ---
 //
 // `rvl scan` is wired into pre-commit hooks and CI gates, so its exit code

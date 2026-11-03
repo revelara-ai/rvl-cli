@@ -3,6 +3,8 @@
 // The render module is compiled into the binary crate; the integration test
 // exercises it through a thin re-export path is not available, so these unit
 // tests live alongside via `include!` of the source under test.
+// The binary reads fields this test does not (a row's `sites`).
+#[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
 
@@ -21,6 +23,7 @@ fn f(id_seed: &str, sev: &str, disp: &str, crit: u32) -> Finding {
         fix: "set a Timeout or thread a ctx deadline".into(),
         site_count: 3,
         example_sites: vec!["a.go:1".into(), "b.go:2".into()],
+        sites: vec!["a.go:1".into(), "b.go:2".into()],
         class_rule: "pkg.T.M".into(),
         suppressed: false,
         gate_exempt: false,
