@@ -26,6 +26,11 @@ on:
         description: "cargo-dist plan manifest (unused directly; the manifests are read from the run's artifacts)"
         required: true
         type: string
+    # Passed by name from release.yml, which does not use `secrets: inherit`.
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: "PAT with write access to revelara-ai/homebrew-tap"
+        required: true
 
 jobs:
   publish-cask:

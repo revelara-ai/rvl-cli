@@ -1,128 +1,298 @@
-//! The reference CI job users copy, docs/examples/rvl-gate.yml, is run by
-//! .github/workflows/rvl-gate-reference.yml against a fixture repository. That
-//! proves the example only while the workflow runs the example's steps, so
-//! this holds them to each other: the workflow's `rvl-gate` steps are the
-//! example's, as written, plus steps named `ci-only: ...`, and the install
-//! step's one addition is the `if:` that hands a pull request's run to the
-//! build of that pull request.
+//! THE REFERENCE CI JOB RUNS. docs/examples/rvl-gate.yml is the job users
+//! copy, so it is tested as a job, not only read.
+//!
+//! [`the_reference_job_has_the_on_ramp_steps`] runs on every `cargo test`:
+//! the job installs a pinned release archive and checks its .sha256, keeps
+//! the spec cache between runs, syncs, then gates.
+//!
+//! [`the_reference_job_runs_on_a_fixture`] runs the job's `run:` steps in
+//! order, the way a runner would, on a git copy of ci/smoke/repo (Go, C and
+//! Python, so goindex, cindex and its libclang are all exercised). The
+//! rvl-gate workflow runs it; it needs the network, for the release download
+//! and for `rvl sync`. What it emulates of a runner:
+//!
+//!   * `uses:` steps are skipped (checkout is the fixture copy, and the cache
+//!     step's path is checked to be where the sync wrote);
+//!   * the job's and each step's `env:` apply, and an `${{ }}` value is empty:
+//!     no secret, no event payload, so the scan runs on the OSS tier;
+//!   * `$GITHUB_PATH` lines prepend to PATH for later steps, as on a runner;
+//!   * each step runs as `bash --noprofile --norc -eo pipefail`, the runner's
+//!     default shell, in the repository, with HOME and RUNNER_TEMP scratch.
+//!
+//! [`RVL_DIR_ENV`] names a directory holding a build of rvl and its helpers.
+//! When set, the `install` step is skipped and that directory goes on PATH
+//! instead: a pull request tests its own build. Unset, the step downloads the
+//! release archive. [`VERSION_ENV`] replaces the job's `RVL_VERSION`, so a
+//! run after a release installs that release.
 
-use serde_yaml::Value;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-const CI_ONLY: &str = "ci-only: ";
-const INSTALL: &str = "Install rvl";
-const STAND_IN: &str = "ci-only: install rvl from this pull request";
+/// A directory with rvl and its helpers, used in place of the install step.
+const RVL_DIR_ENV: &str = "RVL_REFERENCE_JOB_RVL_DIR";
+/// A release tag that replaces the job's `RVL_VERSION`.
+const VERSION_ENV: &str = "RVL_REFERENCE_JOB_VERSION";
 
-fn load(rel: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
-    serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parsing {rel}: {e}"))
+/// The step ids the on-ramp needs, in the order it needs them.
+const STEP_IDS: &[&str] = &["install", "sync", "gate", "coverage"];
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into()),
+    )
+    .join("../..")
 }
 
-fn steps(doc: &Value) -> Vec<Value> {
-    doc["jobs"]["rvl-gate"]["steps"]
+/// The `rvl-gate` job of docs/examples/rvl-gate.yml.
+fn job() -> serde_yaml::Value {
+    let path = workspace_root().join("docs/examples/rvl-gate.yml");
+    let text = std::fs::read_to_string(&path).expect("docs/examples/rvl-gate.yml must exist");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("the reference job parses");
+    doc["jobs"]["rvl-gate"].clone()
+}
+
+fn steps(job: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
+    job["steps"]
         .as_sequence()
-        .expect("a `rvl-gate` job with steps")
+        .expect("the job has steps")
         .clone()
 }
 
-fn name(step: &Value) -> &str {
-    step["name"].as_str().unwrap_or_default()
+fn step_id(step: &serde_yaml::Value) -> Option<&str> {
+    step["id"].as_str()
+}
+
+fn run_text(step: &serde_yaml::Value) -> &str {
+    step["run"].as_str().unwrap_or_default()
+}
+
+/// A mapping of `env:` as strings, an `${{ }}` expression as empty.
+fn env_of(v: &serde_yaml::Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in v.as_mapping().into_iter().flatten() {
+        let k = k.as_str().unwrap_or_default().to_string();
+        let v = match v {
+            serde_yaml::Value::String(s) if s.contains("${{") => String::new(),
+            serde_yaml::Value::String(s) => s.clone(),
+            other => serde_yaml::to_string(other).unwrap().trim().to_string(),
+        };
+        out.insert(k, v);
+    }
+    out
 }
 
 #[test]
-fn the_reference_workflow_runs_the_example_steps_as_written() {
-    let example = steps(&load("docs/examples/rvl-gate.yml"));
-    let workflow = steps(&load(".github/workflows/rvl-gate-reference.yml"));
+fn the_reference_job_has_the_on_ramp_steps() {
+    let job = job();
+    let steps = steps(&job);
 
-    let install = workflow.iter().position(|s| name(s) == INSTALL);
-    let stand_in = workflow.iter().position(|s| name(s) == STAND_IN);
-    let (Some(install), Some(stand_in)) = (install, stand_in) else {
-        panic!("the workflow needs both `{INSTALL}` and `{STAND_IN}`");
-    };
-    assert_eq!(
-        stand_in + 1,
-        install,
-        "the stand-in runs where the install step does"
-    );
-    assert_eq!(
-        workflow[stand_in]["if"].as_str(),
-        Some("github.event_name == 'pull_request'")
-    );
-    assert_eq!(
-        workflow[install]["if"].as_str(),
-        Some("github.event_name != 'pull_request'"),
-        "every run that is not a pull request uses the real install step"
+    let version = env_of(&job["env"])
+        .remove("RVL_VERSION")
+        .unwrap_or_default();
+    let parts: Vec<&str> = version.strip_prefix('v').unwrap_or("").split('.').collect();
+    assert!(
+        parts.len() == 3 && parts.iter().all(|p| p.parse::<u32>().is_ok()),
+        "the job pins one release in its RVL_VERSION, as vX.Y.Z: {version:?}"
     );
 
-    let as_written: Vec<Value> = workflow
-        .into_iter()
-        .filter(|s| !name(s).starts_with(CI_ONLY))
-        .map(|mut s| {
-            if name(&s) == INSTALL {
-                s.as_mapping_mut().unwrap().remove("if");
-            }
-            s
-        })
-        .collect();
-    assert_eq!(
-        as_written, example,
-        "the workflow's steps, less its ci-only steps, must be the example's"
-    );
-}
-
-#[test]
-fn the_reference_workflow_runs_on_the_changes_it_proves() {
-    let on = &load(".github/workflows/rvl-gate-reference.yml")["on"];
-    let paths: Vec<&str> = on["pull_request"]["paths"]
-        .as_sequence()
-        .expect("pull_request paths")
+    let ids: Vec<&str> = steps.iter().filter_map(step_id).collect();
+    let ordered: Vec<&str> = ids
         .iter()
-        .filter_map(Value::as_str)
+        .copied()
+        .filter(|id| STEP_IDS.contains(id))
         .collect();
-    for want in [
-        "docs/examples/rvl-gate.yml",
-        ".github/workflows/rvl-gate-reference.yml",
-        "ci/gate-fixture.sh",
-        "crates/**",
-        "helpers/**",
+    assert_eq!(ordered, STEP_IDS, "the on-ramp steps, in order: {ids:?}");
+
+    let install = steps
+        .iter()
+        .find(|s| step_id(s) == Some("install"))
+        .unwrap();
+    let install = run_text(install);
+    for needle in [
+        "releases/download/$RVL_VERSION",
+        "rvl-x86_64-unknown-linux-gnu.tar.xz",
+        ".sha256",
+        "sha256sum -c",
+        "GITHUB_PATH",
     ] {
-        assert!(paths.contains(&want), "pull_request paths lack {want}");
+        assert!(
+            install.contains(needle),
+            "the install step must use {needle}: {install}"
+        );
     }
-    assert!(on["schedule"].is_sequence(), "a scheduled run");
+    let piped_to_shell = install.split('|').skip(1).any(|rest| {
+        let cmd = rest.split_whitespace().next().unwrap_or_default();
+        matches!(cmd, "sh" | "bash" | "zsh")
+    });
+    assert!(!piped_to_shell, "no curl-pipe-shell: {install}");
+
+    // The cache step comes before the sync and saves rvl's default cache.
+    let at = |pred: &dyn Fn(&serde_yaml::Value) -> bool| steps.iter().position(pred);
+    let cache = at(&|s| {
+        s["uses"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("actions/cache@"))
+    })
+    .expect("the job caches the spec cache");
+    let sync = at(&|s| step_id(s) == Some("sync")).unwrap();
+    assert!(cache < sync, "the cache is restored before the sync");
     assert_eq!(
-        on["workflow_run"]["workflows"][0].as_str(),
-        Some("Release"),
-        "a run after each release"
+        steps[cache]["with"]["path"].as_str(),
+        Some("~/.revelara/cache/specs"),
+        "the cache step saves the directory rvl syncs into by default"
     );
+    assert!(run_text(&steps[sync]).contains("rvl sync"));
+
+    // Untrusted input stays out of shell text: an expression goes through env.
+    for s in &steps {
+        assert!(
+            !run_text(s).contains("${{"),
+            "no expression in a run block: {s:?}"
+        );
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .args([
+            "-c",
+            "user.name=rvl",
+            "-c",
+            "user.email=rvl@example.invalid",
+        ])
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .expect("running git");
+    assert!(ok.success(), "git {args:?}");
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// ci/smoke/repo as a pull request: `main` holds the fixture, and the
+/// checked-out branch adds one more unbounded Python call on top.
+fn fixture_pr(work: &Path) -> PathBuf {
+    let repo = work.join("repo");
+    copy_dir(&workspace_root().join("ci/smoke/repo"), &repo);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["checkout", "-qb", "change"]);
+    let svc = repo.join("svc.py");
+    let mut text = std::fs::read_to_string(&svc).unwrap();
+    text.push_str("\n\ndef fetch_again(url):\n    return requests.get(url)\n");
+    std::fs::write(&svc, text).unwrap();
+    git(&repo, &["commit", "-qam", "change"]);
+    repo
 }
 
 #[test]
-fn the_example_installs_a_pinned_checked_archive_and_syncs_before_it_scans() {
-    let example = steps(&load("docs/examples/rvl-gate.yml"));
-    let at = |n: &str| {
-        example
-            .iter()
-            .position(|s| name(s) == n)
-            .unwrap_or_else(|| panic!("the example has no `{n}` step"))
-    };
-    let install = &example[at(INSTALL)];
-    let version = install["env"]["RVL_VERSION"].as_str().unwrap_or_default();
-    assert!(
-        version.starts_with('v') && version[1..].split('.').count() == 3,
-        "pinned to a release tag: {version:?}"
-    );
-    let run = install["run"].as_str().unwrap();
-    for needle in ["sha256sum -c", "tar -xJf", "$GITHUB_PATH"] {
-        assert!(run.contains(needle), "the install step lacks {needle}");
+#[ignore = "needs the network; the rvl-gate workflow runs it"]
+fn the_reference_job_runs_on_a_fixture() {
+    let job = job();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path();
+    let repo = fixture_pr(work);
+    let home = work.join("home");
+    let runner_temp = work.join("runner-temp");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&runner_temp).unwrap();
+    let github_path = work.join("github-path");
+    std::fs::write(&github_path, "").unwrap();
+
+    let mut job_env = env_of(&job["env"]);
+    if let Ok(v) = std::env::var(VERSION_ENV) {
+        if !v.trim().is_empty() {
+            job_env.insert("RVL_VERSION".into(), v.trim().to_string());
+        }
     }
+    let local_build = std::env::var_os(RVL_DIR_ENV).filter(|v| !v.is_empty());
+    let mut path_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = &local_build {
+        path_dirs.push(PathBuf::from(d));
+    }
+    let base_path = std::env::var_os("PATH").unwrap_or_default();
+
+    for step in steps(&job) {
+        let label = step["name"]
+            .as_str()
+            .or(step["uses"].as_str())
+            .unwrap_or("step")
+            .to_string();
+        if step["uses"].is_string() {
+            eprintln!("skip (uses:): {label}");
+            continue;
+        }
+        if local_build.is_some() && step_id(&step) == Some("install") {
+            eprintln!("skip (the local build is on PATH): {label}");
+            continue;
+        }
+        eprintln!("run: {label}");
+        let mut cmd = Command::new("bash");
+        cmd.args(["--noprofile", "--norc", "-eo", "pipefail", "-c"])
+            .arg(run_text(&step))
+            .current_dir(&repo);
+        // Nothing from the machine running the test may choose a helper, a
+        // cache or a base ref for the job.
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy().into_owned();
+            if k.starts_with("RVL_") || k.starts_with("GITHUB_") || k == "LIBCLANG_PATH" {
+                cmd.env_remove(&k);
+            }
+        }
+        let mut path = std::env::split_paths(&base_path).collect::<Vec<_>>();
+        let mut added: Vec<PathBuf> = std::fs::read_to_string(&github_path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        added.reverse();
+        added.extend(path_dirs.iter().cloned());
+        path.splice(0..0, added);
+        cmd.env("PATH", std::env::join_paths(path).unwrap())
+            .env("HOME", &home)
+            .env("RUNNER_TEMP", &runner_temp)
+            .env("GITHUB_PATH", &github_path)
+            .env("GITHUB_BASE_REF", "main")
+            .env("CI", "true")
+            .envs(&job_env)
+            .envs(env_of(&step["env"]));
+        let status = cmd.status().expect("running bash");
+        assert!(status.success(), "step `{label}` failed: {status}");
+    }
+
     assert!(
-        run.find("sha256sum -c") < run.find("tar -xJf"),
-        "checked before it is unpacked"
+        home.join(".revelara/cache/specs/oss/current/specs.json")
+            .is_file(),
+        "the sync must have installed the OSS tier where the cache step saves"
     );
-    assert!(at(INSTALL) < at("Restore the spec cache"));
-    assert!(at("Restore the spec cache") < at("Sync the spec cache"));
-    assert!(at("Sync the spec cache") < at("Gate the change"));
+    // Every helper the scan used sat beside the rvl it ran, so the archive
+    // (or the build standing in for it) carries what each lane needs.
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.join("findings.json")).unwrap()).unwrap();
+    let retrievers = doc["coverage"]["retrievers"].as_array().unwrap();
+    for lang in ["go", "c/c++"] {
+        let r = retrievers
+            .iter()
+            .find(|r| {
+                r["lang"]
+                    .as_str()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+            })
+            .unwrap_or_else(|| panic!("no {lang} retriever row: {retrievers:?}"));
+        assert_eq!(r["source"], "bundled", "{lang}: {r}");
+    }
 }

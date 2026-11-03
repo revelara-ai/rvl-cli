@@ -110,28 +110,7 @@ pub fn waiver_active(w: &Waiver, today: &str) -> bool {
 
 /// Shared expiry rule for waivers and bound declarations.
 fn expiry_active(expires: &str, today: &str) -> bool {
-    let expires = expires.trim();
-    if expires.is_empty() {
-        return true;
-    }
-    if !is_ymd(expires) {
-        // Unparseable expiry is treated as open-ended, like time.Parse err.
-        return true;
-    }
-    today.trim() <= expires
-}
-
-/// Validate a `YYYY-MM-DD` shape (digits + dashes at fixed positions). Range
-/// validation is unnecessary: any malformed value is treated as open-ended by
-/// `waiver_active`, matching rvl-cli's parse-error branch.
-fn is_ymd(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 10
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[0..4].iter().all(u8::is_ascii_digit)
-        && b[5..7].iter().all(u8::is_ascii_digit)
-        && b[8..10].iter().all(u8::is_ascii_digit)
+    rvl_core::civil::expiry_active(expires, today)
 }
 
 /// Match one glob against one path, mirroring `waiverMatchesPath` for a single

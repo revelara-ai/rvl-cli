@@ -71,6 +71,11 @@ pub struct Finding {
     pub site_count: usize,
     /// Extra example sites for the explain view.
     pub example_sites: Vec<String>,
+    /// Every site of the row, never empty: a path waiver is judged against
+    /// each one. Not persisted: waivers are applied before the last scan is
+    /// saved.
+    #[serde(skip)]
+    pub sites: Vec<String>,
     /// The waiver key for this finding: the class key `client_type.method`
     /// (e.g. `db.RLSPool.QueryRow`). Matched case-insensitively against
     /// `.revelara.yaml` waivers; also the value written by `rvl suppress`.

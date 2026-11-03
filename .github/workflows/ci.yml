@@ -54,6 +54,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
+        # rustup's documented installer, over https with TLS 1.2 or later, run only
+        # on a runner without rustup. Pinning its checksum is a follow-up.
+        # nosemgrep: gha-curl-pipe-shell
         run: |
           # GitHub-hosted images ship rustup; the self-hosted fleet was
           # provisioned for Go/Node, so a runner joining it may not have it.
@@ -86,6 +89,10 @@ jobs:
       # cargo-dist-version in dist-workspace.toml.
       - name: Install dist
         shell: bash
+        # Version-pinned release asset fetched over https with TLS 1.2 or later;
+        # the installer the dist project documents. Pinning its checksum is a
+        # follow-up.
+        # nosemgrep: gha-curl-pipe-shell
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
 
       - name: Release plan holds the rvl app alone

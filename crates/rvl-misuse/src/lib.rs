@@ -61,6 +61,9 @@ pub struct MisuseFinding {
     pub occurrences: usize,
     /// `file:line` evidence sites (capped at [`MAX_EVIDENCE`]).
     pub evidence: Vec<String>,
+    /// Every `file:line` site of the class, uncapped: what a path waiver is
+    /// judged against.
+    pub sites: Vec<String>,
     pub fix: String,
     /// `low` or `medium`, never "high": the retriever reads one function, so
     /// the lane is advisory by design.
@@ -211,6 +214,7 @@ pub fn evaluate(sites: &[Site], specs: &[MisuseSpec]) -> Vec<MisuseFinding> {
                 reason: format!("{occurrences} {what}, in {} function(s)", functions.len()),
                 occurrences,
                 evidence: g.sites.iter().take(MAX_EVIDENCE).map(|s| s.id()).collect(),
+                sites: g.sites.iter().map(|s| s.id()).collect(),
                 fix: format!("{fix} ({control})"),
                 severity: if g.medium { "medium" } else { "low" },
                 class,

@@ -70,10 +70,10 @@ note: no API key; the commercial judgment lanes were not synced.
 Everything local works without credentials: `rvl scan`, `rvl doctor`,
 `rvl explain`, `rvl suppress`, `rvl report`, `rvl index`, `rvl hook`. Once
 synced, a scan works offline; `RVL_OFFLINE=1` disables all network fetches
-if you want to guarantee it. A first scan with no cache syncs before it runs.
-After that first sync the cache keeps itself
-current: `rvl init` syncs, and a scan starts a background check at most every
-six hours that applies from the next scan (see
+if you want to guarantee it. A scan that finds no cache installed syncs one
+first. After that first sync the cache keeps itself current: `rvl init`
+syncs, and a scan starts a background check at most every six hours that
+applies from the next scan (see
 [Keeping the cache current](configuration.md#keeping-the-cache-current)).
 
 To set a repo up properly, run `rvl init` once. It writes `.revelara.yaml`
@@ -137,8 +137,9 @@ check the free experience before you publish.
 `--oss-only` is a load filter. `rvl sync` still syncs both tiers and nothing
 is uninstalled, so the next scan without the flag uses both tiers again. Each
 run prints a note on stderr that the commercial tier was not loaded. If the
-OSS tier is not installed the scan fails and tells you to run `rvl sync`; it
-does not fall back to the commercial tier. The flag cannot be combined with
+OSS tier is not installed the scan syncs first, and if it still does not
+load, fails and tells you to run `rvl sync`; it does not fall back to the
+commercial tier. The flag cannot be combined with
 `--specs-file` or `--judgments`, which bypass the tiers.
 
 `rvl explain` and `rvl suppress` resolve an id from the last scan, so they
@@ -584,11 +585,12 @@ runs as a scanner in their own right are not part of it yet, and the
 
 ## Privacy
 
-The deterministic scan runs entirely locally and your code never leaves the
-machine. The scanner is open source, so you can verify this in the code
-rather than take it on trust. The only thing a scan could ever report to
-Revelara is the shape of unknown API surfaces: exactly four fields per
-surface (client type, method name, language name, and a count of sites).
+The deterministic scan runs entirely locally, and `rvl` never uploads your
+repositories or source files. The scanner is open source, so you can verify
+this in the code rather than take it on trust. The only thing a scan could
+ever report to Revelara is the shape of unknown API surfaces: exactly four
+fields per surface (client type, method name, language name, and a count of
+sites).
 No source snippets, no file paths, no line numbers, nothing that identifies
 your repository. You can see the exact payload any time:
 
@@ -599,6 +601,10 @@ rvl report --json     # the exact JSON the wire would carry
 
 Reporting is local-only today: `rvl report` shows or writes the payload, it
 does not transmit it. `RVL_OFFLINE=1` disables every network fetch.
+Submission mode (`rvl scan --service`, API key required) is the exception:
+it sends findings whose text can quote short excerpts of code or
+configuration; `--dry-run` prints that payload without sending it. See
+[Privacy](privacy.md).
 
 The report leaves out surfaces that your repository declares itself and
 sites whose client type did not resolve. It gives a count for each. See

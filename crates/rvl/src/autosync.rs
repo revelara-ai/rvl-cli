@@ -8,17 +8,13 @@
 //! * While a scan loads its cache it enforces a CI pin and prints the
 //!   attribution line when the corpus changed since this repo's last scan.
 //! * `init` syncs synchronously: it is a setup step, and a first scan with no
-//!   cache cannot run at all.
-//! * For the same reason a scan on a cache with nothing installed syncs
-//!   before it loads, and waits: the one fetch a scan waits on, once per
-//!   machine. Offline it does not, and the refusal says so.
+//!   cache cannot run at all. For the same reason a scan that finds no cache
+//!   installed syncs before it loads (a CI runner's first scan).
 
 use crate::Config;
 use rvl_cache::auto;
 use rvl_cache::model::{HttpModelFetcher, ModelStore, ModelSyncOutcome, MODEL_DIR};
-use rvl_cache::{
-    CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TierFilter, TieredLoaded,
-};
+use rvl_cache::{CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TieredLoaded};
 use rvl_core::BIN;
 use std::path::Path;
 use std::process::ExitCode;
@@ -82,6 +78,41 @@ fn attribution(previous: &str, current: &str) -> String {
         "spec cache updated since this repo's last scan: {previous} -> {current}; \
          findings can change because the corpus changed, not your code"
     )
+}
+
+/// Before a scan on the signed cache: when no tier the scan would load was
+/// ever installed, sync now, in the foreground, because a scan with no cache
+/// cannot judge a call site. This is the first run on a CI runner or a new
+/// machine. Offline there is nothing to fetch: the note names the fix, and
+/// the scan goes on, because the content lane needs no cache and a committed
+/// token must still block. A scan that needs the cache then exits 1 with the
+/// same fix. A cache that is installed but does not verify is left to the
+/// load, which falls back and names its own fix.
+pub fn first_sync(
+    cfg: &Config,
+    store: &CacheStore,
+    keyset: &Keyset,
+    oss_only: bool,
+) -> anyhow::Result<()> {
+    let oss = store.subdir_store(rvl_cache::OSS_DIR)?;
+    if oss.is_installed() || (!oss_only && store.is_installed()) {
+        return Ok(());
+    }
+    if cfg.offline {
+        eprintln!(
+            "note: no spec cache is installed and RVL_OFFLINE is set, so this scan cannot \
+             fetch one: run '{BIN} sync' with network access (or '{BIN} cache import')"
+        );
+        return Ok(());
+    }
+    eprintln!("no spec cache is installed; running '{BIN} sync' before the first scan");
+    let (oss, commercial) = sync_tiers(cfg, store, keyset)?;
+    let mut parts = vec![describe("oss tier", &oss)];
+    if let Some(c) = &commercial {
+        parts.push(describe("commercial tier", c));
+    }
+    eprintln!("{}", parts.join("; "));
+    Ok(())
 }
 
 /// After a scan: start the background check when one is due. Everything here
@@ -196,45 +227,6 @@ pub fn sync_model(cfg: &Config, keyset: &Keyset) -> anyhow::Result<ModelSyncOutc
         keyset,
         cfg.offline,
     ))
-}
-
-/// Before a scan loads: when no tier `filter` allows has anything installed,
-/// sync first. A fresh CI runner is this case on every run that does not
-/// cache the spec cache, and without it the scan exits 1. A sync that fails
-/// is said here and leaves the load to refuse as it always has. Offline there
-/// is no sync, and the refusal says why ([`offline_note`]).
-pub fn sync_if_empty(
-    cfg: &Config,
-    store: &CacheStore,
-    keyset: &Keyset,
-    filter: TierFilter,
-) -> anyhow::Result<()> {
-    let empty = store.subdir_store(rvl_cache::OSS_DIR)?.is_empty()
-        && (filter == TierFilter::OssOnly || store.is_empty());
-    if !empty || cfg.offline {
-        return Ok(());
-    }
-    eprintln!("no spec cache is installed: running '{BIN} sync' before the first scan");
-    let (oss, commercial) = sync_tiers(cfg, store, keyset)?;
-    let mut parts = vec![describe("oss tier", &oss)];
-    if let Some(c) = &commercial {
-        parts.push(describe("commercial tier", c));
-    }
-    eprintln!("spec cache: {}", parts.join("; "));
-    Ok(())
-}
-
-/// Appended to a scan's "no tier loadable" refusal: offline, the scan did not
-/// sync first, so the refusal says that the sync it names needs the network.
-pub fn offline_note() -> String {
-    if rvl_cache::offline_from_env(std::env::var("RVL_OFFLINE").ok().as_deref()) {
-        format!(
-            ". RVL_OFFLINE is set, so this scan did not sync first: run '{BIN} sync' \
-             with network access"
-        )
-    } else {
-        String::new()
-    }
 }
 
 /// `init`'s synchronous sync, as the text after "Spec cache: ". It never fails

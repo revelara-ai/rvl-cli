@@ -1,0 +1,31 @@
+# Read by `semgrep scan` from the repository root, so it applies to the
+# security gate's command, which takes no --exclude of its own. A
+# .semgrepignore replaces Semgrep's built-in ignore list rather than adding to
+# it, so that list is repeated first, unchanged.
+
+# Semgrep's defaults: common large paths.
+node_modules/
+build/
+dist/
+vendor/
+.env/
+.venv/
+.tox/
+*.min.js
+.npm/
+.yarn/
+
+# Semgrep's defaults: common test paths.
+test/
+tests/
+*_test.go
+
+# Semgrep's defaults: its rules and log folders.
+.semgrep
+.semgrep_logs/
+
+# This repository: every testdata/ directory holds synthetic fixtures, source
+# written to misuse a client (raw SQL, an unverified TLS context, a sleep in a
+# retry loop) so rvl's scan has something to detect. A finding there is the
+# fixture working. Out of scope per SECURITY.md.
+testdata/
