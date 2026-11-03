@@ -2,10 +2,11 @@
 //! `internal/project/config.go` (`LoadProjectConfigFrom`).
 //!
 //! Only the keys a scan submission needs are read: `project`, `criticality`,
-//! the repo-level `team:`, and the `components:` list (name / path / team).
+//! the repo-level `team:`, the `components:` list (name / path / team), and
+//! the `scanner.waivers` list (reported as the scan's applied waivers).
 //! Every other key is tolerated and ignored. That matches the convention the
 //! scanner crate already follows for this shared file: `waiver.rs` owns the
-//! `scanner.waivers` / `scanner.bounds` view and `agent.rs` owns the
+//! scanner's `scanner.waivers` / `scanner.bounds` view and `agent.rs` owns the
 //! agent-consent view, each narrow so one consumer can never break another.
 
 use serde::Deserialize;
@@ -24,6 +25,11 @@ pub struct ProjectConfig {
     /// overrides both.
     pub team: String,
     pub components: Vec<ProjectComponent>,
+    /// `scanner.waivers`, parsed apart from the keys above (see
+    /// [`parse_waivers`]) so a malformed waiver can never cost the
+    /// submission its service, criticality or team.
+    #[serde(skip)]
+    pub waivers: Vec<ProjectWaiver>,
 }
 
 impl ProjectConfig {
@@ -56,10 +62,50 @@ pub struct ProjectComponent {
     pub team: String,
 }
 
+/// One `scanner.waivers` entry, the on-disk shape the scanner's waiver
+/// engine reads: `{matcher, paths, expires, reason}`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ProjectWaiver {
+    pub matcher: String,
+    pub paths: Vec<String>,
+    pub expires: String,
+    pub reason: String,
+}
+
+impl ProjectWaiver {
+    /// In force at `today` ("YYYY-MM-DD"), by the scanner's own expiry rule.
+    pub fn active(&self, today: &str) -> bool {
+        rvl_core::civil::expiry_active(&self.expires, today)
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct WaiverFile {
+    scanner: WaiverSection,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct WaiverSection {
+    waivers: Vec<ProjectWaiver>,
+}
+
 /// Parse a `.revelara.yaml` document. Malformed YAML yields `None`, mirroring
 /// Go's `yaml.Unmarshal` error path: a broken config is never load-bearing.
 pub fn parse(text: &str) -> Option<ProjectConfig> {
-    serde_yaml::from_str::<ProjectConfig>(text).ok()
+    let mut cfg = serde_yaml::from_str::<ProjectConfig>(text).ok()?;
+    cfg.waivers = parse_waivers(text);
+    Some(cfg)
+}
+
+/// The `scanner.waivers` list, all or nothing: the scanner applies no waiver
+/// when the list does not parse, so the submission reports none either.
+fn parse_waivers(text: &str) -> Vec<ProjectWaiver> {
+    serde_yaml::from_str::<WaiverFile>(text)
+        .map(|f| f.scanner.waivers)
+        .unwrap_or_default()
 }
 
 /// Read `.revelara.yaml` from `target`'s git root, falling back to the
@@ -155,6 +201,38 @@ mod tests {
             };
             assert_eq!(cfg.criticality_score(), want, "criticality: {label:?}");
         }
+    }
+
+    /// The waiver list is read with its expiry intact; a malformed list costs
+    /// only the waivers, never the rest of the config.
+    #[test]
+    fn waivers_are_read_and_a_malformed_list_keeps_the_config() {
+        let cfg = parse(
+            "project: svc\n\
+             scanner:\n\
+             \x20 waivers:\n\
+             \x20   - matcher: db.Pool.Query\n\
+             \x20     paths: [\"internal/**\"]\n\
+             \x20     expires: 2026-12-31\n\
+             \x20     reason: bounded by statement_timeout\n",
+        )
+        .expect("must parse");
+        assert_eq!(cfg.waivers.len(), 1);
+        let w = &cfg.waivers[0];
+        assert_eq!(w.matcher, "db.Pool.Query");
+        assert_eq!(w.paths, ["internal/**"]);
+        assert!(w.active("2026-12-31"));
+        assert!(!w.active("2027-01-01"));
+
+        let cfg = parse(
+            "project: svc\n\
+             team: checkout\n\
+             scanner:\n\
+             \x20 waivers: not-a-list\n",
+        )
+        .expect("a bad waiver list must not drop the config");
+        assert_eq!(cfg.team, "checkout");
+        assert!(cfg.waivers.is_empty());
     }
 
     #[test]

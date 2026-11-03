@@ -10,6 +10,7 @@
 
 use crate::client::Client;
 use crate::gojson::{compact, compact_raw, pretty, G};
+use crate::project_config::ProjectConfig;
 use crate::scan_cached_output::{note_cached_scan, print_scan_findings, scan_submit_headline};
 use crate::scan_normalize::{
     normalization_summary, normalize_findings, print_normalization_issues, print_stpa_loss_banner,
@@ -1355,6 +1356,35 @@ fn populate_git_metadata(meta: &mut ScanMetadata, target: &Path) {
     }
 }
 
+/// Fill `applied_waivers` with the waivers in `.revelara.yaml` still in force
+/// at `today`: the list the scanner applied. A FALLBACK, like the git
+/// metadata: waivers an input part already reported are kept as sent.
+fn report_applied_waivers(meta: &mut ScanMetadata, cfg: &ProjectConfig, today: &str) {
+    if !meta.applied_waivers.is_empty() {
+        return;
+    }
+    meta.applied_waivers = cfg
+        .waivers
+        .iter()
+        .filter(|w| !w.matcher.trim().is_empty() && w.active(today))
+        .map(|w| AppliedWaiver {
+            matcher: w.matcher.clone(),
+            paths: w.paths.clone(),
+            expires: w.expires.clone(),
+            reason: w.reason.clone(),
+        })
+        .collect();
+}
+
+/// Today as "YYYY-MM-DD" (UTC), the date waiver expiry is judged against.
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rvl_core::civil::civil_from_days((secs / 86400) as i64)
+}
+
 // --- CLI entry ---
 
 /// The submission-mode arguments carried over from the `scan` subcommand.
@@ -1609,6 +1639,12 @@ pub fn run(args: SubmitArgs, version: &str) -> ExitCode {
     // whole submission; otherwise `.revelara.yaml` `team:` (repo default) and
     // per-component `team:` entries apply.
     apply_team_assignments(&mut req, project_cfg.as_ref(), &team_flag);
+
+    // Tell the risk register which `.revelara.yaml` waivers were in force for
+    // this scan, so its waiver audit sees them.
+    if let Some(cfg) = project_cfg.as_ref() {
+        report_applied_waivers(&mut req.metadata, cfg, &today_utc());
+    }
 
     // Dry run (po-4g59y): machine-readable summary on stdout so the scan
     // skill and CI can parse it, human framing on stderr, no submit.
@@ -2051,6 +2087,39 @@ mod tests {
         let mut mode = base_request();
         mode.scan_mode = "ci".into();
         assert_ne!(derive_idempotency_key(&base), derive_idempotency_key(&mode));
+    }
+
+    /// The waivers in force are reported on the wire in the shape the risk
+    /// register's waiver audit reads; expired and matcher-less entries are
+    /// not, and waivers an input part already reported are kept as sent.
+    #[test]
+    fn applied_waivers_come_from_the_active_revelara_waivers() {
+        let cfg = crate::project_config::parse(
+            "scanner:\n\
+             \x20 waivers:\n\
+             \x20   - matcher: db.Pool.Query\n\
+             \x20     paths: [\"internal/**\"]\n\
+             \x20     reason: bounded by statement_timeout\n\
+             \x20   - matcher: http.Client.Do\n\
+             \x20     expires: 2026-01-01\n\
+             \x20   - matcher: \"\"\n",
+        )
+        .unwrap();
+
+        let mut req = base_request();
+        report_applied_waivers(&mut req.metadata, &cfg, "2026-11-03");
+        assert!(request_body(&req, true).contains(
+            r#""applied_waivers":[{"matcher":"db.Pool.Query","paths":["internal/**"],"reason":"bounded by statement_timeout"}]"#
+        ));
+
+        let mut sent = base_request();
+        sent.metadata.applied_waivers = vec![AppliedWaiver {
+            matcher: "in-band".into(),
+            ..Default::default()
+        }];
+        report_applied_waivers(&mut sent.metadata, &cfg, "2026-11-03");
+        assert_eq!(sent.metadata.applied_waivers.len(), 1);
+        assert_eq!(sent.metadata.applied_waivers[0].matcher, "in-band");
     }
 
     /// The canonical bytes are the contract shared with the Go v1 client:
