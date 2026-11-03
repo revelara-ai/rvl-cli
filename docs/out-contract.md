@@ -124,7 +124,10 @@ The orchestrator uses it to:
   not-yet-graded class). `description` is the human one-liner from the
   ladder, `site` the primary `path:line`, and `site_count` how many sites the
   finding rolls up. `id` is the stable finding id that `explain`/`suppress`
-  resolve.
+  resolve. A path waiver is judged for each site of a row: when it covers
+  some sites and not others, the row keeps its `id` and only the sites the
+  waiver does not cover, and the covered sites are a second row of the same
+  `class` with `severity: suppressed` and an `id` of its own.
 - `sites` is every per-site eval row (`site_id`, `snapshot_id`, `verdict`,
   `reason`, `class`): the pre-v1 top-level array verbatim, one level down.
   The eval harness' per-site (verdict, reason) contract lives here;

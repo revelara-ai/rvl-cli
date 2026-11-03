@@ -590,6 +590,7 @@ fn finding_of(d: &Decision) -> Option<ladder::Finding> {
         fix: String::new(),
         site_count: 1,
         example_sites: vec![d.site_id.clone()],
+        sites: vec![d.site_id.clone()],
         class_rule,
         suppressed: false,
         gate_exempt: false,

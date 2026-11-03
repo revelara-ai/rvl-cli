@@ -130,6 +130,10 @@ pub struct TriagedItem {
     pub provenance: Provenance,
     pub site_count: usize,
     pub example_sites: Vec<String>,
+    /// Every site of the class, `file:line`: what a path waiver is judged
+    /// against, one site at a time. `example_sites` is its head.
+    #[serde(skip)]
+    pub sites: Vec<String>,
     /// Shown, never blocking: a construction rule gated on what a change
     /// introduces, at a site the change did not add.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -257,7 +261,8 @@ pub fn triage(
                 control: j.map(|j| j.control.clone()).unwrap_or_default(),
                 provenance: j.map(|j| j.provenance.clone()).unwrap_or_default(),
                 site_count: ids.len(),
-                example_sites: ids.into_iter().take(3).collect(),
+                example_sites: ids.iter().take(3).cloned().collect(),
+                sites: ids,
                 class: k,
                 gate_exempt: false,
             }

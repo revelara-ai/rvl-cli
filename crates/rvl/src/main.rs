@@ -950,6 +950,18 @@ fn triage_to_findings(
         .iter()
         .map(|it| {
             let ck = &it.class;
+            let site = it
+                .example_sites
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("{} sites", it.site_count));
+            // A class with no located site (a repo-wide emission gap) is one
+            // row at its one descriptive site.
+            let sites = if it.sites.is_empty() {
+                vec![site.clone()]
+            } else {
+                it.sites.clone()
+            };
             // The id must be unique per rendered class. ClassKey distinguishes
             // by reason too (e.g. "no bound anywhere" vs "only phase bounds"),
             // so the reason belongs in the id key or distinct classes collide.
@@ -960,11 +972,7 @@ fn triage_to_findings(
             let short = ck.client_type.rsplit('/').next().unwrap_or(&ck.client_type);
             render::Finding {
                 id: render::finding_id(&key),
-                site: it
-                    .example_sites
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| format!("{} sites", it.site_count)),
+                site,
                 // What the LIBRARY does with no explicit bound is spec
                 // knowledge, so the sentence is derived from the spec rather
                 // than asserted (po-av01j.175). No spec, or a spec that never
@@ -993,6 +1001,7 @@ fn triage_to_findings(
                 fix: it.fix.clone(),
                 site_count: it.site_count,
                 example_sites: it.example_sites.clone(),
+                sites,
                 // The waiver key: the readable class key `client_type.method`.
                 // Matched against `.revelara.yaml` waivers; written by suppress.
                 class_rule: format!("{}.{}", ck.client_type, ck.method),
@@ -1029,9 +1038,10 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
         .filter(|f| f.verdict == rvl_core::Verdict::Violates)
         .map(|f| {
             let class_rule = format!("repo_structure.{}", f.control);
+            let site = f.evidence.first().cloned().unwrap_or_else(|| "repo".into());
             render::Finding {
                 id: render::finding_id(&class_rule),
-                site: f.evidence.first().cloned().unwrap_or_else(|| "repo".into()),
+                site: site.clone(),
                 description: format!("{} \u{2014} {}", f.control_name, f.reason),
                 // "surface" + medium/low severity + zero incident counts is
                 // exactly the Advisory cell of render::classify. Structure
@@ -1045,6 +1055,11 @@ fn structure_to_findings(findings: &[rvl_structure::StructureFinding]) -> Vec<re
                 fix: f.fix.clone(),
                 site_count: f.evidence.len().max(1),
                 example_sites: f.evidence.clone(),
+                sites: if f.evidence.is_empty() {
+                    vec![site.clone()]
+                } else {
+                    f.evidence.clone()
+                },
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,
@@ -1126,13 +1141,14 @@ fn server_to_findings(
         .filter(|f| f.verdict == rvl_core::Verdict::Violates)
         .map(|f| {
             let class_rule = format!("server_entry.{}", f.control);
+            let site = f
+                .evidence
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "server".into());
             render::Finding {
                 id: render::finding_id(&class_rule),
-                site: f
-                    .evidence
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "server".into()),
+                site: site.clone(),
                 description: format!("{} \u{2014} {}", f.control_name, f.reason),
                 // "surface" + medium severity + zero incident counts is the
                 // Advisory cell of render::classify, same as the structure
@@ -1145,6 +1161,11 @@ fn server_to_findings(
                 fix: f.fix.clone(),
                 site_count: f.evidence.len().max(1),
                 example_sites: f.evidence.clone(),
+                sites: if f.evidence.is_empty() {
+                    vec![site.clone()]
+                } else {
+                    f.evidence.clone()
+                },
                 class_rule,
                 suppressed: false,
                 gate_exempt: false,
@@ -1175,9 +1196,15 @@ fn liveness_handler_finding(
 ) -> Option<render::Finding> {
     use rvl_propagate::probe_handler;
     let class = probe_handler::class_of(&probe_handler::join(probes, routes))?;
+    let site = class.sites.first().cloned().unwrap_or_default();
     Some(render::Finding {
         id: render::finding_id(probe_handler::CLASS_RULE),
-        site: class.sites.first().cloned().unwrap_or_default(),
+        sites: if class.sites.is_empty() {
+            vec![site.clone()]
+        } else {
+            class.sites.clone()
+        },
+        site,
         description: class.description,
         disposition: "surface".into(),
         severity: probe_handler::SEVERITY.into(),
@@ -3870,6 +3897,7 @@ fn misuse_items(
             provenance: Default::default(),
             site_count: f.occurrences,
             example_sites: f.evidence.into_iter().take(3).collect(),
+            sites: f.sites,
             gate_exempt: false,
         })
         .collect()
@@ -3898,7 +3926,8 @@ fn unsized_items(
             severity: f.severity.to_string(),
             fix: f.fix,
             site_count: f.evidence.len().max(1),
-            example_sites: f.evidence.into_iter().take(3).collect(),
+            example_sites: f.evidence.iter().take(3).cloned().collect(),
+            sites: f.evidence,
             control: f.control,
             provenance: Default::default(),
             gate_exempt: false,
@@ -3998,6 +4027,7 @@ fn construction_items(
                 provenance: Default::default(),
                 site_count: found.len(),
                 example_sites: found.iter().take(3).map(|f| f.site.clone()).collect(),
+                sites: found.iter().map(|f| f.site.clone()).collect(),
                 gate_exempt,
             }
         })
@@ -4277,7 +4307,8 @@ fn emission_items(
             control: f.control.to_string(),
             provenance: Default::default(),
             site_count: f.evidence.len().max(1),
-            example_sites: f.evidence.into_iter().take(3).collect(),
+            example_sites: f.evidence.iter().take(3).cloned().collect(),
+            sites: f.evidence,
             gate_exempt: false,
         })
         .collect()
@@ -4634,6 +4665,51 @@ fn run_scan(
     )
 }
 
+/// Judge `waivers` against each site of each ladder row, not against the row's
+/// first site: a waiver for one file must not hide the same class in another.
+/// A row with every site waived is suppressed whole. A row with some sites
+/// waived keeps its id and only the unwaived sites, and the waived sites
+/// become a suppressed row of their own, so the footer counts them. A row
+/// with no site waived is unchanged.
+fn apply_waivers(ladder: &mut Vec<render::Finding>, waivers: &[waiver::Waiver], today: &str) {
+    let mut waived_rows = Vec::new();
+    for f in ladder.iter_mut() {
+        // Every lane lists the sites of its rows: a row with none cannot be
+        // judged, and treating it as waived or as kept would both be a guess.
+        assert!(
+            !f.sites.is_empty(),
+            "ladder row {} ({}) lists no sites",
+            f.id,
+            f.class_rule
+        );
+        let (waived, kept): (Vec<String>, Vec<String>) =
+            f.sites.iter().cloned().partition(|s| {
+                waiver::is_waived(&f.class_rule, waiver::site_path(s), waivers, today)
+            });
+        if kept.is_empty() {
+            f.suppressed = true;
+        } else if !waived.is_empty() {
+            let mut rest = narrowed(f, waived);
+            rest.id = render::finding_id(&format!("{}:waived", f.id));
+            rest.suppressed = true;
+            waived_rows.push(rest);
+            *f = narrowed(f, kept);
+        }
+    }
+    ladder.extend(waived_rows);
+}
+
+/// `f` cut down to `sites`, a non-empty subset of its own.
+fn narrowed(f: &render::Finding, sites: Vec<String>) -> render::Finding {
+    render::Finding {
+        site: sites[0].clone(),
+        site_count: sites.len(),
+        example_sites: sites.iter().take(3).cloned().collect(),
+        sites,
+        ..f.clone()
+    }
+}
+
 /// What `scan` persists for `explain`/`suppress` to resolve finding ids from.
 /// The ladder prints `explain: rvl explain <id>` as a copy-pasteable hint;
 /// without this state the hint silently re-scans the CURRENT directory with
@@ -4871,12 +4947,7 @@ fn render_scan_output(
     // the footer count, kept out of BLOCKING/ADVISORY. Missing config = no-op.
     let waivers = waiver::load_waivers(&path.join(".revelara.yaml"));
     if !waivers.is_empty() {
-        let today = rvl_cache::today_utc();
-        for f in &mut ladder_findings {
-            if waiver::is_waived(&f.class_rule, waiver::site_path(&f.site), &waivers, &today) {
-                f.suppressed = true;
-            }
-        }
+        apply_waivers(&mut ladder_findings, &waivers, &rvl_cache::today_utc());
     }
 
     stamp_factors(&mut ladder_findings, specs);
@@ -11693,6 +11764,7 @@ mod tests {
             fix: String::new(),
             site_count: 3,
             example_sites: vec!["src/a.ts:12".into()],
+            sites: vec!["src/a.ts:12".into()],
             class_rule: "kysely.SelectQueryBuilder.execute".into(),
             suppressed: false,
             gate_exempt: false,
