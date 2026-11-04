@@ -10,6 +10,7 @@ import (
 	"context"
 	"time"
 
+	gocron "github.com/go-co-op/gocron/v2"
 	cron "github.com/robfig/cron/v3"
 )
 
@@ -44,3 +45,12 @@ func pollLoop() {
 func rebuildAll() {}
 
 func pruneOld(ctx context.Context) { _ = ctx }
+
+// scheduleFlush registers its job the gocron/v2 way: the job function is
+// the argument of gocron.NewTask, inside the scheduler's NewJob call.
+func scheduleFlush(s gocron.Scheduler) {
+	_, _ = s.NewJob(gocron.DurationJob(time.Minute), gocron.NewTask(flushAlerts))
+	s.Start()
+}
+
+func flushAlerts() {}

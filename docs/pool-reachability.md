@@ -209,7 +209,9 @@ measured above:
 2. Link registration arguments to functions, and mark `go` edges.
 3. Add gRPC `Register*Server` and `http.Handler` values as handler entries.
 4. Add interface dispatch (CHA), or the pool-wrapping rule.
-5. Add `go-co-op/gocron` to `jobFrameworks`.
+5. Add `go-co-op/gocron` to `jobFrameworks`. Done: the row is
+   `gocron.NewTask`, whose argument is the job function, so
+   `gocron.NewTask(c.FlushAlerts)` is the job site.
 6. Raise the backward join above 67/193 on nakama and 0 on crowdsec.
 
 Before any decision moves on these facts, adjudicate how often a server

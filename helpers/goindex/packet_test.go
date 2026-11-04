@@ -164,6 +164,17 @@ func TestBackgroundJobRegistrationsAreEmittedWithSiteKind(t *testing.T) {
 		t.Fatalf("want one ticker worker-loop site with client_type time.Ticker, got %+v", ticks)
 	}
 
+	// gocron/v2: the site is the NewTask call, so the job function is its
+	// argument; the enclosing NewJob is not a second site.
+	tasks := byMethod["NewTask"]
+	if len(tasks) != 1 || tasks[0].ClientType != "github.com/go-co-op/gocron.Scheduler" ||
+		tasks[0].Symbol != "scheduleFlush" || tasks[0].CallSite != "gocron.NewTask(flushAlerts)" {
+		t.Fatalf("want one gocron NewTask job site registering flushAlerts, got %+v", tasks)
+	}
+	if len(byMethod["NewJob"]) != 0 {
+		t.Fatalf("NewJob is not the registration row; got %+v", byMethod["NewJob"])
+	}
+
 	// Classic G1 sites are untouched by the extension.
 	for _, s := range sites {
 		if s.Method == "QueryContext" && s.SiteKind != "" {
