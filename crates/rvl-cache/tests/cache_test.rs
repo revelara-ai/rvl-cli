@@ -75,6 +75,16 @@ fn additive_rotation_accepts_any_pinned_key() {
 // --- install / last-good / quarantine ---
 
 #[test]
+fn a_store_is_not_installed_until_an_install() {
+    let k = keys();
+    let (_d, s) = store();
+    assert!(!s.is_installed());
+    let bytes = envelope_bytes(1, "2026-07-30.1");
+    s.install(&bytes, &sign_b64(&k, &bytes), &k.keyset);
+    assert!(s.is_installed());
+}
+
+#[test]
 fn install_is_atomic_and_retains_last_good() {
     let k = keys();
     let (_d, s) = store();
