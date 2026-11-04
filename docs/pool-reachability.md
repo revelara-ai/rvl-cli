@@ -216,3 +216,121 @@ measured above:
 
 Before any decision moves on these facts, adjudicate how often a server
 started with `go`, or a metrics ticker, is misclassed as a job.
+
+## Built: the per-site fact
+
+The operator chose A. goindex now computes the walk once per pool and puts
+the result on every call site whose receiver traces to that pool, as
+`pool_reach` in the site packet (`helpers/goindex/poolreach.go`). The field
+is additive within the v2 packet train. rvl does not read it yet.
+
+```json
+"pool_reach": [{"file": "server/db.go", "line": 122, "symbol": "database/sql.DB",
+  "handlers": 177, "jobs": 20,
+  "handler_entries": [{"symbol": "GetAccount", "file": "server/api_account.go", "line": 30, "via": "grpc"}, ...],
+  "job_entries": [{"symbol": "main", "file": "main.go", "line": 213, "via": "go_literal"}, ...],
+  "users": 1301, "unclassified_roots": 694}]
+```
+
+The entry lists are a sample of 3 per class. The counts cover the whole
+walk. `via` names the rule that classed each entry. `join_open` is set when a
+parameter between the site and the pool belongs to a function with callers
+this repository does not show.
+
+What was built, in the order of the recommendation above:
+
+- **Registrations and go statements.** A function value passed to a route
+  registration is a handler (`route`), and so is a function literal passed to
+  one (`route_literal`). A function started by `go` is a job (`go`), and so is
+  a literal started by one (`go_literal`). A function or literal passed to a
+  `jobFrameworks` registration is a job too (`job_framework`,
+  `job_literal`). The upward walk stops at these entries. It does not cross
+  from a literal to the function the literal is written in, because the
+  framework or the goroutine runs the literal, not that function.
+- **gRPC and http.Handler.** A method of a repository type passed to
+  `Register*Server` is a handler (`grpc`) when the interface that parameter
+  takes names the method. `ServeHTTP` of a type passed as an `http.Handler`
+  (a parameter or `http.Server{Handler: ...}`) is a handler, and so is a
+  function converted to `http.HandlerFunc` (`http_handler`).
+- **Interfaces.** A call through an interface this repository declares
+  reaches every method of a repository type that implements it (CHA).
+  Interfaces from dependencies are left out, so that `io.Writer` does not
+  join every `Write` method.
+- **Wrapping.** A call whose result is a value of the callee's own type
+  wraps its receiver and its arguments: `entsql.OpenDB(dialect, db)` wraps
+  `db`, and `ent.NewClient(ent.Driver(drv))` wraps `drv`. Basic values,
+  errors, contexts and functions are not wrapped. The forward walk follows
+  wraps into the result. A function literal passed as an argument is now
+  bound too, so `ExecuteInTx(ctx, db, func(tx *sql.Tx) error {...})` reaches
+  `tx`. `trace` reads neither, so `client_construction` and its scope are
+  unchanged.
+- **The join.** The search starts from the receiver, or from the first
+  variable it is selected from that leads to a pool. For `c.Ent.Alert.Query()`
+  that is `Ent`. It follows copies, parameters (every visible call),
+  return flow, wraps and literal bindings back to the constructions. A
+  construction is a value of a type declared outside this repository. A
+  repository type only holds a pool, so its operands are followed instead.
+  Nil and the zero value of a pointer are not constructions.
+- **Tickers.** A function is a ticker job when it receives from a
+  `time.Ticker`'s channel or from `time.Tick` in its own body. Calling
+  `time.NewTicker` is not enough. This drops constructors that only store a
+  ticker, such as nakama's `NewMatchHandler`. The loop that reads the ticker
+  is still found, as a `go_literal`.
+
+Measured on 2026-11-04 at the heads above (nakama `f794398`, crowdsec
+`849c7a2`, Go 1.27.1):
+
+| | nakama | crowdsec |
+| --- | --- | --- |
+| DB call sites (`database/sql`, pgx, ent) | 320 | 230 |
+| with `pool_reach` | 312 | 61 |
+| with a handler and a job entry | 301 | 61 |
+| pool at | `server/db.go:122` | `pkg/database/database.go:46` |
+| handler entries | 177 (175 `grpc`, 2 `route`) | 18 (`route`) |
+| job entries | 20 (6 `go`, 14 `go_literal`) | 10 (3 `go_literal`, 4 `job_framework`, 3 `ticker`) |
+| G1 sites on the earlier flow / joined back to the seed | 194 / 194 (strict `trace`: 67) | 0 / 0 |
+| G1 sites on the new flow / joined back to the seed | 336 / 336 | 106 / 106 |
+| `pool_reach` bytes / stream | 292 KB / 10.5 MB (2.8%) | 109 KB / 4.5 MB (2.4%) |
+| `goindex -retrieve`, fastest of 6, before / after | 5.87 s / 6.23 s (+6%) | 3.39 s / 3.53 s (+4%) |
+| peak RSS before / after | 1.10 GB / 1.19 GB | 1.44 GB / 1.53 GB |
+
+167 of crowdsec's 169 DB sites without the fact are in ent's generated
+code (`pkg/database/ent`), such as `_d.Exec(ctx)` inside `ExecX`. There the
+receiver is the receiver of a generated method. The join does not bind a
+method's receiver to the values it is called on, so the search has nowhere
+to go.
+
+The earlier probe gave the wrong cause for the 126 nakama sites that `trace`
+does not resolve. They are not parameters with unseen callers. They hit
+`traceMaxAlias`, the cap of 3 copies. With no cap, `trace` resolves all but 4
+of them. The pool join does not use that cap. Its search keeps a visited set
+instead.
+
+### Job precision
+
+Every job entry on the two pools, read against the source:
+
+- **nakama, 16 of 20 are background work.** These are the leaderboard
+  scheduler and its goroutines, the rank-cache workers, the matchmaker loop
+  and its fan-out, the match loop, the party, status and tracker loops,
+  `NotificationSendAll`'s goroutine, the startup storage-index load and the
+  console's refresh loop. `dbConnect`'s DNS rescan is also background work:
+  it drains the pool with `db.Conn`. Three of the misclassed entries are
+  goroutines started for one websocket connection, on the request path:
+  `SingleSession`, `processOutgoing` and `Close`. The fourth is
+  `HandleShutdown`'s shutdown goroutine.
+- **crowdsec, 7 of 10 are background work.** These are the APIC `Pull`,
+  `SendMetrics` and `SendUsageMetrics` ticker loops and the four flush jobs
+  that the gocron row now finds. The three misclassed entries are the
+  goroutine that runs `apiServer.Run` (the `go server.Run()` case), the one
+  that runs `servePrometheus`, and the signal handler `HandleSignals`.
+- **Metrics tickers.** crowdsec's `SendMetrics` and `SendUsageMetrics` are
+  ticker loops that read the database and send to CAPI. They are background
+  work on the pool, not a misclassification. None of nakama's job entries
+  is a metrics ticker.
+
+So 23 of 30 job entries are right. Every error is a goroutine that serves,
+or lives as long as, a server, a connection or a signal. None of them is a
+false handler. A judge that reads `via` can tell `ticker` and
+`job_framework`, which were all right here, from `go` and `go_literal`, which
+were 16 of 23.
