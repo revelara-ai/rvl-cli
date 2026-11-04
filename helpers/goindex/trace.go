@@ -38,6 +38,14 @@ type reachingValue struct {
 	// Its own values are what the function's return statements hand back
 	// (return flow), so a value can be followed forward out of a constructor.
 	result *types.Var
+	// wraps are the variables a call wraps: the receiver and the arguments
+	// of a call that returns a value of the callee's own type, as
+	// entsql.OpenDB(dialect, db) returns an *entsql.Driver holding db. Only
+	// the pool walk (poolreach.go) follows them; trace does not.
+	wraps []*types.Var
+	// zero: a declaration with no value, or nil. fieldSet: x.f = v,
+	// recorded on x.
+	zero, fieldSet bool
 }
 
 // traceStatus says what a trace found.
@@ -74,6 +82,16 @@ type reachIndex struct {
 	leaked     map[*types.Var]bool          // function-typed variable used other than by calling or passing it
 	indirect   map[*types.Var][]indirectCall
 	ifaceNames map[string]bool // method names called through an interface
+
+	// Function literals passed as an argument (ExecuteInTx(ctx, db,
+	// func(tx *sql.Tx) error {...})): litFlows is the parameter they are
+	// bound to, and litValues what a call through that parameter passes to
+	// the literal's own parameters. Only the pool walk reads litValues, so
+	// trace and the construction it reports are unchanged.
+	litFlows  map[*types.Var][]*types.Signature
+	litValues map[*types.Var][]reachingValue
+
+	next map[types.Object][]*types.Var // forwardEdges, built on first use
 }
 
 func newReachIndex(pkgs []*packages.Package) *reachIndex {
@@ -81,7 +99,8 @@ func newReachIndex(pkgs []*packages.Package) *reachIndex {
 		paramOwner: map[*types.Var]*types.Func{}, open: map[*types.Func]bool{},
 		flows: map[*types.Var][]*types.Func{}, passes: map[*types.Var][]*types.Var{},
 		leaked: map[*types.Var]bool{}, indirect: map[*types.Var][]indirectCall{},
-		ifaceNames: map[string]bool{}}
+		ifaceNames: map[string]bool{}, litFlows: map[*types.Var][]*types.Signature{},
+		litValues: map[*types.Var][]reachingValue{}}
 	for _, p := range pkgs {
 		ix.repo[p.PkgPath] = true
 	}
@@ -137,7 +156,7 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 		}
 		file, line := rel(p, rhs)
 		v := reachingValue{snip: Snippet{File: file, Line: line, Symbol: typeKey(t),
-			Source: src.text(p, rhs, rhs)}}
+			Source: src.text(p, rhs, rhs)}, zero: info.Types[rhs].IsNil()}
 		switch e := ast.Unparen(rhs).(type) {
 		case *ast.Ident, *ast.SelectorExpr:
 			if o := varOf(info, e); o != nil {
@@ -145,6 +164,7 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 			}
 		case *ast.CallExpr:
 			fn := calleeFunc(info, e)
+			v.wraps = wrapped(info, e, idx)
 			switch {
 			case fn != nil && fn.Pkg() != nil && ix.repo[fn.Pkg().Path()]:
 				v.ctor = fn.FullName()
@@ -199,7 +219,7 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 					if owner := varOf(info, sel.X); owner != nil {
 						file, line := rel(p, s)
 						add(owner, reachingValue{snip: Snippet{File: file, Line: line,
-							Symbol: typeKey(info.TypeOf(sel.X)), Source: src.text(p, s, s)}})
+							Symbol: typeKey(info.TypeOf(sel.X)), Source: src.text(p, s, s)}, fieldSet: true})
 					}
 				}
 			}
@@ -211,7 +231,7 @@ func (ix *reachIndex) collect(p *packages.Package, f *ast.File, src *srcIndex,
 					// var c http.Client: the zero value is the construction.
 					file, line := rel(p, s)
 					add(v, reachingValue{snip: Snippet{File: file, Line: line,
-						Symbol: typeKey(info.TypeOf(name)), Source: src.text(p, s, s)}})
+						Symbol: typeKey(info.TypeOf(name)), Source: src.text(p, s, s)}, zero: true})
 				case len(s.Values) == len(s.Names):
 					add(v, valueOf(s.Values[i], 0))
 				case len(s.Values) == 1:
@@ -285,25 +305,15 @@ func (ix *reachIndex) returns(body *ast.BlockStmt, results *types.Tuple,
 
 // forward returns every variable the values of seeds flow into: the reverse
 // of the edges trace follows. A value moves through plain copies, struct
-// fields (T{f: v}, x.f = v), parameters it is passed as, and the results of
+// fields (T{f: v}, x.f = v), parameters it is passed as (a function
+// literal's included), the results of
 // the in-repo function that returns it, into the variables a call of that
-// function is assigned to. It is how a pool built inside a constructor
-// reaches the code that uses it. The seeds are included.
+// function is assigned to, and the calls that wrap it. It is how a pool
+// built inside a constructor reaches the code that uses it. The seeds are
+// included.
 func (ix *reachIndex) forward(seeds []*types.Var) map[*types.Var]bool {
-	next := map[types.Object][]*types.Var{}
-	for to, vals := range ix.values {
-		to, ok := to.(*types.Var)
-		if !ok {
-			continue
-		}
-		for _, rv := range vals {
-			if rv.alias != nil {
-				next[rv.alias] = append(next[rv.alias], to)
-			}
-			if rv.result != nil {
-				next[rv.result] = append(next[rv.result], to)
-			}
-		}
+	if ix.next == nil {
+		ix.next = ix.forwardEdges()
 	}
 	seen := map[*types.Var]bool{}
 	work := append([]*types.Var(nil), seeds...)
@@ -314,9 +324,95 @@ func (ix *reachIndex) forward(seeds []*types.Var) map[*types.Var]bool {
 			continue
 		}
 		seen[v] = true
-		work = append(work, next[v]...)
+		work = append(work, ix.next[v]...)
 	}
 	return seen
+}
+
+// forwardEdges inverts the recorded values, once every file is collected:
+// each object to the variables its value flows into.
+func (ix *reachIndex) forwardEdges() map[types.Object][]*types.Var {
+	next := map[types.Object][]*types.Var{}
+	edges := func(to *types.Var, vals []reachingValue) {
+		for _, rv := range vals {
+			if rv.alias != nil {
+				next[rv.alias] = append(next[rv.alias], to)
+			}
+			if rv.result != nil {
+				next[rv.result] = append(next[rv.result], to)
+			}
+			for _, w := range rv.wraps {
+				next[w] = append(next[w], to)
+			}
+		}
+	}
+	for to, vals := range ix.values {
+		if to, ok := to.(*types.Var); ok {
+			edges(to, vals)
+		}
+	}
+	for to, vals := range ix.litValues {
+		edges(to, vals)
+	}
+	return next
+}
+
+// wrapped returns the variables the call e wraps when its result idx is a
+// value of the callee's own type: the receiver of a method call, and each
+// argument, through an argument that is itself such a call
+// (ent.NewClient(ent.Driver(drv)) wraps drv). Arguments that cannot hold a
+// client are left out: basic values, errors, contexts and functions.
+func wrapped(info *types.Info, e *ast.CallExpr, idx int) []*types.Var {
+	fn := calleeFunc(info, e)
+	if fn == nil || fn.Pkg() == nil {
+		return nil
+	}
+	res := fn.Signature().Results()
+	if idx >= res.Len() || !ownType(res.At(idx).Type(), fn.Pkg()) {
+		return nil
+	}
+	var out []*types.Var
+	operand := func(x ast.Expr) {
+		x = ast.Unparen(x)
+		if v := varOf(info, x); v != nil && canHoldClient(v.Type()) {
+			out = append(out, v)
+		} else if c, ok := x.(*ast.CallExpr); ok {
+			out = append(out, wrapped(info, c, 0)...)
+		}
+	}
+	if sel, ok := ast.Unparen(e.Fun).(*ast.SelectorExpr); ok && fn.Signature().Recv() != nil {
+		operand(sel.X)
+	}
+	for _, a := range e.Args {
+		operand(a)
+	}
+	return out
+}
+
+// ownType reports whether t, through one pointer, is a named type declared
+// in pkg.
+func ownType(t types.Type, pkg *types.Package) bool {
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	named, ok := t.(*types.Named)
+	return ok && named.Obj().Pkg() == pkg
+}
+
+// canHoldClient reports whether a value of type t can be or hold a client:
+// not a basic value, an error, a context or a function.
+func canHoldClient(t types.Type) bool {
+	switch u := t.Underlying().(type) {
+	case *types.Basic, *types.Signature:
+		return false
+	case *types.Interface:
+		if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != nil &&
+			named.Obj().Pkg().Path() == "context" {
+			return false
+		}
+		return u.NumMethods() > 0 && t.String() != "error"
+	}
+	return true
 }
 
 // calleeFunc resolves the declared function or method a call invokes, or nil
@@ -396,6 +492,11 @@ func (ix *reachIndex) bindParams(info *types.Info, call *ast.CallExpr,
 			}
 			param := sig.Params().At(i)
 			ix.values[param] = append(ix.values[param], valueOf(arg, 0))
+			if fl, ok := ast.Unparen(arg).(*ast.FuncLit); ok {
+				if ls, ok := info.TypeOf(fl).(*types.Signature); ok {
+					ix.litFlows[param] = append(ix.litFlows[param], ls)
+				}
+			}
 			argID := nameIdent(arg)
 			if argID == nil {
 				continue
@@ -454,6 +555,7 @@ func (ix *reachIndex) finish() {
 			}
 		}
 	}
+	ix.bindLiterals()
 	for v, fns := range reach {
 		// Only a parameter's callers are enumerable. A function that reached
 		// anything else, or a parameter that was then stored or returned, can
@@ -474,6 +576,51 @@ func (ix *reachIndex) finish() {
 				for i, arg := range ic.args {
 					param := sig.Params().At(i)
 					ix.values[param] = append(ix.values[param], arg)
+				}
+			}
+		}
+	}
+}
+
+// bindLiterals binds what each call through a function-typed parameter
+// passes to the parameters of every literal that reaches it, directly or
+// passed on from parameter to parameter.
+func (ix *reachIndex) bindLiterals() {
+	reach := map[*types.Var]map[*types.Signature]bool{}
+	add := func(v *types.Var, s *types.Signature) bool {
+		if reach[v] == nil {
+			reach[v] = map[*types.Signature]bool{}
+		}
+		if reach[v][s] {
+			return false
+		}
+		reach[v][s] = true
+		return true
+	}
+	for v, sigs := range ix.litFlows {
+		for _, s := range sigs {
+			add(v, s)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for to, froms := range ix.passes {
+			for _, from := range froms {
+				for s := range reach[from] {
+					changed = add(to, s) || changed
+				}
+			}
+		}
+	}
+	for v, sigs := range reach {
+		for s := range sigs {
+			for _, ic := range ix.indirect[v] {
+				if !ic.ok || s.Variadic() || len(ic.args) != s.Params().Len() {
+					continue
+				}
+				for i, arg := range ic.args {
+					param := s.Params().At(i)
+					ix.litValues[param] = append(ix.litValues[param], arg)
 				}
 			}
 		}

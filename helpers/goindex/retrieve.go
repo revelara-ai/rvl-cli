@@ -219,6 +219,11 @@ type RetrievedSite struct {
 	// attach and none of the type elsewhere speaks for it. Additive within the
 	// v2 packet train, like SiteKind.
 	ConstructionScope string `json:"client_construction_scope,omitempty"`
+	// PoolReach: the pool this call's receiver traces to, and the entry
+	// points that reach it, each a handler or a job (poolreach.go). Absent
+	// when the receiver traces to no construction. Additive within the v2
+	// packet train.
+	PoolReach []PoolReach `json:"pool_reach,omitempty"`
 	Prov         Provenance `json:"provenance"`
 
 	// ConstArgs: constant-valued arguments at this call site (schema v2).
@@ -899,6 +904,8 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 		return ordered, depth, roots, len(frontier) > 0
 	}
 
+	pools := newPoolIndex(pkgs, reach, funcs, rel)
+
 	lastRepoConfig = RepoConfig{Kind: "repo_config", Snapshot: name, Constructions: append(lastRepoConfig.Constructions, configFacts...)}
 
 	var out []RetrievedSite
@@ -1111,6 +1118,9 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 						case traceOpaque:
 							rs.ConstructionScope = "unresolved"
 						}
+					}
+					if jobType == "" && !isReader && !pkgRecv {
+						rs.PoolReach = pools.at(info, sel.X)
 					}
 					if rs.ConstructionScope == "" && rs.ClientType != "" {
 						// Assignments first: they carry the options literal a
