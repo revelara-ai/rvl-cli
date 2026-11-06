@@ -82,7 +82,7 @@ The orchestrator uses it to:
     },
     "retrieval": [
       { "lang": "go", "calls_resolved": 18233, "candidates": 412,
-        "unretrieved": { "io.Copy": 3 } }
+        "unretrieved": { "io.Copy": 3 }, "protective_sites": 2 }
     ],
     "structure": { "total": 6, "violates": 1, "satisfies": 3, "abstain": 1,
                    "not_applicable": 1 }
@@ -110,7 +110,14 @@ The orchestrator uses it to:
   "config_sites_overflow": 0,
   "hook_agent": null,
   "blend": null,
-  "decision_model": null
+  "decision_model": null,
+  "protective_sites": [
+    { "file": "api/limit.go", "line": 41,
+      "site": "api/limit.go:41:golang.org/x/time/rate.Limiter:Allow",
+      "class": "golang.org/x/time/rate.Limiter", "method": "Allow",
+      "mechanism": "rate_limit", "scope": "runtime",
+      "enclosing_function": "func (s *Server) limit(w http.ResponseWriter, ...) {...}" }
+  ]
 }
 ```
 
@@ -200,6 +207,9 @@ The orchestrator uses it to:
     surface (`io.Copy` is an example), and is `{}` when there is none. The counts are whole-repo even under
     `--incremental`, but a warm pass that re-parsed no file of a language has
     no row for it: absent means not measured this run, never zero.
+    `protective_sites` counts the rows of the top-level `protective_sites`
+    list the helper retrieved, test files included; it is not part of
+    `candidates`. Additive; `0` from a helper that retrieves none.
   - `dependency_trees_uninstalled`: workspaces that declare dependencies
     with no installed tree, summed across languages. Non-zero means the
     TypeScript retriever resolved those workspaces' client types from import
@@ -311,6 +321,17 @@ The orchestrator uses it to:
   `out_of_scope`, and `block`, the BLEND section as rendered text.
   `complete: false` means the report is the deterministic half alone.
   Nothing in `findings`, `sites` or `undecided` changes because of it.
+- `protective_sites` lists each call where an in-code protective mechanism
+  decides whether work proceeds: today a Go rate limiter's `Allow`, `Wait`
+  or `Reserve` (the table is `protective_calls` in
+  `helpers/goindex/extractor_corpus.json`). One row per call: `file`,
+  `line`, `site` (the site key, `file:line:class:method`), `class` (the
+  limiter type, `golang.org/x/time/rate.Limiter`), `method`, `mechanism`
+  (`rate_limit`), `scope` (the same path-derived scope as `undecided`) and
+  `enclosing_function` (the source of the function that holds the call,
+  where the branch that refuses the work is). These are retrieval output:
+  the scan decides nothing about them, so they are never a finding, a
+  `sites` row or part of `coverage`. Empty when there is none. Additive.
 - `decision_model` is present when the repository turns the decision-model
   lane on (`scanner.decision_model: on`), null otherwise. `model_id` and
   `weights_digest` (`sha256:<hex>` of the model file) name the model;

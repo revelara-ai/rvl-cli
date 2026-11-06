@@ -97,6 +97,17 @@ pub const BOUND_HOW_NAME: &str = "name";
 /// [`CONSTRUCTION_SCOPE_TYPE`], it may evidence an abstention, never a pass.
 pub const BOUND_HOW_TYPE: &str = "type";
 
+/// The `site_kind` stamped on a protective-site packet: a call where an
+/// in-code protective mechanism decides whether work proceeds (a rate
+/// limiter's `Allow` or `Wait`). One packet per call, with the enclosing
+/// function, where the branch that refuses the work is. Retrieval only: no
+/// lane judges it, and the scan reports it as `protective_sites`.
+pub const SITE_KIND_PROTECTIVE: &str = "protective_site";
+
+/// The `const_args` entry name carrying a protective site's mechanism
+/// (`rate_limit`), with `how: "aggregate"`.
+pub const CONST_ARG_PROTECTIVE_MECHANISM: &str = "protective_mechanism";
+
 /// Go marshals a nil slice as JSON `null`, not `[]`, and serde's `default`
 /// attribute only covers a MISSING field, not a present-but-null one. Without
 /// this, 821 of 1525 real production records failed to parse and the scanner
@@ -577,6 +588,20 @@ impl Site {
     pub fn bound_observations(&self) -> impl Iterator<Item = &ConstArg> {
         self.const_args.iter().filter(|a| a.how != "aggregate")
     }
+    /// A protective-site packet (a rate limiter's decision), reported and
+    /// never judged.
+    pub fn is_protective_site(&self) -> bool {
+        self.site_kind == SITE_KIND_PROTECTIVE
+    }
+    /// The protective site's mechanism, read from the
+    /// [`CONST_ARG_PROTECTIVE_MECHANISM`] entry. `None` on every other kind
+    /// and on a malformed packet.
+    pub fn protective_mechanism(&self) -> Option<&str> {
+        self.const_args
+            .iter()
+            .find(|a| a.name == CONST_ARG_PROTECTIVE_MECHANISM)
+            .map(|a| a.value.as_str())
+    }
     /// Unique per site: `file:line:client_type:method`. `id()` (`file:line`) is
     /// NOT unique -- chained calls (`db.selectFrom(...).select(...).execute()`)
     /// put several distinct sites on one line -- so anything that rematches a
@@ -866,6 +891,11 @@ pub struct RetrievalCensus {
     pub candidates: usize,
     #[serde(default, deserialize_with = "null_as_default")]
     pub unretrieved: std::collections::BTreeMap<String, usize>,
+    /// Protective sites retrieved (a rate limiter's decision), test files
+    /// included. Not candidates: no spec judges them. Zero from a helper
+    /// that retrieves none.
+    #[serde(default)]
+    pub protective_sites: usize,
 }
 
 impl RepoConfig {
@@ -1717,6 +1747,27 @@ mod tests {
         let g1 = Site::default();
         assert!(!g1.is_unsized_construction() && !g1.bound_escapes() && !g1.bound_opaque());
         assert_eq!(g1.bound_class(), None);
+    }
+
+    #[test]
+    fn protective_accessors_read_the_mechanism() {
+        let s = Site {
+            client_type: "golang.org/x/time/rate.Limiter".into(),
+            method: "Allow".into(),
+            site_kind: SITE_KIND_PROTECTIVE.into(),
+            const_args: vec![ConstArg {
+                name: CONST_ARG_PROTECTIVE_MECHANISM.into(),
+                value: "rate_limit".into(),
+                how: "aggregate".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(s.is_protective_site() && !s.is_call_site() && !s.is_emission_point());
+        assert_eq!(s.protective_mechanism(), Some("rate_limit"));
+        let g1 = Site::default();
+        assert!(!g1.is_protective_site());
+        assert_eq!(g1.protective_mechanism(), None);
     }
 
     #[test]

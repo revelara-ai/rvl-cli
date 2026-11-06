@@ -402,6 +402,15 @@ pub fn render_retrieval(cov: &Coverage, color: bool) -> String {
             "{}",
             paint(&line, if missed.is_empty() { "2" } else { "33" }, color)
         );
+        // Retrieval output for the fleet, never judged: the count says the
+        // sites exist, and `--out` lists them as `protective_sites`.
+        if r.protective_sites > 0 {
+            let line = format!(
+                "  {} protective sites (rate limiter decisions, not judged): {}",
+                r.lang, r.protective_sites
+            );
+            let _ = writeln!(o, "{}", paint(&line, "2", color));
+        }
     }
     o
 }

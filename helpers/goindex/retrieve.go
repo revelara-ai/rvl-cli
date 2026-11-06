@@ -239,7 +239,8 @@ type RetrievedSite struct {
 	// registration or worker-loop entry (po-av01j.4); "emission_point" = a G4
 	// emission aggregate (po-av01j.5); "misuse_shape" = an error-handling
 	// shape aggregate (misuse.go); "unsized_construction" = a pool, cache
-	// or whole-body read built here (bounds.go). Additive default-carrying
+	// or whole-body read built here (bounds.go); "protective_site" = a rate
+	// limiter call (protective.go). Additive default-carrying
 	// field within the v2 packet train — not a schema bump.
 	SiteKind string `json:"site_kind,omitempty"`
 	// Guard is the condition of the innermost if statement whose branch
@@ -1187,6 +1188,18 @@ func runRetrieveModule(moduleDir, root, name string, repoMods []string) (sites [
 	// Unsized-construction inventory: pools, caches and whole-body reads,
 	// stamped site_kind: "unsized_construction".
 	out = append(out, collectUnsized(pkgs, src, root, name)...)
+	// Protective-site inventory: rate limiter calls, stamped
+	// site_kind: "protective_site", from the module's files and from the test
+	// files that can reach a limiter (protective.go). A test load that fails
+	// costs the test sites only, and says so.
+	protective := collectProtective(pkgs, src, root, name, false)
+	if tpkgs, terr := loadProtectiveTests(moduleDir, pkgs); terr != nil {
+		fmt.Fprintf(os.Stderr, "goindex: protective sites in the tests of %s not read: %v\n", moduleDir, terr)
+	} else {
+		protective = append(protective, collectProtective(tpkgs, src, root, name, true)...)
+	}
+	census.ProtectiveSites = len(protective)
+	out = append(out, protective...)
 	return out, census, true, nil
 }
 

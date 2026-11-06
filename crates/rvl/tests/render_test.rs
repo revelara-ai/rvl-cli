@@ -1323,6 +1323,7 @@ fn go_census(candidates: usize, calls: usize, readall: usize) -> rvl_core::Retri
         calls_resolved: calls,
         candidates,
         unretrieved,
+        ..Default::default()
     }
 }
 
@@ -1360,6 +1361,25 @@ fn retrieval_denominator_prints_when_no_site_is_in_scope() {
         "{out}"
     );
     assert!(out.contains("known I/O not retrieved: none"), "{out}");
+}
+
+/// Protective sites are counted on a line of their own, and only when the
+/// helper retrieved some: they are listed in `--out`, never judged.
+#[test]
+fn coverage_counts_protective_sites_beside_the_census() {
+    let mut c = cov();
+    let mut census = go_census(97, 4200, 0);
+    census.protective_sites = 2;
+    c.retrieval = vec![census];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(
+        out.contains("go protective sites (rate limiter decisions, not judged): 2"),
+        "{out}"
+    );
+    let mut c = cov();
+    c.retrieval = vec![go_census(97, 4200, 0)];
+    let out = render_ladder(&[], c, None, "0.1s", false);
+    assert!(!out.contains("protective sites"), "{out}");
 }
 
 /// No census (an older helper, a language that does not measure it) prints

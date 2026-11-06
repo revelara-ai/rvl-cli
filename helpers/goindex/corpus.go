@@ -9,6 +9,7 @@
 // retrieval table: package functions that read from a reader (io.ReadAll).
 // construction_calls and construction_fields select the crypto, TLS and
 // database constructions retrieved as call sites (construction.go).
+// protective_calls selects the protective sites (protective.go).
 package main
 
 import (
@@ -49,6 +50,7 @@ type extractorCorpus struct {
 	BoundConstructors  []boundConstructor  `json:"bound_constructors"`
 	ConstructionCalls  []constructionCall  `json:"construction_calls"`
 	ConstructionFields []constructionField `json:"construction_fields"`
+	ProtectiveCalls    []protectiveCall    `json:"protective_calls"`
 }
 
 // parseExtractorCorpus is strict: a malformed table would change what is
@@ -102,6 +104,11 @@ func parseExtractorCorpus(raw []byte) (extractorCorpus, error) {
 		if methods[u.Func] {
 			return c, fmt.Errorf("extractor corpus: %s.%s is in io_methods and known_unretrieved",
 				u.Package, u.Func)
+		}
+	}
+	for _, k := range c.ProtectiveCalls {
+		if k.Package == "" || k.Type == "" || k.Method == "" || k.Mechanism == "" {
+			return c, fmt.Errorf("extractor corpus: bad protective_calls entry %+v", k)
 		}
 	}
 	for _, b := range c.BoundConstructors {
@@ -193,6 +200,9 @@ type RetrievalCensus struct {
 	CallsResolved int            `json:"calls_resolved"`
 	Candidates    int            `json:"candidates"`
 	Unretrieved   map[string]int `json:"unretrieved"`
+	// ProtectiveSites counts the protective sites emitted (protective.go),
+	// test files included. They are not candidates: no spec judges them.
+	ProtectiveSites int `json:"protective_sites"`
 }
 
 func newRetrievalCensus() RetrievalCensus {
@@ -202,6 +212,7 @@ func newRetrievalCensus() RetrievalCensus {
 func (c *RetrievalCensus) add(o RetrievalCensus) {
 	c.CallsResolved += o.CallsResolved
 	c.Candidates += o.Candidates
+	c.ProtectiveSites += o.ProtectiveSites
 	for k, v := range o.Unretrieved {
 		c.Unretrieved[k] += v
 	}

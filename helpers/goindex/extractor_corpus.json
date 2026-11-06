@@ -25,7 +25,12 @@
     "functions, the package is the client type) and a TLS setting (a struct field",
     "in a literal or an assignment, the struct is the client type and the field the",
     "method). The violating line is the construction: the call that later uses the",
-    "value does not show it. Whether a hash guards integrity is judged downstream."
+    "value does not show it. Whether a hash guards integrity is judged downstream.",
+    "protective_calls select the protective sites: a method of a type whose call",
+    "decides whether work proceeds (a rate limiter's Allow or Wait). Each type-",
+    "resolved call is retrieved with its enclosing function, where the branch that",
+    "refuses the work is. mechanism names what the type does (rate_limit). The",
+    "site is not a finding: nothing judges whether the refusal is calibrated."
   ],
   "io_methods": [
     "Query", "QueryRow", "Exec",
@@ -76,5 +81,21 @@
   "construction_fields": [
     {"type": "crypto/tls.Config", "field": "InsecureSkipVerify"},
     {"type": "crypto/tls.Config", "field": "MinVersion"}
+  ],
+  "protective_calls": [
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "Allow", "mechanism": "rate_limit"},
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "AllowN", "mechanism": "rate_limit"},
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "Wait", "mechanism": "rate_limit"},
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "WaitN", "mechanism": "rate_limit"},
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "Reserve", "mechanism": "rate_limit"},
+    {"package": "golang.org/x/time/rate", "type": "Limiter", "method": "ReserveN", "mechanism": "rate_limit"},
+    {"package": "github.com/ulule/limiter/v3", "type": "Limiter", "method": "Get", "mechanism": "rate_limit"},
+    {"package": "github.com/ulule/limiter/v3", "type": "Limiter", "method": "Peek", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v10", "type": "Limiter", "method": "Allow", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v10", "type": "Limiter", "method": "AllowN", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v10", "type": "Limiter", "method": "AllowAtMost", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v9", "type": "Limiter", "method": "Allow", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v9", "type": "Limiter", "method": "AllowN", "mechanism": "rate_limit"},
+    {"package": "github.com/go-redis/redis_rate/v9", "type": "Limiter", "method": "AllowAtMost", "mechanism": "rate_limit"}
   ]
 }

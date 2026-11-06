@@ -95,6 +95,16 @@ stream; never the `log` package) and `latency_scalar_metric` (a Prometheus
 gauge or counter with a latency name). Each is named for the shape, not for a
 defect. See "Misuse shapes" in `docs/retrievers.md`.
 
+`protective_calls` in the same file selects the protective sites: a method
+of a type whose call decides whether work proceeds (`golang.org/x/time/rate`
+`Limiter.Allow`), with its mechanism (`rate_limit`). Each type-resolved call
+is emitted with `site_kind: "protective_site"`, the mechanism in `const_args`
+as `protective_mechanism`, and its enclosing function (`protective.go`). No
+spec judges it. Test files are read for these sites: the packages that reach
+a listed package are loaded a second time with their tests. The census counts
+them as `protective_sites`, apart from `candidates`. See "Protective sites"
+in `docs/retrievers.md`.
+
 A cold full load is paid at explicit init, never on the hook path; the
 incremental path (`-files`) reloads only what changed.
 

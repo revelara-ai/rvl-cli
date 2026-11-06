@@ -9,6 +9,19 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### `--out` lists rate limiter decisions as `protective_sites`
+
+See "Protective sites" in `docs/retrievers.md`.
+
+- The scan document has a new top-level list, `protective_sites`: one row
+  per Go rate limiter call that decides whether work proceeds
+  (`golang.org/x/time/rate`, `ulule/limiter`, `go-redis/redis_rate`), with
+  `file`, `line`, `site`, `class`, `method`, `mechanism`, `scope` and
+  `enclosing_function`. The rows are never judged: no finding, no verdict,
+  no change to `coverage` or `sites`.
+- `coverage.retrieval[]` counts them as `protective_sites`, and COVERAGE
+  prints the count on its own line.
+
 ### A TLS opt-out is one the option's name says; a pinned config re-verifies
 
 See "Construction rules" in `docs/retrievers.md`.
