@@ -4879,6 +4879,94 @@ fn scan_surfaces_repo_structure_findings_from_a_retrieved_stream() {
     );
 }
 
+/// RC-057 is decided end to end by a scan of a repository: sources and
+/// tests with a CI workflow and a Makefile that run no coverage tool violate,
+/// and the same repository with `go test -coverprofile` in its workflow
+/// satisfies. No retriever is needed: the structure lane walks the tree.
+#[test]
+fn scan_decides_rc057_coverage_tooling_from_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let svc = repo.join("internal/svc");
+    let workflows = repo.join(".github/workflows");
+    std::fs::create_dir_all(&svc).unwrap();
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(repo.join("go.mod"), "module example.com/svc\n\ngo 1.22\n").unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            svc.join(format!("f{i}.go")),
+            format!("package svc\n\nfunc F{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        svc.join("f_test.go"),
+        "package svc\n\nimport \"testing\"\n\nfunc TestF0(t *testing.T) { F0() }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Makefile"), "test:\n\tgo test ./...\n").unwrap();
+    let workflow = |run: &str| {
+        std::fs::write(
+            workflows.join("ci.yml"),
+            format!(
+                "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                 - run: {run}\n"
+            ),
+        )
+        .unwrap();
+    };
+    // The structure lane reads no spec: empty specs stand in for a cache.
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"apis":[],"configs":[]}"#).unwrap();
+    let rc057 = |n: usize| -> serde_json::Value {
+        let out_path = dir.path().join(format!("out{n}.json"));
+        let out = bin()
+            .arg("scan")
+            .arg(&repo)
+            .arg("--specs-file")
+            .arg(&specs)
+            .arg("--out")
+            .arg(&out_path)
+            .env("RVL_CACHE_DIR", dir.path().join("cache"))
+            .env("HOME", dir.path().join("home"))
+            // The Go sources need goindex for the call-site lanes; the
+            // structure lane under test does not.
+            .env("RVL_ALLOW_MISSING_HELPERS", "1")
+            .output()
+            .expect("failed to run rvl");
+        assert!(
+            scan_reached_a_verdict(&out),
+            "scan failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        doc["structure"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["class"] == "repo_structure.RC-057")
+            .unwrap_or_else(|| panic!("no repo_structure.RC-057 row: {doc}"))
+            .clone()
+    };
+
+    workflow("go test ./...");
+    let row = rc057(0);
+    assert_eq!(row["verdict"], "violates", "{row}");
+    assert!(
+        row["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no coverage tooling"),
+        "{row}"
+    );
+
+    workflow("go test -coverprofile=cover.out ./...");
+    let row = rc057(1);
+    assert_eq!(row["verdict"], "satisfies", "{row}");
+}
+
 // --- hook-mode agent adjudication (po-av01j.15) ---
 
 /// Copy the goindex fixture into a writable temp repo so the test can commit

@@ -149,3 +149,87 @@ fn config_sites_match_the_golden() {
     assert_eq!(user["control"], "RC-044");
     assert_eq!(user["line"], 3, "the USER that decides");
 }
+
+/// RC-042 is decided end to end: a step pinned to a tag violates, a step
+/// pinned to a 40-hex commit SHA satisfies, and the violation is a finding.
+/// The specs map the uses-ref keys to RC-042 with the `sha40` pattern, as
+/// the published OSS spec cache does (docs/lens-reconciliation.md, row 18a).
+#[test]
+fn rc042_unpinned_action_ref_is_decided_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let workflows = repo.join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(
+        workflows.join("ci.yml"),
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - uses: actions/checkout@v4\n      \
+         - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n",
+    )
+    .unwrap();
+    let specs = dir.path().join("specs.json");
+    let key = |key: &str| {
+        serde_json::json!({
+            "format": "github-actions", "key": key,
+            "expect": {"kind": "pattern", "name": "sha40"},
+            "confidence": 0.9, "control": "RC-042", "severity": "medium",
+            "fix": "pin the action to a full-length commit SHA",
+            "rationale": "a tag or branch can be moved to other code",
+        })
+    };
+    let spec_file = serde_json::json!({
+        "config_keys": [key("job.uses.ref"), key("step.uses.ref")],
+    });
+    std::fs::write(&specs, spec_file.to_string()).unwrap();
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .env("RVL_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out_path.is_file(),
+        "scan wrote no --out document: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+
+    let step = |resource: &str| {
+        doc["config_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["key"] == "step.uses.ref" && r["resource"] == resource)
+            .unwrap_or_else(|| panic!("no step.uses.ref row for {resource}: {doc}"))
+    };
+    let tag = step("step:test/0");
+    assert_eq!(tag["value"], "v4");
+    assert_eq!(tag["verdict"], "violates", "{tag}");
+    assert_eq!(tag["control"], "RC-042", "{tag}");
+    let sha = step("step:test/1");
+    assert_eq!(sha["verdict"], "satisfies", "{sha}");
+    assert_eq!(sha["control"], "RC-042", "{sha}");
+
+    let rc042: Vec<&serde_json::Value> = doc["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["control"] == "RC-042")
+        .collect();
+    assert_eq!(rc042.len(), 1, "one RC-042 finding, the tag step: {doc}");
+    assert_eq!(rc042[0]["class"], "github-actions.step.uses.ref");
+    assert!(
+        rc042[0]["site"].as_str().unwrap().contains("step:test/0"),
+        "{}",
+        rc042[0]
+    );
+}
