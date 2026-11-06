@@ -25,6 +25,10 @@
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
 //!     IfNotPresent otherwise)
+//!   * neither `workload.replicas` nor the liveness/readiness probes are
+//!     emitted for a manifest under a test or fixture directory (see
+//!     [`TEST_DIR_SEGMENTS`]), nor the two probes for a Job or CronJob
+//!     container: the specs abstain on what is not deployed or not serving
 //!   * `pdb.min-available` / `pdb.max-unavailable` (authored only: the API
 //!     requires exactly one, so the pair's absence is invalid config, not a
 //!     decidable default)
@@ -715,6 +719,30 @@ pub(super) fn workload_shape(kind: &str) -> Option<(&'static str, &'static [&'st
     }
 }
 
+/// Directory segments that mark a manifest as test material: the retrievers'
+/// test-path convention (`tests/`, `e2e/`, `fixtures/`, `testdata/`, ...)
+/// plus the fake-data trees Kubernetes repos keep beside their tests. Exact
+/// segments, never substrings: `contest/` and `latest/` deploy.
+const TEST_DIR_SEGMENTS: &[&str] = &[
+    "test",
+    "tests",
+    "__tests__",
+    "__mocks__",
+    "testing",
+    "e2e",
+    "fixtures",
+    "testdata",
+    "fake",
+    "fakedata",
+];
+
+/// Whether a repo-relative path lies under a test or fixture directory.
+fn test_material(rel_path: &str) -> bool {
+    let mut dirs = rel_path.split('/');
+    dirs.next_back();
+    dirs.any(|seg| TEST_DIR_SEGMENTS.contains(&seg))
+}
+
 /// Extract packets from one parsed document into the emitter. Documents of
 /// kinds outside the inventory emit nothing (valid Kubernetes, no facts the
 /// G6 control set asks about). `set` is the rendered set `doc` belongs to,
@@ -768,8 +796,15 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
         return;
     };
     let unit = format!("{kind_lower}:{name}");
+    // The replica floor (RC-017) and the probe rules (RC-020) are judged of
+    // deployed, long-running workloads only. A test fixture is not deployed,
+    // and a Job or CronJob runs to completion with no traffic for a probe to
+    // gate; neither emits those keys, so the spec abstains rather than
+    // flagging (or crediting) them.
+    let fixture = test_material(em.file_anchor);
+    let run_to_completion = matches!(kind, "Job" | "CronJob");
 
-    if matches!(kind, "Deployment" | "StatefulSet") {
+    if matches!(kind, "Deployment" | "StatefulSet") && !fixture {
         em.setting(
             &unit,
             "workload.replicas",
@@ -956,11 +991,15 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             );
         }
 
-        for (field, key) in [
-            ("livenessProbe", "container.liveness-probe"),
-            ("readinessProbe", "container.readiness-probe"),
-            ("startupProbe", "container.startup-probe"),
+        // The bool marks the probes the gates above withhold.
+        for (field, key, serving) in [
+            ("livenessProbe", "container.liveness-probe", true),
+            ("readinessProbe", "container.readiness-probe", true),
+            ("startupProbe", "container.startup-probe", false),
         ] {
+            if serving && (fixture || run_to_completion) {
+                continue;
+            }
             em.setting(&cunit, key, doc, &format!("{cpath}.{field}"), field, "none");
         }
 
@@ -1178,6 +1217,119 @@ spec:
         );
         assert_eq!(req.resolved_value.as_deref(), Some("none"));
         assert_eq!(req.resolution, Resolution::PlatformDefault);
+    }
+
+    /// Whether `got` carries a packet for `key` on any unit.
+    fn has_key(got: &Retrieved, key: &str) -> bool {
+        got.packets.iter().any(|p| p.key == key)
+    }
+
+    const BARE_DEPLOY: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: web:v1
+";
+
+    #[test]
+    fn a_bare_deployment_still_carries_replicas_and_probes() {
+        // The gates below leave the deployed, long-running case alone: one
+        // replica and no probes still reach the specs that flag them.
+        let got = retrieve_plain(None, "deploy/k8s/web.yaml", BARE_DEPLOY, "snap");
+        let replicas = find(&got, "deployment:web", "workload.replicas");
+        assert_eq!(replicas.resolved_value.as_deref(), Some("1"));
+        for key in ["container.liveness-probe", "container.readiness-probe"] {
+            let p = find(&got, "container:deployment/web/app", key);
+            assert_eq!(p.resolved_value.as_deref(), Some("none"), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_under_a_test_or_fixture_path_abstains_on_replicas_and_probes() {
+        for path in [
+            "controller/proxy-injector/fake/data/deployment.yaml",
+            "scripts/fakedata/applications/hello-world/deployments.yaml",
+            "test/e2e/deploy.yaml",
+            "pkg/testdata/deploy.yaml",
+            "tests/fixtures/deploy.yaml",
+        ] {
+            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
+            for key in [
+                "workload.replicas",
+                "container.liveness-probe",
+                "container.readiness-probe",
+            ] {
+                assert!(!has_key(&got, key), "{path}: {key} was emitted");
+            }
+            // Only those rules abstain; the rest of the manifest is read.
+            assert!(has_key(&got, "container.resources.limits.cpu"), "{path}");
+        }
+        // A segment, not a substring: these deploy.
+        for path in ["deploy/latest/web.yaml", "contest/web.yaml", "fake.yaml"] {
+            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
+            assert!(has_key(&got, "workload.replicas"), "{path}");
+        }
+    }
+
+    #[test]
+    fn job_and_cronjob_containers_abstain_on_liveness_and_readiness() {
+        let job = "\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cleanup
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          image: cleanup:v1
+";
+        let cron = "\
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: \"0 3 * * *\"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: agent
+              image: nightly:v1
+";
+        for (yaml, cunit) in [
+            (job, "container:job/cleanup/agent"),
+            (cron, "container:cronjob/nightly/agent"),
+        ] {
+            let got = packets(yaml);
+            assert!(!has_key(&got, "container.liveness-probe"), "{cunit}");
+            assert!(!has_key(&got, "container.readiness-probe"), "{cunit}");
+            // The pod template is still read for everything else.
+            find(&got, cunit, "container.resources.limits.cpu");
+        }
+    }
+
+    #[test]
+    fn daemonset_job_and_cronjob_abstain_on_replicas() {
+        for kind in ["DaemonSet", "Job"] {
+            let yaml = BARE_DEPLOY.replace("kind: Deployment", &format!("kind: {kind}"));
+            let got = packets(&yaml);
+            assert!(!has_key(&got, "workload.replicas"), "{kind}");
+            assert!(!got.packets.is_empty(), "{kind}: the pod template is read");
+        }
+        let cron = "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: nightly\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers: []\n";
+        assert!(!has_key(&packets(cron), "workload.replicas"));
+        let sts = BARE_DEPLOY.replace("kind: Deployment", "kind: StatefulSet");
+        find(&packets(&sts), "statefulset:web", "workload.replicas");
     }
 
     #[test]
