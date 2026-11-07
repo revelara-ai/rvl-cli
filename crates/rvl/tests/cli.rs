@@ -208,13 +208,13 @@ fn scan_out_carries_the_structure_lane_in_its_own_array() {
         .expect("failed to run rvl");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("structure: 7 repo controls"),
+        stdout.contains("structure: 8 repo controls"),
         "COVERAGE must summarize the structure lane: {stdout}"
     );
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let rows = doc["structure"].as_array().expect("structure array");
-    assert_eq!(rows.len(), 7, "one row per control: {rows:?}");
+    assert_eq!(rows.len(), 8, "one row per control: {rows:?}");
     for r in rows {
         assert_eq!(r["site_id"], "repo");
         assert_eq!(r["snapshot_id"], "fixture");
@@ -223,7 +223,7 @@ fn scan_out_carries_the_structure_lane_in_its_own_array() {
             .unwrap()
             .starts_with("repo_structure.RC-"));
     }
-    assert_eq!(doc["coverage"]["structure"]["total"], 7);
+    assert_eq!(doc["coverage"]["structure"]["total"], 8);
     // The call-site lane is exactly what it was without the record.
     assert_eq!(doc["sites"].as_array().unwrap().len(), 2);
     assert_eq!(doc["coverage"]["total"], 2);

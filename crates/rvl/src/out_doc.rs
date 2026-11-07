@@ -55,7 +55,7 @@ pub struct OutDoc {
     pub undecided: Vec<OutUndecided>,
     pub covered_classes: Vec<String>,
     /// The repo-structure lane (po-av01j.28): one eval row per control
-    /// (RC-033/057/058/034/070/006) with EVERY verdict, satisfies and
+    /// (RC-033/057/058/034/070/006/027/040) with EVERY verdict, satisfies and
     /// abstain included, pre-waiver. Kept out of `sites` on purpose: these
     /// rows describe the repo, not a call site, so they must not move
     /// `coverage.resolved/total`, `undecided` or `covered_classes`. Empty
