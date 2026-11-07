@@ -24,6 +24,7 @@ use rvl_core::Verdict;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+mod error_reporting;
 mod inventory;
 mod repo_kind;
 mod runbooks;
@@ -158,6 +159,30 @@ pub struct RulesetFacts {
     pub requires_review: bool,
 }
 
+/// What the tree shows about error reporting (RC-027): repo-relative paths,
+/// sorted, at most `MAX_PATHS` per list. Presence only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorReportingFacts {
+    /// Non-test service source that starts a listening server.
+    #[serde(default)]
+    pub listeners: Vec<String>,
+    /// Non-test source or dependency manifests that name an error-tracker
+    /// SDK.
+    #[serde(default)]
+    pub tracker_sdks: Vec<String>,
+    /// Service source that initialises an error tracker.
+    #[serde(default)]
+    pub tracker_inits: Vec<String>,
+    /// Log-shipper configs: fluent-bit, fluentd, vector, promtail or an
+    /// OpenTelemetry collector.
+    #[serde(default)]
+    pub log_shipping: Vec<String>,
+    /// Alert rule files: a PrometheusRule, a Prometheus rule file with an
+    /// `alert:` rule, or a Terraform Sentry alert.
+    #[serde(default)]
+    pub alert_rules: Vec<String>,
+}
+
 /// The repo-scoped structure record. Rides the packet stream as a JSONL line
 /// with `kind: "repo_structure"`, like the `repo_config` record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +216,9 @@ pub struct RepoStructure {
     /// Known CI scanners seen across all GitHub Actions workflows.
     #[serde(default)]
     pub ci_scans: CiScanFacts,
+    /// Error-reporting presence facts (RC-027).
+    #[serde(default)]
+    pub error_reporting: ErrorReportingFacts,
     /// True when the walk exhausted the tree (no unreadable directories).
     /// Only a complete walk licenses reasoning from absence — mirrors
     /// `Provenance::complete` on call-site packets.
@@ -212,6 +240,7 @@ impl Default for RepoStructure {
             codeowners: None,
             rulesets: Vec::new(),
             ci_scans: CiScanFacts::default(),
+            error_reporting: ErrorReportingFacts::default(),
             walk_complete: false,
         }
     }
@@ -288,7 +317,7 @@ pub struct StructureFinding {
 /// Map structure facts to per-control verdicts, `today` the scan date as
 /// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
 /// no model calls. Always returns one finding per control, in stable order:
-/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006.
+/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
 /// decidable negative only when the walk was complete AND absence is
@@ -304,6 +333,7 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
         eval_contract(facts),
         eval_manifests(facts),
         eval_runbooks(facts, today),
+        error_reporting::evaluate(facts),
     ]
 }
 

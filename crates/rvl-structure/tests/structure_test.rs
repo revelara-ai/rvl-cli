@@ -1040,7 +1040,130 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006"],
+        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027"],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
+}
+
+// --- RC-027: error reporting ---
+
+const GO_SERVER: &str = "package main\n\nimport \"net/http\"\n\nfunc main() {\n\thttp.ListenAndServe(\":8080\", nil)\n}\n";
+
+/// A Go service: a main that listens, and a Dockerfile that ships it.
+fn go_service(root: &Path) {
+    write(root, "go.mod", "module example.com/api\n\ngo 1.22\n");
+    write(root, "cmd/api/main.go", GO_SERVER);
+    write(
+        root,
+        "Dockerfile",
+        "FROM scratch\nEXPOSE 8080\nCMD [\"/api\"]\n",
+    );
+}
+
+#[test]
+fn rc027_go_service_without_a_tracker_violates() {
+    let dir = tempfile::tempdir().unwrap();
+    go_service(dir.path());
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-027");
+    assert_eq!(f.verdict, Verdict::Violates, "reason: {}", f.reason);
+    assert_eq!(f.evidence, ["cmd/api/main.go"]);
+    for searched in [
+        "sentry",
+        "bugsnag",
+        "fluent-bit",
+        "promtail",
+        "otel-collector",
+    ] {
+        assert!(
+            f.reason.contains(searched),
+            "names what was looked for: {}",
+            f.reason
+        );
+    }
+}
+
+#[test]
+fn rc027_go_service_with_sentry_and_a_prometheus_rule_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    go_service(dir.path());
+    write(
+        dir.path(),
+        "cmd/api/main.go",
+        "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/getsentry/sentry-go\"\n)\n\n\
+         func main() {\n\tsentry.Init(sentry.ClientOptions{})\n\thttp.ListenAndServe(\":8080\", nil)\n}\n",
+    );
+    write(
+        dir.path(),
+        "deploy/alerts.yaml",
+        "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: api\n\
+         spec:\n  groups:\n    - name: api\n      rules:\n        - alert: ErrorSpike\n",
+    );
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-027");
+    assert_eq!(f.verdict, Verdict::Satisfies, "reason: {}", f.reason);
+    assert!(f.reason.starts_with("partial"), "{}", f.reason);
+    assert_eq!(f.evidence, ["cmd/api/main.go", "deploy/alerts.yaml"]);
+}
+
+#[test]
+fn rc027_library_with_a_dockerfile_only_under_target_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "go.mod", "module example.com/lib\n\ngo 1.22\n");
+    write(dir.path(), "lib.go", "package lib\n\nfunc Dial() {}\n");
+    write(
+        dir.path(),
+        "target/Dockerfile",
+        "FROM scratch\nEXPOSE 8080\n",
+    );
+    // A test server is not the repository's server.
+    write(dir.path(), "server_test.go", GO_SERVER);
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-027");
+    assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
+}
+
+#[test]
+fn rc027_cli_main_without_a_listener_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "go.mod", "module example.com/tool\n\ngo 1.22\n");
+    write(
+        dir.path(),
+        "main.go",
+        "package main\n\nimport \"flag\"\n\nfunc main() { flag.Parse() }\n",
+    );
+    let fs = eval_dir(dir.path());
+    let f = finding(&fs, "RC-027");
+    assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
+}
+
+#[test]
+fn rc027_a_tracker_or_log_shipping_without_alert_rules_abstains() {
+    for (path, text) in [
+        ("requirements.txt", "flask==3.0.0\nsentry-sdk==2.0.0\n"),
+        ("deploy/fluent-bit.conf", "[OUTPUT]\n    Name loki\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "app.py",
+            "from flask import Flask\napp = Flask(__name__)\napp.run()\n",
+        );
+        write(dir.path(), path, text);
+        let fs = eval_dir(dir.path());
+        let f = finding(&fs, "RC-027");
+        assert_eq!(f.verdict, Verdict::Abstain, "{path}: {}", f.reason);
+        assert!(f.reason.contains(path), "{}", f.reason);
+    }
+}
+
+#[test]
+fn rc027_truncated_walk_never_violates() {
+    let mut facts = RepoStructure::default();
+    facts.error_reporting.listeners = vec!["main.go".into()];
+    let f = finding(&evaluate(&facts, TODAY), "RC-027").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
+    facts.walk_complete = true;
+    let f = finding(&evaluate(&facts, TODAY), "RC-027").clone();
+    assert_eq!(f.verdict, Verdict::Violates, "reason: {}", f.reason);
 }
