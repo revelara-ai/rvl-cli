@@ -837,6 +837,18 @@ fn judge(
             ),
         };
     }
+    // And for a protective site: retrieval output, reported as it is. No
+    // lane judges it, and a limiter's Get is not a call to bound.
+    if site.is_protective_site() {
+        return Finding {
+            site_id: id,
+            verdict: Verdict::NotApplicable,
+            reason: format!(
+                "{} site: not a client-call surface, API specs do not apply",
+                site.site_kind
+            ),
+        };
+    }
     let spec = specs.api_for(site);
 
     // Any other kinded site WITHOUT a client-call spec is likewise not this

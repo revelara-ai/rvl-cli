@@ -489,6 +489,35 @@ Nine limits:
   (`import com.zaxxer.hikari.*`). It does not report a pool that a framework
   builds from properties (Spring Boot `spring.datasource.hikari.*`).
 
+## Protective sites
+
+A protective site is a call where an in-code protective mechanism decides
+whether work proceeds: a rate limiter's `Allow`, `Wait` or `Reserve`. The
+retriever reports each one as a packet with `site_kind: "protective_site"`:
+the call, its `client_type` (the limiter type) and `func`, the mechanism as
+the `const_args` entry `protective_mechanism` (`how: "aggregate"`), and the
+enclosing function, chosen as for a call site. The branch that refuses the
+work is in that function, not in the limiter.
+
+Nothing judges the packet. It is not a call site, it is not counted in the
+resolution line, and it is never a finding. The scan lists it in `--out` as a
+row of `protective_sites`, and COVERAGE prints the count beside the
+retrieval census.
+
+The match is on the declared receiver type of the method, so a limiter
+embedded in a struct of the repository is the limiter, and a type of the
+repository with its own `Allow` is not. Test files are read for these
+packets, unlike call sites: goindex loads the tests of the packages that
+reach a listed package a second time, and a module that imports none pays
+for no second load.
+
+| Retriever | Emits |
+| --- | --- |
+| `goindex` | `rate_limit`: `golang.org/x/time/rate.Limiter` `Allow`, `AllowN`, `Wait`, `WaitN`, `Reserve`, `ReserveN`; `github.com/ulule/limiter/v3.Limiter` `Get`, `Peek`; `github.com/go-redis/redis_rate/v10.Limiter` and `/v9.Limiter` `Allow`, `AllowN`, `AllowAtMost`. The list is `protective_calls` in `helpers/goindex/extractor_corpus.json`. |
+
+`ulule/limiter`'s `Get` is also a call site, because `Get` is an I/O method
+name: the two packets share a site key and differ in `site_kind`.
+
 ## The liveness probe join
 
 Kubernetes restarts a container when its liveness probe fails. If the handler

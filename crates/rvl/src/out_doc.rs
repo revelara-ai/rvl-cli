@@ -84,12 +84,54 @@ pub struct OutDoc {
     /// serve. Null when the lane is off. Its `violates` decisions are also
     /// advisory rows in `findings`, class `model.<control>`. Additive.
     pub decision_model: Option<crate::decision::Summary>,
+    /// One row per protective site: a call where an in-code protective
+    /// mechanism decides whether work proceeds (a rate limiter's `Allow`),
+    /// with the function around it, where the refusal branch is. Retrieval
+    /// output, never judged: no finding, no verdict, and no effect on
+    /// `coverage` or `sites`. Empty when the retrievers found none. Additive.
+    pub protective_sites: Vec<OutProtectiveSite>,
 }
 
 impl OutDoc {
     pub fn with_decision_model(mut self, summary: Option<crate::decision::Summary>) -> OutDoc {
         self.decision_model = summary;
         self
+    }
+
+    pub fn with_protective_sites(mut self, sites: &[rvl_core::Site]) -> OutDoc {
+        self.protective_sites = sites.iter().map(OutProtectiveSite::of).collect();
+        self
+    }
+}
+
+/// One protective site. `site` is the site key (`file:line:class:method`),
+/// `class` the limiter type (`golang.org/x/time/rate.Limiter`), `mechanism`
+/// what it is (`rate_limit`) and `scope` the [`rvl_core::ScopeClass`] of its
+/// file, by the rule every site row uses.
+#[derive(Clone, Debug, Serialize)]
+pub struct OutProtectiveSite {
+    pub file: String,
+    pub line: u32,
+    pub site: String,
+    pub class: String,
+    pub method: String,
+    pub mechanism: String,
+    pub scope: &'static str,
+    pub enclosing_function: String,
+}
+
+impl OutProtectiveSite {
+    fn of(s: &rvl_core::Site) -> OutProtectiveSite {
+        OutProtectiveSite {
+            file: s.file_path.clone(),
+            line: s.line_number,
+            site: s.site_key(),
+            class: s.client_type.clone(),
+            method: s.method.clone(),
+            mechanism: s.protective_mechanism().unwrap_or_default().to_string(),
+            scope: s.scope().as_str(),
+            enclosing_function: s.enclosing_function_body.clone(),
+        }
     }
 }
 
@@ -500,12 +542,84 @@ pub fn build(
         hook_agent: hook_agent_block.map(|b| b.to_string()),
         blend: blend.cloned(),
         decision_model: None,
+        protective_sites: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The protective-site rows are a contract with the fleet sampler: the
+    /// key and every field name are fixed, and scope follows the site rule.
+    #[test]
+    fn protective_sites_carry_the_contract_fields() {
+        let site = |file: &str| rvl_core::Site {
+            file_path: file.into(),
+            line_number: 15,
+            client_type: "golang.org/x/time/rate.Limiter".into(),
+            method: "Allow".into(),
+            site_kind: rvl_core::SITE_KIND_PROTECTIVE.into(),
+            enclosing_function_body: "func handle() {}".into(),
+            const_args: vec![rvl_core::ConstArg {
+                name: rvl_core::CONST_ARG_PROTECTIVE_MECHANISM.into(),
+                value: "rate_limit".into(),
+                how: "aggregate".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let doc = build(
+            &[],
+            &render::Coverage::default(),
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            0,
+        )
+        .with_protective_sites(&[site("svc/main.go"), site("svc/main_test.go")]);
+        let v = serde_json::to_value(&doc).unwrap();
+        let rows = v["protective_sites"].as_array().unwrap();
+        let mut keys: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "class",
+                "enclosing_function",
+                "file",
+                "line",
+                "mechanism",
+                "method",
+                "scope",
+                "site"
+            ]
+        );
+        assert_eq!(rows[0]["file"], "svc/main.go");
+        assert_eq!(rows[0]["line"], 15);
+        assert_eq!(
+            rows[0]["site"],
+            "svc/main.go:15:golang.org/x/time/rate.Limiter:Allow"
+        );
+        assert_eq!(rows[0]["class"], "golang.org/x/time/rate.Limiter");
+        assert_eq!(rows[0]["method"], "Allow");
+        assert_eq!(rows[0]["mechanism"], "rate_limit");
+        assert_eq!(rows[0]["scope"], "runtime");
+        assert_eq!(rows[0]["enclosing_function"], "func handle() {}");
+        assert_eq!(rows[1]["scope"], "test_support");
+        // Never judged: no eval row, no coverage.
+        assert_eq!(v["sites"].as_array().unwrap().len(), 0);
+        assert_eq!(v["coverage"]["total"], 0);
+    }
 
     /// The document's `exit` and its blocking rows must tell the same story
     /// the process exit code tells: derived from the same `classify`.
@@ -712,6 +826,7 @@ mod tests {
             calls_resolved: 4200,
             candidates: 97,
             unretrieved,
+            ..Default::default()
         }];
         let doc = build(&[], &cov, None, &[], &[], &[], None, None, None, 0);
         let v = serde_json::to_value(&doc.coverage).unwrap();

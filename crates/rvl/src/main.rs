@@ -3408,8 +3408,9 @@ fn resolve_packet_stream(
 /// findings and triaged items, the G1 sites they are index-aligned with
 /// (server-entry sites are partitioned out), the loaded spec cache so callers
 /// can run the G6 config lane against the same specs, and the G2 server-entry
-/// lane's control findings (po-av01j.3) and route inventory, and whether the commercial tier
-/// loaded with an empty API corpus over real call sites.
+/// lane's control findings (po-av01j.3) and route inventory, whether the commercial tier
+/// loaded with an empty API corpus over real call sites, and the protective
+/// sites.
 type ResolvedScan = (
     Vec<rvl_propagate::Finding>,
     Vec<rvl_triage::TriagedItem>,
@@ -3420,6 +3421,9 @@ type ResolvedScan = (
     // The judgments that graded the scan; the agent lanes read the control
     // of an agent-answered site's class from them.
     Vec<rvl_triage::ClassJudgment>,
+    // The protective sites, partitioned out of the G1 list and never judged:
+    // `--out` reports them as `protective_sites`.
+    Vec<rvl_core::Site>,
 );
 
 /// Did the commercial spec cache load with ZERO API specs while there were
@@ -3730,6 +3734,11 @@ fn findings_from_sites(
     // below.
     let (unsized_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
         sites.into_iter().partition(|s| s.is_unsized_construction());
+    // Protective sites (a rate limiter's decision) are retrieval output for
+    // `--out`, judged by no lane. Same partition, so they never enter G1
+    // coverage, the eval rows or triage.
+    let (protective_sites, sites): (Vec<rvl_core::Site>, Vec<rvl_core::Site>) =
+        sites.into_iter().partition(|s| s.is_protective_site());
     let mut cache = rvl_spec::SpecCache::load(&specs_text)?;
     // Commercial tier layered over the OSS baseline (po-scnmv.13): the
     // existing merge policy applies — higher confidence wins, judgment lanes
@@ -3868,6 +3877,7 @@ fn findings_from_sites(
         server,
         empty_api_corpus,
         judgments,
+        protective_sites,
     ))
 }
 
@@ -4531,7 +4541,7 @@ fn run_scan(
             true,
             &progress,
         ) {
-            Ok((_, _, _, specs, _, _, _)) => Some(specs),
+            Ok((_, _, _, specs, ..)) => Some(specs),
             Err(e) if specs_file.is_none() => {
                 progress.suspend(|| {
                     eprintln!(
@@ -4553,6 +4563,7 @@ fn run_scan(
             path,
             &[],
             &citems,
+            &[],
             &[],
             specs.as_ref(),
             &structure.ladder,
@@ -4591,7 +4602,7 @@ fn run_scan(
         progress.suspend(|| seed_packet_index(index_dir, path, &stream));
     }
     progress::step(&progress, "Resolving findings");
-    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
+    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments, protective) =
         resolve_findings(
             store,
             keyset,
@@ -4636,6 +4647,7 @@ fn run_scan(
         &findings,
         &items,
         &sites,
+        &protective,
         Some(&specs),
         &structure,
         &structure_rows,
@@ -4801,6 +4813,8 @@ fn render_scan_output(
     findings: &[rvl_propagate::Finding],
     items: &[rvl_triage::TriagedItem],
     sites: &[rvl_core::Site],
+    // The protective sites, for `--out` alone: never judged.
+    protective: &[rvl_core::Site],
     // The specs the propagation ran against. Carried this far because the
     // ladder's sentence for an unbounded call depends on what the LIBRARY does
     // with no explicit bound, and only the spec knows that (po-av01j.175).
@@ -4989,6 +5003,7 @@ fn render_scan_output(
             exit,
         )
         .with_decision_model(model.map(|m| m.summary.clone()))
+        .with_protective_sites(protective)
     });
 
     let elapsed = format!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
@@ -5299,7 +5314,9 @@ fn resolve_budgeted(
 /// Merge reused and freshly-retrieved sites, de-duplicating on the full
 /// `site_key`. Reused and fresh come from disjoint file sets, so this normally
 /// drops nothing; keying on `site_key` (never file:line) guarantees a location
-/// that resolves to two sites with different client types keeps both.
+/// that resolves to two sites with different client types keeps both. The
+/// site kind is part of the key: a limiter's `Get` is a call site and a
+/// protective site with one site key, and both are kept.
 fn merge_on_site_key(
     reused: Vec<rvl_core::Site>,
     fresh: Vec<rvl_core::Site>,
@@ -5307,7 +5324,7 @@ fn merge_on_site_key(
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(reused.len() + fresh.len());
     for s in reused.into_iter().chain(fresh) {
-        if seen.insert(rvl_index::site_key(&s)) {
+        if seen.insert((s.site_kind.clone(), rvl_index::site_key(&s))) {
             out.push(s);
         }
     }
@@ -6388,7 +6405,7 @@ fn run_scan_incremental(
         _ => None,
     };
     progress::step(&progress, "Resolving findings");
-    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments) =
+    let (findings, mut items, sites, specs, server, empty_api_corpus, judgments, protective) =
         findings_from_sites(
             store,
             keyset,
@@ -6509,6 +6526,7 @@ fn run_scan_incremental(
         &findings,
         &items,
         &sites,
+        &protective,
         Some(&specs),
         &structure,
         &structure_rows,
@@ -6590,18 +6608,17 @@ fn run_explain(
         false,
         &budget::Limits::resolve(path, None, None),
     )?;
-    let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
-        resolve_findings(
-            store,
-            keyset,
-            &stream.text,
-            specs_file,
-            judgments,
-            TierFilter::Both,
-            Some(path),
-            false,
-            &indicatif::ProgressBar::hidden(),
-        )?;
+    let (_findings, mut items, _sites, specs, server, ..) = resolve_findings(
+        store,
+        keyset,
+        &stream.text,
+        specs_file,
+        judgments,
+        TierFilter::Both,
+        Some(path),
+        false,
+        &indicatif::ProgressBar::hidden(),
+    )?;
     // Mirror the scan's content lane so a `secret.*` finding id resolves in
     // the live fallback too (skipped for --retrieved, same as scan).
     if retrieved.is_none() {
@@ -6666,18 +6683,17 @@ fn run_suppress(
                     false,
                     &budget::Limits::resolve(scan_path, None, None),
                 )?;
-                let (_findings, mut items, _sites, specs, server, _empty_api_corpus, _judgments) =
-                    resolve_findings(
-                        store,
-                        keyset,
-                        &stream.text,
-                        specs_file,
-                        judgments,
-                        TierFilter::Both,
-                        Some(scan_path),
-                        false,
-                        &indicatif::ProgressBar::hidden(),
-                    )?;
+                let (_findings, mut items, _sites, specs, server, ..) = resolve_findings(
+                    store,
+                    keyset,
+                    &stream.text,
+                    specs_file,
+                    judgments,
+                    TierFilter::Both,
+                    Some(scan_path),
+                    false,
+                    &indicatif::ProgressBar::hidden(),
+                )?;
                 // Same content-lane mirror as explain's live fallback.
                 if retrieved.is_none() {
                     items.extend(content_items(scan_path));
@@ -6773,21 +6789,20 @@ fn run_report(
         // Server-entry sites were partitioned out of `sites` inside the
         // pipeline: they are control-level spec questions, never candidates
         // for the shape-only API-surface report.
-        let (findings, _items, sites, _specs, _server, _empty_api_corpus, _judgments) =
-            findings_from_sites(
-                store,
-                keyset,
-                scan.sites,
-                &scan.repo_cfg,
-                0,
-                specs_file,
-                None,
-                tiers,
-                Some(path),
-                false,
-                None,
-                &indicatif::ProgressBar::hidden(),
-            )?;
+        let (findings, _items, sites, ..) = findings_from_sites(
+            store,
+            keyset,
+            scan.sites,
+            &scan.repo_cfg,
+            0,
+            specs_file,
+            None,
+            tiers,
+            Some(path),
+            false,
+            None,
+            &indicatif::ProgressBar::hidden(),
+        )?;
         (findings, sites)
     } else {
         let stream = resolve_packet_stream(
@@ -6797,18 +6812,17 @@ fn run_report(
             false,
             &budget::Limits::resolve(path, None, None),
         )?;
-        let (findings, _items, sites, _specs, _server, _empty_api_corpus, _judgments) =
-            resolve_findings(
-                store,
-                keyset,
-                &stream.text,
-                specs_file,
-                None,
-                tiers,
-                Some(path),
-                false,
-                &indicatif::ProgressBar::hidden(),
-            )?;
+        let (findings, _items, sites, ..) = resolve_findings(
+            store,
+            keyset,
+            &stream.text,
+            specs_file,
+            None,
+            tiers,
+            Some(path),
+            false,
+            &indicatif::ProgressBar::hidden(),
+        )?;
         (findings, sites)
     };
 
@@ -10876,6 +10890,20 @@ mod tests {
         // A genuine duplicate (same site_key) IS collapsed.
         let dup = merge_on_site_key(vec![a.clone()], vec![a]);
         assert_eq!(dup.len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_a_call_site_and_a_protective_site_sharing_a_key() {
+        // A limiter's Get is both: one site key, two kinds.
+        let call = site_at("svc/x.go", 9, "github.com/ulule/limiter/v3.Limiter", "Get");
+        let mut protective = call.clone();
+        protective.site_kind = rvl_core::SITE_KIND_PROTECTIVE.into();
+        let merged = merge_on_site_key(vec![call], vec![protective]);
+        assert_eq!(
+            merged.len(),
+            2,
+            "a protective site must not drop its call site"
+        );
     }
 
     #[test]

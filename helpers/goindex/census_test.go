@@ -61,7 +61,7 @@ func TestCensusCandidatesAreTheEmittedCallSitesAndNeverExceedCallsResolved(t *te
 	sites, scan := runRetrieveAll("testdata/fixture", "fixture")
 	calls := 0
 	for _, s := range sites {
-		if s.SiteKind != siteKindEmission && s.SiteKind != siteKindMisuse && s.SiteKind != siteKindUnsized {
+		if s.SiteKind != siteKindEmission && s.SiteKind != siteKindMisuse && s.SiteKind != siteKindUnsized && s.SiteKind != siteKindProtective {
 			calls++
 		}
 	}
