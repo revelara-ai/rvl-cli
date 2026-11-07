@@ -84,7 +84,7 @@ The orchestrator uses it to:
       { "lang": "go", "calls_resolved": 18233, "candidates": 412,
         "unretrieved": { "io.Copy": 3 }, "protective_sites": 2 }
     ],
-    "structure": { "total": 7, "violates": 1, "satisfies": 3, "abstain": 2,
+    "structure": { "total": 8, "violates": 1, "satisfies": 3, "abstain": 3,
                    "not_applicable": 1 }
   },
   "sites": [
@@ -242,8 +242,8 @@ The orchestrator uses it to:
     It mirrors the `structure:` line of the COVERAGE block. Null when the
     lane did not run.
 - `structure` is the repo-structure lane: one eval row per control (RC-033,
-  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027) in that order, with the
-  same five fields as a `sites` row and no `scope`: a row is about the
+  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040) in that order, with
+  the same five fields as a `sites` row and no `scope`: a row is about the
   repository, not about a file. `site_id` is always `repo`, because the lane
   judges the repository and not a location, so `class`
   (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
@@ -282,6 +282,16 @@ The orchestrator uses it to:
   `PrometheusRule`, a Prometheus rule file with an `alert:` rule, or a
   Terraform Sentry alert). It abstains otherwise: no listener, a tracker or
   log shipping without alert rules, or a truncated walk.
+  The `RC-040` row judges a repository with a server entry point from its
+  GitHub Actions workflows and root `.gitlab-ci.yml`. It satisfies when a
+  SAST step (`semgrep ci`, CodeQL analyze, `snyk code test`, gosec, bandit,
+  or a remote reusable workflow named for sast, codeql or semgrep) runs on a
+  `pull_request` or `merge_group` workflow and fails its job on a finding.
+  It violates when the CI files run no SAST step, when SAST runs only off the
+  pull-request path, or when every SAST step on that path continues on
+  error. It abstains otherwise: no server entry point, no CI file, or a read
+  that could hide the gating step (an unparsed workflow, an opaque call, a
+  CI system it does not read).
 - `config_sites` is the config lane, one row per setting it read, whatever
   the verdict: the sites behind the `coverage.config.by_key` counts, so a
   consumer can sample them. The rows are pre-waiver engine truth. When no

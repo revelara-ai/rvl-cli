@@ -8,10 +8,14 @@
 //! (names, counts, presence) and never a verdict; [`evaluate`] maps those
 //! facts to per-control verdicts with honest abstention.
 //!
-//! The inventory also carries one fact that no control judges yet
-//! (po-6c0v8.7): [`CiScanFacts`], the known dependency-scan and SAST scanners
-//! seen across all GitHub Actions workflows. [`RepoStructure::scanner_seen`]
-//! says when their absence can be read.
+//! The inventory also carries [`CiScanFacts`], the known
+//! dependency-scan and SAST scanners seen across all GitHub Actions
+//! workflows. No control judges the scanners themselves;
+//! [`RepoStructure::scanner_seen`] says when their absence can be read, and
+//! RC-040 reads its counts of what was left unread.
+//!
+//! [`sast`] reads the SAST steps of the repository's CI, each with whether it
+//! runs on the pull-request path and fails its job, for RC-040.
 //!
 //! [`repo_kind`] reads, from the same tree, whether the repository is a
 //! service, a tool or a library, for the rules that block only in a service.
@@ -28,9 +32,11 @@ mod error_reporting;
 mod inventory;
 mod repo_kind;
 mod runbooks;
+mod sast;
 
 pub use inventory::inventory;
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
+pub use sast::{OnFailure, PrPath, SastFacts, SastStep};
 
 /// The `kind` tag this record carries in the packet stream.
 pub const RECORD_KIND: &str = "repo_structure";
@@ -219,6 +225,15 @@ pub struct RepoStructure {
     /// Error-reporting presence facts (RC-027).
     #[serde(default)]
     pub error_reporting: ErrorReportingFacts,
+    /// Repo-relative paths of non-test source files that start a listening
+    /// server, outside test, example, tool and vendored directories: at most
+    /// [`repo_kind::MAX_EVIDENCE`], since one is enough.
+    #[serde(default)]
+    pub server_entry_points: Vec<String>,
+    /// RC-040's SAST steps across the GitHub Actions workflows and the root
+    /// `.gitlab-ci.yml`.
+    #[serde(default)]
+    pub sast: SastFacts,
     /// True when the walk exhausted the tree (no unreadable directories).
     /// Only a complete walk licenses reasoning from absence — mirrors
     /// `Provenance::complete` on call-site packets.
@@ -241,6 +256,8 @@ impl Default for RepoStructure {
             rulesets: Vec::new(),
             ci_scans: CiScanFacts::default(),
             error_reporting: ErrorReportingFacts::default(),
+            server_entry_points: Vec::new(),
+            sast: SastFacts::default(),
             walk_complete: false,
         }
     }
@@ -317,7 +334,7 @@ pub struct StructureFinding {
 /// Map structure facts to per-control verdicts, `today` the scan date as
 /// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
 /// no model calls. Always returns one finding per control, in stable order:
-/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027.
+/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
 /// decidable negative only when the walk was complete AND absence is
@@ -334,6 +351,7 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
         eval_manifests(facts),
         eval_runbooks(facts, today),
         error_reporting::evaluate(facts),
+        sast::evaluate(facts),
     ]
 }
 

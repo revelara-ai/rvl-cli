@@ -388,27 +388,40 @@ fn file(root: &Path, path: &Path, name: &str, s: &mut Signals) {
         if s.deploy.len() < MAX_EVIDENCE && k8s_workload(&read_capped(path)) {
             note(&mut s.deploy, "Kubernetes workload", &rp);
         }
-    } else if SOURCE_EXTS.contains(&ext.as_str()) && !is_test_source(name) {
+    } else if is_source(&ext) && !is_test_source(name) {
         s.sources += 1;
         // Enough evidence of both is enough: later files need not be read.
         if s.listener.len() >= MAX_EVIDENCE && s.main.len() >= MAX_EVIDENCE {
             return;
         }
         let text = read_capped(path);
-        let found = |table: &[(&[&str], &[&str])]| {
-            table
-                .iter()
-                .filter(|(exts, _)| exts.contains(&ext.as_str()))
-                .flat_map(|(_, markers)| markers.iter())
-                .any(|m| text.contains(m))
-        };
-        if found(LISTENERS) {
+        if has_marker(LISTENERS, &ext, &text) {
             note(&mut s.listener, "server entry point", &rp);
         }
-        if found(MAINS) || (ext == "py" && name == "__main__.py") {
+        if has_marker(MAINS, &ext, &text) || (ext == "py" && name == "__main__.py") {
             note(&mut s.main, "main", &rp);
         }
     }
+}
+
+/// Whether `text`, the source of a file with extension `ext` (lowercased),
+/// holds a marker of `table` for that extension.
+fn has_marker(table: &[(&[&str], &[&str])], ext: &str, text: &str) -> bool {
+    table
+        .iter()
+        .filter(|(exts, _)| exts.contains(&ext))
+        .flat_map(|(_, markers)| markers.iter())
+        .any(|m| text.contains(m))
+}
+
+/// Whether `text`, the source of a file with extension `ext` (lowercased),
+/// starts a listening server: the server entry point a service is read from.
+pub(crate) fn serves(ext: &str, text: &str) -> bool {
+    has_marker(LISTENERS, ext, text)
+}
+
+pub(crate) fn is_source(ext: &str) -> bool {
+    SOURCE_EXTS.contains(&ext)
 }
 
 pub(crate) fn is_test_source(name: &str) -> bool {

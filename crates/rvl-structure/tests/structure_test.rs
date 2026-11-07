@@ -1040,7 +1040,7 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027"],
+        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
 }
@@ -1166,4 +1166,299 @@ fn rc027_truncated_walk_never_violates() {
     facts.walk_complete = true;
     let f = finding(&evaluate(&facts, TODAY), "RC-027").clone();
     assert_eq!(f.verdict, Verdict::Violates, "reason: {}", f.reason);
+}
+
+// --- RC-040: SAST on the pull-request path ---
+
+const SERVER_MAIN: &str = "package main\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n";
+
+/// A Go service with the given workflows, judged for RC-040.
+fn rc040(workflows: &[(&str, &str)]) -> StructureFinding {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "cmd/api/main.go", SERVER_MAIN);
+    for (path, text) in workflows {
+        write(dir.path(), path, text);
+    }
+    finding(&eval_dir(dir.path()), "RC-040").clone()
+}
+
+fn wf(on: &str, steps: &str) -> String {
+    format!("on: {on}\njobs:\n  sast:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n{steps}")
+}
+
+const SEMGREP: &str = "      - run: semgrep ci\n";
+const CODEQL: &str =
+    "      - uses: github/codeql-action/init@v3\n      - uses: github/codeql-action/analyze@v3\n";
+
+#[test]
+fn rc040_satisfies_a_gating_sast_step_on_a_pull_request_workflow() {
+    for (on, steps) in [
+        ("[pull_request]", SEMGREP),
+        ("[merge_group]", CODEQL),
+        (
+            "\n  pull_request:\n    branches: [main]\n  push:",
+            "      - uses: securego/gosec@v2\n        with:\n          args: ./...\n",
+        ),
+        (
+            "{pull_request: {}}",
+            "      - run: |\n          pip install bandit\n          bandit -r src\n",
+        ),
+        (
+            "[pull_request]",
+            "      - uses: snyk/actions/node@master\n        with:\n          command: code test\n",
+        ),
+    ] {
+        let f = rc040(&[(".github/workflows/sast.yml", &wf(on, steps))]);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{on} {steps}: {f:?}");
+        assert_eq!(f.evidence, vec![".github/workflows/sast.yml"]);
+    }
+    // A GitLab job in merge request pipelines.
+    let f = rc040(&[(
+        ".gitlab-ci.yml",
+        "semgrep:\n  image: semgrep/semgrep\n  script: semgrep ci\n  rules:\n    - if: $CI_PIPELINE_SOURCE == \"merge_request_event\"\n",
+    )]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+}
+
+#[test]
+fn rc040_a_local_reusable_workflow_runs_on_its_callers_triggers() {
+    let callee = "on: [workflow_call]\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n      - run: semgrep ci\n";
+    let f = rc040(&[
+        (
+            ".github/workflows/ci.yml",
+            "on: [pull_request]\njobs:\n  sast:\n    uses: ./.github/workflows/semgrep.yml\n",
+        ),
+        (".github/workflows/semgrep.yml", callee),
+    ]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    assert_eq!(f.evidence, vec![".github/workflows/semgrep.yml"]);
+    let f = rc040(&[
+        (
+            ".github/workflows/nightly.yml",
+            "on: [schedule]\njobs:\n  sast:\n    uses: ./.github/workflows/semgrep.yml\n",
+        ),
+        (".github/workflows/semgrep.yml", callee),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    // Called by no local workflow: another repository may call it.
+    let f = rc040(&[(".github/workflows/semgrep.yml", callee)]);
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+}
+
+#[test]
+fn rc040_a_remote_reusable_workflow_named_for_sast_is_a_sast_step() {
+    let f = rc040(&[(
+        ".github/workflows/ci.yml",
+        "on: [pull_request]\njobs:\n  sast:\n    uses: org/security/.github/workflows/sast.yml@v1\n",
+    )]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    assert!(
+        f.reason.contains("org/security/.github/workflows/sast.yml"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn rc040_violates_m1_ci_without_any_sast_step() {
+    let f = rc040(&[
+        (".github/workflows/ci.yml", WF_BUILD_ONLY),
+        // Dependency scanning is not SAST.
+        (".github/workflows/deps.yml", &wf("[pull_request]", "      - uses: actions/dependency-review-action@v4\n      - uses: snyk/actions/node@master\n")),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert!(
+        f.reason
+            .contains("2 CI file(s) read and none runs a SAST step"),
+        "{f:?}"
+    );
+    let f = rc040(&[(".gitlab-ci.yml", "test:\n  script: make test\n")]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    // A CI system whose steps are not read may run the SAST.
+    let f = rc040(&[
+        (".github/workflows/ci.yml", WF_BUILD_ONLY),
+        (
+            "Jenkinsfile",
+            "pipeline { stages { stage('sast') { steps { sh 'semgrep ci' } } } }\n",
+        ),
+    ]);
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    assert!(
+        f.reason
+            .contains("CI config not read for SAST: Jenkinsfile"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn rc040_violates_m3_sast_only_off_the_pull_request_path() {
+    let f = rc040(&[
+        (
+            ".github/workflows/ci.yml",
+            &wf("[pull_request]", "      - run: make test\n"),
+        ),
+        (
+            ".github/workflows/codeql.yml",
+            &wf(
+                "\n  push:\n    branches: [main]\n  schedule:\n    - cron: '0 0 * * 0'",
+                CODEQL,
+            ),
+        ),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert!(
+        f.reason
+            .contains("not triggered by pull_request or merge_group"),
+        "{f:?}"
+    );
+    assert_eq!(f.evidence, vec![".github/workflows/codeql.yml"]);
+}
+
+#[test]
+fn rc040_violates_m2a_every_pull_request_sast_step_continues_on_error() {
+    for steps in [
+        "      - run: semgrep ci\n        continue-on-error: true\n",
+        "      - run: gosec ./... || true\n",
+        "      - run: |\n          bandit -r src \\\n            --exit-zero\n",
+    ] {
+        let f = rc040(&[(".github/workflows/sast.yml", &wf("[pull_request]", steps))]);
+        assert_eq!(f.verdict, Verdict::Violates, "{steps}: {f:?}");
+        assert!(f.reason.contains("continues on error"), "{f:?}");
+    }
+    // A job that continues on error lets its steps' findings pass.
+    let f = rc040(&[(
+        ".github/workflows/sast.yml",
+        "on: [pull_request]\njobs:\n  sast:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n    steps:\n      - run: semgrep ci\n",
+    )]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    let f = rc040(&[(
+        ".gitlab-ci.yml",
+        "sast:\n  script: [semgrep ci]\n  allow_failure: true\n  only: [merge_requests]\n",
+    )]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+}
+
+#[test]
+fn rc040_a_line_that_continues_without_running_sast_does_not_excuse_it() {
+    let f = rc040(&[(
+        ".github/workflows/sast.yml",
+        &wf(
+            "[pull_request]",
+            "      - run: |\n          make lint || true\n          gosec ./...\n",
+        ),
+    )]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    // One SAST line that continues does not excuse another that gates.
+    let f = rc040(&[(
+        ".github/workflows/sast.yml",
+        &wf(
+            "[pull_request]",
+            "      - run: |\n          gosec ./... || true\n          bandit -r src\n",
+        ),
+    )]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+}
+
+/// The shape of a real security workflow: gosec installed, then run by its
+/// GOPATH path; a report-only `semgrep scan` beside it.
+#[test]
+fn rc040_reads_a_scanner_run_by_its_install_path() {
+    let f = rc040(&[(
+        ".github/workflows/security.yml",
+        &wf(
+            "\n  push:\n    branches: [main]\n  pull_request:",
+            "      - run: go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0\n      - run: |\n          mkdir -p \"$RUNNER_TEMP/reports\"\n          \"$(go env GOPATH)/bin/gosec\" -exclude-dir=testdata \\\n            -fmt sarif ./...\n      - run: python -m pip install semgrep==1.183.0\n      - run: semgrep scan --config p/default --text\n",
+        ),
+    )]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    assert!(
+        f.reason.contains("gosec (.github/workflows/security.yml)"),
+        "{f:?}"
+    );
+    // Installing a scanner is not running one: it keeps no violation from
+    // being read.
+    let f = rc040(&[(
+        ".github/workflows/sast.yml",
+        &wf(
+            "[pull_request]",
+            "      - run: pip install semgrep\n      - run: semgrep ci || true\n",
+        ),
+    )]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+}
+
+#[test]
+fn rc040_abstains_without_a_server_entry_point_or_ci() {
+    // A library: no server entry point outside tests and examples.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "lib.go", "package lib\n");
+    write(dir.path(), "examples/server/main.go", SERVER_MAIN);
+    write(dir.path(), "server_test.go", SERVER_MAIN);
+    write(dir.path(), "vendor/x/main.go", SERVER_MAIN);
+    write(dir.path(), ".github/workflows/ci.yml", WF_BUILD_ONLY);
+    let facts = inventory(dir.path());
+    assert!(
+        facts.server_entry_points.is_empty(),
+        "{:?}",
+        facts.server_entry_points
+    );
+    let f = finding(&evaluate(&facts, TODAY), "RC-040").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    assert!(f.reason.contains("no server entry point"), "{f:?}");
+    // A service with no CI files at all.
+    let f = rc040(&[]);
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    assert!(f.reason.contains("no GitHub Actions workflow"), "{f:?}");
+}
+
+/// What the walk cannot see may be the step that gates: no violation.
+#[test]
+fn rc040_abstains_when_a_gating_step_could_be_out_of_sight() {
+    let cases: Vec<(&str, String)> = vec![
+        // An opaque call could run SAST.
+        (".github/workflows/ci.yml", "on: [pull_request]\njobs:\n  s:\n    uses: org/shared/.github/workflows/security.yml@v2\n".into()),
+        // A SAST scanner this rule does not judge.
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - uses: SonarSource/sonarcloud-github-action@v2\n")),
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - run: semgrep scan --config auto\n")),
+        // A path filter, a condition, pull_request_target, an expression.
+        (".github/workflows/ci.yml", wf("\n  pull_request:\n    paths: ['src/**']", SEMGREP)),
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - run: semgrep ci\n        if: github.event_name == 'push'\n")),
+        (".github/workflows/ci.yml", wf("[pull_request_target]", SEMGREP)),
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - run: semgrep ci\n        continue-on-error: ${{ inputs.soft }}\n")),
+        // A pipe without pipefail, a shell without -e.
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - run: semgrep ci | tee semgrep.txt\n")),
+        (".github/workflows/ci.yml", wf("[pull_request]", "      - shell: bash {0}\n        run: |\n          gosec ./...\n          echo done\n")),
+        // GitLab branch pipelines and includes.
+        (".gitlab-ci.yml", "sast:\n  script: semgrep ci\n".into()),
+        (".gitlab-ci.yml", "include:\n  - template: Security/SAST.gitlab-ci.yml\ntest:\n  script: make test\n".into()),
+        (".gitlab-ci.yml", ".base:\n  script: semgrep ci\nsast:\n  extends: .base\n".into()),
+        // An unparsed workflow.
+        (".github/workflows/ci.yml", "jobs:\n  a: [unclosed\n".into()),
+    ];
+    for (path, text) in &cases {
+        let files = [(*path, text.as_str())];
+        let f = rc040(&files);
+        assert_eq!(f.verdict, Verdict::Abstain, "{files:?}: {f:?}");
+    }
+}
+
+#[test]
+fn rc040_facts_round_trip_and_an_older_record_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "cmd/api/main.go", SERVER_MAIN);
+    write(
+        dir.path(),
+        ".github/workflows/sast.yml",
+        &wf("[pull_request]", SEMGREP),
+    );
+    let facts = inventory(dir.path());
+    assert_eq!(facts.server_entry_points, vec!["cmd/api/main.go"]);
+    let line = facts.to_jsonl();
+    assert!(
+        line.contains(r#""pr_path":"yes","on_failure":"fails""#),
+        "{line}"
+    );
+    assert_eq!(parse_record(&line).expect("round trip"), facts);
+    let old = r#"{"kind":"repo_structure","snapshot_id":"s","ecosystems":[],"walk_complete":true}"#;
+    let f = finding(&evaluate(&parse_record(old).unwrap(), TODAY), "RC-040").clone();
+    assert_eq!(f.verdict, Verdict::Abstain);
 }

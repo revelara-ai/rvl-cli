@@ -2,7 +2,8 @@
 //! it reports what is present (names, counts, markers), never a verdict.
 //! Contents are read locally to detect markers; no source text is stored.
 
-use crate::{error_reporting, runbooks};
+use crate::sast::{self, SastFacts};
+use crate::{error_reporting, repo_kind, runbooks};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
@@ -60,7 +61,7 @@ const NPM_LOCKS: &[&str] = &[
 /// action itself and any path under it (`snyk/actions/node`, a reusable
 /// workflow of `google/osv-scanner-action`). CodeQL is listed by sub-action:
 /// `github/codeql-action/upload-sarif` uploads a result and scans nothing.
-const SCANNER_ACTIONS: &[(ScannerClass, &str)] = &[
+pub(crate) const SCANNER_ACTIONS: &[(ScannerClass, &str)] = &[
     (
         ScannerClass::DependencyScan,
         "actions/dependency-review-action",
@@ -95,7 +96,7 @@ const SCANNER_ACTIONS: &[(ScannerClass, &str)] = &[
 /// Scanner commands a `run:` step invokes directly. Unambiguous tool names
 /// only: these are matched as substrings of lowercased step text, and a
 /// scanner run as a command must not be reported as absent.
-const SCANNER_COMMANDS: &[(ScannerClass, &str)] = &[
+pub(crate) const SCANNER_COMMANDS: &[(ScannerClass, &str)] = &[
     (ScannerClass::DependencyScan, "cargo audit"),
     (ScannerClass::DependencyScan, "cargo deny"),
     (ScannerClass::DependencyScan, "dependency-check"),
@@ -158,6 +159,11 @@ struct Acc {
     ci_scans: CiScanFacts,
     scanners: BTreeSet<ScannerFacts>,
     error_reporting: error_reporting::Acc,
+    /// The workflow files that parsed, by repo-relative path, for RC-040's
+    /// walk across reusable-workflow calls.
+    workflows: Vec<(String, Value)>,
+    sast: SastFacts,
+    servers: Vec<String>,
     walk_complete: bool,
 }
 
@@ -205,6 +211,10 @@ pub fn inventory(root: &Path) -> RepoStructure {
         }
     }
 
+    acc.workflows.sort_by(|a, b| a.0.cmp(&b.0));
+    sast::github(&acc.workflows, &mut acc.sast);
+    acc.sast.other_ci.sort();
+    acc.servers.sort();
     resolve_lockfiles(root, &mut acc.manifests);
     acc.manifests.sort_by(|a, b| a.path.cmp(&b.path));
     acc.runbook_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -244,6 +254,8 @@ pub fn inventory(root: &Path) -> RepoStructure {
             ..acc.ci_scans
         },
         error_reporting: acc.error_reporting.finish(),
+        server_entry_points: acc.servers,
+        sast: acc.sast,
         walk_complete: acc.walk_complete,
     }
 }
@@ -454,6 +466,23 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     if is_gha_workflow {
         scan_workflow(&rp, &read_capped(path), acc);
     }
+    // --- RC-040 reads the root GitLab CI file as well ---
+    if rp == ".gitlab-ci.yml" {
+        sast::gitlab(&rp, &read_capped(path), &mut acc.sast);
+    }
+    if sast::OTHER_CI.contains(&rp.as_str()) {
+        acc.sast.other_ci.push(rp.clone());
+    }
+
+    // --- server entry points (RC-040 judges a deployable service only) ---
+    if acc.servers.len() < repo_kind::MAX_EVIDENCE
+        && repo_kind::is_source(&ext)
+        && !repo_kind::is_test_source(name)
+        && repo_kind::in_service_code(&rp)
+        && repo_kind::serves(&ext, &read_capped(path))
+    {
+        acc.servers.push(rp.clone());
+    }
 
     // --- contract-test frameworks + dependency manifests ---
     match name {
@@ -575,14 +604,16 @@ fn committed_rulesets(root: &Path) -> Vec<crate::RulesetFacts> {
 /// workflow (invalid YAML, or no `jobs` mapping) is counted as unparsed, not
 /// as a workflow with no scanner: nothing was read from it.
 fn scan_workflow(rp: &str, text: &str, acc: &mut Acc) {
-    let jobs = serde_yaml::from_str::<Value>(text)
-        .ok()
+    let doc = serde_yaml::from_str::<Value>(text).ok();
+    let jobs = doc
+        .as_ref()
         .and_then(|doc| doc.get("jobs").and_then(Value::as_mapping).cloned());
-    let Some(jobs) = jobs else {
+    let (Some(doc), Some(jobs)) = (doc, jobs) else {
         acc.ci_scans.workflows_unparsed += 1;
         return;
     };
     acc.ci_scans.workflows_parsed += 1;
+    acc.workflows.push((rp.to_string(), doc));
     for job in jobs.values() {
         // A job that calls a reusable workflow has `uses:` and no steps.
         if let Some(uses) = job.get("uses").and_then(Value::as_str) {
