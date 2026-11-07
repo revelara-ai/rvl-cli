@@ -233,3 +233,103 @@ fn rc042_unpinned_action_ref_is_decided_end_to_end() {
         rc042[0]
     );
 }
+
+/// RC-079 is decided end to end, one row per release job: a job that
+/// publishes with neither an SBOM nor a provenance step violates M1, one that
+/// makes both and pins every action to a commit satisfies, one with an action
+/// pinned to a tag violates M2b, and a job that does not publish has no row.
+#[test]
+fn rc079_release_job_supply_chain_is_decided_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let workflows = repo.join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
+    std::fs::write(
+        workflows.join("release.yml"),
+        format!(
+            "on: push\njobs:\n  \
+             test:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@v4\n      - run: make test\n  \
+             npm:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{sha}\n      - run: npm publish\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        workflows.join("image.yml"),
+        format!(
+            "on: push\njobs:\n  \
+             image:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: docker/build-push-action@{sha}\n        with:\n          \
+             push: true\n          sbom: true\n          provenance: true\n  \
+             pypi:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: pypa/gh-action-pypi-publish@release/v1\n"
+        ),
+    )
+    .unwrap();
+    let specs = dir.path().join("specs.json");
+    let spec_file = serde_json::json!({
+        "config_keys": [{
+            "format": "github-actions", "key": "job.release_supply_chain",
+            "expect": {"kind": "pattern", "name": "release_supply_chain"},
+            "confidence": 0.9, "control": "RC-079", "severity": "medium",
+            "fix": "make an SBOM and a provenance attestation, and pin every action to a commit",
+            "rationale": "a release that cannot be traced to its source and builder can be swapped",
+        }],
+    });
+    std::fs::write(&specs, spec_file.to_string()).unwrap();
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .env("RVL_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out_path.is_file(),
+        "scan wrote no --out document: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+
+    let rows: Vec<&serde_json::Value> = doc["config_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["key"] == "job.release_supply_chain")
+        .collect();
+    let row = |resource: &str| {
+        rows.iter()
+            .find(|r| r["resource"] == resource)
+            .unwrap_or_else(|| panic!("no release row for {resource}: {rows:?}"))
+    };
+    // `rule` is the class phrase; the value names the rule and the actions.
+    for (resource, verdict, value) in [
+        (
+            "job:npm",
+            "violates",
+            "M1: no SBOM step and no provenance step",
+        ),
+        ("job:image", "satisfies", "S1:"),
+        (
+            "job:pypi",
+            "violates",
+            "M2b: pypa/gh-action-pypi-publish@release/v1 not pinned to a commit",
+        ),
+    ] {
+        let r = row(resource);
+        assert_eq!(r["verdict"], verdict, "{r}");
+        assert_eq!(r["control"], "RC-079", "{r}");
+        assert!(r["value"].as_str().unwrap().starts_with(value), "{r}");
+    }
+    assert_eq!(rows.len(), 3, "the test job publishes nothing: {rows:?}");
+}
