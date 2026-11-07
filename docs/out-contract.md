@@ -84,7 +84,7 @@ The orchestrator uses it to:
       { "lang": "go", "calls_resolved": 18233, "candidates": 412,
         "unretrieved": { "io.Copy": 3 }, "protective_sites": 2 }
     ],
-    "structure": { "total": 6, "violates": 1, "satisfies": 3, "abstain": 1,
+    "structure": { "total": 7, "violates": 1, "satisfies": 3, "abstain": 2,
                    "not_applicable": 1 }
   },
   "sites": [
@@ -242,9 +242,9 @@ The orchestrator uses it to:
     It mirrors the `structure:` line of the COVERAGE block. Null when the
     lane did not run.
 - `structure` is the repo-structure lane: one eval row per control (RC-033,
-  RC-057, RC-058, RC-034, RC-070, RC-006) in that order, with the same five
-  fields as a `sites` row and no `scope`: a row is about the repository, not
-  about a file. `site_id` is always `repo`, because the lane
+  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027) in that order, with the
+  same five fields as a `sites` row and no `scope`: a row is about the
+  repository, not about a file. `site_id` is always `repo`, because the lane
   judges the repository and not a location, so `class`
   (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
   `satisfies`, `abstain` and `not_applicable` included, and the rows are
@@ -270,6 +270,18 @@ The orchestrator uses it to:
   settings is out of scope, and the reason says so. A repository with a
   runbook directory and no runbook files keeps the weak presence-only
   `satisfies`.
+  The `RC-027` row violates when non-test service code starts a listening
+  server (a Go `package main` that calls `ListenAndServe`, `net.Listen` or a
+  gRPC `Serve`; Python `uvicorn.run`, a gunicorn config or a Flask/FastAPI
+  `app.run`; JS/TS `app.listen` or a `createServer(...).listen` chain) and
+  the tree holds no error-tracker SDK (Sentry, Bugsnag, Rollbar,
+  Honeybadger, Airbrake) in non-test source or dependency manifests and no
+  log-shipping config (fluent-bit, fluentd, vector, promtail, an
+  OpenTelemetry collector). It satisfies, partially, when service code
+  initialises a tracker and an alert rule file is committed (a
+  `PrometheusRule`, a Prometheus rule file with an `alert:` rule, or a
+  Terraform Sentry alert). It abstains otherwise: no listener, a tracker or
+  log shipping without alert rules, or a truncated walk.
 - `config_sites` is the config lane, one row per setting it read, whatever
   the verdict: the sites behind the `coverage.config.by_key` counts, so a
   consumer can sample them. The rows are pre-waiver engine truth. When no

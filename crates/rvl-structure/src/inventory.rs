@@ -2,7 +2,7 @@
 //! it reports what is present (names, counts, markers), never a verdict.
 //! Contents are read locally to detect markers; no source text is stored.
 
-use crate::runbooks;
+use crate::{error_reporting, runbooks};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
@@ -157,6 +157,7 @@ struct Acc {
     runbook_files: Vec<RunbookFacts>,
     ci_scans: CiScanFacts,
     scanners: BTreeSet<ScannerFacts>,
+    error_reporting: error_reporting::Acc,
     walk_complete: bool,
 }
 
@@ -242,6 +243,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
             scanners: acc.scanners.into_iter().collect(),
             ..acc.ci_scans
         },
+        error_reporting: acc.error_reporting.finish(),
         walk_complete: acc.walk_complete,
     }
 }
@@ -445,6 +447,8 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
             acc.coverage.insert(rp.clone());
         }
     }
+
+    error_reporting::observe(path, &rp, name, &ext, &mut acc.error_reporting);
 
     // --- CI scanners (Q21/Q22): GitHub Actions workflows only ---
     if is_gha_workflow {

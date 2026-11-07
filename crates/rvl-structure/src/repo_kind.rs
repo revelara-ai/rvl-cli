@@ -411,7 +411,7 @@ fn file(root: &Path, path: &Path, name: &str, s: &mut Signals) {
     }
 }
 
-fn is_test_source(name: &str) -> bool {
+pub(crate) fn is_test_source(name: &str) -> bool {
     name.ends_with("_test.go")
         || name.starts_with("test_")
         || name.ends_with("_test.py")
