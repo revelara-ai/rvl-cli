@@ -97,6 +97,17 @@ pub fn pattern_matches(name: &str, value: &str) -> Option<PatternVerdict> {
                 _ => PatternVerdict::Abstains("the value is not a link status"),
             })
         }
+        // The RC-079 rule a GitHub Actions release job's workflow proves,
+        // named by the value's prefix (`job.release_supply_chain`).
+        "release_supply_chain" => {
+            return Some(match value.split(':').next() {
+                Some("S1") => PatternVerdict::Matches,
+                Some("M1" | "M2b") => PatternVerdict::Fails,
+                _ => PatternVerdict::Abstains(
+                    "the workflow does not prove the release job's SBOM, provenance or pins",
+                ),
+            })
+        }
         _ => return None,
     };
     Some(verdict.into())

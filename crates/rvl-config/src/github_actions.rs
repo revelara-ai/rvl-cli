@@ -27,6 +27,9 @@
 //!     call), so a guard on it abstains rather than closing on a guess.
 //!   * `workflow.publishes_image` — any job does; withheld if any is unknown.
 //!
+//! A job that publishes also gets `job.release_supply_chain`: which RC-079
+//! rule the file proves about its SBOM, provenance and pins (see `release`).
+//!
 //! Anything else in a workflow file is not inventoried: the key list is
 //! spec-driven, exactly as the typed retrievers only inventory client calls.
 
@@ -35,6 +38,8 @@ use crate::{
     Retrieved, FILE_SCOPE,
 };
 use serde_yaml::Value;
+
+mod release;
 
 pub struct GithubActions;
 
@@ -274,6 +279,17 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 wf_publishes = wf_publishes.map(|any| any || publishes);
             }
             _ => wf_publishes = None,
+        }
+
+        // job.release_supply_chain: only a job that publishes is judged.
+        if let Some(r) = release::judge(jobs, job_id, job) {
+            out.packets.push(packet(
+                &unit,
+                "job.release_supply_chain",
+                Some(r.value),
+                Resolution::AsAuthored,
+                vec![ProvenanceStep::new(rel_path, &r.publish_path, "explicit")],
+            ));
         }
 
         // job.timeout-minutes: explicit, else the documented 6h default.
@@ -752,6 +768,120 @@ mod tests {
         assert_eq!(
             fact(&got, "job:test", "job.publishes_image"),
             Some(strs(&["false"]).as_slice())
+        );
+    }
+
+    // ---- RC-079: the release job's supply chain ----
+
+    const SHA: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+
+    /// The `job.release_supply_chain` verdict of each job, judged by the
+    /// pattern a spec maps to RC-079.
+    fn release_verdicts(yaml: &str) -> Vec<(String, rvl_core::Verdict, String)> {
+        let specs = rvl_spec::SpecCache::load(
+            r#"{"config_keys":[{"format":"github-actions","key":"job.release_supply_chain",
+                "expect":{"kind":"pattern","name":"release_supply_chain"},"confidence":0.9,
+                "control":"RC-079","severity":"medium","fix":"attest and pin the release"}]}"#,
+        )
+        .expect("the spec file parses");
+        let got = packets(yaml);
+        got.packets
+            .iter()
+            .filter(|p| p.key == "job.release_supply_chain")
+            .map(|p| {
+                let f = crate::eval::evaluate(p, &got.predicates, &specs);
+                (p.unit.clone(), f.verdict, f.reason)
+            })
+            .collect()
+    }
+
+    fn one(yaml: &str) -> (rvl_core::Verdict, String) {
+        let v = release_verdicts(yaml);
+        assert_eq!(v.len(), 1, "one release job: {v:?}");
+        let (unit, verdict, reason) = v.into_iter().next().unwrap();
+        assert_eq!(unit, "job:release");
+        (verdict, reason)
+    }
+
+    #[test]
+    fn a_publishing_job_with_neither_sbom_nor_provenance_violates_m1() {
+        let (verdict, reason) = one(&format!(
+            "on: push\njobs:\n  release:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: npm publish\n"
+        ));
+        assert_eq!(verdict, rvl_core::Verdict::Violates, "{reason}");
+        assert!(
+            reason.contains("M1: no SBOM step and no provenance step"),
+            "{reason}"
+        );
+        assert!(!reason.contains("M2b"), "{reason}");
+    }
+
+    #[test]
+    fn sbom_provenance_and_commit_pins_satisfy_s1() {
+        let (verdict, reason) = one(&format!(
+            "on: push\njobs:\n  release:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - uses: docker/build-push-action@{SHA}\n        with:\n          push: true\n          sbom: true\n          provenance: mode=max\n"
+        ));
+        assert_eq!(verdict, rvl_core::Verdict::Satisfies, "{reason}");
+        assert!(reason.contains("S1:"), "{reason}");
+        // The attestation may be its own job, one that needs the release job.
+        let (verdict, reason) = one(&format!(
+            "on: push\njobs:\n  release:\n    steps:\n      - uses: softprops/action-gh-release@{SHA}\n      - uses: anchore/sbom-action@{SHA}\n  provenance:\n    needs: [release]\n    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0\n"
+        ));
+        assert_eq!(verdict, rvl_core::Verdict::Satisfies, "{reason}");
+    }
+
+    #[test]
+    fn an_action_pinned_by_tag_violates_m2b_and_is_named() {
+        let (verdict, reason) = one(&format!(
+            "on: push\njobs:\n  release:\n    steps:\n      - uses: actions/checkout@v4\n      - uses: pypa/gh-action-pypi-publish@release/v1\n      - uses: anchore/sbom-action@{SHA}\n      - uses: actions/attest-build-provenance@{SHA}\n"
+        ));
+        assert_eq!(verdict, rvl_core::Verdict::Violates, "{reason}");
+        assert!(
+            reason.contains("M2b: actions/checkout@v4, pypa/gh-action-pypi-publish@release/v1"),
+            "{reason}"
+        );
+        assert!(!reason.contains("M1"), "{reason}");
+    }
+
+    #[test]
+    fn a_job_that_does_not_publish_gets_no_entry() {
+        assert!(release_verdicts(
+            "on: push\njobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm publish --dry-run\n      - uses: docker/build-push-action@v6\n      - uses: goreleaser/goreleaser-action@v6\n        with:\n          args: release --snapshot\n"
+        )
+        .is_empty());
+    }
+
+    // M1 asks about what the file shows. Each of these may make an SBOM or a
+    // provenance attestation out of its sight, so the job abstains.
+    #[test]
+    fn m1_abstains_when_an_attestation_may_be_out_of_sight() {
+        for steps in [
+            "      - uses: goreleaser/goreleaser-action@SHA\n        with:\n          args: release --clean\n",
+            "      - uses: docker/build-push-action@SHA\n        with:\n          push: true\n",
+            "      - uses: ./.github/actions/sign\n      - run: twine upload dist/*\n",
+        ] {
+            let (verdict, reason) = one(&format!(
+                "on: push\njobs:\n  release:\n    steps:\n{}",
+                steps.replace("SHA", SHA)
+            ));
+            assert_eq!(verdict, rvl_core::Verdict::Abstain, "{steps}: {reason}");
+        }
+        let (verdict, reason) = one(
+            "on: push\njobs:\n  release:\n    steps:\n      - run: gh release upload v1 dist/*\n  notes:\n    uses: org/repo/.github/workflows/notes.yml@main\n",
+        );
+        assert_eq!(verdict, rvl_core::Verdict::Abstain, "{reason}");
+    }
+
+    // One of the two is not S1 and not M1.
+    #[test]
+    fn an_sbom_without_provenance_abstains() {
+        let (verdict, reason) = one(&format!(
+            "on: push\njobs:\n  release:\n    steps:\n      - run: ko build ./cmd/app\n      - uses: actions/checkout@{SHA}\n"
+        ));
+        assert_eq!(verdict, rvl_core::Verdict::Abstain, "{reason}");
+        assert!(
+            reason.contains("an SBOM step and no provenance step"),
+            "{reason}"
         );
     }
 }

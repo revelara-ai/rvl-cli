@@ -128,6 +128,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "job.publishes_image",
         "a guard predicate: what the job is, for a conditional spec to ask about",
     ),
+    judged("github-actions", "job.release_supply_chain"),
     judged("github-actions", "job.timeout-minutes"),
     judged("github-actions", "job.uses.ref"),
     judged("github-actions", "step.uses.ref"),

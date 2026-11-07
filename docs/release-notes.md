@@ -9,6 +9,27 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A GitHub Actions release job's SBOM, provenance and pins are judged
+
+- New: the config key `github-actions` `job.release_supply_chain`, on each
+  job that publishes (`docker/build-push-action` that pushes,
+  `goreleaser/goreleaser-action` running a release,
+  `pypa/gh-action-pypi-publish`, `softprops/action-gh-release`, or a `run:`
+  line with `npm publish`, `twine upload`, `gh release upload`, `ko publish`
+  or `ko build`). A job that does not publish has no such key.
+- Its value starts with the rule the workflow file proves: `M1:` when no job
+  in the file makes an SBOM or a provenance attestation, `M2b:` when an
+  action in the job is pinned to a tag or a branch (each one named), `S1:`
+  when the job, or a job that needs it, makes both and every action is
+  pinned to a commit, and `undecided:` otherwise. A local action,
+  goreleaser, `docker/build-push-action` with no `provenance` input, and a
+  reusable-workflow call may each make an SBOM or provenance the file does
+  not show, so with any of them `M1` is not stated.
+- New: the pattern `release_supply_chain`. It is satisfied by `S1:`,
+  violated by `M1:` and `M2b:`, and abstains on anything else. An older
+  `rvl` abstains on a spec that uses it.
+- The spec arrives in the spec cache. Until it carries one, nothing changes.
+
 ### `--out` lists rate limiter decisions as `protective_sites`
 
 See "Protective sites" in `docs/retrievers.md`.
