@@ -23,13 +23,16 @@ fn runtime(test: &str) -> Option<&'static Runtime> {
     let source = match std::env::var_os(runtime::OVERRIDE_ENV).filter(|v| !v.is_empty()) {
         Some(p) => Source::Override(PathBuf::from(p)),
         None => {
-            // target/<profile>/deps/<test> -> target/<profile>/onnxruntime/
+            // target/<profile>/deps/<test>, or in cargo's newer build directory
+            // layout target/<profile>/build/rvl-model/<hash>/out/<test>, ->
+            // target/<profile>/onnxruntime/: the nearest ancestor that holds it.
             let exe = std::env::current_exe().unwrap();
             let lib = exe
-                .parent()
-                .and_then(|deps| deps.parent())
-                .map(|profile| profile.join(runtime::BUNDLE_DIR).join(runtime::LIB_NAME));
-            match lib.filter(|l| l.is_file()) {
+                .ancestors()
+                .skip(1)
+                .map(|dir| dir.join(runtime::BUNDLE_DIR).join(runtime::LIB_NAME))
+                .find(|l| l.is_file());
+            match lib {
                 Some(lib) => Source::Vendored(lib),
                 None => {
                     rvl_testgate::skip(

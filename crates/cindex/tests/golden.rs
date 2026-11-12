@@ -23,20 +23,27 @@ fn manifest_dir() -> std::path::PathBuf {
 /// (`crates/rvl/src/bin/cindex.rs`), so release packaging can pack it beside
 /// `rvl`; see the note at the top of `src/lib.rs`. That means
 /// `CARGO_BIN_EXE_cindex` does not exist here, so the binary is found the only
-/// way a non-owning package can: walk up from this test executable
-/// (`target/<profile>/deps/golden-<hash>`) to the profile directory, where
-/// cargo puts every workspace bin.
+/// way a non-owning package can: walk up from this test executable to the
+/// profile directory, where cargo puts every workspace bin. The test executable
+/// sits at `target/<profile>/deps/golden-<hash>`, or, in cargo's newer build
+/// directory layout, at `target/<profile>/build/cindex/<hash>/out/golden-<hash>`,
+/// so the profile directory is the nearest ancestor that holds `cindex`.
 fn bin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("target/<profile> directory");
-    profile_dir.join(if cfg!(windows) {
+    let name = if cfg!(windows) {
         "cindex.exe"
     } else {
         "cindex"
-    })
+    };
+    let exe = std::env::current_exe().expect("test executable path");
+    let dirs = exe.parent().expect("test executable directory");
+    dirs.ancestors()
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            dirs.parent()
+                .expect("target/<profile> directory")
+                .join(name)
+        })
 }
 
 fn bin() -> Command {
