@@ -1462,3 +1462,40 @@ fn rc040_facts_round_trip_and_an_older_record_abstains() {
     let f = finding(&evaluate(&parse_record(old).unwrap(), TODAY), "RC-040").clone();
     assert_eq!(f.verdict, Verdict::Abstain);
 }
+
+// --- RC-027 answer key (testdata/rc027-key) ---
+
+/// The answer key stays scoreable offline: every row parses with the keys
+/// `examples/rc027_key.rs` and `fetch.sh` read, in the order `fetch.sh`
+/// reads them, a decided label only on a service, and no repository twice.
+#[test]
+fn rc027_answer_key_is_well_formed() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/rc027-key/key.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut repos = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let o = v.as_object().unwrap();
+        let keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["commit", "kind", "repo", "truth", "why"], "{line}");
+        let s = |k: &str| o[k].as_str().unwrap();
+        assert!(line.starts_with(&format!(
+            "{{\"repo\": \"{}\", \"commit\": \"{}\"",
+            s("repo"),
+            s("commit")
+        )));
+        assert!(repos.insert(s("repo").to_string()), "{} twice", s("repo"));
+        assert_eq!(s("commit").len(), 40, "{line}");
+        assert!(
+            ["service", "library", "cli", "tool"].contains(&s("kind")),
+            "{line}"
+        );
+        assert!(
+            ["violates", "satisfies", "abstain"].contains(&s("truth")),
+            "{line}"
+        );
+        assert!(s("truth") == "abstain" || s("kind") == "service", "{line}");
+        assert!(!s("why").trim().is_empty(), "{line}");
+    }
+    assert!(repos.len() >= 100, "{} rows", repos.len());
+}
