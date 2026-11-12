@@ -116,12 +116,27 @@ impl Fixture {
         );
     }
 
-    /// The fixture manifest and the blobs it names, by URL path.
+    /// The fixture manifest and the blobs it names, by URL path. It serves
+    /// `model.onnx` and also lists a `model.int8.onnx` that is not a model,
+    /// so a scan that opened it would fail.
     fn published(&self) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        self.published_serving(serde_json::json!("model.onnx"))
+    }
+
+    /// [`Fixture::published`] with `served_file` set to `served`.
+    fn published_serving(&self, served: serde_json::Value) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         let mut files = Vec::new();
         let mut blobs = Vec::new();
-        for name in ["model.onnx", "tokenizer.json", "cells.json"] {
-            let bytes = std::fs::read(fixture_dir().join(name)).unwrap();
+        for name in [
+            "model.onnx",
+            "tokenizer.json",
+            "cells.json",
+            "model.int8.onnx",
+        ] {
+            let bytes = match name {
+                "model.int8.onnx" => b"not the served model\n".to_vec(),
+                _ => std::fs::read(fixture_dir().join(name)).unwrap(),
+            };
             let sha = sha256_hex(&bytes);
             files.push(serde_json::json!({"name": name, "sha256": sha, "size": bytes.len()}));
             blobs.push((format!("{BLOBS}{sha}"), bytes));
@@ -136,6 +151,7 @@ impl Fixture {
             "gate": {"min_precision": 0.8, "max_ece": 0.05},
             "served_controls": [{"control": "RC-019", "precision": 0.88, "ece": 0.03}],
             "withheld_controls": [{"control": "RC-022", "precision": 0.61, "ece": 0.09}],
+            "served_file": served,
             "bundle_url": BLOBS,
             "files": files,
             "published_at": "2026-10-26T00:00:00Z",
@@ -299,7 +315,13 @@ fn a_served_control_is_decided_offline_from_the_synced_bundle() {
         "sha256:{}",
         sha256_hex(&std::fs::read(fixture_dir().join("model.onnx")).unwrap())
     );
-    assert_eq!(model["weights_digest"], digest.as_str());
+    assert_eq!(model["weights_digest"], digest.as_str(), "the served file");
+    assert!(
+        fx.root
+            .join("cache/model/current/model.int8.onnx")
+            .is_file(),
+        "sync fetches every listed file, served or not"
+    );
     let sites = model["sites"].as_array().unwrap();
     assert_eq!(sites.len(), 1, "only the served control is asked: {model}");
     let d = &sites[0];
@@ -372,6 +394,21 @@ fn a_bundle_with_a_bad_signature_is_refused() {
         !fx.root.join("cache/model/current").exists(),
         "nothing is cached from a refused bundle"
     );
+}
+
+#[test]
+fn a_served_file_the_bundle_does_not_list_is_refused() {
+    let fx = Fixture::new();
+    let (manifest, blobs) = fx.published_serving(serde_json::json!("model.fp16.onnx"));
+    let sig = fx.sign(&manifest);
+    let synced = fx.model_sync(&serve(manifest, sig, blobs));
+    assert!(!synced.status.success(), "{}", text(&synced));
+    assert!(
+        text(&synced).contains(r#"served_file "model.fp16.onnx" is not one of the bundle's files"#),
+        "{}",
+        text(&synced)
+    );
+    assert!(!fx.root.join("cache/model/current").exists());
 }
 
 #[test]

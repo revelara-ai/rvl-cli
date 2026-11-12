@@ -38,6 +38,9 @@ pub const SUPPORTED_MODEL_SCHEMA: u32 = 1;
 /// The tokenizer file every bundle carries.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
+/// The model file a manifest with no `served_file` serves.
+pub const DEFAULT_SERVED_FILE: &str = "model.int8.onnx";
+
 const MANIFEST: &str = "manifest.json";
 const SIG: &str = "manifest.json.sig";
 
@@ -62,6 +65,11 @@ pub struct ModelManifest {
     /// The controls it did not pass the gate for.
     #[serde(default)]
     pub withheld_controls: Vec<ControlEntry>,
+    /// The file of `files` the decision path opens; absent,
+    /// [`DEFAULT_SERVED_FILE`]. A bundle may list more than one model file,
+    /// and every listed file is fetched and verified.
+    #[serde(default)]
+    pub served_file: Option<String>,
     /// Where files are fetched from: `bundle_url + sha256`, relative to the
     /// API base.
     pub bundle_url: String,
@@ -153,13 +161,10 @@ impl ModelManifest {
         Ok(m)
     }
 
-    /// The file that holds the model: the one `.onnx` file.
-    pub fn model_file(&self) -> &BundleFile {
-        // `check` guarantees exactly one.
-        self.files
-            .iter()
-            .find(|f| f.name.ends_with(".onnx"))
-            .expect("checked manifest has one .onnx file")
+    /// The name of the model file the decision path opens. `check`
+    /// guarantees the bundle lists it.
+    pub fn served_name(&self) -> &str {
+        self.served_file.as_deref().unwrap_or(DEFAULT_SERVED_FILE)
     }
 
     /// Whether the model decides `control`.
@@ -211,12 +216,11 @@ impl ModelManifest {
                 f.name
             );
         }
-        let onnx = self
-            .files
-            .iter()
-            .filter(|f| f.name.ends_with(".onnx"))
-            .count();
-        anyhow::ensure!(onnx == 1, "the bundle lists {onnx} .onnx files, not 1");
+        anyhow::ensure!(
+            seen.contains(&self.served_name().to_string()),
+            "served_file {:?} is not one of the bundle's files",
+            self.served_name()
+        );
         anyhow::ensure!(
             seen.contains(&TOKENIZER_FILE.to_string()),
             "the bundle lists no {TOKENIZER_FILE}"
@@ -555,13 +559,13 @@ mod tests {
         let m = ModelManifest::parse(manifest(&files, r#","later":{"x":1}"#).as_bytes()).unwrap();
         assert!(m.serves("RC-019") && !m.serves("RC-022"));
         assert_eq!(m.withheld_controls[0].control, "RC-022");
-        assert_eq!(m.model_file().name, "model.int8.onnx");
+        assert_eq!(m.served_name(), "model.int8.onnx");
     }
 
     #[test]
     fn a_control_with_served_classes_serves_only_their_families() {
         let files = format!(
-            r#"[{{"name":"m.onnx","sha256":"{SHA}"}},{{"name":"tokenizer.json","sha256":"{SHA}"}}]"#
+            r#"[{{"name":"model.int8.onnx","sha256":"{SHA}"}},{{"name":"tokenizer.json","sha256":"{SHA}"}}]"#
         );
         let served = r#"[{"control":"RC-019"},
             {"control":"RC-022","served_classes":["net/http","requests.get"]}]"#;
@@ -590,16 +594,16 @@ mod tests {
             format!("[{tok}]"),
             format!("[{},{tok}]", file("../model.onnx", SHA)),
             format!("[{},{tok}]", file("model.onnx", "abc")),
-            format!("[{},{},{tok}]", file("a.onnx", SHA), file("b.onnx", SHA)),
             format!("[{},{tok},{tok}]", file("model.onnx", SHA)),
             format!("[{}]", file("model.onnx", SHA)),
         ] {
+            let served = r#","served_file":"model.onnx""#;
             assert!(
-                ModelManifest::parse(manifest(&files, "").as_bytes()).is_err(),
+                ModelManifest::parse(manifest(&files, served).as_bytes()).is_err(),
                 "accepted {files}"
             );
         }
-        let ok = format!("[{},{tok}]", file("model.onnx", SHA));
+        let ok = format!("[{},{tok}]", file("model.int8.onnx", SHA));
         let off_site = manifest(&ok, "").replace(
             "\"/api/v1/scanner/model/blobs/\"",
             "\"https://elsewhere.example/\"",
@@ -608,5 +612,40 @@ mod tests {
         let v2 = manifest(&ok, "").replace("\"schema_version\":1", "\"schema_version\":2");
         let err = ModelManifest::parse(v2.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("schema_version 2"), "{err}");
+    }
+
+    #[test]
+    fn served_file_names_the_model_file_and_its_absence_names_int8() {
+        let file = |name: &str| format!(r#"{{"name":"{name}","sha256":"{SHA}"}}"#);
+        let both = format!(
+            "[{},{},{}]",
+            file("model.onnx"),
+            file("model.int8.onnx"),
+            file("tokenizer.json")
+        );
+        let fp32 = manifest(&both, r#","served_file":"model.onnx""#);
+        let m = ModelManifest::parse(fp32.as_bytes()).unwrap();
+        assert_eq!(m.served_name(), "model.onnx");
+        let m = ModelManifest::parse(manifest(&both, "").as_bytes()).unwrap();
+        assert_eq!(m.served_name(), "model.int8.onnx");
+    }
+
+    #[test]
+    fn a_served_file_the_bundle_does_not_list_is_refused() {
+        let file = |name: &str| format!(r#"{{"name":"{name}","sha256":"{SHA}"}}"#);
+        let int8_only = format!("[{},{}]", file("model.int8.onnx"), file("tokenizer.json"));
+        let fp32 = manifest(&int8_only, r#","served_file":"model.onnx""#);
+        let err = ModelManifest::parse(fp32.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"served_file "model.onnx" is not one of the bundle's files"#),
+            "{err}"
+        );
+        let fp32_only = format!("[{},{}]", file("model.onnx"), file("tokenizer.json"));
+        let err = ModelManifest::parse(manifest(&fp32_only, "").as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(r#""model.int8.onnx""#), "{err}");
     }
 }
