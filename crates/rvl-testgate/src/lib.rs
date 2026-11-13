@@ -15,7 +15,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Display;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Set (to anything but empty or `0`) where every engine is provisioned, so a
 /// test that cannot reach its engine fails instead of skipping. CI sets it.
@@ -44,6 +44,32 @@ pub fn skip(test: &str, why: impl Display) {
         );
     }
     eprintln!("SKIP {test}: {why}");
+}
+
+/// The profile directory (`target/<profile>`) above this test executable,
+/// where cargo puts every workspace bin and CI lays out the engine bundles.
+/// Cargo before 1.100 runs a test from `target/<profile>/deps/<test>`; from
+/// 1.100 on, from `target/<profile>/build/<package>/<hash>/out/<test>`.
+pub fn profile_dir() -> PathBuf {
+    profile_dir_of(&std::env::current_exe().expect("test executable path"))
+}
+
+fn profile_dir_of(exe: &Path) -> PathBuf {
+    exe.ancestors()
+        .find(|dir| {
+            matches!(
+                dir.file_name().and_then(OsStr::to_str),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is under no target/<profile>/deps or build",
+                exe.display()
+            )
+        })
+        .to_path_buf()
 }
 
 /// Write `body` to `path` as an executable that may be run at once, even
@@ -105,5 +131,20 @@ mod tests {
     fn any_other_value_forbids_a_skip() {
         assert!(requires(Some(OsStr::new("1"))));
         assert!(requires(Some(OsStr::new("true"))));
+    }
+
+    #[test]
+    fn the_profile_dir_is_found_in_both_cargo_test_layouts() {
+        let want = Path::new("/w/target/debug");
+        assert_eq!(
+            profile_dir_of(Path::new("/w/target/debug/deps/golden-ab12")),
+            want
+        );
+        assert_eq!(
+            profile_dir_of(Path::new(
+                "/w/target/debug/build/cindex/ab12/out/golden-ab12"
+            )),
+            want
+        );
     }
 }
