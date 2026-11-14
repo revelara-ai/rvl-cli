@@ -23,29 +23,21 @@ fn runtime(test: &str) -> Option<&'static Runtime> {
     let source = match std::env::var_os(runtime::OVERRIDE_ENV).filter(|v| !v.is_empty()) {
         Some(p) => Source::Override(PathBuf::from(p)),
         None => {
-            // target/<profile>/onnxruntime/, found from the test executable
-            // up: one level above deps/ in cargo's classic layout, deeper
-            // (target/<profile>/build/<pkg>/<hash>/) in the newer build-dir one.
-            let exe = std::env::current_exe().unwrap();
-            let lib = exe
-                .ancestors()
-                .skip(1)
-                .map(|dir| dir.join(runtime::BUNDLE_DIR).join(runtime::LIB_NAME))
-                .find(|l| l.is_file());
-            match lib {
-                Some(lib) => Source::Vendored(lib),
-                None => {
-                    rvl_testgate::skip(
-                        test,
-                        format_args!(
-                            "no ONNX Runtime: run ci/fetch-onnxruntime.sh <host-triple> \
-                             target/debug, or set {}",
-                            runtime::OVERRIDE_ENV
-                        ),
-                    );
-                    return None;
-                }
+            let lib = rvl_testgate::profile_dir()
+                .join(runtime::BUNDLE_DIR)
+                .join(runtime::LIB_NAME);
+            if !lib.is_file() {
+                rvl_testgate::skip(
+                    test,
+                    format_args!(
+                        "no ONNX Runtime: run ci/fetch-onnxruntime.sh <host-triple> \
+                         target/debug, or set {}",
+                        runtime::OVERRIDE_ENV
+                    ),
+                );
+                return None;
             }
+            Source::Vendored(lib)
         }
     };
     Some(runtime::load(&source).unwrap_or_else(|e| panic!("{test}: {e:#}")))
