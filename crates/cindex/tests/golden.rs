@@ -23,16 +23,10 @@ fn manifest_dir() -> std::path::PathBuf {
 /// (`crates/rvl/src/bin/cindex.rs`), so release packaging can pack it beside
 /// `rvl`; see the note at the top of `src/lib.rs`. That means
 /// `CARGO_BIN_EXE_cindex` does not exist here, so the binary is found the only
-/// way a non-owning package can: walk up from this test executable
-/// (`target/<profile>/deps/golden-<hash>`) to the profile directory, where
-/// cargo puts every workspace bin.
+/// way a non-owning package can: in the profile directory above this test
+/// executable, where cargo puts every workspace bin.
 fn bin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("target/<profile> directory");
-    profile_dir.join(if cfg!(windows) {
+    rvl_testgate::profile_dir().join(if cfg!(windows) {
         "cindex.exe"
     } else {
         "cindex"

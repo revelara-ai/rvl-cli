@@ -23,26 +23,21 @@ fn runtime(test: &str) -> Option<&'static Runtime> {
     let source = match std::env::var_os(runtime::OVERRIDE_ENV).filter(|v| !v.is_empty()) {
         Some(p) => Source::Override(PathBuf::from(p)),
         None => {
-            // target/<profile>/deps/<test> -> target/<profile>/onnxruntime/
-            let exe = std::env::current_exe().unwrap();
-            let lib = exe
-                .parent()
-                .and_then(|deps| deps.parent())
-                .map(|profile| profile.join(runtime::BUNDLE_DIR).join(runtime::LIB_NAME));
-            match lib.filter(|l| l.is_file()) {
-                Some(lib) => Source::Vendored(lib),
-                None => {
-                    rvl_testgate::skip(
-                        test,
-                        format_args!(
-                            "no ONNX Runtime: run ci/fetch-onnxruntime.sh <host-triple> \
-                             target/debug, or set {}",
-                            runtime::OVERRIDE_ENV
-                        ),
-                    );
-                    return None;
-                }
+            let lib = rvl_testgate::profile_dir()
+                .join(runtime::BUNDLE_DIR)
+                .join(runtime::LIB_NAME);
+            if !lib.is_file() {
+                rvl_testgate::skip(
+                    test,
+                    format_args!(
+                        "no ONNX Runtime: run ci/fetch-onnxruntime.sh <host-triple> \
+                         target/debug, or set {}",
+                        runtime::OVERRIDE_ENV
+                    ),
+                );
+                return None;
             }
+            Source::Vendored(lib)
         }
     };
     Some(runtime::load(&source).unwrap_or_else(|e| panic!("{test}: {e:#}")))
