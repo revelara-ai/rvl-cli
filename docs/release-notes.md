@@ -9,6 +9,18 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### The decision model runs the file its manifest serves
+
+- New: the model manifest's `served_file` names the bundle file the
+  decision model runs. Absent, it is `model.int8.onnx`, as before. A
+  manifest whose `served_file` is not one of its `files` is refused, and
+  the cached bundle stays.
+- Changed: a bundle may list more than one `.onnx` file; `rvl model sync`
+  fetches and verifies every listed file.
+- When the published bundle serves the fp32 `model.onnx`, `--out`
+  `decision_model.weights_digest` changes, and each site takes about 1.5 to
+  2 times as long (see the README).
+
 ### A GitHub Actions release job's SBOM, provenance and pins are judged
 
 - New: the config key `github-actions` `job.release_supply_chain`, on each

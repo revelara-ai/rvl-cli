@@ -296,7 +296,7 @@ fn infer(
             max_length: m.max_len,
             pad_id: None,
         },
-        &m.model_file().name,
+        m.served_name(),
     )?;
     let digest = bundle.weights_digest.clone();
     let opts = rvl_model::Options {
@@ -1107,7 +1107,7 @@ mod tests {
                 r#"{{"schema_version":1,"model_id":"m","layout":"compact","max_len":8,
                 "temperature":1.0,"bundle_url":"/b/",
                 "served_controls":[{{"control":"RC-022"{served_classes}}}],
-                "files":[{{"name":"m.onnx","sha256":"{sha}"}},
+                "files":[{{"name":"model.int8.onnx","sha256":"{sha}"}},
                          {{"name":"tokenizer.json","sha256":"{sha}"}}]}}"#
             )
             .as_bytes(),

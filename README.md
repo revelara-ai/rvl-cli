@@ -146,6 +146,20 @@ not Rust.
 | `cindex`, `rustindex` | The C/C++ (libclang) and Rust (rust-analyzer SCIP) retrievers, as libraries; their executables are bins of the `rvl` package. |
 | `rvl-model` | Local classifier inference on CPU: loads an ONNX model bundle and runs it through a runtime-loaded ONNX Runtime, deterministically and inside a time budget. A release carries the pinned runtime (`onnxruntime.pin`) beside `rvl`. |
 
+The decision model's bundle may carry more than one model file; its signed
+manifest's `served_file` names the one rvl runs (absent, `model.int8.onnx`).
+The published bundle serves the fp32 `model.onnx` on every platform: int8
+quantization does not give the same verdicts on x86-64 and arm64, so a
+scan's results would depend on the machine. fp32 is slower. On an x86-64
+desktop (Intel Core Ultra 9 285K, ONNX Runtime 1.31.0, 28 inputs from a
+real scan, most cut at 512 tokens), the fp32 model takes about 145 ms a
+site on 1 thread and 105 ms on 4 (`scanner.model_threads`, default 4), where
+int8 takes about 80 ms and 70 ms. A scan's model time is the number of sites
+asked times that figure, up to `scanner.decision_model_budget`. To measure
+on your machine:
+`cargo run --release -p rvl-model --example latency -- <bundle-dir> model.onnx <inputs.jsonl> 1 4`,
+with the inputs `RVL_DECISION_MODEL_INPUTS=<file>` writes from a scan.
+
 `helpers/` holds the out-of-process retrievers, one directory per language,
 each with its own README: `goindex` (a Go module, with its own `go test`
 suite), `pyindex` (Python), `tsindex` (Node + TypeScript), `javaindex`
