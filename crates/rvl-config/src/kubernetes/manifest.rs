@@ -26,7 +26,7 @@
 //!     (documented conditional default: Always for latest/untagged,
 //!     IfNotPresent otherwise)
 //!   * neither `workload.replicas` nor the liveness/readiness probes are
-//!     emitted for a manifest under a test or fixture directory (see
+//!     emitted for a manifest under a test, fixture or docs directory (see
 //!     [`TEST_DIR_SEGMENTS`]), nor the two probes for a Job or CronJob
 //!     container: the specs abstain on what is not deployed or not serving
 //!   * `pdb.min-available` / `pdb.max-unavailable` (authored only: the API
@@ -721,8 +721,10 @@ pub(super) fn workload_shape(kind: &str) -> Option<(&'static str, &'static [&'st
 
 /// Directory segments that mark a manifest as test material: the retrievers'
 /// test-path convention (`tests/`, `e2e/`, `fixtures/`, `testdata/`, ...)
-/// plus the fake-data trees Kubernetes repos keep beside their tests. Exact
-/// segments, never substrings: `contest/` and `latest/` deploy.
+/// plus the fake-data trees Kubernetes repos keep beside their tests, and
+/// `docs/`, whose manifests illustrate a page rather than deploy. Exact
+/// segments, never substrings: `contest/` and `latest/` deploy. `examples/`
+/// is not listed: repos ship deployable manifests there.
 const TEST_DIR_SEGMENTS: &[&str] = &[
     "test",
     "tests",
@@ -734,9 +736,10 @@ const TEST_DIR_SEGMENTS: &[&str] = &[
     "testdata",
     "fake",
     "fakedata",
+    "docs",
 ];
 
-/// Whether a repo-relative path lies under a test or fixture directory.
+/// Whether a repo-relative path lies under a test, fixture or docs directory.
 fn test_material(rel_path: &str) -> bool {
     let mut dirs = rel_path.split('/');
     dirs.next_back();
@@ -1275,6 +1278,54 @@ spec:
             let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
             assert!(has_key(&got, "workload.replicas"), "{path}");
         }
+    }
+
+    #[test]
+    fn a_docs_manifest_abstains_on_replicas_but_an_examples_one_does_not() {
+        // A documentation page's example Deployment: one replica, no probes.
+        let docs_deploy = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traefik-lb
+
+  template:
+    metadata:
+      labels:
+        app: traefik-lb
+
+    spec:
+      serviceAccountName: traefik-controller
+      containers:
+        - name: traefik
+          image: traefik:v3.8
+          args:
+            - --entryPoints.web.address=:80
+            - --entryPoints.websecure.address=:443
+            - --experimental.kubernetesgateway
+";
+        let path =
+            "docs/content/reference/dynamic-configuration/kubernetes-gateway-traefik-lb-svc.yml";
+        let got = retrieve_plain(None, path, docs_deploy, "snap");
+        for key in [
+            "workload.replicas",
+            "container.liveness-probe",
+            "container.readiness-probe",
+        ] {
+            assert!(!has_key(&got, key), "{key} was emitted");
+        }
+        assert!(has_key(&got, "container.resources.limits.cpu"));
+        // examples/ trees ship deployable manifests: the floor still applies.
+        let path = "examples/kubernetes/manifests/pyrra-apiDeployment.yaml";
+        let got = retrieve_plain(None, path, docs_deploy, "snap");
+        let replicas = find(&got, "deployment:traefik", "workload.replicas");
+        assert_eq!(replicas.resolved_value.as_deref(), Some("1"));
     }
 
     #[test]
