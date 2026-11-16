@@ -721,8 +721,9 @@ pub(super) fn workload_shape(kind: &str) -> Option<(&'static str, &'static [&'st
 
 /// Directory segments that mark a manifest as test material: the retrievers'
 /// test-path convention (`tests/`, `e2e/`, `fixtures/`, `testdata/`, ...)
-/// plus the fake-data trees Kubernetes repos keep beside their tests. Exact
-/// segments, never substrings: `contest/` and `latest/` deploy.
+/// plus the fake-data trees Kubernetes repos keep beside their tests and the
+/// `golden/` files a chart test compares `helm template` output against.
+/// Exact segments, never substrings: `contest/` and `latest/` deploy.
 const TEST_DIR_SEGMENTS: &[&str] = &[
     "test",
     "tests",
@@ -734,6 +735,7 @@ const TEST_DIR_SEGMENTS: &[&str] = &[
     "testdata",
     "fake",
     "fakedata",
+    "golden",
 ];
 
 /// Whether a repo-relative path lies under a test or fixture directory.
@@ -1256,6 +1258,7 @@ spec:
             "controller/proxy-injector/fake/data/deployment.yaml",
             "scripts/fakedata/applications/hello-world/deployments.yaml",
             "test/e2e/deploy.yaml",
+            "deploy/helm/scion-hub/golden/minimal.yaml",
             "pkg/testdata/deploy.yaml",
             "tests/fixtures/deploy.yaml",
         ] {
@@ -1275,6 +1278,42 @@ spec:
             let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
             assert!(has_key(&got, "workload.replicas"), "{path}");
         }
+    }
+
+    #[test]
+    fn helm_golden_output_abstains_on_probes_but_examples_do_not() {
+        // A chart's golden/ files are the expected `helm template` output of
+        // its tests, not a deployed manifest: no probe packet, even for a
+        // container that has a readiness probe and lacks a liveness probe.
+        let golden = BARE_DEPLOY.replace(
+            "          image: web:v1\n",
+            "          image: web:v1\n          readinessProbe:\n            httpGet:\n              path: /readyz\n              port: http\n",
+        );
+        let got = retrieve_plain(
+            None,
+            "deploy/helm/scion-hub/golden/settings-oauth.yaml",
+            &golden,
+            "snap",
+        );
+        assert!(!has_key(&got, "container.liveness-probe"));
+        assert!(!has_key(&got, "container.readiness-probe"));
+        // An examples/ manifest is what users deploy: it is still judged.
+        let got = retrieve_plain(
+            None,
+            "examples/kubernetes/manifests/pyrra-kubernetesDeployment.yaml",
+            BARE_DEPLOY,
+            "snap",
+        );
+        find(
+            &got,
+            "container:deployment/web/app",
+            "container.liveness-probe",
+        );
+        find(
+            &got,
+            "container:deployment/web/app",
+            "container.readiness-probe",
+        );
     }
 
     #[test]
