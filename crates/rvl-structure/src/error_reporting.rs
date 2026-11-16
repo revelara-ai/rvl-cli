@@ -15,8 +15,9 @@
 //! The server entry points are narrower than [`crate::repo_kind`]'s, on
 //! purpose: a framework that wraps `ListenAndServe` in a library function
 //! has no tracker of its own and is not a service, so a Go listener counts
-//! only in `package main`, and a JS listener only as `app.listen(` or a
-//! `createServer(...).listen(` chain on one line.
+//! only in `package main` or in a package only a served `main` can build
+//! (see [`delegated`]), and a JS listener only as `app.listen(`, a
+//! `createServer(...).listen(` chain on one line, or a `next start` script.
 
 use crate::inventory::read_capped;
 use crate::repo_kind::{in_service_code, is_test_source};
@@ -49,6 +50,7 @@ const TEST_DIRS: &[&str] = &[
 ];
 
 /// Error-tracker SDKs, as they appear in an import or a manifest, lowercased.
+/// Each matches as a whole word (see [`has_sdk`]).
 const TRACKER_SDKS: &[&str] = &[
     "getsentry/sentry-go",
     "sentry_sdk",
@@ -130,10 +132,19 @@ pub(crate) struct Acc {
     tracker_inits: BTreeSet<String>,
     log_shipping: BTreeSet<String>,
     alert_rules: BTreeSet<String>,
+    /// Directories holding a Go `package main` file in service code.
+    go_mains: BTreeSet<String>,
+    /// Go files outside `package main` that start a server.
+    go_servers: BTreeSet<String>,
 }
 
 impl Acc {
-    pub(crate) fn finish(self) -> ErrorReportingFacts {
+    pub(crate) fn finish(mut self) -> ErrorReportingFacts {
+        for rp in &self.go_servers {
+            if delegated(rp, &self.go_mains) {
+                self.listeners.insert(rp.clone());
+            }
+        }
         let cap = |s: BTreeSet<String>| s.into_iter().take(MAX_PATHS).collect();
         ErrorReportingFacts {
             listeners: cap(self.listeners),
@@ -161,8 +172,12 @@ pub(crate) fn observe(path: &Path, rp: &str, name: &str, ext: &str, acc: &mut Ac
     let lower = name.to_ascii_lowercase();
     let service = in_service_code(rp);
     if MANIFESTS.contains(&name) || (lower.starts_with("requirements") && ext == "txt") {
-        if has_sdk(&read_capped(path)) {
+        let text = read_capped(path);
+        if has_sdk(&text) {
             acc.tracker_sdks.insert(rp.to_string());
+        }
+        if service && name == "package.json" && next_server(&text, path) {
+            acc.listeners.insert(rp.to_string());
         }
         return;
     }
@@ -198,9 +213,19 @@ pub(crate) fn observe(path: &Path, rp: &str, name: &str, ext: &str, acc: &mut Ac
     }
 }
 
+/// Whether `text` names a tracker SDK. A name that starts or ends with a
+/// letter or digit must not run on into another there: `rollbar` is not in
+/// `scrollbar`, a CSS and UI word.
 fn has_sdk(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
-    TRACKER_SDKS.iter().any(|s| text.contains(s))
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    TRACKER_SDKS.iter().any(|s| {
+        let (first, last) = (s.chars().next(), s.chars().last());
+        text.match_indices(s).any(|(i, _)| {
+            !(word(first) && word(text[..i].chars().last()))
+                && !(word(last) && word(text[i + s.len()..].chars().next()))
+        })
+    })
 }
 
 fn source(path: &Path, rp: &str, ext: &str, service: bool, acc: &mut Acc) {
@@ -215,30 +240,111 @@ fn source(path: &Path, rp: &str, ext: &str, service: bool, acc: &mut Acc) {
             acc.tracker_inits.insert(rp.to_string());
         }
     }
+    if ext == "go" && !go_built(&text) {
+        return;
+    }
     if service && listens(&text, ext) {
         acc.listeners.insert(rp.to_string());
+    }
+    if ext == "go" {
+        if !go_main(&text) {
+            // An httptest server is a test helper's, not the binary's.
+            if go_serves(&text) && !text.contains("httptest.") {
+                acc.go_servers.insert(rp.to_string());
+            }
+        } else if service {
+            let dir = rp.rsplit_once('/').map_or("", |(d, _)| d);
+            acc.go_mains.insert(dir.to_string());
+        }
     }
 }
 
 /// A server entry point in a source file of extension `ext`.
 fn listens(text: &str, ext: &str) -> bool {
     match ext {
-        "go" => {
-            text.lines().any(|l| l.trim() == "package main")
-                && (text.contains("ListenAndServe(")
-                    || text.contains("ListenAndServeTLS(")
-                    || text.contains("net.Listen(")
-                    || (text.contains("grpc.NewServer(") && text.contains(".Serve(")))
-        }
+        "go" => go_main(text) && go_serves(text),
         "py" => {
             text.contains("uvicorn.run(")
                 || (text.contains("app.run(")
                     && (text.contains("Flask(") || text.contains("FastAPI(")))
+                || ((text.contains("from http.server import")
+                    || text.contains("import http.server"))
+                    && (text.contains("HTTPServer((") || text.contains(".serve_forever(")))
         }
         _ => text.lines().any(|l| {
             l.contains("app.listen(") || (l.contains("createServer(") && l.contains(".listen("))
         }),
     }
+}
+
+/// Whether a Go source is ever built: `//go:build ignore` or `none` keeps a
+/// file (a dev helper, a generator) out of every build.
+fn go_built(text: &str) -> bool {
+    !text
+        .lines()
+        .any(|l| matches!(l.trim(), "//go:build ignore" | "//go:build none"))
+}
+
+fn go_main(text: &str) -> bool {
+    text.lines().any(|l| l.trim() == "package main")
+}
+
+/// A Go source that starts a server.
+fn go_serves(text: &str) -> bool {
+    text.contains("ListenAndServe(")
+        || text.contains("ListenAndServeTLS(")
+        || text.contains("net.Listen(")
+        || ((text.contains("grpc.NewServer(") || text.contains("http.Server{"))
+            && text.contains(".Serve("))
+}
+
+/// Whether the Go server outside `package main` at `rp` is a served
+/// binary's own, given the directories of `package main` files in service
+/// code (`mains`). It is when it sits below a `main` under a `cmd/<name>/`
+/// directory (the command's own packages), or under an `internal/`
+/// directory in service code whose parent's tree holds a `main`: Go lets
+/// only that tree import an `internal/` package, so its server is not a
+/// library's API for others.
+fn delegated(rp: &str, mains: &BTreeSet<String>) -> bool {
+    let in_cmd = mains.iter().any(|m| {
+        let parts: Vec<&str> = m.split('/').collect();
+        parts.len() >= 2 && parts[parts.len() - 2] == "cmd" && rp.starts_with(&format!("{m}/"))
+    });
+    let dirs: Vec<&str> = rp.split('/').collect();
+    let in_internal = in_service_code(rp)
+        && dirs[..dirs.len() - 1]
+            .iter()
+            .position(|d| *d == "internal")
+            .is_some_and(|i| {
+                let root = dirs[..i].join("/");
+                mains
+                    .iter()
+                    .any(|m| root.is_empty() || *m == root || m.starts_with(&format!("{root}/")))
+            });
+    in_cmd || in_internal
+}
+
+/// A `package.json` whose `start` script runs `next start`: a Next.js
+/// server. A sibling `next.config.*` with `output: 'export'` builds static
+/// files that `next start` does not serve, so it does not count.
+fn next_server(text: &str, path: &Path) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let start = v
+        .pointer("/scripts/start")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if !start.contains("next start") {
+        return false;
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    !["js", "mjs", "cjs", "ts"].iter().any(|e| {
+        let config: String = read_capped(&dir.join(format!("next.config.{e}")))
+            .split_whitespace()
+            .collect();
+        config.contains("output:'export'") || config.contains("output:\"export\"")
+    })
 }
 
 /// A Prometheus alerting-rule file: a `PrometheusRule` resource, or a rule
@@ -339,6 +445,226 @@ pub(crate) fn evaluate(facts: &RepoStructure) -> StructureFinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RC-027 on a tree of `(path, text)` files.
+    fn judge(files: &[(&str, &str)]) -> StructureFinding {
+        let dir = tempfile::tempdir().unwrap();
+        for (rp, text) in files {
+            let path = dir.path().join(rp);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        evaluate(&crate::inventory(dir.path()))
+    }
+
+    fn assert_verdict(want: Verdict, files: &[(&str, &str)]) {
+        let f = judge(files);
+        assert_eq!(f.verdict, want, "{:?}: {}", files[0].0, f.reason);
+    }
+
+    const GO_MOD: (&str, &str) = ("go.mod", "module example.com/svc\n\ngo 1.22\n");
+
+    #[test]
+    fn an_sdk_name_matches_as_a_whole_word() {
+        for text in [
+            "<ScrollAreaPrimitive.ScrollAreaScrollbar>",
+            "<nav className=\"scrollbar-none flex h-11\">",
+            "// add right margin so scrollbar doesn't touch browser panel",
+        ] {
+            assert!(!has_sdk(text), "{text}");
+        }
+        for text in [
+            "import * as Rollbar from \"rollbar\";",
+            "\"rollbar\": \"^2.26.0\",",
+            "rollbar.init(\"token\")",
+            "\"@sentry/node\": \"^8\"",
+            "import sentry_sdk",
+            "github.com/getsentry/sentry-go v0.27.0",
+            "github.com/airbrake/gobrake/v5",
+            "@bugsnag/js",
+        ] {
+            assert!(has_sdk(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_scrollbar_beside_a_server_is_not_a_tracker() {
+        // A Go server with a web UI (graphjin).
+        assert_verdict(
+            Verdict::Violates,
+            &[
+                (
+                    "serv/web/src/components/ui/scroll-area.jsx",
+                    "<ScrollAreaPrimitive.ScrollAreaScrollbar>\n</ScrollAreaPrimitive.ScrollAreaScrollbar>\n",
+                ),
+                (
+                    "serv/web/src/components/Layout/Header.jsx",
+                    "<nav className=\"scrollbar-none flex h-11\">\n",
+                ),
+                GO_MOD,
+                (
+                    "main.go",
+                    "package main\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n",
+                ),
+            ],
+        );
+        // A Python server with a TypeScript front end (magentic-ui).
+        assert_verdict(
+            Verdict::Violates,
+            &[
+                (
+                    "frontend/src/components/chat/ChatView.tsx",
+                    "// In expanded mode, add right margin so scrollbar doesn't touch browser panel\n",
+                ),
+                (
+                    "src/magentic_ui/backend/cli.py",
+                    "import uvicorn\n\ndef run():\n    uvicorn.run(\"app:app\")\n",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_go_main_that_delegates_its_listener_is_a_service() {
+        // tusd: cmd/tusd/main.go calls cli.Serve().
+        assert_verdict(
+            Verdict::Violates,
+            &[
+                (
+                    "cmd/tusd/main.go",
+                    "package main\n\nimport (\n\t\"github.com/tus/tusd/v2/cmd/tusd/cli\"\n)\n\n\
+                     func main() {\n\tcli.ParseFlags()\n\tcli.CreateComposer()\n\tcli.Serve()\n}\n",
+                ),
+                (
+                    "cmd/tusd/cli/listener.go",
+                    "package cli\n\nfunc NewListener(addr string) (net.Listener, error) {\n\
+                     \treturn net.Listen(\"tcp\", addr)\n}\n",
+                ),
+                ("cmd/tusd/cli/serve.go", "package cli\n\nfunc Serve() {}\n"),
+                GO_MOD,
+            ],
+        );
+        // gluetun: the server runs in an internal package.
+        assert_verdict(
+            Verdict::Violates,
+            &[
+                (
+                    "cmd/gluetun/main.go",
+                    "package main\n\nfunc main() { run() }\n",
+                ),
+                (
+                    "internal/httpserver/run.go",
+                    "package httpserver\n\nfunc (s *Server) Run(ctx context.Context) {\n\
+                     \tserver := http.Server{\n\t\tAddr: s.address,\n\t\tHandler: s.handler,\n\t}\n\
+                     \terr = server.Serve(listener)\n}\n",
+                ),
+                GO_MOD,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_go_library_still_abstains() {
+        let server = "package lib\n\nfunc (e *Engine) Run() { http.ListenAndServe(a, e) }\n";
+        for files in [
+            // A framework's listen helper, no main (gin, resty, cobra).
+            &[GO_MOD, ("gin.go", server)][..],
+            // A main in examples/ only (bubbletea).
+            &[
+                GO_MOD,
+                ("lib.go", server),
+                ("examples/demo/main.go", "package main\n"),
+            ],
+            // A CLI main beside a public package that serves (gosec).
+            &[
+                GO_MOD,
+                ("cmd/gosec/main.go", "package main\n"),
+                ("server/server.go", server),
+            ],
+            // An internal server no main in its tree can import.
+            &[
+                GO_MOD,
+                ("cmd/tool/main.go", "package main\n"),
+                ("pkg/internal/srv/srv.go", server),
+            ],
+            // A dev helper no build compiles (rclone).
+            &[
+                GO_MOD,
+                (
+                    "fs/rc/js/serve.go",
+                    "//go:build none\n\npackage main\n\nfunc main() { http.ListenAndServe(\":3000\", m) }\n",
+                ),
+            ],
+            // An httptest helper in an internal package (minio).
+            &[
+                GO_MOD,
+                ("main.go", "package main\n"),
+                (
+                    "internal/grid/debug.go",
+                    "package grid\n\nfunc start() { l, _ := net.Listen(\"tcp\", a); httptest.NewUnstartedServer(h) }\n",
+                ),
+            ],
+            // A test server below a command.
+            &[
+                GO_MOD,
+                ("cmd/tool/main.go", "package main\n"),
+                ("cmd/tool/serve_test.go", server),
+            ],
+        ] {
+            assert_verdict(Verdict::Abstain, files);
+        }
+    }
+
+    #[test]
+    fn an_http_server_from_the_standard_library_listens() {
+        // hermes-webui.
+        assert_verdict(
+            Verdict::Violates,
+            &[(
+                "server.py",
+                "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\n\
+                 class QuietHTTPServer(ThreadingHTTPServer):\n    pass\n\n\
+                 def main():\n    _abort_if_already_serving(HOST, PORT)\n\
+                 \x20   httpd = QuietHTTPServer((HOST, PORT), Handler)\n",
+            )],
+        );
+        assert!(listens(
+            "import http.server\ns = http.server.HTTPServer(addr, H)\ns.serve_forever()\n",
+            "py"
+        ));
+        assert!(!listens(
+            "from http.server import BaseHTTPRequestHandler\n",
+            "py"
+        ));
+    }
+
+    #[test]
+    fn next_start_is_a_server_unless_exported() {
+        let morphic = r#"{"scripts": {"dev": "next dev", "build": "next build", "start": "next start"},
+            "dependencies": {"next": "^16.2.6"}}"#;
+        let nextchat = r#"{"scripts": {"dev": "concurrently -r \"yarn run mask:watch\" \"next dev\"",
+            "start": "next start"}, "dependencies": {"next": "^14.1.1"}}"#;
+        for pkg in [morphic, nextchat] {
+            assert_verdict(Verdict::Violates, &[("package.json", pkg)]);
+        }
+        assert_verdict(
+            Verdict::Abstain,
+            &[
+                ("package.json", morphic),
+                (
+                    "next.config.mjs",
+                    "export default {\n  output: 'export',\n}\n",
+                ),
+            ],
+        );
+        // With a tracker in the manifest it is not a violation.
+        let tracked =
+            r#"{"scripts": {"start": "next start"}, "dependencies": {"@sentry/nextjs": "^8"}}"#;
+        assert_verdict(Verdict::Abstain, &[("package.json", tracked)]);
+        // A library's dev script is not a server.
+        let lib = r#"{"scripts": {"dev": "next dev", "start": "node dist/cli.js"}}"#;
+        assert_verdict(Verdict::Abstain, &[("package.json", lib)]);
+    }
 
     #[test]
     fn a_go_listener_counts_only_in_package_main() {
