@@ -29,6 +29,9 @@
 //!     emitted for a manifest under a test, fixture or docs directory (see
 //!     [`TEST_DIR_SEGMENTS`]), nor the two probes for a Job or CronJob
 //!     container: the specs abstain on what is not deployed or not serving
+//!   * likewise neither resource request (`container.resources.requests.*`)
+//!     is emitted for a test, fixture or docs manifest, nor for a Job or
+//!     CronJob container; the limits stay, for the specs that judge them
 //!   * `pdb.min-available` / `pdb.max-unavailable` (authored only: the API
 //!     requires exactly one, so the pair's absence is invalid config, not a
 //!     decidable default)
@@ -803,7 +806,9 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
     // deployed, long-running workloads only. A test fixture is not deployed,
     // and a Job or CronJob runs to completion with no traffic for a probe to
     // gate; neither emits those keys, so the spec abstains rather than
-    // flagging (or crediting) them.
+    // flagging (or crediting) them. The capacity rule (RC-024) asks for
+    // resource requests on the same deployed, long-running workloads, so the
+    // two request keys follow the same gates.
     let fixture = test_material(em.file_anchor);
     let run_to_completion = matches!(kind, "Job" | "CronJob");
 
@@ -984,6 +989,11 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             ("container.resources.limits.cpu", "limits", "cpu"),
             ("container.resources.limits.memory", "limits", "memory"),
         ] {
+            // The limits are read everywhere: the memory limit is another
+            // control's key, judged of every container.
+            if section == "requests" && (fixture || run_to_completion) {
+                continue;
+            }
             em.setting(
                 &cunit,
                 key,
@@ -1261,12 +1271,15 @@ spec:
             "test/e2e/deploy.yaml",
             "pkg/testdata/deploy.yaml",
             "tests/fixtures/deploy.yaml",
+            "docs/content/reference/deploy.yml",
         ] {
             let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
             for key in [
                 "workload.replicas",
                 "container.liveness-probe",
                 "container.readiness-probe",
+                "container.resources.requests.cpu",
+                "container.resources.requests.memory",
             ] {
                 assert!(!has_key(&got, key), "{path}: {key} was emitted");
             }
@@ -1364,8 +1377,127 @@ spec:
             let got = packets(yaml);
             assert!(!has_key(&got, "container.liveness-probe"), "{cunit}");
             assert!(!has_key(&got, "container.readiness-probe"), "{cunit}");
+            assert!(
+                !has_key(&got, "container.resources.requests.cpu"),
+                "{cunit}"
+            );
+            assert!(
+                !has_key(&got, "container.resources.requests.memory"),
+                "{cunit}"
+            );
             // The pod template is still read for everything else.
             find(&got, cunit, "container.resources.limits.cpu");
+        }
+    }
+
+    /// No resource request reaches the capacity rule for these: a fake-data
+    /// fixture, a docs example and a one-shot Job, all without requests.
+    #[test]
+    fn fixture_docs_and_job_containers_abstain_on_resource_requests() {
+        const FAKE_DATA: &str = "\
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: nginx
+  namespace: kube-public
+spec:
+  replicas: 1
+  template:
+    spec:
+      initContainers:
+      - name: linkerd-init
+        image: cr.l5d.io/linkerd/proxy-init
+      containers:
+      - name: nginx
+        image: nginx
+      - name: linkerd-proxy
+        image: gc.io/linkerd-io/proxy
+";
+        const DOCS: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami
+";
+        const JOB: &str = "\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-acl-init
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: acl-writer
+          image: busybox:latest
+          command: [sh, -c, \"echo done\"]
+";
+        for (path, yaml, cunits) in [
+            (
+                "controller/proxy-injector/fake/data/deployment-with-injected-proxy.yaml",
+                FAKE_DATA,
+                &[
+                    "container:deployment/nginx/nginx",
+                    "container:deployment/nginx/linkerd-proxy",
+                ][..],
+            ),
+            (
+                "controller/proxy-injector/fake/data/deployment-inject-disabled.yaml",
+                FAKE_DATA,
+                &["container:deployment/nginx/nginx"][..],
+            ),
+            (
+                "docs/content/reference/dynamic-configuration/kubernetes-whoami-svc.yml",
+                DOCS,
+                &["container:deployment/whoami/whoami"][..],
+            ),
+            (
+                "example/v1beta2/acl-pvc/init-acl-job.yaml",
+                JOB,
+                &["container:job/redis-acl-init/acl-writer"][..],
+            ),
+        ] {
+            let got = retrieve_plain(None, path, yaml, "snap");
+            for cunit in cunits {
+                // The container is read; only its requests abstain.
+                find(&got, cunit, "container.resources.limits.memory");
+                for key in [
+                    "container.resources.requests.cpu",
+                    "container.resources.requests.memory",
+                ] {
+                    assert!(
+                        !got.packets.iter().any(|p| p.unit == *cunit && p.key == key),
+                        "{path}: {cunit} {key} was emitted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_examples_deployment_without_requests_still_carries_them() {
+        // examples/ is deployable reference config, not test material.
+        let got = retrieve_plain(
+            None,
+            "examples/kubernetes/manifests/pyrra-apiDeployment.yaml",
+            &BARE_DEPLOY.replace("name: app", "name: pyrra"),
+            "snap",
+        );
+        for key in [
+            "container.resources.requests.cpu",
+            "container.resources.requests.memory",
+        ] {
+            let p = find(&got, "container:deployment/web/pyrra", key);
+            assert_eq!(p.resolved_value.as_deref(), Some("none"), "{key}");
         }
     }
 
