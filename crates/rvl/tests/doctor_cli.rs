@@ -16,30 +16,12 @@ const EXIT_GAP: i32 = 1;
 fn lone_binary(bin_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(bin_dir).unwrap();
     let dest = bin_dir.join("rvl");
-    std::fs::copy(env!("CARGO_BIN_EXE_rvl"), &dest).expect("copying the scanner binary");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    rvl_testgate::copy_executable(Path::new(env!("CARGO_BIN_EXE_rvl")), &dest);
     dest
 }
 
-/// See `fresh_install::run_retrying_etxtbsy`: a fork elsewhere in this
-/// multi-threaded test process can inherit the write descriptor `fs::copy`
-/// holds on the freshly written binary, and the kernel refuses to exec a file
-/// that is open for writing.
 fn run(cmd: &mut Command) -> std::process::Output {
-    for _ in 0..50 {
-        match cmd.output() {
-            Ok(o) => return o,
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => panic!("failed to run rvl: {e:?}"),
-        }
-    }
-    panic!("rvl stayed ETXTBSY for a second")
+    cmd.output().expect("failed to run rvl")
 }
 
 /// A doctor invocation with NOTHING pre-arranged: empty HOME, empty cache,

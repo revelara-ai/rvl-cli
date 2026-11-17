@@ -116,6 +116,42 @@ pub fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
+/// Copy the executable at `src` to `dest`, ready to run at once, for the
+/// reason [`write_executable`] gives: `fs::copy` in this process holds a write
+/// descriptor on `dest` that a fork on another thread can inherit, and exec of
+/// `dest` then fails with "Text file busy". So `/bin/cp` writes the bytes
+/// under a temporary name and this process sets the mode and renames it.
+#[cfg(unix)]
+pub fn copy_executable(src: &Path, dest: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let name = dest.file_name().expect("an executable needs a file name");
+    let tmp = dest.with_file_name(format!(".{}.partial", name.to_string_lossy()));
+    let status = std::process::Command::new("/bin/cp")
+        .arg("--")
+        .arg(src)
+        .arg(&tmp)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("copying to {}: /bin/cp did not start: {e}", tmp.display()));
+    assert!(
+        status.success(),
+        "copying {} to {}: /bin/cp {status}",
+        src.display(),
+        tmp.display()
+    );
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, dest)
+        .unwrap_or_else(|e| panic!("rename {} to {}: {e}", tmp.display(), dest.display()));
+}
+
+/// Without execute bits there is nothing to race: copy the file.
+#[cfg(not(unix))]
+pub fn copy_executable(src: &Path, dest: &Path) {
+    std::fs::copy(src, dest)
+        .unwrap_or_else(|e| panic!("copy {} to {}: {e}", src.display(), dest.display()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +182,25 @@ mod tests {
             )),
             want
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_executable_has_the_source_bytes_and_runs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("rvl-testgate-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.sh");
+        let dest = dir.join("dest.sh");
+        let body = "#!/bin/sh\necho copied\n";
+        std::fs::write(&src, body).unwrap();
+        copy_executable(&src, &dest);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), body);
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(!dir.join(".dest.sh.partial").exists());
+        let out = std::process::Command::new(&dest).output().unwrap();
+        assert_eq!(out.stdout, b"copied\n");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
