@@ -60,7 +60,7 @@ fn every_release_target_pins_exactly_one_checksummed_runtime() {
         .expect("a `version` line");
 
     let mut seen = BTreeSet::new();
-    let mut shas = BTreeSet::new();
+    let mut members = BTreeSet::new();
     for r in rows.iter().filter(|r| r[0] == "lib") {
         assert_eq!(
             r.len(),
@@ -70,11 +70,12 @@ fn every_release_target_pins_exactly_one_checksummed_runtime() {
         let (triple, url, sha, member) = (&r[1], &r[2], &r[3], &r[4]);
         assert!(seen.insert(triple.clone()), "{triple} pinned twice");
         assert!(
-            shas.insert(sha.clone()),
-            "{triple} reuses another target's checksum"
+            members.insert(member.clone()),
+            "{triple} takes another target's library from the package"
         );
         assert!(
-            url.starts_with("https://github.com/microsoft/onnxruntime/releases/download/"),
+            url.starts_with("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/")
+                && url.ends_with(".nupkg"),
             "{triple}: {url}"
         );
         assert!(
@@ -141,17 +142,73 @@ fn have(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A fake release archive laid out like Microsoft's, plus its sha256.
+/// A fake package laid out like Microsoft's NuGet package, plus its sha256.
 struct Fixture {
     _tmp: tempfile::TempDir,
     dir: PathBuf,
     sha: String,
 }
 
-const TOP: &str = "onnxruntime-linux-x64-9.9.9";
+const LIB: &str = "runtimes/linux-x64/native/libonnxruntime.so";
+
+/// CRC-32 (IEEE), which every zip entry carries.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+/// A zip of `files`, stored uncompressed: enough for `unzip`, and no zip tool
+/// or crate is needed to build it.
+fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let u16le = |v: usize| u16::try_from(v).unwrap().to_le_bytes();
+    let u32le = |v: usize| u32::try_from(v).unwrap().to_le_bytes();
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in files {
+        let offset = out.len();
+        let crc = crc32(data).to_le_bytes();
+        // version 2.0, no flags, stored, 1980-01-01 00:00
+        let common = [&20u16.to_le_bytes()[..], &[0, 0, 0, 0, 0, 0, 0x21, 0], &crc].concat();
+        let sizes = [u32le(data.len()), u32le(data.len())].concat();
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&common);
+        out.extend_from_slice(&sizes);
+        out.extend_from_slice(&u16le(name.len()));
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        // made by Unix, so the external attributes below are a mode
+        central.extend_from_slice(&0x0314u16.to_le_bytes());
+        central.extend_from_slice(&common);
+        central.extend_from_slice(&sizes);
+        central.extend_from_slice(&u16le(name.len()));
+        central.extend_from_slice(&[0; 8]);
+        central.extend_from_slice(&(0o100_644u32 << 16).to_le_bytes());
+        central.extend_from_slice(&u32le(offset));
+        central.extend_from_slice(name.as_bytes());
+    }
+    let (cd_offset, cd_size) = (out.len(), central.len());
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&u16le(files.len()));
+    out.extend_from_slice(&u16le(files.len()));
+    out.extend_from_slice(&u32le(cd_size));
+    out.extend_from_slice(&u32le(cd_offset));
+    out.extend_from_slice(&[0, 0]);
+    out
+}
 
 fn fixture(test: &str) -> Option<Fixture> {
-    for tool in ["tar", "gzip", "curl"] {
+    for tool in ["unzip", "curl"] {
         if !have(tool) {
             rvl_testgate::skip(test, format_args!("`{tool}` not on PATH"));
             return None;
@@ -159,36 +216,16 @@ fn fixture(test: &str) -> Option<Fixture> {
     }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
-    let top = dir.join("src").join(TOP);
-    std::fs::create_dir_all(top.join("lib")).unwrap();
-    std::fs::create_dir_all(top.join("include")).unwrap();
-    std::fs::write(top.join("lib/libonnxruntime.so.9.9.9"), "ELF-ish").unwrap();
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(
-            "libonnxruntime.so.9.9.9",
-            top.join("lib/libonnxruntime.so.1"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("libonnxruntime.so.1", top.join("lib/libonnxruntime.so"))
-            .unwrap();
-    }
-    std::fs::write(top.join("LICENSE"), "MIT License\n").unwrap();
-    std::fs::write(top.join("ThirdPartyNotices.txt"), "notices\n").unwrap();
-    std::fs::write(top.join("include/onnxruntime_c_api.h"), "/* api */\n").unwrap();
-    let ok = Command::new("tar")
-        .arg("-czf")
-        .arg(dir.join("runtime.tgz"))
-        .arg("-C")
-        .arg(dir.join("src"))
-        .arg(TOP)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "build the fake archive");
-    let sha = hex::encode(sha2::Sha256::digest(
-        std::fs::read(dir.join("runtime.tgz")).unwrap(),
-    ));
+    let package = zip(&[
+        ("LICENSE", b"MIT License\n"),
+        ("ThirdPartyNotices.txt", b"notices\n"),
+        ("Microsoft.ML.OnnxRuntime.nuspec", b"<package/>\n"),
+        ("build/native/include/onnxruntime_c_api.h", b"/* api */\n"),
+        (LIB, b"ELF-ish"),
+        ("runtimes/linux-arm64/native/libonnxruntime.so", b"ELF-arm"),
+    ]);
+    std::fs::write(dir.join("runtime.nupkg"), &package).unwrap();
+    let sha = hex::encode(sha2::Sha256::digest(&package));
     Some(Fixture {
         _tmp: tmp,
         dir,
@@ -203,8 +240,8 @@ impl Fixture {
             &pin,
             format!(
                 "version 9.9.9\n\
-                 lib x86_64-unknown-linux-gnu file://{d}/runtime.tgz {sha} \
-                 {TOP}/lib/libonnxruntime.so {TOP}/LICENSE\n",
+                 lib x86_64-unknown-linux-gnu file://{d}/runtime.nupkg {sha} \
+                 {LIB} LICENSE\n",
                 d = self.dir.display()
             ),
         )
@@ -223,7 +260,6 @@ impl Fixture {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn fetch_lays_out_the_bundle_rvl_model_looks_for() {
     let Some(fx) = fixture("fetch_lays_out_the_bundle_rvl_model_looks_for") else {
@@ -244,7 +280,7 @@ fn fetch_lays_out_the_bundle_rvl_model_looks_for() {
             .unwrap()
             .file_type()
             .is_symlink(),
-        "the archive's link is followed, so the bundle holds the library itself"
+        "the bundle holds the library itself"
     );
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), "ELF-ish");
     assert_eq!(
@@ -311,8 +347,8 @@ fn fetch_fails_closed_when_the_library_is_not_in_the_archive() {
         &pin,
         format!(
             "version 9.9.9\n\
-             lib x86_64-unknown-linux-gnu file://{d}/runtime.tgz {sha} \
-             {TOP}/lib64/libonnxruntime.so {TOP}/LICENSE\n",
+             lib x86_64-unknown-linux-gnu file://{d}/runtime.nupkg {sha} \
+             runtimes/linux-x64/lib/libonnxruntime.so LICENSE\n",
             d = fx.dir.display(),
             sha = fx.sha
         ),
