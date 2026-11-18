@@ -65,9 +65,10 @@ so a fresh install scans with no setup:
   `dist-workspace.toml` agree.
 - **`onnxruntime/`**, the engine of local model inference (`rvl-model`), is
   vendored the same way: `crates/rvl-model/onnxruntime.pin` names the ONNX
-  Runtime version and, per target triple, Microsoft's release archive and its
-  sha256. `ci/fetch-onnxruntime.sh` verifies the download, fails the build on
-  a mismatch, and writes `crates/rvl/dist-extras/onnxruntime/` (the library,
+  Runtime version, Microsoft's signed NuGet package `Microsoft.ML.OnnxRuntime`
+  and its sha256, and per target triple the library inside it.
+  `ci/fetch-onnxruntime.sh` verifies the download, fails the build on a
+  mismatch, and writes `crates/rvl/dist-extras/onnxruntime/` (the library,
   ONNX Runtime's license and its third-party notices), which `include` packs
   beside `rvl`. The step sets `RVL_REQUIRE_VENDORED_ONNXRUNTIME`, so a release
   `rvl` whose bundle is missing fails closed rather than loading a system

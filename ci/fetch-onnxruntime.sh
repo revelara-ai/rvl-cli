@@ -33,7 +33,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 pin=${ONNXRUNTIME_PIN:-$here/../crates/rvl-model/onnxruntime.pin}
 [ -f "$pin" ] || die "no pin file at $pin"
 
-for tool in curl tar; do
+for tool in curl unzip; do
   command -v "$tool" >/dev/null 2>&1 || die "\`$tool\` is required"
 done
 
@@ -45,7 +45,15 @@ lib_rows=$(rows | awk -v t="$triple" '$1 == "lib" && $2 == t')
 [ "$(printf '%s\n' "$lib_rows" | wc -l)" -eq 1 ] || die "$triple is pinned more than once in $pin"
 read -r _ _ url want lib_member license_member <<<"$lib_rows"
 [ -n "${license_member:-}" ] || die "malformed lib line for $triple in $pin"
-notices_member=$(dirname "$license_member")/ThirdPartyNotices.txt
+# The notices ship beside the license. A license at the archive root gives
+# `ThirdPartyNotices.txt`, not `./ThirdPartyNotices.txt`, which unzip would
+# not match.
+license_dir=$(dirname "$license_member")
+if [ "$license_dir" = . ]; then
+  notices_member=ThirdPartyNotices.txt
+else
+  notices_member=$license_dir/ThirdPartyNotices.txt
+fi
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -60,24 +68,22 @@ scratch=$(mktemp -d "$outdir/.onnxruntime.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
 curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
-  --connect-timeout 30 --max-time 900 -o "$scratch/runtime.tgz" "$url" ||
+  --connect-timeout 30 --max-time 900 -o "$scratch/runtime.nupkg" "$url" ||
   die "download failed: $url"
-got=$(sha256 "$scratch/runtime.tgz")
+got=$(sha256 "$scratch/runtime.nupkg")
 [ "$got" = "$want" ] ||
   die "checksum mismatch for $url: pinned $want, got $got (refusing to ship it)"
 
-# The library member is a symlink to the versioned file beside it, so the
-# whole lib/ directory is unpacked and the link is followed on copy.
+# The package is a zip (a NuGet .nupkg) and every member is a regular file.
 mkdir -p "$scratch/src"
-lib_dir=$(dirname "$lib_member")
-tar -xzf "$scratch/runtime.tgz" -C "$scratch/src" "$lib_dir" "$license_member" "$notices_member" ||
-  die "$lib_dir, $license_member or $notices_member is not in $url"
+unzip -q "$scratch/runtime.nupkg" "$lib_member" "$license_member" "$notices_member" -d "$scratch/src" ||
+  die "$lib_member, $license_member or $notices_member is not in $url"
 
 bundle=$scratch/onnxruntime
 mkdir -p "$bundle"
 lib_name=$(basename "$lib_member")
-[ -e "$scratch/src/$lib_member" ] || die "$lib_member is not in $url (or is a dangling link)"
-cp -L "$scratch/src/$lib_member" "$bundle/$lib_name"
+[ -f "$scratch/src/$lib_member" ] || die "$lib_member is not in $url"
+cp "$scratch/src/$lib_member" "$bundle/$lib_name"
 [ -s "$bundle/$lib_name" ] || die "$lib_member in $url is empty"
 chmod 0644 "$bundle/$lib_name"
 cp "$scratch/src/$license_member" "$bundle/LICENSE"
