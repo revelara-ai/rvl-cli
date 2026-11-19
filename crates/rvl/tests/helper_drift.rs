@@ -246,7 +246,7 @@ fn an_old_goindex_on_path_is_named_as_drift() {
     // it: the source build of the report, where PATH is the only goindex.
     let rvl = dir.path().join("rvl-alone").join("rvl");
     std::fs::create_dir_all(rvl.parent().unwrap()).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_rvl"), &rvl).unwrap();
+    rvl_testgate::copy_executable(Path::new(env!("CARGO_BIN_EXE_rvl")), &rvl);
     let out = Command::new(&rvl)
         .current_dir(&root)
         .env("HOME", dir.path().join("home"))
