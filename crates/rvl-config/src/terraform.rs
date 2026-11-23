@@ -49,6 +49,19 @@
 //!     attribute can take: the provider block or the parent cluster supplies
 //!     it, so they are Unresolvable. No other resource attribute is read. A
 //!     `dynamic` block on the path is Unresolvable.
+//!   * the LEAST-PRIVILEGE facts (RC-044), one per resource of the kinds
+//!     that carry one: `resource.google_service_account_key.declared` and
+//!     `resource.aws_iam_access_key.declared` (a static key exists;
+//!     `count`/`for_each` can make it `false` or Unresolvable),
+//!     `resource.google_iam.role-class` (`primitive` | `viewer` | `custom` |
+//!     `predefined`), `resource.aws_iam.statement-wildcard` (`none` |
+//!     `resource` | `action` | `action-and-resource`, read from a
+//!     `jsonencode({...})`, heredoc or string policy, or a
+//!     `data "aws_iam_policy_document"`), and
+//!     `resource.google_container_node_pool.node-identity`
+//!     (`default-account` | `cloud-platform-scope` | `dedicated`, for a node
+//!     pool or a cluster's inline `node_config`). A value that needs
+//!     evaluation is Unresolvable, never a guess.
 //!   * `terraform.module-kind` (`root` | `reusable` | `indeterminate`) and,
 //!     for roots only, `terraform.root-backend` — the same fact as
 //!     `terraform.backend`, emitted where a missing backend is a finding and
@@ -152,8 +165,9 @@ enum Tok {
     Num(String),
     Punct(char),
     Newline,
-    /// A heredoc body: always expression-grade, content dropped.
-    Heredoc,
+    /// A heredoc's body. Only a policy document is ever read from one
+    /// ([`policy_wildcard_fact`]); everywhere else it is expression-grade.
+    Heredoc(String),
 }
 
 fn tokenize(src: &str) -> Vec<Tok> {
@@ -191,8 +205,9 @@ fn tokenize(src: &str) -> Vec<Tok> {
                 i = ni;
             }
             '<' if i + 1 < b.len() && b[i + 1] == b'<' => {
-                i = scan_heredoc(src, b, i + 2);
-                toks.push(Tok::Heredoc);
+                let (ni, body) = scan_heredoc(src, b, i + 2);
+                toks.push(Tok::Heredoc(body));
+                i = ni;
             }
             '0'..='9' => {
                 let start = i;
@@ -276,9 +291,9 @@ fn scan_string(b: &[u8], mut i: usize) -> (Tok, usize) {
 }
 
 /// Scan a heredoc starting at the tag (after `<<`); returns the index after
-/// the terminating tag line. Content is dropped: a heredoc is never a
-/// literal this lane inventories.
-fn scan_heredoc(src: &str, b: &[u8], mut i: usize) -> usize {
+/// the terminating tag line and the body between the two. The body is never
+/// a literal this lane inventories, only a document it may read.
+fn scan_heredoc(src: &str, b: &[u8], mut i: usize) -> (usize, String) {
     if i < b.len() && b[i] == b'-' {
         i += 1;
     }
@@ -288,12 +303,14 @@ fn scan_heredoc(src: &str, b: &[u8], mut i: usize) -> usize {
     }
     let tag = &src[tag_start..i];
     if tag.is_empty() {
-        return i;
+        return (i, String::new());
     }
     // consume to end of the opening line, then whole lines until the tag
     while i < b.len() && b[i] != b'\n' {
         i += 1;
     }
+    let body_start = (i + 1).min(b.len());
+    let mut body_end = b.len();
     while i < b.len() {
         i += 1; // past the newline
         let line_start = i;
@@ -301,10 +318,11 @@ fn scan_heredoc(src: &str, b: &[u8], mut i: usize) -> usize {
             i += 1;
         }
         if src[line_start..i].trim() == tag {
+            body_end = line_start;
             break;
         }
     }
-    i
+    (i, src[body_start..body_end.max(body_start)].to_string())
 }
 
 // --- bounded HCL subset: grammar ---
@@ -320,9 +338,24 @@ enum Value {
     Object(Vec<(String, Value)>),
     /// A list literal `[a, b, ...]` whose items are all literal scalars.
     List(Vec<String>),
+    /// `jsonencode(...)` of a literal structure: read as a document.
+    Json(Doc),
+    /// A heredoc's body.
+    Heredoc(String),
     /// Anything needing evaluation: templates, functions, other references,
     /// lists, heredocs, operators. Never resolved, never guessed.
     Expr,
+}
+
+/// A JSON-shaped document: the argument of `jsonencode(...)`, or a policy
+/// string or heredoc. A part that needs evaluation is [`Doc::Unknown`], so
+/// the rest of the document stays readable.
+#[derive(Debug, Clone, PartialEq)]
+enum Doc {
+    Str(String),
+    List(Vec<Doc>),
+    Map(Vec<(String, Doc)>),
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +496,30 @@ impl Parser {
                     Value::Expr
                 }
             }
+            Some(Tok::Heredoc(_)) => {
+                let Some(Tok::Heredoc(body)) = self.bump() else {
+                    unreachable!()
+                };
+                Value::Heredoc(body)
+            }
+            Some(Tok::Ident(w))
+                if w == "jsonencode"
+                    && matches!(self.toks.get(self.i + 1), Some(Tok::Punct('('))) =>
+            {
+                self.i += 2;
+                let doc = self.parse_doc();
+                while matches!(self.peek(), Some(Tok::Newline)) {
+                    self.bump();
+                }
+                if matches!(self.peek(), Some(Tok::Punct(')'))) {
+                    self.bump();
+                    Value::Json(doc)
+                } else {
+                    // More than one argument: skip to the call's `)`.
+                    self.consume_list();
+                    Value::Expr
+                }
+            }
             Some(Tok::Punct('{')) => {
                 self.bump();
                 return self.parse_object();
@@ -558,6 +615,103 @@ impl Parser {
         }
     }
 
+    /// One document value inside `jsonencode(...)`. Anything but a plain
+    /// string, an object or a list is consumed as an expression and read as
+    /// [`Doc::Unknown`]; every path consumes at least one token or stops at a
+    /// closer its caller owns.
+    fn parse_doc(&mut self) -> Doc {
+        while matches!(self.peek(), Some(Tok::Newline)) {
+            self.bump();
+        }
+        let doc = match self.peek() {
+            Some(Tok::Str {
+                template: false, ..
+            }) => {
+                let Some(Tok::Str { value, .. }) = self.bump() else {
+                    unreachable!()
+                };
+                Doc::Str(value)
+            }
+            Some(Tok::Punct('{')) => {
+                self.bump();
+                self.parse_doc_map()
+            }
+            Some(Tok::Punct('[')) => {
+                self.bump();
+                self.parse_doc_list()
+            }
+            _ => {
+                self.consume_doc_expr();
+                return Doc::Unknown;
+            }
+        };
+        let ends = matches!(
+            self.peek(),
+            None | Some(Tok::Newline)
+                | Some(Tok::Punct('}'))
+                | Some(Tok::Punct(','))
+                | Some(Tok::Punct(']'))
+                | Some(Tok::Punct(')'))
+        );
+        if !ends {
+            self.consume_doc_expr();
+            return Doc::Unknown;
+        }
+        doc
+    }
+
+    /// A document object after its `{`: `key = value` or `key: value`.
+    fn parse_doc_map(&mut self) -> Doc {
+        let mut fields = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Some(Tok::Punct('}')) => {
+                    self.bump();
+                    return Doc::Map(fields);
+                }
+                Some(Tok::Ident(_))
+                | Some(Tok::Str {
+                    template: false, ..
+                }) => {
+                    let key = match self.bump() {
+                        Some(Tok::Ident(k)) | Some(Tok::Str { value: k, .. }) => k,
+                        _ => unreachable!(),
+                    };
+                    if !matches!(self.peek(), Some(Tok::Punct('=')) | Some(Tok::Punct(':'))) {
+                        self.skip_balanced_brace();
+                        return Doc::Unknown;
+                    }
+                    self.bump();
+                    let v = self.parse_doc();
+                    fields.push((key, v));
+                }
+                None => return Doc::Unknown,
+                _ => {
+                    self.skip_balanced_brace();
+                    return Doc::Unknown;
+                }
+            }
+        }
+    }
+
+    /// A document list after its `[`.
+    fn parse_doc_list(&mut self) -> Doc {
+        let mut items = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Some(Tok::Punct(']')) => {
+                    self.bump();
+                    return Doc::List(items);
+                }
+                // Malformed: leave the closer to the caller that owns it.
+                None | Some(Tok::Punct('}')) | Some(Tok::Punct(')')) => return Doc::Unknown,
+                _ => items.push(self.parse_doc()),
+            }
+        }
+    }
+
     /// Skip to just past the `]` closing the CURRENT list (depth already
     /// inside it).
     fn consume_list(&mut self) {
@@ -589,6 +743,26 @@ impl Parser {
                 Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') => {
                     depth = depth.saturating_sub(1)
                 }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    /// [`Self::consume_expr`] inside `jsonencode(...)`: an unmatched `)` is
+    /// the call's own and ends the expression too.
+    fn consume_doc_expr(&mut self) {
+        let mut depth = 0usize;
+        while let Some(t) = self.peek() {
+            match t {
+                Tok::Newline if depth == 0 => return,
+                Tok::Punct('}') | Tok::Punct(',') | Tok::Punct(']') | Tok::Punct(')')
+                    if depth == 0 =>
+                {
+                    return
+                }
+                Tok::Punct('(') | Tok::Punct('[') | Tok::Punct('{') => depth += 1,
+                Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') => depth -= 1,
                 _ => {}
             }
             self.bump();
@@ -1033,6 +1207,460 @@ fn lookup_attr<'a>(body: &'a [Item], blocks: &[&str], attr: &str) -> AttrLookup<
     match get_attr(body, attr) {
         Some(v) => AttrLookup::Found(v),
         None => AttrLookup::Absent,
+    }
+}
+
+// --- the least-privilege facts (RC-044) ---
+
+/// One packet's (value, resolution, provenance chain).
+type Fact = (Option<String>, Resolution, Vec<ProvenanceStep>);
+
+fn unresolved(mut chain: Vec<ProvenanceStep>, rel: &str, key_path: &str, role: &str) -> Fact {
+    chain.push(ProvenanceStep::new(rel, key_path, role));
+    (None, Resolution::Unresolvable, chain)
+}
+
+/// The IAM grants whose `role` is classed by [`role_class`].
+const GOOGLE_IAM_GRANTS: &[&str] = &[
+    "google_project_iam_member",
+    "google_project_iam_binding",
+    "google_folder_iam_member",
+    "google_folder_iam_binding",
+    "google_organization_iam_member",
+    "google_organization_iam_binding",
+];
+
+/// The AWS resources whose `policy` is an IAM policy document.
+const AWS_IAM_POLICIES: &[&str] = &[
+    "aws_iam_policy",
+    "aws_iam_role_policy",
+    "aws_iam_user_policy",
+    "aws_iam_group_policy",
+];
+
+/// The least-privilege fact one resource carries, if its type has one:
+/// (packet key, fact).
+fn least_privilege_fact(
+    ty: &str,
+    name: &str,
+    body: &[Item],
+    rel: &str,
+    vars: &VarTable,
+) -> Option<(&'static str, Fact)> {
+    let base = format!("resource.{ty}.{name}");
+    let key = match ty {
+        "google_service_account_key" => "resource.google_service_account_key.declared",
+        "aws_iam_access_key" => "resource.aws_iam_access_key.declared",
+        ty if GOOGLE_IAM_GRANTS.contains(&ty) => "resource.google_iam.role-class",
+        ty if AWS_IAM_POLICIES.contains(&ty) => "resource.aws_iam.statement-wildcard",
+        "google_container_node_pool" => "resource.google_container_node_pool.node-identity",
+        // A cluster's nodes are described here only by an inline node_config;
+        // without one they are a separate node pool's.
+        "google_container_cluster"
+            if get_blocks(body, "node_config").next().is_some()
+                || get_blocks(body, "dynamic")
+                    .any(|d| d.labels.first().is_some_and(|l| l == "node_config")) =>
+        {
+            "resource.google_container_node_pool.node-identity"
+        }
+        _ => return None,
+    };
+    let fact = match key {
+        "resource.google_iam.role-class" => role_class_fact(body, rel, &base, vars),
+        "resource.aws_iam.statement-wildcard" => policy_wildcard_fact(
+            get_attr(body, "policy"),
+            rel,
+            &format!("{base}.policy"),
+            vars,
+        ),
+        "resource.google_container_node_pool.node-identity" => {
+            node_identity_fact(body, rel, &base, vars)
+        }
+        _ => declared_fact(body, rel, &base, vars),
+    };
+    Some((key, fact))
+}
+
+/// Whether the resource exists: `true` unless `count` or `for_each` can make
+/// it zero instances. A literal zero (or an empty literal collection) is
+/// `false`; one that needs evaluation (`var.create ? 1 : 0`) abstains.
+fn declared_fact(body: &[Item], rel: &str, base: &str, vars: &VarTable) -> Fact {
+    if let Some(v) = get_attr(body, "count") {
+        let key_path = format!("{base}.count");
+        return match resolve_value(rel, &key_path, v, vars) {
+            (Some(n), res, chain) => match n.parse::<u64>() {
+                Ok(n) => (Some((n > 0).to_string()), res, chain),
+                Err(_) => unresolved(chain, rel, &key_path, "not-a-count"),
+            },
+            unknown => unknown,
+        };
+    }
+    if let Some(v) = get_attr(body, "for_each") {
+        let key_path = format!("{base}.for_each");
+        let explicit = vec![ProvenanceStep::new(rel, &key_path, "explicit")];
+        return match v {
+            Value::List(items) => (
+                Some((!items.is_empty()).to_string()),
+                Resolution::AsAuthored,
+                explicit,
+            ),
+            Value::Object(attrs) => (
+                Some((!attrs.is_empty()).to_string()),
+                Resolution::AsAuthored,
+                explicit,
+            ),
+            _ => unresolved(Vec::new(), rel, &key_path, "expression"),
+        };
+    }
+    (
+        Some("true".to_string()),
+        Resolution::AsAuthored,
+        vec![ProvenanceStep::new(rel, base, "explicit")],
+    )
+}
+
+/// The class of a GCP IAM role name: the basic roles owner and editor are
+/// `primitive`, viewer is `viewer`, a project or organization role is
+/// `custom`, any other `roles/...` is `predefined`. Anything else is `None`.
+fn role_class(role: &str) -> Option<&'static str> {
+    match role {
+        "roles/owner" | "roles/editor" => Some("primitive"),
+        "roles/viewer" => Some("viewer"),
+        r if r.starts_with("projects/") || r.starts_with("organizations/") => Some("custom"),
+        r if r.len() > "roles/".len() && r.starts_with("roles/") => Some("predefined"),
+        _ => None,
+    }
+}
+
+fn role_class_fact(body: &[Item], rel: &str, base: &str, vars: &VarTable) -> Fact {
+    let key_path = format!("{base}.role");
+    let Some(v) = get_attr(body, "role") else {
+        return unresolved(Vec::new(), rel, &key_path, "absent");
+    };
+    match resolve_value(rel, &key_path, v, vars) {
+        (Some(role), res, chain) => match role_class(&role) {
+            Some(class) => (Some(class.to_string()), res, chain),
+            None => unresolved(chain, rel, &key_path, "unrecognized"),
+        },
+        unknown => unknown,
+    }
+}
+
+/// The scope that grants a node every API its service account may call.
+const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
+/// Who the nodes act as. `default-account`: no `service_account` (the
+/// Compute Engine default account), or that account named outright.
+/// `cloud-platform-scope`: a custom account holding the all-APIs scope.
+/// `dedicated`: a custom account with narrower scopes; an absent
+/// `oauth_scopes` is the provider's default set, which excludes
+/// cloud-platform.
+fn node_identity_fact(body: &[Item], rel: &str, base: &str, vars: &VarTable) -> Fact {
+    let account_path = format!("{base}.node_config.service_account");
+    let (account, res, mut chain) = match lookup_attr(body, &["node_config"], "service_account") {
+        AttrLookup::Dynamic => {
+            return unresolved(
+                Vec::new(),
+                rel,
+                &format!("{base}.node_config"),
+                "expression",
+            )
+        }
+        AttrLookup::Absent => {
+            return (
+                Some("default-account".to_string()),
+                Resolution::PlatformDefault,
+                vec![
+                    ProvenanceStep::new(rel, &account_path, "absent"),
+                    ProvenanceStep::new("", "service_account", "platform-default"),
+                ],
+            )
+        }
+        AttrLookup::Found(v) => match resolve_value(rel, &account_path, v, vars) {
+            (Some(a), res, chain) => (a, res, chain),
+            unknown => return unknown,
+        },
+    };
+    if account.is_empty()
+        || account == "default"
+        || account.ends_with("-compute@developer.gserviceaccount.com")
+    {
+        return (Some("default-account".to_string()), res, chain);
+    }
+    let scopes_path = format!("{base}.node_config.oauth_scopes");
+    let identity = match lookup_attr(body, &["node_config"], "oauth_scopes") {
+        AttrLookup::Absent => {
+            chain.push(ProvenanceStep::new(rel, &scopes_path, "absent"));
+            "dedicated"
+        }
+        AttrLookup::Found(Value::List(scopes)) => {
+            chain.push(ProvenanceStep::new(rel, &scopes_path, "explicit"));
+            if scopes
+                .iter()
+                .any(|s| s == CLOUD_PLATFORM_SCOPE || s == "cloud-platform")
+            {
+                "cloud-platform-scope"
+            } else {
+                "dedicated"
+            }
+        }
+        // A scope list never resolves through a variable: one-hop resolution
+        // carries scalar literals only.
+        _ => return unresolved(chain, rel, &scopes_path, "expression"),
+    };
+    (Some(identity.to_string()), res, chain)
+}
+
+/// How wide a policy's Allow statements reach, narrowest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Wildcard {
+    None,
+    Resource,
+    Action,
+    ActionAndResource,
+}
+
+impl Wildcard {
+    fn as_str(self) -> &'static str {
+        match self {
+            Wildcard::None => "none",
+            Wildcard::Resource => "resource",
+            Wildcard::Action => "action",
+            Wildcard::ActionAndResource => "action-and-resource",
+        }
+    }
+
+    /// One statement: every action on every resource; else any action
+    /// wildcard (`*` or a whole service, `s3:*`), whatever the resource;
+    /// else every resource.
+    fn of(actions: &[String], resources: &[String]) -> Wildcard {
+        let all_actions = actions.iter().any(|a| a == "*" || a == "*:*");
+        let all_resources = resources.iter().any(|r| r == "*");
+        if all_actions && all_resources {
+            Wildcard::ActionAndResource
+        } else if all_actions || actions.iter().any(|a| a.ends_with(":*")) {
+            Wildcard::Action
+        } else if all_resources {
+            Wildcard::Resource
+        } else {
+            Wildcard::None
+        }
+    }
+}
+
+/// A statement's actions or resources as read: the literal strings, and
+/// whether some part needs evaluation (and so might be `*`).
+#[derive(Default)]
+struct Part {
+    known: Vec<String>,
+    unknown: bool,
+}
+
+impl Part {
+    fn unread() -> Part {
+        Part {
+            known: Vec::new(),
+            unknown: true,
+        }
+    }
+
+    /// The widest the part could evaluate to.
+    fn widest(&self) -> Vec<String> {
+        let mut all = self.known.clone();
+        if self.unknown {
+            all.push("*".to_string());
+        }
+        all
+    }
+}
+
+/// One policy statement as read; `allow` is `None` when the effect needs
+/// evaluation.
+struct Statement {
+    allow: Option<bool>,
+    actions: Part,
+    resources: Part,
+}
+
+impl Statement {
+    fn unread() -> Statement {
+        Statement {
+            allow: None,
+            actions: Part::unread(),
+            resources: Part::unread(),
+        }
+    }
+}
+
+/// The widest wildcard among the Allow statements, when the parts that need
+/// evaluation cannot change it: the class of what is read must equal the
+/// class if every unknown part were `*`. `s3:*` on a referenced bucket is
+/// `action` either way; `s3:GetObject` on one is open.
+fn widest_wildcard(statements: &[Statement]) -> Option<Wildcard> {
+    let (mut least, mut most) = (Wildcard::None, Wildcard::None);
+    for s in statements {
+        if s.allow == Some(false) {
+            continue;
+        }
+        most = most.max(Wildcard::of(&s.actions.widest(), &s.resources.widest()));
+        if s.allow == Some(true) {
+            least = least.max(Wildcard::of(&s.actions.known, &s.resources.known));
+        }
+    }
+    (least == most).then_some(least)
+}
+
+/// A JSON policy string as a [`Doc`]; a string with a template in it is a
+/// part that needs evaluation.
+fn json_doc(src: &str) -> Option<Doc> {
+    fn conv(v: &serde_json::Value) -> Doc {
+        match v {
+            serde_json::Value::String(s) if !s.contains("${") && !s.contains("%{") => {
+                Doc::Str(s.clone())
+            }
+            serde_json::Value::Array(items) => Doc::List(items.iter().map(conv).collect()),
+            serde_json::Value::Object(m) => {
+                Doc::Map(m.iter().map(|(k, v)| (k.clone(), conv(v))).collect())
+            }
+            _ => Doc::Unknown,
+        }
+    }
+    serde_json::from_str(src).ok().map(|v| conv(&v))
+}
+
+/// The statements of a JSON policy document. `Statement` may be one object
+/// or a list; `Action` and `Resource` one string or a list. A statement
+/// without them (`NotAction`, `NotResource`) is unread, never assumed narrow.
+fn json_statements(doc: &Doc) -> Option<Vec<Statement>> {
+    fn field<'a>(m: &'a [(String, Doc)], key: &str) -> Option<&'a Doc> {
+        m.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    fn part(d: Option<&Doc>) -> Part {
+        match d {
+            Some(Doc::Str(s)) => Part {
+                known: vec![s.clone()],
+                unknown: false,
+            },
+            Some(Doc::List(items)) => Part {
+                known: items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Doc::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                unknown: items.iter().any(|i| !matches!(i, Doc::Str(_))),
+            },
+            _ => Part::unread(),
+        }
+    }
+    let Doc::Map(top) = doc else { return None };
+    let statements = match field(top, "Statement")? {
+        Doc::List(items) => items.iter().collect(),
+        one @ Doc::Map(_) => vec![one],
+        _ => return None,
+    };
+    Some(
+        statements
+            .into_iter()
+            .map(|s| {
+                let Doc::Map(s) = s else {
+                    return Statement::unread();
+                };
+                Statement {
+                    allow: match field(s, "Effect") {
+                        Some(Doc::Str(e)) => Some(e == "Allow"),
+                        _ => None,
+                    },
+                    actions: part(field(s, "Action")),
+                    resources: part(field(s, "Resource")),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `resource.aws_iam.statement-wildcard` of a resource's `policy`: a
+/// `jsonencode({...})` structure, a heredoc, or a string (literal or one
+/// variable hop) holding JSON. `file()`, `templatefile()` and other
+/// references abstain.
+fn policy_wildcard_fact(v: Option<&Value>, rel: &str, key_path: &str, vars: &VarTable) -> Fact {
+    let Some(v) = v else {
+        return unresolved(Vec::new(), rel, key_path, "absent");
+    };
+    let explicit = || vec![ProvenanceStep::new(rel, key_path, "explicit")];
+    let (doc, res, chain) = match v {
+        Value::Json(doc) => (Some(doc.clone()), Resolution::AsAuthored, explicit()),
+        Value::Heredoc(body) => (json_doc(body), Resolution::AsAuthored, explicit()),
+        other => match resolve_value(rel, key_path, other, vars) {
+            (Some(s), res, chain) => (json_doc(&s), res, chain),
+            unknown => return unknown,
+        },
+    };
+    match doc
+        .as_ref()
+        .and_then(json_statements)
+        .and_then(|s| widest_wildcard(&s))
+    {
+        Some(w) => (Some(w.as_str().to_string()), res, chain),
+        None => unresolved(chain, rel, key_path, "unreadable"),
+    }
+}
+
+/// `resource.aws_iam.statement-wildcard` of a `data "aws_iam_policy_document"`
+/// block. `effect` defaults to Allow; a statement with no `resources` and no
+/// `not_resources` (a trust policy's) names no resource. A `dynamic`
+/// statement, or a document merged from others, leaves the answer open.
+fn policy_document_fact(body: &[Item], rel: &str, base: &str, vars: &VarTable) -> Fact {
+    let key_path = format!("{base}.statement");
+    let mut statements: Vec<Statement> = get_blocks(body, "statement")
+        .map(|s| Statement {
+            allow: match get_attr(&s.body, "effect") {
+                None => Some(true),
+                Some(v) => resolve_value(rel, &key_path, v, vars)
+                    .0
+                    .map(|e| e == "Allow"),
+            },
+            actions: match get_attr(&s.body, "actions") {
+                Some(Value::List(items)) => Part {
+                    known: items.clone(),
+                    unknown: false,
+                },
+                _ => Part::unread(),
+            },
+            resources: match (
+                get_attr(&s.body, "resources"),
+                get_attr(&s.body, "not_resources"),
+            ) {
+                (Some(Value::List(items)), _) => Part {
+                    known: items.clone(),
+                    unknown: false,
+                },
+                (None, None) => Part::default(),
+                _ => Part::unread(),
+            },
+        })
+        .collect();
+    let merged = [
+        "source_policy_documents",
+        "override_policy_documents",
+        "source_json",
+        "override_json",
+    ]
+    .iter()
+    .any(|a| get_attr(body, a).is_some());
+    if merged
+        || get_blocks(body, "dynamic").any(|d| d.labels.first().is_some_and(|l| l == "statement"))
+    {
+        statements.push(Statement::unread());
+    }
+    match widest_wildcard(&statements) {
+        Some(w) => (
+            Some(w.as_str().to_string()),
+            Resolution::AsAuthored,
+            vec![ProvenanceStep::new(rel, &key_path, "explicit")],
+        ),
+        None => unresolved(Vec::new(), rel, &key_path, "unreadable"),
     }
 }
 
@@ -1550,6 +2178,36 @@ fn retrieve_dir(
                 out.packets
                     .push(packet(rel, &unit, row.packet_key, value, resolution, prov));
             }
+
+            if let Some((key, (value, resolution, prov))) =
+                least_privilege_fact(ty, name, &b.body, rel, &vars)
+            {
+                out.packets
+                    .push(packet(rel, &unit, key, value, resolution, prov));
+            }
+        }
+    }
+
+    // The policy-document data source is where most IAM policies are
+    // written; its JSON is what an aws_iam_* `policy` then references.
+    for (rel, items) in &parsed_tf {
+        for b in get_blocks(items, "data") {
+            let (Some(ty), Some(name)) = (b.labels.first(), b.labels.get(1)) else {
+                continue;
+            };
+            if ty != "aws_iam_policy_document" {
+                continue;
+            }
+            let (value, resolution, prov) =
+                policy_document_fact(&b.body, rel, &format!("data.{ty}.{name}"), &vars);
+            out.packets.push(packet(
+                rel,
+                &format!("data:{ty}.{name}"),
+                "resource.aws_iam.statement-wildcard",
+                value,
+                resolution,
+                prov,
+            ));
         }
     }
 
@@ -2187,6 +2845,304 @@ module "local" {
                 "resource.google_container_node_pool.node_locations-count"
             ),
             (None, Resolution::Unresolvable, "empty".into())
+        );
+    }
+
+    // --- least privilege (RC-044) ---
+
+    /// The least-privilege fixture module, read as one directory.
+    fn least_privilege() -> Retrieved {
+        let got = one(&[
+            (
+                "keys.tf",
+                include_str!("../testdata/terraform/least_privilege/keys.tf"),
+            ),
+            (
+                "iam.tf",
+                include_str!("../testdata/terraform/least_privilege/iam.tf"),
+            ),
+            (
+                "policies.tf",
+                include_str!("../testdata/terraform/least_privilege/policies.tf"),
+            ),
+            (
+                "nodes.tf",
+                include_str!("../testdata/terraform/least_privilege/nodes.tf"),
+            ),
+            (
+                "variables.tf",
+                include_str!("../testdata/terraform/least_privilege/variables.tf"),
+            ),
+        ]);
+        assert_eq!(got.unparseable, 0, "the fixture module must parse");
+        got
+    }
+
+    #[test]
+    fn a_google_service_account_key_is_declared_unless_count_says_otherwise() {
+        let got = least_privilege();
+        let key = "resource.google_service_account_key.declared";
+        let at = |name: &str| {
+            fact(
+                &got,
+                &format!("resource:google_service_account_key.{name}"),
+                key,
+            )
+        };
+        assert_eq!(
+            at("ci"),
+            (some("true"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("none"),
+            (some("false"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("maybe"),
+            (None, Resolution::Unresolvable, "expression".into()),
+            "a conditional count may be zero"
+        );
+    }
+
+    #[test]
+    fn an_aws_access_key_is_declared_unless_for_each_says_otherwise() {
+        let got = least_privilege();
+        let key = "resource.aws_iam_access_key.declared";
+        let at = |name: &str| fact(&got, &format!("resource:aws_iam_access_key.{name}"), key);
+        assert_eq!(
+            at("deploy"),
+            (some("true"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("none"),
+            (some("false"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("per_user"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+    }
+
+    #[test]
+    fn a_gcp_role_grant_is_classed_or_unresolved() {
+        let got = least_privilege();
+        let key = "resource.google_iam.role-class";
+        let at = |unit: &str| fact(&got, &format!("resource:{unit}"), key);
+        assert_eq!(
+            at("google_project_iam_member.owner"),
+            (some("primitive"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("google_folder_iam_binding.editor"),
+            (some("primitive"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("google_organization_iam_member.viewer"),
+            (some("viewer"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("google_project_iam_member.custom"),
+            (some("custom"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("google_project_iam_binding.predefined"),
+            (some("predefined"), Resolution::AsAuthored, "default".into()),
+            "one variable hop to a literal default"
+        );
+        assert_eq!(
+            at("google_project_iam_member.from_each"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+        for (role, want) in [
+            ("roles/storage.admin", Some("predefined")),
+            ("organizations/1/roles/x", Some("custom")),
+            ("roles/", None),
+            ("owner", None),
+        ] {
+            assert_eq!(role_class(role), want, "{role}");
+        }
+    }
+
+    #[test]
+    fn an_aws_policy_wildcard_is_read_from_jsonencode_heredoc_and_documents() {
+        let got = least_privilege();
+        let key = "resource.aws_iam.statement-wildcard";
+        let at = |unit: &str| fact(&got, unit, key);
+        assert_eq!(
+            at("resource:aws_iam_policy.admin"),
+            (
+                some("action-and-resource"),
+                Resolution::AsAuthored,
+                "explicit".into()
+            )
+        );
+        assert_eq!(
+            at("resource:aws_iam_role_policy.s3_all"),
+            (some("action"), Resolution::AsAuthored, "explicit".into()),
+            "a whole-service action is `action` whatever the referenced resource is"
+        );
+        assert_eq!(
+            at("resource:aws_iam_user_policy.describe"),
+            (some("resource"), Resolution::AsAuthored, "explicit".into()),
+            "a heredoc is read, and a Deny statement grants nothing"
+        );
+        assert_eq!(
+            at("resource:aws_iam_group_policy.scoped"),
+            (some("none"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("resource:aws_iam_policy.from_file"),
+            (None, Resolution::Unresolvable, "expression".into())
+        );
+        assert_eq!(
+            at("resource:aws_iam_policy.from_doc"),
+            (None, Resolution::Unresolvable, "expression".into()),
+            "the referenced document carries its own packet"
+        );
+        assert_eq!(
+            at("resource:aws_iam_role_policy.templated"),
+            (None, Resolution::Unresolvable, "unreadable".into()),
+            "variable actions on every resource could be anything"
+        );
+        assert_eq!(
+            at("data:aws_iam_policy_document.wide"),
+            (
+                some("action-and-resource"),
+                Resolution::AsAuthored,
+                "explicit".into()
+            ),
+            "effect defaults to Allow"
+        );
+        assert_eq!(
+            at("data:aws_iam_policy_document.scoped"),
+            (some("none"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("data:aws_iam_policy_document.assume"),
+            (some("none"), Resolution::AsAuthored, "explicit".into()),
+            "a statement with no resources names none"
+        );
+        assert_eq!(
+            at("data:aws_iam_policy_document.dynamic"),
+            (None, Resolution::Unresolvable, "unreadable".into())
+        );
+    }
+
+    #[test]
+    fn a_policy_string_with_unknown_parts_decides_only_when_they_cannot_matter() {
+        let wild = |json: &str| {
+            json_doc(json)
+                .as_ref()
+                .and_then(json_statements)
+                .and_then(|s| widest_wildcard(&s))
+        };
+        let st = |body: &str| format!(r#"{{"Statement": [{body}]}}"#);
+        assert_eq!(
+            wild(&st(
+                r#"{"Effect": "Allow", "Action": "*", "Resource": "${var.arn}"}"#
+            )),
+            None,
+            "the template might be `*`"
+        );
+        assert_eq!(
+            wild(&st(
+                r#"{"Effect": "Allow", "Action": "*", "Resource": "*"}, {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}"#
+            )),
+            Some(Wildcard::ActionAndResource),
+            "an unread statement cannot outrank the widest class"
+        );
+        assert_eq!(
+            wild(&st(
+                r#"{"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}"#
+            )),
+            None,
+            "NotAction is never assumed narrow"
+        );
+        assert_eq!(
+            wild(r#"{"Statement": {"Effect": "Allow", "Action": "*:*", "Resource": "*"}}"#),
+            Some(Wildcard::ActionAndResource),
+            "Statement may be one object"
+        );
+        assert_eq!(wild("not json"), None);
+    }
+
+    #[test]
+    fn gke_node_identity_is_default_scoped_dedicated_or_unresolved() {
+        let got = least_privilege();
+        let key = "resource.google_container_node_pool.node-identity";
+        let at = |unit: &str| fact(&got, &format!("resource:{unit}"), key);
+        assert_eq!(
+            at("google_container_node_pool.bare"),
+            (
+                some("default-account"),
+                Resolution::PlatformDefault,
+                "platform-default".into()
+            ),
+            "no service_account is the Compute Engine default account"
+        );
+        assert_eq!(
+            at("google_container_node_pool.compute_default"),
+            (
+                some("default-account"),
+                Resolution::AsAuthored,
+                "explicit".into()
+            )
+        );
+        assert_eq!(
+            at("google_container_node_pool.broad_scope"),
+            (
+                some("cloud-platform-scope"),
+                Resolution::AsAuthored,
+                "explicit".into()
+            )
+        );
+        assert_eq!(
+            at("google_container_node_pool.dedicated"),
+            (some("dedicated"), Resolution::AsAuthored, "explicit".into())
+        );
+        assert_eq!(
+            at("google_container_node_pool.from_ref"),
+            (None, Resolution::Unresolvable, "expression".into()),
+            "a referenced account might be the default one"
+        );
+        assert_eq!(
+            at("google_container_cluster.inline"),
+            (
+                some("default-account"),
+                Resolution::PlatformDefault,
+                "platform-default".into()
+            )
+        );
+        assert!(
+            !got.packets
+                .iter()
+                .any(|p| p.key == key && p.unit == "resource:google_container_cluster.pools_only"),
+            "a cluster without an inline node_config describes no nodes"
+        );
+    }
+
+    #[test]
+    fn jsonencode_and_heredocs_do_not_derail_the_attributes_after_them() {
+        let got = one(&[(
+            "main.tf",
+            "resource \"aws_iam_policy\" \"p\" {\n  policy = jsonencode(merge(local.a, {\n    x = [1, 2]\n  }))\n  lifecycle {\n    prevent_destroy = true\n  }\n}\n\
+             resource \"aws_iam_policy\" \"q\" {\n  policy = <<EOF\n{\"Statement\": []}\nEOF\n  lifecycle {\n    prevent_destroy = true\n  }\n}\n",
+        )]);
+        assert_eq!(got.unparseable, 0);
+        for unit in ["resource:aws_iam_policy.p", "resource:aws_iam_policy.q"] {
+            assert_eq!(
+                find(&got, unit, "resource.lifecycle.prevent_destroy").resolved_value,
+                some("true"),
+                "{unit}"
+            );
+        }
+        assert_eq!(
+            fact(
+                &got,
+                "resource:aws_iam_policy.q",
+                "resource.aws_iam.statement-wildcard"
+            ),
+            (some("none"), Resolution::AsAuthored, "explicit".into())
         );
     }
 
