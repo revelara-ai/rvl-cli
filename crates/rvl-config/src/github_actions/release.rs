@@ -245,7 +245,7 @@ pub(super) fn judge(jobs: &Mapping, job_id: &str, job: &Mapping) -> Option<Relea
         match why {
             None => "S1: an SBOM step and a provenance step, every action pinned to a commit"
                 .to_string(),
-            Some(why) => format!("undecided: {why}"),
+            Some(why) => format!("{}{why}", crate::UNDECIDED_PREFIX),
         }
     };
     Some(Release {

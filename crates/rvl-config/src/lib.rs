@@ -52,6 +52,13 @@ pub mod terraform;
 /// `configured` spec pattern judges them.
 pub const ABSENT_RENDERING: &str = "absent";
 
+/// The prefix of a value the retriever read but will not let a spec judge:
+/// the rest of the value says why (a Kubernetes container with one probe of
+/// the two, a leader-elected controller at one replica). The verification
+/// lane abstains on such a packet whatever the spec expects, so neither a
+/// presence check nor a bound can turn the explanation into a verdict.
+pub const UNDECIDED_PREFIX: &str = "undecided: ";
+
 /// How the effective value of a config key was produced, ordered by
 /// decreasing evidentiary strength. This is the packet's confidence marker
 /// (wayfinder po-ae75b.1 item 4: Helm renders stamp `rendered`; unresolvable
