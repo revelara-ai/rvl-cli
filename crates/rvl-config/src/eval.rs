@@ -246,6 +246,16 @@ pub fn evaluate(
         expect = then;
     }
 
+    // The retriever withheld the judgment and said why. This comes before
+    // every expectation: `Present` would credit the explanation as a value.
+    if let Some(why) = p
+        .resolved_value
+        .as_deref()
+        .and_then(|v| v.strip_prefix(crate::UNDECIDED_PREFIX))
+    {
+        return abstain(format!("{} undecided: {why}", p.key));
+    }
+
     // An out-of-repo VALUE is unknowable here, so the value-bearing variants
     // abstain before the expectation is consulted and none of them can guess.
     //
@@ -503,6 +513,29 @@ mod tests {
             }],
             ..Default::default()
         })
+    }
+
+    // A value the retriever left undecided abstains under every expectation,
+    // the presence ones above all: `Present` and `configured` would otherwise
+    // credit the explanation as an authored value.
+    #[test]
+    fn an_undecided_value_abstains_whatever_the_spec_expects() {
+        let value = format!("{}leader election found", crate::UNDECIDED_PREFIX);
+        for expect in [
+            ConfigExpect::Present,
+            ConfigExpect::Absent,
+            ConfigExpect::AtLeast { value: 2.0 },
+            ConfigExpect::Pattern {
+                name: "configured".into(),
+            },
+        ] {
+            let c = cache("workload.replicas", expect.clone(), 0.9);
+            for resolution in [Resolution::AsAuthored, Resolution::PlatformDefault] {
+                let f = evaluate(&packet("workload.replicas", Some(&value), resolution), &c);
+                assert_eq!(f.verdict, Verdict::Abstain, "{expect:?}: {}", f.reason);
+                assert!(f.reason.contains("leader election found"), "{}", f.reason);
+            }
+        }
     }
 
     #[test]

@@ -25,13 +25,20 @@
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
 //!     IfNotPresent otherwise)
-//!   * neither `workload.replicas` nor the liveness/readiness probes are
-//!     emitted for a manifest under a test, fixture or docs directory (see
-//!     [`TEST_DIR_SEGMENTS`]), nor the two probes for a Job or CronJob
-//!     container: the specs abstain on what is not deployed or not serving
-//!   * likewise neither resource request (`container.resources.requests.*`)
-//!     is emitted for a test, fixture or docs manifest, nor for a Job or
-//!     CronJob container; the limits stay, for the specs that judge them
+//!   * neither `workload.replicas`, `workload.strategy.type`, the
+//!     liveness/readiness probes, `container.resources.requests.*`,
+//!     `container.resources.limits.memory` nor `container.security-context`
+//!     is emitted for a manifest under a test, fixture, docs, example, demo
+//!     or dev directory (see [`NON_PRODUCTION_DIR_SEGMENTS`]): the specs
+//!     abstain on what is not deployed
+//!   * neither the two probes nor the two requests are emitted for a Job or
+//!     CronJob container, which runs to completion and serves nothing;
+//!     its limits stay, for the specs that judge them
+//!   * a container with exactly one of the liveness and readiness probes
+//!     carries the other as [`crate::UNDECIDED_PREFIX`] and why, so the
+//!     specs abstain on it; so does `workload.replicas` for a one-replica
+//!     Deployment or StatefulSet whose containers take a leader-election
+//!     flag (see [`leader_election_arg`]): a singleton by design
 //!   * `pdb.min-available` / `pdb.max-unavailable` (authored only: the API
 //!     requires exactly one, so the pair's absence is invalid config, not a
 //!     decidable default)
@@ -203,6 +210,31 @@ impl Emitter<'_> {
         match lookup(doc, path).filter(|v| !empty(v)) {
             Some(v) => self.present(unit, key, path, v),
             None => self.absent(unit, key, path, platform_key, "none"),
+        }
+    }
+
+    /// A key the specs must not judge here: resolved like
+    /// [`Emitter::setting`], valued [`crate::UNDECIDED_PREFIX`] and `why`, so
+    /// the verification lane abstains with that reason.
+    fn undecided(
+        &mut self,
+        unit: &str,
+        key: &str,
+        doc: &Value,
+        path: &str,
+        platform_key: &str,
+        why: &str,
+    ) {
+        let value = format!("{}{why}", crate::UNDECIDED_PREFIX);
+        match lookup(doc, path) {
+            Some(_) => {
+                let (resolution, provenance) = self.oracle.present(path, path);
+                self.push(unit, key, value, resolution, provenance);
+            }
+            None => {
+                let provenance = self.oracle.absent(path, platform_key);
+                self.push(unit, key, value, Resolution::PlatformDefault, provenance);
+            }
         }
     }
 
@@ -722,14 +754,21 @@ pub(super) fn workload_shape(kind: &str) -> Option<(&'static str, &'static [&'st
     }
 }
 
-/// Directory segments that mark a manifest as test material: the retrievers'
-/// test-path convention (`tests/`, `e2e/`, `fixtures/`, `testdata/`, ...)
-/// plus the fake-data trees Kubernetes repos keep beside their tests and the
-/// `golden/` files a chart test compares `helm template` output against, and
-/// `docs/`, whose manifests illustrate a page rather than deploy. Exact
-/// segments, never substrings: `contest/` and `latest/` deploy. `examples/`
-/// is not listed: repos ship deployable manifests there.
-const TEST_DIR_SEGMENTS: &[&str] = &[
+/// Directory segments that mark a manifest as not deployed to production: the
+/// retrievers' test-path convention (`tests/`, `e2e/`, `fixtures/`,
+/// `testdata/`, ...) plus the fake-data trees Kubernetes repos keep beside
+/// their tests and the `golden/` files a chart test compares `helm template`
+/// output against; `docs/`, `book/` and the tutorial trees, whose manifests
+/// illustrate a page; and the example, sample, demo, quickstart, `hack/` and
+/// dev-environment trees. Those last were once left out on the view that
+/// repos ship deployable manifests under `examples/`, but a blind check of
+/// the flags against the rule frames found them test or fixture material
+/// (frame cell C1) or dev-only and experimental config (C2), both not
+/// applicable, for nearly every flag under these directories (Higress
+/// `samples/`, Chaos Mesh `examples/`, git-sync `demo/`, MetalLB `dev-env/`,
+/// a `k8s/dev/` kustomization). Exact segments, never substrings: `contest/`,
+/// `latest/` and `devops/` deploy.
+const NON_PRODUCTION_DIR_SEGMENTS: &[&str] = &[
     "test",
     "tests",
     "__tests__",
@@ -742,13 +781,50 @@ const TEST_DIR_SEGMENTS: &[&str] = &[
     "fakedata",
     "golden",
     "docs",
+    "book",
+    "tutorial",
+    "tutorials",
+    "examples",
+    "example",
+    "samples",
+    "sample",
+    "demo",
+    "demos",
+    "quickstart",
+    "hack",
+    "dev",
+    "dev-env",
 ];
 
-/// Whether a repo-relative path lies under a test, fixture or docs directory.
-fn test_material(rel_path: &str) -> bool {
+/// Whether a repo-relative path lies under a directory whose manifests are
+/// not deployed to production (see [`NON_PRODUCTION_DIR_SEGMENTS`]).
+fn non_production(rel_path: &str) -> bool {
     let mut dirs = rel_path.split('/');
     dirs.next_back();
-    dirs.any(|seg| TEST_DIR_SEGMENTS.contains(&seg))
+    dirs.any(|seg| NON_PRODUCTION_DIR_SEGMENTS.contains(&seg))
+}
+
+/// The first `args` or `command` entry of a pod's containers that turns on
+/// leader election (`--leader-elect`, `--leader-elect=true`,
+/// `--enable-leader-election`), if any. A controller that elects a leader
+/// runs one active copy by design (frame cell C5), so one replica is not the
+/// single point of failure the replica floor looks for. An entry that sets
+/// the flag to `false` turns election off and does not count; nothing is
+/// guessed from names.
+fn leader_election_arg<'a>(doc: &'a Value, pod_prefix: &str) -> Option<&'a str> {
+    let containers = lookup(doc, &format!("{pod_prefix}.containers"))?.as_sequence()?;
+    containers
+        .iter()
+        .filter_map(Value::as_mapping)
+        .flat_map(|c| ["args", "command"].into_iter().filter_map(|f| get(c, f)))
+        .filter_map(Value::as_sequence)
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|arg| {
+            let arg = arg.to_ascii_lowercase();
+            (arg.contains("leader-elect") || arg.contains("leader-election"))
+                && !arg.trim_end().ends_with("=false")
+        })
 }
 
 /// Extract packets from one parsed document into the emitter. Documents of
@@ -805,24 +881,45 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
     };
     let unit = format!("{kind_lower}:{name}");
     // The replica floor (RC-017) and the probe rules (RC-020) are judged of
-    // deployed, long-running workloads only. A test fixture is not deployed,
-    // and a Job or CronJob runs to completion with no traffic for a probe to
-    // gate; neither emits those keys, so the spec abstains rather than
-    // flagging (or crediting) them. The capacity rule (RC-024) asks for
-    // resource requests on the same deployed, long-running workloads, so the
-    // two request keys follow the same gates.
-    let fixture = test_material(em.file_anchor);
+    // deployed, long-running workloads only. A test, example or dev manifest
+    // is not deployed, and a Job or CronJob runs to completion with no
+    // traffic for a probe to gate; neither emits those keys, so the spec
+    // abstains rather than flagging (or crediting) them. The capacity rule
+    // (RC-024) asks for resource requests on the same deployed, long-running
+    // workloads, so the two request keys follow the same gates. The rollout
+    // strategy, the memory limit and the container security context are
+    // production controls too: a manifest that is not deployed cannot
+    // violate them, so they take the path gate (a Job still runs, so its
+    // limit and context stay).
+    let not_deployed = non_production(em.file_anchor);
     let run_to_completion = matches!(kind, "Job" | "CronJob");
 
-    if matches!(kind, "Deployment" | "StatefulSet") && !fixture {
-        em.setting(
-            &unit,
-            "workload.replicas",
-            doc,
-            "spec.replicas",
-            "replicas",
-            "1",
-        );
+    let mut prefix = String::from("spec");
+    for seg in pod_path {
+        prefix.push('.');
+        prefix.push_str(seg);
+    }
+
+    if matches!(kind, "Deployment" | "StatefulSet") && !not_deployed {
+        let one = lookup(doc, "spec.replicas").is_none_or(|v| render_value(v) == "1");
+        match leader_election_arg(doc, &prefix).filter(|_| one) {
+            Some(arg) => em.undecided(
+                &unit,
+                "workload.replicas",
+                doc,
+                "spec.replicas",
+                "replicas",
+                &format!("leader election found ({arg}): one replica is a singleton by design"),
+            ),
+            None => em.setting(
+                &unit,
+                "workload.replicas",
+                doc,
+                "spec.replicas",
+                "replicas",
+                "1",
+            ),
+        }
     }
 
     if replicated(kind) {
@@ -856,7 +953,7 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
         }
     }
 
-    if kind == "Deployment" {
+    if kind == "Deployment" && !not_deployed {
         let stype = dig(doc, &["spec", "strategy", "type"]).and_then(Value::as_str);
         em.setting(
             &unit,
@@ -890,11 +987,6 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
 
     // Pod-level and container-level facts hang off the pod template; a
     // workload without one is invalid config and emits nothing further.
-    let mut prefix = String::from("spec");
-    for seg in pod_path {
-        prefix.push('.');
-        prefix.push_str(seg);
-    }
     let Some(pod) = lookup(doc, &prefix) else {
         return;
     };
@@ -991,9 +1083,14 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             ("container.resources.limits.cpu", "limits", "cpu"),
             ("container.resources.limits.memory", "limits", "memory"),
         ] {
-            // The limits are read everywhere: the memory limit is another
-            // control's key, judged of every container.
-            if section == "requests" && (fixture || run_to_completion) {
+            // The limits are read of every deployed container, a Job's too:
+            // the memory limit is another control's key.
+            let withheld = match key {
+                "container.resources.limits.memory" => not_deployed,
+                _ if section == "requests" => not_deployed || run_to_completion,
+                _ => false,
+            };
+            if withheld {
                 continue;
             }
             em.setting(
@@ -1012,10 +1109,34 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             ("readinessProbe", "container.readiness-probe", true),
             ("startupProbe", "container.startup-probe", false),
         ] {
-            if serving && (fixture || run_to_completion) {
+            if serving && (not_deployed || run_to_completion) {
                 continue;
             }
-            em.setting(&cunit, key, doc, &format!("{cpath}.{field}"), field, "none");
+            let path = format!("{cpath}.{field}");
+            // RC-020 flags a serving container with neither probe. One
+            // probe of the two is a judgment call the frame mostly settles
+            // the other way (a tcpSocket liveness probe on a daemon that
+            // serves no HTTP, readiness gated by a sibling container), so
+            // the missing one is carried undecided, naming the present one.
+            let other = match field {
+                "livenessProbe" => Some("readinessProbe"),
+                "readinessProbe" => Some("livenessProbe"),
+                _ => None,
+            };
+            match other.filter(|o| get(cm, field).is_none() && get(cm, o).is_some()) {
+                Some(present) => em.undecided(
+                    &cunit,
+                    key,
+                    doc,
+                    &path,
+                    field,
+                    &format!(
+                        "the container has a {present} and no {field}; \
+                         one probe of the two is not judged a missing probe"
+                    ),
+                ),
+                None => em.setting(&cunit, key, doc, &path, field, "none"),
+            }
         }
 
         // The path the kubelet requests, for the join to the handler that
@@ -1026,14 +1147,16 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             em.present(&cunit, LIVENESS_HTTP_GET_PATH_KEY, &live_path, v);
         }
 
-        em.setting(
-            &cunit,
-            "container.security-context",
-            doc,
-            &format!("{cpath}.securityContext"),
-            "securityContext",
-            "none",
-        );
+        if !not_deployed {
+            em.setting(
+                &cunit,
+                "container.security-context",
+                doc,
+                &format!("{cpath}.securityContext"),
+                "securityContext",
+                "none",
+            );
+        }
 
         // The security context above is judged for presence. This is the
         // value half: a context that is present and still asks for UID 0.
@@ -1297,7 +1420,7 @@ spec:
     }
 
     #[test]
-    fn a_docs_manifest_abstains_on_replicas_but_an_examples_one_does_not() {
+    fn a_docs_manifest_abstains_on_replicas_and_so_does_an_examples_one() {
         // A documentation page's example Deployment: one replica, no probes.
         let docs_deploy = "\
 apiVersion: apps/v1
@@ -1337,15 +1460,18 @@ spec:
             assert!(!has_key(&got, key), "{key} was emitted");
         }
         assert!(has_key(&got, "container.resources.limits.cpu"));
-        // examples/ trees ship deployable manifests: the floor still applies.
+        // An examples/ tree illustrates the project as much as a docs page.
         let path = "examples/kubernetes/manifests/pyrra-apiDeployment.yaml";
         let got = retrieve_plain(None, path, docs_deploy, "snap");
+        assert!(!has_key(&got, "workload.replicas"));
+        // The same document deployed is still judged.
+        let got = retrieve_plain(None, "deploy/traefik.yaml", docs_deploy, "snap");
         let replicas = find(&got, "deployment:traefik", "workload.replicas");
         assert_eq!(replicas.resolved_value.as_deref(), Some("1"));
     }
 
     #[test]
-    fn helm_golden_output_abstains_on_probes_but_examples_do_not() {
+    fn helm_golden_and_examples_output_abstain_on_probes() {
         // A chart's golden/ files are the expected `helm template` output of
         // its tests, not a deployed manifest: no probe packet, even for a
         // container that has a readiness probe and lacks a liveness probe.
@@ -1361,13 +1487,17 @@ spec:
         );
         assert!(!has_key(&got, "container.liveness-probe"));
         assert!(!has_key(&got, "container.readiness-probe"));
-        // An examples/ manifest is what users deploy: it is still judged.
+        // An examples/ manifest is not deployed either.
         let got = retrieve_plain(
             None,
             "examples/kubernetes/manifests/pyrra-kubernetesDeployment.yaml",
             BARE_DEPLOY,
             "snap",
         );
+        assert!(!has_key(&got, "container.liveness-probe"));
+        assert!(!has_key(&got, "container.readiness-probe"));
+        // Deployed, the container without probes is judged.
+        let got = retrieve_plain(None, "deploy/pyrra.yaml", BARE_DEPLOY, "snap");
         find(
             &got,
             "container:deployment/web/app",
@@ -1500,15 +1630,21 @@ spec:
                 &["container:deployment/whoami/whoami"][..],
             ),
             (
-                "example/v1beta2/acl-pvc/init-acl-job.yaml",
+                "config/v1beta2/acl-pvc/init-acl-job.yaml",
                 JOB,
                 &["container:job/redis-acl-init/acl-writer"][..],
             ),
         ] {
             let got = retrieve_plain(None, path, yaml, "snap");
             for cunit in cunits {
-                // The container is read; only its requests abstain.
-                find(&got, cunit, "container.resources.limits.memory");
+                // The container is read; its requests abstain, and its
+                // memory limit too unless it is a deployed Job's.
+                find(&got, cunit, "container.resources.limits.cpu");
+                let memory = got
+                    .packets
+                    .iter()
+                    .any(|p| p.unit == *cunit && p.key == "container.resources.limits.memory");
+                assert_eq!(memory, path.starts_with("config/"), "{path}: {cunit}");
                 for key in [
                     "container.resources.requests.cpu",
                     "container.resources.requests.memory",
@@ -1523,14 +1659,17 @@ spec:
     }
 
     #[test]
-    fn an_examples_deployment_without_requests_still_carries_them() {
-        // examples/ is deployable reference config, not test material.
-        let got = retrieve_plain(
-            None,
-            "examples/kubernetes/manifests/pyrra-apiDeployment.yaml",
-            &BARE_DEPLOY.replace("name: app", "name: pyrra"),
-            "snap",
-        );
+    fn an_examples_deployment_without_requests_abstains_on_them() {
+        let yaml = BARE_DEPLOY.replace("name: app", "name: pyrra");
+        let path = "examples/kubernetes/manifests/pyrra-apiDeployment.yaml";
+        let got = retrieve_plain(None, path, &yaml, "snap");
+        for key in [
+            "container.resources.requests.cpu",
+            "container.resources.requests.memory",
+        ] {
+            assert!(!has_key(&got, key), "{key} was emitted");
+        }
+        let got = retrieve_plain(None, "deploy/pyrra.yaml", &yaml, "snap");
         for key in [
             "container.resources.requests.cpu",
             "container.resources.requests.memory",
@@ -1538,6 +1677,167 @@ spec:
             let p = find(&got, "container:deployment/web/pyrra", key);
             assert_eq!(p.resolved_value.as_deref(), Some("none"), "{key}");
         }
+    }
+
+    /// The keys the non-production path gate withholds.
+    const PATH_GATED: &[&str] = &[
+        "workload.replicas",
+        "workload.strategy.type",
+        "container.liveness-probe",
+        "container.readiness-probe",
+        "container.resources.requests.cpu",
+        "container.resources.requests.memory",
+        "container.resources.limits.memory",
+        "container.security-context",
+    ];
+
+    #[test]
+    fn example_demo_and_dev_manifests_abstain_on_production_controls() {
+        for dir in [
+            "examples",
+            "example",
+            "samples",
+            "sample",
+            "demo",
+            "demos",
+            "dev",
+            "dev-env",
+            "quickstart",
+            "hack",
+            "book",
+            "tutorial",
+            "tutorials",
+        ] {
+            let path = format!("{dir}/web/deploy.yaml");
+            let got = retrieve_plain(None, &path, BARE_DEPLOY, "snap");
+            for key in PATH_GATED {
+                assert!(!has_key(&got, key), "{path}: {key} was emitted");
+            }
+            // The rest of the manifest is still read.
+            assert!(has_key(&got, "container.image.pin"), "{path}");
+        }
+        // Exact segments, never substrings: these deploy and are judged.
+        for path in [
+            "deploy/web.yaml",
+            "latest/web.yaml",
+            "contest/web.yaml",
+            "devops/web.yaml",
+            "deploy/examples.yaml",
+        ] {
+            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
+            for key in PATH_GATED {
+                assert!(has_key(&got, key), "{path}: {key} was not emitted");
+            }
+            let replicas = find(&got, "deployment:web", "workload.replicas");
+            assert_eq!(replicas.resolved_value.as_deref(), Some("1"), "{path}");
+        }
+    }
+
+    fn with_probes(probes: &str) -> Retrieved {
+        let yaml = BARE_DEPLOY.replace(
+            "          image: web:v1\n",
+            &format!("          image: web:v1\n{probes}"),
+        );
+        retrieve_plain(None, "deploy/web.yaml", &yaml, "snap")
+    }
+
+    const LIVENESS: &str =
+        "          livenessProbe:\n            tcpSocket:\n              port: 6379\n";
+    const READINESS: &str =
+        "          readinessProbe:\n            httpGet:\n              path: /readyz\n              port: 8080\n";
+
+    #[test]
+    fn one_probe_of_two_leaves_the_missing_one_undecided() {
+        const UNIT: &str = "container:deployment/web/app";
+        for (probes, missing, present) in [
+            (LIVENESS, "container.readiness-probe", "livenessProbe"),
+            (READINESS, "container.liveness-probe", "readinessProbe"),
+        ] {
+            let got = with_probes(probes);
+            let p = find(&got, UNIT, missing);
+            let value = p.resolved_value.as_deref().unwrap();
+            let why = value
+                .strip_prefix(crate::UNDECIDED_PREFIX)
+                .unwrap_or_else(|| panic!("{missing} not undecided: {value}"));
+            assert!(why.contains(present), "{why}");
+            assert_eq!(p.resolution, Resolution::PlatformDefault);
+            assert_eq!(p.provenance[0].role, "absent");
+            // The present probe is carried as authored.
+            let other = if missing.contains("readiness") {
+                "container.liveness-probe"
+            } else {
+                "container.readiness-probe"
+            };
+            assert_eq!(find(&got, UNIT, other).resolution, Resolution::AsAuthored);
+        }
+        // Neither probe: both still decidably absent.
+        let got = with_probes("");
+        for key in ["container.liveness-probe", "container.readiness-probe"] {
+            let p = find(&got, UNIT, key);
+            assert_eq!(p.resolved_value.as_deref(), Some("none"), "{key}");
+            assert_eq!(p.resolution, Resolution::PlatformDefault);
+        }
+        // Both probes: both as authored.
+        let got = with_probes(&format!("{LIVENESS}{READINESS}"));
+        for key in ["container.liveness-probe", "container.readiness-probe"] {
+            let p = find(&got, UNIT, key);
+            assert_eq!(p.resolution, Resolution::AsAuthored, "{key}");
+            assert!(!p
+                .resolved_value
+                .as_deref()
+                .unwrap()
+                .starts_with("undecided"));
+        }
+    }
+
+    fn controller(replicas: &str, args: &str) -> Retrieved {
+        let yaml = BARE_DEPLOY
+            .replace(
+                "spec:\n  template:",
+                &format!("spec:\n{replicas}  template:"),
+            )
+            .replace(
+                "          image: web:v1\n",
+                &format!("          image: web:v1\n{args}"),
+            );
+        retrieve_plain(None, "config/manager/manager.yaml", &yaml, "snap")
+    }
+
+    #[test]
+    fn a_one_replica_leader_elected_controller_leaves_replicas_undecided() {
+        for (replicas, args) in [
+            ("", "          args:\n            - --leader-elect\n"),
+            (
+                "  replicas: 1\n",
+                "          args: [--health-probe-bind-address=:8081, --leader-elect=true]\n",
+            ),
+            (
+                "  replicas: 1\n",
+                "          command: [/manager, --enable-leader-election]\n",
+            ),
+        ] {
+            let got = controller(replicas, args);
+            let p = find(&got, "deployment:web", "workload.replicas");
+            let value = p.resolved_value.as_deref().unwrap();
+            let why = value
+                .strip_prefix(crate::UNDECIDED_PREFIX)
+                .unwrap_or_else(|| panic!("{args}: not undecided: {value}"));
+            assert!(why.contains("leader election found"), "{why}");
+        }
+        // Without the flag, or with it turned off, one replica is judged.
+        for args in ["", "          args: [--leader-elect=false]\n"] {
+            let got = controller("  replicas: 1\n", args);
+            let p = find(&got, "deployment:web", "workload.replicas");
+            assert_eq!(p.resolved_value.as_deref(), Some("1"), "{args}");
+        }
+        // Two replicas with the flag: unchanged, as authored.
+        let got = controller(
+            "  replicas: 2\n",
+            "          args:\n            - --leader-elect\n",
+        );
+        let p = find(&got, "deployment:web", "workload.replicas");
+        assert_eq!(p.resolved_value.as_deref(), Some("2"));
+        assert_eq!(p.resolution, Resolution::AsAuthored);
     }
 
     #[test]
@@ -1584,13 +1884,13 @@ spec:
             "structured probes render compactly: {:?}",
             live.resolved_value
         );
-        let ready = find(
+        let startup = find(
             &got,
             "container:deployment/web/app",
-            "container.readiness-probe",
+            "container.startup-probe",
         );
-        assert_eq!(ready.resolved_value.as_deref(), Some("none"));
-        assert_eq!(ready.resolution, Resolution::PlatformDefault);
+        assert_eq!(startup.resolved_value.as_deref(), Some("none"));
+        assert_eq!(startup.resolution, Resolution::PlatformDefault);
     }
 
     #[test]
