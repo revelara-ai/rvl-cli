@@ -6,8 +6,9 @@
 //! server entry point, an error-tracker SDK reference, a tracker init, a
 //! log-shipping config, an alert-rule file. JUDGEMENT ([`evaluate`]) decides
 //! the two cases a tree proves and abstains on the rest. It violates only
-//! when a server runs and the tree holds no tracker SDK and no log shipping
-//! at all: a tracker wired in elsewhere is a claim no file here can refute,
+//! when the repository reads as a service ([`crate::repo_kind`]: a server
+//! entry point and a deployment manifest), a server runs, and the tree holds
+//! no tracker SDK and no log shipping at all: a tracker wired in elsewhere is a claim no file here can refute,
 //! so every presence the search can see counts against a violation. It
 //! satisfies only when a tracker is initialised in service code and an alert
 //! rule file is committed.
@@ -369,8 +370,15 @@ const SEARCHED: &str = "no error-tracker SDK (sentry, bugsnag, rollbar, honeybad
 /// RC-027 from the facts. Satisfies (partially: alert rules on new or
 /// spiking error patterns are not read) on a tracker init and an alert rule
 /// file; violates on a server with no tracker and no log shipping in a
-/// completely walked tree; abstains otherwise.
+/// completely walked tree of a repository read as a service; abstains
+/// otherwise.
 pub(crate) fn evaluate(facts: &RepoStructure) -> StructureFinding {
+    crate::only_in_a_service(from_the_tree(facts), &facts.repo_kind)
+}
+
+/// RC-027 from the tree's error-reporting facts alone, before the
+/// repository's kind is read.
+fn from_the_tree(facts: &RepoStructure) -> StructureFinding {
     let e = &facts.error_reporting;
     let mk = |verdict, reason: String, evidence: Vec<String>| StructureFinding {
         control: CONTROL,
@@ -446,15 +454,21 @@ pub(crate) fn evaluate(facts: &RepoStructure) -> StructureFinding {
 mod tests {
     use super::*;
 
-    /// RC-027 on a tree of `(path, text)` files.
-    fn judge(files: &[(&str, &str)]) -> StructureFinding {
+    /// The inventory of a tree of `(path, text)` files.
+    fn facts(files: &[(&str, &str)]) -> RepoStructure {
         let dir = tempfile::tempdir().unwrap();
         for (rp, text) in files {
             let path = dir.path().join(rp);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        evaluate(&crate::inventory(dir.path()))
+        crate::inventory(dir.path())
+    }
+
+    /// RC-027 on a tree, read from its error-reporting facts alone: what the
+    /// tree says before the repository's kind gates a violation.
+    fn judge(files: &[(&str, &str)]) -> StructureFinding {
+        from_the_tree(&facts(files))
     }
 
     fn assert_verdict(want: Verdict, files: &[(&str, &str)]) {
@@ -463,6 +477,56 @@ mod tests {
     }
 
     const GO_MOD: (&str, &str) = ("go.mod", "module example.com/svc\n\ngo 1.22\n");
+
+    const SERVER: (&str, &str) = (
+        "main.go",
+        "package main\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n",
+    );
+    const DOCKERFILE: (&str, &str) = ("Dockerfile", "FROM scratch\nEXPOSE 8080\n");
+
+    /// A violation stands only in a repository read as a service: a server
+    /// entry point and a deployment manifest.
+    #[test]
+    fn only_a_deployed_service_violates() {
+        let f = evaluate(&facts(&[GO_MOD, SERVER, DOCKERFILE]));
+        assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+        assert_eq!(f.evidence, ["main.go"]);
+
+        // A server and no deployment manifest: not read as a service.
+        let f = evaluate(&facts(&[GO_MOD, SERVER]));
+        assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+        assert!(
+            f.reason.starts_with("no deployment manifest found"),
+            "{f:?}"
+        );
+        assert!(f.reason.contains("main.go"), "{f:?}");
+
+        // A CLI main only.
+        let cli = ("main.go", "package main\n\nfunc main() { flag.Parse() }\n");
+        let f = evaluate(&facts(&[GO_MOD, cli, DOCKERFILE]));
+        assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+
+        // A tool by its own account, deployed or not.
+        let readme = ("README.md", "A vulnerability scanner for Go modules.\n");
+        let f = evaluate(&facts(&[GO_MOD, SERVER, DOCKERFILE, readme]));
+        assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+        assert!(
+            f.reason
+                .starts_with("the repository reads as a tool (README says"),
+            "{f:?}"
+        );
+
+        // A satisfied repository stays satisfied whatever its kind.
+        let f = evaluate(&facts(&[
+            GO_MOD,
+            (
+                "main.go",
+                "package main\n\nimport \"github.com/getsentry/sentry-go\"\n\nfunc main() { sentry.Init(o) }\n",
+            ),
+            ("deploy/rules.yaml", "groups:\n  - rules:\n      - alert: Errors\n"),
+        ]));
+        assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    }
 
     #[test]
     fn an_sdk_name_matches_as_a_whole_word() {
