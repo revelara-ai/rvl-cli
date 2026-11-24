@@ -69,6 +69,46 @@ fn rc033_go_repo_with_tests_satisfies_with_ratio() {
     );
 }
 
+/// A secondary language without tests beside a tested main language is noted,
+/// not flagged; the largest language, or every language, without tests is.
+#[test]
+fn rc033_flags_the_largest_language_or_a_repository_with_no_tests() {
+    let js = |root: &Path, n: usize| {
+        for i in 0..n {
+            write(root, &format!("web/m{i}.js"), "export const x = 1;\n");
+        }
+    };
+    let go_test = "package svc\nimport \"testing\"\nfunc TestF(t *testing.T) {}\n";
+    // Go with tests (6 sources), 5 js files without.
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    write(dir.path(), "internal/svc/f0_test.go", go_test);
+    js(dir.path(), 5);
+    let f = finding(&eval_dir(dir.path()), "RC-033").clone();
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    assert!(
+        f.reason
+            .ends_with("no test files in a secondary language: js (5 source files)"),
+        "{f:?}"
+    );
+    // js the largest language, without tests.
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    write(dir.path(), "internal/svc/f0_test.go", go_test);
+    js(dir.path(), 8);
+    let f = finding(&eval_dir(dir.path()), "RC-033").clone();
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert_eq!(f.reason, "no test files: js (8 source files)");
+    // Two languages, neither with tests.
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    js(dir.path(), 5);
+    let f = finding(&eval_dir(dir.path()), "RC-033").clone();
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert!(f.reason.contains("go (6 source files)"), "{f:?}");
+    assert!(f.reason.contains("js (5 source files)"), "{f:?}");
+}
+
 #[test]
 fn rc033_too_few_sources_abstains_rather_than_accusing() {
     let dir = tempfile::tempdir().unwrap();
@@ -1161,6 +1201,7 @@ fn rc027_a_tracker_or_log_shipping_without_alert_rules_abstains() {
 fn rc027_truncated_walk_never_violates() {
     let mut facts = RepoStructure::default();
     facts.error_reporting.listeners = vec!["main.go".into()];
+    facts.repo_kind.kind = rvl_structure::RepoKind::Service;
     let f = finding(&evaluate(&facts, TODAY), "RC-027").clone();
     assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
     facts.walk_complete = true;
@@ -1172,10 +1213,14 @@ fn rc027_truncated_walk_never_violates() {
 
 const SERVER_MAIN: &str = "package main\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n";
 
+/// A deployment manifest: with a server entry point, a service.
+const DOCKERFILE: &str = "FROM scratch\nEXPOSE 8080\nCMD [\"/api\"]\n";
+
 /// A Go service with the given workflows, judged for RC-040.
 fn rc040(workflows: &[(&str, &str)]) -> StructureFinding {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "cmd/api/main.go", SERVER_MAIN);
+    write(dir.path(), "Dockerfile", DOCKERFILE);
     for (path, text) in workflows {
         write(dir.path(), path, text);
     }
@@ -1384,6 +1429,127 @@ fn rc040_reads_a_scanner_run_by_its_install_path() {
         ),
     )]);
     assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+}
+
+/// golangci-lint runs gosec when its config enables it: a SAST step.
+#[test]
+fn rc040_golangci_lint_with_gosec_enabled_is_a_sast_step() {
+    let action =
+        "      - uses: golangci/golangci-lint-action@v8\n        with:\n          version: v2.1\n";
+    let run = "      - run: golangci-lint run ./...\n";
+    for config in [
+        (
+            ".golangci.yml",
+            "linters:\n  enable:\n    - govet\n    - gosec\n",
+        ),
+        (
+            ".golangci.yaml",
+            "version: \"2\"\nlinters:\n  default: all\n  disable: [wsl]\n",
+        ),
+        (".golangci.yml", "linters:\n  enable-all: true\n"),
+        (".golangci.json", r#"{"linters": {"enable": ["gosec"]}}"#),
+    ] {
+        for steps in [action, run] {
+            let f = rc040(&[
+                config,
+                (".github/workflows/lint.yml", &wf("[pull_request]", steps)),
+            ]);
+            assert_eq!(f.verdict, Verdict::Satisfies, "{config:?} {steps}: {f:?}");
+            assert!(
+                f.reason
+                    .contains("golangci-lint (gosec) (.github/workflows/lint.yml)"),
+                "{f:?}"
+            );
+        }
+    }
+    let lint = (".github/workflows/lint.yml", wf("[pull_request]", action));
+    // gosec not enabled, or disabled from all: golangci-lint is no SAST step.
+    for config in [
+        "linters:\n  enable:\n    - govet\n",
+        "linters:\n  enable-all: true\n  disable:\n    - gosec\n",
+    ] {
+        let f = rc040(&[(".golangci.yml", config), (lint.0, &lint.1)]);
+        assert_eq!(f.verdict, Verdict::Violates, "{config}: {f:?}");
+    }
+    let f = rc040(&[(lint.0, &lint.1)]);
+    assert_eq!(f.verdict, Verdict::Violates, "no config: {f:?}");
+    // A config whose run lets issues pass, or a flag that does.
+    let f = rc040(&[
+        (
+            ".golangci.yml",
+            "run:\n  issues-exit-code: 0\nlinters:\n  enable: [gosec]\n",
+        ),
+        (lint.0, &lint.1),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert!(f.reason.contains("continues on error"), "{f:?}");
+    let f = rc040(&[
+        (".golangci.yml", "linters:\n  enable: [gosec]\n"),
+        (
+            ".github/workflows/lint.yml",
+            &wf(
+                "[pull_request]",
+                "      - run: golangci-lint run --issues-exit-code=0\n",
+            ),
+        ),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    // A GitLab merge request job.
+    let f = rc040(&[
+        (".golangci.yml", "linters:\n  enable: [gosec]\n"),
+        (
+            ".gitlab-ci.yml",
+            "lint:\n  script: golangci-lint run\n  only: [merge_requests]\n",
+        ),
+    ]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+}
+
+/// RC-040 violates only in a repository read as a service.
+#[test]
+fn rc040_violates_only_in_a_deployed_service() {
+    let ci = (".github/workflows/ci.yml", WF_BUILD_ONLY);
+    // A server entry point and a Dockerfile that exposes a port: a service.
+    let f = rc040(&[ci]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    // A server entry point and no deployment manifest.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "cmd/api/main.go", SERVER_MAIN);
+    write(dir.path(), ci.0, ci.1);
+    let f = finding(&eval_dir(dir.path()), "RC-040").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    assert!(
+        f.reason.starts_with("no deployment manifest found"),
+        "{f:?}"
+    );
+    assert!(f.reason.contains("none runs a SAST step"), "{f:?}");
+    // A CLI main only.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "main.go",
+        "package main\n\nfunc main() { flag.Parse() }\n",
+    );
+    write(dir.path(), "Dockerfile", DOCKERFILE);
+    write(dir.path(), ci.0, ci.1);
+    let f = finding(&eval_dir(dir.path()), "RC-040").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    // A tool by its own account, with a server and a Dockerfile.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "cmd/api/main.go", SERVER_MAIN);
+    write(dir.path(), "Dockerfile", DOCKERFILE);
+    write(
+        dir.path(),
+        "README.md",
+        "An HTTP load generator and diagnostic tool.\n",
+    );
+    write(dir.path(), ci.0, ci.1);
+    let f = finding(&eval_dir(dir.path()), "RC-040").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{f:?}");
+    assert!(
+        f.reason.starts_with("the repository reads as a tool"),
+        "{f:?}"
+    );
 }
 
 #[test]

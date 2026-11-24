@@ -162,6 +162,9 @@ struct Acc {
     /// The workflow files that parsed, by repo-relative path, for RC-040's
     /// walk across reusable-workflow calls.
     workflows: Vec<(String, Value)>,
+    /// How a gosec finding fails golangci-lint, when its config enables
+    /// gosec (RC-040).
+    golangci: Option<sast::OnFailure>,
     sast: SastFacts,
     servers: Vec<String>,
     walk_complete: bool,
@@ -174,10 +177,12 @@ impl Acc {
 }
 
 /// Inventory the repository at `root`. Bounded single walk that skips
-/// vendored/build directories.
+/// vendored/build directories, then [`repo_kind::repo_kind`]'s own walk for
+/// the repository's kind.
 pub fn inventory(root: &Path) -> RepoStructure {
     let mut acc = Acc {
         walk_complete: true,
+        golangci: sast::golangci_gosec(root),
         ..Default::default()
     };
     let mut stack = vec![root.to_path_buf()];
@@ -212,7 +217,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
     }
 
     acc.workflows.sort_by(|a, b| a.0.cmp(&b.0));
-    sast::github(&acc.workflows, &mut acc.sast);
+    sast::github(&acc.workflows, acc.golangci, &mut acc.sast);
     acc.sast.other_ci.sort();
     acc.servers.sort();
     resolve_lockfiles(root, &mut acc.manifests);
@@ -256,6 +261,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
         error_reporting: acc.error_reporting.finish(),
         server_entry_points: acc.servers,
         sast: acc.sast,
+        repo_kind: repo_kind::repo_kind(root),
         walk_complete: acc.walk_complete,
     }
 }
@@ -468,7 +474,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
     // --- RC-040 reads the root GitLab CI file as well ---
     if rp == ".gitlab-ci.yml" {
-        sast::gitlab(&rp, &read_capped(path), &mut acc.sast);
+        sast::gitlab(&rp, &read_capped(path), acc.golangci, &mut acc.sast);
     }
     if sast::OTHER_CI.contains(&rp.as_str()) {
         acc.sast.other_ci.push(rp.clone());
