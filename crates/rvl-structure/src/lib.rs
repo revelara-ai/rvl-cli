@@ -17,6 +17,10 @@
 //! [`sast`] reads the SAST steps of the repository's CI, each with whether it
 //! runs on the pull-request path and fails its job, for RC-040.
 //!
+//! [`deploy`] reads where the repository deploys: a CI job or step that
+//! deploys to an environment, or a GitOps manifest that deploys this
+//! repository. RC-058 violates only in a repository with one.
+//!
 //! [`repo_kind`] reads, from the same tree, whether the repository is a
 //! service, a tool or a library, for the rules that block only in a service:
 //! RC-027 and RC-040 violate only in a repository read as a service.
@@ -29,12 +33,15 @@ use rvl_core::Verdict;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+mod deploy;
 mod error_reporting;
 mod inventory;
+mod makefile;
 mod repo_kind;
 mod runbooks;
 mod sast;
 
+pub use deploy::DeploySite;
 pub use inventory::inventory;
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
 pub use sast::{OnFailure, PrPath, SastFacts, SastStep};
@@ -45,6 +52,17 @@ pub const RECORD_KIND: &str = "repo_structure";
 /// An ecosystem with fewer source files than this is too small for "no test
 /// files" to be a decidable negative; the evaluator abstains instead.
 pub const MIN_SOURCES_FOR_TEST_VERDICT: u32 = 5;
+
+/// A repository with fewer production source files of its own than this has
+/// no production source to test: RC-033 and RC-057 abstain rather than
+/// violate. Counted across the ecosystems the inventory recognizes, after it
+/// leaves out test files, vendored trees, the trees
+/// `rvl_config::non_production` classes as not deployed, and generated
+/// files; IaC, config, template, documentation and shell files are no
+/// ecosystem's source. The same floor as [`MIN_SOURCES_FOR_TEST_VERDICT`]:
+/// what is too small for one ecosystem's test verdict is too small for the
+/// repository's.
+pub const MIN_PRODUCTION_SOURCES: u32 = MIN_SOURCES_FOR_TEST_VERDICT;
 
 fn default_kind() -> String {
     RECORD_KIND.to_string()
@@ -235,6 +253,18 @@ pub struct RepoStructure {
     /// `.gitlab-ci.yml`.
     #[serde(default)]
     pub sast: SastFacts,
+    /// Non-test source files of the recognized ecosystems that are the
+    /// repository's own production code ([`MIN_PRODUCTION_SOURCES`]). A
+    /// record without it was not counted: RC-033 and RC-057 judge it as
+    /// before.
+    #[serde(default)]
+    pub production_sources: Option<u32>,
+    /// Where the repository deploys (RC-058): a CI job with an
+    /// `environment:`, a step that runs a deploy command, or an Argo CD
+    /// Application, Flux Kustomization or HelmRelease that deploys this
+    /// repository. Sorted, at most [`deploy::MAX_SITES`].
+    #[serde(default)]
+    pub deploy_sites: Vec<DeploySite>,
     /// What kind of repository the tree reads as ([`repo_kind()`]). A record
     /// without it reads as [`RepoKind::Unknown`]: RC-027 and RC-040 abstain.
     #[serde(default)]
@@ -263,6 +293,8 @@ impl Default for RepoStructure {
             error_reporting: ErrorReportingFacts::default(),
             server_entry_points: Vec::new(),
             sast: SastFacts::default(),
+            production_sources: None,
+            deploy_sites: Vec::new(),
             repo_kind: RepoKindFacts::default(),
             walk_complete: false,
         }
@@ -350,8 +382,8 @@ pub struct StructureFinding {
 /// the reason rather than guessing.
 pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
     vec![
-        eval_unit_tests(facts),
-        eval_coverage(facts),
+        only_with_production_source(eval_unit_tests(facts), facts),
+        only_with_production_source(eval_coverage(facts), facts),
         eval_integration(facts),
         eval_contract(facts),
         eval_manifests(facts),
@@ -396,6 +428,27 @@ pub(crate) fn only_in_a_service(mut f: StructureFinding, kind: &RepoKindFacts) -
         f.reason
     );
     f.evidence = kind.evidence.clone();
+    f
+}
+
+/// A finding of a rule that judges the repository's own production source
+/// (RC-033, RC-057): a violation abstains when fewer than
+/// [`MIN_PRODUCTION_SOURCES`] production source files were counted. Every
+/// other verdict stands.
+fn only_with_production_source(mut f: StructureFinding, facts: &RepoStructure) -> StructureFinding {
+    let Some(n) = facts.production_sources else {
+        return f;
+    };
+    if f.verdict != Verdict::Violates || n >= MIN_PRODUCTION_SOURCES {
+        return f;
+    }
+    f.verdict = Verdict::Abstain;
+    f.reason = format!(
+        "{n} production source file(s) after leaving out tests, vendored, non-production and \
+         generated files, under the floor of {MIN_PRODUCTION_SOURCES}: no production source of \
+         its own to test; judged only where there is, where it would violate: {}",
+        f.reason
+    );
     f
 }
 
@@ -589,10 +642,35 @@ fn eval_integration(facts: &RepoStructure) -> StructureFinding {
         .iter()
         .any(|e| e.source_files >= MIN_SOURCES_FOR_TEST_VERDICT);
     if big_enough && facts.walk_complete {
+        // The control asks what runs after a deploy: a repository that
+        // deploys nothing (a library, a published package, a CLI shipped as
+        // release artifacts) has no site to ask it of.
+        if facts.deploy_sites.is_empty() {
+            return mk(
+                Verdict::Abstain,
+                "no deploy site found (a CI job with an environment, a step that runs a deploy \
+                 command, an Argo CD or Flux manifest that deploys this repository): no deploy \
+                 for a smoke test to follow; an image push, a package publish or a release \
+                 upload is not one"
+                    .into(),
+                vec![],
+            );
+        }
+        let mut files: Vec<String> = facts.deploy_sites.iter().map(|d| d.file.clone()).collect();
+        files.dedup();
         return mk(
             Verdict::Violates,
-            "no test files of any kind: integration and smoke tests are absent".into(),
-            vec![],
+            format!(
+                "no test files of any kind: no integration or smoke test runs after the deploy \
+                 at {}",
+                facts
+                    .deploy_sites
+                    .iter()
+                    .map(|d| format!("{} ({})", d.file, d.deploys))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            files,
         );
     }
     mk(

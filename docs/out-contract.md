@@ -256,6 +256,24 @@ The orchestrator uses it to:
   record). An empty array never means that the repository satisfies the
   controls. To score the lane against a gold set, key each gold case by a
   control code (`RC-033`) or by the full class.
+  The `RC-033` and `RC-057` rows abstain where they would violate when the
+  repository has fewer than 5 production source files of its own: non-test
+  files of the recognized ecosystems, after the walk leaves out vendored
+  trees (`vendor/`, `third_party/`, `node_modules/`), the paths the config
+  lane's non-production classifier names (tests, examples, docs, demos,
+  labs, hack and the like, or a repository whose root directory names it
+  sample material) and generated files. IaC, config, template, docs and
+  shell files are no ecosystem's source.
+  The `RC-058` row violates only in a repository with a deploy site: a CI
+  job with an `environment:` that does not name a package registry, a
+  release or a docs page; a GitHub Actions or root `.gitlab-ci.yml` step that
+  runs a deploy command (`kubectl apply`, `helm upgrade` or `helm install`,
+  `argocd app sync`, `terraform apply`, `gcloud run deploy`, `aws ecs
+  update-service`, `fly deploy`, `vercel deploy`, `serverless deploy`, and
+  the like); or an Argo CD Application, Flux Kustomization or HelmRelease
+  that deploys the repository's own `origin` remote. An image push, a
+  package publish and a release upload are not deploys. Without a site it
+  abstains and says no deploy site was found.
   The `RC-006` row judges a repository with runbook files (markdown under a
   `runbooks/`, `runbook/` or `playbooks/` directory, or in `ops/` or
   `docs/ops/`, index and README files excepted). It violates when a runbook's
@@ -287,6 +305,11 @@ The orchestrator uses it to:
   SAST step (`semgrep ci`, CodeQL analyze, `snyk code test`, gosec, bandit,
   or a remote reusable workflow named for sast, codeql or semgrep) runs on a
   `pull_request` or `merge_group` workflow and fails its job on a finding.
+  golangci-lint is such a step when its root config enables gosec, run
+  directly, by its action, or by a `make` target whose recipe, a
+  prerequisite's or a `$(MAKE)` call's runs `golangci-lint run` (or a
+  variable named or valued `golangci-lint`) in the root Makefile, followed 4
+  steps deep.
   It violates when the CI files run no SAST step, when SAST runs only off the
   pull-request path, or when every SAST step on that path continues on
   error. It abstains otherwise: no server entry point, no CI file, or a read
