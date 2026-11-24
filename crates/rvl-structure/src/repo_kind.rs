@@ -21,10 +21,12 @@
 //! never source text.
 
 use crate::inventory::{read_capped, rel, SKIP_DIRS};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// The kind of a repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum RepoKind {
     /// Deployed: a server entry point and a deployment manifest.
     Service,
@@ -35,6 +37,7 @@ pub enum RepoKind {
     Library,
     /// None of the above can be told: a server with no deployment manifest,
     /// no source, or an incomplete walk.
+    #[default]
     Unknown,
 }
 
@@ -50,11 +53,13 @@ impl RepoKind {
 }
 
 /// A repository's kind and what it was read from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoKindFacts {
+    #[serde(default)]
     pub kind: RepoKind,
     /// `<signal>: <path>` lines, at most [`MAX_EVIDENCE`] per signal, for the
     /// kind's own signals.
+    #[serde(default)]
     pub evidence: Vec<String>,
 }
 

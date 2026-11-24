@@ -18,7 +18,8 @@
 //! runs on the pull-request path and fails its job, for RC-040.
 //!
 //! [`repo_kind`] reads, from the same tree, whether the repository is a
-//! service, a tool or a library, for the rules that block only in a service.
+//! service, a tool or a library, for the rules that block only in a service:
+//! RC-027 and RC-040 violate only in a repository read as a service.
 //!
 //! Privacy: facts are shape-only — file names, counts, and presence booleans.
 //! Content is read locally to detect markers (a `#[cfg(test)]` attribute, a
@@ -234,6 +235,10 @@ pub struct RepoStructure {
     /// `.gitlab-ci.yml`.
     #[serde(default)]
     pub sast: SastFacts,
+    /// What kind of repository the tree reads as ([`repo_kind()`]). A record
+    /// without it reads as [`RepoKind::Unknown`]: RC-027 and RC-040 abstain.
+    #[serde(default)]
+    pub repo_kind: RepoKindFacts,
     /// True when the walk exhausted the tree (no unreadable directories).
     /// Only a complete walk licenses reasoning from absence — mirrors
     /// `Provenance::complete` on call-site packets.
@@ -258,6 +263,7 @@ impl Default for RepoStructure {
             error_reporting: ErrorReportingFacts::default(),
             server_entry_points: Vec::new(),
             sast: SastFacts::default(),
+            repo_kind: RepoKindFacts::default(),
             walk_complete: false,
         }
     }
@@ -355,6 +361,44 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
     ]
 }
 
+/// A finding of a rule that blocks only in a deployed service (RC-027,
+/// RC-040), gated on the repository's kind: a violation stands only in a
+/// repository read as a service, and abstains in a tool, a library or a
+/// repository with no deployment manifest. Every other verdict stands.
+pub(crate) fn only_in_a_service(mut f: StructureFinding, kind: &RepoKindFacts) -> StructureFinding {
+    if f.verdict != Verdict::Violates {
+        return f;
+    }
+    let why = match kind.kind {
+        RepoKind::Service => return f,
+        RepoKind::Tool | RepoKind::Library => format!(
+            "the repository reads as a {}{}, not a deployed service",
+            kind.kind.as_str(),
+            if kind.evidence.is_empty() {
+                " (source with no main)".to_string()
+            } else {
+                format!(" ({})", kind.evidence.join(", "))
+            }
+        ),
+        RepoKind::Unknown => format!(
+            "no deployment manifest found (a Kubernetes workload, a Helm chart, a Dockerfile \
+             that exposes a port, a Procfile web process){}: not read as a deployed service",
+            if kind.evidence.is_empty() {
+                String::new()
+            } else {
+                format!(" beside the {}", kind.evidence.join(", "))
+            }
+        ),
+    };
+    f.verdict = Verdict::Abstain;
+    f.reason = format!(
+        "{why}; judged only for a deployed service, where it would violate: {}",
+        f.reason
+    );
+    f.evidence = kind.evidence.clone();
+    f
+}
+
 /// Ecosystems with any source at all — the candidates the test controls
 /// judge.
 fn eligible(facts: &RepoStructure) -> Vec<&EcosystemFacts> {
@@ -395,7 +439,17 @@ fn eval_unit_tests(facts: &RepoStructure) -> StructureFinding {
         .iter()
         .filter(|e| e.source_files >= MIN_SOURCES_FOR_TEST_VERDICT && e.test_files == 0)
         .collect();
-    if !untested.is_empty() {
+    let list = untested
+        .iter()
+        .map(|e| format!("{} ({} source files)", e.name, e.source_files))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A language without tests violates when it is the largest by source
+    // files (each, on a tie) or no language has tests: a secondary language
+    // beside a tested main one is noted, not flagged.
+    let largest = eligible.iter().map(|e| e.source_files).max().unwrap_or(0);
+    let tested = eligible.iter().any(|e| e.test_files > 0);
+    if !untested.is_empty() && (!tested || untested.iter().any(|e| e.source_files == largest)) {
         if !facts.walk_complete {
             return mk(
                 Verdict::Abstain,
@@ -403,14 +457,9 @@ fn eval_unit_tests(facts: &RepoStructure) -> StructureFinding {
                 vec![],
             );
         }
-        let list = untested
-            .iter()
-            .map(|e| format!("{} ({} source files)", e.name, e.source_files))
-            .collect::<Vec<_>>()
-            .join(", ");
         return mk(Verdict::Violates, format!("no test files: {list}"), vec![]);
     }
-    if eligible.iter().any(|e| e.test_files > 0) {
+    if tested {
         let ratios = eligible
             .iter()
             .filter(|e| e.test_files > 0)
@@ -422,9 +471,14 @@ fn eval_unit_tests(facts: &RepoStructure) -> StructureFinding {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let secondary = if untested.is_empty() {
+            String::new()
+        } else {
+            format!("; no test files in a secondary language: {list}")
+        };
         return mk(
             Verdict::Satisfies,
-            format!("test files present — {ratios}"),
+            format!("test files present — {ratios}{secondary}"),
             vec![],
         );
     }

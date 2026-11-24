@@ -3,7 +3,8 @@
 //! fails its job. Retrieval reads the GitHub Actions workflows the inventory
 //! already parsed (a local reusable workflow's steps run on its callers'
 //! triggers) and the root `.gitlab-ci.yml`; [`evaluate`] judges a repository
-//! with a server entry point and abstains on every other.
+//! with a server entry point, violates only in one read as a service
+//! ([`crate::repo_kind`]), and abstains on every other.
 //!
 //! Built for precision. A step whose path or failure mode hangs on an
 //! expression, a filter or a caller this walk cannot see is `unclear`, and a
@@ -19,6 +20,7 @@ use crate::{RepoStructure, ScannerClass, StructureFinding};
 use rvl_core::Verdict;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+use std::path::Path;
 
 /// Whether a CI step runs on the pull-request path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -134,7 +136,58 @@ const CONTINUE_MARKERS: &[&str] = &[
     "|| exit 0",
     "--exit-zero",
     "-no-fail",
+    "--issues-exit-code=0",
+    "--issues-exit-code 0",
 ];
+
+/// golangci-lint's root config files. A TOML config is not read: its gosec
+/// is out of sight, and a golangci-lint step stays no SAST step.
+const GOLANGCI_CONFIGS: &[&str] = &[".golangci.yml", ".golangci.yaml", ".golangci.json"];
+
+/// The name a golangci-lint step that runs gosec is judged by.
+const GOLANGCI_GOSEC: &str = "golangci-lint (gosec)";
+
+/// Whether the root golangci-lint config enables gosec (`enable: [gosec]`,
+/// or every linter by `enable-all: true` or `default: all` with gosec not
+/// disabled), and if so how a gosec finding fails a run: a config that sets
+/// `run.issues-exit-code` to 0 lets it pass. A config that does not parse
+/// enables gosec as far as anyone can tell, with an unclear failure mode.
+/// `None` when no config enables it: a golangci-lint step is then no SAST
+/// step.
+pub(crate) fn golangci_gosec(root: &Path) -> Option<OnFailure> {
+    let path = GOLANGCI_CONFIGS
+        .iter()
+        .map(|c| root.join(c))
+        .find(|p| p.is_file())?;
+    let Ok(doc) = serde_yaml::from_str::<Value>(&crate::inventory::read_capped(&path)) else {
+        return Some(OnFailure::Unclear);
+    };
+    let linters = doc.get("linters");
+    let names = |key: &str| -> bool {
+        linters
+            .and_then(|l| l.get(key))
+            .and_then(Value::as_sequence)
+            .is_some_and(|seq| {
+                seq.iter()
+                    .any(|n| matches!(n.as_str(), Some("gosec" | "gas")))
+            })
+    };
+    let all = linters.is_some_and(|l| {
+        l.get("enable-all").and_then(Value::as_bool) == Some(true)
+            || l.get("default").and_then(Value::as_str) == Some("all")
+    });
+    if !(names("enable") || (all && !names("disable"))) {
+        return None;
+    }
+    Some(
+        match doc.get("run").and_then(|r| r.get("issues-exit-code")) {
+            None => OnFailure::Fails,
+            Some(code) if code.as_u64() == Some(0) => OnFailure::Continues,
+            Some(code) if code.as_u64().is_some() => OnFailure::Fails,
+            Some(_) => OnFailure::Unclear,
+        },
+    )
+}
 
 /// Root config files of CI systems whose steps are not read here: a SAST step
 /// in one of them is out of sight.
@@ -190,13 +243,15 @@ fn command_words(segment: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The RC-040 SAST command one shell line runs, if any.
-fn sast_command(line: &str) -> Option<&'static str> {
+/// The RC-040 SAST command one shell line runs, if any. `golangci` is
+/// whether the golangci-lint config enables gosec ([`golangci_gosec`]).
+fn sast_command(line: &str, golangci: bool) -> Option<&'static str> {
     line.split(['&', '|', ';']).find_map(|segment| {
         let words = command_words(segment);
         let first = words.first()?.rsplit('/').next()?;
         match (first, &words[1..]) {
             ("gosec", _) => Some("gosec"),
+            ("golangci-lint", ["run", ..]) if golangci => Some(GOLANGCI_GOSEC),
             ("bandit", _) => Some("bandit"),
             ("python" | "python3", ["-m", "bandit", ..]) => Some("bandit"),
             ("semgrep", ["ci", ..]) => Some("semgrep ci"),
@@ -210,11 +265,14 @@ fn sast_command(line: &str) -> Option<&'static str> {
 /// continue when every SAST line does. A SAST command piped into another
 /// exits with the last command's status unless `pipefail` is set, which
 /// GitHub's default `bash -e` does not set.
-fn shell_failure(lines: &[String]) -> OnFailure {
+fn shell_failure(lines: &[String], golangci: bool) -> OnFailure {
     if lines.iter().any(|l| l.contains("set +e")) {
         return OnFailure::Unclear;
     }
-    let sast: Vec<&String> = lines.iter().filter(|l| sast_command(l).is_some()).collect();
+    let sast: Vec<&String> = lines
+        .iter()
+        .filter(|l| sast_command(l, golangci).is_some())
+        .collect();
     if !sast.is_empty()
         && sast
             .iter()
@@ -252,8 +310,9 @@ fn continues(v: Option<&Value>) -> OnFailure {
 
 // --- GitHub Actions ---
 
-/// One GitHub Actions step's SAST reading and failure mode.
-fn github_step(step: &Value) -> Option<(Sast, OnFailure)> {
+/// One GitHub Actions step's SAST reading and failure mode, `golangci` how
+/// the golangci-lint config fails a gosec finding, if it enables gosec.
+fn github_step(step: &Value, golangci: Option<OnFailure>) -> Option<(Sast, OnFailure)> {
     let own = continues(step.get("continue-on-error"));
     if let Some(uses) = step.get("uses").and_then(Value::as_str) {
         let action = action_of(uses);
@@ -280,6 +339,12 @@ fn github_step(step: &Value) -> Option<(Sast, OnFailure)> {
         if let Some(known) = SAST_ACTIONS.iter().find(|k| under(&action, k)) {
             return Some((Sast::Step(known.to_string()), own.and(inputs_continue)));
         }
+        if let Some(config) = golangci.filter(|_| under(&action, "golangci/golangci-lint-action")) {
+            return Some((
+                Sast::Step(GOLANGCI_GOSEC.into()),
+                own.and(inputs_continue).and(config),
+            ));
+        }
         // `init` sets CodeQL up; `analyze` is the step judged.
         let other = SCANNER_ACTIONS.iter().any(|(class, known)| {
             *class == ScannerClass::Sast
@@ -290,7 +355,10 @@ fn github_step(step: &Value) -> Option<(Sast, OnFailure)> {
     }
     let run = step.get("run").and_then(Value::as_str)?;
     let lines = shell_lines(run);
-    if let Some(name) = lines.iter().find_map(|l| sast_command(l)) {
+    if let Some(name) = lines
+        .iter()
+        .find_map(|l| sast_command(l, golangci.is_some()))
+    {
         // A custom shell without `-e` runs on past a failing line.
         let shell = step.get("shell").and_then(Value::as_str).unwrap_or("");
         let shell = if shell.contains("{0}") && !shell.contains("-e") {
@@ -298,7 +366,12 @@ fn github_step(step: &Value) -> Option<(Sast, OnFailure)> {
         } else {
             OnFailure::Fails
         };
-        let failure = own.and(shell).and(shell_failure(&lines));
+        let mut failure = own
+            .and(shell)
+            .and(shell_failure(&lines, golangci.is_some()));
+        if name == GOLANGCI_GOSEC {
+            failure = failure.and(golangci.unwrap_or(OnFailure::Fails));
+        }
         return Some((Sast::Step(name.into()), failure));
     }
     mentions_sast(run).then_some((Sast::Other, own))
@@ -414,8 +487,13 @@ fn workflow_path(workflows: &[(String, Value)], file: &str, depth: usize) -> PrP
     }
 }
 
-/// The RC-040 SAST steps of the parsed GitHub Actions workflows.
-pub(crate) fn github(workflows: &[(String, Value)], out: &mut SastFacts) {
+/// The RC-040 SAST steps of the parsed GitHub Actions workflows, `golangci`
+/// as [`golangci_gosec`] reads the root golangci-lint config.
+pub(crate) fn github(
+    workflows: &[(String, Value)],
+    golangci: Option<OnFailure>,
+    out: &mut SastFacts,
+) {
     out.ci_files += workflows.len() as u32;
     for (file, doc) in workflows {
         let jobs = doc.get("jobs").and_then(Value::as_mapping);
@@ -436,7 +514,7 @@ pub(crate) fn github(workflows: &[(String, Value)], out: &mut SastFacts) {
             }
             let steps = job.get("steps").and_then(Value::as_sequence);
             for step in steps.into_iter().flatten() {
-                match github_step(step) {
+                match github_step(step, golangci) {
                     Some((Sast::Step(scanner), failure)) => out.steps.push(SastStep {
                         file: file.clone(),
                         scanner,
@@ -508,8 +586,9 @@ fn gitlab_path(job: &Value) -> PrPath {
     }
 }
 
-/// The RC-040 SAST steps of one `.gitlab-ci.yml`.
-pub(crate) fn gitlab(file: &str, text: &str, out: &mut SastFacts) {
+/// The RC-040 SAST steps of one `.gitlab-ci.yml`, `golangci` as
+/// [`golangci_gosec`] reads the root golangci-lint config.
+pub(crate) fn gitlab(file: &str, text: &str, golangci: Option<OnFailure>, out: &mut SastFacts) {
     let Some(root) = serde_yaml::from_str::<Value>(text)
         .ok()
         .and_then(|d| d.as_mapping().cloned())
@@ -547,7 +626,10 @@ pub(crate) fn gitlab(file: &str, text: &str, out: &mut SastFacts) {
                 None => {}
             }
         }
-        if let Some(scanner) = lines.iter().find_map(|l| sast_command(l)) {
+        if let Some(scanner) = lines
+            .iter()
+            .find_map(|l| sast_command(l, golangci.is_some()))
+        {
             let mut pr_path = gitlab_path(job);
             if !mr_pipelines && pr_path == PrPath::Yes {
                 pr_path = PrPath::Unclear;
@@ -556,7 +638,12 @@ pub(crate) fn gitlab(file: &str, text: &str, out: &mut SastFacts) {
                 file: file.to_string(),
                 scanner: scanner.into(),
                 pr_path,
-                on_failure: continues(job.get("allow_failure")).and(shell_failure(&lines)),
+                on_failure: continues(job.get("allow_failure"))
+                    .and(shell_failure(&lines, golangci.is_some()))
+                    .and(match scanner {
+                        GOLANGCI_GOSEC => golangci.unwrap_or(OnFailure::Fails),
+                        _ => OnFailure::Fails,
+                    }),
             });
         } else if lines.iter().any(|l| mentions_sast(l)) {
             out.unrecognized.push(file.to_string());
@@ -584,8 +671,15 @@ fn listed(steps: &[&SastStep]) -> (String, Vec<String>) {
 }
 
 /// RC-040: does a SAST step run on the pull-request path and fail its job on
-/// a finding? Judged only for a repository with a server entry point.
+/// a finding? Judged only for a repository with a server entry point, and
+/// violated only in one read as a service.
 pub(crate) fn evaluate(facts: &RepoStructure) -> StructureFinding {
+    crate::only_in_a_service(from_the_tree(facts), &facts.repo_kind)
+}
+
+/// RC-040 from the SAST steps and server entry points alone, before the
+/// repository's kind is read.
+fn from_the_tree(facts: &RepoStructure) -> StructureFinding {
     let mk = |verdict, reason: String, evidence| StructureFinding {
         control: "RC-040",
         control_name: "SAST on the pull-request path",
@@ -676,7 +770,7 @@ pub(crate) fn evaluate(facts: &RepoStructure) -> StructureFinding {
             Verdict::Violates,
             format!(
                 "{} CI file(s) read and none runs a SAST step (semgrep, CodeQL analyze, \
-                 snyk code test, gosec, bandit)",
+                 snyk code test, gosec, bandit, golangci-lint with gosec enabled)",
                 s.ci_files
             ),
             vec![],
