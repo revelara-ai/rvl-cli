@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 rvl-core = { path = "../rvl-core" }
+rvl-config = { path = "../rvl-config" }
 
 [dev-dependencies]
 tempfile = "3"

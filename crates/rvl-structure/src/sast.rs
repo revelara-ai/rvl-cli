@@ -147,6 +147,32 @@ const GOLANGCI_CONFIGS: &[&str] = &[".golangci.yml", ".golangci.yaml", ".golangc
 /// The name a golangci-lint step that runs gosec is judged by.
 const GOLANGCI_GOSEC: &str = "golangci-lint (gosec)";
 
+/// How golangci-lint runs gosec in this repository: how its root config
+/// fails a gosec finding ([`golangci_gosec`]), `None` when the config does
+/// not enable gosec, and the root Makefile targets that run golangci-lint
+/// ([`crate::makefile`]), so a step that runs `make lint` runs it too.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Golangci {
+    pub(crate) on_failure: Option<OnFailure>,
+    pub(crate) make_targets: Vec<String>,
+}
+
+impl Golangci {
+    /// Read from the root config and the root Makefile; the Makefile only
+    /// when the config enables gosec.
+    pub(crate) fn read(root: &Path) -> Golangci {
+        let on_failure = golangci_gosec(root);
+        Golangci {
+            on_failure,
+            make_targets: if on_failure.is_some() {
+                crate::makefile::golangci_targets(root)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
 /// Whether the root golangci-lint config enables gosec (`enable: [gosec]`,
 /// or every linter by `enable-all: true` or `default: all` with gosec not
 /// disabled), and if so how a gosec finding fails a run: a config that sets
@@ -154,7 +180,7 @@ const GOLANGCI_GOSEC: &str = "golangci-lint (gosec)";
 /// enables gosec as far as anyone can tell, with an unclear failure mode.
 /// `None` when no config enables it: a golangci-lint step is then no SAST
 /// step.
-pub(crate) fn golangci_gosec(root: &Path) -> Option<OnFailure> {
+fn golangci_gosec(root: &Path) -> Option<OnFailure> {
     let path = GOLANGCI_CONFIGS
         .iter()
         .map(|c| root.join(c))
@@ -223,7 +249,7 @@ fn under(action: &str, known: &str) -> bool {
 }
 
 /// Shell text with backslash-continued lines joined.
-fn shell_lines(run: &str) -> Vec<String> {
+pub(crate) fn shell_lines(run: &str) -> Vec<String> {
     run.replace("\\\n", " ")
         .lines()
         .map(str::to_string)
@@ -243,15 +269,24 @@ fn command_words(segment: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The RC-040 SAST command one shell line runs, if any. `golangci` is
-/// whether the golangci-lint config enables gosec ([`golangci_gosec`]).
-fn sast_command(line: &str, golangci: bool) -> Option<&'static str> {
+/// The RC-040 SAST command one shell line runs, if any: golangci-lint, or a
+/// `make` target that runs it, counts when its config enables gosec.
+fn sast_command(line: &str, golangci: &Golangci) -> Option<&'static str> {
+    let gosec = golangci.on_failure.is_some();
     line.split(['&', '|', ';']).find_map(|segment| {
         let words = command_words(segment);
         let first = words.first()?.rsplit('/').next()?;
         match (first, &words[1..]) {
             ("gosec", _) => Some("gosec"),
-            ("golangci-lint", ["run", ..]) if golangci => Some(GOLANGCI_GOSEC),
+            ("golangci-lint", ["run", ..]) if gosec => Some(GOLANGCI_GOSEC),
+            ("make" | "gmake", args)
+                if gosec
+                    && crate::makefile::make_targets(args)
+                        .iter()
+                        .any(|t| golangci.make_targets.contains(t)) =>
+            {
+                Some(GOLANGCI_GOSEC)
+            }
             ("bandit", _) => Some("bandit"),
             ("python" | "python3", ["-m", "bandit", ..]) => Some("bandit"),
             ("semgrep", ["ci", ..]) => Some("semgrep ci"),
@@ -265,7 +300,7 @@ fn sast_command(line: &str, golangci: bool) -> Option<&'static str> {
 /// continue when every SAST line does. A SAST command piped into another
 /// exits with the last command's status unless `pipefail` is set, which
 /// GitHub's default `bash -e` does not set.
-fn shell_failure(lines: &[String], golangci: bool) -> OnFailure {
+fn shell_failure(lines: &[String], golangci: &Golangci) -> OnFailure {
     if lines.iter().any(|l| l.contains("set +e")) {
         return OnFailure::Unclear;
     }
@@ -311,8 +346,8 @@ fn continues(v: Option<&Value>) -> OnFailure {
 // --- GitHub Actions ---
 
 /// One GitHub Actions step's SAST reading and failure mode, `golangci` how
-/// the golangci-lint config fails a gosec finding, if it enables gosec.
-fn github_step(step: &Value, golangci: Option<OnFailure>) -> Option<(Sast, OnFailure)> {
+/// golangci-lint runs gosec here.
+fn github_step(step: &Value, golangci: &Golangci) -> Option<(Sast, OnFailure)> {
     let own = continues(step.get("continue-on-error"));
     if let Some(uses) = step.get("uses").and_then(Value::as_str) {
         let action = action_of(uses);
@@ -339,7 +374,10 @@ fn github_step(step: &Value, golangci: Option<OnFailure>) -> Option<(Sast, OnFai
         if let Some(known) = SAST_ACTIONS.iter().find(|k| under(&action, k)) {
             return Some((Sast::Step(known.to_string()), own.and(inputs_continue)));
         }
-        if let Some(config) = golangci.filter(|_| under(&action, "golangci/golangci-lint-action")) {
+        if let Some(config) = golangci
+            .on_failure
+            .filter(|_| under(&action, "golangci/golangci-lint-action"))
+        {
             return Some((
                 Sast::Step(GOLANGCI_GOSEC.into()),
                 own.and(inputs_continue).and(config),
@@ -355,10 +393,7 @@ fn github_step(step: &Value, golangci: Option<OnFailure>) -> Option<(Sast, OnFai
     }
     let run = step.get("run").and_then(Value::as_str)?;
     let lines = shell_lines(run);
-    if let Some(name) = lines
-        .iter()
-        .find_map(|l| sast_command(l, golangci.is_some()))
-    {
+    if let Some(name) = lines.iter().find_map(|l| sast_command(l, golangci)) {
         // A custom shell without `-e` runs on past a failing line.
         let shell = step.get("shell").and_then(Value::as_str).unwrap_or("");
         let shell = if shell.contains("{0}") && !shell.contains("-e") {
@@ -366,11 +401,9 @@ fn github_step(step: &Value, golangci: Option<OnFailure>) -> Option<(Sast, OnFai
         } else {
             OnFailure::Fails
         };
-        let mut failure = own
-            .and(shell)
-            .and(shell_failure(&lines, golangci.is_some()));
+        let mut failure = own.and(shell).and(shell_failure(&lines, golangci));
         if name == GOLANGCI_GOSEC {
-            failure = failure.and(golangci.unwrap_or(OnFailure::Fails));
+            failure = failure.and(golangci.on_failure.unwrap_or(OnFailure::Fails));
         }
         return Some((Sast::Step(name.into()), failure));
     }
@@ -488,12 +521,8 @@ fn workflow_path(workflows: &[(String, Value)], file: &str, depth: usize) -> PrP
 }
 
 /// The RC-040 SAST steps of the parsed GitHub Actions workflows, `golangci`
-/// as [`golangci_gosec`] reads the root golangci-lint config.
-pub(crate) fn github(
-    workflows: &[(String, Value)],
-    golangci: Option<OnFailure>,
-    out: &mut SastFacts,
-) {
+/// as [`Golangci::read`] reads it.
+pub(crate) fn github(workflows: &[(String, Value)], golangci: &Golangci, out: &mut SastFacts) {
     out.ci_files += workflows.len() as u32;
     for (file, doc) in workflows {
         let jobs = doc.get("jobs").and_then(Value::as_mapping);
@@ -535,7 +564,7 @@ pub(crate) fn github(
 // --- GitLab CI ---
 
 /// Top-level `.gitlab-ci.yml` keys that are not jobs.
-const GITLAB_GLOBALS: &[&str] = &[
+pub(crate) const GITLAB_GLOBALS: &[&str] = &[
     "after_script",
     "before_script",
     "cache",
@@ -587,8 +616,8 @@ fn gitlab_path(job: &Value) -> PrPath {
 }
 
 /// The RC-040 SAST steps of one `.gitlab-ci.yml`, `golangci` as
-/// [`golangci_gosec`] reads the root golangci-lint config.
-pub(crate) fn gitlab(file: &str, text: &str, golangci: Option<OnFailure>, out: &mut SastFacts) {
+/// [`Golangci::read`] reads it.
+pub(crate) fn gitlab(file: &str, text: &str, golangci: &Golangci, out: &mut SastFacts) {
     let Some(root) = serde_yaml::from_str::<Value>(text)
         .ok()
         .and_then(|d| d.as_mapping().cloned())
@@ -626,10 +655,7 @@ pub(crate) fn gitlab(file: &str, text: &str, golangci: Option<OnFailure>, out: &
                 None => {}
             }
         }
-        if let Some(scanner) = lines
-            .iter()
-            .find_map(|l| sast_command(l, golangci.is_some()))
-        {
+        if let Some(scanner) = lines.iter().find_map(|l| sast_command(l, golangci)) {
             let mut pr_path = gitlab_path(job);
             if !mr_pipelines && pr_path == PrPath::Yes {
                 pr_path = PrPath::Unclear;
@@ -639,9 +665,9 @@ pub(crate) fn gitlab(file: &str, text: &str, golangci: Option<OnFailure>, out: &
                 scanner: scanner.into(),
                 pr_path,
                 on_failure: continues(job.get("allow_failure"))
-                    .and(shell_failure(&lines, golangci.is_some()))
+                    .and(shell_failure(&lines, golangci))
                     .and(match scanner {
-                        GOLANGCI_GOSEC => golangci.unwrap_or(OnFailure::Fails),
+                        GOLANGCI_GOSEC => golangci.on_failure.unwrap_or(OnFailure::Fails),
                         _ => OnFailure::Fails,
                     }),
             });

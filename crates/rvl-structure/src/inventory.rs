@@ -3,11 +3,12 @@
 //! Contents are read locally to detect markers; no source text is stored.
 
 use crate::sast::{self, SastFacts};
-use crate::{error_reporting, repo_kind, runbooks};
+use crate::{deploy, error_reporting, repo_kind, runbooks, DeploySite};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
 };
+use rvl_config::non_production;
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -162,10 +163,16 @@ struct Acc {
     /// The workflow files that parsed, by repo-relative path, for RC-040's
     /// walk across reusable-workflow calls.
     workflows: Vec<(String, Value)>,
-    /// How a gosec finding fails golangci-lint, when its config enables
-    /// gosec (RC-040).
-    golangci: Option<sast::OnFailure>,
+    /// How golangci-lint runs gosec here (RC-040).
+    golangci: sast::Golangci,
     sast: SastFacts,
+    /// The scanned root's sample-repository token, read once
+    /// ([`non_production::root_token`]).
+    repo_token: Option<&'static str>,
+    /// Non-test source files that are the repository's own production code.
+    production_sources: u32,
+    deploy_sites: Vec<DeploySite>,
+    gitops: deploy::GitOps,
     servers: Vec<String>,
     walk_complete: bool,
 }
@@ -182,7 +189,8 @@ impl Acc {
 pub fn inventory(root: &Path) -> RepoStructure {
     let mut acc = Acc {
         walk_complete: true,
-        golangci: sast::golangci_gosec(root),
+        golangci: sast::Golangci::read(root),
+        repo_token: non_production::root_token(root),
         ..Default::default()
     };
     let mut stack = vec![root.to_path_buf()];
@@ -217,7 +225,10 @@ pub fn inventory(root: &Path) -> RepoStructure {
     }
 
     acc.workflows.sort_by(|a, b| a.0.cmp(&b.0));
-    sast::github(&acc.workflows, acc.golangci, &mut acc.sast);
+    sast::github(&acc.workflows, &acc.golangci, &mut acc.sast);
+    deploy::github(&acc.workflows, &mut acc.deploy_sites);
+    acc.gitops
+        .sites(deploy::origin(root).as_deref(), &mut acc.deploy_sites);
     acc.sast.other_ci.sort();
     acc.servers.sort();
     resolve_lockfiles(root, &mut acc.manifests);
@@ -261,6 +272,8 @@ pub fn inventory(root: &Path) -> RepoStructure {
         error_reporting: acc.error_reporting.finish(),
         server_entry_points: acc.servers,
         sast: acc.sast,
+        production_sources: Some(acc.production_sources),
+        deploy_sites: deploy::finish(acc.deploy_sites),
         repo_kind: repo_kind::repo_kind(root),
         walk_complete: acc.walk_complete,
     }
@@ -305,8 +318,8 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // --- ecosystems + test conventions ---
-    match ext.as_str() {
+    // --- ecosystems + test conventions: Some(is_test) for a source file ---
+    let source = match ext.as_str() {
         "go" => {
             let is_test = name.ends_with("_test.go");
             let e = acc.eco("go");
@@ -321,6 +334,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
                     e.markers.insert(d.clone());
                 }
             }
+            Some(is_test)
         }
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" if !is_declaration_ts(name) => {
             let is_test =
@@ -342,6 +356,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
                     e.markers.insert(d.clone());
                 }
             }
+            Some(is_test || e2e_config || is_cy)
         }
         "py" => {
             let is_test = name.starts_with("test_")
@@ -357,6 +372,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
                     e.markers.insert(d.clone());
                 }
             }
+            Some(is_test)
         }
         "rs" => {
             // Inline `#[cfg(test)]` is the dominant Rust idiom; a name-only
@@ -371,6 +387,8 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
                     e.markers.insert(d.clone());
                 }
             }
+            // A Rust source with inline tests is production code too.
+            Some(has_dir("tests"))
         }
         "java" => {
             let in_src_test = rp.contains("/src/test/") || rp.starts_with("src/test/");
@@ -388,8 +406,12 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
                     e.markers.insert(d.clone());
                 }
             }
+            Some(is_test)
         }
-        _ => {}
+        _ => None,
+    };
+    if source == Some(false) && own_production_source(path, &rp, name, acc.repo_token) {
+        acc.production_sources += 1;
     }
 
     // --- coverage configuration ---
@@ -474,7 +496,16 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
     // --- RC-040 reads the root GitLab CI file as well ---
     if rp == ".gitlab-ci.yml" {
-        sast::gitlab(&rp, &read_capped(path), acc.golangci, &mut acc.sast);
+        let text = read_capped(path);
+        sast::gitlab(&rp, &text, &acc.golangci, &mut acc.sast);
+        deploy::gitlab(&rp, &text, &mut acc.deploy_sites);
+    }
+    // --- RC-058: GitOps manifests that may deploy this repository ---
+    if matches!(ext.as_str(), "yaml" | "yml")
+        && !is_ci_file
+        && non_production::reason(acc.repo_token, &rp).is_none()
+    {
+        acc.gitops.observe(&rp, &read_capped(path));
     }
     if sast::OTHER_CI.contains(&rp.as_str()) {
         acc.sast.other_ci.push(rp.clone());
@@ -589,6 +620,45 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
             code_owned: false,
         });
     }
+}
+
+/// File-name endings of generated source.
+const GENERATED_SUFFIXES: &[&str] = &[
+    ".pb.go",
+    ".pb.gw.go",
+    "_generated.go",
+    ".gen.go",
+    "_gen.go",
+    "_pb2.py",
+    "_pb2_grpc.py",
+    ".min.js",
+    ".generated.ts",
+];
+
+/// Markers a generator writes into a file's head.
+const GENERATED_MARKERS: &[&str] = &["Code generated", "DO NOT EDIT", "@generated"];
+
+/// The head of a source file read for a generator's marker.
+const GENERATED_HEAD: u64 = 1024;
+
+/// Whether the non-test source file at repo-relative `rp` is the
+/// repository's own production code: not vendored or built (the walk already
+/// skips `vendor/` and `node_modules/`), not under a tree the shared
+/// classifier names non-production, in a repository whose root it does not
+/// name sample material, and not generated.
+fn own_production_source(path: &Path, rp: &str, name: &str, repo: Option<&str>) -> bool {
+    if error_reporting::not_ours(rp) || non_production::reason(repo, rp).is_some() {
+        return false;
+    }
+    if name.starts_with("zz_generated") || GENERATED_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return false;
+    }
+    let mut head = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(GENERATED_HEAD).read_to_end(&mut head);
+    }
+    let head = String::from_utf8_lossy(&head);
+    !GENERATED_MARKERS.iter().any(|m| head.contains(m))
 }
 
 /// The committed `.github/rulesets/*.json` files, sorted by path.

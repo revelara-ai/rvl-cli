@@ -380,14 +380,143 @@ fn rc058_unit_tests_only_abstains() {
     );
 }
 
+/// A workflow whose one job runs `steps` on push to main, with `job_keys`
+/// (an `environment:`) on the job.
+fn deploy_wf(job_keys: &str, steps: &str) -> String {
+    format!(
+        "on:\n  push:\n    branches: [main]\njobs:\n  ship:\n    runs-on: ubuntu-latest\n{job_keys}    steps:\n      - uses: actions/checkout@v4\n{steps}"
+    )
+}
+
 #[test]
-fn rc058_no_tests_at_all_violates() {
-    let dir = tempfile::tempdir().unwrap();
-    go_repo_without_tests(dir.path());
-    assert_eq!(
-        finding(&eval_dir(dir.path()), "RC-058").verdict,
-        Verdict::Violates
+fn rc058_a_deploy_site_without_any_test_violates() {
+    for (file, text, deploys) in [
+        (
+            ".github/workflows/deploy.yml",
+            deploy_wf("    environment: production\n", "      - run: ./ship.sh\n"),
+            "a job with an environment",
+        ),
+        (
+            ".github/workflows/deploy.yml",
+            deploy_wf("", "      - run: |\n          helm upgrade --install api ./chart \\\n            --wait\n"),
+            "helm upgrade",
+        ),
+        (
+            ".gitlab-ci.yml",
+            "deploy:\n  script:\n    - kubectl apply -f k8s/\n".to_string(),
+            "kubectl apply",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        go_repo_without_tests(dir.path());
+        write(dir.path(), file, &text);
+        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
+        assert_eq!(f.verdict, Verdict::Violates, "{file}: {f:?}");
+        assert!(f.reason.contains(&format!("{file} ({deploys})")), "{f:?}");
+        assert_eq!(f.evidence, vec![file.to_string()]);
+    }
+}
+
+/// A repository that deploys nothing has no site for a smoke test to follow:
+/// a package publish, a release upload, an image push, tests and CodeQL only,
+/// no CI at all.
+#[test]
+fn rc058_abstains_without_a_deploy_site() {
+    let publish = deploy_wf(
+        "    environment: nuget\n",
+        "      - run: dotnet pack -c Release\n      - run: dotnet nuget push out/*.nupkg\n",
     );
+    let release = deploy_wf(
+        "",
+        "      - run: go build -o dist/tool ./cmd/tool\n      - run: gh release upload v1 dist/tool\n",
+    );
+    let image = deploy_wf(
+        "",
+        "      - run: docker build -t ghcr.io/o/api:latest .\n      - run: docker push ghcr.io/o/api:latest\n",
+    );
+    let checks = "on: [pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n      - uses: github/codeql-action/analyze@v3\n      - run: kubectl apply --dry-run=client -f k8s/\n";
+    for workflow in [
+        Some(publish),
+        Some(release),
+        Some(image),
+        Some(checks.to_string()),
+        None,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        go_repo_without_tests(dir.path());
+        if let Some(text) = &workflow {
+            write(dir.path(), ".github/workflows/ci.yml", text);
+        }
+        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
+        assert_eq!(f.verdict, Verdict::Abstain, "{workflow:?}: {f:?}");
+        assert!(f.reason.contains("no deploy site found"), "{f:?}");
+    }
+}
+
+/// An Argo CD Application or a Flux Kustomization or HelmRelease is a deploy
+/// site when it deploys this repository by its `origin` remote; one that
+/// deploys another repository, the Flux bootstrap sync, or an example is not.
+#[test]
+fn rc058_a_gitops_manifest_of_this_repository_is_a_deploy_site() {
+    const ORIGIN: &str =
+        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@example.com:o/api.git\n";
+    let argo = |url: &str| {
+        format!("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\nspec:\n  source:\n    repoURL: {url}\n    path: deploy\n")
+    };
+    let flux = |name: &str, consumer: &str| {
+        format!(
+            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: {name}\nspec:\n  url: https://example.com/o/api\n---\n{consumer}"
+        )
+    };
+    let kustomization = |name: &str| {
+        format!("apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: api\nspec:\n  path: ./deploy\n  sourceRef:\n    kind: GitRepository\n    name: {name}\n")
+    };
+    let helm_release = "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: api\nspec:\n  chart:\n    spec:\n      chart: ./chart\n      sourceRef:\n        kind: GitRepository\n        name: api\n";
+    for (path, text, deploys) in [
+        (
+            "deploy/argo/app.yaml",
+            argo("https://example.com/o/api.git"),
+            Some("an Argo CD Application"),
+        ),
+        (
+            "deploy/argo/app.yaml",
+            argo("https://example.com/o/other.git"),
+            None,
+        ),
+        (
+            "examples/argo/app.yaml",
+            argo("https://example.com/o/api.git"),
+            None,
+        ),
+        (
+            "clusters/prod/api.yaml",
+            flux("api", &kustomization("api")),
+            Some("a Flux Kustomization"),
+        ),
+        (
+            "clusters/prod/api.yaml",
+            flux("api", helm_release),
+            Some("a Flux HelmRelease"),
+        ),
+        (
+            "clusters/prod/sync.yaml",
+            flux("flux-system", &kustomization("flux-system")),
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        go_repo_without_tests(dir.path());
+        write(dir.path(), ".git/config", ORIGIN);
+        write(dir.path(), path, &text);
+        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
+        match deploys {
+            Some(d) => {
+                assert_eq!(f.verdict, Verdict::Violates, "{path}: {f:?}");
+                assert!(f.reason.contains(&format!("{path} ({d})")), "{f:?}");
+            }
+            None => assert_eq!(f.verdict, Verdict::Abstain, "{path}: {f:?}"),
+        }
+    }
 }
 
 // --- RC-034: contract-test frameworks (live catalog: Contract Testing) ---
@@ -1664,4 +1793,247 @@ fn rc027_answer_key_is_well_formed() {
         assert!(!s("why").trim().is_empty(), "{line}");
     }
     assert!(repos.len() >= 100, "{} rows", repos.len());
+}
+
+// --- RC-033 and RC-057: a repository with no production source of its own ---
+
+/// Each shape holds source of the recognized ecosystems, none of it the
+/// repository's own production code: the test rules abstain, never violate.
+#[test]
+fn rc033_rc057_abstain_without_production_source() {
+    type Shape = fn(&Path);
+    let shapes: [(&str, Shape); 6] = [
+        ("a book whose Go code is chapter examples", |root| {
+            write(root, "book.md", "# The book\n");
+            for i in 0..6 {
+                write(
+                    root,
+                    &format!("examples/ch{i}/main.go"),
+                    "package main\nfunc main() {}\n",
+                );
+            }
+        }),
+        ("a Kubernetes training repository", |root| {
+            write(
+                root,
+                "labs/01/deployment.yaml",
+                "apiVersion: apps/v1\nkind: Deployment\n",
+            );
+            write(root, "install.sh", "#!/bin/sh\nkubectl apply -f labs/\n");
+            write(root, "demo/app/main.py", "print('hi')\n");
+            for i in 0..6 {
+                write(root, &format!("labs/0{i}/check.py"), "print('ok')\n");
+            }
+        }),
+        ("an IaC template collection", |root| {
+            write(
+                root,
+                "templates/vpc.yaml",
+                "AWSTemplateFormatVersion: '2010-09-09'\n",
+            );
+            write(root, "modules/net/main.tf", "resource \"x\" \"y\" {}\n");
+            write(root, "arm/azuredeploy.json", "{}\n");
+            write(root, "scripts/render.py", "print('render')\n");
+            for i in 0..6 {
+                write(root, &format!("samples/s{i}/app.py"), "print('s')\n");
+            }
+        }),
+        (
+            "generated code beside a little hand-written source",
+            |root| {
+                write(root, "api/doc.go", "package api\n");
+                for i in 0..6 {
+                    write(root, &format!("api/v{i}.pb.go"), "package api\n");
+                    write(
+                        root,
+                        &format!("api/client{i}.go"),
+                        "// Code generated by a tool. DO NOT EDIT.\npackage api\n",
+                    );
+                }
+            },
+        ),
+        ("a vendored third-party tree", |root| {
+            write(root, "main.go", "package main\nfunc main() {}\n");
+            for i in 0..6 {
+                write(root, &format!("third_party/lib/f{i}.go"), "package lib\n");
+                write(
+                    root,
+                    &format!("vendor/gopl.io/ch{i}/main.go"),
+                    "package main\n",
+                );
+            }
+        }),
+        ("a GitOps config repository with shell validators", |root| {
+            write(
+                root,
+                "clusters/prod/kustomization.yaml",
+                "resources: [apps]\n",
+            );
+            write(
+                root,
+                "clusters/prod/apps/release.yaml",
+                "kind: HelmRelease\n",
+            );
+            write(
+                root,
+                "hack/validate.sh",
+                "#!/bin/sh\nkubeconform clusters/\n",
+            );
+            write(root, "docs/guide.md", "# Guide\n");
+            for i in 0..6 {
+                write(root, &format!("hack/check{i}.py"), "print('ok')\n");
+            }
+        }),
+    ];
+    for (shape, build) in shapes {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path());
+        let fs = eval_dir(dir.path());
+        for control in ["RC-033", "RC-057"] {
+            let f = finding(&fs, control);
+            assert_eq!(f.verdict, Verdict::Abstain, "{shape} {control}: {f:?}");
+            assert!(
+                f.reason.contains("no production source of its own"),
+                "{shape} {control}: {f:?}"
+            );
+        }
+    }
+}
+
+/// A repository whose root names it sample material has no production
+/// source, wherever its code sits.
+#[test]
+fn rc033_rc057_abstain_in_a_samples_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cloud-emulator-samples");
+    go_repo_without_tests(&root);
+    let fs = eval_dir(&root);
+    for control in ["RC-033", "RC-057"] {
+        assert_eq!(finding(&fs, control).verdict, Verdict::Abstain, "{control}");
+    }
+}
+
+/// Both sides of the floor: one production file under it abstains, at it
+/// violates, the examples beside it counted on neither side.
+#[test]
+fn rc033_rc057_production_source_floor() {
+    use rvl_structure::MIN_PRODUCTION_SOURCES;
+    for (n, want) in [
+        (MIN_PRODUCTION_SOURCES - 1, Verdict::Abstain),
+        (MIN_PRODUCTION_SOURCES, Verdict::Violates),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/svc\n\ngo 1.22\n");
+        for i in 0..n {
+            write(
+                dir.path(),
+                &format!("internal/svc/f{i}.go"),
+                "package svc\n",
+            );
+        }
+        for i in 0..6 {
+            write(
+                dir.path(),
+                &format!("examples/e{i}/main.go"),
+                "package main\n",
+            );
+        }
+        let facts = inventory(dir.path());
+        assert_eq!(facts.production_sources, Some(n));
+        let fs = evaluate(&facts, TODAY);
+        for control in ["RC-033", "RC-057"] {
+            let f = finding(&fs, control);
+            assert_eq!(f.verdict, want, "{n} {control}: {f:?}");
+        }
+    }
+}
+
+/// A record from before the count judges as it did.
+#[test]
+fn rc033_rc057_an_uncounted_record_judges_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo_without_tests(dir.path());
+    let mut facts = inventory(dir.path());
+    facts.production_sources = None;
+    let fs = evaluate(&facts, TODAY);
+    assert_eq!(finding(&fs, "RC-033").verdict, Verdict::Violates);
+    assert_eq!(finding(&fs, "RC-057").verdict, Verdict::Violates);
+}
+
+// --- RC-040: golangci-lint run through a Makefile target ---
+
+const GOLANGCI_V2: &str =
+    "version: \"2\"\nlinters:\n  enable:\n    - errcheck\n    - gosec\n    - govet\n";
+
+const MAKEFILE_LINT: &str = "GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint\n\n\
+.PHONY: lint verify\n\
+lint: lint-custom #HELP Run golangci linter.\n\
+\t$(GOLANGCI_LINT) run --build-tags $(GO_BUILD_TAGS) $(GOLANGCI_LINT_ARGS)\n\n\
+lint-custom:\n\
+\tgo run ./hack/lint ./...\n\n\
+verify: tidy lint\n\n\
+tidy:\n\
+\tgo mod tidy\n";
+
+/// A pull-request step that runs `make lint`, or a target that depends on
+/// it, runs golangci-lint, and gosec with it when the config enables it.
+#[test]
+fn rc040_a_make_target_that_runs_golangci_lint_is_a_sast_step() {
+    for target in ["lint", "verify"] {
+        let ci = wf("[pull_request]", &format!("      - run: make {target}\n"));
+        let f = rc040(&[
+            (".golangci.yaml", GOLANGCI_V2),
+            ("Makefile", MAKEFILE_LINT),
+            (".github/workflows/ci.yml", &ci),
+        ]);
+        assert_eq!(f.verdict, Verdict::Satisfies, "{target}: {f:?}");
+        assert!(f.reason.contains("golangci-lint (gosec)"), "{f:?}");
+    }
+    // The config's gosec check stays: without gosec, `make lint` is no SAST.
+    let ci = wf("[pull_request]", "      - run: make lint\n");
+    let f = rc040(&[
+        (
+            ".golangci.yaml",
+            "version: \"2\"\nlinters:\n  enable: [govet]\n",
+        ),
+        ("Makefile", MAKEFILE_LINT),
+        (".github/workflows/ci.yml", &ci),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+}
+
+/// A Makefile whose lint target does not run golangci-lint runs no SAST.
+#[test]
+fn rc040_a_make_lint_target_without_golangci_lint_still_violates() {
+    let ci = wf("[pull_request]", "      - run: make lint\n");
+    let f = rc040(&[
+        (".golangci.yaml", GOLANGCI_V2),
+        ("Makefile", "lint:\n\tgo vet ./...\n\tgofmt -l .\n"),
+        (".github/workflows/ci.yml", &ci),
+    ]);
+    assert_eq!(f.verdict, Verdict::Violates, "{f:?}");
+    assert!(f.reason.contains("none runs a SAST step"), "{f:?}");
+}
+
+/// A pull-request step that satisfies the rule wins over CodeQL run only on
+/// push and schedule.
+#[test]
+fn rc040_a_pull_request_make_lint_wins_over_codeql_off_the_pull_request_path() {
+    let f = rc040(&[
+        (".golangci.yaml", GOLANGCI_V2),
+        ("Makefile", MAKEFILE_LINT),
+        (
+            ".github/workflows/lint.yml",
+            &wf("[pull_request]", "      - run: make lint\n"),
+        ),
+        (
+            ".github/workflows/codeql.yml",
+            &wf(
+                "\n  push:\n    branches: [main]\n  schedule:\n    - cron: '0 0 * * 0'",
+                CODEQL,
+            ),
+        ),
+    ]);
+    assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
+    assert_eq!(f.evidence, vec![".github/workflows/lint.yml"]);
 }

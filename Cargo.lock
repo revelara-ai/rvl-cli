@@ -1616,6 +1616,7 @@ name = "rvl-structure"
 version = "1.12.0"
 dependencies = [
  "anyhow",
+ "rvl-config",
  "rvl-core",
  "serde",
  "serde_json",

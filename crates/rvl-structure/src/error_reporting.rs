@@ -158,6 +158,12 @@ impl Acc {
 }
 
 /// Whether repo-relative `rp` sits under a directory of `names`.
+/// Whether the file at `rp` is build output or vendored code the walk
+/// still descends into.
+pub(crate) fn not_ours(rp: &str) -> bool {
+    under(rp, NOT_OURS)
+}
+
 fn under(rp: &str, names: &[&str]) -> bool {
     let mut dirs: Vec<&str> = rp.split('/').collect();
     dirs.pop();
