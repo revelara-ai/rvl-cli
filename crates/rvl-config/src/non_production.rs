@@ -38,7 +38,7 @@ use std::path::Path;
 /// scenario, playground, sandbox and proof-of-concept trees (`keda-example/`,
 /// Higress `samples/`, Chaos Mesh `examples/`, git-sync `demo/`); `hack/`;
 /// the CI-only values a chart is linted with (`helm/ci/`); and dev, local,
-/// kind, minikube and temporary environments (`dev-env/`, `development/kind/`,
+/// kind and temporary environments (`dev-env/`, `development/kind/`,
 /// `cluster-dev.yaml`, `environments/temp/`). Exact segments alone missed
 /// most of these: the stem and the hyphenated parts carry the signal.
 pub const NON_PRODUCTION_TOKENS: &[&str] = &[
@@ -77,7 +77,6 @@ pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "development",
     "local",
     "kind",
-    "minikube",
     "temp",
     "tmp",
     "playground",
