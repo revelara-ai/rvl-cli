@@ -24,8 +24,10 @@ use std::path::Path;
 /// Path tokens that mark a config unit as not deployed to production. A
 /// path is split on every non-alphanumeric character, directory segments
 /// and the file stem alike, and lower-cased; a unit is non-production when
-/// any WHOLE token is listed here, so `devops/`, `latest/`, `contest/`,
-/// `production/` and `staging/` deploy.
+/// any WHOLE token, or two adjacent tokens of one segment joined by `-`, is
+/// listed here, so `devops/`, `latest/`, `contest/` and `production/`
+/// deploy. Every unit under a `.github/` directory is non-production too
+/// ([`GITHUB_DIR`]).
 ///
 /// Evidence: a blind check of flagged units against the rule frames (two
 /// independent judges with repository access, a row counted where both
@@ -41,6 +43,14 @@ use std::path::Path;
 /// kind and temporary environments (`dev-env/`, `development/kind/`,
 /// `cluster-dev.yaml`, `environments/temp/`). Exact segments alone missed
 /// most of these: the stem and the hyphenated parts carry the signal.
+///
+/// A second check after that classifier found the rest of the wrong flags
+/// under a local cluster bootstrap (`.bootstrap/`, a `localstack` emulator),
+/// a `single-node` dev setup, `archive/` trees, mock servers (`wiremock/`),
+/// load generators (`stress-cpu.yaml`), and preview, canary, staging,
+/// proof-of-concept and prototype environments. The test is on path tokens
+/// only: a rollout strategy named `canary` in a document is a key, not a
+/// path, and stays a fact.
 pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "test",
     "tests",
@@ -88,7 +98,27 @@ pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "doc",
     "book",
     "poc",
+    "prototype",
+    "bootstrap",
+    "localstack",
+    "single-node",
+    "singlenode",
+    "archive",
+    "archived",
+    "wiremock",
+    "mock",
+    "stress",
+    "preview",
+    "canary",
+    "staging",
+    "stage",
 ];
+
+/// A directory segment whose units are not deployed: the manifests under
+/// `.github/` are applied by CI jobs (the e2e clients a workflow installs),
+/// and the workflow files there have a retriever of their own that does not
+/// ask this classifier.
+pub const GITHUB_DIR: &str = ".github";
 
 /// Tokens of the scanned root directory's own name that mark the whole
 /// repository as sample or teaching material, so every unit in it is
@@ -124,14 +154,22 @@ const FRAGMENT_STEM_TOKENS: &[&str] = &["patch", "patches"];
 /// The reason an absent key of a patch fragment carries.
 pub const FRAGMENT_REASON: &str = "patch fragment: the base carries this key";
 
-/// The first token of `s` that `list` holds.
+/// The first token of `s` that `list` holds: a token, or two adjacent
+/// tokens of one `/`-segment joined by `-` (`single_node` is `single-node`).
 fn listed(s: &str, list: &[&'static str]) -> Option<&'static str> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .find_map(|t| {
-            let t = t.to_lowercase();
-            list.iter().copied().find(|w| *w == t)
+    s.split('/').find_map(|segment| {
+        let tokens: Vec<String> = segment
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        tokens.iter().enumerate().find_map(|(i, t)| {
+            let pair = tokens.get(i + 1).map(|next| format!("{t}-{next}"));
+            list.iter()
+                .copied()
+                .find(|w| *w == t || pair.as_deref() == Some(*w))
         })
+    })
 }
 
 /// A repo-relative path split into its directory and its file stem (the
@@ -144,8 +182,26 @@ fn dir_and_stem(rel_path: &str) -> (&str, &str) {
 /// The token that marks `rel_path` non-production, if any.
 pub fn path_token(rel_path: &str) -> Option<&'static str> {
     let (dir, stem) = dir_and_stem(rel_path);
+    if dir.split('/').any(|seg| seg == GITHUB_DIR) {
+        return Some(GITHUB_DIR);
+    }
     listed(dir, NON_PRODUCTION_TOKENS).or_else(|| listed(stem, NON_PRODUCTION_TOKENS))
 }
+
+/// Whether a resource name is a template awaiting substitution rather than
+/// a name the API accepts: it holds `$NAME`, `${...}`, `{{ ... }}` or an
+/// upper-case `PR_NUMBER`. A Kubernetes object name is lower-case letters,
+/// digits, `-` and `.`, so any other character means the file is applied
+/// only after a script fills it in (a per-pull-request preview, an e2e
+/// template), and is a fragment of what deploys. A chart template is
+/// rendered before its name is read, so its rendered name is what is asked.
+pub fn placeholder_name(name: &str) -> bool {
+    name.chars()
+        .any(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'))
+}
+
+/// The reason a unit with a [`placeholder_name`] carries.
+pub const PLACEHOLDER_REASON: &str = "unexpanded placeholder in the resource name";
 
 /// The token of the scanned root's own directory name that marks the whole
 /// repository as sample material, if any. The name is the last component
@@ -271,6 +327,24 @@ mod tests {
             ("src/__mocks__/deploy.yaml", "mocks"),
             ("hack/dev-env/metallb.yaml", "hack"),
             ("k8s/app.test.yaml", "test"),
+            (
+                ".bootstrap/localstack/manifests/deployment.yaml",
+                "bootstrap",
+            ),
+            (".bootstrap/portal/manifests/deployment.yaml", "bootstrap"),
+            ("k8s/single-node/agent.yml", "single-node"),
+            ("k8s/single_node/agent.yml", "single-node"),
+            (".github/db-client.yaml", ".github"),
+            ("ci/.github/kind/store-client.yaml", ".github"),
+            ("archive/network/echo.yaml", "archive"),
+            ("deploy/wiremock/wiremock-deployment.yaml", "wiremock"),
+            ("deploy/mock/api.yaml", "mock"),
+            ("k8s/apps/stress-cpu.yaml", "stress"),
+            ("cluster/canary/merger.yaml", "canary"),
+            ("deploy/staging/api.yaml", "staging"),
+            ("envs/stage/main.tf", "stage"),
+            ("deploy/preview/api.yaml", "preview"),
+            ("prototype/api.yaml", "prototype"),
         ] {
             assert_eq!(path_token(path), Some(token), "{path}");
         }
@@ -283,11 +357,31 @@ mod tests {
             "devops/k8s/app.yaml",
             "charts/api/templates/deployment.yaml",
             "clusters/live/apps/api.yaml",
-            "infra/staging/db.tf",
+            "infra/prod/db.tf",
             "contest/latest/app.yaml",
+            "deploy/production/api.yaml",
+            "k8s/node/single.yaml",
+            "k8s/single/node/app.yaml",
+            "github/k8s/app.yaml",
+            "k8s/rollouts/api.yaml",
             "deploy.yaml",
         ] {
             assert_eq!(path_token(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_name_the_api_would_refuse_is_a_placeholder() {
+        for name in [
+            "board-deployment-PR_NUMBER",
+            "db-$NAME",
+            "api-${SUFFIX}",
+            "{{ .name }}",
+        ] {
+            assert!(placeholder_name(name), "{name}");
+        }
+        for name in ["board-deployment", "db", "api-v2.internal"] {
+            assert!(!placeholder_name(name), "{name}");
         }
     }
 

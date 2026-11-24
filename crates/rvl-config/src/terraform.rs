@@ -2646,7 +2646,7 @@ module "local" {
             "root"
         );
         let got = one(&[(
-            "infra/staging/db.tf",
+            "infra/production/db.tf",
             "resource \"aws_db_instance\" \"db\" {}\n",
         )]);
         let p = find(
@@ -3597,7 +3597,7 @@ module "local" {
                 "envs/prod/versions.tf",
                 "terraform {\n  required_version = \">= 1.5\"\n}\n",
             ),
-            ("envs/staging/main.tf", "resource \"a\" \"b\" {}\n"),
+            ("envs/second/main.tf", "resource \"a\" \"b\" {}\n"),
         ]);
         // prod merges the two terraform blocks: backend from one file,
         // required_version from the other.
@@ -3615,12 +3615,12 @@ module "local" {
             })
             .expect("prod required_version packet");
         assert_eq!(prod_rv.resolved_value.as_deref(), Some(">= 1.5"));
-        // staging is its own module with its own defaults.
+        // second is its own module with its own defaults.
         let dev_backend = got
             .packets
             .iter()
-            .find(|p| p.file_path == "envs/staging/main.tf" && p.key == "terraform.backend")
-            .expect("staging backend packet");
+            .find(|p| p.file_path == "envs/second/main.tf" && p.key == "terraform.backend")
+            .expect("second backend packet");
         assert_eq!(dev_backend.resolved_value.as_deref(), Some("local"));
     }
 
