@@ -115,7 +115,30 @@ rvl sync        # now syncs both tiers
 The commercial tier layers over the free baseline at load time. Same
 binary, nothing to uninstall, no migration. The OSS store lives in an
 `oss/` subdirectory beside the commercial one under the cache root, so the
-two never conflict. Remove the key and the scanner falls back to the free
+two never conflict.
+
+### Without a key, nothing commercial loads
+
+A run with no key (no `RVL_API_KEY`, and no `api_key` in
+`~/.revelara/config.yaml`) loads the OSS tier alone. A commercial tier or
+decision model that an earlier keyed install cached is not read, even though
+it is still on disk: not the commercial tier in `current/`, not the one in
+`last-good/`, and not the model bundle. This holds for `rvl scan`,
+`rvl report`, `rvl explain`, `rvl suppress` and `rvl cache keys`.
+
+The cached files are not deleted, so adding the key back loads them again
+with no re-sync. While a commercial tier sits on disk unread, each keyless
+scan says so on stderr, in the same words `--oss-only` uses:
+
+```text
+note: no API key: the commercial tier was not loaded; this scan uses the OSS vocabulary tier alone, so API surfaces are unjudged and findings are advisory
+```
+
+When `.revelara.yaml` turns the decision model on, a keyless scan prints
+`note: no API key: the decision model was not loaded` and COVERAGE names the
+model lane as not run. If the OSS tier is not installed either, a keyless
+scan syncs it first. If it still does not load, the scan fails and tells you
+to run `rvl sync` or set the key. It never falls back to the commercial
 tier.
 
 ### Scanning with the free tier only
@@ -128,9 +151,10 @@ rvl scan --oss-only
 rvl report --oss-only
 ```
 
-The flag skips the commercial tier at load time, so the scan behaves exactly
-like a no-key install: vocabulary lanes only, no judgments, and every finding
-advisory except lanes that carry their own severity (secret detection). Use
+The flag skips the commercial tier and the decision model at load time, so
+the scan behaves exactly like a no-key install: vocabulary lanes only, no
+judgments, and every finding advisory except lanes that carry their own
+severity (secret detection). Use
 it to demo the free tier, to compare the two tiers on the same repo, or to
 check the free experience before you publish.
 

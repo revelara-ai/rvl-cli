@@ -93,11 +93,12 @@ impl Fixture {
             .env("RVL_CACHE_DIR", self.root.join("cache"))
             .env("HOME", self.root.join("home"))
             .env(TEST_KEYSET_ENV, &self.key_hex)
+            // The test tier is the commercial one, which loads only with a key.
+            .env("RVL_API_KEY", "pk_determinism_test")
             // No network: offline also turns the background cache check off.
             .env("RVL_OFFLINE", "1");
         for k in [
             "RVL_SPEC_VERSION",
-            "RVL_API_KEY",
             "RVL_BASE_REF",
             "GITHUB_BASE_REF",
             "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",

@@ -19,7 +19,7 @@ The keys this binary reads are:
 | `scanner.agent_hooks.<hook>.enabled` | Per-hook opt-in for that lane. |
 | `scanner.agent_verdicts` | `gate` promotes agent `violates` verdicts into the BLOCKING section; anything else keeps them advisory. |
 | `scanner.model_threads` | CPU threads for local model inference (default 4, at least 1). Verdicts do not depend on it; it trades scan time for CPU. |
-| `scanner.decision_model` | `on` runs the decision-model lane: after the deterministic lanes, each undecided runtime call site is asked the question of every frame (from the spec cache) whose control the cached model serves, on this machine. `violates` decisions are advisory findings (`model.<control>`); other controls abstain and are named on the COVERAGE line. A site outside runtime code (dev_only, test_support, migration, backfill) is not asked; the COVERAGE line counts them. Off by default. Needs the bundle `rvl model sync` caches (an API key; `RVL_OFFLINE=1` uses the cached bundle). |
+| `scanner.decision_model` | `on` runs the decision-model lane: after the deterministic lanes, each undecided runtime call site is asked the question of every frame (from the spec cache) whose control the cached model serves, on this machine. `violates` decisions are advisory findings (`model.<control>`); other controls abstain and are named on the COVERAGE line. A site outside runtime code (dev_only, test_support, migration, backfill) is not asked; the COVERAGE line counts them. Off by default. Needs an API key and the bundle `rvl model sync` caches (`RVL_OFFLINE=1` uses the cached bundle). Without a key the lane does not run, even when a bundle is cached. |
 | `scanner.decision_model_budget` | The longest the decision model may run in one scan (default `60s`; `90`, `150s`, `5m`, `1h`). Questions are asked site by site in scan order; the ones the budget does not reach abstain, and the COVERAGE line counts them and names the first file cut. Under a hook and `--changed-only` the budget is at most `60s`, whatever this says. A full scan of a large repository may need more: a scan that runs out says so. |
 
 Unknown keys are tolerated everywhere, so the same file can carry settings for
@@ -129,8 +129,14 @@ relocates it. Under that root live two independent stores:
 Both artifacts are signature-verified against the same pinned keyset at fetch
 and at load. At scan time the two layer: the OSS tier is the base payload and
 the commercial tier the overlay, so a keyed install adds the judgment lanes
-on top of the public vocabulary baseline, and removing the key falls back to
-the baseline. The judgments corpus (what grades a finding) rides only in the
+on top of the public vocabulary baseline.
+
+Without a key, nothing commercial loads. A run with no `RVL_API_KEY` and no
+`api_key` in the config file loads the OSS tier alone. It does not read a
+commercial tier (`current/` or `last-good/`) or a decision model (`model/`)
+that an earlier keyed install cached. The files stay on disk, so the next run
+with the key loads them again. A keyless scan that skips a cached commercial
+tier says so on stderr. The judgments corpus (what grades a finding) rides only in the
 commercial tier. See [Scanning your repo with rvl](scanning.md) for the
 user-facing guide.
 
