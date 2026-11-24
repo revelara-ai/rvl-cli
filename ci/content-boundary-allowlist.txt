@@ -1,0 +1,21 @@
+# Files allowed to cross the content boundary (ci/check-content-boundary.py).
+# One entry per line: <rule> <path> <reason>. The reason is required, and an
+# entry that matches nothing fails the check, so remove it with its last use.
+# A new entry is a boundary decision: content belongs on the Revelara API.
+
+# embed: production code
+embed crates/rvl/src/context_files.rs the managed AGENTS.md/CLAUDE.md template rvl writes into a repo (its test module also embeds the goldens)
+embed crates/rvl/src/embedded_helpers.rs the pyindex, tsindex and javaindex retriever sources: mechanism the binary runs, not content
+embed crates/rvl-skills/src/prompt_hook.rs reads its reminder from the same AGENTS.md template context_files.rs embeds, so the two cannot drift
+
+# embed: test modules and integration tests only, never compiled into a release binary
+embed crates/rvl-config/src/key_ledger.rs test module embeds the retriever sources to check every config key they read is ledgered
+embed crates/rvl-config/src/construction.rs test module loads the construction-rules test fixture
+embed crates/rvl-config/src/terraform.rs test module loads Terraform fixtures from testdata
+embed crates/rvl/src/main.rs test module loads the construction-rules test fixture
+embed crates/rvl/tests/cli.rs integration test loads the hand-authored server-spec test seed
+embed crates/rvl/tests/determinism.rs integration test loads the hand-authored server-spec test seed
+
+# artifact: test fixtures
+artifact crates/rvl-model/testdata/tiny-classifier/model.onnx 2 KB toy network with generated weights, written by make_tiny_classifier.py to drive the ONNX Runtime lane in tests
+artifact crates/rvl/tests/fixtures/c_seed_judgments.json three hand-authored test judgments for the C lane e2e, not the published corpus

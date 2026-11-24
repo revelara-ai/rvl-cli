@@ -296,6 +296,14 @@ jobs:
           npm ci
           node --test
 
+      # rvl-cli holds mechanism only: commercial content is served by the API
+      # behind a key. Fails on a new include_str!/include_bytes!/include_dir!
+      # outside ci/content-boundary-allowlist.txt and on a committed file
+      # shaped like signed spec-cache content, a judgments ruleset or model
+      # weights. Runs the check's own tests first.
+      - name: Content boundary
+        run: make content-boundary
+
       - name: No internal codenames
         run: |
           # concatenated so this pattern never matches its own source

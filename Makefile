@@ -41,7 +41,7 @@ endif
 
 BIN_DIR := target/$(PROFILE)
 
-.PHONY: build rebuild install uninstall helpers helpers-csindex dev test lint fmt fmt-check clippy clean help
+.PHONY: build rebuild install uninstall helpers helpers-csindex dev test lint fmt fmt-check clippy content-boundary clean help
 
 ## build: compile the rvl workspace binaries
 build:
@@ -123,6 +123,11 @@ fmt:
 ## fmt-check: verify formatting without writing
 fmt-check:
 	$(CARGO) fmt --all --check
+
+## content-boundary: fail on embedded content or committed artifacts (ci/check-content-boundary.py), after its own tests
+content-boundary:
+	python3 -I -B -m unittest discover -s ci -p 'test_*.py'
+	python3 -I ci/check-content-boundary.py
 
 ## clean: remove build artifacts
 clean:
