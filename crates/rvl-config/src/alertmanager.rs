@@ -116,47 +116,67 @@ impl ConfigRetriever for Alertmanager {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        let mut out = Retrieved::default();
-        let Ok(Value::Mapping(root)) = serde_yaml::from_str::<Value>(contents) else {
-            // No rendering on the scan path: a Helm template is not broken
-            // YAML, it is a variant this retriever declines.
-            if helm_templated(contents) {
-                out.sightings
-                    .push(FormatSighting::declined("alertmanager-templated", 1));
-            } else {
-                out.unparseable = 1;
-            }
-            return out;
-        };
-        let Some(route) = get(&root, "route").and_then(Value::as_mapping) else {
-            out.unparseable = 1;
-            return out;
-        };
-        let em = Emitter {
-            rel_path,
-            snapshot_id,
-            receivers: receivers(&root),
-        };
-        em.route(route, "route:root", "route", None, &mut out);
-
-        // inhibit_rules: shape-only presence; the matchers never leave.
-        let inhibits = get(&root, "inhibit_rules")
-            .and_then(Value::as_sequence)
-            .is_some_and(|s| !s.is_empty());
-        let (value, role) = if inhibits {
-            ("nonempty", "explicit")
-        } else {
-            ("", "absent")
-        };
-        out.packets.push(em.packet(
-            "config",
-            "inhibit_rules",
-            Some(value.to_string()),
-            Resolution::AsAuthored,
-            vec![ProvenanceStep::new(rel_path, "inhibit_rules", role)],
-        ));
+        let mut out = retrieve(rel_path, contents, snapshot_id);
+        crate::non_production::undecide_unit(None, rel_path, &mut out);
         out
     }
+
+    /// The walk's entry: the root names a sample repository
+    /// ([`crate::non_production::undecide_unit`]).
+    fn retrieve_with_root(
+        &self,
+        root: &std::path::Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let mut out = retrieve(rel_path, contents, snapshot_id);
+        crate::non_production::undecide_unit(Some(root), rel_path, &mut out);
+        out
+    }
+}
+
+fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+    let mut out = Retrieved::default();
+    let Ok(Value::Mapping(root)) = serde_yaml::from_str::<Value>(contents) else {
+        // No rendering on the scan path: a Helm template is not broken
+        // YAML, it is a variant this retriever declines.
+        if helm_templated(contents) {
+            out.sightings
+                .push(FormatSighting::declined("alertmanager-templated", 1));
+        } else {
+            out.unparseable = 1;
+        }
+        return out;
+    };
+    let Some(route) = get(&root, "route").and_then(Value::as_mapping) else {
+        out.unparseable = 1;
+        return out;
+    };
+    let em = Emitter {
+        rel_path,
+        snapshot_id,
+        receivers: receivers(&root),
+    };
+    em.route(route, "route:root", "route", None, &mut out);
+
+    // inhibit_rules: shape-only presence; the matchers never leave.
+    let inhibits = get(&root, "inhibit_rules")
+        .and_then(Value::as_sequence)
+        .is_some_and(|s| !s.is_empty());
+    let (value, role) = if inhibits {
+        ("nonempty", "explicit")
+    } else {
+        ("", "absent")
+    };
+    out.packets.push(em.packet(
+        "config",
+        "inhibit_rules",
+        Some(value.to_string()),
+        Resolution::AsAuthored,
+        vec![ProvenanceStep::new(rel_path, "inhibit_rules", role)],
+    ));
+    out
 }
 
 /// Defined receiver names, each mapped to whether it carries at least one
@@ -405,6 +425,27 @@ mod tests {
     }
 
     // --- route grouping: explicit, inherited, platform default ---
+
+    #[test]
+    fn a_config_in_a_sample_repository_carries_every_fact_undecided() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("monitoring-workshop");
+        let got = Alertmanager.retrieve_with_root(&root, PATH, BARE, "snap");
+        assert!(!got.packets.is_empty());
+        for p in &got.packets {
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("undecided: non-production repository: workshop"),
+                "{}",
+                p.key
+            );
+        }
+        let got = Alertmanager.retrieve("local/alertmanager.yml", BARE, "snap");
+        assert!(got
+            .packets
+            .iter()
+            .all(|p| p.resolved_value.as_deref() == Some("undecided: non-production path: local")));
+    }
 
     #[test]
     fn explicit_root_grouping_resolves_as_authored() {

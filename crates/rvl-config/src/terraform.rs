@@ -67,6 +67,12 @@
 //!     `terraform.backend`, emitted where a missing backend is a finding and
 //!     nowhere else (see [`emit_module_kinds`]).
 //!
+//! What a spec must not judge is carried as [`crate::UNDECIDED_PREFIX`] and
+//! why (see [`gate_undeployed`]): every fact of a file that is not deployed
+//! to production ([`crate::non_production`]); a resource attribute a
+//! reusable module takes from a variable or leaves unset; and the backup
+//! and availability facts of a Cloud SQL read replica.
+//!
 //! Variable references resolve ONE hop and only to literals: a value that is
 //! exactly `var.x` consults the module directory's `variable "x"` default,
 //! overlaid by `terraform.tfvars` then `*.auto.tfvars` (lexical order, later
@@ -108,7 +114,7 @@ impl ConfigRetriever for Terraform {
     /// no special following: their directory is a group here like any other.
     fn retrieve_all(
         &self,
-        _root: &std::path::Path,
+        root: &std::path::Path,
         files: &[(String, String)],
         snapshot_id: &str,
     ) -> Retrieved {
@@ -124,8 +130,38 @@ impl ConfigRetriever for Terraform {
             group.sort_by(|a, b| a.0.cmp(&b.0));
             modules.extend(retrieve_dir(dir, &group, snapshot_id, &mut out));
         }
-        emit_module_kinds(&modules, snapshot_id, &mut out);
+        let reusable = emit_module_kinds(&modules, snapshot_id, &mut out);
+        gate_undeployed(root, &reusable, &mut out);
         out
+    }
+}
+
+/// Undecide what a spec must not judge here (see [`crate::non_production`]).
+///
+///   * Every packet of a file that is not deployed to production, but
+///     `terraform.module-kind`: that says what a module IS, not a setting.
+///   * In a reusable module, a resource attribute the module takes from a
+///     variable or leaves unset: the caller sets it, so the module's
+///     default is no fact about any deployment. A literal the module
+///     authors stays a fact, and so does `lifecycle.prevent_destroy`,
+///     which no caller can set.
+fn gate_undeployed(root: &std::path::Path, reusable: &[&str], out: &mut Retrieved) {
+    let repo = crate::non_production::root_token(root);
+    for p in &mut out.packets {
+        if p.key != "terraform.module-kind" {
+            if let Some(why) = crate::non_production::reason(repo, &p.file_path) {
+                crate::non_production::undecide(p, &why);
+            }
+        }
+        let caller_sets = p.resolution == Resolution::PlatformDefault
+            || p.provenance.first().is_some_and(|s| s.role == "reference");
+        if caller_sets
+            && p.unit.starts_with("resource:")
+            && p.key != "resource.lifecycle.prevent_destroy"
+            && reusable.contains(&dir_of(&p.file_path))
+        {
+            crate::non_production::undecide(p, "reusable module: the caller sets this");
+        }
     }
 }
 
@@ -1096,6 +1132,15 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
     },
 ];
 
+/// The Cloud SQL facts a read replica (`master_instance_name` set) carries
+/// undecided: its primary holds the backups, and the replica's own
+/// availability type is not the instance's failover posture.
+const REPLICA_UNDECIDED: &[&str] = &[
+    "resource.google_sql_database_instance.backup_configuration.enabled",
+    "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
+    "resource.google_sql_database_instance.settings.availability_type",
+];
+
 /// The shape of a GCP location name: `region` (`us-central1`) or `zone`
 /// (`us-central1-a`). Anything else is `None`, never a guess.
 fn location_shape(location: &str) -> Option<&'static str> {
@@ -1693,7 +1738,14 @@ struct ModuleFacts {
 ///     shared module declares no provider configuration.
 ///   * neither → `indeterminate`, and NO root-backend packet: abstaining
 ///     beats flagging a published module for lacking a backend.
-fn emit_module_kinds(modules: &[ModuleFacts], snapshot_id: &str, out: &mut Retrieved) {
+///
+/// Returns the directories of the reusable modules.
+fn emit_module_kinds<'a>(
+    modules: &'a [ModuleFacts],
+    snapshot_id: &str,
+    out: &mut Retrieved,
+) -> Vec<&'a str> {
+    let mut reusable = Vec::new();
     // Target directory → the first call that names it from ANOTHER directory.
     let mut callers: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
     for m in modules {
@@ -1733,7 +1785,11 @@ fn emit_module_kinds(modules: &[ModuleFacts], snapshot_id: &str, out: &mut Retri
                 ..m.backend.clone()
             });
         }
+        if kind == "reusable" {
+            reusable.push(m.dir.as_str());
+        }
     }
+    reusable
 }
 
 /// Retrieve one module directory: `group` is path-sorted (rel, contents).
@@ -2161,6 +2217,8 @@ fn retrieve_dir(
             }
 
             // The resource-attribute lane: only the rows of RESOURCE_ATTRS.
+            let replica = ty == "google_sql_database_instance"
+                && get_attr(&b.body, "master_instance_name").is_some();
             for row in RESOURCE_ATTRS.iter().filter(|r| r.resource_type == ty) {
                 if row
                     .unless_attr
@@ -2175,8 +2233,11 @@ fn retrieve_dir(
                     .join(".");
                 let found = lookup_attr(&b.body, row.blocks, row.attr);
                 let (value, resolution, prov) = resolve_row(row, rel, &key_path, found, &vars);
-                out.packets
-                    .push(packet(rel, &unit, row.packet_key, value, resolution, prov));
+                let mut p = packet(rel, &unit, row.packet_key, value, resolution, prov);
+                if replica && REPLICA_UNDECIDED.contains(&row.packet_key) {
+                    crate::non_production::undecide(&mut p, "read replica");
+                }
+                out.packets.push(p);
             }
 
             if let Some((key, (value, resolution, prov))) =
@@ -2554,6 +2615,122 @@ module "local" {
             "{:#?}",
             got.packets
         );
+    }
+
+    #[test]
+    fn a_module_under_a_non_production_path_carries_its_facts_undecided() {
+        let got = one(&[(
+            "course/infra/labs/gcp/02-wordpress/main.tf",
+            "provider \"google\" {}\nresource \"google_sql_database_instance\" \"db\" {\n  settings {\n    tier = \"db-f1-micro\"\n  }\n}\n",
+        )]);
+        let enabled = find(
+            &got,
+            "resource:google_sql_database_instance.db",
+            "resource.google_sql_database_instance.backup_configuration.enabled",
+        );
+        assert_eq!(
+            enabled.resolved_value.as_deref(),
+            Some("undecided: non-production path: course")
+        );
+        for p in got
+            .packets
+            .iter()
+            .filter(|p| p.key != "terraform.module-kind")
+        {
+            let v = p.resolved_value.as_deref().unwrap_or("undecided: ");
+            assert!(v.starts_with("undecided: "), "{}: {v}", p.key);
+        }
+        // What the module IS stays a fact.
+        assert_eq!(
+            module_kind(&got, "course/infra/labs/gcp/02-wordpress/main.tf"),
+            "root"
+        );
+        let got = one(&[(
+            "infra/staging/db.tf",
+            "resource \"aws_db_instance\" \"db\" {}\n",
+        )]);
+        let p = find(
+            &got,
+            "resource:aws_db_instance.db",
+            "resource.aws_db_instance.backup_retention_period",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn a_cloud_sql_read_replica_carries_backup_and_availability_undecided() {
+        let got = one(&[(
+            "db.tf",
+            "resource \"google_sql_database_instance\" \"replica\" {\n  master_instance_name = google_sql_database_instance.main.name\n  settings {\n    tier = \"db-custom-2-7680\"\n  }\n}\n",
+        )]);
+        for key in [
+            "resource.google_sql_database_instance.backup_configuration.enabled",
+            "resource.google_sql_database_instance.backup_configuration.point_in_time_recovery_enabled",
+            "resource.google_sql_database_instance.settings.availability_type",
+        ] {
+            let p = find(&got, "resource:google_sql_database_instance.replica", key);
+            assert_eq!(p.resolved_value.as_deref(), Some("undecided: read replica"), "{key}");
+        }
+        // The primary is still judged.
+        let got = one(&[(
+            "db.tf",
+            "resource \"google_sql_database_instance\" \"main\" {\n  settings {\n    tier = \"db-custom-2-7680\"\n  }\n}\n",
+        )]);
+        let p = find(
+            &got,
+            "resource:google_sql_database_instance.main",
+            "resource.google_sql_database_instance.settings.availability_type",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some("ZONAL"));
+    }
+
+    #[test]
+    fn a_reusable_module_leaves_to_its_caller_what_it_does_not_author() {
+        const REUSABLE: &str = "undecided: reusable module: the caller sets this";
+        let got = one(&[
+            (
+                "envs/prod/main.tf",
+                "provider \"aws\" {}\nmodule \"db\" {\n  source = \"../../modules/postgresql\"\n}\n",
+            ),
+            (
+                "modules/postgresql/main.tf",
+                "variable \"multi_az\" {\n  default = false\n}\nresource \"aws_db_instance\" \"db\" {\n  multi_az = var.multi_az\n  backup_retention_period = 7\n}\n",
+            ),
+        ]);
+        assert_eq!(module_kind(&got, "modules/postgresql/main.tf"), "reusable");
+        let value = |key: &str| {
+            find(&got, "resource:aws_db_instance.db", key)
+                .resolved_value
+                .clone()
+                .unwrap_or_default()
+        };
+        // From a variable: the caller sets it.
+        assert_eq!(value("resource.aws_db_instance.multi_az"), REUSABLE);
+        // A literal the module authors stays a fact.
+        assert_eq!(
+            value("resource.aws_db_instance.backup_retention_period"),
+            "7"
+        );
+        // No caller can set a lifecycle, so its default stays a fact.
+        assert_eq!(value("resource.lifecycle.prevent_destroy"), "false");
+
+        // Unset, in a module the caller configures.
+        let got = one(&[
+            (
+                "main.tf",
+                "provider \"google\" {}\nmodule \"sql\" {\n  source = \"./modules/cloudsql-instance\"\n}\n",
+            ),
+            (
+                "modules/cloudsql-instance/main.tf",
+                "resource \"google_sql_database_instance\" \"db\" {\n  settings {\n    tier = \"db-f1-micro\"\n  }\n}\n",
+            ),
+        ]);
+        let p = find(
+            &got,
+            "resource:google_sql_database_instance.db",
+            "resource.google_sql_database_instance.backup_configuration.enabled",
+        );
+        assert_eq!(p.resolved_value.as_deref(), Some(REUSABLE));
     }
 
     #[test]
@@ -3420,7 +3597,7 @@ module "local" {
                 "envs/prod/versions.tf",
                 "terraform {\n  required_version = \">= 1.5\"\n}\n",
             ),
-            ("envs/dev/main.tf", "resource \"a\" \"b\" {}\n"),
+            ("envs/staging/main.tf", "resource \"a\" \"b\" {}\n"),
         ]);
         // prod merges the two terraform blocks: backend from one file,
         // required_version from the other.
@@ -3438,12 +3615,12 @@ module "local" {
             })
             .expect("prod required_version packet");
         assert_eq!(prod_rv.resolved_value.as_deref(), Some(">= 1.5"));
-        // dev is its own module with its own defaults.
+        // staging is its own module with its own defaults.
         let dev_backend = got
             .packets
             .iter()
-            .find(|p| p.file_path == "envs/dev/main.tf" && p.key == "terraform.backend")
-            .expect("dev backend packet");
+            .find(|p| p.file_path == "envs/staging/main.tf" && p.key == "terraform.backend")
+            .expect("staging backend packet");
         assert_eq!(dev_backend.resolved_value.as_deref(), Some("local"));
     }
 
