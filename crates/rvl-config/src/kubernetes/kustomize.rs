@@ -11,10 +11,12 @@
 //!
 //! Bounded on purpose: depth-capped recursion with cycle detection, no path
 //! ever escapes the repo root, no remote bases. What the bounded merge
-//! cannot resolve honestly — JSON6902 op lists, `$patch`/`$retainKeys`
+//! cannot resolve honestly — JSON6902 op lists, nested `$patch`/`$retainKeys`
 //! directives, remote or missing references — drops the affected resource
 //! and records a `kubernetes-kustomize-unresolved` sighting: an abstention,
-//! never a guess.
+//! never a guess. A patch whose top level is `$patch: delete` is resolved:
+//! the resource it names is not in the kustomization's output, so it emits
+//! nothing from it and the rendered set stays complete.
 
 use super::manifest::{self, get, lookup, Emitter, ProvenanceOracle, RenderedSet};
 use crate::{FormatSighting, ProvenanceStep, Resolution, Retrieved};
@@ -330,18 +332,24 @@ impl Resolver<'_> {
                 },
                 (None, None) => continue,
             };
-            match serde_yaml::from_str::<Value>(&text) {
-                Ok(Value::Sequence(_)) => self.drop_matching(&mut resources, &target),
-                Ok(doc @ Value::Mapping(_)) => {
-                    // An explicit target wins over the patch doc's identity.
-                    let t = if get(em, "target").is_some() {
-                        target
-                    } else {
-                        Target::from_doc(&doc)
-                    };
-                    self.apply_smp(&mut resources, &doc, t, &pfile);
-                }
-                _ => self.unparseable += 1,
+            if let Ok(Value::Sequence(_)) = serde_yaml::from_str::<Value>(&text) {
+                self.drop_matching(&mut resources, &target);
+                continue;
+            }
+            // A patch file may hold several documents (one per resource it
+            // deletes, say), each naming its own target.
+            let (docs, failed) = manifest::parse_docs(&text);
+            if failed || docs.is_empty() {
+                self.unparseable += 1;
+            }
+            for doc in docs {
+                // An explicit target wins over the patch doc's identity.
+                let t = if get(em, "target").is_some() {
+                    Target::from_mapping(get(em, "target").and_then(Value::as_mapping))
+                } else {
+                    Target::from_doc(&doc)
+                };
+                self.apply_smp(&mut resources, &doc, t, &pfile);
             }
         }
         for _ in seq(kdoc, "patchesJson6902") {
@@ -398,6 +406,16 @@ impl Resolver<'_> {
         target: Target,
         pfile: &str,
     ) {
+        // `$patch: delete` at the top removes the resource from the output:
+        // a decided fact, no abstention.
+        let directive = patch
+            .as_mapping()
+            .and_then(|m| get(m, "$patch"))
+            .and_then(Value::as_str);
+        if directive == Some("delete") && target.name.is_some() {
+            resources.retain(|r| !target.matches(r));
+            return;
+        }
         if has_directive(patch) {
             self.drop_matching(resources, &target);
             return;
@@ -1037,5 +1055,113 @@ spec:
             find(&got, "deployment:web", "workload.replicas");
             assert!(coverage(&got).is_none(), "{hole}: {:?}", coverage(&got));
         }
+    }
+
+    fn statefulset(name: &str) -> String {
+        format!(
+            "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: {name}\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n        - name: {name}\n          image: {name}:1\n"
+        )
+    }
+
+    /// A base of an `api` Deployment and two StatefulSets, and a production
+    /// overlay that applies `patch` (a multi-document file) as `field`.
+    fn overlay(field: &str, patch: &str) -> Retrieved {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "k8s/base/api.yaml", BASE_DEPLOY);
+        write(root, "k8s/base/cache.yaml", &statefulset("cache"));
+        write(root, "k8s/base/store.yaml", &statefulset("store"));
+        write(
+            root,
+            "k8s/base/kustomization.yaml",
+            "resources:\n  - api.yaml\n  - cache.yaml\n  - store.yaml\n",
+        );
+        write(root, "k8s/overlays/production/databases.yaml", patch);
+        let entry = match field {
+            "patches" => "patches:\n  - path: databases.yaml\n",
+            _ => "patchesStrategicMerge:\n  - databases.yaml\n",
+        };
+        write(
+            root,
+            "k8s/overlays/production/kustomization.yaml",
+            &format!("resources:\n  - ../../base\n{entry}"),
+        );
+        run(root, "k8s/overlays/production/kustomization.yaml")
+    }
+
+    #[test]
+    fn a_resource_the_overlay_deletes_emits_nothing_from_it() {
+        let delete = "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: cache\n$patch: delete\n---\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: store\n$patch: delete\n";
+        for field in ["patches", "patchesStrategicMerge"] {
+            let got = overlay(field, delete);
+            assert!(
+                !got.packets
+                    .iter()
+                    .any(|p| p.unit.contains("cache") || p.unit.contains("store")),
+                "{field}: {:?}",
+                got.packets
+            );
+            // The rest of the overlay is resolved, and the deletion is a
+            // decided fact, not a hole in the set.
+            find(&got, "deployment:web", "workload.replicas");
+            assert!(got.sightings.is_empty(), "{field}: {:?}", got.sightings);
+            assert!(coverage(&got).is_some(), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_resource_the_overlay_patches_without_deleting_keeps_its_rows() {
+        let patch = "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: cache\nspec:\n  replicas: 1\n---\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: store\nspec:\n  replicas: 1\n";
+        for field in ["patches", "patchesStrategicMerge"] {
+            let got = overlay(field, patch);
+            for name in ["cache", "store"] {
+                let p = find(&got, &format!("statefulset:{name}"), "workload.replicas");
+                assert_eq!(p.resolved_value.as_deref(), Some("1"), "{field}");
+                find(
+                    &got,
+                    &format!("container:statefulset/{name}/{name}"),
+                    "container.resources.requests.cpu",
+                );
+            }
+        }
+    }
+
+    fn autoscaled_base(min: &str) -> Retrieved {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "k8s/base/dispatch.yaml",
+            &BASE_DEPLOY.replace("name: web", "name: dispatch"),
+        );
+        write(
+            root,
+            "k8s/base/hpa.yaml",
+            &format!("apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: dispatch\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: dispatch\n  minReplicas: {min}\n  maxReplicas: 4\n"),
+        );
+        write(
+            root,
+            "k8s/base/kustomization.yaml",
+            "resources:\n  - dispatch.yaml\n  - hpa.yaml\n",
+        );
+        run(root, "k8s/base/kustomization.yaml")
+    }
+
+    #[test]
+    fn an_autoscaler_of_the_kustomization_sets_the_replica_floor() {
+        let got = autoscaled_base("2");
+        assert!(
+            !got.packets
+                .iter()
+                .any(|p| p.unit == "deployment:dispatch" && p.key == "workload.replicas"),
+            "{:?}",
+            got.packets
+        );
+        let p = find(&got, "hpa:dispatch", "hpa.min-replicas");
+        assert_eq!(p.resolved_value.as_deref(), Some("2"));
+        // A floor of one is still the row RC-017 judges.
+        let got = autoscaled_base("1");
+        let p = find(&got, "hpa:dispatch", "hpa.min-replicas");
+        assert_eq!(p.resolved_value.as_deref(), Some("1"));
     }
 }

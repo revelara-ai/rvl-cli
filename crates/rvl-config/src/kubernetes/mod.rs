@@ -263,12 +263,20 @@ mod tests {
             "cnpg/cluster-dev.yaml",
             "docs/content/reference/deploy.yml",
             "hack/dev-env/web.yaml",
+            ".bootstrap/localstack/manifests/deployment.yaml",
+            "k8s/single-node/agent.yml",
+            ".github/db-client.yaml",
+            "archive/network/echo.yaml",
+            "deploy/wiremock/wiremock-deployment.yaml",
+            "k8s/apps/stress-cpu.yaml",
+            "cluster/canary/merger.yaml",
         ] {
             let got = Kubernetes.retrieve(path, DEPLOY, "snap");
             assert!(got.packets.is_empty(), "{path}: {:?}", got.packets);
         }
         for path in [
             "deploy/production/app.yaml",
+            "deploy/production/api.yaml",
             "devops/k8s/app.yaml",
             "clusters/live/apps/api.yaml",
         ] {

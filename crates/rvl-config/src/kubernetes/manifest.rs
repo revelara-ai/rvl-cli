@@ -40,6 +40,13 @@
 //!     specs abstain on it; so does `workload.replicas` for a one-replica
 //!     Deployment or StatefulSet whose containers take a leader-election
 //!     flag (see [`leader_election_arg`]): a singleton by design
+//!   * every key of a workload whose name is an unexpanded placeholder
+//!     ([`crate::non_production::placeholder_name`]) or that is scaled to
+//!     `replicas: 0` is carried as [`crate::UNDECIDED_PREFIX`] and why: a
+//!     template a script fills in, or a parked copy that runs nothing
+//!   * `workload.replicas` is not emitted for a workload a
+//!     HorizontalPodAutoscaler of the same RENDERED SET targets: the
+//!     autoscaler's `hpa.min-replicas` is the replica floor
 //!   * `pdb.min-available` / `pdb.max-unavailable` (authored only: the API
 //!     requires exactly one, so the pair's absence is invalid config, not a
 //!     decidable default)
@@ -294,6 +301,13 @@ enum Selects {
     Unknown,
 }
 
+/// What one HorizontalPodAutoscaler of a rendered set scales.
+struct HpaTarget {
+    kind: String,
+    name: String,
+    namespace: Option<String>,
+}
+
 /// PDB coverage of one workload within its rendered set.
 enum Coverage<'a> {
     Covered(&'a Pdb),
@@ -312,6 +326,7 @@ enum Coverage<'a> {
 /// then gets no coverage packet at all, which is how this family abstains.
 pub(super) struct RenderedSet {
     pdbs: Vec<Pdb>,
+    hpas: Vec<HpaTarget>,
     complete: bool,
 }
 
@@ -319,6 +334,7 @@ impl RenderedSet {
     pub(super) fn new() -> Self {
         Self {
             pdbs: Vec::new(),
+            hpas: Vec::new(),
             complete: true,
         }
     }
@@ -328,11 +344,28 @@ impl RenderedSet {
         self.complete = false;
     }
 
-    /// Record `doc` when it is a PodDisruptionBudget; every other kind is
-    /// not part of the coverage question.
+    /// Record `doc` when it is a PodDisruptionBudget or a
+    /// HorizontalPodAutoscaler; every other kind answers no question of
+    /// another document.
     pub(super) fn add(&mut self, file: &str, doc: &Value) {
-        if dig(doc, &["kind"]).and_then(Value::as_str) != Some("PodDisruptionBudget") {
-            return;
+        match dig(doc, &["kind"]).and_then(Value::as_str) {
+            Some("PodDisruptionBudget") => {}
+            Some("HorizontalPodAutoscaler") => {
+                let target = |field: &str| {
+                    dig(doc, &["spec", "scaleTargetRef", field])
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                if let (Some(kind), Some(name)) = (target("kind"), target("name")) {
+                    self.hpas.push(HpaTarget {
+                        kind,
+                        name,
+                        namespace: namespace_of(doc),
+                    });
+                }
+                return;
+            }
+            _ => return,
         }
         let Some(name) = dig(doc, &["metadata", "name"]).and_then(Value::as_str) else {
             return;
@@ -347,6 +380,19 @@ impl RenderedSet {
                 .filter(|v| !v.is_null())
                 .cloned(),
         });
+    }
+
+    /// Whether an autoscaler of the set scales the `kind` named `name`. A
+    /// namespace only one side states is taken to match: both are applied
+    /// together, with one `-n`.
+    fn autoscaled(&self, kind: &str, name: &str, namespace: Option<&str>) -> bool {
+        self.hpas.iter().any(|h| {
+            h.kind == kind
+                && h.name == name
+                && (h.namespace.is_none()
+                    || namespace.is_none()
+                    || h.namespace.as_deref() == namespace)
+        })
     }
 
     fn coverage(&self, namespace: Option<&str>, labels: Option<&Mapping>) -> Coverage<'_> {
@@ -676,7 +722,8 @@ fn replicated(kind: &str) -> bool {
 }
 
 /// The rendered set of a bare manifest file: its own documents plus the
-/// PodDisruptionBudgets of the other YAML files of its directory. Without a
+/// PodDisruptionBudgets and autoscalers of the other YAML files of its
+/// directory. Without a
 /// `root` the directory cannot be listed and the set is incomplete.
 fn directory_set(root: Option<&Path>, rel_path: &str, own: &[Value], failed: bool) -> RenderedSet {
     let mut set = RenderedSet::new();
@@ -723,7 +770,7 @@ fn directory_set(root: Option<&Path>, rel_path: &str, own: &[Value], failed: boo
             set.mark_incomplete();
             continue;
         };
-        if !text.contains("PodDisruptionBudget") {
+        if !text.contains("PodDisruptionBudget") && !text.contains("HorizontalPodAutoscaler") {
             continue;
         }
         // A templated budget has a selector no committed input renders here.
@@ -778,11 +825,36 @@ fn leader_election_arg<'a>(doc: &'a Value, pod_prefix: &str) -> Option<&'a str> 
         })
 }
 
+/// The reason a workload's facts are not judged at all: its name is a
+/// placeholder a script substitutes, or it is scaled to zero and runs
+/// nothing. `None` for every other document.
+fn idle_workload(doc: &Value) -> Option<&'static str> {
+    let kind = dig(doc, &["kind"]).and_then(Value::as_str)?;
+    workload_shape(kind)?;
+    let name = dig(doc, &["metadata", "name"]).and_then(Value::as_str)?;
+    if crate::non_production::placeholder_name(name) {
+        return Some(crate::non_production::PLACEHOLDER_REASON);
+    }
+    let zero = lookup(doc, "spec.replicas").is_some_and(|v| render_value(v) == "0");
+    (replicated(kind) && zero).then_some("replicas: 0, the workload runs nothing")
+}
+
 /// Extract packets from one parsed document into the emitter. Documents of
 /// kinds outside the inventory emit nothing (valid Kubernetes, no facts the
 /// G6 control set asks about). `set` is the rendered set `doc` belongs to,
-/// which answers the one fact a document cannot answer about itself.
+/// which answers the facts a document cannot answer about itself. The
+/// packets of an idle workload ([`idle_workload`]) are carried undecided.
 pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter) {
+    let start = em.out.len();
+    emit_doc(doc, set, em);
+    if let Some(why) = idle_workload(doc) {
+        for p in &mut em.out[start..] {
+            crate::non_production::undecide(p, why);
+        }
+    }
+}
+
+fn emit_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter) {
     let Some(root) = doc.as_mapping() else { return };
     let Some(kind) = get(root, "kind").and_then(Value::as_str) else {
         return;
@@ -846,7 +918,11 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
         prefix.push_str(seg);
     }
 
-    if matches!(kind, "Deployment" | "StatefulSet") {
+    // An autoscaler that targets the workload sets its replica count; its
+    // `hpa.min-replicas` is the floor RC-017 judges, so the authored count
+    // is no fact about it.
+    let autoscaled = set.autoscaled(kind, name, namespace_of(doc).as_deref());
+    if matches!(kind, "Deployment" | "StatefulSet") && !autoscaled {
         let one = lookup(doc, "spec.replicas").is_none_or(|v| render_value(v) == "1");
         match leader_election_arg(doc, &prefix).filter(|_| one) {
             Some(arg) => em.undecided(
@@ -2466,5 +2542,138 @@ spec:
         let p = find(&got, "statefulset:web", "workload.pdb-coverage");
         assert_eq!(p.resolved_value.as_deref(), Some("none"));
         find(&got, "statefulset:web", "pod.anti-affinity");
+    }
+
+    // --- idle workloads and autoscaled replica counts ---
+
+    fn workload(name: &str, replicas: &str) -> String {
+        format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  template:\n    spec:\n      containers:\n        - name: app\n          image: app:v1\n"
+        )
+    }
+
+    /// The RC-017, RC-020 and RC-024 rows of one Deployment and its `app`
+    /// container.
+    fn judged_rows<'a>(got: &'a Retrieved, name: &str) -> Vec<&'a ConfigPacket> {
+        let cunit = format!("container:deployment/{name}/app");
+        let wunit = format!("deployment:{name}");
+        got.packets
+            .iter()
+            .filter(|p| {
+                (p.unit == wunit && p.key == "workload.replicas")
+                    || (p.unit == cunit
+                        && [
+                            "container.liveness-probe",
+                            "container.readiness-probe",
+                            "container.resources.requests.cpu",
+                            "container.resources.requests.memory",
+                        ]
+                        .contains(&p.key.as_str()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_workload_named_by_an_unexpanded_placeholder_abstains() {
+        for (path, name) in [
+            ("k8s/deployment.yaml", "board-deployment-PR_NUMBER"),
+            ("deploy/datastore/db/template.yaml", "db-$NAME"),
+            ("k8s/api.yaml", "api-${SUFFIX}"),
+        ] {
+            let got = retrieve_plain(None, path, &workload(name, "1"), "snap");
+            let rows = judged_rows(&got, name);
+            assert_eq!(rows.len(), 5, "{name}: {:?}", got.packets);
+            for p in rows {
+                assert_eq!(
+                    p.resolved_value.as_deref(),
+                    Some("undecided: unexpanded placeholder in the resource name"),
+                    "{name}: {}",
+                    p.key
+                );
+            }
+        }
+        // The same file with a name the API accepts is judged.
+        let got = retrieve_plain(
+            None,
+            "k8s/deployment.yaml",
+            &workload("board-deployment", "1"),
+            "snap",
+        );
+        assert_eq!(
+            value_of(&got, "deployment:board-deployment", "workload.replicas"),
+            "1"
+        );
+        assert_eq!(
+            value_of(
+                &got,
+                "container:deployment/board-deployment/app",
+                "container.resources.requests.cpu"
+            ),
+            "none"
+        );
+    }
+
+    #[test]
+    fn a_workload_scaled_to_zero_abstains() {
+        let path = "infra/k8s/db/deployment.yaml";
+        let got = retrieve_plain(None, path, &workload("db", "0"), "snap");
+        let rows = judged_rows(&got, "db");
+        assert_eq!(rows.len(), 5, "{:?}", got.packets);
+        for p in rows {
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("undecided: replicas: 0, the workload runs nothing"),
+                "{}",
+                p.key
+            );
+        }
+        let got = retrieve_plain(None, path, &workload("db", "1"), "snap");
+        assert_eq!(value_of(&got, "deployment:db", "workload.replicas"), "1");
+        assert_eq!(
+            value_of(
+                &got,
+                "container:deployment/db/app",
+                "container.liveness-probe"
+            ),
+            "none"
+        );
+    }
+
+    fn hpa(target: &str, min: &str) -> String {
+        format!(
+            "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: {target}\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: {target}\n  minReplicas: {min}\n  maxReplicas: 5\n"
+        )
+    }
+
+    #[test]
+    fn an_autoscaler_of_the_set_decides_the_replica_floor() {
+        let yaml = format!("{}---\n{}", workload("dispatch", "1"), hpa("dispatch", "2"));
+        let got = in_dir(&[("deploy.yaml", &yaml)]);
+        assert!(
+            !has_key(&got, "workload.replicas"),
+            "the autoscaler sets the count: {:?}",
+            got.packets
+        );
+        assert_eq!(value_of(&got, "hpa:dispatch", "hpa.min-replicas"), "2");
+
+        // An autoscaler in a sibling file of the directory is in the set.
+        let got = in_dir(&[
+            ("deploy.yaml", &workload("dispatch", "1")),
+            ("hpa.yaml", &hpa("dispatch", "2")),
+        ]);
+        assert!(!has_key(&got, "workload.replicas"), "{:?}", got.packets);
+
+        // An autoscaler with a floor of one is still a row RC-017 judges.
+        let yaml = format!("{}---\n{}", workload("dispatch", "1"), hpa("dispatch", "1"));
+        let got = in_dir(&[("deploy.yaml", &yaml)]);
+        assert_eq!(value_of(&got, "hpa:dispatch", "hpa.min-replicas"), "1");
+
+        // An autoscaler of another workload leaves the count a fact.
+        let yaml = format!("{}---\n{}", workload("dispatch", "1"), hpa("worker", "2"));
+        let got = in_dir(&[("deploy.yaml", &yaml)]);
+        assert_eq!(
+            value_of(&got, "deployment:dispatch", "workload.replicas"),
+            "1"
+        );
     }
 }
