@@ -207,6 +207,8 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "resource.aws_db_instance.backup_retention_period",
     ),
     judged("terraform", "resource.aws_db_instance.multi_az"),
+    judged("terraform", "resource.aws_iam.statement-wildcard"),
+    judged("terraform", "resource.aws_iam_access_key.declared"),
     judged(
         "terraform",
         "resource.aws_rds_cluster.backup_retention_period",
@@ -217,8 +219,14 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     ),
     judged(
         "terraform",
+        "resource.google_container_node_pool.node-identity",
+    ),
+    judged(
+        "terraform",
         "resource.google_container_node_pool.node_locations-count",
     ),
+    judged("terraform", "resource.google_iam.role-class"),
+    judged("terraform", "resource.google_service_account_key.declared"),
     judged(
         "terraform",
         "resource.google_sql_database_instance.backup_configuration.enabled",
@@ -567,6 +575,27 @@ mod tests {
         let q = mint_queue(&SpecCache::default());
         assert_eq!(q.specced, 0);
         assert_eq!(q.mint_queue + q.vocabulary_only, q.emitted);
+    }
+
+    /// The least-privilege facts (RC-044) ship before any spec: they are
+    /// measured over a cohort first, so each reads as awaiting a spec.
+    #[test]
+    fn the_least_privilege_facts_await_a_spec() {
+        let q = mint_queue(&SpecCache::default());
+        for key in [
+            "resource.google_service_account_key.declared",
+            "resource.aws_iam_access_key.declared",
+            "resource.google_iam.role-class",
+            "resource.aws_iam.statement-wildcard",
+            "resource.google_container_node_pool.node-identity",
+        ] {
+            let row = q
+                .keys
+                .iter()
+                .find(|r| r.format == "terraform" && r.key == key)
+                .unwrap_or_else(|| panic!("terraform {key} is not in the ledger"));
+            assert_eq!(row.state, KeyState::MintQueue, "{row:?}");
+        }
     }
 
     // A ledger key is emitted by a retriever from one file, and it is a key

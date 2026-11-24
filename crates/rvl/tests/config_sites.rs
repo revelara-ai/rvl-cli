@@ -333,3 +333,82 @@ fn rc079_release_job_supply_chain_is_decided_end_to_end() {
     }
     assert_eq!(rows.len(), 3, "the test job publishes nothing: {rows:?}");
 }
+
+/// The RC-044 least-privilege facts ship ahead of their specs: a scan of a
+/// module holding each resource kind writes every key into config_sites,
+/// and with no spec each row abstains and no finding is raised.
+#[test]
+fn rc044_least_privilege_facts_abstain_with_no_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    copy_tree(
+        &manifest_dir().join("../rvl-config/testdata/terraform/least_privilege"),
+        &repo,
+    );
+    let specs = dir.path().join("specs.json");
+    std::fs::write(&specs, r#"{"config_keys": []}"#).unwrap();
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .env("RVL_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out_path.is_file(),
+        "scan wrote no --out document: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let rows = doc["config_sites"].as_array().unwrap();
+    for (key, resource, value) in [
+        (
+            "resource.google_service_account_key.declared",
+            "resource:google_service_account_key.ci",
+            "true",
+        ),
+        (
+            "resource.aws_iam_access_key.declared",
+            "resource:aws_iam_access_key.deploy",
+            "true",
+        ),
+        (
+            "resource.google_iam.role-class",
+            "resource:google_project_iam_member.owner",
+            "primitive",
+        ),
+        (
+            "resource.aws_iam.statement-wildcard",
+            "resource:aws_iam_policy.admin",
+            "action-and-resource",
+        ),
+        (
+            "resource.google_container_node_pool.node-identity",
+            "resource:google_container_node_pool.bare",
+            "default-account",
+        ),
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r["key"] == key && r["resource"] == resource)
+            .unwrap_or_else(|| panic!("no {key} row for {resource}: {doc}"));
+        assert_eq!(row["format"], "terraform", "{row}");
+        assert_eq!(row["value"], value, "{row}");
+        assert_eq!(row["verdict"], "abstain", "{row}");
+    }
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r["format"] == "terraform" && r["verdict"] != "abstain"),
+        "no spec, so no terraform row is decided: {doc}"
+    );
+    assert_eq!(doc["findings"].as_array().map_or(0, Vec::len), 0, "{doc}");
+}
