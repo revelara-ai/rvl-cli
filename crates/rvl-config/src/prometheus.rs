@@ -131,7 +131,20 @@ impl ConfigRetriever for PrometheusRules {
     }
 }
 
+/// A rule file that is not deployed to production carries every fact
+/// undecided ([`crate::non_production::undecide_unit`]).
 fn retrieve_in(
+    repo_root: Option<&Path>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
+    let mut out = retrieve_file(repo_root, rel_path, contents, snapshot_id);
+    crate::non_production::undecide_unit(repo_root, rel_path, &mut out);
+    out
+}
+
+fn retrieve_file(
     repo_root: Option<&Path>,
     rel_path: &str,
     contents: &str,
@@ -636,6 +649,25 @@ mod tests {
     }
 
     // --- per-alert facts with file + group + rule provenance ---
+
+    #[test]
+    fn a_rule_file_under_a_non_production_path_carries_every_fact_undecided() {
+        let got = PrometheusRules.retrieve("deploy/test-apps/rules.yml", BARE_ALERT, "snap");
+        assert!(!got.packets.is_empty());
+        // An unresolvable packet abstains already and keeps its own chain.
+        for p in got
+            .packets
+            .iter()
+            .filter(|p| p.resolution != Resolution::Unresolvable)
+        {
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("undecided: non-production path: test"),
+                "{}",
+                p.key
+            );
+        }
+    }
 
     #[test]
     fn explicit_alert_facts_resolve_as_authored_with_group_rule_chain() {

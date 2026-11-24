@@ -139,7 +139,27 @@ fn core_group(api_version: &str) -> bool {
     matches!(group, "apps" | "batch" | "policy" | "autoscaling") || group.ends_with(".k8s.io")
 }
 
+/// Retrieve one file of the family. A manifest that is not deployed to
+/// production ([`crate::non_production`]: its anchor's path, or a sample
+/// repository's root) emits no packets at all, for every workload, pod,
+/// container, PodDisruptionBudget and autoscaler key: the family's one
+/// behavior for test material. Sightings and parse failures still count.
 fn dispatch(root: Option<&Path>, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+    let mut got = retrieve_file(root, rel_path, contents, snapshot_id);
+    if root.and_then(crate::non_production::root_token).is_some() {
+        got.packets.clear();
+    }
+    got.packets
+        .retain(|p| crate::non_production::path_token(&p.file_path).is_none());
+    got
+}
+
+fn retrieve_file(
+    root: Option<&Path>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
     match basename(rel_path) {
         "kustomization.yaml" | "kustomization.yml" => match root {
             Some(root) => kustomize::retrieve(root, rel_path, contents, snapshot_id),
@@ -228,6 +248,56 @@ mod tests {
             "istio.yaml",
             "apiVersion: networking.istio.io/v1beta1\nkind: VirtualService\n"
         ));
+    }
+
+    const DEPLOY: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      containers:\n        - name: app\n          image: web:v1\n";
+
+    #[test]
+    fn a_manifest_under_a_non_production_path_emits_nothing() {
+        for path in [
+            "keda-example/rabbitmq/deploy.yaml",
+            "deploy/test-apps/unhealthy-app.yaml",
+            "deploy/helm/ci/backing-services.yaml",
+            "development/kind/dex.yaml",
+            "kubernetes/snippets/define-command-in-deployment.yml",
+            "cnpg/cluster-dev.yaml",
+            "docs/content/reference/deploy.yml",
+            "hack/dev-env/web.yaml",
+        ] {
+            let got = Kubernetes.retrieve(path, DEPLOY, "snap");
+            assert!(got.packets.is_empty(), "{path}: {:?}", got.packets);
+        }
+        for path in [
+            "deploy/production/app.yaml",
+            "devops/k8s/app.yaml",
+            "clusters/live/apps/api.yaml",
+        ] {
+            let got = Kubernetes.retrieve(path, DEPLOY, "snap");
+            for key in [
+                "workload.replicas",
+                "container.liveness-probe",
+                "container.resources.requests.cpu",
+                "container.image.pin",
+            ] {
+                assert!(got.packets.iter().any(|p| p.key == key), "{path}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_manifest_of_a_sample_repository_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kubernetes-training");
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        std::fs::write(root.join("k8s/deploy.yaml"), DEPLOY).unwrap();
+        let got = Kubernetes.retrieve_with_root(&root, "k8s/deploy.yaml", DEPLOY, "snap");
+        assert!(got.packets.is_empty(), "{:?}", got.packets);
+        // The same manifest in a repository not named for samples deploys.
+        let root = dir.path().join("platform");
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        std::fs::write(root.join("k8s/deploy.yaml"), DEPLOY).unwrap();
+        let got = Kubernetes.retrieve_with_root(&root, "k8s/deploy.yaml", DEPLOY, "snap");
+        assert!(got.packets.iter().any(|p| p.key == "workload.pdb-coverage"));
     }
 
     #[test]

@@ -70,7 +70,19 @@ impl ConfigRetriever for OperatorCrs {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        retrieve(rel_path, contents, snapshot_id)
+        retrieve_in(None, rel_path, contents, snapshot_id)
+    }
+
+    /// The walk's entry: the root names a sample repository and holds the
+    /// kustomization that may list this file as a patch.
+    fn retrieve_with_root(
+        &self,
+        root: &std::path::Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        retrieve_in(Some(root), rel_path, contents, snapshot_id)
     }
 }
 
@@ -85,6 +97,23 @@ fn product(group: &str, kind: &str) -> Option<&'static str> {
         "constraints.gatekeeper.sh" if !kind.is_empty() => Some(FORMAT_GATEKEEPER),
         _ => None,
     }
+}
+
+/// A unit that is not deployed to production carries every fact undecided;
+/// a CR a kustomization patches in carries the keys it does not author
+/// undecided (see [`crate::non_production`]).
+fn retrieve_in(
+    root: Option<&std::path::Path>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
+    let mut out = retrieve(rel_path, contents, snapshot_id);
+    if crate::non_production::patch_fragment(root, rel_path) {
+        crate::non_production::undecide_fragment_absences(&mut out.packets);
+    }
+    crate::non_production::undecide_unit(root, rel_path, &mut out);
+    out
 }
 
 fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
@@ -336,6 +365,40 @@ mod tests {
 
     const CNPG_HEAD: &str =
         "apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n  name: pg\n";
+
+    #[test]
+    fn a_cluster_under_a_non_production_path_carries_every_fact_undecided() {
+        let yaml = format!("{CNPG_HEAD}spec:\n  instances: 1\n");
+        let got = OperatorCrs.retrieve("cnpg/cluster-dev.yaml", &yaml, "snap");
+        assert!(!got.packets.is_empty());
+        for p in &got.packets {
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("undecided: non-production path: dev"),
+                "{}",
+                p.key
+            );
+        }
+        // Deployed, the missing backup is a fact.
+        let got = OperatorCrs.retrieve("cnpg/cluster.yaml", &yaml, "snap");
+        assert_eq!(value(&got, "cluster:pg", "cluster.backup.method"), "absent");
+    }
+
+    #[test]
+    fn a_patched_in_cluster_carries_what_it_does_not_author_undecided() {
+        let yaml =
+            format!("{CNPG_HEAD}spec:\n  backup:\n    volumeSnapshot:\n      className: csi\n");
+        let got = OperatorCrs.retrieve("apps/immich/app/patches/cnpg.yaml", &yaml, "snap");
+        assert_eq!(
+            value(&got, "cluster:pg", "cluster.backup.wal-archiving"),
+            "undecided: patch fragment: the base carries this key"
+        );
+        // The method the patch authors stays a fact.
+        assert_eq!(
+            value(&got, "cluster:pg", "cluster.backup.method"),
+            "volumeSnapshot"
+        );
+    }
 
     #[test]
     fn matches_head_claims_only_the_named_groups_and_kinds() {

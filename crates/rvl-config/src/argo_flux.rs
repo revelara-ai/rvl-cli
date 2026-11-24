@@ -111,7 +111,23 @@ impl ConfigRetriever for ArgoFlux {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        retrieve(rel_path, contents, snapshot_id)
+        let mut out = retrieve(rel_path, contents, snapshot_id);
+        crate::non_production::undecide_unit(None, rel_path, &mut out);
+        out
+    }
+
+    /// The walk's entry: the root names a sample repository
+    /// ([`crate::non_production::undecide_unit`]).
+    fn retrieve_with_root(
+        &self,
+        root: &std::path::Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let mut out = retrieve(rel_path, contents, snapshot_id);
+        crate::non_production::undecide_unit(Some(root), rel_path, &mut out);
+        out
     }
 }
 
@@ -830,6 +846,27 @@ mod tests {
             "a.yaml",
             "apiVersion: argoproj.io/v1alpha1\nkind: Experiment\n---\napiVersion: apps/v1\nkind: Application\n"
         ));
+    }
+
+    #[test]
+    fn an_application_under_a_non_production_path_carries_every_fact_undecided() {
+        let yaml = "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  syncPolicy:\n    automated: {}\n";
+        let got = ArgoFlux.retrieve("examples/argocd/app.yaml", yaml, "snap");
+        assert!(!got.packets.is_empty());
+        for p in &got.packets {
+            assert_eq!(
+                p.resolved_value.as_deref(),
+                Some("undecided: non-production path: examples"),
+                "{}",
+                p.key
+            );
+        }
+        let got = packets(yaml);
+        assert!(got.packets.iter().all(|p| !p
+            .resolved_value
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("undecided")));
     }
 
     #[test]

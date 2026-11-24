@@ -41,6 +41,7 @@ pub mod github_actions;
 pub mod gitlab_ci;
 pub mod key_ledger;
 pub mod kubernetes;
+pub mod non_production;
 pub mod operators;
 pub mod prometheus;
 pub mod terraform;

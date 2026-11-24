@@ -25,12 +25,13 @@
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
 //!     IfNotPresent otherwise)
-//!   * neither `workload.replicas`, `workload.strategy.type`, the
-//!     liveness/readiness probes, `container.resources.requests.*`,
-//!     `container.resources.limits.memory` nor `container.security-context`
-//!     is emitted for a manifest under a test, fixture, docs, example, demo
-//!     or dev directory (see [`NON_PRODUCTION_DIR_SEGMENTS`]): the specs
-//!     abstain on what is not deployed
+//!   * nothing is emitted for a manifest that is not deployed to
+//!     production (see [`crate::non_production`] and [`super::dispatch`]):
+//!     the specs abstain on what is not deployed
+//!   * a bare manifest that is a kustomize patch fragment
+//!     ([`crate::non_production::patch_fragment`]) carries every key it does
+//!     not author as [`crate::UNDECIDED_PREFIX`] and why: the base it
+//!     patches carries that key, so its absence here is no fact
 //!   * neither the two probes nor the two requests are emitted for a Job or
 //!     CronJob container, which runs to completion and serves nothing;
 //!     its limits stay, for the specs that judge them
@@ -754,56 +755,6 @@ pub(super) fn workload_shape(kind: &str) -> Option<(&'static str, &'static [&'st
     }
 }
 
-/// Directory segments that mark a manifest as not deployed to production: the
-/// retrievers' test-path convention (`tests/`, `e2e/`, `fixtures/`,
-/// `testdata/`, ...) plus the fake-data trees Kubernetes repos keep beside
-/// their tests and the `golden/` files a chart test compares `helm template`
-/// output against; `docs/`, `book/` and the tutorial trees, whose manifests
-/// illustrate a page; and the example, sample, demo, quickstart, `hack/` and
-/// dev-environment trees. Those last were once left out on the view that
-/// repos ship deployable manifests under `examples/`, but a blind check of
-/// the flags against the rule frames found them test or fixture material
-/// (frame cell C1) or dev-only and experimental config (C2), both not
-/// applicable, for nearly every flag under these directories (Higress
-/// `samples/`, Chaos Mesh `examples/`, git-sync `demo/`, MetalLB `dev-env/`,
-/// a `k8s/dev/` kustomization). Exact segments, never substrings: `contest/`,
-/// `latest/` and `devops/` deploy.
-const NON_PRODUCTION_DIR_SEGMENTS: &[&str] = &[
-    "test",
-    "tests",
-    "__tests__",
-    "__mocks__",
-    "testing",
-    "e2e",
-    "fixtures",
-    "testdata",
-    "fake",
-    "fakedata",
-    "golden",
-    "docs",
-    "book",
-    "tutorial",
-    "tutorials",
-    "examples",
-    "example",
-    "samples",
-    "sample",
-    "demo",
-    "demos",
-    "quickstart",
-    "hack",
-    "dev",
-    "dev-env",
-];
-
-/// Whether a repo-relative path lies under a directory whose manifests are
-/// not deployed to production (see [`NON_PRODUCTION_DIR_SEGMENTS`]).
-fn non_production(rel_path: &str) -> bool {
-    let mut dirs = rel_path.split('/');
-    dirs.next_back();
-    dirs.any(|seg| NON_PRODUCTION_DIR_SEGMENTS.contains(&seg))
-}
-
 /// The first `args` or `command` entry of a pod's containers that turns on
 /// leader election (`--leader-elect`, `--leader-elect=true`,
 /// `--enable-leader-election`), if any. A controller that elects a leader
@@ -881,17 +832,12 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
     };
     let unit = format!("{kind_lower}:{name}");
     // The replica floor (RC-017) and the probe rules (RC-020) are judged of
-    // deployed, long-running workloads only. A test, example or dev manifest
-    // is not deployed, and a Job or CronJob runs to completion with no
-    // traffic for a probe to gate; neither emits those keys, so the spec
-    // abstains rather than flagging (or crediting) them. The capacity rule
-    // (RC-024) asks for resource requests on the same deployed, long-running
-    // workloads, so the two request keys follow the same gates. The rollout
-    // strategy, the memory limit and the container security context are
-    // production controls too: a manifest that is not deployed cannot
-    // violate them, so they take the path gate (a Job still runs, so its
-    // limit and context stay).
-    let not_deployed = non_production(em.file_anchor);
+    // long-running workloads only: a Job or CronJob runs to completion with
+    // no traffic for a probe to gate, so it emits neither probe, and the
+    // spec abstains rather than flagging (or crediting) it. The capacity
+    // rule (RC-024) asks for resource requests of the same long-running
+    // workloads, so the two request keys follow the same gate. A manifest
+    // that is not deployed at all emits nothing (see [`super::dispatch`]).
     let run_to_completion = matches!(kind, "Job" | "CronJob");
 
     let mut prefix = String::from("spec");
@@ -900,7 +846,7 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
         prefix.push_str(seg);
     }
 
-    if matches!(kind, "Deployment" | "StatefulSet") && !not_deployed {
+    if matches!(kind, "Deployment" | "StatefulSet") {
         let one = lookup(doc, "spec.replicas").is_none_or(|v| render_value(v) == "1");
         match leader_election_arg(doc, &prefix).filter(|_| one) {
             Some(arg) => em.undecided(
@@ -953,7 +899,7 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
         }
     }
 
-    if kind == "Deployment" && !not_deployed {
+    if kind == "Deployment" {
         let stype = dig(doc, &["spec", "strategy", "type"]).and_then(Value::as_str);
         em.setting(
             &unit,
@@ -1083,14 +1029,9 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             ("container.resources.limits.cpu", "limits", "cpu"),
             ("container.resources.limits.memory", "limits", "memory"),
         ] {
-            // The limits are read of every deployed container, a Job's too:
-            // the memory limit is another control's key.
-            let withheld = match key {
-                "container.resources.limits.memory" => not_deployed,
-                _ if section == "requests" => not_deployed || run_to_completion,
-                _ => false,
-            };
-            if withheld {
+            // The limits are read of every container, a Job's too: the
+            // memory limit is another control's key.
+            if section == "requests" && run_to_completion {
                 continue;
             }
             em.setting(
@@ -1109,7 +1050,7 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             ("readinessProbe", "container.readiness-probe", true),
             ("startupProbe", "container.startup-probe", false),
         ] {
-            if serving && (not_deployed || run_to_completion) {
+            if serving && run_to_completion {
                 continue;
             }
             let path = format!("{cpath}.{field}");
@@ -1147,16 +1088,14 @@ pub(super) fn packets_from_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter)
             em.present(&cunit, LIVENESS_HTTP_GET_PATH_KEY, &live_path, v);
         }
 
-        if !not_deployed {
-            em.setting(
-                &cunit,
-                "container.security-context",
-                doc,
-                &format!("{cpath}.securityContext"),
-                "securityContext",
-                "none",
-            );
-        }
+        em.setting(
+            &cunit,
+            "container.security-context",
+            doc,
+            &format!("{cpath}.securityContext"),
+            "securityContext",
+            "none",
+        );
 
         // The security context above is judged for presence. This is the
         // value half: a context that is present and still asks for UID 0.
@@ -1269,6 +1208,9 @@ pub(super) fn retrieve_plain(
     };
     for doc in &docs {
         packets_from_doc(doc, &set, &mut em);
+    }
+    if crate::non_production::patch_fragment(root, rel_path) {
+        crate::non_production::undecide_fragment_absences(&mut em.out);
     }
     out.packets = em.out;
     out
@@ -1389,128 +1331,6 @@ spec:
     }
 
     #[test]
-    fn a_manifest_under_a_test_or_fixture_path_abstains_on_replicas_and_probes() {
-        for path in [
-            "controller/proxy-injector/fake/data/deployment.yaml",
-            "scripts/fakedata/applications/hello-world/deployments.yaml",
-            "test/e2e/deploy.yaml",
-            "deploy/helm/scion-hub/golden/minimal.yaml",
-            "pkg/testdata/deploy.yaml",
-            "tests/fixtures/deploy.yaml",
-            "docs/content/reference/deploy.yml",
-        ] {
-            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
-            for key in [
-                "workload.replicas",
-                "container.liveness-probe",
-                "container.readiness-probe",
-                "container.resources.requests.cpu",
-                "container.resources.requests.memory",
-            ] {
-                assert!(!has_key(&got, key), "{path}: {key} was emitted");
-            }
-            // Only those rules abstain; the rest of the manifest is read.
-            assert!(has_key(&got, "container.resources.limits.cpu"), "{path}");
-        }
-        // A segment, not a substring: these deploy.
-        for path in ["deploy/latest/web.yaml", "contest/web.yaml", "fake.yaml"] {
-            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
-            assert!(has_key(&got, "workload.replicas"), "{path}");
-        }
-    }
-
-    #[test]
-    fn a_docs_manifest_abstains_on_replicas_and_so_does_an_examples_one() {
-        // A documentation page's example Deployment: one replica, no probes.
-        let docs_deploy = "\
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: traefik
-
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: traefik-lb
-
-  template:
-    metadata:
-      labels:
-        app: traefik-lb
-
-    spec:
-      serviceAccountName: traefik-controller
-      containers:
-        - name: traefik
-          image: traefik:v3.8
-          args:
-            - --entryPoints.web.address=:80
-            - --entryPoints.websecure.address=:443
-            - --experimental.kubernetesgateway
-";
-        let path =
-            "docs/content/reference/dynamic-configuration/kubernetes-gateway-traefik-lb-svc.yml";
-        let got = retrieve_plain(None, path, docs_deploy, "snap");
-        for key in [
-            "workload.replicas",
-            "container.liveness-probe",
-            "container.readiness-probe",
-        ] {
-            assert!(!has_key(&got, key), "{key} was emitted");
-        }
-        assert!(has_key(&got, "container.resources.limits.cpu"));
-        // An examples/ tree illustrates the project as much as a docs page.
-        let path = "examples/kubernetes/manifests/pyrra-apiDeployment.yaml";
-        let got = retrieve_plain(None, path, docs_deploy, "snap");
-        assert!(!has_key(&got, "workload.replicas"));
-        // The same document deployed is still judged.
-        let got = retrieve_plain(None, "deploy/traefik.yaml", docs_deploy, "snap");
-        let replicas = find(&got, "deployment:traefik", "workload.replicas");
-        assert_eq!(replicas.resolved_value.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn helm_golden_and_examples_output_abstain_on_probes() {
-        // A chart's golden/ files are the expected `helm template` output of
-        // its tests, not a deployed manifest: no probe packet, even for a
-        // container that has a readiness probe and lacks a liveness probe.
-        let golden = BARE_DEPLOY.replace(
-            "          image: web:v1\n",
-            "          image: web:v1\n          readinessProbe:\n            httpGet:\n              path: /readyz\n              port: http\n",
-        );
-        let got = retrieve_plain(
-            None,
-            "deploy/helm/scion-hub/golden/settings-oauth.yaml",
-            &golden,
-            "snap",
-        );
-        assert!(!has_key(&got, "container.liveness-probe"));
-        assert!(!has_key(&got, "container.readiness-probe"));
-        // An examples/ manifest is not deployed either.
-        let got = retrieve_plain(
-            None,
-            "examples/kubernetes/manifests/pyrra-kubernetesDeployment.yaml",
-            BARE_DEPLOY,
-            "snap",
-        );
-        assert!(!has_key(&got, "container.liveness-probe"));
-        assert!(!has_key(&got, "container.readiness-probe"));
-        // Deployed, the container without probes is judged.
-        let got = retrieve_plain(None, "deploy/pyrra.yaml", BARE_DEPLOY, "snap");
-        find(
-            &got,
-            "container:deployment/web/app",
-            "container.liveness-probe",
-        );
-        find(
-            &got,
-            "container:deployment/web/app",
-            "container.readiness-probe",
-        );
-    }
-
-    #[test]
     fn job_and_cronjob_containers_abstain_on_liveness_and_readiness() {
         let job = "\
 apiVersion: batch/v1
@@ -1559,178 +1379,73 @@ spec:
         }
     }
 
-    /// No resource request reaches the capacity rule for these: a fake-data
-    /// fixture, a docs example and a one-shot Job, all without requests.
-    #[test]
-    fn fixture_docs_and_job_containers_abstain_on_resource_requests() {
-        const FAKE_DATA: &str = "\
-kind: Deployment
-apiVersion: apps/v1
-metadata:
-  name: nginx
-  namespace: kube-public
-spec:
-  replicas: 1
-  template:
-    spec:
-      initContainers:
-      - name: linkerd-init
-        image: cr.l5d.io/linkerd/proxy-init
-      containers:
-      - name: nginx
-        image: nginx
-      - name: linkerd-proxy
-        image: gc.io/linkerd-io/proxy
-";
-        const DOCS: &str = "\
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: whoami
-
-spec:
-  replicas: 2
-  template:
-    spec:
-      containers:
-        - name: whoami
-          image: traefik/whoami
-";
-        const JOB: &str = "\
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: redis-acl-init
-spec:
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: acl-writer
-          image: busybox:latest
-          command: [sh, -c, \"echo done\"]
-";
-        for (path, yaml, cunits) in [
-            (
-                "controller/proxy-injector/fake/data/deployment-with-injected-proxy.yaml",
-                FAKE_DATA,
-                &[
-                    "container:deployment/nginx/nginx",
-                    "container:deployment/nginx/linkerd-proxy",
-                ][..],
-            ),
-            (
-                "controller/proxy-injector/fake/data/deployment-inject-disabled.yaml",
-                FAKE_DATA,
-                &["container:deployment/nginx/nginx"][..],
-            ),
-            (
-                "docs/content/reference/dynamic-configuration/kubernetes-whoami-svc.yml",
-                DOCS,
-                &["container:deployment/whoami/whoami"][..],
-            ),
-            (
-                "config/v1beta2/acl-pvc/init-acl-job.yaml",
-                JOB,
-                &["container:job/redis-acl-init/acl-writer"][..],
-            ),
-        ] {
-            let got = retrieve_plain(None, path, yaml, "snap");
-            for cunit in cunits {
-                // The container is read; its requests abstain, and its
-                // memory limit too unless it is a deployed Job's.
-                find(&got, cunit, "container.resources.limits.cpu");
-                let memory = got
-                    .packets
-                    .iter()
-                    .any(|p| p.unit == *cunit && p.key == "container.resources.limits.memory");
-                assert_eq!(memory, path.starts_with("config/"), "{path}: {cunit}");
-                for key in [
-                    "container.resources.requests.cpu",
-                    "container.resources.requests.memory",
-                ] {
-                    assert!(
-                        !got.packets.iter().any(|p| p.unit == *cunit && p.key == key),
-                        "{path}: {cunit} {key} was emitted"
-                    );
-                }
-            }
-        }
+    /// The value of `unit`'s `key` packet.
+    fn value_of<'a>(got: &'a Retrieved, unit: &str, key: &str) -> &'a str {
+        find(got, unit, key).resolved_value.as_deref().unwrap_or("")
     }
 
     #[test]
-    fn an_examples_deployment_without_requests_abstains_on_them() {
-        let yaml = BARE_DEPLOY.replace("name: app", "name: pyrra");
-        let path = "examples/kubernetes/manifests/pyrra-apiDeployment.yaml";
-        let got = retrieve_plain(None, path, &yaml, "snap");
-        for key in [
-            "container.resources.requests.cpu",
-            "container.resources.requests.memory",
-        ] {
-            assert!(!has_key(&got, key), "{key} was emitted");
-        }
-        let got = retrieve_plain(None, "deploy/pyrra.yaml", &yaml, "snap");
-        for key in [
-            "container.resources.requests.cpu",
-            "container.resources.requests.memory",
-        ] {
-            let p = find(&got, "container:deployment/web/pyrra", key);
-            assert_eq!(p.resolved_value.as_deref(), Some("none"), "{key}");
-        }
-    }
-
-    /// The keys the non-production path gate withholds.
-    const PATH_GATED: &[&str] = &[
-        "workload.replicas",
-        "workload.strategy.type",
-        "container.liveness-probe",
-        "container.readiness-probe",
-        "container.resources.requests.cpu",
-        "container.resources.requests.memory",
-        "container.resources.limits.memory",
-        "container.security-context",
-    ];
-
-    #[test]
-    fn example_demo_and_dev_manifests_abstain_on_production_controls() {
-        for dir in [
-            "examples",
-            "example",
-            "samples",
-            "sample",
-            "demo",
-            "demos",
-            "dev",
-            "dev-env",
-            "quickstart",
-            "hack",
-            "book",
-            "tutorial",
-            "tutorials",
-        ] {
-            let path = format!("{dir}/web/deploy.yaml");
-            let got = retrieve_plain(None, &path, BARE_DEPLOY, "snap");
-            for key in PATH_GATED {
-                assert!(!has_key(&got, key), "{path}: {key} was emitted");
-            }
-            // The rest of the manifest is still read.
-            assert!(has_key(&got, "container.image.pin"), "{path}");
-        }
-        // Exact segments, never substrings: these deploy and are judged.
+    fn a_patch_fragment_carries_what_it_does_not_author_undecided() {
+        const FRAGMENT: &str = "undecided: patch fragment: the base carries this key";
+        // A kubebuilder patch that only adds a port: no replicas, no probes.
+        let patch = BARE_DEPLOY.replace(
+            "          image: web:v1\n",
+            "          image: web:v1\n          ports:\n            - containerPort: 9443\n",
+        );
         for path in [
-            "deploy/web.yaml",
-            "latest/web.yaml",
-            "contest/web.yaml",
-            "devops/web.yaml",
-            "deploy/examples.yaml",
+            "config/default/manager_webhook_patch.yaml",
+            "kubernetes/apps/web/patches/web.yaml",
+            "components/web/base/deploy.yaml",
         ] {
-            let got = retrieve_plain(None, path, BARE_DEPLOY, "snap");
-            for key in PATH_GATED {
-                assert!(has_key(&got, key), "{path}: {key} was not emitted");
+            let got = retrieve_plain(None, path, &patch, "snap");
+            assert_eq!(
+                value_of(&got, "deployment:web", "workload.replicas"),
+                FRAGMENT
+            );
+            for key in ["container.liveness-probe", "container.readiness-probe"] {
+                assert_eq!(
+                    value_of(&got, "container:deployment/web/app", key),
+                    FRAGMENT,
+                    "{path}: {key}"
+                );
             }
-            let replicas = find(&got, "deployment:web", "workload.replicas");
-            assert_eq!(replicas.resolved_value.as_deref(), Some("1"), "{path}");
+            // What the patch authors stays a fact.
+            assert_eq!(
+                value_of(&got, "container:deployment/web/app", "container.image.pin"),
+                "tag"
+            );
         }
+        // A patch that sets replicas authors that key.
+        let scaled = BARE_DEPLOY.replace("spec:\n  template:", "spec:\n  replicas: 1\n  template:");
+        let got = retrieve_plain(None, "config/default/replicas_patch.yaml", &scaled, "snap");
+        assert_eq!(value_of(&got, "deployment:web", "workload.replicas"), "1");
+
+        // A kustomization in the same directory lists the patch by path.
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("overlay");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            overlay.join("kustomization.yaml"),
+            "resources: [../base]\npatchesJson6902:\n- path: ./web.yaml\n  target: {kind: Deployment, name: web}\n",
+        )
+        .unwrap();
+        let got = retrieve_plain(Some(dir.path()), "overlay/web.yaml", &patch, "snap");
+        assert_eq!(
+            value_of(&got, "deployment:web", "workload.replicas"),
+            FRAGMENT
+        );
+
+        // The base, a whole workload, still carries the default the specs flag.
+        let got = retrieve_plain(Some(dir.path()), "base/web.yaml", BARE_DEPLOY, "snap");
+        assert_eq!(value_of(&got, "deployment:web", "workload.replicas"), "1");
+        assert_eq!(
+            value_of(
+                &got,
+                "container:deployment/web/app",
+                "container.liveness-probe"
+            ),
+            "none"
+        );
     }
 
     fn with_probes(probes: &str) -> Retrieved {
