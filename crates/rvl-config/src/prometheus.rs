@@ -7,6 +7,11 @@
 //!
 //!   * literal Prometheus rule files — top-level `groups:` whose rules carry
 //!     `alert:` / `record:`;
+//!   * the same rule groups under `spec.groups` of a rule resource
+//!     ([`rule_container`]): a `PrometheusRule`, a VictoriaMetrics `VMRule`,
+//!     or a Google Managed Prometheus `Rules` / `ClusterRules` /
+//!     `GlobalRules`, unless an Argo/Flux or operator CR in the same file
+//!     makes the file another family's;
 //!   * sloth SLO definitions — the native `service:` + `slos:` shape, or the
 //!     CRD form (`apiVersion: sloth.slok.dev/...`).
 //!
@@ -22,7 +27,11 @@
 //!   * `rule.for` — per alert rule; absent resolves the DOCUMENTED `0s`
 //!     platform default (the alert fires on first evaluation).
 //!   * `rule.labels.severity` — per alert rule; absence is an AUTHORED fact
-//!     (no platform supplies a severity), emitted as the empty string.
+//!     (no platform supplies a severity), emitted as the empty string. Also
+//!     a guard predicate ([`crate::ConfigPredicate`]) of the same key, read
+//!     lower-cased and from the `priority` label when `severity` is absent,
+//!     so `when rule.labels.severity one_of [critical, page, p1]` matches
+//!     `Critical` and `priority: P1`. A templated label states no predicate.
 //!   * `rule.annotations.runbook` — presence of a `runbook_url` / `runbook`
 //!     annotation. SHAPE-ONLY: the packet carries the marker `nonempty`,
 //!     never the URL (runbook locations are repo-internal content).
@@ -34,6 +43,17 @@
 //!     unresolvable. Emitted only when the walk hands the retriever the
 //!     repository root and the annotation is set; the link itself never
 //!     rides in a packet either.
+//!   * the RC-006 abstain facts, each a guard predicate: per alert rule
+//!     `rule.annotations.link_like` (`present` when an annotation key names
+//!     a link or a value holds one, see [`link_like`]), `rule.name_unique`
+//!     (`false` when the group has another rule of the same alert name and
+//!     not all of them are paging rules without a runbook), and
+//!     `rule.kustomize_patched` (`true` for a `PrometheusRule` a kustomize
+//!     patch targets); per file, from one walk of the repository
+//!     ([`crate::prometheus_repo`]), `repo.alertmanager.mentions_runbook`
+//!     and `repo.alertmanager.paging_receiver`. `rule.kustomize_patched`
+//!     and the repo facts are emitted only when the walk hands over the
+//!     root.
 //!   * `rule.expr` — non-emptiness of the alert expression. SHAPE-ONLY: the
 //!     marker `nonempty`, never the PromQL (metric names, label values and
 //!     hostnames live in expressions; per the privacy contract they never
@@ -46,12 +66,33 @@
 //!     generation-time sloth setting (`--default-slo-period`), so an absent
 //!     `time_window` is unresolvable, never guessed at 30d.
 //!
+//! A paging rule (severity `critical`, `page` or `p1`) with no runbook is
+//! the finding RC-006 asks for, and a blind check of such flags found its
+//! wrong and disputed flags where one of these held. So the
+//! `rule.annotations.runbook` packet of a rule with no runbook, or a
+//! templated one, is carried undecided with the first reason that holds:
+//! a templated runbook value, a link-like annotation (a judge must read the
+//! link), an Alertmanager config or template that composes the link,
+//! receivers that page nobody, a duplicate alert name, a kustomize patch
+//! that can change the severity. Every packet of a rule file that is a
+//! vendored or generated pack
+//! ([`crate::non_production::vendored_token`]) is carried undecided too,
+//! the way a non-production file's are. The rule's other packets keep
+//! their values: none of these reasons is about `for:` or the expression.
+//!
 //! Recording rules are detected (they make a file claimable) but emit no
 //! per-rule packets: `for:` and severity semantics are alert-only, and a
 //! record rule's health is promtool's job, not a reliability control's.
 
-use crate::{render_value, ConfigPacket, ConfigRetriever, ProvenanceStep, Resolution, Retrieved};
+use crate::argo_flux::{group_of, head_scan};
+use crate::prometheus_repo::{Paging, RepoFacts};
+use crate::{
+    render_value, ConfigPacket, ConfigPredicate, ConfigRetriever, ProvenanceStep, Resolution,
+    Retrieved,
+};
+use serde::Deserialize;
 use serde_yaml::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub struct PrometheusRules;
@@ -62,6 +103,43 @@ pub struct PrometheusRules;
 /// from `.Values` / `.Release`.
 pub(crate) fn helm_templated(text: &str) -> bool {
     text.contains("{{-") || text.contains(".Values") || text.contains(".Release")
+}
+
+/// The severities that page, read lower-cased: the guard of the RC-006 spec
+/// as it was measured. A duplicate alert name only counts against a rule
+/// when its twins are not all paging rules without a runbook.
+const PAGING_SEVERITIES: &[&str] = &["critical", "page", "p1"];
+
+/// Annotation key fragments (any case) that name a link of some kind.
+const LINK_KEY_WORDS: &[&str] = &[
+    "runbook",
+    "playbook",
+    "sop",
+    "wiki",
+    "doc",
+    "procedure",
+    "remediation",
+    "troubleshoot",
+    "guide",
+    "link",
+    "url",
+];
+
+/// Annotation value fragments (any case) that hold a link of some kind.
+const LINK_VALUE_WORDS: &[&str] = &["http://", "https://", "runbook", "playbook"];
+
+/// Whether an `apiVersion` + `kind` is a resource whose `spec.groups` hold
+/// Prometheus rule groups.
+fn rule_container(api_version: &str, kind: &str) -> bool {
+    matches!(
+        (group_of(api_version), kind),
+        ("monitoring.coreos.com", "PrometheusRule")
+            | ("operator.victoriametrics.com", "VMRule")
+            | (
+                "monitoring.googleapis.com",
+                "Rules" | "ClusterRules" | "GlobalRules"
+            )
+    )
 }
 
 impl ConfigRetriever for PrometheusRules {
@@ -92,8 +170,17 @@ impl ConfigRetriever for PrometheusRules {
         {
             return true;
         }
-        // Any other manifest (including PrometheusRule CRDs) is the
-        // Kubernetes family's, not ours.
+        // A rule resource is ours unless the file is another family's: the
+        // Kubernetes family declines any file with a foreign group, but the
+        // Argo/Flux and operator retrievers claim theirs from mixed files.
+        if head_scan(head)
+            .iter()
+            .any(|(api, kind)| rule_container(api, kind))
+        {
+            return !crate::argo_flux::ArgoFlux.matches_head(rel_path, head)
+                && !crate::operators::OperatorCrs.matches_head(rel_path, head);
+        }
+        // Any other manifest is the Kubernetes family's, not ours.
         if col0("apiVersion:") && col0("kind:") {
             return false;
         }
@@ -116,10 +203,11 @@ impl ConfigRetriever for PrometheusRules {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        retrieve_in(None, rel_path, contents, snapshot_id)
+        retrieve_in(None, None, rel_path, contents, snapshot_id)
     }
 
-    /// The walk's entry: with the root, a runbook link can be resolved.
+    /// One file with the root: a runbook link can be resolved, and the
+    /// repository is walked once for its facts.
     fn retrieve_with_root(
         &self,
         root: &Path,
@@ -127,55 +215,107 @@ impl ConfigRetriever for PrometheusRules {
         contents: &str,
         snapshot_id: &str,
     ) -> Retrieved {
-        retrieve_in(Some(root), rel_path, contents, snapshot_id)
+        let facts = RepoFacts::read(root);
+        retrieve_in(Some(root), Some(&facts), rel_path, contents, snapshot_id)
+    }
+
+    /// The walk's entry: every claimed file shares one walk of the
+    /// repository for its facts.
+    fn retrieve_all(
+        &self,
+        root: &Path,
+        files: &[(String, String)],
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let facts = RepoFacts::read(root);
+        let mut out = Retrieved::default();
+        for (rel, contents) in files {
+            let got = retrieve_in(Some(root), Some(&facts), rel, contents, snapshot_id);
+            out.packets.extend(got.packets);
+            out.predicates.extend(got.predicates);
+            out.unparseable += got.unparseable;
+        }
+        out
     }
 }
 
-/// A rule file that is not deployed to production carries every fact
-/// undecided ([`crate::non_production::undecide_unit`]).
+/// A rule file that is not deployed to production, or is a vendored or
+/// generated pack, carries every fact undecided
+/// ([`crate::non_production::undecide_unit`]).
 fn retrieve_in(
     repo_root: Option<&Path>,
+    repo: Option<&RepoFacts>,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
 ) -> Retrieved {
-    let mut out = retrieve_file(repo_root, rel_path, contents, snapshot_id);
+    let mut out = retrieve_file(repo_root, repo, rel_path, contents, snapshot_id);
     crate::non_production::undecide_unit(repo_root, rel_path, &mut out);
+    if let Some(token) = crate::non_production::vendored_token(repo_root, rel_path) {
+        let why = format!("vendored or generated rule pack: {token}");
+        for p in &mut out.packets {
+            crate::non_production::undecide(p, &why);
+        }
+    }
     out
 }
 
 fn retrieve_file(
     repo_root: Option<&Path>,
+    repo: Option<&RepoFacts>,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
 ) -> Retrieved {
     let mut out = Retrieved::default();
-    let Ok(doc) = serde_yaml::from_str::<Value>(contents) else {
-        out.unparseable = 1;
-        return out;
-    };
-    let Some(root) = doc.as_mapping() else {
+    let docs: Result<Vec<Value>, _> = serde_yaml::Deserializer::from_str(contents)
+        .map(Value::deserialize)
+        .collect();
+    let Ok(docs) = docs else {
         out.unparseable = 1;
         return out;
     };
     let em = Emitter {
         root: repo_root,
+        repo,
         rel_path,
         snapshot_id,
     };
-    // Sloth first (native root or CRD `spec:`), then rule files; a
-    // claimed file that is neither degrades to an unparseable count.
-    if get(root, "slos").is_some() {
-        em.sloth(root, "", &mut out);
-    } else if let Some(spec) = get(root, "spec").and_then(Value::as_mapping) {
-        if get(spec, "slos").is_some() {
+    // Sloth first (native root or CRD `spec:`), then rule files and rule
+    // resources; a claimed file with none of them degrades to an
+    // unparseable count. Other documents of a rule resource's file (its
+    // Service, its ServiceMonitor) are not ours and are skipped.
+    let mut read = false;
+    for root in docs.iter().filter_map(Value::as_mapping) {
+        let spec = get(root, "spec").and_then(Value::as_mapping);
+        let str_of = |k: &str| get(root, k).and_then(Value::as_str).unwrap_or("");
+        let rule_groups = spec
+            .and_then(|s| get(s, "groups"))
+            .and_then(Value::as_sequence)
+            .filter(|_| rule_container(str_of("apiVersion"), str_of("kind")));
+        if get(root, "slos").is_some() {
+            em.sloth(root, "", &mut out);
+        } else if let Some(spec) = spec.filter(|s| get(s, "slos").is_some()) {
             em.sloth(spec, "spec.", &mut out);
+        } else if let Some(groups) = get(root, "groups").and_then(Value::as_sequence) {
+            em.rule_groups(groups, None, "", &mut out);
+        } else if let Some(groups) = rule_groups {
+            // Only a PrometheusRule is a kustomize patch target here.
+            let target = (str_of("kind") == "PrometheusRule").then(|| {
+                get(root, "metadata")
+                    .and_then(Value::as_mapping)
+                    .and_then(|m| get(m, "name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            });
+            em.rule_groups(groups, target, "spec.", &mut out);
         } else {
-            out.unparseable = 1;
+            continue;
         }
-    } else if let Some(groups) = get(root, "groups").and_then(Value::as_sequence) {
-        em.rule_groups(groups, &mut out);
+        read = true;
+    }
+    if read {
+        em.repo_predicates(&mut out);
     } else {
         out.unparseable = 1;
     }
@@ -185,6 +325,8 @@ fn retrieve_file(
 /// Shared packet plumbing for one file.
 struct Emitter<'a> {
     root: Option<&'a Path>,
+    /// The repository's facts; `None` when no root was handed over.
+    repo: Option<&'a RepoFacts>,
     rel_path: &'a str,
     snapshot_id: &'a str,
 }
@@ -311,7 +453,42 @@ impl Emitter<'_> {
         ))
     }
 
-    fn rule_groups(&self, groups: &[Value], out: &mut Retrieved) {
+    /// A guard predicate about `unit` of this file.
+    fn predicate(&self, unit: &str, key: &str, value: &str) -> ConfigPredicate {
+        ConfigPredicate {
+            file_path: self.rel_path.to_string(),
+            unit: unit.to_string(),
+            key: crate::key_ledger::declared("prometheus-rules", key),
+            values: vec![value.to_string()],
+        }
+    }
+
+    /// The repository's facts, true of every rule in the file.
+    fn repo_predicates(&self, out: &mut Retrieved) {
+        let Some(repo) = self.repo else { return };
+        let unit = crate::FILE_SCOPE;
+        out.predicates.push(self.predicate(
+            unit,
+            "repo.alertmanager.mentions_runbook",
+            &repo.mentions_runbook.to_string(),
+        ));
+        out.predicates.push(self.predicate(
+            unit,
+            "repo.alertmanager.paging_receiver",
+            repo.paging.as_str(),
+        ));
+    }
+
+    /// The groups of one rule file or rule resource. `patch_target` is the
+    /// name of the `PrometheusRule` they are in, `None` for any other
+    /// container; `prefix` leads every key path (`spec.` in a resource).
+    fn rule_groups(
+        &self,
+        groups: &[Value],
+        patch_target: Option<&str>,
+        prefix: &str,
+        out: &mut Retrieved,
+    ) {
         for (gidx, group) in groups.iter().enumerate() {
             let Some(g) = group.as_mapping() else {
                 continue;
@@ -328,7 +505,7 @@ impl Emitter<'_> {
                 Some(v) => out.packets.push(self.scalar(
                     &gunit,
                     "group.interval",
-                    &format!("groups.{gname}.interval"),
+                    &format!("{prefix}groups.{gname}.interval"),
                     v,
                 )),
                 None => out.packets.push(self.packet(
@@ -339,7 +516,7 @@ impl Emitter<'_> {
                     vec![
                         ProvenanceStep::new(
                             self.rel_path,
-                            &format!("groups.{gname}.interval"),
+                            &format!("{prefix}groups.{gname}.interval"),
                             "absent",
                         ),
                         ProvenanceStep::new("", "global evaluation_interval", "project-setting"),
@@ -347,78 +524,139 @@ impl Emitter<'_> {
                 )),
             }
 
-            let rules = get(g, "rules").and_then(Value::as_sequence);
-            for rule in rules.into_iter().flatten() {
-                let Some(rule) = rule.as_mapping() else {
-                    continue;
-                };
-                // Recording rules carry no alert semantics: detected (they
-                // make the file claimable) but not inventoried.
-                let Some(aname) = get(rule, "alert").and_then(Value::as_str) else {
-                    continue;
-                };
+            // Recording rules carry no alert semantics: detected (they make
+            // the file claimable) but not inventoried.
+            let rules: Vec<(&str, &serde_yaml::Mapping)> = get(g, "rules")
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_mapping)
+                .filter_map(|r| Some((get(r, "alert")?.as_str()?, r)))
+                .collect();
+            // Whether each alert name is held by one rule, or by several
+            // that are all paging rules without a runbook: a twin that is
+            // not (the warning half of a mixin's pair) may be the rule a
+            // reader meant.
+            let mut twins: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
+            for (aname, rule) in &rules {
+                twins.entry(aname).or_default().push(would_flag(rule));
+            }
+            for (aname, rule) in rules {
                 let unit = format!("rule:{gname}/{aname}");
-                let kp = |k: &str| format!("groups.{gname}.rules.{aname}.{k}");
-
-                // rule.for: explicit, else the documented 0s default (the
-                // alert fires on first evaluation).
-                match get(rule, "for") {
-                    Some(v) => out
-                        .packets
-                        .push(self.scalar(&unit, "rule.for", &kp("for"), v)),
-                    None => out.packets.push(self.packet(
-                        &unit,
-                        "rule.for",
-                        Some("0s".to_string()),
-                        Resolution::PlatformDefault,
-                        vec![
-                            ProvenanceStep::new(self.rel_path, &kp("for"), "absent"),
-                            ProvenanceStep::new("", "for", "platform-default"),
-                        ],
-                    )),
-                }
-
-                // rule.labels.severity: explicit, else an authored absence.
-                let labels = get(rule, "labels").and_then(Value::as_mapping);
-                match labels.and_then(|l| get(l, "severity")) {
-                    Some(v) => out.packets.push(self.scalar(
-                        &unit,
-                        "rule.labels.severity",
-                        &kp("labels.severity"),
-                        v,
-                    )),
-                    None => out.packets.push(self.authored_absent(
-                        &unit,
-                        "rule.labels.severity",
-                        &kp("labels.severity"),
-                    )),
-                }
-
-                // rule.annotations.runbook: runbook_url or runbook, as a
-                // shape-only presence marker.
-                let annotations = get(rule, "annotations").and_then(Value::as_mapping);
-                let runbook =
-                    annotations.and_then(|a| get(a, "runbook_url").or_else(|| get(a, "runbook")));
-                out.packets.push(self.presence_marker(
-                    &unit,
-                    "rule.annotations.runbook",
-                    &kp("annotations.runbook_url"),
-                    runbook,
-                ));
-                if let Some(p) = self.runbook_target(&unit, &kp("annotations.runbook_url"), runbook)
-                {
-                    out.packets.push(p);
-                }
-
-                // rule.expr: shape-only non-emptiness of the expression.
-                out.packets.push(self.presence_marker(
-                    &unit,
-                    "rule.expr",
-                    &kp("expr"),
-                    get(rule, "expr"),
-                ));
+                let kp = |k: &str| format!("{prefix}groups.{gname}.rules.{aname}.{k}");
+                let unique = twins
+                    .get(aname)
+                    .is_none_or(|t| t.len() == 1 || t.iter().all(|f| *f));
+                self.alert_rule(&unit, &kp, rule, unique, patch_target, out);
             }
         }
+    }
+
+    /// The packets and predicates of one alert rule.
+    fn alert_rule(
+        &self,
+        unit: &str,
+        kp: &dyn Fn(&str) -> String,
+        rule: &serde_yaml::Mapping,
+        unique: bool,
+        patch_target: Option<&str>,
+        out: &mut Retrieved,
+    ) {
+        // rule.for: explicit, else the documented 0s default (the alert
+        // fires on first evaluation).
+        match get(rule, "for") {
+            Some(v) => out
+                .packets
+                .push(self.scalar(unit, "rule.for", &kp("for"), v)),
+            None => out.packets.push(self.packet(
+                unit,
+                "rule.for",
+                Some("0s".to_string()),
+                Resolution::PlatformDefault,
+                vec![
+                    ProvenanceStep::new(self.rel_path, &kp("for"), "absent"),
+                    ProvenanceStep::new("", "for", "platform-default"),
+                ],
+            )),
+        }
+
+        // rule.labels.severity: explicit, else an authored absence. The
+        // guard predicate reads it lower-cased, `priority` standing in.
+        let labels = get(rule, "labels").and_then(Value::as_mapping);
+        match labels.and_then(|l| get(l, "severity")) {
+            Some(v) => out.packets.push(self.scalar(
+                unit,
+                "rule.labels.severity",
+                &kp("labels.severity"),
+                v,
+            )),
+            None => out.packets.push(self.authored_absent(
+                unit,
+                "rule.labels.severity",
+                &kp("labels.severity"),
+            )),
+        }
+        if let Some(severity) = severity(rule) {
+            out.predicates
+                .push(self.predicate(unit, "rule.labels.severity", &severity));
+        }
+
+        // rule.annotations.runbook: runbook_url or runbook, as a shape-only
+        // presence marker.
+        let annotations = get(rule, "annotations").and_then(Value::as_mapping);
+        let runbook = runbook(rule);
+        let mut packet = self.presence_marker(
+            unit,
+            "rule.annotations.runbook",
+            &kp("annotations.runbook_url"),
+            runbook,
+        );
+        let link = link_like(annotations);
+        let patched =
+            patch_target.is_some_and(|name| self.repo.is_some_and(|r| r.patches_rule(name)));
+        let templated = runbook.is_some_and(|v| render_value(v).contains("{{"));
+        if packet.resolved_value.as_deref() == Some("") || templated {
+            let repo = self.repo;
+            let why = [
+                (templated, "templated runbook value"),
+                (link, "a link-like annotation: a reader must judge the link"),
+                (
+                    repo.is_some_and(|r| r.mentions_runbook),
+                    "an Alertmanager config or template mentions a runbook",
+                ),
+                (
+                    repo.is_some_and(|r| r.paging == Paging::No),
+                    "no receiver can page: alerts go to chat, email or nowhere",
+                ),
+                (!unique, "another rule of the group has this alert name"),
+                (patched, "a kustomize patch targets this PrometheusRule"),
+            ]
+            .into_iter()
+            .find_map(|(holds, why)| holds.then_some(why));
+            if let Some(why) = why {
+                crate::non_production::undecide(&mut packet, why);
+            }
+        }
+        out.packets.push(packet);
+        if let Some(p) = self.runbook_target(unit, &kp("annotations.runbook_url"), runbook) {
+            out.packets.push(p);
+        }
+        let present = if link { "present" } else { "absent" };
+        out.predicates
+            .push(self.predicate(unit, "rule.annotations.link_like", present));
+        out.predicates
+            .push(self.predicate(unit, "rule.name_unique", &unique.to_string()));
+        if self.repo.is_some() {
+            out.predicates.push(self.predicate(
+                unit,
+                "rule.kustomize_patched",
+                &patched.to_string(),
+            ));
+        }
+
+        // rule.expr: shape-only non-emptiness of the expression.
+        out.packets
+            .push(self.presence_marker(unit, "rule.expr", &kp("expr"), get(rule, "expr")));
     }
 
     fn sloth(&self, base: &serde_yaml::Mapping, prefix: &str, out: &mut Retrieved) {
@@ -515,6 +753,41 @@ impl Emitter<'_> {
             }
         }
     }
+}
+
+/// The runbook annotation of an alert rule: `runbook_url`, else `runbook`.
+fn runbook(rule: &serde_yaml::Mapping) -> Option<&Value> {
+    let annotations = get(rule, "annotations").and_then(Value::as_mapping)?;
+    get(annotations, "runbook_url").or_else(|| get(annotations, "runbook"))
+}
+
+/// The severity a guard reads: the `severity` label, else `priority`,
+/// trimmed and lower-cased; the empty string when neither is set. `None`
+/// for a templated label, whose rendered value is unknowable here.
+fn severity(rule: &serde_yaml::Mapping) -> Option<String> {
+    let labels = get(rule, "labels").and_then(Value::as_mapping);
+    let Some(v) = labels.and_then(|l| get(l, "severity").or_else(|| get(l, "priority"))) else {
+        return Some(String::new());
+    };
+    let v = render_value(v);
+    (!v.contains("{{")).then(|| v.trim().to_lowercase())
+}
+
+/// Whether the rule is what RC-006 flags: a paging severity and no runbook.
+fn would_flag(rule: &serde_yaml::Mapping) -> bool {
+    let paging = severity(rule).is_some_and(|s| PAGING_SEVERITIES.contains(&s.as_str()));
+    paging && runbook(rule).is_none_or(|v| render_value(v).trim().is_empty())
+}
+
+/// Whether any annotation key names a link ([`LINK_KEY_WORDS`]) or any
+/// annotation value holds one ([`LINK_VALUE_WORDS`]), in any case.
+fn link_like(annotations: Option<&serde_yaml::Mapping>) -> bool {
+    annotations.into_iter().flatten().any(|(k, v)| {
+        let k = render_value(k).to_lowercase();
+        let v = render_value(v).to_lowercase();
+        LINK_KEY_WORDS.iter().any(|w| k.contains(w))
+            || LINK_VALUE_WORDS.iter().any(|w| v.contains(w))
+    })
 }
 
 /// A link with a scheme (`https:`, `mailto:`, RFC 3986's grammar) or a host
@@ -625,10 +898,10 @@ mod tests {
             "k8s/deploy.yaml",
             "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\n"
         ));
-        // A PrometheusRule CRD is a Kubernetes manifest too.
+        // Another monitoring.coreos.com kind is not a rule resource.
         assert!(!r.matches_head(
-            "k8s/rules.yaml",
-            "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nspec:\n  groups: []\n"
+            "k8s/monitor.yaml",
+            "apiVersion: monitoring.coreos.com/v1\nkind: ServiceMonitor\nspec:\n  endpoints: []\n"
         ));
         // Unknown YAML is not a sighting and not a claim.
         assert!(!r.matches_head("docs/notes.yaml", "a: b\n"));
@@ -726,8 +999,13 @@ mod tests {
         );
         let got = PrometheusRules.retrieve_with_root(root, "alerts/rules.yml", &yaml, "snap");
         for p in &got.packets {
+            // An undecided reason is fixed text; only the link must not ride.
             let v = p.resolved_value.as_deref().unwrap_or("");
-            assert!(!v.contains("runbook"), "the link rides in a packet: {p:?}");
+            let reason = v.starts_with(crate::UNDECIDED_PREFIX);
+            assert!(
+                !v.contains(if reason { link } else { "runbook" }),
+                "the link rides in a packet: {p:?}"
+            );
         }
         find(&got, "rule:api/A", "rule.annotations.runbook.target").clone()
     }
@@ -902,6 +1180,341 @@ mod tests {
         );
         // The group-level fact still emits.
         assert!(got.packets.iter().any(|p| p.unit == "group:agg"));
+    }
+
+    // --- rule resources: PrometheusRule, VMRule, Google Managed Prometheus ---
+
+    const PROMETHEUS_RULE: &str = "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: api\nspec:\n  groups:\n  - name: api\n    rules:\n    - alert: ApiDown\n      expr: up == 0\n      labels:\n        severity: critical\n";
+
+    #[test]
+    fn matches_head_claims_rule_resources_unless_another_family_owns_the_file() {
+        let r = PrometheusRules;
+        assert!(r.matches_head("deploy/rules.yaml", PROMETHEUS_RULE));
+        assert!(r.matches_head(
+            "deploy/vmrule.yaml",
+            "apiVersion: operator.victoriametrics.com/v1beta1\nkind: VMRule\nspec:\n  groups: []\n"
+        ));
+        assert!(r.matches_head(
+            "deploy/gmp.yaml",
+            "apiVersion: monitoring.googleapis.com/v1\nkind: ClusterRules\nspec:\n  groups: []\n"
+        ));
+        // A Service beside the rules: the Kubernetes family declines the
+        // mixed file, so the rules are read here.
+        let mixed = format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n---\n{PROMETHEUS_RULE}"
+        );
+        assert!(r.matches_head("deploy/all.yaml", &mixed));
+        // An Argo CD Application beside them keeps the file Argo's.
+        let argo = format!("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\n---\n{PROMETHEUS_RULE}");
+        assert!(!r.matches_head("deploy/app.yaml", &argo));
+    }
+
+    #[test]
+    fn a_prometheus_rule_resource_emits_the_rule_facts_under_spec() {
+        let mixed = format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n---\n{PROMETHEUS_RULE}"
+        );
+        let got = PrometheusRules.retrieve("deploy/rules.yaml", &mixed, "snap");
+        assert_eq!(got.unparseable, 0);
+        let sev = find(&got, "rule:api/ApiDown", "rule.labels.severity");
+        assert_eq!(sev.resolved_value.as_deref(), Some("critical"));
+        assert_eq!(
+            sev.provenance[0].key_path,
+            "spec.groups.api.rules.ApiDown.labels.severity"
+        );
+        let rb = find(&got, "rule:api/ApiDown", "rule.annotations.runbook");
+        assert_eq!(rb.resolved_value.as_deref(), Some(""));
+        assert!(got.packets.iter().any(|p| p.unit == "group:api"));
+    }
+
+    #[test]
+    fn a_vmrule_emits_the_rule_facts() {
+        let vmrule = "apiVersion: operator.victoriametrics.com/v1beta1\nkind: VMRule\nmetadata:\n  name: db\nspec:\n  groups:\n  - name: db\n    rules:\n    - alert: DbDown\n      expr: up == 0\n      labels:\n        severity: page\n      annotations:\n        runbook_url: https://runbooks.example.com/db\n";
+        let got = PrometheusRules.retrieve("deploy/vmrule.yaml", vmrule, "snap");
+        let sev = find(&got, "rule:db/DbDown", "rule.labels.severity");
+        assert_eq!(sev.resolved_value.as_deref(), Some("page"));
+        let rb = find(&got, "rule:db/DbDown", "rule.annotations.runbook");
+        assert_eq!(rb.resolved_value.as_deref(), Some("nonempty"));
+    }
+
+    #[test]
+    fn a_rule_resource_with_no_groups_counts_unparseable() {
+        let got = PrometheusRules.retrieve(
+            "deploy/rules.yaml",
+            "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nspec: {}\n",
+            "snap",
+        );
+        assert!(got.packets.is_empty());
+        assert_eq!(got.unparseable, 1);
+    }
+
+    // --- the severity guard predicate ---
+
+    fn predicate<'a>(got: &'a Retrieved, unit: &str, key: &str) -> Option<&'a [String]> {
+        got.predicates
+            .iter()
+            .find(|f| f.unit == unit && f.key == key)
+            .map(|f| f.values.as_slice())
+    }
+
+    #[test]
+    fn the_severity_predicate_is_lower_cased_and_falls_back_to_priority() {
+        let got = packets("groups:\n- name: g\n  rules:\n  - alert: A\n    expr: up == 0\n    labels:\n      severity: Critical\n  - alert: B\n    expr: up == 0\n    labels:\n      priority: P1\n  - alert: C\n    expr: up == 0\n    labels:\n      severity: warning\n      priority: P1\n  - alert: D\n    expr: up == 0\n  - alert: E\n    expr: up == 0\n    labels:\n      severity: \"{{ $labels.sev }}\"\n");
+        let sev = |a: &str| predicate(&got, &format!("rule:g/{a}"), "rule.labels.severity");
+        assert_eq!(sev("A"), Some(&["critical".to_string()][..]));
+        assert_eq!(sev("B"), Some(&["p1".to_string()][..]));
+        assert_eq!(
+            sev("C"),
+            Some(&["warning".to_string()][..]),
+            "severity wins"
+        );
+        assert_eq!(sev("D"), Some(&[String::new()][..]));
+        assert_eq!(sev("E"), None, "a templated label states nothing");
+        // The packet keeps the label as authored.
+        let p = find(&got, "rule:g/A", "rule.labels.severity");
+        assert_eq!(p.resolved_value.as_deref(), Some("Critical"));
+        let p = find(&got, "rule:g/B", "rule.labels.severity");
+        assert_eq!(p.resolved_value.as_deref(), Some(""));
+    }
+
+    // --- the RC-006 abstain conditions, each with a twin that still emits ---
+
+    /// The `rule.annotations.runbook` value of `unit` in `rule_file`, retrieved
+    /// from a repository of `files` (the rule file among them).
+    fn runbook_in(files: &[(&str, &str)], rule_file: &str, unit: &str) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("platform");
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let text = files.iter().find(|(p, _)| *p == rule_file).unwrap().1;
+        let got = PrometheusRules.retrieve_with_root(&root, rule_file, text, "snap");
+        find(&got, unit, "rule.annotations.runbook")
+            .resolved_value
+            .clone()
+    }
+
+    const RULES: &str = "deploy/prometheus/rules.yaml";
+
+    /// One critical alert with the given annotations block.
+    fn critical(annotations: &str) -> String {
+        format!("groups:\n- name: api\n  rules:\n  - alert: ApiDown\n    expr: up == 0\n    labels:\n      severity: critical\n{annotations}")
+    }
+
+    fn undecided(why: &str) -> Option<String> {
+        Some(format!("{}{why}", crate::UNDECIDED_PREFIX))
+    }
+
+    const UNIT: &str = "rule:api/ApiDown";
+
+    #[test]
+    fn a_link_like_annotation_is_undecided() {
+        for annotations in [
+            "    annotations:\n      dashboard_url: x\n",
+            "    annotations:\n      Playbook: x\n",
+            "    annotations:\n      description: see https://wiki.example.com/api\n",
+            "    annotations:\n      description: follow the runbook\n",
+        ] {
+            assert_eq!(
+                runbook_in(&[(RULES, &critical(annotations))], RULES, UNIT),
+                undecided("a link-like annotation: a reader must judge the link"),
+                "{annotations}"
+            );
+        }
+        let plain = critical("    annotations:\n      summary: the API is down\n");
+        assert_eq!(
+            runbook_in(&[(RULES, &plain)], RULES, UNIT),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn an_alertmanager_template_that_mentions_a_runbook_is_undecided() {
+        let rules = critical("");
+        let tmpl = "{{ define \"pager\" }}{{ .CommonAnnotations.runbook }}{{ end }}";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("alertmanager/pager.tmpl", tmpl)],
+                RULES,
+                UNIT
+            ),
+            undecided("an Alertmanager config or template mentions a runbook")
+        );
+        let other = "{{ define \"pager\" }}{{ .CommonAnnotations.summary }}{{ end }}";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("alertmanager/pager.tmpl", other)],
+                RULES,
+                UNIT
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn receivers_that_page_nobody_are_undecided() {
+        let rules = critical("");
+        let chat = "route:\n  receiver: chat\nreceivers:\n- name: chat\n  slack_configs:\n  - channel: '#alerts'\n";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("alertmanager/alertmanager.yml", chat)],
+                RULES,
+                UNIT
+            ),
+            undecided("no receiver can page: alerts go to chat, email or nowhere")
+        );
+        let pager = "route:\n  receiver: pager\nreceivers:\n- name: pager\n  pagerduty_configs:\n  - routing_key: K\n";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("alertmanager/alertmanager.yml", pager)],
+                RULES,
+                UNIT
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_duplicate_alert_name_is_undecided_unless_every_twin_would_flag() {
+        let pair = "groups:\n- name: api\n  rules:\n  - alert: ApiDown\n    expr: up == 0\n    labels:\n      severity: warning\n  - alert: ApiDown\n    expr: up == 0\n    for: 10m\n    labels:\n      severity: critical\n";
+        assert_eq!(
+            runbook_in(&[(RULES, pair)], RULES, UNIT),
+            undecided("another rule of the group has this alert name")
+        );
+        let both = pair.replace("severity: warning", "severity: critical");
+        assert_eq!(
+            runbook_in(&[(RULES, &both)], RULES, UNIT),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_kustomize_patch_of_the_prometheus_rule_is_undecided() {
+        let path = "deploy/base/rules.yaml";
+        let unit = "rule:api/ApiDown";
+        let patch = |name: &str| {
+            format!("resources: [../base]\npatches:\n- path: severity.yaml\n  target:\n    kind: PrometheusRule\n    name: {name}\n")
+        };
+        assert_eq!(
+            runbook_in(
+                &[
+                    (path, PROMETHEUS_RULE),
+                    ("deploy/ring/kustomization.yaml", &patch("api"))
+                ],
+                path,
+                unit
+            ),
+            undecided("a kustomize patch targets this PrometheusRule")
+        );
+        assert_eq!(
+            runbook_in(
+                &[
+                    (path, PROMETHEUS_RULE),
+                    ("deploy/ring/kustomization.yaml", &patch("etcd"))
+                ],
+                path,
+                unit
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_templated_runbook_value_is_undecided() {
+        let templated = critical("    annotations:\n      runbook: \"{{ $externalURL }}\"\n");
+        let got = packets(&templated);
+        assert_eq!(
+            find(&got, UNIT, "rule.annotations.runbook").resolved_value,
+            undecided("templated runbook value")
+        );
+        let literal = critical("    annotations:\n      runbook: docs/api.md\n");
+        let got = packets(&literal);
+        assert_eq!(
+            find(&got, UNIT, "rule.annotations.runbook")
+                .resolved_value
+                .as_deref(),
+            Some("nonempty")
+        );
+    }
+
+    #[test]
+    fn a_non_production_path_is_undecided() {
+        let rules = critical("");
+        assert_eq!(
+            runbook_in(
+                &[("examples/rules.yaml", &rules)],
+                "examples/rules.yaml",
+                UNIT
+            ),
+            undecided("non-production path: examples")
+        );
+        assert_eq!(
+            runbook_in(&[(RULES, &rules)], RULES, UNIT),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_vendored_or_generated_pack_is_undecided_on_every_fact() {
+        let rules = critical("");
+        let path = "monitoring/mixins/api/alerts.yaml";
+        assert_eq!(
+            runbook_in(&[(path, &rules)], path, UNIT),
+            undecided("vendored or generated rule pack: mixins")
+        );
+        let got = PrometheusRules.retrieve(path, &rules, "snap");
+        let p = find(&got, UNIT, "rule.for");
+        assert_eq!(
+            p.resolved_value,
+            undecided("vendored or generated rule pack: mixins")
+        );
+        assert_eq!(
+            runbook_in(&[(RULES, &rules)], RULES, UNIT),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_rule_with_a_runbook_keeps_its_value_whatever_the_repository_says() {
+        let rules =
+            critical("    annotations:\n      runbook_url: https://runbooks.example.com/api\n");
+        let chat = "route:\n  receiver: chat\nreceivers:\n- name: chat\n  slack_configs:\n  - channel: '#alerts'\n";
+        assert_eq!(
+            runbook_in(&[(RULES, &rules), ("alertmanager.yml", chat)], RULES, UNIT).as_deref(),
+            Some("nonempty")
+        );
+    }
+
+    #[test]
+    fn the_abstain_facts_are_guard_predicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = "groups:\n- name: api\n  rules:\n  - alert: ApiDown\n    expr: up == 0\n    labels:\n      severity: warning\n    annotations:\n      dashboard: https://grafana.example.com/d/api\n  - alert: ApiDown\n    expr: up == 0\n    labels:\n      severity: critical\n";
+        let got = PrometheusRules.retrieve_with_root(dir.path(), RULES, pair, "snap");
+        let one = |unit: &str, key: &str| predicate(&got, unit, key).map(|v| v.join(","));
+        assert_eq!(one(UNIT, "rule.name_unique").as_deref(), Some("false"));
+        assert_eq!(
+            one(UNIT, "rule.annotations.link_like").as_deref(),
+            Some("present")
+        );
+        assert_eq!(
+            one(UNIT, "rule.kustomize_patched").as_deref(),
+            Some("false")
+        );
+        let repo = |key: &str| one(crate::FILE_SCOPE, key);
+        assert_eq!(
+            repo("repo.alertmanager.mentions_runbook").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            repo("repo.alertmanager.paging_receiver").as_deref(),
+            Some("none_declared")
+        );
+        // Without the root the repository is unknown, and says nothing.
+        let got = packets(pair);
+        assert!(predicate(&got, crate::FILE_SCOPE, "repo.alertmanager.paging_receiver").is_none());
+        assert!(predicate(&got, UNIT, "rule.kustomize_patched").is_none());
     }
 
     // --- sloth SLO definitions ---
