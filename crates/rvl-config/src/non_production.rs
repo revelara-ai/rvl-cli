@@ -114,6 +114,45 @@ pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "stage",
 ];
 
+/// Path tokens that mark an Argo CD Application or ApplicationSet, a Flux
+/// Kustomization or a HelmRelease as not reconciled into production, on top
+/// of [`NON_PRODUCTION_TOKENS`]. Read only through [`gitops_path_token`] and
+/// [`gitops_value_token`], by the Argo/Flux retriever.
+///
+/// Evidence: a measured GitOps reconciliation rule over Argo CD and Flux
+/// objects only, where these trees held the lower environments (`stg/`,
+/// `nonprod/`, `qa/`, `uat/`, `int/`, `k3d/`), the chart and cluster
+/// skeletons a script copies (`template/`, `skeleton/`) and the objects
+/// kept and no longer applied (`legacy/`, `old/`, `attic/`, `backup/`,
+/// `disabled/`, `unused/`). They are not on the shared list: `templates`
+/// there would drop every Helm chart's rendered Kubernetes facts, and the
+/// other retrievers were not measured with them.
+pub const GITOPS_NON_PRODUCTION_TOKENS: &[&str] = &[
+    "stg",
+    "nonprod",
+    "k3d",
+    "qa",
+    "uat",
+    "integration",
+    "int",
+    "experimental",
+    "template",
+    "templates",
+    "skeleton",
+    "deprecated",
+    "legacy",
+    "old",
+    "disabled",
+    "unused",
+    "backup",
+    "bak",
+    "attic",
+];
+
+/// Repository-name tokens that mark a GitOps repository as a home or
+/// teaching lab, on top of [`SAMPLE_REPOSITORY_TOKENS`].
+pub const GITOPS_SAMPLE_REPOSITORY_TOKENS: &[&str] = &["lab", "labs"];
+
 /// A directory segment whose units are not deployed: the manifests under
 /// `.github/` are applied by CI jobs (the e2e clients a workflow installs),
 /// and the workflow files there have a retriever of their own that does not
@@ -188,6 +227,23 @@ pub fn path_token(rel_path: &str) -> Option<&'static str> {
     listed(dir, NON_PRODUCTION_TOKENS).or_else(|| listed(stem, NON_PRODUCTION_TOKENS))
 }
 
+/// The token that marks the GitOps object file at `rel_path`
+/// non-production: [`path_token`], then [`GITOPS_NON_PRODUCTION_TOKENS`]
+/// on its directory and stem.
+pub fn gitops_path_token(rel_path: &str) -> Option<&'static str> {
+    let (dir, stem) = dir_and_stem(rel_path);
+    path_token(rel_path)
+        .or_else(|| listed(dir, GITOPS_NON_PRODUCTION_TOKENS))
+        .or_else(|| listed(stem, GITOPS_NON_PRODUCTION_TOKENS))
+}
+
+/// The token that marks a GitOps target non-production: the same whole
+/// token test as [`gitops_path_token`], on a value an object names where it
+/// deploys (its name and namespace, a destination, a source path).
+pub fn gitops_value_token(value: &str) -> Option<&'static str> {
+    listed(value, NON_PRODUCTION_TOKENS).or_else(|| listed(value, GITOPS_NON_PRODUCTION_TOKENS))
+}
+
 /// Whether a resource name is a template awaiting substitution rather than
 /// a name the API accepts: it holds `$NAME`, `${...}`, `{{ ... }}` or an
 /// upper-case `PR_NUMBER`. A Kubernetes object name is lower-case letters,
@@ -209,11 +265,21 @@ pub const PLACEHOLDER_REASON: &str = "unexpanded placeholder in the resource nam
 /// `..`); a root with no name, such as `/` or the empty path a rootless
 /// retrieval passes, has no token.
 pub fn root_token(root: &Path) -> Option<&'static str> {
+    listed(&root_name(root)?, SAMPLE_REPOSITORY_TOKENS)
+}
+
+/// [`root_token`], then [`GITOPS_SAMPLE_REPOSITORY_TOKENS`].
+pub fn gitops_root_token(root: &Path) -> Option<&'static str> {
+    root_token(root).or_else(|| listed(&root_name(root)?, GITOPS_SAMPLE_REPOSITORY_TOKENS))
+}
+
+/// The scanned root's own directory name, as [`root_token`] reads it.
+fn root_name(root: &Path) -> Option<String> {
     let name = match root.file_name() {
         Some(name) => name.to_os_string(),
         None => root.canonicalize().ok()?.file_name()?.to_os_string(),
     };
-    listed(&name.to_string_lossy(), SAMPLE_REPOSITORY_TOKENS)
+    Some(name.to_string_lossy().into_owned())
 }
 
 /// Why the unit at `rel_path` is not deployed to production, or `None`
@@ -221,6 +287,15 @@ pub fn root_token(root: &Path) -> Option<&'static str> {
 /// once per scan by a caller that asks of many units.
 pub fn reason(repo: Option<&str>, rel_path: &str) -> Option<String> {
     if let Some(token) = path_token(rel_path) {
+        return Some(format!("non-production path: {token}"));
+    }
+    repo.map(|token| format!("non-production repository: {token}"))
+}
+
+/// [`reason`] for a GitOps object file: [`gitops_path_token`], then the
+/// repository's [`gitops_root_token`].
+pub fn gitops_reason(repo: Option<&str>, rel_path: &str) -> Option<String> {
+    if let Some(token) = gitops_path_token(rel_path) {
         return Some(format!("non-production path: {token}"));
     }
     repo.map(|token| format!("non-production repository: {token}"))
@@ -368,6 +443,61 @@ mod tests {
         ] {
             assert_eq!(path_token(path), None, "{path}");
         }
+    }
+
+    #[test]
+    fn gitops_paths_and_targets_add_their_own_tokens_to_the_shared_list() {
+        for (path, token) in [
+            ("clusters/stg/apps.yaml", "stg"),
+            ("clusters/nonprod/apps.yaml", "nonprod"),
+            ("clusters/k3d/apps.yaml", "k3d"),
+            ("apps/qa/api.yaml", "qa"),
+            ("apps/uat/api.yaml", "uat"),
+            ("envs/int/api.yaml", "int"),
+            ("envs/integration/api.yaml", "integration"),
+            ("apps/experimental/api.yaml", "experimental"),
+            ("cluster-template/apps.yaml", "template"),
+            ("charts/api/templates/app.yaml", "templates"),
+            ("skeleton/apps.yaml", "skeleton"),
+            ("apps/deprecated/api.yaml", "deprecated"),
+            ("legacy/apps.yaml", "legacy"),
+            ("apps/old/api.yaml", "old"),
+            ("apps/disabled/api.yaml", "disabled"),
+            ("apps/unused/api.yaml", "unused"),
+            ("backup/apps.yaml", "backup"),
+            ("apps/api.bak.yaml", "bak"),
+            ("attic/apps.yaml", "attic"),
+            ("clusters/staging/apps.yaml", "staging"),
+        ] {
+            assert_eq!(gitops_path_token(path), Some(token), "{path}");
+        }
+        assert_eq!(gitops_path_token("clusters/production/apps.yaml"), None);
+        assert_eq!(gitops_path_token("clusters/interop/holdout.yaml"), None);
+        // The shared list is unchanged: a chart template still deploys.
+        assert_eq!(path_token("charts/api/templates/app.yaml"), None);
+        assert_eq!(path_token("legacy/apps.yaml"), None);
+
+        assert_eq!(gitops_value_token("podinfo-qa"), Some("qa"));
+        assert_eq!(gitops_value_token("./clusters/staging"), Some("staging"));
+        assert_eq!(gitops_value_token("values-dev.yaml"), Some("dev"));
+        assert_eq!(gitops_value_token("https://kubernetes.default.svc"), None);
+        assert_eq!(gitops_value_token("podinfo"), None);
+
+        assert_eq!(
+            gitops_root_token(Path::new("/scans/homelab-labs")),
+            Some("labs")
+        );
+        assert_eq!(gitops_root_token(Path::new("/scans/k8s-lab")), Some("lab"));
+        assert_eq!(gitops_root_token(Path::new("/scans/fleet")), None);
+        assert_eq!(root_token(Path::new("/scans/k8s-lab")), None);
+        assert_eq!(
+            gitops_reason(None, "clusters/qa/apps.yaml").as_deref(),
+            Some("non-production path: qa")
+        );
+        assert_eq!(
+            gitops_reason(Some("lab"), "clusters/prod/apps.yaml").as_deref(),
+            Some("non-production repository: lab")
+        );
     }
 
     #[test]

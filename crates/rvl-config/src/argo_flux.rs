@@ -27,7 +27,8 @@
 //!     success nor a failure condition, which are measured and never judged.
 //!   * Application / ApplicationSet (`argoproj.io`, format `argo-cd`) —
 //!     `application.syncPolicy.automated` (presence), `.prune` / `.selfHeal`
-//!     (documented `false` defaults), `application.syncPolicy.retry`
+//!     (documented `false` defaults), `.enabled` (documented `true`: an
+//!     automated block switched off), `application.syncPolicy.retry`
 //!     (automated apps only: an unattended sync loop with no bounded retry
 //!     is the risk a spec judges), `application.targetRevision.shape`
 //!     (`pinned` | `floating`; HEAD/branch float, tag/SHA pin — the value is
@@ -41,7 +42,9 @@
 //!     (documented `false`), `.timeout` (documented: defaults to the
 //!     interval).
 //!   * HelmRelease (`helm.toolkit.fluxcd.io`) — `helmrelease.interval`,
-//!     `.timeout` (documented `300s`),
+//!     `.timeout` (documented `300s`), `helmrelease.driftDetection.mode`
+//!     (absent with no `driftDetection` block; a block without a mode is
+//!     the documented `disabled`),
 //!     `helmrelease.install.remediation.retries` /
 //!     `helmrelease.upgrade.remediation.retries` (documented `0`: a failed
 //!     install/upgrade is NOT remediated unless asked — the rollback
@@ -64,6 +67,13 @@
 //!     intent, so its absences are authored facts, judgeable by specs (the
 //!     `configured` pattern) — never platform-side unknowns.
 //!
+//! Application, ApplicationSet, Kustomization and HelmRelease units are
+//! judged only where they are whole and reconciled into production: the
+//! conditions of [`Repo`] carry a unit's facts undecided with the reason
+//! otherwise (a non-production path, repository or target, a chart
+//! template, a fragment, an object declared twice, a templated value, an
+//! interval that is not a Go duration).
+//!
 //! Seed-grade bounds, recorded for the corpus follow-up bead: only
 //! `spec.source` of an Application is read (multi-source apps emit no
 //! targetRevision packet), content claiming reads the walk's bounded head,
@@ -75,6 +85,9 @@ use crate::{
 };
 use serde::Deserialize as _;
 use serde_yaml::Value;
+use std::cell::OnceCell;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 pub struct ArgoFlux;
 
@@ -111,22 +124,43 @@ impl ConfigRetriever for ArgoFlux {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        let mut out = retrieve(rel_path, contents, snapshot_id);
+        let files = [(rel_path.to_string(), contents.to_string())];
+        let mut out = retrieve(rel_path, contents, snapshot_id, &Repo::new(None, &files));
         crate::non_production::undecide_unit(None, rel_path, &mut out);
         out
     }
 
-    /// The walk's entry: the root names a sample repository
+    /// One file under a root: the root names a sample repository
     /// ([`crate::non_production::undecide_unit`]).
     fn retrieve_with_root(
         &self,
-        root: &std::path::Path,
+        root: &Path,
         rel_path: &str,
         contents: &str,
         snapshot_id: &str,
     ) -> Retrieved {
-        let mut out = retrieve(rel_path, contents, snapshot_id);
-        crate::non_production::undecide_unit(Some(root), rel_path, &mut out);
+        let files = [(rel_path.to_string(), contents.to_string())];
+        self.retrieve_all(root, &files, snapshot_id)
+    }
+
+    /// The walk's entry: every claimed file at once, so an object another
+    /// file restates is seen as declared twice ([`Repo`]).
+    fn retrieve_all(
+        &self,
+        root: &Path,
+        files: &[(String, String)],
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let repo = Repo::new(Some(root), files);
+        let mut out = Retrieved::default();
+        for (rel, contents) in files {
+            let mut got = retrieve(rel, contents, snapshot_id, &repo);
+            crate::non_production::undecide_unit(Some(root), rel, &mut got);
+            out.packets.extend(got.packets);
+            out.predicates.extend(got.predicates);
+            out.unparseable += got.unparseable;
+            out.sightings.extend(got.sightings);
+        }
         out
     }
 }
@@ -325,7 +359,7 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str, repo: &Repo) -> Retrieved {
     let mut out = Retrieved::default();
     let mut recognized_docs = 0usize;
     for doc in serde_yaml::Deserializer::from_str(contents) {
@@ -333,6 +367,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             out.unparseable = 1;
             break;
         };
+        let first = out.packets.len();
         let Some(m) = v.as_mapping() else { continue };
         let Some(api) = get(m, "apiVersion").and_then(Value::as_str) else {
             continue;
@@ -442,6 +477,30 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             }
             _ => unreachable!("recognized() only admits the kinds above"),
         }
+        if let Some(why) = repo.abstain(rel_path, contents, kind, &v) {
+            for p in &mut out.packets[first..] {
+                crate::non_production::undecide(p, &why);
+            }
+        }
+        if kind == "HelmRelease" && !drift_detection_on(spec) && repo.drift_patched() {
+            for p in &mut out.packets[first..] {
+                if p.key == "helmrelease.driftDetection.mode" {
+                    crate::non_production::undecide(p, DRIFT_PATCH_REASON);
+                }
+            }
+        }
+    }
+    if out.unparseable == 1 {
+        // A file that does not parse (a chart template, a file a script
+        // fills in) says nothing whole about the reconciled objects before
+        // the break.
+        let reconciled = |unit: &str| {
+            unit.split_once(':')
+                .is_some_and(|(kind, _)| RECONCILED.iter().any(|k| k.eq_ignore_ascii_case(kind)))
+        };
+        for p in out.packets.iter_mut().filter(|p| reconciled(&p.unit)) {
+            crate::non_production::undecide(p, "the file does not parse as YAML");
+        }
     }
     if recognized_docs == 0 && out.unparseable == 0 {
         // Claimed by head shape, but nothing recognized parsed out (the head
@@ -469,14 +528,25 @@ fn emit_application(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>, base: &
             );
             // The automated block's knobs have documented `false` defaults.
             let am = v.as_mapping();
-            for (knob, key) in [
-                ("prune", "application.syncPolicy.automated.prune"),
-                ("selfHeal", "application.syncPolicy.automated.selfHeal"),
+            // `enabled` turns the block off without removing it, and
+            // defaults to `true`.
+            for (knob, key, default) in [
+                ("prune", "application.syncPolicy.automated.prune", "false"),
+                (
+                    "selfHeal",
+                    "application.syncPolicy.automated.selfHeal",
+                    "false",
+                ),
+                (
+                    "enabled",
+                    "application.syncPolicy.automated.enabled",
+                    "true",
+                ),
             ] {
                 let key_path = jp(&format!("syncPolicy.automated.{knob}"));
                 match am.and_then(|a| get(a, knob)) {
                     Some(v) => e.authored(key, &key_path, v),
-                    None => e.platform_default(key, &key_path, knob, "false"),
+                    None => e.platform_default(key, &key_path, knob, default),
                 }
             }
             // Retry is judged where sync is automated: an unattended failure
@@ -579,6 +649,24 @@ fn emit_helmrelease(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
             "timeout (the documented 300s Helm-action default)",
             "300s",
         ),
+    }
+    // Drift detection: with no block, Flux never corrects a change made in
+    // the cluster; a block without a mode is the documented `disabled`.
+    match sget("driftDetection") {
+        None => e.absent("helmrelease.driftDetection.mode", "spec.driftDetection"),
+        Some(block) => match block.as_mapping().and_then(|b| get(b, "mode")) {
+            Some(v) => e.authored(
+                "helmrelease.driftDetection.mode",
+                "spec.driftDetection.mode",
+                v,
+            ),
+            None => e.platform_default(
+                "helmrelease.driftDetection.mode",
+                "spec.driftDetection.mode",
+                "driftDetection.mode",
+                "disabled",
+            ),
+        },
     }
     // Remediation retries: documented default 0 — a failed install/upgrade
     // is NOT remediated unless asked. This is the rollback control's fact.
@@ -775,6 +863,333 @@ fn emit_analysis_template(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
     }
 }
 
+/// The kinds whose reconciliation a GitOps spec judges: the abstain
+/// conditions of [`Repo::abstain`] were measured on these, and only these.
+const RECONCILED: &[&str] = &[
+    "Application",
+    "ApplicationSet",
+    "Kustomization",
+    "HelmRelease",
+];
+
+/// The reason a HelmRelease's drift-detection fact carries when a patch in
+/// the repository may set it.
+const DRIFT_PATCH_REASON: &str =
+    "a patch in the repository may set driftDetection (a YAML file holds both)";
+
+/// Text that marks a value as filled in before it is applied: a Helm or
+/// ApplicationSet template, a Flux post-build substitution, a placeholder.
+const TEMPLATE_MARKERS: &[&str] = &["{{", "${", "<"];
+
+/// What the abstain conditions of the reconciled kinds read beyond one
+/// document: the scanned root, and every file the scan claimed for this
+/// retriever. A unit these conditions catch carries its facts undecided
+/// with the reason, so the lane abstains and says why:
+///
+///   * a chart template (`<chart>/templates/`, rendered before it is
+///     applied);
+///   * a non-production path or repository
+///     ([`crate::non_production::gitops_reason`]);
+///   * a fragment: a patch or component file, a file holding `$patch`, an
+///     Application with no destination or no source, a Kustomization with
+///     no `sourceRef`, a HelmRelease with no `chart` and no `chartRef`;
+///   * a non-production target: its name, its namespace, or where it
+///     deploys holds a token ([`crate::non_production::gitops_value_token`]);
+///   * an object declared in more than one file (an overlay or a second
+///     cluster restates it, so no one file is its whole intent);
+///   * a templated value in a judged field, or an ApplicationSet with a
+///     `templatePatch`;
+///   * an `interval` that is not a Go duration.
+///
+/// A HelmRelease's `helmrelease.driftDetection.mode` alone is undecided
+/// when a YAML file of the repository holds both `driftDetection` and
+/// `patch`: a parent Kustomization usually patches it into every release.
+struct Repo<'a> {
+    root: Option<&'a Path>,
+    token: Option<&'static str>,
+    files: &'a [(String, String)],
+    /// The number of files declaring each reconciled (kind, name).
+    declared: BTreeMap<(String, String), usize>,
+    drift_patched: OnceCell<bool>,
+}
+
+impl<'a> Repo<'a> {
+    fn new(root: Option<&'a Path>, files: &'a [(String, String)]) -> Self {
+        let mut declared = BTreeMap::new();
+        for (_, contents) in files {
+            let mut seen = std::collections::BTreeSet::new();
+            for doc in serde_yaml::Deserializer::from_str(contents) {
+                let Ok(v) = Value::deserialize(doc) else {
+                    break;
+                };
+                if let Some(key) = reconciled_identity(&v) {
+                    seen.insert(key);
+                }
+            }
+            for key in seen {
+                *declared.entry(key).or_insert(0) += 1;
+            }
+        }
+        Self {
+            root,
+            token: root.and_then(crate::non_production::gitops_root_token),
+            files,
+            declared,
+            drift_patched: OnceCell::new(),
+        }
+    }
+
+    /// Whether a YAML file of the repository holds both `driftDetection`
+    /// and `patch`. Walked once, on the first HelmRelease that asks; with
+    /// no root, the claimed files are the repository.
+    fn drift_patched(&self) -> bool {
+        let patches = |text: &str| text.contains("driftDetection") && text.contains("patch");
+        *self.drift_patched.get_or_init(|| match self.root {
+            None => self.files.iter().any(|(_, text)| patches(text)),
+            Some(root) => crate::walk(root).flatten().any(|entry| {
+                let path = entry.path();
+                entry.file_type().is_some_and(|t| t.is_file())
+                    && path.extension().is_some_and(|x| x == "yaml" || x == "yml")
+                    && std::fs::read_to_string(path).is_ok_and(|text| patches(&text))
+            }),
+        })
+    }
+
+    /// Why the object `doc` of kind `kind` in the file at `rel_path` is not
+    /// judged, or `None` when it is (or is not a reconciled kind).
+    fn abstain(&self, rel_path: &str, contents: &str, kind: &str, doc: &Value) -> Option<String> {
+        use crate::non_production as np;
+        if !RECONCILED.contains(&kind) {
+            return None;
+        }
+        if self
+            .root
+            .is_some_and(|root| crate::kubernetes::helm::under_chart_templates(root, rel_path))
+        {
+            return Some("chart template: rendered before it is applied".into());
+        }
+        if let Some(why) = np::gitops_reason(self.token, rel_path) {
+            return Some(why);
+        }
+        if np::patch_fragment(self.root, rel_path) || contents.contains("$patch") {
+            return Some("fragment: a patch or component another file completes".into());
+        }
+        let spec = at(doc, &["spec"]);
+        // An ApplicationSet is judged by the Application spec it stamps out.
+        let app = match kind {
+            "ApplicationSet" => spec.and_then(|s| at(s, &["template", "spec"])),
+            _ => spec,
+        };
+        if let Some(field) = missing_whole_field(kind, spec, app) {
+            return Some(format!("fragment: no {field}, another file completes it"));
+        }
+        if let Some((field, token)) = target_fields(kind, doc, spec, app)
+            .into_iter()
+            .find_map(|(field, v)| np::gitops_value_token(&v).map(|t| (field, t)))
+        {
+            return Some(format!("non-production target: {field} names {token}"));
+        }
+        if let Some(n) = reconciled_identity(doc)
+            .and_then(|key| self.declared.get(&key))
+            .filter(|n| **n > 1)
+        {
+            return Some(format!(
+                "declared in {n} files: an overlay or a second cluster restates it"
+            ));
+        }
+        if kind == "ApplicationSet" && spec.and_then(|s| at(s, &["templatePatch"])).is_some() {
+            return Some("templated value: templatePatch".into());
+        }
+        for (field, v) in judged_fields(kind, spec, app) {
+            let text = v.as_str().map_or_else(|| render_value(v), str::to_string);
+            if v.is_string() && TEMPLATE_MARKERS.iter().any(|m| text.contains(m)) {
+                return Some(format!("templated value: {field}"));
+            }
+            if field == "interval" && !go_duration(&text) {
+                return Some(format!("interval {text:?} is not a Go duration"));
+            }
+        }
+        None
+    }
+}
+
+/// The (kind, name) of a reconciled object, for [`Repo::declared`].
+fn reconciled_identity(doc: &Value) -> Option<(String, String)> {
+    let api = at(doc, &["apiVersion"]).and_then(Value::as_str)?;
+    let kind = at(doc, &["kind"]).and_then(Value::as_str)?;
+    if !(RECONCILED.contains(&kind) && recognized(group_of(api), kind)) {
+        return None;
+    }
+    let name = at(doc, &["metadata", "name"]).and_then(Value::as_str);
+    Some((kind.to_string(), name.unwrap_or("unnamed").to_string()))
+}
+
+/// The field a whole object of `kind` has and a fragment lacks, if it is
+/// missing: what it deploys and where.
+fn missing_whole_field(
+    kind: &str,
+    spec: Option<&Value>,
+    app: Option<&Value>,
+) -> Option<&'static str> {
+    let has = |v: Option<&Value>, key: &str| v.and_then(|v| at(v, &[key])).is_some();
+    match kind {
+        "Application" | "ApplicationSet" if !has(app, "destination") => Some("destination"),
+        "Application" | "ApplicationSet" if !has(app, "source") && !has(app, "sources") => {
+            Some("source")
+        }
+        "Kustomization" if !has(spec, "sourceRef") => Some("sourceRef"),
+        "HelmRelease" if !has(spec, "chart") && !has(spec, "chartRef") => Some("chart or chartRef"),
+        _ => None,
+    }
+}
+
+/// The string values that name what an object is and where it deploys,
+/// each with its field: the object's name and namespace; an Argo CD
+/// destination, project, source path and value files; a Flux path and
+/// target namespace.
+fn target_fields<'v>(
+    kind: &str,
+    doc: &'v Value,
+    spec: Option<&'v Value>,
+    app: Option<&'v Value>,
+) -> Vec<(&'static str, String)> {
+    let mut found: Vec<(&'static str, Option<&'v Value>)> = vec![
+        ("metadata.name", at(doc, &["metadata", "name"])),
+        ("metadata.namespace", at(doc, &["metadata", "namespace"])),
+    ];
+    let under = |v: Option<&'v Value>, path: &[&str]| v.and_then(|v| at(v, path));
+    match kind {
+        "Application" | "ApplicationSet" => {
+            found.extend([
+                (
+                    "destination.namespace",
+                    under(app, &["destination", "namespace"]),
+                ),
+                ("destination.name", under(app, &["destination", "name"])),
+                ("destination.server", under(app, &["destination", "server"])),
+                ("project", under(app, &["project"])),
+            ]);
+            let sources = under(app, &["sources"])
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .chain(under(app, &["source"]));
+            for source in sources {
+                found.push(("source.path", at(source, &["path"])));
+                found.push((
+                    "source.helm.valueFiles",
+                    at(source, &["helm", "valueFiles"]),
+                ));
+            }
+        }
+        "Kustomization" => found.extend([
+            ("spec.path", under(spec, &["path"])),
+            ("spec.targetNamespace", under(spec, &["targetNamespace"])),
+        ]),
+        _ => found.push(("spec.targetNamespace", under(spec, &["targetNamespace"]))),
+    }
+    let mut out = Vec::new();
+    for (field, v) in found {
+        match v {
+            Some(Value::String(s)) => out.push((field, s.clone())),
+            Some(Value::Sequence(items)) => out.extend(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| (field, s.to_string())),
+            ),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The fields a GitOps spec judges, as authored, each named by its last
+/// key: Argo CD's sync policy and its automated knobs, a Kustomization's
+/// prune and interval, a HelmRelease's interval and drift detection.
+fn judged_fields<'v>(
+    kind: &str,
+    spec: Option<&'v Value>,
+    app: Option<&'v Value>,
+) -> Vec<(&'static str, &'v Value)> {
+    let under = |v: Option<&'v Value>, path: &[&str]| v.and_then(|v| at(v, path));
+    let fields: Vec<(&'static str, Option<&'v Value>)> = match kind {
+        "Application" | "ApplicationSet" => {
+            let automated = under(app, &["syncPolicy", "automated"]);
+            vec![
+                ("syncPolicy", under(app, &["syncPolicy"])),
+                ("automated", automated),
+                ("selfHeal", under(automated, &["selfHeal"])),
+                ("prune", under(automated, &["prune"])),
+                ("enabled", under(automated, &["enabled"])),
+            ]
+        }
+        "Kustomization" => vec![
+            ("prune", under(spec, &["prune"])),
+            ("interval", under(spec, &["interval"])),
+        ],
+        _ => vec![
+            ("interval", under(spec, &["interval"])),
+            ("driftDetection", under(spec, &["driftDetection"])),
+            ("mode", under(spec, &["driftDetection", "mode"])),
+        ],
+    };
+    fields
+        .into_iter()
+        .filter_map(|(field, v)| v.map(|v| (field, v)))
+        .collect()
+}
+
+/// Whether a HelmRelease's own `driftDetection.mode` turns detection on
+/// (`enabled`, or `warn`, which detects and reports).
+fn drift_detection_on(spec: Option<&serde_yaml::Mapping>) -> bool {
+    spec.and_then(|s| get(s, "driftDetection"))
+        .and_then(|d| at(d, &["mode"]))
+        .and_then(Value::as_str)
+        .is_some_and(|mode| matches!(mode, "enabled" | "warn"))
+}
+
+/// Whether `text` is a Go duration (`time.ParseDuration`): an optional
+/// sign, then `0` or one or more decimal numbers each with a unit of `ns`,
+/// `us`, `µs`, `ms`, `s`, `m` or `h`. Flux parses every interval this way.
+fn go_duration(text: &str) -> bool {
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if body == "0" {
+        return true;
+    }
+    let mut rest = body;
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let number = &rest[..digits];
+        if !number.bytes().any(|b| b.is_ascii_digit()) || number.matches('.').count() > 1 {
+            return false;
+        }
+        rest = &rest[digits..];
+        let unit = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        if !matches!(
+            &rest[..unit],
+            "ns" | "us" | "\u{b5}s" | "\u{3bc}s" | "ms" | "s" | "m" | "h"
+        ) {
+            return false;
+        }
+        rest = &rest[unit..];
+    }
+    true
+}
+
+/// The value at `path` under `v`, through mappings.
+fn at<'v>(v: &'v Value, path: &[&str]) -> Option<&'v Value> {
+    path.iter()
+        .try_fold(v, |v, key| v.as_mapping().and_then(|m| get(m, key)))
+}
+
 pub(crate) fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
     m.get(Value::String(key.to_string()))
 }
@@ -850,7 +1265,7 @@ mod tests {
 
     #[test]
     fn an_application_under_a_non_production_path_carries_every_fact_undecided() {
-        let yaml = "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  syncPolicy:\n    automated: {}\n";
+        let yaml = "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    repoURL: https://example.com/deploy.git\n  syncPolicy:\n    automated: {}\n";
         let got = ArgoFlux.retrieve("examples/argocd/app.yaml", yaml, "snap");
         assert!(!got.packets.is_empty());
         for p in &got.packets {
@@ -872,7 +1287,7 @@ mod tests {
     #[test]
     fn automated_app_without_retry_emits_an_as_authored_absent_packet() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  syncPolicy:\n    automated: {}\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    repoURL: https://example.com/deploy.git\n  syncPolicy:\n    automated: {}\n",
         );
         let auto = find(
             &got,
@@ -917,7 +1332,7 @@ mod tests {
     #[test]
     fn explicit_automated_knobs_and_retry_resolve_as_authored() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  syncPolicy:\n    automated:\n      prune: true\n      selfHeal: true\n    retry:\n      limit: 5\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    repoURL: https://example.com/deploy.git\n  syncPolicy:\n    automated:\n      prune: true\n      selfHeal: true\n    retry:\n      limit: 5\n",
         );
         assert_eq!(
             find(
@@ -937,7 +1352,7 @@ mod tests {
     #[test]
     fn manual_sync_app_is_absent_automated_and_emits_no_retry_packet() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  project: team-a\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    repoURL: https://example.com/deploy.git\n  project: team-a\n",
         );
         let auto = find(&got, "application:g", "application.syncPolicy.automated");
         assert_eq!(auto.resolved_value.as_deref(), Some(ABSENT_RENDERING));
@@ -971,7 +1386,7 @@ mod tests {
             (sha, "pinned"),
         ] {
             let got = packets(&format!(
-                "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  source:\n    targetRevision: {rev}\n"
+                "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    targetRevision: {rev}\n"
             ));
             let p = find(&got, "application:g", "application.targetRevision.shape");
             assert_eq!(p.resolved_value.as_deref(), Some(shape), "rev {rev}");
@@ -986,7 +1401,7 @@ mod tests {
     #[test]
     fn absent_target_revision_defaults_to_floating_head() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  source:\n    path: k8s\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    path: k8s\n",
         );
         let p = find(&got, "application:g", "application.targetRevision.shape");
         assert_eq!(p.resolved_value.as_deref(), Some("floating"));
@@ -998,7 +1413,7 @@ mod tests {
     #[test]
     fn project_defaults_to_the_default_project() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec: {}\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: g\nspec:\n  destination:\n    server: https://kubernetes.default.svc\n  source:\n    repoURL: https://example.com/deploy.git\n",
         );
         let p = find(&got, "application:g", "application.project");
         assert_eq!(p.resolved_value.as_deref(), Some("default"));
@@ -1008,7 +1423,7 @@ mod tests {
     #[test]
     fn applicationset_template_emits_application_keys_under_its_own_unit() {
         let got = packets(
-            "apiVersion: argoproj.io/v1alpha1\nkind: ApplicationSet\nmetadata:\n  name: fleet\nspec:\n  template:\n    spec:\n      source:\n        targetRevision: main\n      syncPolicy:\n        automated: {}\n",
+            "apiVersion: argoproj.io/v1alpha1\nkind: ApplicationSet\nmetadata:\n  name: fleet\nspec:\n  template:\n    spec:\n      destination:\n        server: https://kubernetes.default.svc\n      source:\n        targetRevision: main\n      syncPolicy:\n        automated: {}\n",
         );
         let p = find(
             &got,
@@ -1031,7 +1446,7 @@ mod tests {
     #[test]
     fn kustomization_required_fields_absent_are_as_authored_absent() {
         let got = packets(
-            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: apps\nspec:\n  path: ./k8s\n",
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: apps\nspec:\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n  path: ./k8s\n",
         );
         for key in ["kustomization.interval", "kustomization.prune"] {
             let p = find(&got, "kustomization:apps", key);
@@ -1052,7 +1467,7 @@ mod tests {
     #[test]
     fn kustomization_timeout_derives_from_the_interval() {
         let got = packets(
-            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: apps\nspec:\n  interval: 10m\n  prune: true\n  wait: true\n",
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: apps\nspec:\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n  interval: 10m\n  prune: true\n  wait: true\n",
         );
         let t = find(&got, "kustomization:apps", "kustomization.timeout");
         assert_eq!(t.resolved_value.as_deref(), Some("10m"));
@@ -1077,7 +1492,7 @@ mod tests {
     #[test]
     fn helmrelease_remediation_retries_default_to_zero() {
         let got = packets(
-            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: podinfo\nspec:\n  interval: 5m\n  install:\n    remediation:\n      retries: 3\n",
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: podinfo\nspec:\n  chart:\n    spec:\n      chart: podinfo\n  interval: 5m\n  install:\n    remediation:\n      retries: 3\n",
         );
         let install = find(
             &got,
@@ -1317,5 +1732,564 @@ mod tests {
             None
         );
         assert_eq!(sight_unrecognized(""), None);
+    }
+
+    /// A whole Application: it names where it deploys and what.
+    fn whole_app(name: &str, spec: &str) -> String {
+        format!(
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: {name}\n  namespace: argocd\nspec:\n  project: platform\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: {name}\n  source:\n    repoURL: https://example.com/deploy.git\n    path: apps/{name}\n{spec}"
+        )
+    }
+
+    /// A whole Flux Kustomization.
+    fn whole_ks(name: &str, spec: &str) -> String {
+        format!(
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: {name}\n  namespace: flux-system\nspec:\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n  path: ./apps/{name}\n{spec}"
+        )
+    }
+
+    /// A whole HelmRelease.
+    fn whole_hr(name: &str, spec: &str) -> String {
+        format!(
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: {name}\n  namespace: {name}\nspec:\n  chart:\n    spec:\n      chart: {name}\n{spec}"
+        )
+    }
+
+    /// The reason a packet carries when undecided, else `None`.
+    fn undecided<'a>(got: &'a Retrieved, unit: &str, key: &str) -> Option<&'a str> {
+        find(got, unit, key)
+            .resolved_value
+            .as_deref()
+            .and_then(|v| v.strip_prefix(crate::UNDECIDED_PREFIX))
+    }
+
+    /// Retrieve `files` as one scan of a repository written under `root`.
+    fn scan(root: &Path, files: &[(&str, &str)]) -> Retrieved {
+        for (rel, text) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let claimed: Vec<(String, String)> = files
+            .iter()
+            .filter(|(rel, text)| ArgoFlux.matches_head(rel, text))
+            .map(|(rel, text)| (rel.to_string(), text.to_string()))
+            .collect();
+        ArgoFlux.retrieve_all(root, &claimed, "snap")
+    }
+
+    #[test]
+    fn automated_enabled_defaults_to_true_and_reads_an_authored_false() {
+        let got = packets(&whole_app("api", "  syncPolicy:\n    automated: {}\n"));
+        let on = find(
+            &got,
+            "application:api",
+            "application.syncPolicy.automated.enabled",
+        );
+        assert_eq!(on.resolved_value.as_deref(), Some("true"));
+        assert_eq!(on.resolution, Resolution::PlatformDefault);
+        let got = packets(&whole_app(
+            "api",
+            "  syncPolicy:\n    automated:\n      enabled: false\n",
+        ));
+        let off = find(
+            &got,
+            "application:api",
+            "application.syncPolicy.automated.enabled",
+        );
+        assert_eq!(off.resolved_value.as_deref(), Some("false"));
+        assert_eq!(off.resolution, Resolution::AsAuthored);
+        assert_eq!(
+            off.provenance[0].key_path,
+            "spec.syncPolicy.automated.enabled"
+        );
+        // No automated block: no enabled fact, as for prune and selfHeal.
+        let got = packets(&whole_app("api", ""));
+        assert!(!got
+            .packets
+            .iter()
+            .any(|p| p.key == "application.syncPolicy.automated.enabled"));
+    }
+
+    #[test]
+    fn drift_detection_mode_is_absent_without_a_block_and_disabled_by_default() {
+        let key = "helmrelease.driftDetection.mode";
+        let got = packets(&whole_hr("podinfo", "  interval: 5m\n"));
+        let p = find(&got, "helmrelease:podinfo", key);
+        assert_eq!(p.resolved_value.as_deref(), Some(ABSENT_RENDERING));
+        assert_eq!(p.resolution, Resolution::AsAuthored);
+        assert_eq!(p.provenance[0].role, "absent");
+
+        let got = packets(&whole_hr("podinfo", "  driftDetection: {}\n"));
+        let p = find(&got, "helmrelease:podinfo", key);
+        assert_eq!(p.resolved_value.as_deref(), Some("disabled"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+
+        for mode in ["enabled", "warn", "disabled"] {
+            let got = packets(&whole_hr(
+                "podinfo",
+                &format!("  driftDetection:\n    mode: {mode}\n"),
+            ));
+            let p = find(&got, "helmrelease:podinfo", key);
+            assert_eq!(p.resolved_value.as_deref(), Some(mode));
+            assert_eq!(p.resolution, Resolution::AsAuthored);
+        }
+    }
+
+    #[test]
+    fn a_gitops_non_production_path_is_undecided_and_its_production_twin_is_not() {
+        let ks = whole_ks("apps", "  interval: 30m\n  prune: true\n");
+        for (path, token) in [
+            ("clusters/qa/apps.yaml", "qa"),
+            ("clusters/staging/apps.yaml", "staging"),
+            ("legacy/apps.yaml", "legacy"),
+            ("clusters/prod/apps-old.yaml", "old"),
+        ] {
+            let got = ArgoFlux.retrieve(path, &ks, "snap");
+            assert_eq!(
+                undecided(&got, "kustomization:apps", "kustomization.interval"),
+                Some(format!("non-production path: {token}").as_str()),
+                "{path}"
+            );
+        }
+        let got = ArgoFlux.retrieve("clusters/production/apps.yaml", &ks, "snap");
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+        // A kind the measurement did not cover keeps the shared list only.
+        let rollout = "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\nspec:\n  strategy:\n    canary: {}\n";
+        let got = ArgoFlux.retrieve("legacy/rollout.yaml", rollout, "snap");
+        assert_eq!(undecided(&got, "rollout:web", "rollout.strategy"), None);
+    }
+
+    #[test]
+    fn a_non_production_target_is_undecided_and_its_production_twin_is_not() {
+        let key = "application.syncPolicy.automated.selfHeal";
+        let auto = "  syncPolicy:\n    automated: {}\n";
+        for (yaml, field, token) in [
+            (
+                whole_app("api", auto).replace("name: api\n", "name: api-staging\n"),
+                "metadata.name",
+                "staging",
+            ),
+            (
+                whole_app("api", auto).replace("namespace: argocd", "namespace: dev"),
+                "metadata.namespace",
+                "dev",
+            ),
+            (
+                whole_app("api", auto).replace("    namespace: api", "    namespace: qa"),
+                "destination.namespace",
+                "qa",
+            ),
+            (
+                whole_app("api", auto).replace(
+                    "    server: https://kubernetes.default.svc",
+                    "    name: uat-cluster",
+                ),
+                "destination.name",
+                "uat",
+            ),
+            (
+                whole_app("api", auto).replace(
+                    "https://kubernetes.default.svc",
+                    "https://stg.k8s.internal",
+                ),
+                "destination.server",
+                "stg",
+            ),
+            (
+                whole_app("api", auto).replace("path: apps/api", "path: envs/preview/api"),
+                "source.path",
+                "preview",
+            ),
+            (
+                whole_app("api", auto).replace("project: platform", "project: sandbox"),
+                "project",
+                "sandbox",
+            ),
+            (
+                whole_app(
+                    "api",
+                    &format!("{auto}  sources:\n  - repoURL: https://example.com/c.git\n    helm:\n      valueFiles: [values-int.yaml]\n"),
+                ),
+                "source.helm.valueFiles",
+                "int",
+            ),
+        ] {
+            let got = packets(&yaml);
+            let unit = got.packets[0].unit.clone();
+            assert_eq!(
+                undecided(&got, &unit, key),
+                Some(format!("non-production target: {field} names {token}").as_str()),
+                "{yaml}"
+            );
+        }
+        let ks = whole_ks("apps", "  interval: 30m\n").replace("./apps/apps", "./clusters/staging");
+        let got = packets(&ks);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("non-production target: spec.path names staging")
+        );
+        let ks = whole_ks("apps", "  targetNamespace: qa\n  interval: 30m\n");
+        let got = packets(&ks);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("non-production target: spec.targetNamespace names qa")
+        );
+        let hr = whole_hr(
+            "podinfo",
+            "  targetNamespace: podinfo-dev\n  interval: 5m\n",
+        );
+        let got = packets(&hr);
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+            Some("non-production target: spec.targetNamespace names dev")
+        );
+
+        // The production twins.
+        let got = packets(&whole_app("api", auto));
+        assert_eq!(undecided(&got, "application:api", key), None);
+        let got = packets(&whole_ks(
+            "apps",
+            "  targetNamespace: apps\n  interval: 30m\n",
+        ));
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+        let got = packets(&whole_hr(
+            "podinfo",
+            "  targetNamespace: podinfo\n  interval: 5m\n",
+        ));
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lab_repository_is_undecided_and_a_fleet_repository_is_not() {
+        let ks = whole_ks("apps", "  interval: 30m\n");
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(&dir.path().join("k8s-lab"), &[("clusters/apps.yaml", &ks)]);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("non-production repository: lab")
+        );
+        let got = scan(&dir.path().join("fleet"), &[("clusters/apps.yaml", &ks)]);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_chart_template_is_undecided_and_a_file_beside_the_chart_is_not() {
+        let ks = whole_ks("apps", "  interval: 30m\n");
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(
+            dir.path(),
+            &[
+                (
+                    "chart/Chart.yaml",
+                    "apiVersion: v2\nname: fleet\nversion: 1.0.0\n",
+                ),
+                ("chart/templates/apps.yaml", &ks),
+            ],
+        );
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("chart template: rendered before it is applied")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(
+            dir.path(),
+            &[
+                (
+                    "chart/Chart.yaml",
+                    "apiVersion: v2\nname: fleet\nversion: 1.0.0\n",
+                ),
+                ("chart/apps.yaml", &ks),
+            ],
+        );
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_undecides_the_documents_before_the_break() {
+        let ks = whole_ks("apps", "  interval: 30m\n");
+        let rollout = "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\nspec:\n  strategy:\n    canary: {}\n";
+        let got = packets(&format!("{ks}---\n{rollout}---\nkey: [unclosed\n"));
+        assert_eq!(got.unparseable, 1);
+        // A kind the measurement did not cover keeps its facts.
+        assert_eq!(undecided(&got, "rollout:web", "rollout.strategy"), None);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("the file does not parse as YAML")
+        );
+        let got = packets(&ks);
+        assert_eq!(got.unparseable, 0);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_undecided_and_its_whole_twin_is_not() {
+        let ks = whole_ks("apps", "  interval: 30m\n");
+        let file_fragment = "fragment: a patch or component another file completes";
+        for path in [
+            "clusters/prod/patches/apps.yaml",
+            "clusters/prod/components/apps.yaml",
+            "clusters/prod/apps-patch.yaml",
+        ] {
+            let got = ArgoFlux.retrieve(path, &ks, "snap");
+            assert_eq!(
+                undecided(&got, "kustomization:apps", "kustomization.interval"),
+                Some(file_fragment),
+                "{path}"
+            );
+        }
+        let got = packets(&format!("{ks}  $patch: replace\n"));
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some(file_fragment)
+        );
+
+        let auto = "  syncPolicy:\n    automated: {}\n";
+        let key = "application.syncPolicy.automated.prune";
+        let no_destination = whole_app("api", auto).replace(
+            "  destination:\n    server: https://kubernetes.default.svc\n    namespace: api\n",
+            "",
+        );
+        let got = packets(&no_destination);
+        assert_eq!(
+            undecided(&got, "application:api", key),
+            Some("fragment: no destination, another file completes it")
+        );
+        let no_source = whole_app("api", auto).replace(
+            "  source:\n    repoURL: https://example.com/deploy.git\n    path: apps/api\n",
+            "",
+        );
+        let got = packets(&no_source);
+        assert_eq!(
+            undecided(&got, "application:api", key),
+            Some("fragment: no source, another file completes it")
+        );
+        let multi = no_source.replace(
+            "  syncPolicy:",
+            "  sources:\n  - repoURL: https://example.com/deploy.git\n  syncPolicy:",
+        );
+        assert_eq!(undecided(&packets(&multi), "application:api", key), None);
+
+        let no_ref = ks.replace(
+            "  sourceRef:\n    kind: GitRepository\n    name: flux-system\n",
+            "",
+        );
+        let got = packets(&no_ref);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            Some("fragment: no sourceRef, another file completes it")
+        );
+
+        let hr = whole_hr("podinfo", "  interval: 5m\n");
+        let no_chart = hr.replace("  chart:\n    spec:\n      chart: podinfo\n", "");
+        let got = packets(&no_chart);
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+            Some("fragment: no chart or chartRef, another file completes it")
+        );
+        let chart_ref = no_chart.replace(
+            "  interval:",
+            "  chartRef:\n    kind: OCIRepository\n    name: podinfo\n  interval:",
+        );
+        let got = packets(&chart_ref);
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+            None
+        );
+        let got = packets(&ks);
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.interval"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_object_declared_in_two_files_is_undecided_and_a_single_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(
+            dir.path(),
+            &[
+                (
+                    "clusters/eu/apps.yaml",
+                    &whole_ks("apps", "  interval: 30m\n"),
+                ),
+                (
+                    "clusters/us/apps.yaml",
+                    &whole_ks("apps", "  interval: 5m\n"),
+                ),
+                (
+                    "clusters/us/infra.yaml",
+                    &whole_ks("infra", "  interval: 30m\n"),
+                ),
+            ],
+        );
+        let reasons: Vec<_> = got
+            .packets
+            .iter()
+            .filter(|p| p.key == "kustomization.interval")
+            .map(|p| (p.file_path.as_str(), p.resolved_value.as_deref()))
+            .collect();
+        let twice =
+            Some("undecided: declared in 2 files: an overlay or a second cluster restates it");
+        assert_eq!(
+            reasons,
+            vec![
+                ("clusters/eu/apps.yaml", twice),
+                ("clusters/us/apps.yaml", twice),
+                ("clusters/us/infra.yaml", Some("30m")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_templated_value_is_undecided_and_its_literal_twin_is_not() {
+        for (yaml, unit, key, field) in [
+            (
+                whole_ks("apps", "  interval: ${RECONCILE_INTERVAL}\n"),
+                "kustomization:apps",
+                "kustomization.interval",
+                "interval",
+            ),
+            (
+                whole_ks(
+                    "apps",
+                    "  interval: 30m\n  prune: \"{{ .Values.prune }}\"\n",
+                ),
+                "kustomization:apps",
+                "kustomization.prune",
+                "prune",
+            ),
+            (
+                whole_app(
+                    "api",
+                    "  syncPolicy:\n    automated:\n      selfHeal: <self-heal>\n",
+                ),
+                "application:api",
+                "application.syncPolicy.automated.prune",
+                "selfHeal",
+            ),
+            (
+                whole_app("api", "  syncPolicy: \"{{ .syncPolicy }}\"\n"),
+                "application:api",
+                "application.syncPolicy.automated",
+                "syncPolicy",
+            ),
+            (
+                whole_hr(
+                    "podinfo",
+                    "  interval: 5m\n  driftDetection:\n    mode: ${DRIFT}\n",
+                ),
+                "helmrelease:podinfo",
+                "helmrelease.driftDetection.mode",
+                "mode",
+            ),
+        ] {
+            let got = packets(&yaml);
+            assert_eq!(
+                undecided(&got, unit, key),
+                Some(format!("templated value: {field}").as_str()),
+                "{yaml}"
+            );
+        }
+        let set = "apiVersion: argoproj.io/v1alpha1\nkind: ApplicationSet\nmetadata:\n  name: fleet\nspec:\n  template:\n    spec:\n      destination:\n        server: https://kubernetes.default.svc\n      source:\n        repoURL: https://example.com/deploy.git\n      syncPolicy:\n        automated: {}\n";
+        let key = "application.syncPolicy.automated.selfHeal";
+        let got = packets(&format!("{set}  templatePatch: |\n    spec: {{}}\n"));
+        assert_eq!(
+            undecided(&got, "applicationset:fleet", key),
+            Some("templated value: templatePatch")
+        );
+        assert_eq!(undecided(&packets(set), "applicationset:fleet", key), None);
+        let got = packets(&whole_ks("apps", "  interval: 30m\n  prune: false\n"));
+        assert_eq!(
+            undecided(&got, "kustomization:apps", "kustomization.prune"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_interval_that_is_not_a_go_duration_is_undecided() {
+        for interval in ["1d", "five minutes", "10", "1.2.3m"] {
+            let got = packets(&whole_ks("apps", &format!("  interval: {interval}\n")));
+            assert_eq!(
+                undecided(&got, "kustomization:apps", "kustomization.prune"),
+                Some(format!("interval {interval:?} is not a Go duration").as_str()),
+                "{interval}"
+            );
+        }
+        for interval in ["1h30m", "30m", "0", "1.5h", "500ms"] {
+            let got = packets(&whole_hr("podinfo", &format!("  interval: {interval}\n")));
+            assert_eq!(
+                undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+                None,
+                "{interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_detection_patched_elsewhere_undecides_only_the_drift_fact() {
+        let key = "helmrelease.driftDetection.mode";
+        let hr = whole_hr("podinfo", "  interval: 5m\n");
+        let parent = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: apps\nspec:\n  patches:\n  - patch: |\n      - op: add\n        path: /spec/driftDetection\n        value: {mode: enabled}\n    target:\n      kind: HelmRelease\n";
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(
+            dir.path(),
+            &[
+                ("apps/podinfo.yaml", &hr),
+                ("clusters/prod/kustomization.yaml", parent),
+            ],
+        );
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", key),
+            Some(DRIFT_PATCH_REASON)
+        );
+        assert_eq!(
+            undecided(&got, "helmrelease:podinfo", "helmrelease.interval"),
+            None
+        );
+        // A release that turns detection on itself keeps its fact.
+        let on = whole_hr("podinfo", "  driftDetection:\n    mode: enabled\n");
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(
+            dir.path(),
+            &[
+                ("apps/podinfo.yaml", &on),
+                ("clusters/prod/kustomization.yaml", parent),
+            ],
+        );
+        assert_eq!(undecided(&got, "helmrelease:podinfo", key), None);
+        // No patch anywhere: the absence is the fact.
+        let dir = tempfile::tempdir().unwrap();
+        let got = scan(dir.path(), &[("apps/podinfo.yaml", &hr)]);
+        let p = find(&got, "helmrelease:podinfo", key);
+        assert_eq!(p.resolved_value.as_deref(), Some(ABSENT_RENDERING));
+    }
+
+    #[test]
+    fn go_duration_follows_parse_duration() {
+        for ok in ["0", "5m", "1h30m", "1.5h", "300ms", "10us", "-1s", "+2h"] {
+            assert!(go_duration(ok), "{ok}");
+        }
+        for bad in ["", "5", "1d", "1w", "m", "1..5s", ".s", "5 m", "5M"] {
+            assert!(!go_duration(bad), "{bad}");
+        }
     }
 }

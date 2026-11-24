@@ -412,3 +412,140 @@ fn rc044_least_privilege_facts_abstain_with_no_spec() {
     );
     assert_eq!(doc["findings"].as_array().map_or(0, Vec::len), 0, "{doc}");
 }
+
+/// Scan the repository `files` describe with the `config_keys` specs, and
+/// return the `--out` document.
+fn scan_repo(files: &[(&str, &str)], config_keys: serde_json::Value) -> serde_json::Value {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    for (rel, text) in files {
+        let path = repo.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let specs = dir.path().join("specs.json");
+    std::fs::write(
+        &specs,
+        serde_json::json!({ "config_keys": config_keys }).to_string(),
+    )
+    .unwrap();
+    let out_path = dir.path().join("out.json");
+    let out = bin()
+        .arg("scan")
+        .arg(&repo)
+        .arg("--specs-file")
+        .arg(&specs)
+        .arg("--out")
+        .arg(&out_path)
+        .env("RVL_CACHE_DIR", dir.path().join("cache"))
+        .env("HOME", dir.path().join("home"))
+        .env("RVL_OFFLINE", "1")
+        .output()
+        .expect("failed to run rvl");
+    assert!(
+        out_path.is_file(),
+        "scan wrote no --out document: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap()
+}
+
+/// RC-050 is decided end to end for Flux: a production Kustomization that
+/// reconciles every 30 minutes violates a 10-minute bound and the same
+/// object under `clusters/staging/` abstains; a HelmRelease with no drift
+/// detection violates, and abstains when another file patches
+/// `driftDetection` into the releases.
+#[test]
+fn rc050_flux_reconciliation_is_decided_end_to_end() {
+    let spec = |key: &str, expect: serde_json::Value| {
+        serde_json::json!({
+            "format": "flux", "key": key, "expect": expect,
+            "confidence": 0.9, "control": "RC-050", "severity": "medium",
+            "fix": "reconcile within 10 minutes and correct drift",
+            "rationale": "a change made in the cluster stays until the next reconciliation",
+        })
+    };
+    let specs = serde_json::json!([
+        spec(
+            "kustomization.interval",
+            serde_json::json!({"kind": "duration_at_most", "value": "10m"})
+        ),
+        spec(
+            "helmrelease.driftDetection.mode",
+            serde_json::json!({"kind": "one_of", "values": ["enabled", "warn"]})
+        ),
+    ]);
+    let ks = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n\
+              metadata:\n  name: apps\n  namespace: flux-system\n\
+              spec:\n  interval: 30m\n  prune: true\n  path: ./apps\n  \
+              sourceRef:\n    kind: GitRepository\n    name: flux-system\n";
+    let hr = "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n\
+              metadata:\n  name: podinfo\n  namespace: podinfo\n\
+              spec:\n  interval: 5m\n  chart:\n    spec:\n      chart: podinfo\n";
+    let row = |doc: &serde_json::Value, key: &str| {
+        doc["config_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["format"] == "flux" && r["key"] == key)
+            .unwrap_or_else(|| panic!("no flux {key} row: {doc}"))
+            .clone()
+    };
+    let rc050 = |doc: &serde_json::Value| {
+        doc["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|f| f["control"] == "RC-050")
+            .count()
+    };
+
+    let doc = scan_repo(
+        &[
+            ("clusters/production/apps.yaml", ks),
+            ("apps/podinfo.yaml", hr),
+        ],
+        specs.clone(),
+    );
+    let interval = row(&doc, "kustomization.interval");
+    assert_eq!(interval["verdict"], "violates", "{interval}");
+    assert_eq!(interval["control"], "RC-050", "{interval}");
+    assert_eq!(interval["value"], "30m", "{interval}");
+    let drift = row(&doc, "helmrelease.driftDetection.mode");
+    assert_eq!(drift["verdict"], "violates", "{drift}");
+    assert_eq!(drift["resource"], "helmrelease:podinfo", "{drift}");
+    assert_eq!(rc050(&doc), 2, "{doc}");
+
+    let doc = scan_repo(&[("clusters/staging/apps.yaml", ks)], specs.clone());
+    let interval = row(&doc, "kustomization.interval");
+    assert_eq!(interval["verdict"], "abstain", "{interval}");
+    assert_eq!(
+        interval["value"], "undecided: non-production path: staging",
+        "{interval}"
+    );
+    assert_eq!(rc050(&doc), 0, "{doc}");
+
+    let parent = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n\
+                  metadata:\n  name: releases\n  namespace: flux-system\n\
+                  spec:\n  interval: 5m\n  prune: true\n  path: ./apps\n  \
+                  sourceRef:\n    kind: GitRepository\n    name: flux-system\n  \
+                  patches:\n  - patch: |\n      - op: add\n        path: /spec/driftDetection\n        \
+                  value: {mode: enabled}\n    target:\n      kind: HelmRelease\n";
+    let doc = scan_repo(
+        &[
+            ("clusters/production/releases.yaml", parent),
+            ("apps/podinfo.yaml", hr),
+        ],
+        specs,
+    );
+    let drift = row(&doc, "helmrelease.driftDetection.mode");
+    assert_eq!(drift["verdict"], "abstain", "{drift}");
+    assert!(
+        drift["value"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("undecided: a patch in the repository")),
+        "{drift}"
+    );
+    assert_eq!(rc050(&doc), 0, "{doc}");
+}

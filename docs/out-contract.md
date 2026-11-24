@@ -339,6 +339,22 @@ The orchestrator uses it to:
     an abstention it says why (`no config spec for kubernetes.pod.anti-affinity`).
     A satisfied reason can hold the value, so `rule` is cut at 200
     characters in the same way as `value`.
+  The Argo CD and Flux rows (`argo-cd`, `flux`) carry the GitOps
+  reconciliation facts: `application.syncPolicy.automated` and its
+  `.prune`, `.selfHeal` and `.enabled` knobs, `kustomization.prune`,
+  `kustomization.interval`, `helmrelease.interval`, and
+  `helmrelease.driftDetection.mode` (`absent` when the HelmRelease has no
+  `driftDetection` block, `disabled` for a block without a mode). An
+  Application, ApplicationSet, Kustomization or HelmRelease row abstains,
+  its `value` `undecided: ` and the reason
+  (`undecided: non-production path: staging`), when the object is not whole or not deployed
+  to production: a non-production path, repository name or target (its
+  name, namespace, destination, source path or value files, Flux path or
+  target namespace), a chart template, a file that does not parse, a patch
+  or component fragment, an object declared in more than one file, a
+  templated value, or an interval that is not a Go duration. The
+  `helmrelease.driftDetection.mode` row alone also abstains when a YAML
+  file of the repository holds both `driftDetection` and `patch`.
   The rows are ordered by format, file, line, resource, then key. A scan
   lists at most 5000 of them; `config_sites_overflow` counts the settings
   past that cap, so `config_sites` plus `config_sites_overflow` equals

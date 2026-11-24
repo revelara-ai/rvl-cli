@@ -331,6 +331,23 @@ const VARIANTS_OF_SUPPORTED: &[&str] = &[
     "kustomize",
 ];
 
+/// The lane's walk of `root`: `.gitignore` honored, dot-directories kept,
+/// [`SKIP_DIRS`] never entered (see [`retrieve_repo`]).
+pub(crate) fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .build()
+}
+
 /// Directory names never worth descending into (mirrors the code lane).
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -556,19 +573,7 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     // scope; git_global(false) keeps output independent of whose machine ran
     // it. SKIP_DIRS stays as a belt-and-suspenders filter (vendor/.terraform
     // are not always gitignored). Mirrors rvl-content::scan_root (po-lqbh2).
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(false)
-        .parents(true)
-        .require_git(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref())
-        })
-        .build();
-    for entry in walker.flatten() {
+    for entry in walk(root).flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -592,19 +597,17 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
             String::new()
         };
         // Content-identified formats (no canonical path) get a bounded
-        // head consult before the file degrades to a sighting.
+        // head consult before the file degrades to a sighting. A claimed
+        // file joins its retriever's batch, so a format that reads across
+        // its objects (the GitOps objects a second file restates) sees
+        // them all.
         if needs_head {
-            if let Some(r) = retrievers.iter().find(|r| r.matches_head(&rel, &head)) {
+            if let Some(idx) = retrievers.iter().position(|r| r.matches_head(&rel, &head)) {
                 let Ok(contents) = std::fs::read_to_string(path) else {
                     out.unparseable_files += 1;
                     continue;
                 };
-                absorb(
-                    &mut out,
-                    &mut sightings,
-                    &mut declined,
-                    r.retrieve_with_root(root, &rel, &contents, snapshot_id),
-                );
+                claimed[idx].push((rel, contents));
                 continue;
             }
         }
