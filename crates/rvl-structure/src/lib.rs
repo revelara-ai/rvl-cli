@@ -25,6 +25,10 @@
 //! service, a tool or a library, for the rules that block only in a service:
 //! RC-027 and RC-040 violate only in a repository read as a service.
 //!
+//! [`limiter`] reads whether a service names a rate limiter or a load
+//! shedder anywhere in its code or config, for RC-069, which also violates
+//! only in a repository read as a service.
+//!
 //! Privacy: facts are shape-only — file names, counts, and presence booleans.
 //! Content is read locally to detect markers (a `#[cfg(test)]` attribute, a
 //! coverage key in a config) but no source text is ever stored in the facts.
@@ -36,6 +40,7 @@ use std::path::Path;
 mod deploy;
 mod error_reporting;
 mod inventory;
+mod limiter;
 mod makefile;
 mod repo_kind;
 mod runbooks;
@@ -43,6 +48,7 @@ mod sast;
 
 pub use deploy::DeploySite;
 pub use inventory::inventory;
+pub use limiter::{LimiterFacts, LIMITER_VOCABULARY};
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
 pub use sast::{OnFailure, PrPath, SastFacts, SastStep};
 
@@ -265,6 +271,10 @@ pub struct RepoStructure {
     /// repository. Sorted, at most [`deploy::MAX_SITES`].
     #[serde(default)]
     pub deploy_sites: Vec<DeploySite>,
+    /// RC-069's rate-limit vocabulary, server entry points and deployment
+    /// manifests. A record without it was not read for RC-069: it abstains.
+    #[serde(default)]
+    pub limiter: Option<LimiterFacts>,
     /// What kind of repository the tree reads as ([`repo_kind()`]). A record
     /// without it reads as [`RepoKind::Unknown`]: RC-027 and RC-040 abstain.
     #[serde(default)]
@@ -295,6 +305,7 @@ impl Default for RepoStructure {
             sast: SastFacts::default(),
             production_sources: None,
             deploy_sites: Vec::new(),
+            limiter: None,
             repo_kind: RepoKindFacts::default(),
             walk_complete: false,
         }
@@ -372,7 +383,7 @@ pub struct StructureFinding {
 /// Map structure facts to per-control verdicts, `today` the scan date as
 /// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
 /// no model calls. Always returns one finding per control, in stable order:
-/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040.
+/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040, RC-069.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
 /// decidable negative only when the walk was complete AND absence is
@@ -390,11 +401,12 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
         eval_runbooks(facts, today),
         error_reporting::evaluate(facts),
         sast::evaluate(facts),
+        limiter::evaluate(facts),
     ]
 }
 
 /// A finding of a rule that blocks only in a deployed service (RC-027,
-/// RC-040), gated on the repository's kind: a violation stands only in a
+/// RC-040, RC-069), gated on the repository's kind: a violation stands only in a
 /// repository read as a service, and abstains in a tool, a library or a
 /// repository with no deployment manifest. Every other verdict stands.
 pub(crate) fn only_in_a_service(mut f: StructureFinding, kind: &RepoKindFacts) -> StructureFinding {

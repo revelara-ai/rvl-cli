@@ -1209,7 +1209,10 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
+        vec![
+            "RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040",
+            "RC-069"
+        ],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
 }
@@ -2036,4 +2039,122 @@ fn rc040_a_pull_request_make_lint_wins_over_codeql_off_the_pull_request_path() {
     ]);
     assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
     assert_eq!(f.evidence, vec![".github/workflows/lint.yml"]);
+}
+
+// --- RC-069: ingress rate limiting and load shedding ---
+
+const GIN_SERVER: &str = "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc main() {\n\tr := gin.New()\n\tr.GET(\"/orders\", listOrders)\n\thttp.ListenAndServe(\":8080\", r)\n}\n";
+
+/// A Go web service with a Deployment and no limiter anywhere.
+fn unlimited_service(root: &Path) {
+    write(root, "go.mod", "module example.com/orders\n\ngo 1.22\n");
+    write(root, "cmd/orders/main.go", GIN_SERVER);
+    write(
+        root,
+        "deploy/orders.yaml",
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: orders\n",
+    );
+    write(root, "README.md", "# orders\n\nNo rate limit yet.\n");
+    write(
+        root,
+        "internal/testutil/limit.go",
+        "package testutil // throttle\n",
+    );
+}
+
+fn rc069(root: &Path) -> StructureFinding {
+    finding(&eval_dir(root), "RC-069").clone()
+}
+
+#[test]
+fn rc069_a_service_with_no_limiter_vocabulary_violates() {
+    let dir = tempfile::tempdir().unwrap();
+    unlimited_service(dir.path());
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Violates, "reason: {}", f.reason);
+    assert_eq!(f.evidence, ["cmd/orders/main.go", "deploy/orders.yaml"]);
+    assert!(f.reason.contains("rate limit"), "{}", f.reason);
+}
+
+#[test]
+fn rc069_a_limiter_in_middleware_or_an_ingress_annotation_satisfies() {
+    for (rp, text) in [
+        (
+            "internal/middleware/limit.go",
+            "package middleware\n\nimport \"golang.org/x/time/rate\"\n\nvar l = rate.NewLimiter(10, 20)\n",
+        ),
+        (
+            "deploy/ingress.yaml",
+            "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  annotations:\n    nginx.ingress.kubernetes.io/limit-rps: \"20\"\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        unlimited_service(dir.path());
+        write(dir.path(), rp, text);
+        let f = rc069(dir.path());
+        assert_eq!(f.verdict, Verdict::Satisfies, "{rp}: {}", f.reason);
+        assert_eq!(f.evidence, [rp]);
+    }
+}
+
+#[test]
+fn rc069_a_server_on_a_unix_socket_only_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    unlimited_service(dir.path());
+    write(
+        dir.path(),
+        "cmd/orders/main.go",
+        "package main\n\nfunc main() {\n\tlis, _ := net.Listen(\"unix\", \"/run/orders.sock\")\n\tgrpc.NewServer().Serve(lis)\n}\n",
+    );
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
+    assert!(f.reason.contains("unix socket"), "{}", f.reason);
+}
+
+#[test]
+fn rc069_a_csi_driver_or_a_teaching_repository_abstains_by_its_name() {
+    for name in ["spdk-csi", "kubernetes-bootcamp"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(name);
+        unlimited_service(&root);
+        let f = rc069(&root);
+        assert_eq!(f.verdict, Verdict::Abstain, "{name}: {}", f.reason);
+    }
+}
+
+#[test]
+fn rc069_teaching_scrape_only_and_non_production_servers_do_not_count() {
+    for (server, deploy) in [
+        ("chapter3/main.go", "deploy/orders.yaml"),
+        ("cmd/metrics/main.go", "deploy/orders.yaml"),
+        ("cmd/orders/main.go", "sample-app/orders.yaml"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/orders\n");
+        write(dir.path(), server, GIN_SERVER);
+        write(
+            dir.path(),
+            deploy,
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: orders\n",
+        );
+        let f = rc069(dir.path());
+        assert_eq!(
+            f.verdict,
+            Verdict::Abstain,
+            "{server} {deploy}: {}",
+            f.reason
+        );
+    }
+}
+
+/// A tool or a library is not judged, and a record from an earlier scanner
+/// has no RC-069 facts.
+#[test]
+fn rc069_abstains_outside_a_service_and_without_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "main.go", GIN_SERVER);
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Abstain, "no deployment: {}", f.reason);
+    let f = finding(&evaluate(&RepoStructure::default(), TODAY), "RC-069").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
 }

@@ -392,5 +392,5 @@ fn g7_repo_structure_scans_the_same_twice() {
             .to_string(),
     ]);
     let (doc, _) = fx.assert_deterministic();
-    assert_eq!(doc["structure"].as_array().unwrap().len(), 8, "{doc}");
+    assert_eq!(doc["structure"].as_array().unwrap().len(), 9, "{doc}");
 }

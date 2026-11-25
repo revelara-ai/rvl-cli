@@ -3,7 +3,7 @@
 //! Contents are read locally to detect markers; no source text is stored.
 
 use crate::sast::{self, SastFacts};
-use crate::{deploy, error_reporting, repo_kind, runbooks, DeploySite};
+use crate::{deploy, error_reporting, limiter, repo_kind, runbooks, DeploySite};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
@@ -160,6 +160,7 @@ struct Acc {
     ci_scans: CiScanFacts,
     scanners: BTreeSet<ScannerFacts>,
     error_reporting: error_reporting::Acc,
+    limiter: limiter::Acc,
     /// The workflow files that parsed, by repo-relative path, for RC-040's
     /// walk across reusable-workflow calls.
     workflows: Vec<(String, Value)>,
@@ -274,6 +275,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
         sast: acc.sast,
         production_sources: Some(acc.production_sources),
         deploy_sites: deploy::finish(acc.deploy_sites),
+        limiter: Some(acc.limiter.finish(root)),
         repo_kind: repo_kind::repo_kind(root),
         walk_complete: acc.walk_complete,
     }
@@ -489,6 +491,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
 
     error_reporting::observe(path, &rp, name, &ext, &mut acc.error_reporting);
+    limiter::observe(path, &rp, name, &ext, &mut acc.limiter);
 
     // --- CI scanners (Q21/Q22): GitHub Actions workflows only ---
     if is_gha_workflow {
