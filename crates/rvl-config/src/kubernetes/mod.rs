@@ -26,6 +26,8 @@
 //!     the bounded merge cannot resolve honestly (JSON6902 ops, `$patch`
 //!     directives) emits NO packets for the touched resource, only an
 //!     identity sighting — never a guess.
+//!     A kustomization another one references is a base: it emits nothing
+//!     itself, and its units are asked through each overlay that renders it.
 //!   * **Helm** ([`helm`]) — a `Chart.yaml` renders the chart's own
 //!     templates with COMMITTED values only (`values.yaml`); packets stamp
 //!     `rendered`. No cluster and no remote fetch, ever. Charts declaring
@@ -42,6 +44,7 @@ pub mod kustomize;
 pub mod manifest;
 
 use crate::{ConfigRetriever, Retrieved};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub struct Kubernetes;
@@ -89,7 +92,7 @@ impl ConfigRetriever for Kubernetes {
     /// helm need sibling files); a kustomization/Chart file without a root
     /// emits nothing rather than a partial guess.
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        dispatch(None, rel_path, contents, snapshot_id)
+        dispatch(None, &BTreeSet::new(), rel_path, contents, snapshot_id)
     }
 
     /// Root-aware single-file entry: the walk hands content-claimed bare
@@ -102,13 +105,22 @@ impl ConfigRetriever for Kubernetes {
         contents: &str,
         snapshot_id: &str,
     ) -> Retrieved {
-        dispatch(Some(root), rel_path, contents, snapshot_id)
+        dispatch(
+            Some(root),
+            &BTreeSet::new(),
+            rel_path,
+            contents,
+            snapshot_id,
+        )
     }
 
     /// The batch entry point: kustomization roots, charts, and bare
     /// manifests arrive together; each file dispatches independently (the
     /// cross-FILE resolution lives in kustomize/helm, which read their own
-    /// committed inputs under `root`).
+    /// committed inputs under `root`). The batch holds every kustomization
+    /// of the repository, so it alone knows which are bases another one
+    /// references ([`kustomize::referenced_bases`]); those emit nothing
+    /// themselves.
     fn retrieve_all(
         &self,
         root: &Path,
@@ -116,8 +128,9 @@ impl ConfigRetriever for Kubernetes {
         snapshot_id: &str,
     ) -> Retrieved {
         let mut out = Retrieved::default();
+        let bases = kustomize::referenced_bases(files);
         for (rel, contents) in files {
-            let got = dispatch(Some(root), rel, contents, snapshot_id);
+            let got = dispatch(Some(root), &bases, rel, contents, snapshot_id);
             out.packets.extend(got.packets);
             out.unparseable += got.unparseable;
             out.sightings.extend(got.sightings);
@@ -144,7 +157,18 @@ fn core_group(api_version: &str) -> bool {
 /// repository's root) emits no packets at all, for every workload, pod,
 /// container, PodDisruptionBudget and autoscaler key: the family's one
 /// behavior for test material. Sightings and parse failures still count.
-fn dispatch(root: Option<&Path>, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+/// A kustomization in `bases` is rendered by the overlays that reference
+/// it, and emits nothing as it stands.
+fn dispatch(
+    root: Option<&Path>,
+    bases: &BTreeSet<String>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
+    if bases.contains(rel_path) {
+        return Retrieved::default();
+    }
     let mut got = retrieve_file(root, rel_path, contents, snapshot_id);
     if root.and_then(crate::non_production::root_token).is_some() {
         got.packets.clear();
@@ -331,5 +355,211 @@ mod tests {
         // Rootless, the directory is out of reach: no claim either way.
         let rootless = Kubernetes.retrieve("k8s/deploy.yaml", deploy, "snap");
         assert_eq!(value(rootless), None);
+    }
+
+    /// Write `files` under `root` and retrieve the batch the walk hands
+    /// over: every kustomization of the repository.
+    fn batch(root: &Path, files: &[(&str, &str)]) -> Retrieved {
+        let mut claimed = Vec::new();
+        for (rel, contents) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+            if Kubernetes.matches(rel) {
+                claimed.push((rel.to_string(), contents.to_string()));
+            }
+        }
+        Kubernetes.retrieve_all(root, &claimed, "snap")
+    }
+
+    fn statefulset(name: &str) -> String {
+        format!("apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: {name}\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n        - name: {name}\n          image: {name}:1\n")
+    }
+
+    /// Two app bases, and overlays named `overlays` that reference both.
+    fn apps_referenced_by(overlays: &[&str]) -> Retrieved {
+        let dir = tempfile::tempdir().unwrap();
+        let (testapi, moto) = (statefulset("testapi"), statefulset("moto"));
+        let mut files = vec![
+            ("config/apps/testapi/testapi.yaml", testapi.as_str()),
+            (
+                "config/apps/testapi/kustomization.yaml",
+                "resources:\n  - testapi.yaml\n",
+            ),
+            ("config/apps/moto/moto.yaml", moto.as_str()),
+            (
+                "config/apps/moto/kustomization.yaml",
+                "resources:\n  - moto.yaml\n",
+            ),
+        ];
+        let paths: Vec<String> = overlays
+            .iter()
+            .map(|o| format!("config/{o}/kustomization.yaml"))
+            .collect();
+        for path in &paths {
+            files.push((path, "resources:\n  - ../apps/testapi\n  - ../apps/moto\n"));
+        }
+        batch(dir.path(), &files)
+    }
+
+    #[test]
+    fn a_base_only_non_production_overlays_reference_emits_nothing() {
+        let got = apps_referenced_by(&["ci", "dev"]);
+        assert!(got.packets.is_empty(), "{:?}", got.packets);
+        // A production overlay renders the same bases, under its own path.
+        let got = apps_referenced_by(&["ci", "production"]);
+        for unit in ["statefulset:testapi", "statefulset:moto"] {
+            let rows: Vec<_> = got.packets.iter().filter(|p| p.unit == unit).collect();
+            assert!(!rows.is_empty(), "{unit}: {:?}", got.packets);
+            assert!(
+                rows.iter()
+                    .all(|p| p.file_path == "config/production/kustomization.yaml"),
+                "{unit}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_base_behind_a_non_production_overlay_emits_nothing_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = statefulset("api");
+        let got = batch(
+            dir.path(),
+            &[
+                ("deploy/base/api.yaml", &api),
+                (
+                    "deploy/base/kustomization.yaml",
+                    "resources:\n  - api.yaml\n",
+                ),
+                (
+                    "deploy/shared/kustomization.yaml",
+                    "resources:\n  - ../base\n",
+                ),
+                (
+                    "deploy/dev/kustomization.yaml",
+                    "resources:\n  - ../shared\n",
+                ),
+            ],
+        );
+        assert!(got.packets.is_empty(), "{:?}", got.packets);
+    }
+
+    const PDB: &str = "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: web\n";
+
+    #[test]
+    fn a_base_emits_nothing_itself_and_its_overlay_renders_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = batch(
+            dir.path(),
+            &[
+                ("deploy/kubernetes/base/web.yaml", DEPLOY),
+                (
+                    "deploy/kubernetes/base/kustomization.yaml",
+                    "resources:\n  - web.yaml\n",
+                ),
+                ("deploy/kubernetes/production/pdb.yaml", PDB),
+                (
+                    "deploy/kubernetes/production/kustomization.yaml",
+                    "resources:\n  - ../base\n  - pdb.yaml\nreplicas:\n  - name: web\n    count: 2\n",
+                ),
+            ],
+        );
+        assert!(
+            got.packets
+                .iter()
+                .all(|p| p.file_path == "deploy/kubernetes/production/kustomization.yaml"),
+            "{:?}",
+            got.packets
+        );
+        let value = |key: &str| {
+            got.packets
+                .iter()
+                .find(|p| p.unit == "deployment:web" && p.key == key)
+                .and_then(|p| p.resolved_value.clone())
+        };
+        assert_eq!(value("workload.replicas").as_deref(), Some("2"));
+        assert_eq!(value("workload.pdb-coverage").as_deref(), Some("covered"));
+    }
+
+    #[test]
+    fn a_unit_the_production_overlay_deletes_is_not_emitted_from_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let redis = statefulset("redis");
+        let got = batch(
+            dir.path(),
+            &[
+                ("k8s/web.yaml", DEPLOY),
+                ("k8s/redis.yaml", &redis),
+                (
+                    "k8s/kustomization.yaml",
+                    "resources:\n  - web.yaml\n  - redis.yaml\n",
+                ),
+                (
+                    "k8s/overlays/production/drop-redis.yaml",
+                    "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: redis\n$patch: delete\n",
+                ),
+                (
+                    "k8s/overlays/production/kustomization.yaml",
+                    "resources:\n  - ../..\npatches:\n  - path: drop-redis.yaml\n",
+                ),
+            ],
+        );
+        assert!(
+            !got.packets.iter().any(|p| p.unit.contains("redis")),
+            "{:?}",
+            got.packets
+        );
+        assert!(got.packets.iter().any(|p| p.unit == "deployment:web"));
+    }
+
+    #[test]
+    fn a_root_kustomization_nothing_references_keeps_its_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = batch(
+            dir.path(),
+            &[
+                ("deploy/kubernetes/base/web.yaml", DEPLOY),
+                (
+                    "deploy/kubernetes/base/kustomization.yaml",
+                    "resources:\n  - web.yaml\n",
+                ),
+                // A self-reference does not make a kustomization a base.
+                ("k8s/kustomization.yaml", "resources:\n  - .\n"),
+            ],
+        );
+        let p = got
+            .packets
+            .iter()
+            .find(|p| p.unit == "deployment:web" && p.key == "workload.replicas")
+            .expect("the root emits");
+        assert_eq!(p.resolved_value.as_deref(), Some("1"));
+        assert_eq!(p.file_path, "deploy/kubernetes/base/kustomization.yaml");
+    }
+
+    #[test]
+    fn every_manifest_of_a_lab_repository_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        for (repo, emits) in [("aks-landing-zone-lab", false), ("platform", true)] {
+            let root = dir.path().join(repo);
+            std::fs::create_dir_all(root.join("k8s/apps")).unwrap();
+            std::fs::write(root.join("k8s/apps/log-generator.yaml"), DEPLOY).unwrap();
+            let got =
+                Kubernetes.retrieve_with_root(&root, "k8s/apps/log-generator.yaml", DEPLOY, "snap");
+            assert_eq!(!got.packets.is_empty(), emits, "{repo}: {:?}", got.packets);
+        }
+    }
+
+    #[test]
+    fn performance_test_tooling_emits_nothing_and_a_performance_service_does() {
+        for path in [
+            "perf/dashboards/exporters/redis_exporter.yaml",
+            "k8s/loadtest/web.yaml",
+            "benchmarks/web.yaml",
+        ] {
+            let got = Kubernetes.retrieve(path, DEPLOY, "snap");
+            assert!(got.packets.is_empty(), "{path}: {:?}", got.packets);
+        }
+        let got = Kubernetes.retrieve("deploy/performance-api.yaml", DEPLOY, "snap");
+        assert!(got.packets.iter().any(|p| p.key == "workload.replicas"));
     }
 }
