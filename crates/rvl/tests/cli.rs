@@ -5152,7 +5152,7 @@ fn write_argo_flux_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::
     std::fs::create_dir_all(dir.join("deploy")).unwrap();
     std::fs::write(
         dir.join("deploy/app.yaml"),
-        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  project: default\n  source:\n    repoURL: https://example.com/repo.git\n    path: k8s\n    targetRevision: main\n  syncPolicy:\n    automated: {}\n",
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: guestbook\nspec:\n  project: default\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: guestbook\n  source:\n    repoURL: https://example.com/repo.git\n    path: k8s\n    targetRevision: main\n  syncPolicy:\n    automated: {}\n",
     )
     .unwrap();
     std::fs::write(

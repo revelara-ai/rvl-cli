@@ -574,8 +574,7 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     // scope; git_global(false) keeps output independent of whose machine ran
     // it. SKIP_DIRS stays as a belt-and-suspenders filter (vendor/.terraform
     // are not always gitignored). Mirrors rvl-content::scan_root (po-lqbh2).
-    let walker = walk(root);
-    for entry in walker.flatten() {
+    for entry in walk(root).flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -599,8 +598,10 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
             String::new()
         };
         // Content-identified formats (no canonical path) get a bounded
-        // head consult before the file degrades to a sighting.
-        // They join the same per-format batch as path-claimed files.
+        // head consult before the file degrades to a sighting. A claimed
+        // file joins its retriever's batch, so a format that reads across
+        // its objects (the GitOps objects a second file restates) sees
+        // them all.
         if needs_head {
             if let Some(idx) = retrievers.iter().position(|r| r.matches_head(&rel, &head)) {
                 let Ok(contents) = std::fs::read_to_string(path) else {
