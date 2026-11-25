@@ -40,11 +40,13 @@ mod makefile;
 mod repo_kind;
 mod runbooks;
 mod sast;
+mod terraform_state;
 
 pub use deploy::DeploySite;
 pub use inventory::inventory;
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
 pub use sast::{OnFailure, PrPath, SastFacts, SastStep};
+pub use terraform_state::{TerraformRoot, TerraformStateFacts};
 
 /// The `kind` tag this record carries in the packet stream.
 pub const RECORD_KIND: &str = "repo_structure";
@@ -269,6 +271,10 @@ pub struct RepoStructure {
     /// without it reads as [`RepoKind::Unknown`]: RC-027 and RC-040 abstain.
     #[serde(default)]
     pub repo_kind: RepoKindFacts,
+    /// Terraform roots and state (RC-016). A record without it was not
+    /// read: RC-016 abstains.
+    #[serde(default)]
+    pub terraform_state: Option<TerraformStateFacts>,
     /// True when the walk exhausted the tree (no unreadable directories).
     /// Only a complete walk licenses reasoning from absence — mirrors
     /// `Provenance::complete` on call-site packets.
@@ -296,6 +302,7 @@ impl Default for RepoStructure {
             production_sources: None,
             deploy_sites: Vec::new(),
             repo_kind: RepoKindFacts::default(),
+            terraform_state: None,
             walk_complete: false,
         }
     }
@@ -372,7 +379,7 @@ pub struct StructureFinding {
 /// Map structure facts to per-control verdicts, `today` the scan date as
 /// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
 /// no model calls. Always returns one finding per control, in stable order:
-/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040.
+/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040, RC-016.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
 /// decidable negative only when the walk was complete AND absence is
@@ -390,6 +397,7 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
         eval_runbooks(facts, today),
         error_reporting::evaluate(facts),
         sast::evaluate(facts),
+        terraform_state::evaluate(facts),
     ]
 }
 

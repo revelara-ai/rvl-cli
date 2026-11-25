@@ -3,7 +3,7 @@
 //! Contents are read locally to detect markers; no source text is stored.
 
 use crate::sast::{self, SastFacts};
-use crate::{deploy, error_reporting, repo_kind, runbooks, DeploySite};
+use crate::{deploy, error_reporting, repo_kind, runbooks, terraform_state, DeploySite};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
@@ -174,6 +174,7 @@ struct Acc {
     deploy_sites: Vec<DeploySite>,
     gitops: deploy::GitOps,
     servers: Vec<String>,
+    terraform: terraform_state::Acc,
     walk_complete: bool,
 }
 
@@ -275,6 +276,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
         production_sources: Some(acc.production_sources),
         deploy_sites: deploy::finish(acc.deploy_sites),
         repo_kind: repo_kind::repo_kind(root),
+        terraform_state: Some(acc.terraform.finish(root)),
         walk_complete: acc.walk_complete,
     }
 }
@@ -489,6 +491,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
 
     error_reporting::observe(path, &rp, name, &ext, &mut acc.error_reporting);
+    terraform_state::observe(path, &rp, name, &ext, &mut acc.terraform);
 
     // --- CI scanners (Q21/Q22): GitHub Actions workflows only ---
     if is_gha_workflow {
