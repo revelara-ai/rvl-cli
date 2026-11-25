@@ -48,7 +48,11 @@ use std::path::Path;
 /// under a local cluster bootstrap (`.bootstrap/`, a `localstack` emulator),
 /// a `single-node` dev setup, `archive/` trees, mock servers (`wiremock/`),
 /// load generators (`stress-cpu.yaml`), and preview, canary, staging,
-/// proof-of-concept and prototype environments. The test is on path tokens
+/// proof-of-concept and prototype environments. A third check found
+/// performance-test tooling (`perf/dashboards/`): `perf`, `benchmark` and
+/// `loadtest` trees hold what a load run deploys. `performance` is not
+/// listed: a service named for it (`performance-api`) deploys, while the
+/// short and test-shaped names do not. The test is on path tokens
 /// only: a rollout strategy named `canary` in a document is a key, not a
 /// path, and stays a fact.
 pub const NON_PRODUCTION_TOKENS: &[&str] = &[
@@ -112,6 +116,11 @@ pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "canary",
     "staging",
     "stage",
+    "perf",
+    "benchmark",
+    "benchmarks",
+    "loadtest",
+    "load-test",
 ];
 
 /// A directory segment whose units are not deployed: the manifests under
@@ -124,7 +133,9 @@ pub const GITHUB_DIR: &str = ".github";
 /// repository as sample or teaching material, so every unit in it is
 /// non-production: the same check found every flag in repositories named
 /// for training, cheatsheets, blog code, docs examples and samples not
-/// applicable, wherever in the tree the unit sat.
+/// applicable, wherever in the tree the unit sat, and the next check every
+/// flag in a lab repository (`aks-landing-zone-lab`): a lab or homelab
+/// repository is an exercise, not a production estate.
 pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "samples",
     "sample",
@@ -142,6 +153,9 @@ pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "demos",
     "learning",
     "playground",
+    "lab",
+    "labs",
+    "homelab",
     "talks",
     "codelab",
     "codelabs",
@@ -459,6 +473,12 @@ mod tests {
             ("envs/stage/main.tf", "stage"),
             ("deploy/preview/api.yaml", "preview"),
             ("prototype/api.yaml", "prototype"),
+            ("perf/dashboards/exporters/redis_exporter.yaml", "perf"),
+            ("benchmarks/api.yaml", "benchmarks"),
+            ("deploy/benchmark-runner.yaml", "benchmark"),
+            ("k8s/loadtest/locust.yaml", "loadtest"),
+            ("k8s/load-test/locust.yaml", "load-test"),
+            ("k8s/load_test/locust.yaml", "load-test"),
         ] {
             assert_eq!(path_token(path), Some(token), "{path}");
         }
@@ -479,6 +499,9 @@ mod tests {
             "github/k8s/app.yaml",
             "k8s/rollouts/api.yaml",
             "deploy.yaml",
+            "deploy/performance-api.yaml",
+            "k8s/load/balancer.yaml",
+            "superf/api.yaml",
         ] {
             assert_eq!(path_token(path), None, "{path}");
         }
@@ -545,9 +568,14 @@ mod tests {
             ("/scans/docs-examples", Some("examples")),
             ("/scans/terraform-docs-samples", Some("samples")),
             ("/scans/localstack-terraform-samples", Some("samples")),
+            ("/scans/aks-landing-zone-lab", Some("lab")),
+            ("/scans/k8s-labs", Some("labs")),
+            ("/scans/homelab", Some("homelab")),
             ("/scans/devfest-codelabs", Some("codelabs")),
             ("/scans/conference-talks", Some("talks")),
             ("/scans/platform", None),
+            ("/scans/gitlab-runner", None),
+            ("/scans/label-studio", None),
             ("", None),
         ] {
             assert_eq!(root_token(Path::new(root)), token, "{root}");
