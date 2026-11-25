@@ -180,6 +180,8 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "workload.strategy.max-unavailable"),
     judged("kubernetes", "workload.strategy.type"),
     judged("kyverno", "rule.validate.failureAction"),
+    judged("loki", "limits_config.retention_period-effective"),
+    judged("loki", "table_manager.retention_period-effective"),
     judged("prometheus-rules", "group.interval"),
     vocabulary_only(
         "prometheus-rules",
@@ -230,6 +232,10 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("terraform", "provider.version-constraint"),
     judged(
         "terraform",
+        "resource.aws_cloudwatch_log_group.retention_in_days",
+    ),
+    judged(
+        "terraform",
         "resource.aws_db_instance.backup_retention_period",
     ),
     judged("terraform", "resource.aws_db_instance.multi_az"),
@@ -239,6 +245,10 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged(
         "terraform",
         "resource.aws_rds_cluster.backup_retention_period",
+    ),
+    judged(
+        "terraform",
+        "resource.azurerm_log_analytics_workspace.retention_in_days",
     ),
     judged(
         "terraform",
@@ -253,6 +263,22 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "resource.google_container_node_pool.node_locations-count",
     ),
     judged("terraform", "resource.google_iam.role-class"),
+    judged(
+        "terraform",
+        "resource.google_logging_billing_account_bucket_config.retention_days",
+    ),
+    judged(
+        "terraform",
+        "resource.google_logging_folder_bucket_config.retention_days",
+    ),
+    judged(
+        "terraform",
+        "resource.google_logging_organization_bucket_config.retention_days",
+    ),
+    judged(
+        "terraform",
+        "resource.google_logging_project_bucket_config.retention_days",
+    ),
     judged("terraform", "resource.google_service_account_key.declared"),
     judged(
         "terraform",
@@ -406,6 +432,7 @@ mod tests {
                 include_str!("kubernetes/manifest.rs"),
             ),
             ("kubernetes/mod.rs", include_str!("kubernetes/mod.rs")),
+            ("loki.rs", include_str!("loki.rs")),
             ("operators.rs", include_str!("operators.rs")),
             ("prometheus.rs", include_str!("prometheus.rs")),
             ("terraform.rs", include_str!("terraform.rs")),
