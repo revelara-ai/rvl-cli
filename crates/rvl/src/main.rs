@@ -3544,12 +3544,26 @@ fn resolve_judgments(
     }
 }
 
-/// `--oss-only` as the load filter it selects.
-fn tier_filter(oss_only: bool) -> TierFilter {
+/// The load filter `--oss-only` and the configured key select. Without a
+/// key nothing commercial loads: a tier or model an earlier keyed install
+/// cached stays on disk, unread, until the key is back.
+fn tier_filter(oss_only: bool, org_key: &str) -> TierFilter {
     if oss_only {
         TierFilter::OssOnly
+    } else if org_key.is_empty() {
+        TierFilter::NoKey
     } else {
         TierFilter::Both
+    }
+}
+
+/// Why a load skipped the commercial artifacts, as the stderr notes say it.
+/// None when the filter loads them.
+fn commercial_skip_reason(tiers: TierFilter) -> Option<&'static str> {
+    match tiers {
+        TierFilter::Both => None,
+        TierFilter::OssOnly => Some("--oss-only"),
+        TierFilter::NoKey => Some("no API key"),
     }
 }
 
@@ -3618,10 +3632,17 @@ fn findings_from_sites(
             // reads lighter than the install's real answer. Said on stderr on
             // every run, for the same reason `--specs-file` is: a scan whose
             // inputs were reduced must not look like the ordinary one.
-            if tier_filter == TierFilter::OssOnly {
+            // Without a key the note is said only when a commercial tier is
+            // on disk to skip: a keyless install that never had one loaded
+            // what it always loads.
+            let skipped = match tier_filter {
+                TierFilter::NoKey if !store.is_installed() => None,
+                t => commercial_skip_reason(t),
+            };
+            if let Some(why) = skipped {
                 progress.suspend(|| {
                     eprintln!(
-                        "note: --oss-only: the commercial tier was not loaded; this scan uses \
+                        "note: {why}: the commercial tier was not loaded; this scan uses \
                          the OSS vocabulary tier alone, so API surfaces are unjudged and \
                          findings are advisory"
                     )
@@ -3660,6 +3681,13 @@ fn findings_from_sites(
                     "--oss-only needs the OSS tier, and it is not installed or did not \
                      verify: run '{BIN} sync' (the OSS vocabulary tier needs no API key)"
                 ),
+                None if tier_filter == TierFilter::NoKey && store.is_installed() => {
+                    anyhow::bail!(
+                        "no API key, so the cached commercial tier is not loaded, and the OSS \
+                         tier is not installed or did not verify: run '{BIN} sync' (the OSS \
+                         vocabulary tier needs no API key), or set RVL_API_KEY"
+                    )
+                }
                 None => anyhow::bail!(
                     "no spec cache tier loadable: run '{BIN} sync' \
                      (the OSS vocabulary tier needs no API key), or '{BIN} cache import'"
@@ -4432,6 +4460,7 @@ fn stdout_color(mode: Option<&str>) -> bool {
 fn decision_lane(
     store: &CacheStore,
     keyset: &Keyset,
+    tiers: TierFilter,
     path: &Path,
     findings: &[rvl_propagate::Finding],
     sites: &[rvl_core::Site],
@@ -4441,6 +4470,18 @@ fn decision_lane(
     progress: &indicatif::ProgressBar,
 ) -> Option<decision::LaneOutput> {
     let cfg = progress.suspend(|| decision::enabled(path))?;
+    // The model is commercial: it loads only where the commercial tier does.
+    if let Some(why) = commercial_skip_reason(tiers) {
+        progress.suspend(|| {
+            eprintln!(
+                "note: {why}: the decision model was not loaded; its lane does not run \
+                 on this scan"
+            )
+        });
+        return Some(decision::not_run(format!(
+            "{why}: the decision model loads only with the commercial tier"
+        )));
+    }
     let budget = model_budget(&cfg, held, limits.remaining());
     Some(decision::run(
         &cfg,
@@ -4626,7 +4667,7 @@ fn run_scan(
     let lane = config_lane::run(path, &specs, &snapshot_name(path));
     structure.extend(server_to_findings(&server, &lane.liveness_probes));
     let model = decision_lane(
-        store, keyset, path, &findings, &sites, &specs, &limits, false, &progress,
+        store, keyset, tiers, path, &findings, &sites, &specs, &limits, false, &progress,
     );
     let blended = blend.then(|| {
         progress::step(&progress, "Blending");
@@ -6496,6 +6537,7 @@ fn run_scan_incremental(
     let model = decision_lane(
         store,
         keyset,
+        tiers,
         path,
         &findings,
         &sites,
@@ -6579,6 +6621,7 @@ fn finding_from_last_scan(
 fn run_explain(
     store: &CacheStore,
     keyset: &Keyset,
+    tiers: TierFilter,
     state_path: &std::path::Path,
     id: &str,
     path: &std::path::Path,
@@ -6614,7 +6657,7 @@ fn run_explain(
         &stream.text,
         specs_file,
         judgments,
-        TierFilter::Both,
+        tiers,
         Some(path),
         false,
         &indicatif::ProgressBar::hidden(),
@@ -6654,6 +6697,7 @@ fn run_explain(
 fn run_suppress(
     store: &CacheStore,
     keyset: &Keyset,
+    tiers: TierFilter,
     state_path: &std::path::Path,
     id: &str,
     path: Option<&std::path::Path>,
@@ -6689,7 +6733,7 @@ fn run_suppress(
                     &stream.text,
                     specs_file,
                     judgments,
-                    TierFilter::Both,
+                    tiers,
                     Some(scan_path),
                     false,
                     &indicatif::ProgressBar::hidden(),
@@ -8469,7 +8513,7 @@ fn run() -> anyhow::Result<ExitCode> {
             } else {
                 budget::Limits::resolve(&path, scan_budget, helper_timeout)
             };
-            let tiers = tier_filter(oss_only);
+            let tiers = tier_filter(oss_only, &cfg.org_key);
             // The base-ref chain (po-av01j.194), resolved once and used twice:
             // to pick the changed-set question below, and HERE to decide what
             // a v1 `--changed-only` meant. v1 resolved that flag against this
@@ -8541,7 +8585,7 @@ fn run() -> anyhow::Result<ExitCode> {
             );
             // After every flag check, so a usage error fetches nothing.
             if specs_file.is_none() {
-                autosync::first_sync(&cfg, &store, &keyset, oss_only)?;
+                autosync::first_sync(&cfg, &store, &keyset, tiers)?;
             }
             // `--incremental` only applies when we own retrieval; `--retrieved`
             // is a prebuilt stream with no per-file hash gate to reuse.
@@ -8615,7 +8659,7 @@ fn run() -> anyhow::Result<ExitCode> {
             &path.unwrap_or_else(|| PathBuf::from(".")),
             retrieved.as_deref(),
             specs_file.as_deref(),
-            tier_filter(oss_only),
+            tier_filter(oss_only, &cfg.org_key),
             incremental,
             json,
             out.as_deref(),
@@ -8634,6 +8678,7 @@ fn run() -> anyhow::Result<ExitCode> {
         } => run_explain(
             &store,
             &keyset,
+            tier_filter(false, &cfg.org_key),
             &state_path,
             &id,
             &path.unwrap_or_else(|| PathBuf::from(".")),
@@ -8653,6 +8698,7 @@ fn run() -> anyhow::Result<ExitCode> {
         } => run_suppress(
             &store,
             &keyset,
+            tier_filter(false, &cfg.org_key),
             &state_path,
             &id,
             path.as_deref(),
@@ -8813,7 +8859,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     &oss_store,
                     &keyset,
                     &rvl_cache::today_utc(),
-                    TierFilter::Both,
+                    tier_filter(false, &cfg.org_key),
                 );
                 let specs = match tiers.spec_texts()? {
                     Some((base, overlay)) => {

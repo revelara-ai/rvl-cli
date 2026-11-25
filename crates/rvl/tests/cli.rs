@@ -9964,7 +9964,8 @@ fn install_signed_tier_with_judgments(
 }
 
 /// Scan the runtime Python fixture on the SIGNED cache (no `--specs-file`),
-/// trusting `key_hex` through the debug-only seam.
+/// trusting `key_hex` through the debug-only seam. With an API key, which the
+/// commercial tier needs to load.
 fn scan_on_the_signed_cache(
     root: &std::path::Path,
     packets: &std::path::Path,
@@ -9975,6 +9976,7 @@ fn scan_on_the_signed_cache(
         .arg(packets)
         .env("RVL_CACHE_DIR", root.join("cache"))
         .env("HOME", root.join("home"))
+        .env("RVL_API_KEY", "pk_cli_test")
         .env(TEST_KEYSET_ENV, key_hex)
         .output()
         .expect("failed to run rvl")
@@ -10055,6 +10057,7 @@ fn scan_and_explain_signed_judgment(
     let env = |c: &mut Command| {
         c.env("RVL_CACHE_DIR", root.join("cache"))
             .env("HOME", root.join("home"))
+            .env("RVL_API_KEY", "pk_cli_test")
             .env(TEST_KEYSET_ENV, &key_hex);
     };
     let mut scan = bin();
@@ -10145,6 +10148,156 @@ fn the_test_keyset_does_not_trust_a_tier_signed_by_another_key() {
 
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("no spec cache tier loadable"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Sign `specs` (a synthetic `SpecFile` body) as an envelope of version
+/// `version` with `signing`, and install it in the store at `dir`.
+fn install_signed_specs(
+    dir: &std::path::Path,
+    signing: &ed25519_dalek::SigningKey,
+    version: &str,
+    specs: &str,
+) {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
+    let key_hex = hex::encode(signing.verifying_key().to_bytes());
+    let keyset = rvl_cache::Keyset::from_hex(&[key_hex.as_str()]).unwrap();
+    let bytes =
+        format!(r#"{{"schema":1,"content_version":"{version}","specs":{specs}}}"#).into_bytes();
+    let sig = base64::engine::general_purpose::STANDARD.encode(signing.sign(&bytes).to_bytes());
+    let store = rvl_cache::CacheStore::open(dir).unwrap();
+    let outcome = store.install(&bytes, &sig, &keyset);
+    assert!(
+        matches!(outcome, rvl_cache::SyncOutcome::Installed { .. }),
+        "the test envelope must install: {outcome:?}"
+    );
+}
+
+/// WITHOUT A KEY, NOTHING COMMERCIAL LOADS. The cache holds what an earlier
+/// keyed install left: a commercial tier (`current/` and `last-good/`) whose
+/// one API spec would resolve the fixture's site, and a decision model the
+/// repository turned on. The model is unreadable bytes, so reading it at all
+/// would surface a manifest error. A keyless scan loads the OSS tier alone,
+/// says on stderr what it did not load, and leaves the files on disk for the
+/// day the key comes back. The same cache with a key loads both.
+#[cfg(debug_assertions)]
+#[test]
+fn a_keyless_scan_loads_only_the_oss_tier_and_no_cached_model() {
+    let (root, packets, _) = write_runtime_python_fixture("keyless-skips-commercial");
+    let cache = root.join("cache");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let key_hex = hex::encode(signing.verifying_key().to_bytes());
+    let today = rvl_cache::today_utc();
+    let commercial_version = format!("{today}.commercial");
+    let oss_version = format!("{today}.oss");
+    // Installed twice, so the first artifact rotates into last-good/.
+    for version in [format!("{today}.previous"), commercial_version.clone()] {
+        install_signed_specs(
+            &cache,
+            &signing,
+            &version,
+            &format!(r#"{{"apis":{REQUESTS_GET_API},"configs":[]}}"#),
+        );
+    }
+    install_signed_specs(
+        &cache.join("oss"),
+        &signing,
+        &oss_version,
+        r#"{"apis":[],"configs":[]}"#,
+    );
+    let model = cache.join("model/current");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("manifest.json"), "not a manifest").unwrap();
+    std::fs::write(model.join("manifest.json.sig"), "not a signature").unwrap();
+    std::fs::write(
+        root.join(".revelara.yaml"),
+        "scanner:\n  decision_model: on\n",
+    )
+    .unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".revelara")).unwrap();
+    // A config file with no key: the scan must not find one anywhere.
+    std::fs::write(
+        home.join(".revelara/config.yaml"),
+        "api_url: http://127.0.0.1:9\n",
+    )
+    .unwrap();
+    let on_disk = |dir: &std::path::Path| {
+        ["current", "last-good"]
+            .iter()
+            .all(|slot| dir.join(slot).join("specs.json").is_file())
+    };
+    assert!(on_disk(&cache), "the fixture needs both commercial slots");
+    let scan = |key: Option<&str>| {
+        let mut c = bin();
+        c.args(["scan", "--retrieved"])
+            .arg(&packets)
+            .current_dir(&root)
+            .env("RVL_CACHE_DIR", &cache)
+            .env("HOME", &home)
+            .env(TEST_KEYSET_ENV, &key_hex)
+            .env_remove("RVL_API_KEY")
+            .env_remove("RVL_CONTEXT");
+        if let Some(k) = key {
+            c.env("RVL_API_KEY", k);
+        }
+        let out = c.output().expect("failed to run rvl");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, stdout, stderr) = scan(None);
+    assert!(
+        matches!(code, Some(0) | Some(EXIT_BLOCKED)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("oss tier {oss_version}")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(&commercial_version), "{stdout}");
+    assert!(
+        stdout.contains("0/1 API surfaces resolved"),
+        "the commercial API spec must not judge the site: {stdout}"
+    );
+    assert!(
+        stderr.contains("no API key: the commercial tier was not loaded"),
+        "stderr must name the tier it skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("no API key: the decision model was not loaded"),
+        "stderr must name the model it skipped: {stderr}"
+    );
+    assert!(
+        !stdout.contains("manifest") && !stderr.contains("manifest"),
+        "the cached model must not be read:\n{stdout}\n{stderr}"
+    );
+    assert!(on_disk(&cache), "the commercial tier stays on disk");
+    assert!(
+        model.join("manifest.json").is_file(),
+        "the model stays on disk"
+    );
+
+    let (code, stdout, stderr) = scan(Some("pk_cli_test"));
+    assert!(
+        matches!(code, Some(0) | Some(EXIT_BLOCKED)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("spec cache {commercial_version}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1/1 API surfaces resolved"), "{stdout}");
+    assert!(
+        stdout.contains("the cached model manifest does not verify"),
+        "with a key the cached model is read: {stdout}"
+    );
+    assert!(!stderr.contains("no API key"), "{stderr}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

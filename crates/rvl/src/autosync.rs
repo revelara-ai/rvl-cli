@@ -14,7 +14,9 @@
 use crate::Config;
 use rvl_cache::auto;
 use rvl_cache::model::{HttpModelFetcher, ModelStore, ModelSyncOutcome, MODEL_DIR};
-use rvl_cache::{CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TieredLoaded};
+use rvl_cache::{
+    CacheStore, HttpFetcher, Keyset, OssHttpFetcher, SyncOutcome, TierFilter, TieredLoaded,
+};
 use rvl_core::BIN;
 use std::path::Path;
 use std::process::ExitCode;
@@ -92,10 +94,10 @@ pub fn first_sync(
     cfg: &Config,
     store: &CacheStore,
     keyset: &Keyset,
-    oss_only: bool,
+    tiers: TierFilter,
 ) -> anyhow::Result<()> {
     let oss = store.subdir_store(rvl_cache::OSS_DIR)?;
-    if oss.is_installed() || (!oss_only && store.is_installed()) {
+    if oss.is_installed() || (tiers.loads_commercial() && store.is_installed()) {
         return Ok(());
     }
     if cfg.offline {

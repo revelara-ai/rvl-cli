@@ -190,7 +190,7 @@ pub fn run(
     }
 }
 
-fn not_run(why: String) -> LaneOutput {
+pub fn not_run(why: String) -> LaneOutput {
     let mut summary = Summary {
         not_run: Some(why),
         ..Summary::default()
