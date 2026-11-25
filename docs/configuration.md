@@ -122,14 +122,14 @@ relocates it. Under that root live two independent stores:
 
 - the **commercial tier** in the root itself (`current/`, `last-good/`,
   `rejected/`), synced only with an API key;
-- the **OSS vocabulary tier** in the `oss/` subdirectory, which `rvl sync`
+- the **OSS tier** (the open rules and frames) in the `oss/` subdirectory, which `rvl sync`
   fetches with no credentials. A keyless `rvl sync` is not an error; it
   installs this tier alone.
 
 Both artifacts are signature-verified against the same pinned keyset at fetch
 and at load. At scan time the two layer: the OSS tier is the base payload and
-the commercial tier the overlay, so a keyed install adds the judgment lanes
-on top of the public vocabulary baseline.
+the commercial tier the overlay, so a keyed install adds the per-API verdict
+corpus and the decision model on top of the public rules and frames.
 
 Without a key, nothing commercial loads. A run with no `RVL_API_KEY` and no
 `api_key` in the config file loads the OSS tier alone. It does not read a
