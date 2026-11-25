@@ -53,6 +53,9 @@
 //!     that carry one: `resource.google_service_account_key.declared` and
 //!     `resource.aws_iam_access_key.declared` (a static key exists;
 //!     `count`/`for_each` can make it `false` or Unresolvable),
+//!     beside each the CREDENTIAL HYGIENE fact (RC-072)
+//!     `resource.<type>.static-credential` (`declared` | `none`, the same
+//!     existence; undecided under a retired, library or asset directory),
 //!     `resource.google_iam.role-class` (`primitive` | `viewer` | `custom` |
 //!     `predefined`), `resource.aws_iam.statement-wildcard` (`none` |
 //!     `resource` | `action` | `action-and-resource`, read from a
@@ -1326,6 +1329,27 @@ fn least_privilege_fact(
     Some((key, fact))
 }
 
+/// The credential hygiene fact (RC-072) a static key resource carries
+/// beside its least-privilege `declared` fact (RC-044): the same existence,
+/// valued `declared` | `none`, under its own key so each control has a spec:
+/// (key, value). The caller undecides it under the
+/// [`crate::non_production::STATIC_CREDENTIAL_DIR_TOKENS`] directories,
+/// where RC-044's fact stays.
+fn static_credential(
+    declared_key: &str,
+    declared: Option<&str>,
+) -> Option<(&'static str, Option<String>)> {
+    let key = match declared_key {
+        "resource.google_service_account_key.declared" => {
+            "resource.google_service_account_key.static-credential"
+        }
+        "resource.aws_iam_access_key.declared" => "resource.aws_iam_access_key.static-credential",
+        _ => return None,
+    };
+    let value = declared.map(|v| if v == "true" { "declared" } else { "none" }.to_string());
+    Some((key, value))
+}
+
 /// Whether the resource exists: `true` unless `count` or `for_each` can make
 /// it zero instances. A literal zero (or an empty literal collection) is
 /// `false`; one that needs evaluation (`var.create ? 1 : 0`) abstains.
@@ -2243,6 +2267,16 @@ fn retrieve_dir(
             if let Some((key, (value, resolution, prov))) =
                 least_privilege_fact(ty, name, &b.body, rel, &vars)
             {
+                if let Some((cred_key, cred_value)) = static_credential(key, value.as_deref()) {
+                    let mut p = packet(rel, &unit, cred_key, cred_value, resolution, prov.clone());
+                    if let Some(t) = crate::non_production::static_credential_dir_token(rel) {
+                        crate::non_production::undecide(
+                            &mut p,
+                            &format!("not a deployed credential: {t}"),
+                        );
+                    }
+                    out.packets.push(p);
+                }
                 out.packets
                     .push(packet(rel, &unit, key, value, resolution, prov));
             }
@@ -3097,6 +3131,59 @@ module "local" {
         assert_eq!(
             at("per_user"),
             (None, Resolution::Unresolvable, "expression".into())
+        );
+    }
+
+    // RC-072 reads the same existence under its own key, so the RC-044
+    // spec on `declared` and the RC-072 spec on `static-credential` each
+    // decide one control.
+    #[test]
+    fn a_static_key_resource_carries_a_static_credential_fact_beside_declared() {
+        let got = least_privilege();
+        for (unit, want) in [
+            ("google_service_account_key.ci", some("declared")),
+            ("google_service_account_key.none", some("none")),
+            ("google_service_account_key.maybe", None),
+            ("aws_iam_access_key.deploy", some("declared")),
+            ("aws_iam_access_key.none", some("none")),
+            ("aws_iam_access_key.per_user", None),
+        ] {
+            let ty = unit.split('.').next().unwrap();
+            let key = format!("resource.{ty}.static-credential");
+            let p = find(&got, &format!("resource:{unit}"), &key);
+            assert_eq!(p.resolved_value, want, "{unit}");
+            assert!(
+                got.packets
+                    .iter()
+                    .any(|d| d.unit == p.unit && d.key == format!("resource.{ty}.declared")),
+                "{unit} keeps its RC-044 fact"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_credential_under_a_retired_or_library_tree_is_undecided() {
+        let tf = "resource \"aws_iam_access_key\" \"ci\" {\n  user = \"ci\"\n}\n";
+        let got = one(&[("infra/iam/keys.tf", tf), ("infra/deprecated/keys.tf", tf)]);
+        let at = |file: &str, key: &str| {
+            got.packets
+                .iter()
+                .find(|p| p.file_path == file && p.key == key)
+                .and_then(|p| p.resolved_value.clone())
+        };
+        let cred = "resource.aws_iam_access_key.static-credential";
+        assert_eq!(at("infra/iam/keys.tf", cred), some("declared"));
+        assert_eq!(
+            at("infra/deprecated/keys.tf", cred),
+            some("undecided: not a deployed credential: deprecated")
+        );
+        assert_eq!(
+            at(
+                "infra/deprecated/keys.tf",
+                "resource.aws_iam_access_key.declared"
+            ),
+            some("true"),
+            "the RC-044 fact is unchanged"
         );
     }
 
