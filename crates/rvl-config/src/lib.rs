@@ -36,6 +36,7 @@ pub mod alertmanager;
 pub mod argo_flux;
 pub mod construction;
 pub mod dep_manifests;
+mod deploy_check;
 pub mod eval;
 pub mod github_actions;
 pub mod gitlab_ci;

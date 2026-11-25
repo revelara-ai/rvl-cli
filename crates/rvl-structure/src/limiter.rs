@@ -416,7 +416,7 @@ fn repository_token(root: &Path) -> Option<String> {
         .map(|n| n.to_string_lossy().into_owned())
         .into_iter()
         .collect();
-    if let Some(url) = crate::deploy::origin(root) {
+    if let Some(url) = origin(root) {
         let url = url.trim_end_matches('/').trim_end_matches(".git");
         names.extend(url.rsplit(['/', ':']).take(2).map(str::to_string));
     }
@@ -430,6 +430,26 @@ fn repository_token(root: &Path) -> Option<String> {
             .map(str::to_lowercase)
             .find(|t| lists.iter().any(|l| l.contains(&t.as_str())))
     })
+}
+
+/// The URL of the `origin` remote in the repository's `.git/config`, if
+/// there is one.
+fn origin(root: &Path) -> Option<String> {
+    let config = crate::inventory::read_capped(&root.join(".git/config"));
+    let mut in_origin = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_origin = t == "[remote \"origin\"]";
+        } else if in_origin {
+            if let Some((key, value)) = t.split_once('=') {
+                if key.trim() == "url" {
+                    return Some(value.trim().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 const CONTROL: &str = "RC-069";

@@ -10,13 +10,30 @@
 //!   * `job.allow_failure` — explicit, else the documented default, which is
 //!     `true` for manual jobs (`when: manual`) and `false` otherwise.
 //!
+//!   * `job.post-deploy-check` (RC-058) — on a job whose script deploys:
+//!     `none`, or `undecided:` and why, with the guard predicate
+//!     `job.deploy-class` (see [`crate::deploy_check`]). A script entry
+//!     that deploys is the deploy step; what may check it is a later entry
+//!     of the job or its `after_script`, the deploy entry itself, or a job
+//!     of a later stage.
+//!
 //! `include:`-only files are valid GitLab CI and emit zero packets (the
 //! included files are not fetched: no remote reads on the scan path).
 
-use crate::{render_value, ConfigPacket, ConfigRetriever, ProvenanceStep, Resolution, Retrieved};
-use serde_yaml::Value;
+use crate::deploy_check;
+use crate::{
+    render_value, ConfigPacket, ConfigPredicate, ConfigRetriever, ProvenanceStep, Resolution,
+    Retrieved,
+};
+use serde_yaml::{Mapping, Value};
 
 pub struct GitlabCi;
+
+/// The stages of a pipeline with no `stages:` list, in order.
+const DEFAULT_STAGES: &[&str] = &["build", "test", "deploy"];
+
+/// The stage of a job with no `stage:`.
+const DEFAULT_STAGE: &str = "test";
 
 /// Top-level keys that configure the pipeline rather than define a job.
 const RESERVED: &[&str] = &[
@@ -41,6 +58,29 @@ impl ConfigRetriever for GitlabCi {
     /// setting (unresolvable from the repo) and out of scope for family (1).
     fn matches(&self, rel_path: &str) -> bool {
         rel_path == ".gitlab-ci.yml"
+    }
+
+    /// The scanned root's name says whether the repository is sample
+    /// material, on which the post-deploy check fact abstains.
+    fn retrieve_with_root(
+        &self,
+        root: &std::path::Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let mut out = self.retrieve(rel_path, contents, snapshot_id);
+        if let Some(t) = crate::non_production::root_token(root) {
+            let why = format!("non-production repository: {t}");
+            for p in out
+                .packets
+                .iter_mut()
+                .filter(|p| p.key == deploy_check::KEY)
+            {
+                crate::non_production::undecide(p, &why);
+            }
+        }
+        out
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
@@ -86,6 +126,23 @@ impl ConfigRetriever for GitlabCi {
             };
             let unit = format!("job:{job_id}");
             let jpath = |k: &str| format!("{job_id}.{k}");
+
+            // job.post-deploy-check: only a job whose script deploys.
+            if let Some((value, class, at)) = post_deploy(contents, root, job_id, job) {
+                out.packets.push(packet(
+                    &unit,
+                    deploy_check::KEY,
+                    Some(value),
+                    Resolution::AsAuthored,
+                    vec![ProvenanceStep::new(rel_path, &at, "explicit")],
+                ));
+                out.predicates.push(ConfigPredicate {
+                    file_path: rel_path.to_string(),
+                    unit: unit.clone(),
+                    key: crate::key_ledger::declared("gitlab-ci", deploy_check::CLASS_KEY),
+                    values: vec![class.to_string()],
+                });
+            }
 
             // job.timeout: job > default block > project setting (outside repo).
             match (get(job, "timeout"), dget("timeout")) {
@@ -193,6 +250,109 @@ impl ConfigRetriever for GitlabCi {
     }
 }
 
+/// The script entries of a job's `key` (a list, or one string).
+fn entries<'a>(job: &'a Mapping, key: &str) -> Vec<&'a str> {
+    match get(job, key) {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Sequence(seq)) => seq.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The position of a job's stage in the pipeline, or None for a stage the
+/// pipeline does not list.
+fn stage_index(root: &Mapping, job: &Mapping) -> Option<usize> {
+    let listed: Vec<&str> = match get(root, "stages").and_then(Value::as_sequence) {
+        Some(seq) => seq.iter().filter_map(Value::as_str).collect(),
+        None => DEFAULT_STAGES.to_vec(),
+    };
+    let stage = get(job, "stage")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_STAGE);
+    std::iter::once(".pre")
+        .chain(listed)
+        .chain(std::iter::once(".post"))
+        .position(|s| s == stage)
+}
+
+/// A job's RC-058 facts: the [`deploy_check::KEY`] value, the
+/// [`deploy_check::CLASS_KEY`] value and the path of the deploy entry, or
+/// None when no script entry deploys.
+fn post_deploy(
+    contents: &str,
+    root: &Mapping,
+    job_id: &str,
+    job: &Mapping,
+) -> Option<(String, &'static str, String)> {
+    let script: Vec<(&str, usize, &str)> = ["before_script", "script"]
+        .into_iter()
+        .flat_map(|k| {
+            entries(job, k)
+                .into_iter()
+                .enumerate()
+                .map(move |(i, e)| (k, i, e))
+        })
+        .collect();
+    let (at, deploy) = script
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, (_, _, e))| deploy_check::in_run(e).map(|d| (at, d)))?;
+    let (key, idx, own) = script[at];
+    let path = format!("{job_id}.{key}[{idx}] deploys: {}", deploy.kind);
+
+    let env = get(job, "environment").and_then(deploy_check::environment_name);
+    let conditions: String = ["only", "rules"]
+        .iter()
+        .filter_map(|k| get(job, k))
+        .map(deploy_check::text_of)
+        .collect();
+    let checked =
+        |w: String, at: String| Some(format!("a check may follow the deploy: {at} ({w})"));
+    let why = if let Some(m) = deploy_check::test_cluster(contents) {
+        Some(format!("test cluster or rehearsal in the pipeline: {m}"))
+    } else if let Some(t) = [Some(job_id), env]
+        .into_iter()
+        .flatten()
+        .find_map(deploy_check::non_production_token)
+    {
+        Some(format!("non-production job: {t}"))
+    } else if conditions.contains("merge_request") {
+        Some("deploys a merge request".to_string())
+    } else if let Some(m) = deploy_check::preview(own) {
+        Some(format!("deploys a pull request or a preview: {m}"))
+    } else if let Some(w) = deploy_check::check_word(own) {
+        checked(w, "the deploy entry".into())
+    } else if let Some(w) = script[at + 1..]
+        .iter()
+        .map(|(_, _, e)| *e)
+        .chain(entries(job, "after_script"))
+        .find_map(deploy_check::check_word)
+    {
+        checked(w, "a later script entry".into())
+    } else {
+        let stage = stage_index(root, job);
+        root.iter()
+            .filter_map(|(k, v)| Some((k.as_str()?, v.as_mapping()?)))
+            .filter(|(k, _)| !RESERVED.contains(k) && !k.starts_with('.'))
+            .filter(|(_, j)| stage.is_some_and(|s| stage_index(root, j).is_some_and(|o| o > s)))
+            .find_map(|(k, j)| {
+                let text: String = std::iter::once(k.to_string())
+                    .chain(
+                        ["before_script", "script", "after_script"]
+                            .iter()
+                            .flat_map(|f| entries(j, f))
+                            .map(str::to_string),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                deploy_check::check_word(&text).map(|w| (k, w))
+            })
+            .and_then(|(k, w)| checked(w, format!("job {k} of a later stage")))
+    };
+    Some((deploy_check::value(why), deploy.class(), path))
+}
+
 fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
     m.get(Value::String(key.to_string()))
 }
@@ -298,6 +458,97 @@ mod tests {
         let got = packets("include:\n  - project: group/ci\n    file: ci.yml\n");
         assert!(got.packets.is_empty());
         assert_eq!(got.unparseable, 0, "an include-only file is not malformed");
+    }
+
+    /// `job.post-deploy-check` and `job.deploy-class` of each deploy job.
+    fn deploy_sites(got: &Retrieved) -> Vec<(String, String, String)> {
+        got.packets
+            .iter()
+            .filter(|p| p.key == deploy_check::KEY)
+            .map(|p| {
+                let class = got
+                    .predicates
+                    .iter()
+                    .find(|f| f.unit == p.unit && f.key == deploy_check::CLASS_KEY)
+                    .map(|f| f.values.join(","))
+                    .unwrap_or_default();
+                (p.unit.clone(), p.resolved_value.clone().unwrap(), class)
+            })
+            .collect()
+    }
+
+    const PIPELINE: &str = "stages: [build, deploy, verify]\nbuild:\n  stage: build\n  script: make\ndeploy:\n  stage: deploy\n  environment: production\n  script:\n    - echo deploying\n    - kubectl apply -f k8s/\n";
+
+    #[test]
+    fn a_deploy_job_with_nothing_after_it_is_none_and_its_twin_is_not() {
+        let got = packets(PIPELINE);
+        assert_eq!(
+            deploy_sites(&got),
+            vec![("job:deploy".into(), "none".into(), "deploy".into())]
+        );
+        assert_eq!(
+            find(&got, "job:deploy", deploy_check::KEY).provenance[0].key_path,
+            "deploy.script[1] deploys: kubectl apply"
+        );
+        let later = format!("{PIPELINE}smoke:\n  stage: verify\n  script: ./smoke.sh\n");
+        assert_eq!(
+            deploy_sites(&packets(&later))[0].1,
+            "undecided: a check may follow the deploy: job smoke of a later stage (smoke)"
+        );
+        let after = PIPELINE.replace(
+            "    - kubectl apply -f k8s/\n",
+            "    - kubectl apply -f k8s/\n    - curl -f https://example.com/\n",
+        );
+        assert_eq!(
+            deploy_sites(&packets(&after))[0].1,
+            "undecided: a check may follow the deploy: a later script entry (curl)"
+        );
+    }
+
+    #[test]
+    fn an_earlier_stage_is_no_check_and_a_terraform_apply_is_its_own_class() {
+        let earlier = PIPELINE.replace(
+            "build:\n  stage: build\n  script: make",
+            "test:\n  stage: build\n  script: make test",
+        );
+        assert_eq!(deploy_sites(&packets(&earlier))[0].1, "none");
+        let tf = "apply:\n  stage: deploy\n  script:\n    - terraform init\n    - terraform apply -auto-approve\n";
+        assert_eq!(
+            deploy_sites(&packets(tf)),
+            vec![("job:apply".into(), "none".into(), "terraform".into())]
+        );
+    }
+
+    #[test]
+    fn non_production_and_merge_request_deploys_abstain() {
+        for (yaml, want) in [
+            (
+                PIPELINE.replace("environment: production", "environment:\n    name: review/$CI_COMMIT_REF_SLUG"),
+                "non-production job: review",
+            ),
+            (
+                format!("{PIPELINE}  rules:\n    - if: $CI_PIPELINE_SOURCE == \"merge_request_event\"\n"),
+                "deploys a merge request",
+            ),
+            (
+                format!("{PIPELINE}e2e:\n  stage: build\n  script: k3d cluster create ci\n"),
+                "test cluster or rehearsal in the pipeline: k3d",
+            ),
+        ] {
+            let got = deploy_sites(&packets(&yaml));
+            assert_eq!(
+                got.iter().find(|s| s.0 == "job:deploy").unwrap().1,
+                format!("undecided: {want}"),
+                "{yaml}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gitlab-examples");
+        let got = GitlabCi.retrieve_with_root(&root, ".gitlab-ci.yml", PIPELINE, "snap");
+        assert_eq!(
+            deploy_sites(&got)[0].1,
+            "undecided: non-production repository: examples"
+        );
     }
 
     #[test]
