@@ -666,6 +666,48 @@ pub(crate) fn retrieve(
     out
 }
 
+/// The kustomizations of `files` that another kustomization of `files`
+/// references through `resources`, `bases` or `components`: the bases. A
+/// base is not deployed as it stands; each overlay that references it
+/// renders it with its own patches, deletions and transformers, and that
+/// rendering is what deploys. So a base emits nothing itself, and its units
+/// are asked through each root that renders them, under that root's path:
+/// a base only non-production overlays reference emits nothing anywhere,
+/// at any depth. A kustomization nothing references is a root and emits.
+pub(crate) fn referenced_bases(files: &[(String, String)]) -> BTreeSet<String> {
+    let kustomizations: Vec<&(String, String)> = files
+        .iter()
+        .filter(|(rel, _)| {
+            matches!(
+                rel.rsplit('/').next(),
+                Some("kustomization.yaml" | "kustomization.yml")
+            )
+        })
+        .collect();
+    let mut by_dir: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (rel, _) in &kustomizations {
+        by_dir.entry(parent_dir(rel)).or_default().push(rel);
+    }
+    let mut bases = BTreeSet::new();
+    for (rel, contents) in kustomizations {
+        let dir = parent_dir(rel);
+        let Ok(Value::Mapping(kdoc)) = serde_yaml::from_str::<Value>(contents) else {
+            continue;
+        };
+        let targets = ["resources", "bases", "components"]
+            .into_iter()
+            .flat_map(|field| str_entries(&kdoc, field))
+            .filter_map(|entry| norm_join(dir, entry))
+            .filter(|target| target != dir);
+        for target in targets {
+            if let Some(referenced) = by_dir.get(target.as_str()) {
+                bases.extend(referenced.iter().map(|k| k.to_string()));
+            }
+        }
+    }
+    bases
+}
+
 /// Whether a same-directory kustomization references this manifest file (in
 /// which case the kustomization visit owns its facts). Bounded to the same
 /// directory: a kustomization elsewhere referencing the file directly leaves
@@ -1163,5 +1205,32 @@ spec:
         let got = autoscaled_base("1");
         let p = find(&got, "hpa:dispatch", "hpa.min-replicas");
         assert_eq!(p.resolved_value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn bases_are_the_kustomizations_another_one_references() {
+        let file = |rel: &str, contents: &str| (rel.to_string(), contents.to_string());
+        let files = [
+            file("k8s/base/kustomization.yaml", "resources:\n  - web.yaml\n"),
+            file("k8s/components/tls/kustomization.yml", "resources: []\n"),
+            file("k8s/legacy/kustomization.yaml", "resources: []\n"),
+            file(
+                "k8s/overlays/production/kustomization.yaml",
+                "resources:\n  - ../../base/\ncomponents:\n  - ../../components/tls\nbases:\n  - ../../legacy\n",
+            ),
+            file("k8s/root/kustomization.yaml", "resources:\n  - ./\n  - ../../../outside\n"),
+            file("k8s/base/web.yaml", "kind: Deployment\n"),
+        ];
+        assert_eq!(
+            referenced_bases(&files),
+            BTreeSet::from(
+                [
+                    "k8s/base/kustomization.yaml",
+                    "k8s/components/tls/kustomization.yml",
+                    "k8s/legacy/kustomization.yaml",
+                ]
+                .map(String::from)
+            )
+        );
     }
 }
