@@ -698,6 +698,17 @@ pub enum TierFilter {
     /// commercial store is never opened, so it contributes no specs, no
     /// judgments and no staleness or upgrade chatter.
     OssOnly,
+    /// The OSS tier alone because no API key is configured. Loads what
+    /// `OssOnly` loads: a commercial tier an earlier keyed install cached
+    /// stays on disk, unopened. A separate variant so the caller can say why.
+    NoKey,
+}
+
+impl TierFilter {
+    /// Whether this filter opens the commercial store.
+    pub fn loads_commercial(self) -> bool {
+        self == TierFilter::Both
+    }
 }
 
 /// Load the tiers `filter` allows, tolerating either store being absent or
@@ -713,9 +724,10 @@ pub fn load_tiered(
 ) -> TieredLoaded {
     TieredLoaded {
         oss: oss.load(keyset, today).ok(),
-        commercial: match filter {
-            TierFilter::Both => commercial.load(keyset, today).ok(),
-            TierFilter::OssOnly => None,
+        commercial: if filter.loads_commercial() {
+            commercial.load(keyset, today).ok()
+        } else {
+            None
         },
     }
 }
