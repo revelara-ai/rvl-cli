@@ -44,6 +44,7 @@ pub mod kubernetes;
 pub mod non_production;
 pub mod operators;
 pub mod prometheus;
+pub mod prometheus_repo;
 pub mod terraform;
 
 /// The canonical rendering of a decidable authored ABSENCE: a key the
@@ -514,6 +515,23 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     None
 }
 
+/// The lane's walk of `root`: every file the config lane may read, the
+/// gitignored and [`SKIP_DIRS`] trees left out (see [`retrieve_repo`]).
+pub(crate) fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .build()
+}
+
 /// Walk `root` for config files: run every matching [`registry`] retriever
 /// and record identity-only sightings for formats none of them support.
 pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
@@ -556,18 +574,7 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
     // scope; git_global(false) keeps output independent of whose machine ran
     // it. SKIP_DIRS stays as a belt-and-suspenders filter (vendor/.terraform
     // are not always gitignored). Mirrors rvl-content::scan_root (po-lqbh2).
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(false)
-        .parents(true)
-        .require_git(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref())
-        })
-        .build();
+    let walker = walk(root);
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
@@ -593,18 +600,14 @@ pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
         };
         // Content-identified formats (no canonical path) get a bounded
         // head consult before the file degrades to a sighting.
+        // They join the same per-format batch as path-claimed files.
         if needs_head {
-            if let Some(r) = retrievers.iter().find(|r| r.matches_head(&rel, &head)) {
+            if let Some(idx) = retrievers.iter().position(|r| r.matches_head(&rel, &head)) {
                 let Ok(contents) = std::fs::read_to_string(path) else {
                     out.unparseable_files += 1;
                     continue;
                 };
-                absorb(
-                    &mut out,
-                    &mut sightings,
-                    &mut declined,
-                    r.retrieve_with_root(root, &rel, &contents, snapshot_id),
-                );
+                claimed[idx].push((rel, contents));
                 continue;
             }
         }
@@ -666,7 +669,7 @@ fn read_head(path: &Path, cap: usize) -> String {
 
 /// The repo-relative, forward-slashed spelling of `file` under `root`
 /// (matches the code lane's spelling so waivers and reports line up).
-fn repo_relative(root: &Path, file: &Path) -> String {
+pub(crate) fn repo_relative(root: &Path, file: &Path) -> String {
     let rel = file.strip_prefix(root).unwrap_or(file);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())

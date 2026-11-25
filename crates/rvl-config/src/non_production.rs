@@ -158,6 +158,23 @@ pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "homelab",
 ];
 
+/// Tokens of a rule file's path, or of the scanned root's own name, that
+/// mark the rules as a pack another project wrote or a tool generated: a
+/// monitoring mixin, a vendored or upstream copy. Its gaps are the
+/// upstream's, not this repository's (frame cell C4). Matched with the same
+/// tokenizer as [`NON_PRODUCTION_TOKENS`]; asked by the Prometheus rule
+/// retriever only, where a blind check of flagged alert rules found
+/// vendored mixin packs among the wrong flags.
+pub const VENDORED_TOKENS: &[&str] = &[
+    "mixin",
+    "mixins",
+    "vendor",
+    "vendored",
+    "upstream",
+    "generated",
+    "thirdparty",
+];
+
 /// Directories whose documents are kustomize fragments: patches, and the
 /// components an overlay mixes in.
 const FRAGMENT_DIRS: &[&str] = &["patches", "components"];
@@ -223,11 +240,26 @@ pub const PLACEHOLDER_REASON: &str = "unexpanded placeholder in the resource nam
 /// `..`); a root with no name, such as `/` or the empty path a rootless
 /// retrieval passes, has no token.
 pub fn root_token(root: &Path) -> Option<&'static str> {
+    listed(&root_name(root)?, SAMPLE_REPOSITORY_TOKENS)
+}
+
+/// The last component of the scanned root, made absolute first when the
+/// path has none.
+fn root_name(root: &Path) -> Option<String> {
     let name = match root.file_name() {
         Some(name) => name.to_os_string(),
         None => root.canonicalize().ok()?.file_name()?.to_os_string(),
     };
-    listed(&name.to_string_lossy(), SAMPLE_REPOSITORY_TOKENS)
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// The [`VENDORED_TOKENS`] entry of `rel_path` (its directories, then its
+/// stem) or of the scanned root's name, if any.
+pub fn vendored_token(root: Option<&Path>, rel_path: &str) -> Option<&'static str> {
+    let (dir, stem) = dir_and_stem(rel_path);
+    listed(dir, VENDORED_TOKENS)
+        .or_else(|| listed(stem, VENDORED_TOKENS))
+        .or_else(|| listed(&root_name(root?)?, VENDORED_TOKENS))
 }
 
 /// Why the unit at `rel_path` is not deployed to production, or `None`
@@ -437,6 +469,38 @@ mod tests {
             "the path names its own token first"
         );
         assert_eq!(reason(None, "k8s/app.yaml"), None);
+    }
+
+    #[test]
+    fn a_vendored_or_generated_pack_is_named_by_its_path_or_root() {
+        for (root, path, token) in [
+            (
+                "/scans/platform",
+                "monitoring/mixins/kubernetes/alerts.yaml",
+                Some("mixins"),
+            ),
+            ("/scans/platform", "rules/node-mixin.yaml", Some("mixin")),
+            (
+                "/scans/platform",
+                "deploy/upstream/rules.yaml",
+                Some("upstream"),
+            ),
+            (
+                "/scans/platform",
+                "rules/generated_alerts.yml",
+                Some("generated"),
+            ),
+            ("/scans/thirdparty-rules", "rules.yaml", Some("thirdparty")),
+            ("/scans/platform", "deploy/prometheus/rules.yaml", None),
+            ("/scans/platform", "rules/mixing.yaml", None),
+        ] {
+            assert_eq!(
+                vendored_token(Some(Path::new(root)), path),
+                token,
+                "{root} {path}"
+            );
+        }
+        assert_eq!(vendored_token(None, "rules/alerts.yaml"), None);
     }
 
     #[test]

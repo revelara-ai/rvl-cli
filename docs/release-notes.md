@@ -9,6 +9,36 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A paging alert with no runbook is judged in rule resources too
+
+- Changed: the `prometheus-rules` keys (`rule.for`, `rule.labels.severity`,
+  `rule.annotations.runbook`, `rule.annotations.runbook.target`,
+  `rule.expr`, `group.interval`) are now read from the `spec.groups` of a
+  `PrometheusRule`, a VictoriaMetrics `VMRule`, and a Google Managed
+  Prometheus `Rules`, `ClusterRules` or `GlobalRules` resource, as well as
+  from plain rule files. Their key paths start with `spec.`. A file that
+  also holds an Argo CD, Flux or operator resource stays with that
+  retriever. Helm values and ConfigMap strings are not read for rules.
+- New: guard predicates for a `when` spec. Per alert rule:
+  `rule.labels.severity` (lower-cased; the `priority` label when
+  `severity` is absent; none for a templated label),
+  `rule.annotations.link_like` (`present` or `absent`), `rule.name_unique`
+  and `rule.kustomize_patched` (`true` or `false`). Per rule file:
+  `repo.alertmanager.mentions_runbook` (`true` or `false`) and
+  `repo.alertmanager.paging_receiver` (`yes`, `no` or `none_declared`).
+  The `rule.kustomize_patched` and `repo.` predicates need the scan root.
+  `rvl cache keys` lists them as vocabulary only.
+- Changed: a `rule.annotations.runbook` value that is empty or templated
+  is `undecided:` with a reason when the rule has a link-like annotation,
+  when an Alertmanager config or a `*.tmpl`, `*.tpl` or `*.gotmpl` file
+  mentions a runbook, when every receiver of the repository's Alertmanager
+  configs only posts to chat or email, when the group has another rule of
+  the same alert name, when a kustomize patch targets its
+  `PrometheusRule`, or when the value is templated. Every packet of a rule
+  file whose path or repository name has the token `mixin`, `mixins`,
+  `vendor`, `vendored`, `upstream`, `generated` or `thirdparty` is
+  `undecided:` too.
+
 ### The decision model runs the file its manifest serves
 
 - New: the model manifest's `served_file` names the bundle file the
