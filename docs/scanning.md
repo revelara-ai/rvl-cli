@@ -59,7 +59,7 @@ rvl sync          # pull the free OSS ruleset - no API key needed
 rvl scan          # deterministic scan of the current directory
 ```
 
-`rvl sync` with no credentials installs the OSS vocabulary tier and says so:
+`rvl sync` with no credentials installs the OSS tier and says so:
 
 ```
 oss tier: installed spec cache 2026-08-17.1
@@ -83,19 +83,30 @@ below.
 
 ### What the free tier contains
 
-The OSS artifact carries the vocabulary rulesets: server entry patterns,
-emission patterns (logging, tracing, error handling), and configuration
-knowledge for the config/IaC lane (Kubernetes, Terraform, GitHub Actions,
-GitLab CI, Prometheus rules, Argo/Flux, dependency manifests). These are
-enumerable facts about ecosystems.
+The free tier is the open spec tier: the rules and frames the scanner runs
+on, everything except the decision model and private data. `rvl sync` installs
+it with no API key. It carries:
 
-It does not contain the judgment rulesets: the per-API verdicts about
-blocking behavior, boundedness, and severity that grade API-surface
-findings. Those are commercial-only. In practice the free tier finds and
-names reliability-relevant surfaces in your code and configuration, and the
-commercial tier additionally judges the API surfaces, which is what lets
-those findings gate a commit. Lanes that carry their own severity still
-gate on the free tier; secret detection is the main one.
+- server entry patterns and emission patterns (logging, tracing, error
+  handling);
+- config keys, each with its expectation, the control it maps to, and its
+  severity, for the config/IaC lane (Kubernetes, Terraform, GitHub Actions,
+  GitLab CI, Prometheus rules, Argo/Flux, dependency manifests);
+- config frames and conformance frames;
+- the mappings from each control to its causal factors.
+
+An API key adds the commercial tier, which holds two things:
+
+- the per-API verdict corpus: the APIs, their configs, and the judgments
+  about blocking behavior, boundedness, and severity that grade API-surface
+  findings;
+- the decision model.
+
+In practice the free tier finds and names reliability-relevant surfaces in
+your code and configuration, and the commercial tier additionally judges the
+API surfaces, which is what lets those findings gate a commit. Lanes that
+carry their own severity still gate on the free tier; secret detection is the
+main one.
 
 The free ruleset is licensed
 [CDLA-Permissive-2.0](https://cdla.dev/permissive-2-0/), embedded in the
@@ -152,8 +163,8 @@ rvl report --oss-only
 ```
 
 The flag skips the commercial tier and the decision model at load time, so
-the scan behaves exactly like a no-key install: vocabulary lanes only, no
-judgments, and every finding advisory except lanes that carry their own
+the scan behaves exactly like a no-key install: the open rules and frames
+only, no per-API judgments, and every finding advisory except lanes that carry their own
 severity (secret detection). Use
 it to demo the free tier, to compare the two tiers on the same repo, or to
 check the free experience before you publish.
