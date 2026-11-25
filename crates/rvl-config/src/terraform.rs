@@ -1001,6 +1001,14 @@ fn get_blocks<'a>(body: &'a [Item], kind: &str) -> impl Iterator<Item = &'a Bloc
     })
 }
 
+/// Whether the body sets `name` as an attribute or a block (a literal or a
+/// `dynamic` one): `restore_to_point_in_time` is a block, the rest attributes.
+fn has_attr_or_block(body: &[Item], name: &str) -> bool {
+    get_attr(body, name).is_some()
+        || get_blocks(body, name).next().is_some()
+        || get_blocks(body, "dynamic").any(|d| d.labels.first().is_some_and(|l| l == name))
+}
+
 /// One provider's constraint fact and where it came from.
 struct ProviderFact {
     file: String,
@@ -1021,9 +1029,10 @@ struct ResourceAttr {
     attr: &'static str,
     absent: Absent,
     shape: Shape,
-    /// An attribute whose presence means this fact does not describe the
-    /// resource, so no packet is emitted.
-    unless_attr: Option<&'static str>,
+    /// Attributes whose presence means the documented default does not hold:
+    /// when `attr` is absent and any of these is set, no packet is emitted.
+    /// An authored `attr` is still emitted.
+    unless_attrs: &'static [&'static str],
 }
 
 /// What an absent attribute means.
@@ -1049,8 +1058,11 @@ enum Shape {
 
 const RESOURCE_ATTRS: &[ResourceAttr] = &[
     // RC-030 / RC-054: 0 disables automated backups, and with them
-    // point-in-time recovery. A read replica is excluded: its source carries
-    // the backup posture, and the documented 0 would flag every replica.
+    // point-in-time recovery. The provider sends an absent attribute as 0 on
+    // a plain create only. A read replica (of an instance or a cluster) takes
+    // its backup posture from the source, and on a restore from a snapshot or
+    // a point in time the provider sends no retention, so the service
+    // decides: there the documented 0 does not hold.
     ResourceAttr {
         resource_type: "aws_db_instance",
         packet_key: "resource.aws_db_instance.backup_retention_period",
@@ -1058,7 +1070,12 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "backup_retention_period",
         absent: Absent::Default("0"),
         shape: Shape::AsWritten,
-        unless_attr: Some("replicate_source_db"),
+        unless_attrs: &[
+            "replicate_source_db",
+            "replicate_source_db_cluster",
+            "snapshot_identifier",
+            "restore_to_point_in_time",
+        ],
     },
     ResourceAttr {
         resource_type: "aws_rds_cluster",
@@ -1067,7 +1084,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "backup_retention_period",
         absent: Absent::Default("1"),
         shape: Shape::AsWritten,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     ResourceAttr {
         resource_type: "google_sql_database_instance",
@@ -1076,7 +1093,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "enabled",
         absent: Absent::Default("false"),
         shape: Shape::AsWritten,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     ResourceAttr {
         resource_type: "google_sql_database_instance",
@@ -1085,7 +1102,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "point_in_time_recovery_enabled",
         absent: Absent::Default("false"),
         shape: Shape::AsWritten,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     // RC-017: a single-AZ instance has no standby in another zone.
     ResourceAttr {
@@ -1095,7 +1112,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "multi_az",
         absent: Absent::Default("false"),
         shape: Shape::AsWritten,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     // RC-017: ZONAL has no failover replica in a second zone.
     ResourceAttr {
@@ -1105,7 +1122,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "availability_type",
         absent: Absent::Default("ZONAL"),
         shape: Shape::AsWritten,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     // RC-017: a zone location is a zonal cluster (one control-plane zone); a
     // region location is a regional one. An absent location falls back to
@@ -1117,7 +1134,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "location",
         absent: Absent::Elsewhere("provider-setting"),
         shape: Shape::Location,
-        unless_attr: None,
+        unless_attrs: &[],
     },
     // RC-017: how many zones the pool's nodes spread over. An absent list
     // inherits the cluster's zones, which the pool body does not name.
@@ -1128,7 +1145,7 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "node_locations",
         absent: Absent::Elsewhere("inherited"),
         shape: Shape::ListCount,
-        unless_attr: None,
+        unless_attrs: &[],
     },
 ];
 
@@ -2220,9 +2237,12 @@ fn retrieve_dir(
             let replica = ty == "google_sql_database_instance"
                 && get_attr(&b.body, "master_instance_name").is_some();
             for row in RESOURCE_ATTRS.iter().filter(|r| r.resource_type == ty) {
-                if row
-                    .unless_attr
-                    .is_some_and(|a| get_attr(&b.body, a).is_some())
+                let found = lookup_attr(&b.body, row.blocks, row.attr);
+                if matches!(found, AttrLookup::Absent)
+                    && row
+                        .unless_attrs
+                        .iter()
+                        .any(|a| has_attr_or_block(&b.body, a))
                 {
                     continue;
                 }
@@ -2231,7 +2251,6 @@ fn retrieve_dir(
                     .chain(std::iter::once(row.attr.to_string()))
                     .collect::<Vec<_>>()
                     .join(".");
-                let found = lookup_attr(&b.body, row.blocks, row.attr);
                 let (value, resolution, prov) = resolve_row(row, rel, &key_path, found, &vars);
                 let mut p = packet(rel, &unit, row.packet_key, value, resolution, prov);
                 if replica && REPLICA_UNDECIDED.contains(&row.packet_key) {
@@ -2615,6 +2634,46 @@ module "local" {
             "{:#?}",
             got.packets
         );
+    }
+
+    #[test]
+    fn a_cluster_replica_or_a_restore_emits_no_default_backup_retention() {
+        // The provider sends an absent retention as 0 only on a plain create:
+        // a cluster replica takes no retention, and a restore from a snapshot
+        // or a point in time leaves it to the service.
+        let key = "resource.aws_db_instance.backup_retention_period";
+        for marker in [
+            "replicate_source_db = aws_db_instance.main.identifier\n",
+            "replicate_source_db_cluster = aws_rds_cluster.main.arn\n",
+            "snapshot_identifier = \"final-snap\"\n",
+            "restore_to_point_in_time {\n    use_latest_restorable_time = true\n  }\n",
+        ] {
+            let got = one(&[(
+                "db.tf",
+                &format!("resource \"aws_db_instance\" \"db\" {{\n  {marker}}}\n"),
+            )]);
+            assert!(
+                !got.packets.iter().any(|p| p.key == key),
+                "{marker}: {:#?}",
+                got.packets
+            );
+            // An authored value is still a fact on every path.
+            let got = one(&[(
+                "db.tf",
+                &format!(
+                    "resource \"aws_db_instance\" \"db\" {{\n  {marker}  backup_retention_period = 0\n}}\n"
+                ),
+            )]);
+            let p = find(&got, "resource:aws_db_instance.db", key);
+            assert_eq!(p.resolved_value.as_deref(), Some("0"), "{marker}");
+            assert_ne!(p.resolution, Resolution::PlatformDefault, "{marker}");
+        }
+        // A plain instance still gets the documented 0.
+        let got = one(&[("db.tf", "resource \"aws_db_instance\" \"db\" {}\n")]);
+        let p = find(&got, "resource:aws_db_instance.db", key);
+        assert_eq!(p.resolved_value.as_deref(), Some("0"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+        assert_eq!(p.provenance.last().unwrap().role, "platform-default");
     }
 
     #[test]
