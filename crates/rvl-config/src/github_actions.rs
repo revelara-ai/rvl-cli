@@ -27,6 +27,10 @@
 //!     call), so a guard on it abstains rather than closing on a guess.
 //!   * `workflow.publishes_image` — any job does; withheld if any is unknown.
 //!
+//! A unit that hands a static cloud key from `secrets` to its tools gets
+//! `credential.static-cloud-key` (RC-072): the provider, or `undecided:`
+//! and why (see `static_key`).
+//!
 //! A job that publishes also gets `job.release_supply_chain`: which RC-079
 //! rule the file proves about its SBOM, provenance and pins (see `release`).
 //!
@@ -40,6 +44,7 @@ use crate::{
 use serde_yaml::Value;
 
 mod release;
+mod static_key;
 
 pub struct GithubActions;
 
@@ -73,6 +78,23 @@ impl ConfigRetriever for GithubActions {
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
         retrieve(rel_path, contents, snapshot_id)
+    }
+
+    /// The scanned root's name says whether the repository is sample
+    /// material, which the static cloud key fact abstains on.
+    fn retrieve_with_root(
+        &self,
+        root: &std::path::Path,
+        rel_path: &str,
+        contents: &str,
+        snapshot_id: &str,
+    ) -> Retrieved {
+        retrieve_in(
+            crate::non_production::root_token(root),
+            rel_path,
+            contents,
+            snapshot_id,
+        )
     }
 }
 
@@ -143,6 +165,16 @@ fn step_publishes_image(step: &serde_yaml::Mapping) -> bool {
 }
 
 fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+    retrieve_in(None, rel_path, contents, snapshot_id)
+}
+
+/// Retrieve one file; `repo` is the scanned root's sample token, if any.
+fn retrieve_in(
+    repo: Option<&'static str>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
     let mut out = Retrieved::default();
     let Ok(doc) = serde_yaml::from_str::<Value>(contents) else {
         out.unparseable = 1;
@@ -251,6 +283,34 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                 ProvenanceStep::new("", "concurrency", "platform-default"),
             ],
         )),
+    }
+
+    // credential.static-cloud-key: the provider of a static key the unit
+    // reads from `secrets`, emitted only where there is one.
+    let stem = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
+    let static_key_packet = |unit: &str, at: &str, k: &static_key::StaticKey, job_id| {
+        let cx = static_key::Context {
+            repo,
+            stem,
+            job_id,
+            contents,
+        };
+        packet(
+            unit,
+            "credential.static-cloud-key",
+            Some(static_key::value(k, &cx)),
+            Resolution::AsAuthored,
+            vec![ProvenanceStep::new(
+                rel_path,
+                &format!("{at}.{} = secrets.{}", k.key, k.secret),
+                "explicit",
+            )],
+        )
+    };
+    if let Some(k) = static_key::in_env(root) {
+        out.packets
+            .push(static_key_packet("workflow", "env", &k, None));
     }
 
     for (job_key, job_val) in jobs {
@@ -407,8 +467,23 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             }
         }
 
-        // step.uses.ref: the version reference of each external action.
+        if let Some(k) = static_key::in_env(job) {
+            out.packets
+                .push(static_key_packet(&unit, &jpath("env"), &k, Some(job_id)));
+        }
         let steps = get(job, "steps").and_then(Value::as_sequence);
+        for (idx, step) in steps.into_iter().flatten().enumerate() {
+            if let Some((k, field)) = step.as_mapping().and_then(static_key::in_step) {
+                out.packets.push(static_key_packet(
+                    &format!("step:{job_id}/{idx}"),
+                    &jpath(&format!("steps[{idx}].{field}")),
+                    &k,
+                    Some(job_id),
+                ));
+            }
+        }
+
+        // step.uses.ref: the version reference of each external action.
         for (idx, step) in steps.into_iter().flatten().enumerate() {
             let Some(step) = step.as_mapping() else {
                 continue;
@@ -525,6 +600,176 @@ mod tests {
         );
         assert!(got.packets.iter().any(|p| p.key == "step.uses.ref"));
         assert!(got.packets.iter().all(|p| p.key != "job.uses.ref"));
+    }
+
+    /// `credential.static-cloud-key` per unit of one workflow file.
+    fn static_keys(path: &str, yaml: &str) -> Vec<(String, String)> {
+        retrieve(path, yaml, "s")
+            .packets
+            .into_iter()
+            .filter(|p| p.key == "credential.static-cloud-key")
+            .map(|p| (p.unit, p.resolved_value.unwrap_or_default()))
+            .collect()
+    }
+
+    fn one_step(with: &str) -> String {
+        format!("on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n{with}")
+    }
+
+    #[test]
+    fn a_static_cloud_key_from_secrets_is_flagged_per_provider() {
+        let wf = ".github/workflows/deploy.yml";
+        for (step, provider) in [
+            (
+                "      - uses: aws-actions/configure-aws-credentials@v4\n        with:\n          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}\n          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}\n          aws-region: us-east-1\n",
+                "aws",
+            ),
+            (
+                "      - uses: google-github-actions/auth@v2\n        with:\n          credentials_json: ${{ secrets.GCP_SA_KEY }}\n",
+                "gcp",
+            ),
+            (
+                "      - uses: azure/login@v2\n        with:\n          creds: ${{ secrets.AZURE_CREDENTIALS }}\n",
+                "azure",
+            ),
+            (
+                "      - run: terraform apply\n        env:\n          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}\n",
+                "azure",
+            ),
+        ] {
+            assert_eq!(
+                static_keys(wf, &one_step(step)),
+                vec![("step:deploy/0".to_string(), provider.to_string())],
+                "{step}"
+            );
+        }
+    }
+
+    // The twins: a federated login, a key that is not from `secrets`, and a
+    // `creds` input of an action other than azure/login (a GitHub App's).
+    #[test]
+    fn federated_logins_and_other_credentials_carry_no_static_cloud_key() {
+        let wf = ".github/workflows/deploy.yml";
+        for step in [
+            "      - uses: aws-actions/configure-aws-credentials@v4\n        with:\n          role-to-assume: arn:aws:iam::123456789012:role/example\n          aws-region: us-east-1\n",
+            "      - uses: google-github-actions/auth@v2\n        with:\n          workload_identity_provider: ${{ vars.WIF_PROVIDER }}\n          service_account: example@example.iam.gserviceaccount.com\n",
+            "      - uses: azure/login@v2\n        with:\n          client-id: ${{ secrets.AZURE_CLIENT_ID }}\n          tenant-id: ${{ secrets.AZURE_TENANT_ID }}\n",
+            "      - uses: some-org/deploy-pages@v1\n        with:\n          creds: ${{ secrets.GH_APP_CREDS }}\n",
+            "      - run: aws s3 ls\n        env:\n          AWS_ACCESS_KEY_ID: example\n          AWS_SECRET_ACCESS_KEY: ${{ vars.EXAMPLE }}\n",
+        ] {
+            assert_eq!(static_keys(wf, &one_step(step)), vec![], "{step}");
+        }
+    }
+
+    #[test]
+    fn job_and_workflow_env_keys_are_their_own_units() {
+        let got = static_keys(
+            ".github/workflows/release.yml",
+            "on: push\nenv:\n  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}\njobs:\n  publish:\n    env:\n      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}\n    steps:\n      - run: make publish\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("workflow".to_string(), "gcp".to_string()),
+                ("job:publish".to_string(), "aws".to_string()),
+            ]
+        );
+        let p = retrieve(
+            ".github/workflows/release.yml",
+            "on: push\njobs:\n  publish:\n    env:\n      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}\n",
+            "s",
+        )
+        .packets
+        .into_iter()
+        .find(|p| p.key == "credential.static-cloud-key")
+        .unwrap();
+        assert_eq!(
+            p.provenance[0].key_path,
+            "jobs.publish.env.AWS_ACCESS_KEY_ID = secrets.AWS_ACCESS_KEY_ID",
+            "the provenance names the secret, never a value"
+        );
+    }
+
+    #[test]
+    fn a_static_cloud_key_abstains_where_the_frame_says_it_may() {
+        let undecided = |path: &str, yaml: &str| {
+            let got = static_keys(path, yaml);
+            assert_eq!(got.len(), 1, "{path}: {got:?}");
+            got[0]
+                .1
+                .strip_prefix(crate::UNDECIDED_PREFIX)
+                .map(str::to_string)
+        };
+        let aws = |secret: &str, extra: &str| {
+            one_step(&format!(
+                "      - run: aws s3 sync . s3://example\n        env:\n          AWS_ACCESS_KEY_ID: ${{{{ secrets.{secret} }}}}\n{extra}"
+            ))
+        };
+        let wf = ".github/workflows/deploy.yml";
+        assert_eq!(undecided(wf, &aws("AWS_ACCESS_KEY_ID", "")), None);
+        assert_eq!(
+            undecided(
+                wf,
+                &aws(
+                    "AWS_ACCESS_KEY_ID",
+                    "          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}\n"
+                )
+            )
+            .as_deref(),
+            Some("a federation or session input is beside the key")
+        );
+        assert_eq!(
+            undecided(wf, &aws("R2_ACCESS_KEY_ID", "")).as_deref(),
+            Some("S3-compatible third party: R2")
+        );
+        assert_eq!(
+            undecided(
+                wf,
+                &aws(
+                    "AWS_ACCESS_KEY_ID",
+                    "          AWS_ENDPOINT_URL: https://example.r2.cloudflarestorage.com\n"
+                )
+            )
+            .as_deref(),
+            Some("S3-compatible third party: ENDPOINT")
+        );
+        assert_eq!(
+            undecided(
+                ".github/workflows/deploy-backend-dev.yml",
+                &aws("AWS_ACCESS_KEY_ID", "")
+            )
+            .as_deref(),
+            Some("non-production workflow: dev")
+        );
+        assert_eq!(
+            undecided(
+                ".github/workflows/ci-deploy.yml",
+                &aws("AWS_ACCESS_KEY_ID", "")
+            ),
+            None,
+            "a ci workflow deploys"
+        );
+        assert_eq!(
+            undecided(
+                wf,
+                &aws("AWS_ACCESS_KEY_ID", "").replace("  deploy:", "  e2e_tests:")
+            )
+            .as_deref(),
+            Some("non-production job: e2e")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cloud-samples");
+        let got = GithubActions.retrieve_with_root(&root, wf, &aws("AWS_ACCESS_KEY_ID", ""), "s");
+        let p = got
+            .packets
+            .iter()
+            .find(|p| p.key == "credential.static-cloud-key")
+            .unwrap();
+        assert_eq!(
+            p.resolved_value.as_deref(),
+            Some("undecided: non-production repository: samples")
+        );
     }
 
     #[test]

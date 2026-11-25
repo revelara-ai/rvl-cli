@@ -123,6 +123,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("flux", "kustomization.timeout"),
     judged("flux", "kustomization.wait"),
     judged("gatekeeper", "constraint.enforcementAction"),
+    judged("github-actions", "credential.static-cloud-key"),
     judged("github-actions", "job.continue-on-error"),
     judged("github-actions", "job.permissions"),
     vocabulary_only(
@@ -182,11 +183,36 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "workload.strategy.type"),
     judged("kyverno", "rule.validate.failureAction"),
     judged("prometheus-rules", "group.interval"),
+    vocabulary_only(
+        "prometheus-rules",
+        "repo.alertmanager.mentions_runbook",
+        "a guard predicate: an Alertmanager config or notification template of the repository mentions a runbook",
+    ),
+    vocabulary_only(
+        "prometheus-rules",
+        "repo.alertmanager.paging_receiver",
+        "a guard predicate: whether the repository's receivers can page (yes, no, none_declared)",
+    ),
+    vocabulary_only(
+        "prometheus-rules",
+        "rule.annotations.link_like",
+        "a guard predicate: an annotation of the rule names or holds a link",
+    ),
     judged("prometheus-rules", "rule.annotations.runbook"),
     judged("prometheus-rules", "rule.annotations.runbook.target"),
     judged("prometheus-rules", "rule.expr"),
     judged("prometheus-rules", "rule.for"),
+    vocabulary_only(
+        "prometheus-rules",
+        "rule.kustomize_patched",
+        "a guard predicate: a kustomize patch targets the PrometheusRule the rule is in",
+    ),
     judged("prometheus-rules", "rule.labels.severity"),
+    vocabulary_only(
+        "prometheus-rules",
+        "rule.name_unique",
+        "a guard predicate: false when another rule of the group has the same alert name",
+    ),
     judged("prometheus-rules", "slo.alerting.page_alert"),
     judged("prometheus-rules", "slo.alerting.ticket_alert"),
     judged("prometheus-rules", "slo.objective"),
@@ -211,6 +237,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("terraform", "resource.aws_db_instance.multi_az"),
     judged("terraform", "resource.aws_iam.statement-wildcard"),
     judged("terraform", "resource.aws_iam_access_key.declared"),
+    judged("terraform", "resource.aws_iam_access_key.static-credential"),
     judged(
         "terraform",
         "resource.aws_rds_cluster.backup_retention_period",
@@ -229,6 +256,10 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     ),
     judged("terraform", "resource.google_iam.role-class"),
     judged("terraform", "resource.google_service_account_key.declared"),
+    judged(
+        "terraform",
+        "resource.google_service_account_key.static-credential",
+    ),
     judged(
         "terraform",
         "resource.google_sql_database_instance.backup_configuration.enabled",
@@ -561,9 +592,9 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        // Three terraform raw-identity keys, three guard predicates, and the
+        // Three terraform raw-identity keys, eight guard predicates, and the
         // liveness probe path.
-        assert_eq!(q.vocabulary_only, 7);
+        assert_eq!(q.vocabulary_only, 12);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(

@@ -737,19 +737,24 @@ fn tier_filter_both_layers_the_commercial_tier_over_oss() {
 fn tier_filter_oss_only_behaves_like_a_no_key_install() {
     let k = keys();
     let (_d, commercial, oss) = keyed_install(&k);
-    let t = load_tiered(
-        &commercial,
-        &oss,
-        &k.keyset,
-        "2026-07-30",
-        TierFilter::OssOnly,
-    );
-    assert!(t.oss.is_some());
-    assert!(t.commercial.is_none(), "the commercial tier must not load");
-    assert!(t.judgments().is_none(), "no judgments: everything advisory");
-    let (base, overlay) = t.spec_texts().unwrap().unwrap();
-    assert!(base.contains("oss-vocabulary"));
-    assert!(overlay.is_none(), "no commercial overlay to merge");
+    for filter in [TierFilter::OssOnly, TierFilter::NoKey] {
+        let t = load_tiered(&commercial, &oss, &k.keyset, "2026-07-30", filter);
+        assert!(t.oss.is_some(), "{filter:?}");
+        assert!(
+            t.commercial.is_none(),
+            "{filter:?}: the commercial tier must not load"
+        );
+        assert!(
+            t.judgments().is_none(),
+            "{filter:?}: no judgments, all advisory"
+        );
+        let (base, overlay) = t.spec_texts().unwrap().unwrap();
+        assert!(base.contains("oss-vocabulary"));
+        assert!(
+            overlay.is_none(),
+            "{filter:?}: no commercial overlay to merge"
+        );
+    }
 }
 
 #[test]
@@ -759,13 +764,9 @@ fn tier_filter_oss_only_never_falls_back_to_the_commercial_tier() {
     let oss = commercial.subdir_store(OSS_DIR).unwrap();
     let com_bytes = envelope_with_judgments("2026-07-30.1", "blocking");
     commercial.install(&com_bytes, &sign_b64(&k, &com_bytes), &k.keyset);
-    let t = load_tiered(
-        &commercial,
-        &oss,
-        &k.keyset,
-        "2026-07-30",
-        TierFilter::OssOnly,
-    );
-    assert!(!t.any());
-    assert!(t.spec_texts().unwrap().is_none());
+    for filter in [TierFilter::OssOnly, TierFilter::NoKey] {
+        let t = load_tiered(&commercial, &oss, &k.keyset, "2026-07-30", filter);
+        assert!(!t.any(), "{filter:?}");
+        assert!(t.spec_texts().unwrap().is_none(), "{filter:?}");
+    }
 }

@@ -48,7 +48,11 @@ use std::path::Path;
 /// under a local cluster bootstrap (`.bootstrap/`, a `localstack` emulator),
 /// a `single-node` dev setup, `archive/` trees, mock servers (`wiremock/`),
 /// load generators (`stress-cpu.yaml`), and preview, canary, staging,
-/// proof-of-concept and prototype environments. The test is on path tokens
+/// proof-of-concept and prototype environments. A third check found
+/// performance-test tooling (`perf/dashboards/`): `perf`, `benchmark` and
+/// `loadtest` trees hold what a load run deploys. `performance` is not
+/// listed: a service named for it (`performance-api`) deploys, while the
+/// short and test-shaped names do not. The test is on path tokens
 /// only: a rollout strategy named `canary` in a document is a key, not a
 /// path, and stays a fact.
 pub const NON_PRODUCTION_TOKENS: &[&str] = &[
@@ -112,6 +116,11 @@ pub const NON_PRODUCTION_TOKENS: &[&str] = &[
     "canary",
     "staging",
     "stage",
+    "perf",
+    "benchmark",
+    "benchmarks",
+    "loadtest",
+    "load-test",
 ];
 
 /// Path tokens that mark an Argo CD Application or ApplicationSet, a Flux
@@ -163,7 +172,9 @@ pub const GITHUB_DIR: &str = ".github";
 /// repository as sample or teaching material, so every unit in it is
 /// non-production: the same check found every flag in repositories named
 /// for training, cheatsheets, blog code, docs examples and samples not
-/// applicable, wherever in the tree the unit sat.
+/// applicable, wherever in the tree the unit sat, and the next check every
+/// flag in a lab repository (`aks-landing-zone-lab`): a lab or homelab
+/// repository is an exercise, not a production estate.
 pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "samples",
     "sample",
@@ -181,6 +192,111 @@ pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "demos",
     "learning",
     "playground",
+    "lab",
+    "labs",
+    "homelab",
+    "talks",
+    "codelab",
+    "codelabs",
+];
+
+/// Tokens of a workflow file's stem or a job id that mark a GitHub Actions
+/// unit as reaching a non-production environment (frame cell C5), for the
+/// static cloud key fact (RC-072). Narrower than [`NON_PRODUCTION_TOKENS`]:
+/// every workflow sits under `.github/`, and a `ci-*.yaml` workflow that
+/// holds a cloud key was judged a violation, so `ci` is not listed, nor are
+/// `staging` and `canary`, which deploy.
+pub const NON_PRODUCTION_WORKFLOW_TOKENS: &[&str] = &[
+    "dev",
+    "development",
+    "test",
+    "tests",
+    "testing",
+    "e2e",
+    "sandbox",
+    "demo",
+    "preview",
+    "playground",
+    "local",
+];
+
+/// Upper-case substrings of a secret's name that mark an AWS-shaped key as
+/// one for an S3-compatible third party (Cloudflare R2, DigitalOcean
+/// Spaces, MinIO, Backblaze B2 and the like), which no cloud federation
+/// replaces (frame cell C6).
+pub const S3_COMPATIBLE_SECRET_TOKENS: &[&str] = &[
+    "R2",
+    "CLOUDFLARE",
+    "CF_",
+    "SPACES",
+    "DIGITALOCEAN",
+    "DO_",
+    "MINIO",
+    "B2_",
+    "BACKBLAZE",
+    "WASABI",
+    "SCALEWAY",
+    "SCW",
+    "OSS",
+    "ALIYUN",
+    "LINODE",
+    "HETZNER",
+    "TIGRIS",
+    "STORJ",
+    "GARAGE",
+    "CEPH",
+    "OVH",
+    "YANDEX",
+    "IDRIVE",
+    "SUPABASE",
+];
+
+/// Text in a workflow file that points its AWS-shaped keys at an
+/// S3-compatible endpoint: an endpoint input or variable, or one of those
+/// providers' host names. Matched case-sensitively, as written.
+pub const S3_COMPATIBLE_FILE_MARKERS: &[&str] = &[
+    "endpoint-url",
+    "endpoint_url",
+    "ENDPOINT",
+    "r2.cloudflarestorage.com",
+    "digitaloceanspaces.com",
+    "backblazeb2.com",
+    "wasabisys.com",
+    "scw.cloud",
+    "aliyuncs.com",
+    "linodeobjects.com",
+    "your-objectstorage.com",
+    "storage.dev",
+    "tigris.dev",
+    "storjshare.io",
+    "cloud.ovh.net",
+    "yandexcloud.net",
+    "idrivee2",
+    "supabase.co",
+];
+
+/// Directory tokens under which a Terraform static credential is not one a
+/// deployment holds: a retired tree, or library and asset code another
+/// module embeds. Asked of the static credential fact (RC-072) only, on top
+/// of [`path_token`] (which already holds `archive` and `archived`): `pkg`
+/// and `internal` hold deployed code in general.
+pub const STATIC_CREDENTIAL_DIR_TOKENS: &[&str] = &["deprecated", "pkg", "internal", "assets"];
+
+/// Tokens of a rule file's path, or of the scanned root's own name, that
+/// mark the rules as a pack another project wrote or a tool generated: a
+/// monitoring mixin, a vendored or upstream copy. Its gaps are the
+/// upstream's, not this repository's (frame cell C4). Matched with the same
+/// tokenizer as [`NON_PRODUCTION_TOKENS`]; asked by the Prometheus rule
+/// retriever only, where a blind check of flagged alert rules found
+/// vendored mixin packs among the wrong flags.
+pub const VENDORED_TOKENS: &[&str] = &[
+    "mixin",
+    "mixins",
+    "vendor",
+    "vendored",
+    "upstream",
+    "generated",
+    "thirdparty",
 ];
 
 /// Directories whose documents are kustomize fragments: patches, and the
@@ -209,6 +325,35 @@ fn listed(s: &str, list: &[&'static str]) -> Option<&'static str> {
                 .find(|w| *w == t || pair.as_deref() == Some(*w))
         })
     })
+}
+
+/// The [`NON_PRODUCTION_WORKFLOW_TOKENS`] token of a workflow file stem or
+/// a job id, if any.
+pub fn workflow_token(name: &str) -> Option<&'static str> {
+    listed(name, NON_PRODUCTION_WORKFLOW_TOKENS)
+}
+
+/// The [`S3_COMPATIBLE_SECRET_TOKENS`] token a secret's name holds, if any.
+pub fn s3_compatible_secret(name: &str) -> Option<&'static str> {
+    let upper = name.to_uppercase();
+    S3_COMPATIBLE_SECRET_TOKENS
+        .iter()
+        .copied()
+        .find(|t| upper.contains(t))
+}
+
+/// The [`S3_COMPATIBLE_FILE_MARKERS`] entry a file's text holds, if any.
+pub fn s3_compatible_file(contents: &str) -> Option<&'static str> {
+    S3_COMPATIBLE_FILE_MARKERS
+        .iter()
+        .copied()
+        .find(|m| contents.contains(m))
+}
+
+/// The [`STATIC_CREDENTIAL_DIR_TOKENS`] token of `rel_path`'s directory, if
+/// any.
+pub fn static_credential_dir_token(rel_path: &str) -> Option<&'static str> {
+    listed(dir_and_stem(rel_path).0, STATIC_CREDENTIAL_DIR_TOKENS)
 }
 
 /// A repo-relative path split into its directory and its file stem (the
@@ -273,13 +418,23 @@ pub fn gitops_root_token(root: &Path) -> Option<&'static str> {
     root_token(root).or_else(|| listed(&root_name(root)?, GITOPS_SAMPLE_REPOSITORY_TOKENS))
 }
 
-/// The scanned root's own directory name, as [`root_token`] reads it.
+/// The last component of the scanned root, made absolute first when the
+/// path has none.
 fn root_name(root: &Path) -> Option<String> {
     let name = match root.file_name() {
         Some(name) => name.to_os_string(),
         None => root.canonicalize().ok()?.file_name()?.to_os_string(),
     };
     Some(name.to_string_lossy().into_owned())
+}
+
+/// The [`VENDORED_TOKENS`] entry of `rel_path` (its directories, then its
+/// stem) or of the scanned root's name, if any.
+pub fn vendored_token(root: Option<&Path>, rel_path: &str) -> Option<&'static str> {
+    let (dir, stem) = dir_and_stem(rel_path);
+    listed(dir, VENDORED_TOKENS)
+        .or_else(|| listed(stem, VENDORED_TOKENS))
+        .or_else(|| listed(&root_name(root?)?, VENDORED_TOKENS))
 }
 
 /// Why the unit at `rel_path` is not deployed to production, or `None`
@@ -420,6 +575,12 @@ mod tests {
             ("envs/stage/main.tf", "stage"),
             ("deploy/preview/api.yaml", "preview"),
             ("prototype/api.yaml", "prototype"),
+            ("perf/dashboards/exporters/redis_exporter.yaml", "perf"),
+            ("benchmarks/api.yaml", "benchmarks"),
+            ("deploy/benchmark-runner.yaml", "benchmark"),
+            ("k8s/loadtest/locust.yaml", "loadtest"),
+            ("k8s/load-test/locust.yaml", "load-test"),
+            ("k8s/load_test/locust.yaml", "load-test"),
         ] {
             assert_eq!(path_token(path), Some(token), "{path}");
         }
@@ -440,6 +601,9 @@ mod tests {
             "github/k8s/app.yaml",
             "k8s/rollouts/api.yaml",
             "deploy.yaml",
+            "deploy/performance-api.yaml",
+            "k8s/load/balancer.yaml",
+            "superf/api.yaml",
         ] {
             assert_eq!(path_token(path), None, "{path}");
         }
@@ -485,11 +649,11 @@ mod tests {
 
         assert_eq!(
             gitops_root_token(Path::new("/scans/homelab-labs")),
-            Some("labs")
+            Some("homelab")
         );
         assert_eq!(gitops_root_token(Path::new("/scans/k8s-lab")), Some("lab"));
         assert_eq!(gitops_root_token(Path::new("/scans/fleet")), None);
-        assert_eq!(root_token(Path::new("/scans/k8s-lab")), None);
+        assert_eq!(root_token(Path::new("/scans/k8s-lab")), Some("lab"));
         assert_eq!(
             gitops_reason(None, "clusters/qa/apps.yaml").as_deref(),
             Some("non-production path: qa")
@@ -498,6 +662,43 @@ mod tests {
             gitops_reason(Some("lab"), "clusters/prod/apps.yaml").as_deref(),
             Some("non-production repository: lab")
         );
+    }
+
+    #[test]
+    fn workflow_tokens_leave_ci_and_staging_deployed() {
+        for (name, token) in [
+            ("deploy-python-backend-dev", Some("dev")),
+            ("e2e_tests", Some("e2e")),
+            ("deploy_sandbox", Some("sandbox")),
+            ("ci-deploy", None),
+            ("deploy-staging", None),
+            ("release", None),
+        ] {
+            assert_eq!(workflow_token(name), token, "{name}");
+        }
+    }
+
+    #[test]
+    fn s3_compatible_secrets_and_endpoints_are_named() {
+        assert_eq!(s3_compatible_secret("R2_ACCESS_KEY_ID"), Some("R2"));
+        assert_eq!(s3_compatible_secret("do_spaces_key"), Some("SPACES"));
+        assert_eq!(s3_compatible_secret("AWS_ACCESS_KEY_ID"), None);
+        assert_eq!(
+            s3_compatible_file("run: aws s3 sync . s3://b --endpoint-url $E"),
+            Some("endpoint-url")
+        );
+        assert_eq!(s3_compatible_file("run: aws s3 sync . s3://b"), None);
+    }
+
+    #[test]
+    fn static_credential_dir_tokens_read_the_directory_only() {
+        assert_eq!(
+            static_credential_dir_token("infra/deprecated/iam.tf"),
+            Some("deprecated")
+        );
+        assert_eq!(static_credential_dir_token("pkg/keys/main.tf"), Some("pkg"));
+        assert_eq!(static_credential_dir_token("infra/internal.tf"), None);
+        assert_eq!(static_credential_dir_token("infra/prod/iam.tf"), None);
     }
 
     #[test]
@@ -524,7 +725,14 @@ mod tests {
             ("/scans/docs-examples", Some("examples")),
             ("/scans/terraform-docs-samples", Some("samples")),
             ("/scans/localstack-terraform-samples", Some("samples")),
+            ("/scans/aks-landing-zone-lab", Some("lab")),
+            ("/scans/k8s-labs", Some("labs")),
+            ("/scans/homelab", Some("homelab")),
+            ("/scans/devfest-codelabs", Some("codelabs")),
+            ("/scans/conference-talks", Some("talks")),
             ("/scans/platform", None),
+            ("/scans/gitlab-runner", None),
+            ("/scans/label-studio", None),
             ("", None),
         ] {
             assert_eq!(root_token(Path::new(root)), token, "{root}");
@@ -539,6 +747,38 @@ mod tests {
             "the path names its own token first"
         );
         assert_eq!(reason(None, "k8s/app.yaml"), None);
+    }
+
+    #[test]
+    fn a_vendored_or_generated_pack_is_named_by_its_path_or_root() {
+        for (root, path, token) in [
+            (
+                "/scans/platform",
+                "monitoring/mixins/kubernetes/alerts.yaml",
+                Some("mixins"),
+            ),
+            ("/scans/platform", "rules/node-mixin.yaml", Some("mixin")),
+            (
+                "/scans/platform",
+                "deploy/upstream/rules.yaml",
+                Some("upstream"),
+            ),
+            (
+                "/scans/platform",
+                "rules/generated_alerts.yml",
+                Some("generated"),
+            ),
+            ("/scans/thirdparty-rules", "rules.yaml", Some("thirdparty")),
+            ("/scans/platform", "deploy/prometheus/rules.yaml", None),
+            ("/scans/platform", "rules/mixing.yaml", None),
+        ] {
+            assert_eq!(
+                vendored_token(Some(Path::new(root)), path),
+                token,
+                "{root} {path}"
+            );
+        }
+        assert_eq!(vendored_token(None, "rules/alerts.yaml"), None);
     }
 
     #[test]

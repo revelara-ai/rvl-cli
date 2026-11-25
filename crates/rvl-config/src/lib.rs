@@ -44,6 +44,7 @@ pub mod kubernetes;
 pub mod non_production;
 pub mod operators;
 pub mod prometheus;
+pub mod prometheus_repo;
 pub mod terraform;
 
 /// The canonical rendering of a decidable authored ABSENCE: a key the
@@ -331,23 +332,6 @@ const VARIANTS_OF_SUPPORTED: &[&str] = &[
     "kustomize",
 ];
 
-/// The lane's walk of `root`: `.gitignore` honored, dot-directories kept,
-/// [`SKIP_DIRS`] never entered (see [`retrieve_repo`]).
-pub(crate) fn walk(root: &Path) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(false)
-        .parents(true)
-        .require_git(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref())
-        })
-        .build()
-}
-
 /// Directory names never worth descending into (mirrors the code lane).
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -531,6 +515,23 @@ fn sight_format(rel: &str, head: &str) -> Option<&'static str> {
     None
 }
 
+/// The lane's walk of `root`: every file the config lane may read, the
+/// gitignored and [`SKIP_DIRS`] trees left out (see [`retrieve_repo`]).
+pub(crate) fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .build()
+}
+
 /// Walk `root` for config files: run every matching [`registry`] retriever
 /// and record identity-only sightings for formats none of them support.
 pub fn retrieve_repo(root: &Path, snapshot_id: &str) -> LaneRetrieval {
@@ -669,7 +670,7 @@ fn read_head(path: &Path, cap: usize) -> String {
 
 /// The repo-relative, forward-slashed spelling of `file` under `root`
 /// (matches the code lane's spelling so waivers and reports line up).
-fn repo_relative(root: &Path, file: &Path) -> String {
+pub(crate) fn repo_relative(root: &Path, file: &Path) -> String {
     let rel = file.strip_prefix(root).unwrap_or(file);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())

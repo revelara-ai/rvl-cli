@@ -9,6 +9,36 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A paging alert with no runbook is judged in rule resources too
+
+- Changed: the `prometheus-rules` keys (`rule.for`, `rule.labels.severity`,
+  `rule.annotations.runbook`, `rule.annotations.runbook.target`,
+  `rule.expr`, `group.interval`) are now read from the `spec.groups` of a
+  `PrometheusRule`, a VictoriaMetrics `VMRule`, and a Google Managed
+  Prometheus `Rules`, `ClusterRules` or `GlobalRules` resource, as well as
+  from plain rule files. Their key paths start with `spec.`. A file that
+  also holds an Argo CD, Flux or operator resource stays with that
+  retriever. Helm values and ConfigMap strings are not read for rules.
+- New: guard predicates for a `when` spec. Per alert rule:
+  `rule.labels.severity` (lower-cased; the `priority` label when
+  `severity` is absent; none for a templated label),
+  `rule.annotations.link_like` (`present` or `absent`), `rule.name_unique`
+  and `rule.kustomize_patched` (`true` or `false`). Per rule file:
+  `repo.alertmanager.mentions_runbook` (`true` or `false`) and
+  `repo.alertmanager.paging_receiver` (`yes`, `no` or `none_declared`).
+  The `rule.kustomize_patched` and `repo.` predicates need the scan root.
+  `rvl cache keys` lists them as vocabulary only.
+- Changed: a `rule.annotations.runbook` value that is empty or templated
+  is `undecided:` with a reason when the rule has a link-like annotation,
+  when an Alertmanager config or a `*.tmpl`, `*.tpl` or `*.gotmpl` file
+  mentions a runbook, when every receiver of the repository's Alertmanager
+  configs only posts to chat or email, when the group has another rule of
+  the same alert name, when a kustomize patch targets its
+  `PrometheusRule`, or when the value is templated. Every packet of a rule
+  file whose path or repository name has the token `mixin`, `mixins`,
+  `vendor`, `vendored`, `upstream`, `generated` or `thirdparty` is
+  `undecided:` too.
+
 ### The decision model runs the file its manifest serves
 
 - New: the model manifest's `served_file` names the bundle file the
@@ -20,6 +50,34 @@ To read the installed version, run `rvl --version` or `rvl version`.
 - When the published bundle serves the fp32 `model.onnx`, `--out`
   `decision_model.weights_digest` changes, and each site takes about 1.5 to
   2 times as long (see the README).
+
+### Static cloud keys in workflows and Terraform are facts
+
+- New: the config key `github-actions` `credential.static-cloud-key`, on a
+  step (`step:<job id>/<index>`), job (`job:<job id>`) or the workflow
+  (`workflow`) whose mapping hands a cloud key from `${{ secrets.<NAME> }}`
+  to its tools: a step's `with`, else its `env`; a job's `env`; the
+  workflow's `env`. A unit with no such key has no such fact.
+- Its value is the provider, `aws` | `gcp` | `azure`, or `undecided:` and
+  why: a federation or session input (`aws-session-token`,
+  `AWS_SESSION_TOKEN`, `workload_identity_provider`, `client-id`,
+  `ARM_USE_OIDC`, `AZURE_FEDERATED_TOKEN_FILE`) in the same mapping; an
+  AWS-shaped key for an S3-compatible third party (the secret's name or an
+  endpoint in the file says so); a workflow file stem or job id naming a dev,
+  test, e2e, sandbox, demo, preview, playground or local environment; or a
+  sample repository. `creds` counts only as an input of `azure/login`. The
+  fact never holds a credential, only the secret's name in its provenance.
+  The expectation `equals: none` flags every decided value.
+- New: the config keys `terraform`
+  `resource.google_service_account_key.static-credential` and
+  `resource.aws_iam_access_key.static-credential`, valued `declared` |
+  `none` (or unresolvable when `count` or `for_each` needs evaluation), and
+  `undecided:` under a `deprecated`, `pkg`, `internal` or `assets`
+  directory. The expectation `not_equals: declared` flags a declared key.
+  The `declared` facts of the same resources are unchanged.
+- Changed: a repository whose root directory is named for `talks` or
+  `codelabs` is sample material for every config retriever.
+- The specs arrive in the spec cache. Until it carries them, nothing changes.
 
 ### A GitHub Actions release job's SBOM, provenance and pins are judged
 
