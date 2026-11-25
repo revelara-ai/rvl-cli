@@ -242,7 +242,7 @@ The orchestrator uses it to:
     It mirrors the `structure:` line of the COVERAGE block. Null when the
     lane did not run.
 - `structure` is the repo-structure lane: one eval row per control (RC-033,
-  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040) in that order, with
+  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040, RC-016) in that order, with
   the same five fields as a `sites` row and no `scope`: a row is about the
   repository, not about a file. `site_id` is always `repo`, because the lane
   judges the repository and not a location, so `class`

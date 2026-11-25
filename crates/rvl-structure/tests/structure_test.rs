@@ -1209,7 +1209,10 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
+        vec![
+            "RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040",
+            "RC-016"
+        ],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
 }
