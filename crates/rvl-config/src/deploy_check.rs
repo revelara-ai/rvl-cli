@@ -217,7 +217,7 @@ const NON_PRODUCTION_JOB_TOKENS: &[&str] = &[
 ];
 
 /// Text anywhere in a workflow that shows a test cluster or a rehearsal: a
-/// kind, minikube, k3d or k3s cluster, an emulator, chart testing, a
+/// kind, k3d or k3s cluster, an emulator, chart testing, a
 /// controller test environment, a virtual cluster, test containers, a dry
 /// run, or a Kubernetes test runner. Matched in the lower-cased text.
 const TEST_CLUSTER_MARKERS: &[&str] = &[
@@ -226,7 +226,6 @@ const TEST_CLUSTER_MARKERS: &[&str] = &[
     "kind-action",
     "setup-kind",
     "kindest/",
-    "minikube",
     "k3d",
     "k3s",
     "localstack",
