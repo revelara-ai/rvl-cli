@@ -121,6 +121,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("flux", "kustomization.timeout"),
     judged("flux", "kustomization.wait"),
     judged("gatekeeper", "constraint.enforcementAction"),
+    judged("github-actions", "credential.static-cloud-key"),
     judged("github-actions", "job.continue-on-error"),
     judged("github-actions", "job.permissions"),
     vocabulary_only(
@@ -234,6 +235,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("terraform", "resource.aws_db_instance.multi_az"),
     judged("terraform", "resource.aws_iam.statement-wildcard"),
     judged("terraform", "resource.aws_iam_access_key.declared"),
+    judged("terraform", "resource.aws_iam_access_key.static-credential"),
     judged(
         "terraform",
         "resource.aws_rds_cluster.backup_retention_period",
@@ -252,6 +254,10 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     ),
     judged("terraform", "resource.google_iam.role-class"),
     judged("terraform", "resource.google_service_account_key.declared"),
+    judged(
+        "terraform",
+        "resource.google_service_account_key.static-credential",
+    ),
     judged(
         "terraform",
         "resource.google_sql_database_instance.backup_configuration.enabled",

@@ -156,7 +156,92 @@ pub const SAMPLE_REPOSITORY_TOKENS: &[&str] = &[
     "lab",
     "labs",
     "homelab",
+    "talks",
+    "codelab",
+    "codelabs",
 ];
+
+/// Tokens of a workflow file's stem or a job id that mark a GitHub Actions
+/// unit as reaching a non-production environment (frame cell C5), for the
+/// static cloud key fact (RC-072). Narrower than [`NON_PRODUCTION_TOKENS`]:
+/// every workflow sits under `.github/`, and a `ci-*.yaml` workflow that
+/// holds a cloud key was judged a violation, so `ci` is not listed, nor are
+/// `staging` and `canary`, which deploy.
+pub const NON_PRODUCTION_WORKFLOW_TOKENS: &[&str] = &[
+    "dev",
+    "development",
+    "test",
+    "tests",
+    "testing",
+    "e2e",
+    "sandbox",
+    "demo",
+    "preview",
+    "playground",
+    "local",
+];
+
+/// Upper-case substrings of a secret's name that mark an AWS-shaped key as
+/// one for an S3-compatible third party (Cloudflare R2, DigitalOcean
+/// Spaces, MinIO, Backblaze B2 and the like), which no cloud federation
+/// replaces (frame cell C6).
+pub const S3_COMPATIBLE_SECRET_TOKENS: &[&str] = &[
+    "R2",
+    "CLOUDFLARE",
+    "CF_",
+    "SPACES",
+    "DIGITALOCEAN",
+    "DO_",
+    "MINIO",
+    "B2_",
+    "BACKBLAZE",
+    "WASABI",
+    "SCALEWAY",
+    "SCW",
+    "OSS",
+    "ALIYUN",
+    "LINODE",
+    "HETZNER",
+    "TIGRIS",
+    "STORJ",
+    "GARAGE",
+    "CEPH",
+    "OVH",
+    "YANDEX",
+    "IDRIVE",
+    "SUPABASE",
+];
+
+/// Text in a workflow file that points its AWS-shaped keys at an
+/// S3-compatible endpoint: an endpoint input or variable, or one of those
+/// providers' host names. Matched case-sensitively, as written.
+pub const S3_COMPATIBLE_FILE_MARKERS: &[&str] = &[
+    "endpoint-url",
+    "endpoint_url",
+    "ENDPOINT",
+    "r2.cloudflarestorage.com",
+    "digitaloceanspaces.com",
+    "backblazeb2.com",
+    "wasabisys.com",
+    "scw.cloud",
+    "aliyuncs.com",
+    "linodeobjects.com",
+    "your-objectstorage.com",
+    "storage.dev",
+    "tigris.dev",
+    "storjshare.io",
+    "cloud.ovh.net",
+    "yandexcloud.net",
+    "idrivee2",
+    "supabase.co",
+];
+
+/// Directory tokens under which a Terraform static credential is not one a
+/// deployment holds: a retired tree, or library and asset code another
+/// module embeds. Asked of the static credential fact (RC-072) only, on top
+/// of [`path_token`] (which already holds `archive` and `archived`): `pkg`
+/// and `internal` hold deployed code in general.
+pub const STATIC_CREDENTIAL_DIR_TOKENS: &[&str] = &["deprecated", "pkg", "internal", "assets"];
 
 /// Tokens of a rule file's path, or of the scanned root's own name, that
 /// mark the rules as a pack another project wrote or a tool generated: a
@@ -201,6 +286,35 @@ fn listed(s: &str, list: &[&'static str]) -> Option<&'static str> {
                 .find(|w| *w == t || pair.as_deref() == Some(*w))
         })
     })
+}
+
+/// The [`NON_PRODUCTION_WORKFLOW_TOKENS`] token of a workflow file stem or
+/// a job id, if any.
+pub fn workflow_token(name: &str) -> Option<&'static str> {
+    listed(name, NON_PRODUCTION_WORKFLOW_TOKENS)
+}
+
+/// The [`S3_COMPATIBLE_SECRET_TOKENS`] token a secret's name holds, if any.
+pub fn s3_compatible_secret(name: &str) -> Option<&'static str> {
+    let upper = name.to_uppercase();
+    S3_COMPATIBLE_SECRET_TOKENS
+        .iter()
+        .copied()
+        .find(|t| upper.contains(t))
+}
+
+/// The [`S3_COMPATIBLE_FILE_MARKERS`] entry a file's text holds, if any.
+pub fn s3_compatible_file(contents: &str) -> Option<&'static str> {
+    S3_COMPATIBLE_FILE_MARKERS
+        .iter()
+        .copied()
+        .find(|m| contents.contains(m))
+}
+
+/// The [`STATIC_CREDENTIAL_DIR_TOKENS`] token of `rel_path`'s directory, if
+/// any.
+pub fn static_credential_dir_token(rel_path: &str) -> Option<&'static str> {
+    listed(dir_and_stem(rel_path).0, STATIC_CREDENTIAL_DIR_TOKENS)
 }
 
 /// A repo-relative path split into its directory and its file stem (the
@@ -426,6 +540,43 @@ mod tests {
     }
 
     #[test]
+    fn workflow_tokens_leave_ci_and_staging_deployed() {
+        for (name, token) in [
+            ("deploy-python-backend-dev", Some("dev")),
+            ("e2e_tests", Some("e2e")),
+            ("deploy_sandbox", Some("sandbox")),
+            ("ci-deploy", None),
+            ("deploy-staging", None),
+            ("release", None),
+        ] {
+            assert_eq!(workflow_token(name), token, "{name}");
+        }
+    }
+
+    #[test]
+    fn s3_compatible_secrets_and_endpoints_are_named() {
+        assert_eq!(s3_compatible_secret("R2_ACCESS_KEY_ID"), Some("R2"));
+        assert_eq!(s3_compatible_secret("do_spaces_key"), Some("SPACES"));
+        assert_eq!(s3_compatible_secret("AWS_ACCESS_KEY_ID"), None);
+        assert_eq!(
+            s3_compatible_file("run: aws s3 sync . s3://b --endpoint-url $E"),
+            Some("endpoint-url")
+        );
+        assert_eq!(s3_compatible_file("run: aws s3 sync . s3://b"), None);
+    }
+
+    #[test]
+    fn static_credential_dir_tokens_read_the_directory_only() {
+        assert_eq!(
+            static_credential_dir_token("infra/deprecated/iam.tf"),
+            Some("deprecated")
+        );
+        assert_eq!(static_credential_dir_token("pkg/keys/main.tf"), Some("pkg"));
+        assert_eq!(static_credential_dir_token("infra/internal.tf"), None);
+        assert_eq!(static_credential_dir_token("infra/prod/iam.tf"), None);
+    }
+
+    #[test]
     fn a_name_the_api_would_refuse_is_a_placeholder() {
         for name in [
             "board-deployment-PR_NUMBER",
@@ -452,6 +603,8 @@ mod tests {
             ("/scans/aks-landing-zone-lab", Some("lab")),
             ("/scans/k8s-labs", Some("labs")),
             ("/scans/homelab", Some("homelab")),
+            ("/scans/devfest-codelabs", Some("codelabs")),
+            ("/scans/conference-talks", Some("talks")),
             ("/scans/platform", None),
             ("/scans/gitlab-runner", None),
             ("/scans/label-studio", None),

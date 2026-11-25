@@ -51,6 +51,34 @@ To read the installed version, run `rvl --version` or `rvl version`.
   `decision_model.weights_digest` changes, and each site takes about 1.5 to
   2 times as long (see the README).
 
+### Static cloud keys in workflows and Terraform are facts
+
+- New: the config key `github-actions` `credential.static-cloud-key`, on a
+  step (`step:<job id>/<index>`), job (`job:<job id>`) or the workflow
+  (`workflow`) whose mapping hands a cloud key from `${{ secrets.<NAME> }}`
+  to its tools: a step's `with`, else its `env`; a job's `env`; the
+  workflow's `env`. A unit with no such key has no such fact.
+- Its value is the provider, `aws` | `gcp` | `azure`, or `undecided:` and
+  why: a federation or session input (`aws-session-token`,
+  `AWS_SESSION_TOKEN`, `workload_identity_provider`, `client-id`,
+  `ARM_USE_OIDC`, `AZURE_FEDERATED_TOKEN_FILE`) in the same mapping; an
+  AWS-shaped key for an S3-compatible third party (the secret's name or an
+  endpoint in the file says so); a workflow file stem or job id naming a dev,
+  test, e2e, sandbox, demo, preview, playground or local environment; or a
+  sample repository. `creds` counts only as an input of `azure/login`. The
+  fact never holds a credential, only the secret's name in its provenance.
+  The expectation `equals: none` flags every decided value.
+- New: the config keys `terraform`
+  `resource.google_service_account_key.static-credential` and
+  `resource.aws_iam_access_key.static-credential`, valued `declared` |
+  `none` (or unresolvable when `count` or `for_each` needs evaluation), and
+  `undecided:` under a `deprecated`, `pkg`, `internal` or `assets`
+  directory. The expectation `not_equals: declared` flags a declared key.
+  The `declared` facts of the same resources are unchanged.
+- Changed: a repository whose root directory is named for `talks` or
+  `codelabs` is sample material for every config retriever.
+- The specs arrive in the spec cache. Until it carries them, nothing changes.
+
 ### A GitHub Actions release job's SBOM, provenance and pins are judged
 
 - New: the config key `github-actions` `job.release_supply_chain`, on each
