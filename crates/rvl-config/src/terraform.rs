@@ -47,7 +47,15 @@
 //!     `resource.google_container_node_pool.node_locations-count` (the
 //!     length of a literal list). The last two have no default an absent
 //!     attribute can take: the provider block or the parent cluster supplies
-//!     it, so they are Unresolvable. No other resource attribute is read. A
+//!     it, so they are Unresolvable. The log retention facts (RC-028), in
+//!     days: `resource.aws_cloudwatch_log_group.retention_in_days` (`never`
+//!     for an absent attribute or a literal `0`: the group never expires),
+//!     `resource.azurerm_log_analytics_workspace.retention_in_days` and
+//!     `resource.google_logging_<scope>_bucket_config.retention_days` for the
+//!     project, folder, organization and billing-account forms (an absent
+//!     attribute or a `0` takes the service's default, which the body does
+//!     not name: Unresolvable); undecided under an eval fixture tree
+//!     ([`crate::log_retention`]). No other resource attribute is read. A
 //!     `dynamic` block on the path is Unresolvable.
 //!   * the LEAST-PRIVILEGE facts (RC-044), one per resource of the kinds
 //!     that carry one: `resource.google_service_account_key.declared` and
@@ -1057,6 +1065,9 @@ enum Shape {
     /// How many items a literal list holds; a non-empty list only, since an
     /// empty one means "not set" to the provider.
     ListCount,
+    /// A retention in days, as written, but a literal `0`: that is `never`
+    /// where `zero` says so, else the service's default (Unresolvable).
+    RetentionDays { zero: Option<&'static str> },
 }
 
 const RESOURCE_ATTRS: &[ResourceAttr] = &[
@@ -1148,6 +1159,67 @@ const RESOURCE_ATTRS: &[ResourceAttr] = &[
         attr: "node_locations",
         absent: Absent::Elsewhere("inherited"),
         shape: Shape::ListCount,
+        unless_attrs: &[],
+    },
+    // RC-028: how long a log store keeps what it is sent. A CloudWatch log
+    // group with no retention, or `0`, never expires.
+    ResourceAttr {
+        resource_type: "aws_cloudwatch_log_group",
+        packet_key: "resource.aws_cloudwatch_log_group.retention_in_days",
+        blocks: &[],
+        attr: "retention_in_days",
+        absent: Absent::Default("never"),
+        shape: Shape::RetentionDays {
+            zero: Some("never"),
+        },
+        unless_attrs: &[],
+    },
+    // RC-028: an absent workspace retention takes the service's default.
+    ResourceAttr {
+        resource_type: "azurerm_log_analytics_workspace",
+        packet_key: "resource.azurerm_log_analytics_workspace.retention_in_days",
+        blocks: &[],
+        attr: "retention_in_days",
+        absent: Absent::Elsewhere("service-default"),
+        shape: Shape::RetentionDays { zero: None },
+        unless_attrs: &[],
+    },
+    // RC-028: a log bucket created with no retention, or `0`, takes the
+    // service's default.
+    ResourceAttr {
+        resource_type: "google_logging_project_bucket_config",
+        packet_key: "resource.google_logging_project_bucket_config.retention_days",
+        blocks: &[],
+        attr: "retention_days",
+        absent: Absent::Elsewhere("service-default"),
+        shape: Shape::RetentionDays { zero: None },
+        unless_attrs: &[],
+    },
+    ResourceAttr {
+        resource_type: "google_logging_folder_bucket_config",
+        packet_key: "resource.google_logging_folder_bucket_config.retention_days",
+        blocks: &[],
+        attr: "retention_days",
+        absent: Absent::Elsewhere("service-default"),
+        shape: Shape::RetentionDays { zero: None },
+        unless_attrs: &[],
+    },
+    ResourceAttr {
+        resource_type: "google_logging_organization_bucket_config",
+        packet_key: "resource.google_logging_organization_bucket_config.retention_days",
+        blocks: &[],
+        attr: "retention_days",
+        absent: Absent::Elsewhere("service-default"),
+        shape: Shape::RetentionDays { zero: None },
+        unless_attrs: &[],
+    },
+    ResourceAttr {
+        resource_type: "google_logging_billing_account_bucket_config",
+        packet_key: "resource.google_logging_billing_account_bucket_config.retention_days",
+        blocks: &[],
+        attr: "retention_days",
+        absent: Absent::Elsewhere("service-default"),
+        shape: Shape::RetentionDays { zero: None },
         unless_attrs: &[],
     },
 ];
@@ -1244,6 +1316,16 @@ fn resolve_row(
                 (_, Resolution::Unresolvable, chain) => (None, Resolution::Unresolvable, chain),
                 (_, _, chain) => unresolvable(chain, "not-a-list"),
             },
+        },
+        Shape::RetentionDays { zero } => match resolve_value(rel, key_path, v, vars) {
+            (Some(days), res, mut chain) if days.trim() == "0" => match zero {
+                Some(z) => (Some(z.to_string()), res, chain),
+                None => {
+                    chain.push(ProvenanceStep::new("", row.attr, "service-default"));
+                    (None, Resolution::Unresolvable, chain)
+                }
+            },
+            resolved => resolved,
         },
     }
 }
@@ -2279,6 +2361,11 @@ fn retrieve_dir(
                 let mut p = packet(rel, &unit, row.packet_key, value, resolution, prov);
                 if replica && REPLICA_UNDECIDED.contains(&row.packet_key) {
                     crate::non_production::undecide(&mut p, "read replica");
+                }
+                if matches!(row.shape, Shape::RetentionDays { .. }) {
+                    if let Some(t) = crate::log_retention::eval_dir_token(rel) {
+                        crate::non_production::undecide(&mut p, &format!("eval fixture: {t}"));
+                    }
                 }
                 out.packets.push(p);
             }
@@ -3848,5 +3935,148 @@ resource "aws_instance" "web" {
         assert_eq!(classify_source("github.com/acme/net"), "git");
         assert_eq!(classify_source("s3::https://bucket/x.zip"), "other");
         assert_eq!(classify_source("https://example.com/x.zip"), "other");
+    }
+
+    /// The verdict one unconditional expectation gives a packet.
+    fn judge(p: &ConfigPacket, expect: rvl_spec::ConfigExpect) -> rvl_core::Verdict {
+        let specs = rvl_spec::SpecCache::from_file(rvl_spec::SpecFile {
+            config_keys: vec![rvl_spec::ConfigKeySpec {
+                format: "terraform".into(),
+                key: p.key.clone(),
+                expect,
+                confidence: 0.9,
+                rationale: String::new(),
+                control: String::new(),
+                severity: String::new(),
+                fix: String::new(),
+                gate: String::new(),
+            }],
+            ..Default::default()
+        });
+        crate::eval::evaluate(p, &[], &specs).verdict
+    }
+
+    const LOG_GROUPS: &str = "\
+variable \"days\" {\n  default = 14\n}\n\
+variable \"open\" {}\n\
+resource \"aws_cloudwatch_log_group\" \"short\" {\n  retention_in_days = 7\n}\n\
+resource \"aws_cloudwatch_log_group\" \"long\" {\n  retention_in_days = 90\n}\n\
+resource \"aws_cloudwatch_log_group\" \"unset\" {\n  name = \"app\"\n}\n\
+resource \"aws_cloudwatch_log_group\" \"zero\" {\n  retention_in_days = 0\n}\n\
+resource \"aws_cloudwatch_log_group\" \"by_default\" {\n  retention_in_days = var.days\n}\n\
+resource \"aws_cloudwatch_log_group\" \"by_caller\" {\n  retention_in_days = var.open\n}\n\
+resource \"aws_cloudwatch_log_group\" \"computed\" {\n  retention_in_days = local.days * 2\n}\n\
+terraform {\n  backend \"s3\" {}\n}\n";
+
+    // RC-028: `at_least 30` alone decides a log group. A literal under 30
+    // (directly or as a variable's literal default) violates; a group that
+    // never expires or whose retention needs evaluation is no finding.
+    #[test]
+    fn a_log_group_retention_is_days_or_never_and_at_least_30_decides_it() {
+        use rvl_core::Verdict::{Abstain, Satisfies, Violates};
+        let got = one(&[("logs/main.tf", LOG_GROUPS)]);
+        let key = "resource.aws_cloudwatch_log_group.retention_in_days";
+        for (name, value, verdict) in [
+            ("short", some("7"), Violates),
+            ("long", some("90"), Satisfies),
+            ("unset", some("never"), Abstain),
+            ("zero", some("never"), Abstain),
+            ("by_default", some("14"), Violates),
+            ("by_caller", None, Abstain),
+            ("computed", None, Abstain),
+        ] {
+            let p = find(
+                &got,
+                &format!("resource:aws_cloudwatch_log_group.{name}"),
+                key,
+            );
+            assert_eq!(p.resolved_value, value, "{name}");
+            let expect = rvl_spec::ConfigExpect::AtLeast { value: 30.0 };
+            assert_eq!(judge(p, expect), verdict, "{name}");
+        }
+        let unset = find(&got, "resource:aws_cloudwatch_log_group.unset", key);
+        assert_eq!(unset.resolution, Resolution::PlatformDefault);
+    }
+
+    #[test]
+    fn workspace_and_log_bucket_retention_is_read_and_a_default_is_unresolvable() {
+        let tf = "\
+resource \"azurerm_log_analytics_workspace\" \"short\" {\n  retention_in_days = 7\n}\n\
+resource \"azurerm_log_analytics_workspace\" \"unset\" {\n  sku = \"PerGB2018\"\n}\n\
+resource \"google_logging_project_bucket_config\" \"short\" {\n  retention_days = 14\n}\n\
+resource \"google_logging_folder_bucket_config\" \"long\" {\n  retention_days = 400\n}\n\
+resource \"google_logging_organization_bucket_config\" \"zero\" {\n  retention_days = 0\n}\n\
+resource \"google_logging_billing_account_bucket_config\" \"unset\" {\n  bucket_id = \"b\"\n}\n\
+terraform {\n  backend \"gcs\" {}\n}\n";
+        let got = one(&[("logs/main.tf", tf)]);
+        for (unit, key, value) in [
+            (
+                "azurerm_log_analytics_workspace.short",
+                "retention_in_days",
+                some("7"),
+            ),
+            (
+                "azurerm_log_analytics_workspace.unset",
+                "retention_in_days",
+                None,
+            ),
+            (
+                "google_logging_project_bucket_config.short",
+                "retention_days",
+                some("14"),
+            ),
+            (
+                "google_logging_folder_bucket_config.long",
+                "retention_days",
+                some("400"),
+            ),
+            (
+                "google_logging_organization_bucket_config.zero",
+                "retention_days",
+                None,
+            ),
+            (
+                "google_logging_billing_account_bucket_config.unset",
+                "retention_days",
+                None,
+            ),
+        ] {
+            let ty = unit.split('.').next().unwrap();
+            let p = find(
+                &got,
+                &format!("resource:{unit}"),
+                &format!("resource.{ty}.{key}"),
+            );
+            assert_eq!(p.resolved_value, value, "{unit}");
+            if value.is_none() {
+                assert_eq!(p.resolution, Resolution::Unresolvable, "{unit}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_group_under_an_eval_or_test_tree_is_undecided() {
+        let tf = "resource \"aws_cloudwatch_log_group\" \"app\" {\n  retention_in_days = 7\n}\n";
+        let got = one(&[
+            ("infra/logs/main.tf", tf),
+            ("evals/task-1/evidence/main.tf", tf),
+            ("benchmarks/logs/main.tf", tf),
+        ]);
+        let key = "resource.aws_cloudwatch_log_group.retention_in_days";
+        let at = |file: &str| {
+            got.packets
+                .iter()
+                .find(|p| p.file_path == file && p.key == key)
+                .and_then(|p| p.resolved_value.clone())
+        };
+        assert_eq!(at("infra/logs/main.tf"), some("7"));
+        assert_eq!(
+            at("evals/task-1/evidence/main.tf"),
+            some("undecided: eval fixture: evals")
+        );
+        assert_eq!(
+            at("benchmarks/logs/main.tf"),
+            some("undecided: non-production path: benchmarks")
+        );
     }
 }
