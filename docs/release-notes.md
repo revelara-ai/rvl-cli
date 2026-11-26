@@ -79,6 +79,44 @@ To read the installed version, run `rvl --version` or `rvl version`.
   `vendor`, `vendored`, `upstream`, `generated` or `thirdparty` is
   `undecided:` too.
 
+### Log retention is a fact in Terraform and Loki configs
+
+- New: the config keys `terraform`
+  `resource.aws_cloudwatch_log_group.retention_in_days`,
+  `resource.azurerm_log_analytics_workspace.retention_in_days` and
+  `resource.google_logging_<scope>_bucket_config.retention_days` (`project`,
+  `folder`, `organization`, `billing_account`), on `resource:<type>.<name>`.
+  The value is the retention in days as written, or the literal default of
+  the `var.<x>` it names. A CloudWatch log group with no retention or `0` is
+  `never` (it never expires). A workspace or bucket with no retention or `0`
+  takes the service's default and is unresolvable, as is an expression or a
+  variable with no literal default. Under an `eval`, `evals`,
+  `evaluation` or `evaluations` directory the value is `undecided:`. The
+  expectation `at_least: 30` flags a retention from 1 to 29 days and
+  abstains on `never`.
+- New: the `loki` format, and its keys
+  `limits_config.retention_period-effective` and
+  `table_manager.retention_period-effective`. A Loki config is a YAML
+  mapping that holds `limits_config` or `table_manager` at any depth: a
+  plain file, a Helm values block or a ConfigMap string. The unit is
+  `<kind>:<metadata.name>` for a Kubernetes object, else
+  `loki-config:<key path>` (`loki-config:root` for a plain file). The value
+  is the section's `retention_period` when its switch is `true` in the same
+  mapping (`compactor.retention_enabled`, `table_manager.retention_deletes_enabled`),
+  else `never`; a period of `0` is `never`; a period that is not a duration
+  or a switch that is not a boolean is unresolvable; a section with no
+  period emits nothing. The value is `undecided:` in a non-production path
+  or repository, in an eval directory, for a placeholder object name, and
+  for a plain file with a compose file in its directory or above that no
+  Kubernetes manifest, kustomization or chart template names and no chart
+  in its directory carries. A Helm-templated file is declined as a
+  `loki-templated` sighting. The expectation `duration_at_least: 720h` flags
+  a deleting period under 30 days and abstains on `never`.
+- Changed: a manifest that holds a Loki config is claimed by the Loki
+  retriever and handed to the Kubernetes retriever too; its `kubernetes`
+  facts do not change.
+- The specs arrive in the spec cache. Until it carries them, nothing changes.
+
 ### The decision model runs the file its manifest serves
 
 - New: the model manifest's `served_file` names the bundle file the

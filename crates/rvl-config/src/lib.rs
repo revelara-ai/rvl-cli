@@ -42,6 +42,8 @@ pub mod github_actions;
 pub mod gitlab_ci;
 pub mod key_ledger;
 pub mod kubernetes;
+pub mod log_retention;
+pub mod loki;
 pub mod non_production;
 pub mod operators;
 pub mod prometheus;
@@ -271,6 +273,9 @@ pub fn registry() -> Vec<Box<dyn ConfigRetriever>> {
         Box::new(argo_flux::ArgoFlux),
         Box::new(terraform::Terraform),
         Box::new(operators::OperatorCrs),
+        // Loki claims a manifest only where Kubernetes would, and hands it
+        // on to Kubernetes as well (see the module).
+        Box::new(loki::Loki),
         // Kubernetes stays LAST: its content claim (bare apiVersion+kind
         // YAML) is the broadest, so narrower families (sloth CRDs, Argo/Flux
         // and operator CRs, rule files) must get first refusal.
