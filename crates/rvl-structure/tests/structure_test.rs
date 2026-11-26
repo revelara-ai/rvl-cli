@@ -333,192 +333,6 @@ fn rc057_absence_claim_names_the_search_that_backs_it() {
     );
 }
 
-// --- RC-058: integration/e2e test presence (live catalog: Integration and Smoke Tests) ---
-
-#[test]
-fn rc058_integration_dir_satisfies() {
-    let dir = tempfile::tempdir().unwrap();
-    go_repo_without_tests(dir.path());
-    write(
-        dir.path(),
-        "tests/integration/api_test.go",
-        "package integration\nfunc TestAPI(t *testing.T) {}\n",
-    );
-    let fs = eval_dir(dir.path());
-    assert_eq!(finding(&fs, "RC-058").verdict, Verdict::Satisfies);
-}
-
-#[test]
-fn rc058_e2e_config_satisfies() {
-    let dir = tempfile::tempdir().unwrap();
-    for i in 0..6 {
-        write(dir.path(), &format!("src/m{i}.ts"), "export const x = 1;\n");
-    }
-    write(dir.path(), "playwright.config.ts", "export default {};\n");
-    assert_eq!(
-        finding(&eval_dir(dir.path()), "RC-058").verdict,
-        Verdict::Satisfies
-    );
-}
-
-#[test]
-fn rc058_unit_tests_only_abstains() {
-    let dir = tempfile::tempdir().unwrap();
-    go_repo_without_tests(dir.path());
-    write(
-        dir.path(),
-        "internal/svc/f0_test.go",
-        "package svc\nfunc TestF(t *testing.T) {}\n",
-    );
-    let f = &eval_dir(dir.path())[..];
-    let f = finding(f, "RC-058");
-    assert_eq!(
-        f.verdict,
-        Verdict::Abstain,
-        "integration tests may not follow a detectable convention: {}",
-        f.reason
-    );
-}
-
-/// A workflow whose one job runs `steps` on push to main, with `job_keys`
-/// (an `environment:`) on the job.
-fn deploy_wf(job_keys: &str, steps: &str) -> String {
-    format!(
-        "on:\n  push:\n    branches: [main]\njobs:\n  ship:\n    runs-on: ubuntu-latest\n{job_keys}    steps:\n      - uses: actions/checkout@v4\n{steps}"
-    )
-}
-
-#[test]
-fn rc058_a_deploy_site_without_any_test_violates() {
-    for (file, text, deploys) in [
-        (
-            ".github/workflows/deploy.yml",
-            deploy_wf("    environment: production\n", "      - run: ./ship.sh\n"),
-            "a job with an environment",
-        ),
-        (
-            ".github/workflows/deploy.yml",
-            deploy_wf("", "      - run: |\n          helm upgrade --install api ./chart \\\n            --wait\n"),
-            "helm upgrade",
-        ),
-        (
-            ".gitlab-ci.yml",
-            "deploy:\n  script:\n    - kubectl apply -f k8s/\n".to_string(),
-            "kubectl apply",
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        write(dir.path(), file, &text);
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        assert_eq!(f.verdict, Verdict::Violates, "{file}: {f:?}");
-        assert!(f.reason.contains(&format!("{file} ({deploys})")), "{f:?}");
-        assert_eq!(f.evidence, vec![file.to_string()]);
-    }
-}
-
-/// A repository that deploys nothing has no site for a smoke test to follow:
-/// a package publish, a release upload, an image push, tests and CodeQL only,
-/// no CI at all.
-#[test]
-fn rc058_abstains_without_a_deploy_site() {
-    let publish = deploy_wf(
-        "    environment: nuget\n",
-        "      - run: dotnet pack -c Release\n      - run: dotnet nuget push out/*.nupkg\n",
-    );
-    let release = deploy_wf(
-        "",
-        "      - run: go build -o dist/tool ./cmd/tool\n      - run: gh release upload v1 dist/tool\n",
-    );
-    let image = deploy_wf(
-        "",
-        "      - run: docker build -t ghcr.io/o/api:latest .\n      - run: docker push ghcr.io/o/api:latest\n",
-    );
-    let checks = "on: [pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n      - uses: github/codeql-action/analyze@v3\n      - run: kubectl apply --dry-run=client -f k8s/\n";
-    for workflow in [
-        Some(publish),
-        Some(release),
-        Some(image),
-        Some(checks.to_string()),
-        None,
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        if let Some(text) = &workflow {
-            write(dir.path(), ".github/workflows/ci.yml", text);
-        }
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        assert_eq!(f.verdict, Verdict::Abstain, "{workflow:?}: {f:?}");
-        assert!(f.reason.contains("no deploy site found"), "{f:?}");
-    }
-}
-
-/// An Argo CD Application or a Flux Kustomization or HelmRelease is a deploy
-/// site when it deploys this repository by its `origin` remote; one that
-/// deploys another repository, the Flux bootstrap sync, or an example is not.
-#[test]
-fn rc058_a_gitops_manifest_of_this_repository_is_a_deploy_site() {
-    const ORIGIN: &str =
-        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@example.com:o/api.git\n";
-    let argo = |url: &str| {
-        format!("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\nspec:\n  source:\n    repoURL: {url}\n    path: deploy\n")
-    };
-    let flux = |name: &str, consumer: &str| {
-        format!(
-            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: {name}\nspec:\n  url: https://example.com/o/api\n---\n{consumer}"
-        )
-    };
-    let kustomization = |name: &str| {
-        format!("apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: api\nspec:\n  path: ./deploy\n  sourceRef:\n    kind: GitRepository\n    name: {name}\n")
-    };
-    let helm_release = "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: api\nspec:\n  chart:\n    spec:\n      chart: ./chart\n      sourceRef:\n        kind: GitRepository\n        name: api\n";
-    for (path, text, deploys) in [
-        (
-            "deploy/argo/app.yaml",
-            argo("https://example.com/o/api.git"),
-            Some("an Argo CD Application"),
-        ),
-        (
-            "deploy/argo/app.yaml",
-            argo("https://example.com/o/other.git"),
-            None,
-        ),
-        (
-            "examples/argo/app.yaml",
-            argo("https://example.com/o/api.git"),
-            None,
-        ),
-        (
-            "clusters/prod/api.yaml",
-            flux("api", &kustomization("api")),
-            Some("a Flux Kustomization"),
-        ),
-        (
-            "clusters/prod/api.yaml",
-            flux("api", helm_release),
-            Some("a Flux HelmRelease"),
-        ),
-        (
-            "clusters/prod/sync.yaml",
-            flux("flux-system", &kustomization("flux-system")),
-            None,
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        write(dir.path(), ".git/config", ORIGIN);
-        write(dir.path(), path, &text);
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        match deploys {
-            Some(d) => {
-                assert_eq!(f.verdict, Verdict::Violates, "{path}: {f:?}");
-                assert!(f.reason.contains(&format!("{path} ({d})")), "{f:?}");
-            }
-            None => assert_eq!(f.verdict, Verdict::Abstain, "{path}: {f:?}"),
-        }
-    }
-}
-
 // --- RC-034: contract-test frameworks (live catalog: Contract Testing) ---
 
 #[test]
@@ -1173,6 +987,17 @@ fn ci_scans_a_record_without_the_fact_still_parses_and_decides_nothing() {
     assert_eq!(parsed.scanner_seen(ScannerClass::Sast), None);
 }
 
+// A record written before the RC-058 row was removed carries
+// `deploy_sites`; it still parses, and no RC-058 row comes of it.
+#[test]
+fn a_record_with_deploy_sites_still_parses_and_yields_no_rc058_row() {
+    let old = r#"{"kind":"repo_structure","snapshot_id":"s","ecosystems":[],"deploy_sites":[{"file":".gitlab-ci.yml","deploys":"kubectl apply"}],"walk_complete":true}"#;
+    let parsed = parse_record(old).expect("an older record still parses");
+    assert!(evaluate(&parsed, TODAY)
+        .iter()
+        .all(|f| f.control != "RC-058"));
+}
+
 #[test]
 fn ci_scans_round_trip_through_a_packet_stream() {
     let dir = tempfile::tempdir().unwrap();
@@ -1209,7 +1034,7 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
+        vec!["RC-033", "RC-057", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
 }
