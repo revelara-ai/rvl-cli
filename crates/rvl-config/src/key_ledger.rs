@@ -180,7 +180,17 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "workload.strategy.max-unavailable"),
     judged("kubernetes", "workload.strategy.type"),
     judged("kyverno", "rule.validate.failureAction"),
+    vocabulary_only(
+        "prometheus-rules",
+        "file.rule_pack_path",
+        "a guard predicate: the rule file's path names a skill package or a template to copy",
+    ),
     judged("prometheus-rules", "group.interval"),
+    vocabulary_only(
+        "prometheus-rules",
+        "repo.alertmanager.disabled",
+        "a guard predicate: a Helm values file of the repository sets alertmanager.enabled to false",
+    ),
     vocabulary_only(
         "prometheus-rules",
         "repo.alertmanager.mentions_runbook",
@@ -189,7 +199,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     vocabulary_only(
         "prometheus-rules",
         "repo.alertmanager.paging_receiver",
-        "a guard predicate: whether the repository's receivers can page (yes, no, none_declared)",
+        "a guard predicate: whether the repository's receivers can page (yes, webhook_only, no, none_declared)",
     ),
     vocabulary_only(
         "prometheus-rules",
@@ -200,6 +210,11 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("prometheus-rules", "rule.annotations.runbook.target"),
     judged("prometheus-rules", "rule.expr"),
     judged("prometheus-rules", "rule.for"),
+    vocabulary_only(
+        "prometheus-rules",
+        "rule.group.upstream_mixin",
+        "a guard predicate: the rule's group name is one of an upstream monitoring mixin",
+    ),
     vocabulary_only(
         "prometheus-rules",
         "rule.kustomize_patched",
@@ -590,9 +605,9 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        // Three terraform raw-identity keys, eight guard predicates, and the
+        // Three terraform raw-identity keys, eleven guard predicates, and the
         // liveness probe path.
-        assert_eq!(q.vocabulary_only, 12);
+        assert_eq!(q.vocabulary_only, 15);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(

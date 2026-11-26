@@ -7,13 +7,15 @@
 //!   * an Alertmanager config or a notification template that mentions a
 //!     runbook can compose the link from labels, so the rule needs none;
 //!   * receivers that only post to chat or email (or to nothing) page nobody,
-//!     so there is no pager to open a runbook from;
+//!     so there is no pager to open a runbook from; receivers whose only
+//!     paging-capable integration is a webhook may or may not page;
+//!   * Helm values that switch Alertmanager off route no alert anywhere;
 //!   * a kustomize patch that targets a `PrometheusRule` can change the
 //!     severity the rule file states.
 //!
-//! One walk of the repository answers all three, once per scan. Nothing read
+//! One walk of the repository answers all four, once per scan. Nothing read
 //! here rides in a packet: receiver names, targets and template text stay
-//! inside this module, and only the three answers leave it.
+//! inside this module, and only the answers leave it.
 
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -21,18 +23,23 @@ use std::path::Path;
 
 /// Integration types that can page a person: a receiver with one of these
 /// can wake someone, so a runbook link has a reader. Chat and email
-/// integrations (`slack`, `msteams`, `email`, ...) are not in the list.
+/// integrations (`slack`, `msteams`, `email`, ...) are not in the list, and
+/// neither is [`WEBHOOK_INTEGRATION`]: what a webhook reaches is not in the
+/// config.
 const PAGING_INTEGRATIONS: &[&str] = &[
     "pagerduty",
     "opsgenie",
     "victorops",
     "pushover",
-    "webhook",
     "sns",
     "incidentio",
     "rootly",
     "jira",
 ];
+
+/// The integration type whose receiver posts to a URL: a pager's intake or
+/// a chat bridge, which the config cannot tell apart.
+const WEBHOOK_INTEGRATION: &str = "webhook";
 
 /// Notification-template extensions Alertmanager configs load.
 const TEMPLATE_EXTENSIONS: &[&str] = &["tmpl", "tpl", "gotmpl"];
@@ -49,17 +56,38 @@ pub enum Paging {
     NoneDeclared,
     /// A receiver has a paging integration ([`PAGING_INTEGRATIONS`]).
     Yes,
-    /// Receivers are declared and none has a paging integration.
+    /// No receiver has a paging integration and one has a webhook: whether
+    /// it pages cannot be told from the repository.
+    WebhookOnly,
+    /// Receivers are declared and none has a paging integration or a
+    /// webhook.
     No,
 }
 
 impl Paging {
-    /// The predicate value: `none_declared`, `yes` or `no`.
+    /// The predicate value: `none_declared`, `yes`, `webhook_only` or `no`.
     pub fn as_str(self) -> &'static str {
         match self {
             Paging::NoneDeclared => "none_declared",
             Paging::Yes => "yes",
+            Paging::WebhookOnly => "webhook_only",
             Paging::No => "no",
+        }
+    }
+
+    /// Fold one more config's answer in: a config that pages wins, then
+    /// one with a webhook, then one that pages nobody.
+    fn join(self, other: Paging) -> Paging {
+        let rank = |p: Paging| match p {
+            Paging::NoneDeclared => 0,
+            Paging::No => 1,
+            Paging::WebhookOnly => 2,
+            Paging::Yes => 3,
+        };
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
         }
     }
 }
@@ -71,6 +99,9 @@ pub struct RepoFacts {
     /// `runbook` (any case).
     pub mentions_runbook: bool,
     pub paging: Paging,
+    /// A Helm values file in a production path sets `alertmanager.enabled`
+    /// to false, at any depth (an umbrella chart nests its subcharts').
+    pub alertmanager_disabled: bool,
     /// The `target.name` of each kustomize patch whose `target.kind` is
     /// `PrometheusRule`; `None` for a target that names no resource, which
     /// patches every one.
@@ -107,6 +138,11 @@ impl RepoFacts {
             } else if kustomization {
                 facts.patched_rules.extend(patched_rules(&text));
             } else {
+                if name.starts_with("values") && text.contains("alertmanager") {
+                    facts.alertmanager_disabled |= crate::non_production::path_token(&rel)
+                        .is_none()
+                        && documents(&text).iter().any(alertmanager_off);
+                }
                 facts.read_alertmanager(&rel, &text);
             }
         }
@@ -133,11 +169,7 @@ impl RepoFacts {
             if !production {
                 continue;
             }
-            if pages(config) {
-                self.paging = Paging::Yes;
-            } else if self.paging == Paging::NoneDeclared {
-                self.paging = Paging::No;
-            }
+            self.paging = self.paging.join(pages(config));
         }
     }
 
@@ -194,29 +226,52 @@ fn alertmanager_configs(v: &Value, out: &mut Vec<Mapping>) {
     }
 }
 
-/// Whether any receiver of `config` has a non-empty integration list of a
-/// paging type. The integration type is the key without its `_configs`
-/// (plain config) or `Configs` (`AlertmanagerConfig`) suffix, lower-cased and
-/// without `_`.
-fn pages(config: &Mapping) -> bool {
+/// Whether the receivers of `config` page: `Yes` when one has a non-empty
+/// integration list of a paging type, else `WebhookOnly` when one has a
+/// non-empty webhook list, else `No`. The integration type is the key
+/// without its `_configs` (plain config) or `Configs` (`AlertmanagerConfig`)
+/// suffix, lower-cased and without `_`.
+fn pages(config: &Mapping) -> Paging {
     let receivers = config.get("receivers").and_then(Value::as_sequence);
     receivers
         .into_iter()
         .flatten()
         .filter_map(Value::as_mapping)
         .flat_map(|r| r.iter())
-        .any(|(k, v)| {
-            let Some(k) = k.as_str() else { return false };
-            let Some(kind) = k
-                .strip_suffix("_configs")
-                .or_else(|| k.strip_suffix("Configs"))
-            else {
-                return false;
+        .map(|(k, v)| {
+            let kind = k.as_str().and_then(|k| {
+                k.strip_suffix("_configs")
+                    .or_else(|| k.strip_suffix("Configs"))
+            });
+            let Some(kind) = kind.filter(|_| v.as_sequence().is_some_and(|s| !s.is_empty())) else {
+                return Paging::No;
             };
             let kind = kind.replace('_', "").to_lowercase();
-            PAGING_INTEGRATIONS.contains(&kind.as_str())
-                && v.as_sequence().is_some_and(|s| !s.is_empty())
+            if PAGING_INTEGRATIONS.contains(&kind.as_str()) {
+                Paging::Yes
+            } else if kind == WEBHOOK_INTEGRATION {
+                Paging::WebhookOnly
+            } else {
+                Paging::No
+            }
         })
+        .fold(Paging::No, Paging::join)
+}
+
+/// Whether `v` holds, at any depth, an `alertmanager` mapping whose
+/// `enabled` is false (a boolean, or the string a templated values file
+/// quotes).
+fn alertmanager_off(v: &Value) -> bool {
+    match v {
+        Value::Mapping(m) => m.iter().any(|(k, v)| {
+            let off = k.as_str() == Some("alertmanager")
+                && v.get("enabled")
+                    .is_some_and(|e| e.as_bool() == Some(false) || e.as_str() == Some("false"));
+            off || alertmanager_off(v)
+        }),
+        Value::Sequence(s) => s.iter().any(alertmanager_off),
+        _ => false,
+    }
 }
 
 /// The `PrometheusRule` targets of one kustomization's `patches` and
@@ -269,6 +324,50 @@ mod tests {
         // An empty paging list is no integration.
         let empty = "route:\n  receiver: x\nreceivers:\n- name: x\n  webhook_configs: []\n";
         assert_eq!(repo(&[("alertmanager.yaml", empty)]).paging, Paging::No);
+    }
+
+    #[test]
+    fn a_webhook_is_neither_paging_nor_silent() {
+        let hook = "route:\n  receiver: hook\nreceivers:\n- name: hook\n  webhook_configs:\n  - url: http://bridge:8080/\n";
+        assert_eq!(
+            repo(&[("alertmanager.yml", hook)]).paging,
+            Paging::WebhookOnly
+        );
+        // Chat beside a webhook: still nothing known to page.
+        let both = format!("{hook}- name: chat\n  slack_configs:\n  - channel: '#a'\n");
+        assert_eq!(
+            repo(&[("alertmanager.yml", &both)]).paging,
+            Paging::WebhookOnly
+        );
+        // A pager anywhere wins, in the same config or another.
+        let pager = format!("{hook}- name: pager\n  pagerduty_configs:\n  - routing_key: K\n");
+        assert_eq!(repo(&[("alertmanager.yml", &pager)]).paging, Paging::Yes);
+        assert_eq!(
+            repo(&[("a/alertmanager.yml", hook), ("b/alertmanager.yml", PAGER)]).paging,
+            Paging::Yes
+        );
+        assert_eq!(
+            repo(&[
+                ("a/alertmanager.yml", hook),
+                ("b/alertmanager.yml", SLACK_ONLY)
+            ])
+            .paging,
+            Paging::WebhookOnly
+        );
+    }
+
+    #[test]
+    fn helm_values_can_switch_alertmanager_off() {
+        let off = "alertmanager:\n  enabled: false\n";
+        assert!(repo(&[("deploy/values.yaml", off)]).alertmanager_disabled);
+        let nested = "kube-prometheus-stack:\n  alertmanager:\n    enabled: \"false\"\n";
+        assert!(repo(&[("deploy/values-prod.yml", nested)]).alertmanager_disabled);
+        let on = "alertmanager:\n  enabled: true\n";
+        assert!(!repo(&[("deploy/values.yaml", on)]).alertmanager_disabled);
+        // Only a values file, and only in a production path.
+        assert!(!repo(&[("deploy/settings.yaml", off)]).alertmanager_disabled);
+        assert!(!repo(&[("examples/values.yaml", off)]).alertmanager_disabled);
+        assert!(!repo(&[]).alertmanager_disabled);
     }
 
     #[test]
