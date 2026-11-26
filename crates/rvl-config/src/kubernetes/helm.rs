@@ -22,6 +22,7 @@
 //! vendored in-tree abstains entirely with `helm-unvendored-dependencies`.
 
 use super::manifest::{self, get, Emitter, ProvenanceOracle, RenderedSet};
+use super::release::Release;
 use crate::{render_value, FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde_yaml::Value;
 use std::path::Path;
@@ -672,6 +673,7 @@ pub(crate) fn retrieve(
             file_anchor: template_rel,
             snapshot_id,
             oracle: &oracle,
+            release: Release::Chart,
             out: Vec::new(),
         };
         for doc in docs {

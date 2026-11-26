@@ -19,6 +19,7 @@
 //! nothing from it and the rendered set stays complete.
 
 use super::manifest::{self, get, lookup, Emitter, ProvenanceOracle, RenderedSet};
+use super::release::Release;
 use crate::{FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -611,6 +612,7 @@ impl ProvenanceOracle for KustomizeOracle<'_> {
 /// Resolve one kustomization's resource tree into packets.
 pub(crate) fn retrieve(
     root: &Path,
+    release: Release,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
@@ -652,6 +654,7 @@ pub(crate) fn retrieve(
             file_anchor: rel_path,
             snapshot_id,
             oracle: &oracle,
+            release,
             out: Vec::new(),
         };
         manifest::packets_from_doc(r.doc(), &set, &mut em);
@@ -775,7 +778,7 @@ spec:
 
     fn run(root: &Path, krel: &str) -> Retrieved {
         let contents = std::fs::read_to_string(root.join(krel)).unwrap();
-        retrieve(root, krel, &contents, "snap")
+        retrieve(root, Release::Rootless, krel, &contents, "snap")
     }
 
     fn find<'a>(got: &'a Retrieved, unit: &str, key: &str) -> &'a ConfigPacket {

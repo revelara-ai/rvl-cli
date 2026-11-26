@@ -25,6 +25,12 @@
 //!     the image reference itself), `container.image-pull-policy`
 //!     (documented conditional default: Always for latest/untagged,
 //!     IfNotPresent otherwise)
+//!   * the release facts (RC-014, see [`super::release`]):
+//!     `container.image.tag-mutable` (Deployment/StatefulSet containers;
+//!     derived: `true` | `false`, never the image reference) and
+//!     `workload.revision-history-limit` (an `apps/` Deployment; default
+//!     10), each carried as [`crate::UNDECIDED_PREFIX`] and why when the
+//!     shared classifier or a repository fact says it is not judged
 //!   * nothing is emitted for a manifest that is not deployed to
 //!     production (see [`crate::non_production`] and [`super::dispatch`]):
 //!     the specs abstain on what is not deployed
@@ -72,6 +78,7 @@
 //! they do not demote these defaults to `unresolvable` (contrast the
 //! GITHUB_TOKEN default, which always exists org-side).
 
+use super::release::{self, Release, REVISION_HISTORY_KEY, TAG_MUTABLE_KEY};
 use crate::{render_value, ConfigPacket, FormatSighting, ProvenanceStep, Resolution, Retrieved};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -156,6 +163,8 @@ pub(super) struct Emitter<'a> {
     pub file_anchor: &'a str,
     pub snapshot_id: &'a str,
     pub oracle: &'a dyn ProvenanceOracle,
+    /// What the repository says about how the workloads are released.
+    pub release: Release<'a>,
     pub out: Vec<ConfigPacket>,
 }
 
@@ -1016,6 +1025,44 @@ fn emit_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter) {
         return;
     }
 
+    // The release facts (RC-014), of a long-running workload: can a
+    // rollback return to the image and the ReplicaSet that ran before? A
+    // workload with no containers is a fragment another file completes.
+    let release_why = match lookup(doc, &format!("{prefix}.containers")) {
+        _ if !replicated(kind) => None,
+        Some(Value::Sequence(c)) if !c.is_empty() => release::unit_reason(
+            em.release,
+            em.file_anchor,
+            name,
+            namespace_of(doc).as_deref(),
+        ),
+        _ => Some("no containers: a fragment another file completes".to_string()),
+    };
+    let apps_group = dig(doc, &["apiVersion"])
+        .and_then(Value::as_str)
+        .is_some_and(|v| v.starts_with("apps/"));
+    if kind == "Deployment" && apps_group {
+        const PATH: &str = "spec.revisionHistoryLimit";
+        match &release_why {
+            Some(why) => em.undecided(
+                &unit,
+                REVISION_HISTORY_KEY,
+                doc,
+                PATH,
+                "revisionHistoryLimit",
+                why,
+            ),
+            None => em.setting(
+                &unit,
+                REVISION_HISTORY_KEY,
+                doc,
+                PATH,
+                "revisionHistoryLimit",
+                "10",
+            ),
+        }
+    }
+
     em.setting(
         &unit,
         "pod.termination-grace-period-seconds",
@@ -1225,8 +1272,29 @@ fn emit_doc(doc: &Value, set: &RenderedSet, em: &mut Emitter) {
                     );
                 }
             }
+            if replicated(kind) {
+                let path = format!("{cpath}.image");
+                match release_why
+                    .clone()
+                    .map_or_else(|| release::tag_mutable(em.release, image), Err)
+                {
+                    Ok(v) => em.derived(
+                        &cunit,
+                        TAG_MUTABLE_KEY,
+                        &path,
+                        &format!("{path} (tag mutability)"),
+                        v,
+                    ),
+                    Err(why) => em.undecided(&cunit, TAG_MUTABLE_KEY, doc, &path, "image", &why),
+                }
+            }
         }
     }
+}
+
+/// Whether `key` is one of the release facts (RC-014).
+fn release_key(key: &str) -> bool {
+    key == TAG_MUTABLE_KEY || key == REVISION_HISTORY_KEY
 }
 
 /// Parse a manifest file into documents. Docs parsed before a syntax error
@@ -1251,6 +1319,7 @@ pub(super) fn parse_docs(contents: &str) -> (Vec<Value>, bool) {
 /// platform default. `root` lets PDB coverage see the file's directory.
 pub(super) fn retrieve_plain(
     root: Option<&Path>,
+    release: Release,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
@@ -1280,6 +1349,7 @@ pub(super) fn retrieve_plain(
         file_anchor: rel_path,
         snapshot_id,
         oracle: &oracle,
+        release,
         out: Vec::new(),
     };
     for doc in &docs {
@@ -1287,6 +1357,11 @@ pub(super) fn retrieve_plain(
     }
     if crate::non_production::patch_fragment(root, rel_path) {
         crate::non_production::undecide_fragment_absences(&mut em.out);
+        // A fragment's release facts are the rendered workload's, which a
+        // base and its overlays decide together.
+        for p in em.out.iter_mut().filter(|p| release_key(&p.key)) {
+            crate::non_production::undecide(p, crate::non_production::FRAGMENT_REASON);
+        }
     }
     out.packets = em.out;
     out
@@ -1298,7 +1373,7 @@ mod tests {
     use crate::{ConfigPacket, Resolution};
 
     fn packets(yaml: &str) -> Retrieved {
-        retrieve_plain(None, "k8s/deploy.yaml", yaml, "snap")
+        retrieve_plain(None, Release::Rootless, "k8s/deploy.yaml", yaml, "snap")
     }
 
     fn find<'a>(got: &'a Retrieved, unit: &str, key: &str) -> &'a ConfigPacket {
@@ -1397,7 +1472,13 @@ spec:
     fn a_bare_deployment_still_carries_replicas_and_probes() {
         // The gates below leave the deployed, long-running case alone: one
         // replica and no probes still reach the specs that flag them.
-        let got = retrieve_plain(None, "deploy/k8s/web.yaml", BARE_DEPLOY, "snap");
+        let got = retrieve_plain(
+            None,
+            Release::Rootless,
+            "deploy/k8s/web.yaml",
+            BARE_DEPLOY,
+            "snap",
+        );
         let replicas = find(&got, "deployment:web", "workload.replicas");
         assert_eq!(replicas.resolved_value.as_deref(), Some("1"));
         for key in ["container.liveness-probe", "container.readiness-probe"] {
@@ -1473,7 +1554,7 @@ spec:
             "kubernetes/apps/web/patches/web.yaml",
             "components/web/base/deploy.yaml",
         ] {
-            let got = retrieve_plain(None, path, &patch, "snap");
+            let got = retrieve_plain(None, Release::Rootless, path, &patch, "snap");
             assert_eq!(
                 value_of(&got, "deployment:web", "workload.replicas"),
                 FRAGMENT
@@ -1493,7 +1574,13 @@ spec:
         }
         // A patch that sets replicas authors that key.
         let scaled = BARE_DEPLOY.replace("spec:\n  template:", "spec:\n  replicas: 1\n  template:");
-        let got = retrieve_plain(None, "config/default/replicas_patch.yaml", &scaled, "snap");
+        let got = retrieve_plain(
+            None,
+            Release::Rootless,
+            "config/default/replicas_patch.yaml",
+            &scaled,
+            "snap",
+        );
         assert_eq!(value_of(&got, "deployment:web", "workload.replicas"), "1");
 
         // A kustomization in the same directory lists the patch by path.
@@ -1505,14 +1592,26 @@ spec:
             "resources: [../base]\npatchesJson6902:\n- path: ./web.yaml\n  target: {kind: Deployment, name: web}\n",
         )
         .unwrap();
-        let got = retrieve_plain(Some(dir.path()), "overlay/web.yaml", &patch, "snap");
+        let got = retrieve_plain(
+            Some(dir.path()),
+            Release::Rootless,
+            "overlay/web.yaml",
+            &patch,
+            "snap",
+        );
         assert_eq!(
             value_of(&got, "deployment:web", "workload.replicas"),
             FRAGMENT
         );
 
         // The base, a whole workload, still carries the default the specs flag.
-        let got = retrieve_plain(Some(dir.path()), "base/web.yaml", BARE_DEPLOY, "snap");
+        let got = retrieve_plain(
+            Some(dir.path()),
+            Release::Rootless,
+            "base/web.yaml",
+            BARE_DEPLOY,
+            "snap",
+        );
         assert_eq!(value_of(&got, "deployment:web", "workload.replicas"), "1");
         assert_eq!(
             value_of(
@@ -1529,7 +1628,7 @@ spec:
             "          image: web:v1\n",
             &format!("          image: web:v1\n{probes}"),
         );
-        retrieve_plain(None, "deploy/web.yaml", &yaml, "snap")
+        retrieve_plain(None, Release::Rootless, "deploy/web.yaml", &yaml, "snap")
     }
 
     const LIVENESS: &str =
@@ -1591,7 +1690,13 @@ spec:
                 "          image: web:v1\n",
                 &format!("          image: web:v1\n{args}"),
             );
-        retrieve_plain(None, "config/manager/manager.yaml", &yaml, "snap")
+        retrieve_plain(
+            None,
+            Release::Rootless,
+            "config/manager/manager.yaml",
+            &yaml,
+            "snap",
+        )
     }
 
     #[test]
@@ -2135,7 +2240,13 @@ spec:
             .find(|(name, _)| *name == "deploy.yaml")
             .expect("the fixture names deploy.yaml")
             .1;
-        retrieve_plain(Some(dir.path()), "k8s/deploy.yaml", own, "snap")
+        retrieve_plain(
+            Some(dir.path()),
+            Release::Rootless,
+            "k8s/deploy.yaml",
+            own,
+            "snap",
+        )
     }
 
     fn coverage(got: &Retrieved) -> Option<&ConfigPacket> {
@@ -2580,7 +2691,7 @@ spec:
             ("deploy/datastore/db/template.yaml", "db-$NAME"),
             ("k8s/api.yaml", "api-${SUFFIX}"),
         ] {
-            let got = retrieve_plain(None, path, &workload(name, "1"), "snap");
+            let got = retrieve_plain(None, Release::Rootless, path, &workload(name, "1"), "snap");
             let rows = judged_rows(&got, name);
             assert_eq!(rows.len(), 5, "{name}: {:?}", got.packets);
             for p in rows {
@@ -2595,6 +2706,7 @@ spec:
         // The same file with a name the API accepts is judged.
         let got = retrieve_plain(
             None,
+            Release::Rootless,
             "k8s/deployment.yaml",
             &workload("board-deployment", "1"),
             "snap",
@@ -2616,7 +2728,7 @@ spec:
     #[test]
     fn a_workload_scaled_to_zero_abstains() {
         let path = "infra/k8s/db/deployment.yaml";
-        let got = retrieve_plain(None, path, &workload("db", "0"), "snap");
+        let got = retrieve_plain(None, Release::Rootless, path, &workload("db", "0"), "snap");
         let rows = judged_rows(&got, "db");
         assert_eq!(rows.len(), 5, "{:?}", got.packets);
         for p in rows {
@@ -2627,7 +2739,7 @@ spec:
                 p.key
             );
         }
-        let got = retrieve_plain(None, path, &workload("db", "1"), "snap");
+        let got = retrieve_plain(None, Release::Rootless, path, &workload("db", "1"), "snap");
         assert_eq!(value_of(&got, "deployment:db", "workload.replicas"), "1");
         assert_eq!(
             value_of(
