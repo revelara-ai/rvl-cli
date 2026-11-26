@@ -10188,12 +10188,12 @@ mod tests {
             [
                 "repo_structure.RC-033",
                 "repo_structure.RC-057",
-                "repo_structure.RC-058",
                 "repo_structure.RC-034",
                 "repo_structure.RC-070",
                 "repo_structure.RC-006",
                 "repo_structure.RC-027",
                 "repo_structure.RC-040",
+                "repo_structure.RC-069",
             ]
         );
         let snapshot = snapshot_name(dir.path());

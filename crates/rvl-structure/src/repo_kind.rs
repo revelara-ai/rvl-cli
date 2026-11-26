@@ -69,7 +69,7 @@ pub const MAX_EVIDENCE: usize = 2;
 /// Directories whose contents do not say what the repository is: samples of
 /// what it works on, its tests, its docs. Matched on any path component,
 /// lowercased, in addition to the inventory's vendored and build directories.
-const NOT_THE_REPO: &[&str] = &[
+pub(crate) const NOT_THE_REPO: &[&str] = &[
     "test",
     "tests",
     "testdata",
@@ -379,19 +379,11 @@ fn file(root: &Path, path: &Path, name: &str, s: &mut Signals) {
         .unwrap_or("")
         .to_ascii_lowercase();
     let rp = rel(root, path);
-    if name == "Dockerfile" || name.starts_with("Dockerfile.") || ext == "dockerfile" {
-        if dockerfile_serves(&read_capped(path)) {
-            note(&mut s.deploy, "Dockerfile that serves", &rp);
-        }
-    } else if name == "Chart.yaml" {
-        note(&mut s.deploy, "Helm chart", &rp);
-    } else if name == "Procfile" {
-        if read_capped(path).lines().any(|l| l.starts_with("web:")) {
-            note(&mut s.deploy, "Procfile web process", &rp);
-        }
-    } else if ext == "yaml" || ext == "yml" {
-        if s.deploy.len() < MAX_EVIDENCE && k8s_workload(&read_capped(path)) {
-            note(&mut s.deploy, "Kubernetes workload", &rp);
+    if may_deploy(name, &ext) {
+        if s.deploy.len() < MAX_EVIDENCE {
+            if let Some(what) = deployment(path, name, &ext) {
+                note(&mut s.deploy, what, &rp);
+            }
         }
     } else if is_source(&ext) && !is_test_source(name) {
         s.sources += 1;
@@ -407,6 +399,48 @@ fn file(root: &Path, path: &Path, name: &str, s: &mut Signals) {
             note(&mut s.main, "main", &rp);
         }
     }
+}
+
+/// Whether a file named `name`, extension `ext` (lowercased), is of a kind
+/// that can be a deployment manifest: a Dockerfile, a Helm chart, a
+/// Procfile or YAML.
+pub(crate) fn may_deploy(name: &str, ext: &str) -> bool {
+    name == "Dockerfile"
+        || name.starts_with("Dockerfile.")
+        || ext == "dockerfile"
+        || name == "Chart.yaml"
+        || name == "Procfile"
+        || ext == "yaml"
+        || ext == "yml"
+}
+
+/// The deployment manifest the file at `path` is, if it is one: a
+/// Dockerfile that exposes a port, a Helm chart, a Procfile `web` process or
+/// a Kubernetes workload. Read only when [`may_deploy`].
+pub(crate) fn deployment(path: &Path, name: &str, ext: &str) -> Option<&'static str> {
+    if name == "Dockerfile" || name.starts_with("Dockerfile.") || ext == "dockerfile" {
+        dockerfile_serves(&read_capped(path)).then_some("Dockerfile that serves")
+    } else if name == "Chart.yaml" {
+        Some("Helm chart")
+    } else if name == "Procfile" {
+        read_capped(path)
+            .lines()
+            .any(|l| l.starts_with("web:"))
+            .then_some("Procfile web process")
+    } else if ext == "yaml" || ext == "yml" {
+        k8s_workload(&read_capped(path)).then_some("Kubernetes workload")
+    } else {
+        None
+    }
+}
+
+/// The server entry-point markers for a source file of extension `ext`
+/// (lowercased).
+pub(crate) fn listener_markers(ext: &str) -> impl Iterator<Item = &'static str> + '_ {
+    LISTENERS
+        .iter()
+        .filter(move |(exts, _)| exts.contains(&ext))
+        .flat_map(|(_, markers)| markers.iter().copied())
 }
 
 /// Whether `text`, the source of a file with extension `ext` (lowercased),

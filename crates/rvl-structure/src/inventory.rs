@@ -3,7 +3,7 @@
 //! Contents are read locally to detect markers; no source text is stored.
 
 use crate::sast::{self, SastFacts};
-use crate::{deploy, error_reporting, repo_kind, runbooks, DeploySite};
+use crate::{error_reporting, limiter, repo_kind, runbooks};
 use crate::{
     CiScanFacts, EcosystemFacts, ManifestFacts, RepoStructure, RunbookFacts, ScannerClass,
     ScannerFacts,
@@ -160,6 +160,7 @@ struct Acc {
     ci_scans: CiScanFacts,
     scanners: BTreeSet<ScannerFacts>,
     error_reporting: error_reporting::Acc,
+    limiter: limiter::Acc,
     /// The workflow files that parsed, by repo-relative path, for RC-040's
     /// walk across reusable-workflow calls.
     workflows: Vec<(String, Value)>,
@@ -171,8 +172,6 @@ struct Acc {
     repo_token: Option<&'static str>,
     /// Non-test source files that are the repository's own production code.
     production_sources: u32,
-    deploy_sites: Vec<DeploySite>,
-    gitops: deploy::GitOps,
     servers: Vec<String>,
     walk_complete: bool,
 }
@@ -226,9 +225,6 @@ pub fn inventory(root: &Path) -> RepoStructure {
 
     acc.workflows.sort_by(|a, b| a.0.cmp(&b.0));
     sast::github(&acc.workflows, &acc.golangci, &mut acc.sast);
-    deploy::github(&acc.workflows, &mut acc.deploy_sites);
-    acc.gitops
-        .sites(deploy::origin(root).as_deref(), &mut acc.deploy_sites);
     acc.sast.other_ci.sort();
     acc.servers.sort();
     resolve_lockfiles(root, &mut acc.manifests);
@@ -273,7 +269,7 @@ pub fn inventory(root: &Path) -> RepoStructure {
         server_entry_points: acc.servers,
         sast: acc.sast,
         production_sources: Some(acc.production_sources),
-        deploy_sites: deploy::finish(acc.deploy_sites),
+        limiter: Some(acc.limiter.finish(root)),
         repo_kind: repo_kind::repo_kind(root),
         walk_complete: acc.walk_complete,
     }
@@ -489,6 +485,7 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     }
 
     error_reporting::observe(path, &rp, name, &ext, &mut acc.error_reporting);
+    limiter::observe(path, &rp, name, &ext, &mut acc.limiter);
 
     // --- CI scanners (Q21/Q22): GitHub Actions workflows only ---
     if is_gha_workflow {
@@ -498,14 +495,6 @@ fn classify_file(root: &Path, path: &Path, name: &str, acc: &mut Acc) {
     if rp == ".gitlab-ci.yml" {
         let text = read_capped(path);
         sast::gitlab(&rp, &text, &acc.golangci, &mut acc.sast);
-        deploy::gitlab(&rp, &text, &mut acc.deploy_sites);
-    }
-    // --- RC-058: GitOps manifests that may deploy this repository ---
-    if matches!(ext.as_str(), "yaml" | "yml")
-        && !is_ci_file
-        && non_production::reason(acc.repo_token, &rp).is_none()
-    {
-        acc.gitops.observe(&rp, &read_capped(path));
     }
     if sast::OTHER_CI.contains(&rp.as_str()) {
         acc.sast.other_ci.push(rp.clone());

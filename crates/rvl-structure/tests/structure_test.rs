@@ -333,192 +333,6 @@ fn rc057_absence_claim_names_the_search_that_backs_it() {
     );
 }
 
-// --- RC-058: integration/e2e test presence (live catalog: Integration and Smoke Tests) ---
-
-#[test]
-fn rc058_integration_dir_satisfies() {
-    let dir = tempfile::tempdir().unwrap();
-    go_repo_without_tests(dir.path());
-    write(
-        dir.path(),
-        "tests/integration/api_test.go",
-        "package integration\nfunc TestAPI(t *testing.T) {}\n",
-    );
-    let fs = eval_dir(dir.path());
-    assert_eq!(finding(&fs, "RC-058").verdict, Verdict::Satisfies);
-}
-
-#[test]
-fn rc058_e2e_config_satisfies() {
-    let dir = tempfile::tempdir().unwrap();
-    for i in 0..6 {
-        write(dir.path(), &format!("src/m{i}.ts"), "export const x = 1;\n");
-    }
-    write(dir.path(), "playwright.config.ts", "export default {};\n");
-    assert_eq!(
-        finding(&eval_dir(dir.path()), "RC-058").verdict,
-        Verdict::Satisfies
-    );
-}
-
-#[test]
-fn rc058_unit_tests_only_abstains() {
-    let dir = tempfile::tempdir().unwrap();
-    go_repo_without_tests(dir.path());
-    write(
-        dir.path(),
-        "internal/svc/f0_test.go",
-        "package svc\nfunc TestF(t *testing.T) {}\n",
-    );
-    let f = &eval_dir(dir.path())[..];
-    let f = finding(f, "RC-058");
-    assert_eq!(
-        f.verdict,
-        Verdict::Abstain,
-        "integration tests may not follow a detectable convention: {}",
-        f.reason
-    );
-}
-
-/// A workflow whose one job runs `steps` on push to main, with `job_keys`
-/// (an `environment:`) on the job.
-fn deploy_wf(job_keys: &str, steps: &str) -> String {
-    format!(
-        "on:\n  push:\n    branches: [main]\njobs:\n  ship:\n    runs-on: ubuntu-latest\n{job_keys}    steps:\n      - uses: actions/checkout@v4\n{steps}"
-    )
-}
-
-#[test]
-fn rc058_a_deploy_site_without_any_test_violates() {
-    for (file, text, deploys) in [
-        (
-            ".github/workflows/deploy.yml",
-            deploy_wf("    environment: production\n", "      - run: ./ship.sh\n"),
-            "a job with an environment",
-        ),
-        (
-            ".github/workflows/deploy.yml",
-            deploy_wf("", "      - run: |\n          helm upgrade --install api ./chart \\\n            --wait\n"),
-            "helm upgrade",
-        ),
-        (
-            ".gitlab-ci.yml",
-            "deploy:\n  script:\n    - kubectl apply -f k8s/\n".to_string(),
-            "kubectl apply",
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        write(dir.path(), file, &text);
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        assert_eq!(f.verdict, Verdict::Violates, "{file}: {f:?}");
-        assert!(f.reason.contains(&format!("{file} ({deploys})")), "{f:?}");
-        assert_eq!(f.evidence, vec![file.to_string()]);
-    }
-}
-
-/// A repository that deploys nothing has no site for a smoke test to follow:
-/// a package publish, a release upload, an image push, tests and CodeQL only,
-/// no CI at all.
-#[test]
-fn rc058_abstains_without_a_deploy_site() {
-    let publish = deploy_wf(
-        "    environment: nuget\n",
-        "      - run: dotnet pack -c Release\n      - run: dotnet nuget push out/*.nupkg\n",
-    );
-    let release = deploy_wf(
-        "",
-        "      - run: go build -o dist/tool ./cmd/tool\n      - run: gh release upload v1 dist/tool\n",
-    );
-    let image = deploy_wf(
-        "",
-        "      - run: docker build -t ghcr.io/o/api:latest .\n      - run: docker push ghcr.io/o/api:latest\n",
-    );
-    let checks = "on: [pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n      - uses: github/codeql-action/analyze@v3\n      - run: kubectl apply --dry-run=client -f k8s/\n";
-    for workflow in [
-        Some(publish),
-        Some(release),
-        Some(image),
-        Some(checks.to_string()),
-        None,
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        if let Some(text) = &workflow {
-            write(dir.path(), ".github/workflows/ci.yml", text);
-        }
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        assert_eq!(f.verdict, Verdict::Abstain, "{workflow:?}: {f:?}");
-        assert!(f.reason.contains("no deploy site found"), "{f:?}");
-    }
-}
-
-/// An Argo CD Application or a Flux Kustomization or HelmRelease is a deploy
-/// site when it deploys this repository by its `origin` remote; one that
-/// deploys another repository, the Flux bootstrap sync, or an example is not.
-#[test]
-fn rc058_a_gitops_manifest_of_this_repository_is_a_deploy_site() {
-    const ORIGIN: &str =
-        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@example.com:o/api.git\n";
-    let argo = |url: &str| {
-        format!("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\nspec:\n  source:\n    repoURL: {url}\n    path: deploy\n")
-    };
-    let flux = |name: &str, consumer: &str| {
-        format!(
-            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: {name}\nspec:\n  url: https://example.com/o/api\n---\n{consumer}"
-        )
-    };
-    let kustomization = |name: &str| {
-        format!("apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: api\nspec:\n  path: ./deploy\n  sourceRef:\n    kind: GitRepository\n    name: {name}\n")
-    };
-    let helm_release = "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: api\nspec:\n  chart:\n    spec:\n      chart: ./chart\n      sourceRef:\n        kind: GitRepository\n        name: api\n";
-    for (path, text, deploys) in [
-        (
-            "deploy/argo/app.yaml",
-            argo("https://example.com/o/api.git"),
-            Some("an Argo CD Application"),
-        ),
-        (
-            "deploy/argo/app.yaml",
-            argo("https://example.com/o/other.git"),
-            None,
-        ),
-        (
-            "examples/argo/app.yaml",
-            argo("https://example.com/o/api.git"),
-            None,
-        ),
-        (
-            "clusters/prod/api.yaml",
-            flux("api", &kustomization("api")),
-            Some("a Flux Kustomization"),
-        ),
-        (
-            "clusters/prod/api.yaml",
-            flux("api", helm_release),
-            Some("a Flux HelmRelease"),
-        ),
-        (
-            "clusters/prod/sync.yaml",
-            flux("flux-system", &kustomization("flux-system")),
-            None,
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        go_repo_without_tests(dir.path());
-        write(dir.path(), ".git/config", ORIGIN);
-        write(dir.path(), path, &text);
-        let f = finding(&eval_dir(dir.path()), "RC-058").clone();
-        match deploys {
-            Some(d) => {
-                assert_eq!(f.verdict, Verdict::Violates, "{path}: {f:?}");
-                assert!(f.reason.contains(&format!("{path} ({d})")), "{f:?}");
-            }
-            None => assert_eq!(f.verdict, Verdict::Abstain, "{path}: {f:?}"),
-        }
-    }
-}
-
 // --- RC-034: contract-test frameworks (live catalog: Contract Testing) ---
 
 #[test]
@@ -1173,6 +987,17 @@ fn ci_scans_a_record_without_the_fact_still_parses_and_decides_nothing() {
     assert_eq!(parsed.scanner_seen(ScannerClass::Sast), None);
 }
 
+// A record written before the RC-058 row was removed carries
+// `deploy_sites`; it still parses, and no RC-058 row comes of it.
+#[test]
+fn a_record_with_deploy_sites_still_parses_and_yields_no_rc058_row() {
+    let old = r#"{"kind":"repo_structure","snapshot_id":"s","ecosystems":[],"deploy_sites":[{"file":".gitlab-ci.yml","deploys":"kubectl apply"}],"walk_complete":true}"#;
+    let parsed = parse_record(old).expect("an older record still parses");
+    assert!(evaluate(&parsed, TODAY)
+        .iter()
+        .all(|f| f.control != "RC-058"));
+}
+
 #[test]
 fn ci_scans_round_trip_through_a_packet_stream() {
     let dir = tempfile::tempdir().unwrap();
@@ -1209,7 +1034,7 @@ fn evaluate_emits_one_finding_per_control_every_time() {
     let controls: Vec<&str> = fs.iter().map(|f| f.control).collect();
     assert_eq!(
         controls,
-        vec!["RC-033", "RC-057", "RC-058", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040"],
+        vec!["RC-033", "RC-057", "RC-034", "RC-070", "RC-006", "RC-027", "RC-040", "RC-069"],
         "abstain/satisfies outcomes are part of the record, never dropped"
     );
 }
@@ -2036,4 +1861,122 @@ fn rc040_a_pull_request_make_lint_wins_over_codeql_off_the_pull_request_path() {
     ]);
     assert_eq!(f.verdict, Verdict::Satisfies, "{f:?}");
     assert_eq!(f.evidence, vec![".github/workflows/lint.yml"]);
+}
+
+// --- RC-069: ingress rate limiting and load shedding ---
+
+const GIN_SERVER: &str = "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc main() {\n\tr := gin.New()\n\tr.GET(\"/orders\", listOrders)\n\thttp.ListenAndServe(\":8080\", r)\n}\n";
+
+/// A Go web service with a Deployment and no limiter anywhere.
+fn unlimited_service(root: &Path) {
+    write(root, "go.mod", "module example.com/orders\n\ngo 1.22\n");
+    write(root, "cmd/orders/main.go", GIN_SERVER);
+    write(
+        root,
+        "deploy/orders.yaml",
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: orders\n",
+    );
+    write(root, "README.md", "# orders\n\nNo rate limit yet.\n");
+    write(
+        root,
+        "internal/testutil/limit.go",
+        "package testutil // throttle\n",
+    );
+}
+
+fn rc069(root: &Path) -> StructureFinding {
+    finding(&eval_dir(root), "RC-069").clone()
+}
+
+#[test]
+fn rc069_a_service_with_no_limiter_vocabulary_violates() {
+    let dir = tempfile::tempdir().unwrap();
+    unlimited_service(dir.path());
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Violates, "reason: {}", f.reason);
+    assert_eq!(f.evidence, ["cmd/orders/main.go", "deploy/orders.yaml"]);
+    assert!(f.reason.contains("rate limit"), "{}", f.reason);
+}
+
+#[test]
+fn rc069_a_limiter_in_middleware_or_an_ingress_annotation_satisfies() {
+    for (rp, text) in [
+        (
+            "internal/middleware/limit.go",
+            "package middleware\n\nimport \"golang.org/x/time/rate\"\n\nvar l = rate.NewLimiter(10, 20)\n",
+        ),
+        (
+            "deploy/ingress.yaml",
+            "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  annotations:\n    nginx.ingress.kubernetes.io/limit-rps: \"20\"\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        unlimited_service(dir.path());
+        write(dir.path(), rp, text);
+        let f = rc069(dir.path());
+        assert_eq!(f.verdict, Verdict::Satisfies, "{rp}: {}", f.reason);
+        assert_eq!(f.evidence, [rp]);
+    }
+}
+
+#[test]
+fn rc069_a_server_on_a_unix_socket_only_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    unlimited_service(dir.path());
+    write(
+        dir.path(),
+        "cmd/orders/main.go",
+        "package main\n\nfunc main() {\n\tlis, _ := net.Listen(\"unix\", \"/run/orders.sock\")\n\tgrpc.NewServer().Serve(lis)\n}\n",
+    );
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Abstain, "reason: {}", f.reason);
+    assert!(f.reason.contains("unix socket"), "{}", f.reason);
+}
+
+#[test]
+fn rc069_a_csi_driver_or_a_teaching_repository_abstains_by_its_name() {
+    for name in ["spdk-csi", "kubernetes-bootcamp"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(name);
+        unlimited_service(&root);
+        let f = rc069(&root);
+        assert_eq!(f.verdict, Verdict::Abstain, "{name}: {}", f.reason);
+    }
+}
+
+#[test]
+fn rc069_teaching_scrape_only_and_non_production_servers_do_not_count() {
+    for (server, deploy) in [
+        ("chapter3/main.go", "deploy/orders.yaml"),
+        ("cmd/metrics/main.go", "deploy/orders.yaml"),
+        ("cmd/orders/main.go", "sample-app/orders.yaml"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/orders\n");
+        write(dir.path(), server, GIN_SERVER);
+        write(
+            dir.path(),
+            deploy,
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: orders\n",
+        );
+        let f = rc069(dir.path());
+        assert_eq!(
+            f.verdict,
+            Verdict::Abstain,
+            "{server} {deploy}: {}",
+            f.reason
+        );
+    }
+}
+
+/// A tool or a library is not judged, and a record from an earlier scanner
+/// has no RC-069 facts.
+#[test]
+fn rc069_abstains_outside_a_service_and_without_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "main.go", GIN_SERVER);
+    let f = rc069(dir.path());
+    assert_eq!(f.verdict, Verdict::Abstain, "no deployment: {}", f.reason);
+    let f = finding(&evaluate(&RepoStructure::default(), TODAY), "RC-069").clone();
+    assert_eq!(f.verdict, Verdict::Abstain, "{}", f.reason);
 }

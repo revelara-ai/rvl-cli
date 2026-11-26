@@ -34,6 +34,10 @@
 //! A job that publishes also gets `job.release_supply_chain`: which RC-079
 //! rule the file proves about its SBOM, provenance and pins (see `release`).
 //!
+//! A job that deploys gets `job.post-deploy-check` (RC-058): `none`, or
+//! `undecided:` and why, with the guard predicate `job.deploy-class` (see
+//! `post_deploy`).
+//!
 //! Anything else in a workflow file is not inventoried: the key list is
 //! spec-driven, exactly as the typed retrievers only inventory client calls.
 
@@ -43,6 +47,7 @@ use crate::{
 };
 use serde_yaml::Value;
 
+mod post_deploy;
 mod release;
 mod static_key;
 
@@ -94,7 +99,30 @@ impl ConfigRetriever for GithubActions {
             rel_path,
             contents,
             snapshot_id,
+            &post_deploy::FollowUps::read([(rel_path, contents)]),
         )
+    }
+
+    /// Every workflow of the scan is read once for the follow-up workflows
+    /// a deploy job's fact asks about.
+    fn retrieve_all(
+        &self,
+        root: &std::path::Path,
+        files: &[(String, String)],
+        snapshot_id: &str,
+    ) -> Retrieved {
+        let follow_ups =
+            post_deploy::FollowUps::read(files.iter().map(|(p, t)| (p.as_str(), t.as_str())));
+        let repo = crate::non_production::root_token(root);
+        let mut out = Retrieved::default();
+        for (rel, contents) in files {
+            let got = retrieve_in(repo, rel, contents, snapshot_id, &follow_ups);
+            out.packets.extend(got.packets);
+            out.predicates.extend(got.predicates);
+            out.unparseable += got.unparseable;
+            out.sightings.extend(got.sightings);
+        }
+        out
     }
 }
 
@@ -165,15 +193,18 @@ fn step_publishes_image(step: &serde_yaml::Mapping) -> bool {
 }
 
 fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-    retrieve_in(None, rel_path, contents, snapshot_id)
+    let follow_ups = post_deploy::FollowUps::read([(rel_path, contents)]);
+    retrieve_in(None, rel_path, contents, snapshot_id, &follow_ups)
 }
 
-/// Retrieve one file; `repo` is the scanned root's sample token, if any.
+/// Retrieve one file; `repo` is the scanned root's sample token, if any,
+/// and `follow_ups` what the scan's workflows say runs after another.
 fn retrieve_in(
     repo: Option<&'static str>,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
+    follow_ups: &post_deploy::FollowUps,
 ) -> Retrieved {
     let mut out = Retrieved::default();
     let Ok(doc) = serde_yaml::from_str::<Value>(contents) else {
@@ -312,6 +343,8 @@ fn retrieve_in(
         out.packets
             .push(static_key_packet("workflow", "env", &k, None));
     }
+    let deploy_wf =
+        post_deploy::Workflow::new(repo, rel_path, stem, contents, root, jobs, follow_ups);
 
     for (job_key, job_val) in jobs {
         let Some(job_id) = job_key.as_str() else {
@@ -349,6 +382,22 @@ fn retrieve_in(
                 Some(r.value),
                 Resolution::AsAuthored,
                 vec![ProvenanceStep::new(rel_path, &r.publish_path, "explicit")],
+            ));
+        }
+
+        // job.post-deploy-check: only a job that deploys is judged.
+        if let Some(site) = post_deploy::judge(&deploy_wf, job_id, job) {
+            out.packets.push(packet(
+                &unit,
+                crate::deploy_check::KEY,
+                Some(site.value),
+                Resolution::AsAuthored,
+                vec![ProvenanceStep::new(rel_path, &site.path, "explicit")],
+            ));
+            out.predicates.push(predicate(
+                &unit,
+                crate::deploy_check::CLASS_KEY,
+                vec![site.class.to_string()],
             ));
         }
 

@@ -17,13 +17,13 @@
 //! [`sast`] reads the SAST steps of the repository's CI, each with whether it
 //! runs on the pull-request path and fails its job, for RC-040.
 //!
-//! [`deploy`] reads where the repository deploys: a CI job or step that
-//! deploys to an environment, or a GitOps manifest that deploys this
-//! repository. RC-058 violates only in a repository with one.
-//!
 //! [`repo_kind`] reads, from the same tree, whether the repository is a
 //! service, a tool or a library, for the rules that block only in a service:
 //! RC-027 and RC-040 violate only in a repository read as a service.
+//!
+//! [`limiter`] reads whether a service names a rate limiter or a load
+//! shedder anywhere in its code or config, for RC-069, which also violates
+//! only in a repository read as a service.
 //!
 //! Privacy: facts are shape-only — file names, counts, and presence booleans.
 //! Content is read locally to detect markers (a `#[cfg(test)]` attribute, a
@@ -33,16 +33,16 @@ use rvl_core::Verdict;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-mod deploy;
 mod error_reporting;
 mod inventory;
+mod limiter;
 mod makefile;
 mod repo_kind;
 mod runbooks;
 mod sast;
 
-pub use deploy::DeploySite;
 pub use inventory::inventory;
+pub use limiter::{LimiterFacts, LIMITER_VOCABULARY};
 pub use repo_kind::{in_service_code, repo_kind, RepoKind, RepoKindFacts};
 pub use sast::{OnFailure, PrPath, SastFacts, SastStep};
 
@@ -259,12 +259,10 @@ pub struct RepoStructure {
     /// before.
     #[serde(default)]
     pub production_sources: Option<u32>,
-    /// Where the repository deploys (RC-058): a CI job with an
-    /// `environment:`, a step that runs a deploy command, or an Argo CD
-    /// Application, Flux Kustomization or HelmRelease that deploys this
-    /// repository. Sorted, at most [`deploy::MAX_SITES`].
+    /// RC-069's rate-limit vocabulary, server entry points and deployment
+    /// manifests. A record without it was not read for RC-069: it abstains.
     #[serde(default)]
-    pub deploy_sites: Vec<DeploySite>,
+    pub limiter: Option<LimiterFacts>,
     /// What kind of repository the tree reads as ([`repo_kind()`]). A record
     /// without it reads as [`RepoKind::Unknown`]: RC-027 and RC-040 abstain.
     #[serde(default)]
@@ -294,7 +292,7 @@ impl Default for RepoStructure {
             server_entry_points: Vec::new(),
             sast: SastFacts::default(),
             production_sources: None,
-            deploy_sites: Vec::new(),
+            limiter: None,
             repo_kind: RepoKindFacts::default(),
             walk_complete: false,
         }
@@ -372,7 +370,7 @@ pub struct StructureFinding {
 /// Map structure facts to per-control verdicts, `today` the scan date as
 /// YYYY-MM-DD (it dates only RC-006's advisory staleness note). Deterministic,
 /// no model calls. Always returns one finding per control, in stable order:
-/// RC-033, RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040.
+/// RC-033, RC-057, RC-034, RC-070, RC-006, RC-027, RC-040, RC-069.
 ///
 /// Abstention philosophy, matching the call-site scanner: an absence is a
 /// decidable negative only when the walk was complete AND absence is
@@ -384,17 +382,17 @@ pub fn evaluate(facts: &RepoStructure, today: &str) -> Vec<StructureFinding> {
     vec![
         only_with_production_source(eval_unit_tests(facts), facts),
         only_with_production_source(eval_coverage(facts), facts),
-        eval_integration(facts),
         eval_contract(facts),
         eval_manifests(facts),
         eval_runbooks(facts, today),
         error_reporting::evaluate(facts),
         sast::evaluate(facts),
+        limiter::evaluate(facts),
     ]
 }
 
 /// A finding of a rule that blocks only in a deployed service (RC-027,
-/// RC-040), gated on the repository's kind: a violation stands only in a
+/// RC-040, RC-069), gated on the repository's kind: a violation stands only in a
 /// repository read as a service, and abstains in a tool, a library or a
 /// repository with no deployment manifest. Every other verdict stands.
 pub(crate) fn only_in_a_service(mut f: StructureFinding, kind: &RepoKindFacts) -> StructureFinding {
@@ -588,94 +586,6 @@ fn eval_coverage(facts: &RepoStructure) -> StructureFinding {
         Verdict::Violates,
         "no coverage tooling found in coverage config, CI workflows, Makefiles or build scripts"
             .into(),
-        vec![],
-    )
-}
-
-fn eval_integration(facts: &RepoStructure) -> StructureFinding {
-    let control = "RC-058";
-    let control_name = "integration and smoke tests";
-    let fix = "add integration/e2e tests (tests/integration/, e2e/, playwright/cypress) and run \
-               them post-deployment"
-        .to_string();
-    let mk = |verdict, reason: String, evidence| StructureFinding {
-        control,
-        control_name,
-        verdict,
-        reason,
-        evidence,
-        fix: fix.clone(),
-        severity: "medium",
-        weak: false,
-    };
-    let eligible = eligible(facts);
-    if eligible.is_empty() {
-        return mk(
-            Verdict::NotApplicable,
-            "no recognized source ecosystems".into(),
-            vec![],
-        );
-    }
-    let markers: Vec<String> = facts
-        .ecosystems
-        .iter()
-        .flat_map(|e| e.integration_markers.iter().cloned())
-        .collect();
-    if !markers.is_empty() {
-        return mk(
-            Verdict::Satisfies,
-            "integration/e2e test convention present".into(),
-            markers,
-        );
-    }
-    let total_tests: u32 = eligible.iter().map(|e| e.test_files).sum();
-    if total_tests > 0 {
-        return mk(
-            Verdict::Abstain,
-            "unit tests present but no recognizable integration/e2e convention; integration \
-             tests may exist under other names"
-                .into(),
-            vec![],
-        );
-    }
-    let big_enough = eligible
-        .iter()
-        .any(|e| e.source_files >= MIN_SOURCES_FOR_TEST_VERDICT);
-    if big_enough && facts.walk_complete {
-        // The control asks what runs after a deploy: a repository that
-        // deploys nothing (a library, a published package, a CLI shipped as
-        // release artifacts) has no site to ask it of.
-        if facts.deploy_sites.is_empty() {
-            return mk(
-                Verdict::Abstain,
-                "no deploy site found (a CI job with an environment, a step that runs a deploy \
-                 command, an Argo CD or Flux manifest that deploys this repository): no deploy \
-                 for a smoke test to follow; an image push, a package publish or a release \
-                 upload is not one"
-                    .into(),
-                vec![],
-            );
-        }
-        let mut files: Vec<String> = facts.deploy_sites.iter().map(|d| d.file.clone()).collect();
-        files.dedup();
-        return mk(
-            Verdict::Violates,
-            format!(
-                "no test files of any kind: no integration or smoke test runs after the deploy \
-                 at {}",
-                facts
-                    .deploy_sites
-                    .iter()
-                    .map(|d| format!("{} ({})", d.file, d.deploys))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            files,
-        );
-    }
-    mk(
-        Verdict::Abstain,
-        "too few source files or truncated walk: cannot judge integration test presence".into(),
         vec![],
     )
 }

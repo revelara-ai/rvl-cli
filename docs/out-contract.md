@@ -242,8 +242,8 @@ The orchestrator uses it to:
     It mirrors the `structure:` line of the COVERAGE block. Null when the
     lane did not run.
 - `structure` is the repo-structure lane: one eval row per control (RC-033,
-  RC-057, RC-058, RC-034, RC-070, RC-006, RC-027, RC-040) in that order, with
-  the same five fields as a `sites` row and no `scope`: a row is about the
+  RC-057, RC-034, RC-070, RC-006, RC-027, RC-040, RC-069) in that order,
+  with the same five fields as a `sites` row and no `scope`: a row is about the
   repository, not about a file. `site_id` is always `repo`, because the lane
   judges the repository and not a location, so `class`
   (`repo_structure.RC-XXX`) is the key of a row. Every verdict is present,
@@ -264,16 +264,6 @@ The orchestrator uses it to:
   labs, hack and the like, or a repository whose root directory names it
   sample material) and generated files. IaC, config, template, docs and
   shell files are no ecosystem's source.
-  The `RC-058` row violates only in a repository with a deploy site: a CI
-  job with an `environment:` that does not name a package registry, a
-  release or a docs page; a GitHub Actions or root `.gitlab-ci.yml` step that
-  runs a deploy command (`kubectl apply`, `helm upgrade` or `helm install`,
-  `argocd app sync`, `terraform apply`, `gcloud run deploy`, `aws ecs
-  update-service`, `fly deploy`, `vercel deploy`, `serverless deploy`, and
-  the like); or an Argo CD Application, Flux Kustomization or HelmRelease
-  that deploys the repository's own `origin` remote. An image push, a
-  package publish and a release upload are not deploys. Without a site it
-  abstains and says no deploy site was found.
   The `RC-006` row judges a repository with runbook files (markdown under a
   `runbooks/`, `runbook/` or `playbooks/` directory, or in `ops/` or
   `docs/ops/`, index and README files excepted). It violates when a runbook's
@@ -315,6 +305,21 @@ The orchestrator uses it to:
   error. It abstains otherwise: no server entry point, no CI file, or a read
   that could hide the gating step (an unparsed workflow, an opaque call, a
   CI system it does not read).
+  The `RC-069` row violates in a repository read as a service, walked
+  completely, when no code or config file holds rate-limit or load-shedding
+  vocabulary (rate limit in its spellings, throttle, limiter, `limit_req`,
+  `limit_conn`, the ingress `limit-rps` annotations, a token or leaky
+  bucket, 429 or `TooManyRequests`, load shedding, backpressure, a
+  semaphore, a concurrency or in-flight cap, and the common limiter
+  libraries). Vendored, build, test, example, sample, demo, docs, benchmark,
+  fixture and mock trees, test files, prose, data and lock files are not
+  read. The service needs a web server entry point and a deployment manifest
+  of its own outside teaching steps (`chapter3/`, `lesson2/`, a numbered
+  directory), non-production directories and metrics, health or debug
+  paths. It satisfies, weakly, when a file holds the vocabulary. It abstains
+  in a repository whose name or owner marks sample or teaching material, an
+  exporter or a CSI driver, when every server entry point listens on a unix
+  socket, and on a truncated walk.
 - `config_sites` is the config lane, one row per setting it read, whatever
   the verdict: the sites behind the `coverage.config.by_key` counts, so a
   consumer can sample them. The rows are pre-waiver engine truth. When no
