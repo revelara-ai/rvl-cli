@@ -42,8 +42,10 @@
 pub mod helm;
 pub mod kustomize;
 pub mod manifest;
+pub mod release;
 
 use crate::{ConfigRetriever, Retrieved};
+use release::{Release, RepoRelease};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -92,7 +94,14 @@ impl ConfigRetriever for Kubernetes {
     /// helm need sibling files); a kustomization/Chart file without a root
     /// emits nothing rather than a partial guess.
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        dispatch(None, &BTreeSet::new(), rel_path, contents, snapshot_id)
+        dispatch(
+            None,
+            Release::Rootless,
+            &BTreeSet::new(),
+            rel_path,
+            contents,
+            snapshot_id,
+        )
     }
 
     /// Root-aware single-file entry: the walk hands content-claimed bare
@@ -105,8 +114,10 @@ impl ConfigRetriever for Kubernetes {
         contents: &str,
         snapshot_id: &str,
     ) -> Retrieved {
+        let repo = RepoRelease::read(root);
         dispatch(
             Some(root),
+            Release::Repo(&repo),
             &BTreeSet::new(),
             rel_path,
             contents,
@@ -129,8 +140,16 @@ impl ConfigRetriever for Kubernetes {
     ) -> Retrieved {
         let mut out = Retrieved::default();
         let bases = kustomize::referenced_bases(files);
+        let repo = RepoRelease::read(root);
         for (rel, contents) in files {
-            let got = dispatch(Some(root), &bases, rel, contents, snapshot_id);
+            let got = dispatch(
+                Some(root),
+                Release::Repo(&repo),
+                &bases,
+                rel,
+                contents,
+                snapshot_id,
+            );
             out.packets.extend(got.packets);
             out.unparseable += got.unparseable;
             out.sightings.extend(got.sightings);
@@ -161,6 +180,7 @@ fn core_group(api_version: &str) -> bool {
 /// it, and emits nothing as it stands.
 fn dispatch(
     root: Option<&Path>,
+    release: Release,
     bases: &BTreeSet<String>,
     rel_path: &str,
     contents: &str,
@@ -169,7 +189,7 @@ fn dispatch(
     if bases.contains(rel_path) {
         return Retrieved::default();
     }
-    let mut got = retrieve_file(root, rel_path, contents, snapshot_id);
+    let mut got = retrieve_file(root, release, rel_path, contents, snapshot_id);
     if root.and_then(crate::non_production::root_token).is_some() {
         got.packets.clear();
     }
@@ -180,13 +200,14 @@ fn dispatch(
 
 fn retrieve_file(
     root: Option<&Path>,
+    release: Release,
     rel_path: &str,
     contents: &str,
     snapshot_id: &str,
 ) -> Retrieved {
     match basename(rel_path) {
         "kustomization.yaml" | "kustomization.yml" => match root {
-            Some(root) => kustomize::retrieve(root, rel_path, contents, snapshot_id),
+            Some(root) => kustomize::retrieve(root, release, rel_path, contents, snapshot_id),
             None => Retrieved::default(),
         },
         "Chart.yaml" | "Chart.yml" => match root {
@@ -205,7 +226,7 @@ fn retrieve_file(
                     return Retrieved::default();
                 }
             }
-            manifest::retrieve_plain(root, rel_path, contents, snapshot_id)
+            manifest::retrieve_plain(root, release, rel_path, contents, snapshot_id)
         }
     }
 }
@@ -561,5 +582,166 @@ mod tests {
         }
         let got = Kubernetes.retrieve("deploy/performance-api.yaml", DEPLOY, "snap");
         assert!(got.packets.iter().any(|p| p.key == "workload.replicas"));
+    }
+
+    fn web(image: &str, extra_spec: &str) -> String {
+        format!("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n{extra_spec}  template:\n    spec:\n      containers:\n        - name: app\n          image: {image}\n")
+    }
+
+    /// Retrieve the manifest at `path` in a repository named `repo` that
+    /// also holds `files`; the release facts of `deployment:web`.
+    fn release(repo: &str, files: &[(&str, &str)], path: &str, manifest: &str) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(repo);
+        for (rel, text) in files.iter().chain([(path, manifest)].iter()) {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let got = Kubernetes.retrieve_with_root(&root, path, manifest, "snap");
+        let value = |unit: &str, key: &str| {
+            got.packets
+                .iter()
+                .find(|p| p.unit == unit && p.key == key)
+                .and_then(|p| p.resolved_value.clone())
+                .unwrap_or_else(|| panic!("no {unit} {key}: {:?}", got.packets))
+        };
+        (
+            value(
+                "container:deployment/web/app",
+                "container.image.tag-mutable",
+            ),
+            value("deployment:web", "workload.revision-history-limit"),
+        )
+    }
+
+    #[test]
+    fn a_mutable_tag_and_a_short_history_are_facts_and_their_twins_pass() {
+        let flagged = web("ghcr.io/acme/web:latest", "  revisionHistoryLimit: 1\n");
+        let (tag, history) = release("platform", &[], "k8s/web.yaml", &flagged);
+        assert_eq!((tag.as_str(), history.as_str()), ("true", "1"));
+        let twin = web("ghcr.io/acme/web:v1.4.2", "");
+        let (tag, history) = release("platform", &[], "k8s/web.yaml", &twin);
+        assert_eq!((tag.as_str(), history.as_str()), ("false", "10"));
+    }
+
+    #[test]
+    fn each_release_abstain_leaves_the_facts_undecided_and_its_twin_judged() {
+        let flagged = web("ghcr.io/acme/web:main", "  revisionHistoryLimit: 0\n");
+        let undecided = |v: &str| v.starts_with(crate::UNDECIDED_PREFIX);
+        // (repo, other files, path, twin path): both facts abstain.
+        for (repo, files, path, twin) in [
+            (
+                "platform",
+                vec![],
+                "envs/dev2/web.yaml",
+                "envs/prd/web.yaml",
+            ),
+            (
+                "platform",
+                vec![],
+                "k8s/day-2/web.yaml",
+                "k8s/days/web.yaml",
+            ),
+            ("kubeworkshop", vec![], "k8s/web.yaml", ""),
+            (
+                "platform",
+                vec![("charts/web/Chart.yaml", "name: web\n")],
+                "charts/web/crds/web.yaml",
+                "charts/web.yaml",
+            ),
+            (
+                "platform",
+                vec![],
+                "config/default/web_patch.yaml",
+                "config/default/web.yaml",
+            ),
+        ] {
+            let (tag, history) = release(repo, &files, path, &flagged);
+            assert!(
+                undecided(&tag) && undecided(&history),
+                "{repo} {path}: {tag} {history}"
+            );
+            let (repo, twin) = match twin {
+                "" => ("platform", "k8s/web.yaml"),
+                twin => (repo, twin),
+            };
+            let (tag, history) = release(repo, &files, twin, &flagged);
+            assert_eq!(
+                (tag.as_str(), history.as_str()),
+                ("true", "0"),
+                "{repo} {twin}"
+            );
+        }
+        // The image abstains leave the history judged.
+        for (files, image) in [
+            (
+                vec![(
+                    "k8s/prod/kustomization.yaml",
+                    "images:\n  - name: ghcr.io/acme/web\n    newTag: v2\n",
+                )],
+                "ghcr.io/acme/web:main",
+            ),
+            (
+                vec![("deploy.sh", "kubectl set image deployment/web app=$REF\n")],
+                "ghcr.io/acme/web:main",
+            ),
+            (vec![], "web:main"),
+            (vec![], "example.com/acme/web:main"),
+        ] {
+            let manifest = web(image, "  revisionHistoryLimit: 0\n");
+            let (tag, history) = release("platform", &files, "k8s/web.yaml", &manifest);
+            assert!(undecided(&tag), "{image}: {tag}");
+            assert_eq!(history, "0");
+        }
+    }
+
+    #[test]
+    fn a_statefulset_has_a_tag_fact_and_no_history_fact() {
+        let set = "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  revisionHistoryLimit: 1\n  template:\n    spec:\n      containers:\n        - name: db\n          image: ghcr.io/acme/db:latest\n";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("platform");
+        std::fs::create_dir_all(root.join("k8s")).unwrap();
+        std::fs::write(root.join("k8s/db.yaml"), set).unwrap();
+        let got = Kubernetes.retrieve_with_root(&root, "k8s/db.yaml", set, "snap");
+        let tag = got
+            .packets
+            .iter()
+            .find(|p| p.key == "container.image.tag-mutable")
+            .and_then(|p| p.resolved_value.as_deref());
+        assert_eq!(tag, Some("true"));
+        assert!(!got
+            .packets
+            .iter()
+            .any(|p| p.key == "workload.revision-history-limit"));
+    }
+
+    #[test]
+    fn a_rendered_chart_carries_its_release_facts_undecided() {
+        let dir = tempfile::tempdir().unwrap();
+        let flagged = web("ghcr.io/acme/web:latest", "  revisionHistoryLimit: 1\n");
+        let got = batch(
+            dir.path(),
+            &[
+                (
+                    "chart/Chart.yaml",
+                    "apiVersion: v2\nname: web\nversion: 0.1.0\n",
+                ),
+                ("chart/values.yaml", "{}\n"),
+                ("chart/templates/web.yaml", flagged.as_str()),
+            ],
+        );
+        let release: Vec<_> = got
+            .packets
+            .iter()
+            .filter(|p| {
+                p.key == "container.image.tag-mutable" || p.key == "workload.revision-history-limit"
+            })
+            .collect();
+        assert_eq!(release.len(), 2, "{:?}", got.packets);
+        assert!(release.iter().all(|p| p
+            .resolved_value
+            .as_deref()
+            .is_some_and(|v| v.starts_with(crate::UNDECIDED_PREFIX))));
     }
 }

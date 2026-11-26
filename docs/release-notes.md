@@ -9,6 +9,90 @@ To read the installed version, run `rvl --version` or `rvl version`.
 
 ## After 1.6.0 (not released yet)
 
+### A workload a rollback cannot return to is a fact
+
+- New: the config key `kubernetes` `container.image.tag-mutable`, on each
+  container of a Deployment or StatefulSet: `true` when the image has no
+  digest and its tag is one a registry moves (`latest`, `main`, `master`,
+  `edge`, `nightly`, `stable`, `dev`, `develop`, `head`, `trunk`,
+  `canary`, `snapshot`, in any case) or it has no tag; `false` otherwise.
+  The image reference itself never enters a packet. A spec decides it with
+  `equals "false"`.
+- New: the config key `kubernetes` `workload.revision-history-limit`, on a
+  Deployment of an `apps/` API version: the authored
+  `spec.revisionHistoryLimit`, else the documented default `10`. A spec
+  decides it with `at_least 2`.
+- New: the config key `argo-cd` `application.revisionHistoryLimit`, on an
+  Application that has a `spec.destination`: the authored value, else the
+  documented default `10` (`at_least 1`). And `flux`
+  `helmrelease.maxHistory`, on every HelmRelease: the authored value, else
+  the documented default `5`; `0` keeps every revision (`not_equals "1"`).
+- These four keys are `undecided:` with a reason when a token of the path
+  (directories and file stem), the object name or its namespace is a
+  non-production token once its trailing digits are stripped (`dev2` is
+  `dev`; besides the usual tokens, `stg`, `template`, `templates`,
+  `minikube` and `k3d`); when a directory is a numbered lesson (`day-3`,
+  `part2`, `01-intro`); when the scan root's name is a teaching
+  repository (`guide`, `getting-started`, `bootcamp`, `handbook` and the
+  like, or one holding `workshop`, `tutorial`, `training`, `example`,
+  `sample` or `demo` inside a word); when a `Chart.yaml` sits in the
+  file's directory or above it, a Helm-rendered workload included; and,
+  for the two `kubernetes` keys, when the Deployment or StatefulSet has no
+  containers or is a kustomize patch fragment.
+- `container.image.tag-mutable` is also `undecided:` when the image name
+  has no `/` (a placeholder or a library image), names a placeholder
+  registry or holds a placeholder (`example.com/`, `localhost`, `<`,
+  `CHANGEME`), is set by the `images:` of any kustomization of the
+  repository, or when the repository sets images at deploy time: a CI
+  file, Makefile or `*.sh`/`*.mk` script that runs `kubectl set image`,
+  `kustomize edit set image`, `envsubst`, `sed` or `yq` on an image,
+  `--set image.tag`, skaffold, ko or tilt, or names `IMAGE_TAG`, `IMG=` or
+  `newTag`; a `skaffold.yaml` or `Tiltfile`; or a YAML file that declares
+  an Argo CD image updater or a Flux `ImagePolicy`. A file-by-file
+  retrieval with no scan root carries it `undecided:` too.
+- `rvl cache keys` lists the four keys as awaiting a spec until the spec
+  artifact carries one.
+
+### A deploy job with no check after the deploy is a fact
+
+- New: the config key `job.post-deploy-check`, in `github-actions` and
+  `gitlab-ci`, on each job (`job:<job id>`) one of whose steps deploys: a
+  deploy action (ECS, Cloud Run, App Engine, Cloud Functions, Azure Web
+  Apps, Functions, Container Apps and AKS, CloudFormation, deploys over
+  SSH, Heroku, DigitalOcean, Serverless, Dokku, CapRover, Railway, Render,
+  Koyeb, Fly), or a shell command whose command word is a deploy tool
+  followed by its deploy subcommand (`helm upgrade|install`, `kubectl
+  apply|set image|rollout restart|replace`, `argocd app sync`, `terraform`,
+  `tofu` or `terragrunt apply`, `pulumi up`, `aws ecs update-service`,
+  `aws lambda update-function-code`, `aws cloudformation deploy`, `sam`,
+  `cdk` or `serverless deploy`, `gcloud run|app|functions deploy`, `az
+  webapp|functionapp|containerapp ... deploy`, `fly deploy`, `kamal
+  deploy`, `ansible-playbook`, `docker stack deploy`, and an `ssh` command
+  that runs `docker compose`, `docker pull|run`, `git pull`, `systemctl
+  restart` or `pm2` on the remote host). A command inside a printed message
+  (`echo`, `printf`, `Write-Host`) or a comment is no deploy. GitHub Pages,
+  static site uploads, deploy scripts and Makefile targets are no deploy
+  site.
+- Its value is `none` when nothing after the deploy looks like a check, or
+  `undecided:` and why: a smoke, test, probe, health or status word in a
+  later step of the job, in the deploy step itself, or in a job that needs
+  the job (GitLab: a job of a later stage); a follow-up workflow (one that
+  names the workflow under `workflow_run`, or any that listens on
+  `deployment_status` or `page_build`); a test cluster or dry run in the
+  file; a workflow that runs only on pull requests; a job id, job name,
+  environment name or workflow file stem naming a preview, developer, test,
+  review, demo or other non-production environment (`staging` is not one);
+  a job condition or deploy step naming a pull request or a preview; a
+  sample repository. The expectation `not_equals: none` flags `none`.
+- New: the guard predicate `job.deploy-class` on the same jobs, `terraform`
+  for an infrastructure apply (Terraform, OpenTofu, Terragrunt, Pulumi,
+  CloudFormation, CDK) and `deploy` otherwise. `rvl cache keys` lists it as
+  vocabulary only.
+- Removed: the repo-structure lane's `RC-058` row. The lane judges seven
+  controls, and the record no longer carries `deploy_sites`.
+- The specs arrive in the spec cache. Until it carries them, nothing changes
+  but the removed row.
+
 ### A paging alert with no runbook is judged in rule resources too
 
 - Changed: the `prometheus-rules` keys (`rule.for`, `rule.labels.severity`,

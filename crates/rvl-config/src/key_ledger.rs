@@ -75,6 +75,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("alertmanager", "route.repeat_interval"),
     judged("argo-cd", "application.ignoreDifferences"),
     judged("argo-cd", "application.project"),
+    judged("argo-cd", "application.revisionHistoryLimit"),
     judged("argo-cd", "application.syncPolicy.automated"),
     judged("argo-cd", "application.syncPolicy.automated.prune"),
     judged("argo-cd", "application.syncPolicy.automated.selfHeal"),
@@ -113,6 +114,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("flux", "gitrepository.ref.shape"),
     judged("flux", "helmrelease.install.remediation.retries"),
     judged("flux", "helmrelease.interval"),
+    judged("flux", "helmrelease.maxHistory"),
     judged("flux", "helmrelease.timeout"),
     judged("flux", "helmrelease.upgrade.remediation.retries"),
     judged("flux", "helmrepository.interval"),
@@ -123,7 +125,13 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("gatekeeper", "constraint.enforcementAction"),
     judged("github-actions", "credential.static-cloud-key"),
     judged("github-actions", "job.continue-on-error"),
+    vocabulary_only(
+        "github-actions",
+        "job.deploy-class",
+        "a guard predicate: what a deploy job deploys, a service or infrastructure",
+    ),
     judged("github-actions", "job.permissions"),
+    judged("github-actions", "job.post-deploy-check"),
     vocabulary_only(
         "github-actions",
         "job.publishes_image",
@@ -145,10 +153,17 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "a guard predicate: the events that start the workflow",
     ),
     judged("gitlab-ci", "job.allow_failure"),
+    vocabulary_only(
+        "gitlab-ci",
+        "job.deploy-class",
+        "a guard predicate: what a deploy job deploys, a service or infrastructure",
+    ),
+    judged("gitlab-ci", "job.post-deploy-check"),
     judged("gitlab-ci", "job.retry"),
     judged("gitlab-ci", "job.timeout"),
     judged("kubernetes", "container.image-pull-policy"),
     judged("kubernetes", "container.image.pin"),
+    judged("kubernetes", "container.image.tag-mutable"),
     judged("kubernetes", "container.liveness-probe"),
     vocabulary_only(
         "kubernetes",
@@ -176,6 +191,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kubernetes", "pod.zone-pin.count"),
     judged("kubernetes", "workload.pdb-coverage"),
     judged("kubernetes", "workload.replicas"),
+    judged("kubernetes", "workload.revision-history-limit"),
     judged("kubernetes", "workload.strategy.max-surge"),
     judged("kubernetes", "workload.strategy.max-unavailable"),
     judged("kubernetes", "workload.strategy.type"),
@@ -420,6 +436,7 @@ mod tests {
             ("alertmanager.rs", include_str!("alertmanager.rs")),
             ("argo_flux.rs", include_str!("argo_flux.rs")),
             ("dep_manifests.rs", include_str!("dep_manifests.rs")),
+            ("deploy_check.rs", include_str!("deploy_check.rs")),
             ("github_actions.rs", include_str!("github_actions.rs")),
             ("gitlab_ci.rs", include_str!("gitlab_ci.rs")),
             ("kubernetes/helm.rs", include_str!("kubernetes/helm.rs")),
@@ -432,6 +449,10 @@ mod tests {
                 include_str!("kubernetes/manifest.rs"),
             ),
             ("kubernetes/mod.rs", include_str!("kubernetes/mod.rs")),
+            (
+                "kubernetes/release.rs",
+                include_str!("kubernetes/release.rs"),
+            ),
             ("loki.rs", include_str!("loki.rs")),
             ("operators.rs", include_str!("operators.rs")),
             ("prometheus.rs", include_str!("prometheus.rs")),
@@ -617,9 +638,9 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        // Three terraform raw-identity keys, eight guard predicates, and the
+        // Three terraform raw-identity keys, ten guard predicates, and the
         // liveness probe path.
-        assert_eq!(q.vocabulary_only, 12);
+        assert_eq!(q.vocabulary_only, 14);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(

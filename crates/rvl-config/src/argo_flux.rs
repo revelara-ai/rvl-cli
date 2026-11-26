@@ -111,7 +111,7 @@ impl ConfigRetriever for ArgoFlux {
     }
 
     fn retrieve(&self, rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
-        let mut out = retrieve(rel_path, contents, snapshot_id);
+        let mut out = retrieve(None, rel_path, contents, snapshot_id);
         crate::non_production::undecide_unit(None, rel_path, &mut out);
         out
     }
@@ -125,7 +125,7 @@ impl ConfigRetriever for ArgoFlux {
         contents: &str,
         snapshot_id: &str,
     ) -> Retrieved {
-        let mut out = retrieve(rel_path, contents, snapshot_id);
+        let mut out = retrieve(Some(root), rel_path, contents, snapshot_id);
         crate::non_production::undecide_unit(Some(root), rel_path, &mut out);
         out
     }
@@ -325,7 +325,14 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
+/// `root` scopes the release facts of an Application or a HelmRelease
+/// ([`emit_release_history`]).
+fn retrieve(
+    root: Option<&std::path::Path>,
+    rel_path: &str,
+    contents: &str,
+    snapshot_id: &str,
+) -> Retrieved {
     let mut out = Retrieved::default();
     let mut recognized_docs = 0usize;
     for doc in serde_yaml::Deserializer::from_str(contents) {
@@ -354,6 +361,13 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
             .and_then(Value::as_str)
             .unwrap_or("unnamed");
         let spec = get(m, "spec").and_then(Value::as_mapping);
+        let release_why = || {
+            let namespace = get(m, "metadata")
+                .and_then(Value::as_mapping)
+                .and_then(|md| get(md, "namespace"))
+                .and_then(Value::as_str);
+            crate::non_production::release_reason(root, rel_path, name, namespace)
+        };
         match kind {
             "Application" => {
                 let mut e = Emitter::new(
@@ -364,6 +378,11 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                     format!("application:{name}"),
                 );
                 emit_application(&mut e, spec, "spec");
+                // A rollback is to a synced revision of a deployed app: an
+                // Application with no destination deploys nothing.
+                if spec.and_then(|s| get(s, "destination")).is_some() {
+                    emit_release_history(&mut e, spec, APPLICATION_HISTORY, release_why());
+                }
             }
             "ApplicationSet" => {
                 let tmpl = spec
@@ -419,6 +438,7 @@ fn retrieve(rel_path: &str, contents: &str, snapshot_id: &str) -> Retrieved {
                     format!("helmrelease:{name}"),
                 );
                 emit_helmrelease(&mut e, spec);
+                emit_release_history(&mut e, spec, HELMRELEASE_HISTORY, release_why());
             }
             "GitRepository" => {
                 let mut e = Emitter::new(
@@ -600,6 +620,55 @@ fn emit_helmrelease(e: &mut Emitter, spec: Option<&serde_yaml::Mapping>) {
                 &format!("{action}.remediation.retries"),
                 "0",
             ),
+        }
+    }
+}
+
+/// One release history key: its name, its field under `spec`, and the
+/// documented default with its note.
+struct History {
+    name: &'static str,
+    field: &'static str,
+    default: &'static str,
+    note: &'static str,
+}
+
+/// Argo CD keeps 10 synced revisions to roll back to unless told otherwise.
+const APPLICATION_HISTORY: History = History {
+    name: "application.revisionHistoryLimit",
+    field: "revisionHistoryLimit",
+    default: "10",
+    note: "revisionHistoryLimit (the documented default of 10 revisions)",
+};
+
+/// Flux keeps 5 Helm release revisions unless told otherwise; `0` keeps
+/// every one.
+const HELMRELEASE_HISTORY: History = History {
+    name: "helmrelease.maxHistory",
+    field: "maxHistory",
+    default: "5",
+    note: "maxHistory (the documented default of 5 revisions)",
+};
+
+/// How many revisions a rollback can return to (RC-014): the authored
+/// value, else the documented default. Carried [`crate::UNDECIDED_PREFIX`]
+/// and `why` when the shared classifier says the unit's release facts are
+/// not judged ([`crate::non_production::release_reason`]).
+fn emit_release_history(
+    e: &mut Emitter,
+    spec: Option<&serde_yaml::Mapping>,
+    h: History,
+    why: Option<String>,
+) {
+    let key_path = format!("spec.{}", h.field);
+    let start = e.out.packets.len();
+    match spec.and_then(|s| get(s, h.field)) {
+        Some(v) => e.authored(h.name, &key_path, v),
+        None => e.platform_default(h.name, &key_path, h.note, h.default),
+    }
+    if let Some(why) = why {
+        for p in &mut e.out.packets[start..] {
+            crate::non_production::undecide(p, &why);
         }
     }
 }
@@ -1317,5 +1386,56 @@ mod tests {
             None
         );
         assert_eq!(sight_unrecognized(""), None);
+    }
+
+    #[test]
+    fn an_application_with_a_destination_carries_its_revision_history() {
+        let app = |extra: &str| {
+            format!("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\n  namespace: argocd\nspec:\n  project: default\n{extra}")
+        };
+        let dest = "  destination:\n    server: https://kubernetes.default.svc\n";
+        let got = packets(&app(&format!("{dest}  revisionHistoryLimit: 0\n")));
+        let p = find(&got, "application:api", "application.revisionHistoryLimit");
+        assert_eq!(p.resolved_value.as_deref(), Some("0"));
+        let got = packets(&app(dest));
+        let p = find(&got, "application:api", "application.revisionHistoryLimit");
+        assert_eq!(p.resolved_value.as_deref(), Some("10"));
+        assert_eq!(p.resolution, Resolution::PlatformDefault);
+        // No destination: nothing deploys, so there is nothing to roll back.
+        let got = packets(&app("  revisionHistoryLimit: 0\n"));
+        assert!(!got
+            .packets
+            .iter()
+            .any(|p| p.key == "application.revisionHistoryLimit"));
+    }
+
+    #[test]
+    fn a_helmrelease_carries_its_max_history_and_abstains_where_its_twin_does_not() {
+        let hr = |name: &str, extra: &str| {
+            format!("apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: {name}\nspec:\n  interval: 5m\n{extra}")
+        };
+        let value = |got: &Retrieved, unit: &str| {
+            find(got, unit, "helmrelease.maxHistory")
+                .resolved_value
+                .clone()
+                .unwrap()
+        };
+        let got = packets(&hr("api", "  maxHistory: 1\n"));
+        assert_eq!(value(&got, "helmrelease:api"), "1");
+        let got = packets(&hr("api", ""));
+        assert_eq!(value(&got, "helmrelease:api"), "5");
+        // A name the release classifier reads as dev, digits stripped.
+        let got = packets(&hr("api-dev2", "  maxHistory: 1\n"));
+        assert_eq!(
+            value(&got, "helmrelease:api-dev2"),
+            "undecided: non-production name: dev"
+        );
+        // Only the release key abstains on the name.
+        assert_eq!(
+            find(&got, "helmrelease:api-dev2", "helmrelease.interval")
+                .resolved_value
+                .as_deref(),
+            Some("5m")
+        );
     }
 }

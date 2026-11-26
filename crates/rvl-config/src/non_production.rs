@@ -270,14 +270,141 @@ const FRAGMENT_STEM_TOKENS: &[&str] = &["patch", "patches"];
 /// The reason an absent key of a patch fragment carries.
 pub const FRAGMENT_REASON: &str = "patch fragment: the base carries this key";
 
+/// Image tags a registry moves to a new build: a workload on one of these
+/// cannot be rolled back to the image it ran, because the old build no
+/// longer has the name (RC-014, `container.image.tag-mutable`).
+pub const MUTABLE_IMAGE_TAGS: &[&str] = &[
+    "latest", "main", "master", "edge", "nightly", "stable", "dev", "develop", "head", "trunk",
+    "canary", "snapshot",
+];
+
+/// Tokens, beyond [`NON_PRODUCTION_TOKENS`], that mark the release facts of
+/// a unit (RC-014: `container.image.tag-mutable` and the revision history
+/// keys) as not judged: a staging or template tree, and local-cluster
+/// tools. Asked by [`release_reason`] only, which also strips a token's
+/// trailing digits (`stg1`, `dev2`); the other facts of the same unit do
+/// not read this list.
+pub const RELEASE_NON_PRODUCTION_TOKENS: &[&str] =
+    &["stg", "template", "templates", "minikube", "k3d"];
+
+/// Tokens of the scanned root's name that mark a teaching repository for
+/// the release facts, beyond [`SAMPLE_REPOSITORY_TOKENS`]. Asked by
+/// [`release_reason`] only.
+pub const TEACHING_REPOSITORY_TOKENS: &[&str] = &[
+    "guide",
+    "guides",
+    "getting-started",
+    "gettingstarted",
+    "practical",
+    "exercises",
+    "lessons",
+    "bootcamp",
+    "academy",
+    "handbook",
+    "study",
+    "talks",
+    "template",
+    "templates",
+];
+
+/// Substrings of the scanned root's lower-cased name that mark a teaching
+/// repository for the release facts even inside one word (`kubeworkshop`).
+/// Asked by [`release_reason`] only.
+pub const TEACHING_REPOSITORY_SUBSTRINGS: &[&str] = &[
+    "workshop", "tutorial", "training", "example", "sample", "demo",
+];
+
+/// Words that, followed by a number, name a lesson directory (`day-3`,
+/// `lab01`, `chapter_2`). Asked by [`release_reason`] only.
+pub const LESSON_DIR_WORDS: &[&str] = &[
+    "day", "week", "lesson", "chapter", "module", "lab", "part", "step", "section", "exercise",
+];
+
+/// Prefixes of an image name that point at no real registry.
+pub const PLACEHOLDER_REGISTRY_PREFIXES: &[&str] = &[
+    "example.org",
+    "example.com",
+    "example.io",
+    "localhost",
+    "my-registry",
+    "your-registry",
+];
+
+/// Text anywhere in an image reference that marks it a placeholder a
+/// reader replaces. `placeholder` is matched in any case, the rest as
+/// written.
+pub const PLACEHOLDER_IMAGE_MARKERS: &[&str] =
+    &["placeholder", "<", "REPLACE", "CHANGEME", "YOUR_"];
+
+/// Text in a CI file, Makefile or script that sets a workload's image at
+/// deploy time, matched as written: the committed tag is then not what
+/// runs. A line holding the word `sed` or `yq` together with `image` (or
+/// `sed` with `tag`), in any case, counts too ([`image_rewrite`]).
+pub const IMAGE_REWRITE_MARKERS: &[&str] = &[
+    "kubectl set image",
+    "kustomize edit set image",
+    "envsubst",
+    "--set image.tag",
+    "--set-string image.tag",
+    "skaffold",
+    "ko apply",
+    "ko resolve",
+    "tilt up",
+    "IMAGE_TAG",
+    "IMG=",
+    "newTag",
+];
+
+/// Text in any YAML file of a repository that names an in-cluster image
+/// updater, which rewrites a workload's image after it is applied.
+pub const IMAGE_UPDATER_MARKERS: &[&str] = &[
+    "argocd-image-updater",
+    "ImagePolicy",
+    "ImageUpdateAutomation",
+];
+
+/// File names whose presence alone means a tool builds and sets the image
+/// at deploy time.
+pub const IMAGE_REWRITE_FILES: &[&str] = &["skaffold.yaml", "skaffold.yml", "Tiltfile"];
+
+/// CI files, by name, whose text [`image_rewrite`] reads, besides every
+/// file under `.github/workflows/` and [`DEPLOY_SCRIPT_EXTENSIONS`].
+pub const DEPLOY_SCRIPT_FILES: &[&str] = &[
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "Jenkinsfile",
+    ".gitlab-ci.yml",
+    ".gitlab-ci.yaml",
+    "azure-pipelines.yml",
+    "bitbucket-pipelines.yml",
+    "cloudbuild.yaml",
+    "cloudbuild.yml",
+];
+
+/// Extensions of the scripts [`image_rewrite`] reads.
+pub const DEPLOY_SCRIPT_EXTENSIONS: &[&str] = &["sh", "mk"];
+
 /// The first token of `s` that `list` holds: a token, or two adjacent
 /// tokens of one `/`-segment joined by `-` (`single_node` is `single-node`).
 fn listed(s: &str, list: &[&'static str]) -> Option<&'static str> {
+    listed_with(s, list, false)
+}
+
+/// [`listed`], with each token's trailing digits stripped first when
+/// `strip_digits` is set (`dev2` is `dev`).
+fn listed_with(s: &str, list: &[&'static str], strip_digits: bool) -> Option<&'static str> {
     s.split('/').find_map(|segment| {
         let tokens: Vec<String> = segment
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
-            .map(str::to_lowercase)
+            .map(|t| {
+                let t = t.to_lowercase();
+                match strip_digits {
+                    true => t.trim_end_matches(|c: char| c.is_ascii_digit()).to_string(),
+                    false => t,
+                }
+            })
             .collect();
         tokens.iter().enumerate().find_map(|(i, t)| {
             let pair = tokens.get(i + 1).map(|next| format!("{t}-{next}"));
@@ -452,6 +579,147 @@ pub fn undecide_fragment_absences(packets: &mut [ConfigPacket]) {
             undecide(p, FRAGMENT_REASON);
         }
     }
+}
+
+/// Why the release facts of a unit (RC-014: `container.image.tag-mutable`
+/// and the revision history keys) are not judged, or `None`. Asked on top
+/// of [`path_token`] and [`root_token`], which the retrievers already
+/// apply, and broader than them:
+///
+///   * a token of the path (directories and file stem), of the object's
+///     `name` or of its `namespace` is on [`NON_PRODUCTION_TOKENS`] or
+///     [`RELEASE_NON_PRODUCTION_TOKENS`] once its trailing digits are
+///     stripped (`envs/dev2/`, `api-stg1`);
+///   * a directory is a numbered lesson ([`lesson_dir`]);
+///   * the scanned root is named for teaching ([`teaching_repository`]);
+///   * a `Chart.yaml` sits in the unit's directory or above it, within
+///     `root`: a chart's values, not its files, decide what deploys.
+pub fn release_reason(
+    root: Option<&Path>,
+    rel_path: &str,
+    name: &str,
+    namespace: Option<&str>,
+) -> Option<String> {
+    let token = |s: &str| {
+        listed_with(s, NON_PRODUCTION_TOKENS, true)
+            .or_else(|| listed_with(s, RELEASE_NON_PRODUCTION_TOKENS, true))
+    };
+    let (dir, stem) = dir_and_stem(rel_path);
+    if let Some(t) = token(dir).or_else(|| token(stem)) {
+        return Some(format!("non-production path: {t}"));
+    }
+    if let Some(t) = token(name) {
+        return Some(format!("non-production name: {t}"));
+    }
+    if let Some(t) = namespace.and_then(token) {
+        return Some(format!("non-production namespace: {t}"));
+    }
+    if let Some(seg) = lesson_dir(dir) {
+        return Some(format!("numbered lesson directory: {seg}"));
+    }
+    let root = root?;
+    if let Some(t) = root_token(root).or_else(|| teaching_repository(root)) {
+        return Some(format!("non-production repository: {t}"));
+    }
+    in_helm_chart(root, dir).then(|| "inside a Helm chart: its values decide what deploys".into())
+}
+
+/// The first directory segment of `dir` that numbers a lesson: one of
+/// [`LESSON_DIR_WORDS`] followed by a number (`day-3`, `lab01`), or a
+/// segment that starts with a number and a separator (`01-intro`).
+pub fn lesson_dir(dir: &str) -> Option<&str> {
+    dir.split('/').find(|seg| {
+        let lower = seg.to_lowercase();
+        let numbered = |rest: &str| {
+            rest.trim_start_matches(['-', '_', '.', ' '])
+                .starts_with(|c: char| c.is_ascii_digit())
+        };
+        let digits = lower.trim_start_matches(|c: char| c.is_ascii_digit());
+        (digits.len() < lower.len() && digits.starts_with(['-', '_', '.', ' ']))
+            || LESSON_DIR_WORDS
+                .iter()
+                .any(|w| lower.strip_prefix(w).is_some_and(numbered))
+    })
+}
+
+/// The [`TEACHING_REPOSITORY_TOKENS`] token, or the
+/// [`TEACHING_REPOSITORY_SUBSTRINGS`] substring, of the scanned root's own
+/// name, if any.
+pub fn teaching_repository(root: &Path) -> Option<&'static str> {
+    let name = root_name(root)?;
+    let lower = name.to_lowercase();
+    listed(&name, TEACHING_REPOSITORY_TOKENS).or_else(|| {
+        TEACHING_REPOSITORY_SUBSTRINGS
+            .iter()
+            .copied()
+            .find(|s| lower.contains(s))
+    })
+}
+
+/// Whether `dir`, or a directory above it within `root`, holds a
+/// `Chart.yaml`.
+fn in_helm_chart(root: &Path, dir: &str) -> bool {
+    let mut dir = dir;
+    loop {
+        if ["Chart.yaml", "Chart.yml"]
+            .iter()
+            .any(|f| root.join(dir).join(f).is_file())
+        {
+            return true;
+        }
+        match dir.rsplit_once('/') {
+            Some((up, _)) => dir = up,
+            None if !dir.is_empty() => dir = "",
+            None => return false,
+        }
+    }
+}
+
+/// Whether an image reference is a placeholder rather than an image a
+/// cluster pulls: its name starts with a [`PLACEHOLDER_REGISTRY_PREFIXES`]
+/// entry or it holds a [`PLACEHOLDER_IMAGE_MARKERS`] entry.
+pub fn placeholder_image(image: &str) -> bool {
+    PLACEHOLDER_REGISTRY_PREFIXES
+        .iter()
+        .any(|p| image.starts_with(p))
+        || PLACEHOLDER_IMAGE_MARKERS.iter().any(|m| match *m {
+            "placeholder" => image.to_lowercase().contains(m),
+            _ => image.contains(m),
+        })
+}
+
+/// The marker by which a CI file, Makefile or script's `text` sets an image
+/// at deploy time, if any: an [`IMAGE_REWRITE_MARKERS`] entry, or a line
+/// whose words hold `sed` and `image` or `tag`, or `yq` and `image`.
+pub fn image_rewrite(text: &str) -> Option<&'static str> {
+    if let Some(m) = IMAGE_REWRITE_MARKERS.iter().find(|m| text.contains(*m)) {
+        return Some(m);
+    }
+    text.lines().find_map(|line| {
+        let lower = line.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let has = |w: &str| words.contains(&w);
+        if has("sed") && (lower.contains("image") || has("tag")) {
+            Some("sed on an image or tag")
+        } else if has("yq") && lower.contains("image") {
+            Some("yq on an image")
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether the file at `rel_path` is a CI file or script that
+/// [`image_rewrite`] reads.
+pub fn deploy_script(rel_path: &str) -> bool {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    rel_path.contains(".github/workflows/")
+        || DEPLOY_SCRIPT_FILES.contains(&name)
+        || DEPLOY_SCRIPT_EXTENSIONS.contains(&ext)
 }
 
 #[cfg(test)]
@@ -678,5 +946,165 @@ mod tests {
         .unwrap();
         assert!(patch_fragment(Some(dir.path()), "overlay/replicas.yaml"));
         assert!(!patch_fragment(Some(dir.path()), "overlay/service.yaml"));
+    }
+
+    #[test]
+    fn release_reason_strips_trailing_digits_and_reads_names() {
+        for (path, name, namespace, why) in [
+            (
+                "envs/dev2/api/deployment.yaml",
+                "api",
+                None,
+                "non-production path: dev",
+            ),
+            (
+                "deploy/stg1/api.yaml",
+                "api",
+                None,
+                "non-production path: stg",
+            ),
+            (
+                "k8s/api.yaml",
+                "api-test3",
+                None,
+                "non-production name: test",
+            ),
+            (
+                "k8s/api.yaml",
+                "api",
+                Some("staging"),
+                "non-production namespace: staging",
+            ),
+            (
+                "k8s/minikube/api.yaml",
+                "api",
+                None,
+                "non-production path: minikube",
+            ),
+            (
+                "course/day-3/api.yaml",
+                "api",
+                None,
+                "non-production path: course",
+            ),
+            (
+                "k8s/day-3/api.yaml",
+                "api",
+                None,
+                "numbered lesson directory: day-3",
+            ),
+            (
+                "k8s/01-intro/api.yaml",
+                "api",
+                None,
+                "numbered lesson directory: 01-intro",
+            ),
+            (
+                "k8s/part2/api.yaml",
+                "api",
+                None,
+                "numbered lesson directory: part2",
+            ),
+        ] {
+            assert_eq!(
+                release_reason(None, path, name, namespace).as_deref(),
+                Some(why),
+                "{path} {name}"
+            );
+        }
+        for (path, name, namespace) in [
+            ("envs/prd/api/deployment.yaml", "api", None),
+            ("k8s/api.yaml", "api-v2", Some("payments")),
+            ("k8s/days/api.yaml", "api", None),
+            ("k8s/v1/api.yaml", "api", None),
+            ("k8s/stepfunctions/api.yaml", "api", None),
+        ] {
+            assert_eq!(release_reason(None, path, name, namespace), None, "{path}");
+        }
+        // The general path test keeps its whole-token reading.
+        assert_eq!(path_token("envs/dev2/api/deployment.yaml"), None);
+    }
+
+    #[test]
+    fn release_reason_reads_teaching_repositories_and_charts() {
+        let dir = tempfile::tempdir().unwrap();
+        for (repo, why) in [
+            ("kubeworkshop", Some("non-production repository: workshop")),
+            (
+                "kubernetes-getting-started",
+                Some("non-production repository: getting-started"),
+            ),
+            (
+                "devops-bootcamp",
+                Some("non-production repository: bootcamp"),
+            ),
+            ("platform", None),
+        ] {
+            let root = dir.path().join(repo);
+            assert_eq!(
+                release_reason(Some(&root), "k8s/api.yaml", "api", None).as_deref(),
+                why,
+                "{repo}"
+            );
+        }
+        let root = dir.path().join("platform");
+        std::fs::create_dir_all(root.join("charts/api/files")).unwrap();
+        std::fs::write(root.join("charts/api/Chart.yaml"), "name: api\n").unwrap();
+        assert!(
+            release_reason(Some(&root), "charts/api/files/api.yaml", "api", None)
+                .is_some_and(|w| w.starts_with("inside a Helm chart"))
+        );
+        assert_eq!(
+            release_reason(Some(&root), "charts/web.yaml", "api", None),
+            None
+        );
+    }
+
+    #[test]
+    fn placeholder_images_and_deploy_rewrites_are_named() {
+        for image in [
+            "example.org/web:latest",
+            "my-registry/web",
+            "acme/web:REPLACE_ME",
+        ] {
+            assert!(placeholder_image(image), "{image}");
+        }
+        assert!(!placeholder_image("ghcr.io/acme/web:latest"));
+        for (text, marker) in [
+            (
+                "kustomize edit set image web=$REF",
+                "kustomize edit set image",
+            ),
+            (
+                "helm upgrade api ./chart --set image.tag=$SHA",
+                "--set image.tag",
+            ),
+            ("export IMAGE_TAG=$SHA", "IMAGE_TAG"),
+            (
+                "sed -i \"s/:latest/:$SHA/\" k8s/web.yaml # tag",
+                "sed on an image or tag",
+            ),
+            (
+                "sed -i 's|IMAGE|ghcr.io/acme/web|' k8s/web.yaml",
+                "sed on an image or tag",
+            ),
+            (
+                "yq -i '.spec.template.spec.containers[0].image = env(REF)' web.yaml",
+                "yq on an image",
+            ),
+        ] {
+            assert_eq!(image_rewrite(text), Some(marker), "{text}");
+        }
+        for text in [
+            "sed -i 's/a/b/' README.md",
+            "docker build -t web .",
+            "based on the image",
+        ] {
+            assert_eq!(image_rewrite(text), None, "{text}");
+        }
+        assert!(deploy_script(".github/workflows/deploy.yml"));
+        assert!(deploy_script("scripts/release.sh"));
+        assert!(deploy_script("Makefile"));
+        assert!(!deploy_script("k8s/deploy.yaml"));
     }
 }
