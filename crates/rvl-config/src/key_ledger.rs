@@ -123,7 +123,13 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("gatekeeper", "constraint.enforcementAction"),
     judged("github-actions", "credential.static-cloud-key"),
     judged("github-actions", "job.continue-on-error"),
+    vocabulary_only(
+        "github-actions",
+        "job.deploy-class",
+        "a guard predicate: what a deploy job deploys, a service or infrastructure",
+    ),
     judged("github-actions", "job.permissions"),
+    judged("github-actions", "job.post-deploy-check"),
     vocabulary_only(
         "github-actions",
         "job.publishes_image",
@@ -145,6 +151,12 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
         "a guard predicate: the events that start the workflow",
     ),
     judged("gitlab-ci", "job.allow_failure"),
+    vocabulary_only(
+        "gitlab-ci",
+        "job.deploy-class",
+        "a guard predicate: what a deploy job deploys, a service or infrastructure",
+    ),
+    judged("gitlab-ci", "job.post-deploy-check"),
     judged("gitlab-ci", "job.retry"),
     judged("gitlab-ci", "job.timeout"),
     judged("kubernetes", "container.image-pull-policy"),
@@ -182,7 +194,17 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("kyverno", "rule.validate.failureAction"),
     judged("loki", "limits_config.retention_period-effective"),
     judged("loki", "table_manager.retention_period-effective"),
+    vocabulary_only(
+        "prometheus-rules",
+        "file.rule_pack_path",
+        "a guard predicate: the rule file's path names a skill package or a template to copy",
+    ),
     judged("prometheus-rules", "group.interval"),
+    vocabulary_only(
+        "prometheus-rules",
+        "repo.alertmanager.disabled",
+        "a guard predicate: a Helm values file of the repository sets alertmanager.enabled to false",
+    ),
     vocabulary_only(
         "prometheus-rules",
         "repo.alertmanager.mentions_runbook",
@@ -191,7 +213,7 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     vocabulary_only(
         "prometheus-rules",
         "repo.alertmanager.paging_receiver",
-        "a guard predicate: whether the repository's receivers can page (yes, no, none_declared)",
+        "a guard predicate: whether the repository's receivers can page (yes, webhook_only, no, none_declared)",
     ),
     vocabulary_only(
         "prometheus-rules",
@@ -202,6 +224,11 @@ pub const EMITTED_KEYS: &[EmittedKey] = &[
     judged("prometheus-rules", "rule.annotations.runbook.target"),
     judged("prometheus-rules", "rule.expr"),
     judged("prometheus-rules", "rule.for"),
+    vocabulary_only(
+        "prometheus-rules",
+        "rule.group.upstream_mixin",
+        "a guard predicate: the rule's group name is one of an upstream monitoring mixin",
+    ),
     vocabulary_only(
         "prometheus-rules",
         "rule.kustomize_patched",
@@ -420,6 +447,7 @@ mod tests {
             ("alertmanager.rs", include_str!("alertmanager.rs")),
             ("argo_flux.rs", include_str!("argo_flux.rs")),
             ("dep_manifests.rs", include_str!("dep_manifests.rs")),
+            ("deploy_check.rs", include_str!("deploy_check.rs")),
             ("github_actions.rs", include_str!("github_actions.rs")),
             ("gitlab_ci.rs", include_str!("gitlab_ci.rs")),
             ("kubernetes/helm.rs", include_str!("kubernetes/helm.rs")),
@@ -617,9 +645,9 @@ mod tests {
         assert_eq!(q.emitted, EMITTED_KEYS.len());
         assert_eq!(q.keys.len(), q.emitted);
         assert_eq!(q.specced, 2);
-        // Three terraform raw-identity keys, eight guard predicates, and the
+        // Three terraform raw-identity keys, thirteen guard predicates, and the
         // liveness probe path.
-        assert_eq!(q.vocabulary_only, 12);
+        assert_eq!(q.vocabulary_only, 17);
         assert_eq!(q.specced + q.mint_queue + q.vocabulary_only, q.emitted);
         let row = q.keys.iter().find(|r| r.key == "module.version-pin");
         assert!(

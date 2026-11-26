@@ -53,7 +53,11 @@
 //!     ([`crate::prometheus_repo`]), `repo.alertmanager.mentions_runbook`
 //!     and `repo.alertmanager.paging_receiver`. `rule.kustomize_patched`
 //!     and the repo facts are emitted only when the walk hands over the
-//!     root.
+//!     root. Three more: per file `file.rule_pack_path` (`true` when the
+//!     path holds a [`RULE_PACK_PATH_TOKENS`] token), per alert rule
+//!     `rule.group.upstream_mixin` (`true` when the group name is one of
+//!     [`UPSTREAM_MIXIN_GROUPS`]), and from the walk
+//!     `repo.alertmanager.disabled`.
 //!   * `rule.expr` — non-emptiness of the alert expression. SHAPE-ONLY: the
 //!     marker `nonempty`, never the PromQL (metric names, label values and
 //!     hostnames live in expressions; per the privacy contract they never
@@ -72,9 +76,12 @@
 //! `rule.annotations.runbook` packet of a rule with no runbook, or a
 //! templated one, is carried undecided with the first reason that holds:
 //! a templated runbook value, a link-like annotation (a judge must read the
-//! link), an Alertmanager config or template that composes the link,
-//! receivers that page nobody, a duplicate alert name, a kustomize patch
-//! that can change the severity. Every packet of a rule file that is a
+//! link), a skill package or copy-me template path, an Alertmanager config
+//! or template that composes the link, receivers that page nobody,
+//! Alertmanager switched off in Helm values, receivers whose only
+//! paging-capable integration is a webhook, a duplicate alert name, a group
+//! name copied from an upstream mixin, a kustomize patch that can change
+//! the severity. Every packet of a rule file that is a
 //! vendored or generated pack
 //! ([`crate::non_production::vendored_token`]) is carried undecided too,
 //! the way a non-production file's are. The rule's other packets keep
@@ -127,6 +134,62 @@ const LINK_KEY_WORDS: &[&str] = &[
 
 /// Annotation value fragments (any case) that hold a link of some kind.
 const LINK_VALUE_WORDS: &[&str] = &["http://", "https://", "runbook", "playbook"];
+
+/// Path tokens (any case, of any directory or the file stem) of a rule file
+/// that ships for others to copy or adapt: a skill package an assistant
+/// installs, or a template a user fills in. The rule's severity and
+/// annotations are the consumer's to set. Read for rule files only: a
+/// chart's `templates/` is a production path for other retrievers, and a
+/// `PrometheusRule` in one is a chart whose consumer decides its values.
+const RULE_PACK_PATH_TOKENS: &[&str] = &["skill", "skills", "template", "templates"];
+
+/// Rule group names of the upstream monitoring mixins, as kube-prometheus
+/// and the kube-prometheus-stack chart render them: kubernetes-mixin,
+/// node-exporter, Alertmanager, Prometheus, prometheus-operator,
+/// kube-state-metrics and etcd. A group of one of these names is a copy of
+/// the upstream pack even where no vendored path token says so, and its
+/// runbook links are the upstream's choice, not the repository's.
+const UPSTREAM_MIXIN_GROUPS: &[&str] = &[
+    "alertmanager.rules",
+    "config-reloaders",
+    "etcd",
+    "general.rules",
+    "k8s.rules",
+    "kube-apiserver-availability.rules",
+    "kube-apiserver-burnrate.rules",
+    "kube-apiserver-histogram.rules",
+    "kube-apiserver-slos",
+    "kube-prometheus-general.rules",
+    "kube-prometheus-node-recording.rules",
+    "kube-scheduler.rules",
+    "kube-state-metrics",
+    "kubelet.rules",
+    "kubernetes-apps",
+    "kubernetes-resources",
+    "kubernetes-storage",
+    "kubernetes-system",
+    "kubernetes-system-apiserver",
+    "kubernetes-system-controller-manager",
+    "kubernetes-system-kube-proxy",
+    "kubernetes-system-kubelet",
+    "kubernetes-system-scheduler",
+    "node-exporter",
+    "node-exporter.rules",
+    "node-network",
+    "node.rules",
+    "prometheus",
+    "prometheus-operator",
+];
+
+/// The [`RULE_PACK_PATH_TOKENS`] token of `rel_path`, if any: its
+/// directories and file stem split at every character that is not a letter
+/// or a digit.
+fn rule_pack_token(rel_path: &str) -> Option<&'static str> {
+    let stem = rel_path.rsplit_once('.').map_or(rel_path, |(stem, _)| stem);
+    stem.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .find_map(|t| RULE_PACK_PATH_TOKENS.iter().copied().find(|w| *w == t))
+}
 
 /// Whether an `apiVersion` + `kind` is a resource whose `spec.groups` hold
 /// Prometheus rule groups.
@@ -315,11 +378,24 @@ fn retrieve_file(
         read = true;
     }
     if read {
-        em.repo_predicates(&mut out);
+        em.file_predicates(&mut out);
     } else {
         out.unparseable = 1;
     }
     out
+}
+
+/// What the rule's group says about one alert rule.
+#[derive(Clone, Copy)]
+struct RuleFacts<'a> {
+    /// The group has no other rule of this alert name, or every one of them
+    /// is a paging rule without a runbook.
+    unique: bool,
+    /// The group name is one of [`UPSTREAM_MIXIN_GROUPS`].
+    upstream: bool,
+    /// The name of the `PrometheusRule` the rule is in; `None` for any
+    /// other container.
+    patch_target: Option<&'a str>,
 }
 
 /// Shared packet plumbing for one file.
@@ -463,10 +539,16 @@ impl Emitter<'_> {
         }
     }
 
-    /// The repository's facts, true of every rule in the file.
-    fn repo_predicates(&self, out: &mut Retrieved) {
-        let Some(repo) = self.repo else { return };
+    /// The file's and the repository's facts, true of every rule in the
+    /// file.
+    fn file_predicates(&self, out: &mut Retrieved) {
         let unit = crate::FILE_SCOPE;
+        out.predicates.push(self.predicate(
+            unit,
+            "file.rule_pack_path",
+            &rule_pack_token(self.rel_path).is_some().to_string(),
+        ));
+        let Some(repo) = self.repo else { return };
         out.predicates.push(self.predicate(
             unit,
             "repo.alertmanager.mentions_runbook",
@@ -476,6 +558,11 @@ impl Emitter<'_> {
             unit,
             "repo.alertmanager.paging_receiver",
             repo.paging.as_str(),
+        ));
+        out.predicates.push(self.predicate(
+            unit,
+            "repo.alertmanager.disabled",
+            &repo.alertmanager_disabled.to_string(),
         ));
     }
 
@@ -547,7 +634,13 @@ impl Emitter<'_> {
                 let unique = twins
                     .get(aname)
                     .is_none_or(|t| t.len() == 1 || t.iter().all(|f| *f));
-                self.alert_rule(&unit, &kp, rule, unique, patch_target, out);
+                let upstream = UPSTREAM_MIXIN_GROUPS.contains(&gname.as_str());
+                let rule_facts = RuleFacts {
+                    unique,
+                    upstream,
+                    patch_target,
+                };
+                self.alert_rule(&unit, &kp, rule, rule_facts, out);
             }
         }
     }
@@ -558,10 +651,14 @@ impl Emitter<'_> {
         unit: &str,
         kp: &dyn Fn(&str) -> String,
         rule: &serde_yaml::Mapping,
-        unique: bool,
-        patch_target: Option<&str>,
+        facts: RuleFacts,
         out: &mut Retrieved,
     ) {
+        let RuleFacts {
+            unique,
+            upstream,
+            patch_target,
+        } = facts;
         // rule.for: explicit, else the documented 0s default (the alert
         // fires on first evaluation).
         match get(rule, "for") {
@@ -617,9 +714,12 @@ impl Emitter<'_> {
         let templated = runbook.is_some_and(|v| render_value(v).contains("{{"));
         if packet.resolved_value.as_deref() == Some("") || templated {
             let repo = self.repo;
+            let pack = rule_pack_token(self.rel_path)
+                .map(|t| format!("a skill package or template to copy: {t}"));
             let why = [
                 (templated, "templated runbook value"),
                 (link, "a link-like annotation: a reader must judge the link"),
+                (pack.is_some(), pack.as_deref().unwrap_or("")),
                 (
                     repo.is_some_and(|r| r.mentions_runbook),
                     "an Alertmanager config or template mentions a runbook",
@@ -628,7 +728,16 @@ impl Emitter<'_> {
                     repo.is_some_and(|r| r.paging == Paging::No),
                     "no receiver can page: alerts go to chat, email or nowhere",
                 ),
+                (
+                    repo.is_some_and(|r| r.alertmanager_disabled),
+                    "Helm values switch Alertmanager off",
+                ),
+                (
+                    repo.is_some_and(|r| r.paging == Paging::WebhookOnly),
+                    "only a webhook receiver: whether it pages cannot be told",
+                ),
                 (!unique, "another rule of the group has this alert name"),
+                (upstream, "the group name of an upstream mixin rule pack"),
                 (patched, "a kustomize patch targets this PrometheusRule"),
             ]
             .into_iter()
@@ -646,6 +755,11 @@ impl Emitter<'_> {
             .push(self.predicate(unit, "rule.annotations.link_like", present));
         out.predicates
             .push(self.predicate(unit, "rule.name_unique", &unique.to_string()));
+        out.predicates.push(self.predicate(
+            unit,
+            "rule.group.upstream_mixin",
+            &upstream.to_string(),
+        ));
         if self.repo.is_some() {
             out.predicates.push(self.predicate(
                 unit,
@@ -1477,6 +1591,112 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_package_or_template_path_is_undecided() {
+        let rules = critical("");
+        for (path, token) in [
+            ("skills/alerting/rules.yaml", "skills"),
+            ("agent/skill/prometheus/alerts.yml", "skill"),
+            ("monitoring/alert-template.yaml", "template"),
+            // A chart's own PrometheusRule is the chart consumer's to decide.
+            ("charts/api/Templates/rules.yaml", "templates"),
+        ] {
+            assert_eq!(
+                runbook_in(&[(path, &rules)], path, UNIT),
+                undecided(&format!("a skill package or template to copy: {token}")),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            runbook_in(&[(RULES, &rules)], RULES, UNIT),
+            Some(String::new())
+        );
+        // A token is a whole word, not a substring.
+        let path = "deploy/skillful/rules.yaml";
+        assert_eq!(
+            runbook_in(&[(path, &rules)], path, UNIT),
+            Some(String::new())
+        );
+        // Only the runbook is the consumer's: the rule's other facts stand.
+        let got = PrometheusRules.retrieve("skills/rules.yaml", &rules, "snap");
+        assert_eq!(
+            find(&got, UNIT, "rule.for").resolved_value.as_deref(),
+            Some("0s")
+        );
+    }
+
+    const PAGERDUTY: &str = "route:\n  receiver: pager\nreceivers:\n- name: pager\n  pagerduty_configs:\n  - routing_key: K\n";
+
+    #[test]
+    fn alertmanager_switched_off_in_helm_values_is_undecided() {
+        let rules = critical("");
+        let off = "kube-prometheus-stack:\n  alertmanager:\n    enabled: false\n";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("deploy/helm/values.yaml", off)],
+                RULES,
+                UNIT
+            ),
+            undecided("Helm values switch Alertmanager off")
+        );
+        let on = "kube-prometheus-stack:\n  alertmanager:\n    enabled: true\n";
+        assert_eq!(
+            runbook_in(
+                &[
+                    (RULES, &rules),
+                    ("deploy/helm/values.yaml", on),
+                    ("alertmanager/alertmanager.yml", PAGERDUTY)
+                ],
+                RULES,
+                UNIT
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_webhook_only_receiver_is_undecided() {
+        let rules = critical("");
+        let hook = "route:\n  receiver: hook\nreceivers:\n- name: hook\n  webhook_configs:\n  - url: http://bridge:8080/\n";
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &rules), ("alertmanager/alertmanager.yml", hook)],
+                RULES,
+                UNIT
+            ),
+            undecided("only a webhook receiver: whether it pages cannot be told")
+        );
+        assert_eq!(
+            runbook_in(
+                &[
+                    (RULES, &rules),
+                    ("alertmanager/alertmanager.yml", PAGERDUTY)
+                ],
+                RULES,
+                UNIT
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn an_upstream_mixin_group_name_is_undecided() {
+        let rules = critical("").replace("- name: api", "- name: kubernetes-apps");
+        assert_eq!(
+            runbook_in(&[(RULES, &rules)], RULES, "rule:kubernetes-apps/ApiDown"),
+            undecided("the group name of an upstream mixin rule pack")
+        );
+        let first_party = critical("").replace("- name: api", "- name: kubernetes-api-gateway");
+        assert_eq!(
+            runbook_in(
+                &[(RULES, &first_party)],
+                RULES,
+                "rule:kubernetes-api-gateway/ApiDown"
+            ),
+            Some(String::new())
+        );
+    }
+
+    #[test]
     fn a_rule_with_a_runbook_keeps_its_value_whatever_the_repository_says() {
         let rules =
             critical("    annotations:\n      runbook_url: https://runbooks.example.com/api\n");
@@ -1511,10 +1731,29 @@ mod tests {
             repo("repo.alertmanager.paging_receiver").as_deref(),
             Some("none_declared")
         );
+        assert_eq!(repo("repo.alertmanager.disabled").as_deref(), Some("false"));
+        assert_eq!(repo("file.rule_pack_path").as_deref(), Some("false"));
+        assert_eq!(
+            one(UNIT, "rule.group.upstream_mixin").as_deref(),
+            Some("false")
+        );
         // Without the root the repository is unknown, and says nothing.
         let got = packets(pair);
         assert!(predicate(&got, crate::FILE_SCOPE, "repo.alertmanager.paging_receiver").is_none());
         assert!(predicate(&got, UNIT, "rule.kustomize_patched").is_none());
+        assert!(predicate(&got, crate::FILE_SCOPE, "repo.alertmanager.disabled").is_none());
+        // The path and the group name are the file's own, read without it.
+        let got = PrometheusRules.retrieve("skills/rules.yaml", pair, "snap");
+        assert_eq!(
+            predicate(&got, crate::FILE_SCOPE, "file.rule_pack_path"),
+            Some(&["true".to_string()][..])
+        );
+        let mixin = pair.replace("- name: api", "- name: etcd");
+        let got = packets(&mixin);
+        assert_eq!(
+            predicate(&got, "rule:etcd/ApiDown", "rule.group.upstream_mixin"),
+            Some(&["true".to_string()][..])
+        );
     }
 
     // --- sloth SLO definitions ---

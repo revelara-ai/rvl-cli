@@ -10188,7 +10188,6 @@ mod tests {
             [
                 "repo_structure.RC-033",
                 "repo_structure.RC-057",
-                "repo_structure.RC-058",
                 "repo_structure.RC-034",
                 "repo_structure.RC-070",
                 "repo_structure.RC-006",
